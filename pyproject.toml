@@ -7,7 +7,7 @@ name = "biopb"
 version = "0.1.0"
 requires-python = ">=3.8"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
-description = "A place for collecting protobuf definitions for bio-research data"
+description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
 readme = "README.md"
 license = {file = "LICENSE"}
 

@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package biopb.image;
+
+option java_package = "biopb.image";
+option java_multiple_files = true;
+
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/empty.proto";
+
+import "biopb/image/image_data.proto";
+
+message ProcessRequest {
+
+    // Input image for processing
+    ImageData image_data = 1;
+
+    // Specify a operator name because the server may implement multiple operations.
+    string op_name = 2; 
+
+    // A field_mask to indicate the requested fields in the reply. Default is to
+    // return the full response. May be ignored by the server.
+    google.protobuf.FieldMask field_mask = 3;
+
+}
+
+message ProcessResponse {
+
+    // Output image after processing
+    ImageData image_data = 1;
+
+    // Additonal information the server may return as a text string
+    string annotation = 2;
+}
+
+
+message OpNames {
+
+    // a list of op names
+    repeated string names = 1;
+
+}
+
+// A generic image process protocol that returns a new image. Examples include
+// denoising, super-resolution, and semantic segmentation.
+//
+service ProcessImage {
+
+    // Process the input image
+    rpc Run(ProcessRequest) returns (ProcessResponse) ;
+
+    // Query operation names. Server with a single op may not implement this
+    // call.
+    rpc GetOpNames(google.protobuf.Empty) returns (OpNames) ;
+
+}
+

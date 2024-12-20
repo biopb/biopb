@@ -28,7 +28,7 @@ service ObjectDetection {
     rpc RunDetectionStream(stream DetectionRequest) returns (stream DetectionResponse) ;
 
 
-    // Send the image dataset as a stream of (partially overlapping) image
+    // Send the image dataset as a stream of (overlapping or non-overlapping) image
     // patches, instead of one large chunk of binary data. There are two use
     // cases for this call: (1) The image dataset is too large therefore sending
     // all data in one message would exceed GRPC message size limit; (2) The
@@ -37,7 +37,7 @@ service ObjectDetection {
     rpc RunDetectionOnGrid(stream DetectionRequest) returns (DetectionResponse) ;
 
 
-    // Run model adaptation based on the submitted stream of DetectionReqeust,
+    // Run model adaptation based on the submitted stream of DetectionRequest,
     // which may or may not contain ROI annotations. The all returns an opaque
     // data strcuture representing the model configuration after model
     // adaptation, which in turn should be included in future inference reuest
