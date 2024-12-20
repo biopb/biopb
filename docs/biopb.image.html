@@ -77,6 +77,13 @@
       </a>
     </p>
     
+    <p>
+      <a href="#service-biopb.image.ProcessImage">
+        <span class="tag" style="min-width: 6em">Service</span>
+        <code>ProcessImage</code> 
+      </a>
+    </p>
+    
 
     
       
@@ -171,6 +178,15 @@
     
       
       <p>
+        <a href="#message-biopb.image.OpNames">
+          <span class="tag" style="min-width: 6em">Message</span>
+          <code>OpNames</code> 
+        </a>
+      </p>
+      
+    
+      
+      <p>
         <a href="#message-biopb.image.Pixels">
           <span class="tag" style="min-width: 6em">Message</span>
           <code>Pixels</code> 
@@ -192,6 +208,24 @@
         <a href="#message-biopb.image.Polygon">
           <span class="tag" style="min-width: 6em">Message</span>
           <code>Polygon</code> 
+        </a>
+      </p>
+      
+    
+      
+      <p>
+        <a href="#message-biopb.image.ProcessRequest">
+          <span class="tag" style="min-width: 6em">Message</span>
+          <code>ProcessRequest</code> 
+        </a>
+      </p>
+      
+    
+      
+      <p>
+        <a href="#message-biopb.image.ProcessResponse">
+          <span class="tag" style="min-width: 6em">Message</span>
+          <code>ProcessResponse</code> 
         </a>
       </p>
       
@@ -319,7 +353,7 @@ bandwidth.</p></p>
 
   
   <div class="block">
-    <p><p>Send the image dataset as a stream of (partially overlapping) image
+    <p><p>Send the image dataset as a stream of (overlapping or non-overlapping) image
 patches, instead of one large chunk of binary data. There are two use
 cases for this call: (1) The image dataset is too large therefore sending
 all data in one message would exceed GRPC message size limit; (2) The
@@ -343,11 +377,67 @@ as patches.</p></p>
 
   
   <div class="block">
-    <p><p>Run model adaptation based on the submitted stream of DetectionReqeust,
+    <p><p>Run model adaptation based on the submitted stream of DetectionRequest,
 which may or may not contain ROI annotations. The all returns an opaque
 data strcuture representing the model configuration after model
 adaptation, which in turn should be included in future inference reuest
 as a DetectionSetting field.</p></p>
+  </div>
+  
+</div>
+ 
+    </div>
+    
+    <div>
+      
+
+<h4 class="title is-4 type-heading" id="service-biopb.image.ProcessImage">
+  <a href="#service-biopb.image.ProcessImage" title="biopb.image.ProcessImage">service ProcessImage</a>
+  
+</h4>
+
+<div class="block content">
+  <p><p>A generic image process protocol that returns a new image. Examples include
+denoising, super-resolution, and semantic segmentation.</p></p>
+</div>
+
+
+<div class="box">
+  <div class="block">
+    <h5 class="title is-5" id="service-biopb.image.ProcessImage-Run">
+      <a href="#service-biopb.image.ProcessImage-Run">
+        rpc <code>Run</code>
+      </a>
+    </h5>
+    Request: <code><a href="biopb.image.html#message-biopb.image.ProcessRequest"><span title="biopb.image.ProcessRequest">biopb.image.ProcessRequest</span>
+    </a></code><br>
+    Response: <code><a href="biopb.image.html#message-biopb.image.ProcessResponse"><span title="biopb.image.ProcessResponse">biopb.image.ProcessResponse</span>
+    </a></code><br>
+  </div>
+
+  
+  <div class="block">
+    <p><p>Process the input image</p></p>
+  </div>
+  
+</div>
+
+<div class="box">
+  <div class="block">
+    <h5 class="title is-5" id="service-biopb.image.ProcessImage-GetOpNames">
+      <a href="#service-biopb.image.ProcessImage-GetOpNames">
+        rpc <code>GetOpNames</code>
+      </a>
+    </h5>
+    Request: <code><span>google.protobuf.Empty</span></code><br>
+    Response: <code><a href="biopb.image.html#message-biopb.image.OpNames"><span title="biopb.image.OpNames">biopb.image.OpNames</span>
+    </a></code><br>
+  </div>
+
+  
+  <div class="block">
+    <p><p>Query operation names. Server with a single op may not implement this
+call.</p></p>
   </div>
   
 </div>
@@ -997,7 +1087,22 @@ server due to the potential out-of-memory problem.</p></td>
     </a>
         </code>
       </td>
-      <td class="content"></td>
+      <td class="content"><p>a list of region of interest</p></td>
+      
+    </tr>
+    
+    <tr>
+      <td>2</td>
+      <td>
+        annotation
+      </td>
+      <td>
+        <code title="string">
+          
+          <span>string</span>
+        </code>
+      </td>
+      <td class="content"><p>additional text annotation</p></td>
       
     </tr>
     
@@ -1209,6 +1314,58 @@ same as the that of the image data the Roi is applied to.</p>
         </code>
       </td>
       <td class="content"></td>
+      
+    </tr>
+    
+    
+  </tbody>
+</table>
+ 
+      </div>
+      
+    
+      
+      <div class="block">
+        
+
+<h4 class="title is-4 type-heading" id="message-biopb.image.OpNames">
+  <span>
+    <a href="#message-biopb.image.OpNames" title="biopb.image.OpNames">message OpNames</a>
+  
+  </span>
+  
+</h4>
+
+<div class="block content">
+  
+</div>
+
+<table class="table is-fullwidth is-hoverable is-bordered">
+  <thead>
+    <tr>
+      <th></th>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Description</th>
+      
+    </tr>
+  </thead>
+  <tbody>
+    
+    <tr>
+      <td>1</td>
+      <td>
+        names
+      </td>
+      <td>
+        <code title="string">
+          
+            repeated
+          
+          <span>string</span>
+        </code>
+      </td>
+      <td class="content"><p>a list of op names</p></td>
       
     </tr>
     
@@ -1681,6 +1838,154 @@ uses counterclockwise winding (this is the default OpenGL behavior)</p>
         </code>
       </td>
       <td class="content"></td>
+      
+    </tr>
+    
+    
+  </tbody>
+</table>
+ 
+      </div>
+      
+    
+      
+      <div class="block">
+        
+
+<h4 class="title is-4 type-heading" id="message-biopb.image.ProcessRequest">
+  <span>
+    <a href="#message-biopb.image.ProcessRequest" title="biopb.image.ProcessRequest">message ProcessRequest</a>
+  
+  </span>
+  
+</h4>
+
+<div class="block content">
+  
+</div>
+
+<table class="table is-fullwidth is-hoverable is-bordered">
+  <thead>
+    <tr>
+      <th></th>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Description</th>
+      
+    </tr>
+  </thead>
+  <tbody>
+    
+    <tr>
+      <td>1</td>
+      <td>
+        image_data
+      </td>
+      <td>
+        <code title="biopb.image.ImageData">
+          
+          <a href="biopb.image.html#message-biopb.image.ImageData"><span title="biopb.image.ImageData">biopb.image.ImageData</span>
+    </a>
+        </code>
+      </td>
+      <td class="content"><p>Input image for processing</p></td>
+      
+    </tr>
+    
+    <tr>
+      <td>2</td>
+      <td>
+        op_name
+      </td>
+      <td>
+        <code title="string">
+          
+          <span>string</span>
+        </code>
+      </td>
+      <td class="content"><p>Specify a operator name because the server may implement multiple operations.</p></td>
+      
+    </tr>
+    
+    <tr>
+      <td>3</td>
+      <td>
+        field_mask
+      </td>
+      <td>
+        <code title="google.protobuf.FieldMask">
+          
+          <span>google.protobuf.FieldMask</span>
+        </code>
+      </td>
+      <td class="content"><p>A field_mask to indicate the requested fields in the reply. Default is to
+return the full response. May be ignored by the server.</p></td>
+      
+    </tr>
+    
+    
+  </tbody>
+</table>
+ 
+      </div>
+      
+    
+      
+      <div class="block">
+        
+
+<h4 class="title is-4 type-heading" id="message-biopb.image.ProcessResponse">
+  <span>
+    <a href="#message-biopb.image.ProcessResponse" title="biopb.image.ProcessResponse">message ProcessResponse</a>
+  
+  </span>
+  
+</h4>
+
+<div class="block content">
+  
+</div>
+
+<table class="table is-fullwidth is-hoverable is-bordered">
+  <thead>
+    <tr>
+      <th></th>
+      <th>Field</th>
+      <th>Type</th>
+      <th>Description</th>
+      
+    </tr>
+  </thead>
+  <tbody>
+    
+    <tr>
+      <td>1</td>
+      <td>
+        image_data
+      </td>
+      <td>
+        <code title="biopb.image.ImageData">
+          
+          <a href="biopb.image.html#message-biopb.image.ImageData"><span title="biopb.image.ImageData">biopb.image.ImageData</span>
+    </a>
+        </code>
+      </td>
+      <td class="content"><p>Output image after processing</p></td>
+      
+    </tr>
+    
+    <tr>
+      <td>2</td>
+      <td>
+        annotation
+      </td>
+      <td>
+        <code title="string">
+          
+          <span>string</span>
+        </code>
+      </td>
+      <td class="content"><p>Additonal information the server may return as a text string</p></td>
       
     </tr>
     

@@ -1,4 +1,4 @@
 #! /bin/sh
 
 cd gen && sabledocs
-cp -R sabledocs_output ../docs
+cp -R sabledocs_output/* ../docs
