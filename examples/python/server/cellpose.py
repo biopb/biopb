@@ -58,6 +58,9 @@ def process_input(request: proto.DetectionRequest):
     pixels = request.image_data.pixels
 
     image = decode_image(pixels)
+    image = image[..., :1]
+    if image.shape[0] == 1: # 2D
+        image = image.squeeze(0)
 
     settings = request.detection_settings
 
@@ -67,19 +70,11 @@ def process_input(request: proto.DetectionRequest):
         diameter = settings.cell_diameter_hint / physical_size
 
     else:
-        diameter = 30 / (settings.scaling_hint or 1.0)
-    
-    if image.shape[0] == 1: # 2D
-        image = image.squeeze(0)
 
-    if image.shape[-1] > 1:
-        channels = [1, 2]
-    else:
-        channels = [0, 0]
+        diameter = 30 / (settings.scaling_hint or 1.0)   
 
     kwargs = dict(
         diameter = diameter,
-        channels = channels,
     )
 
     return image, kwargs
