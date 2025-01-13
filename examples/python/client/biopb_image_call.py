@@ -4,7 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import grpc
-import imageio
+import imageio.v2 as imageio
 import biopb.image as proto
 
 SERVER = "127.0.0.1:50051"
@@ -27,9 +27,9 @@ def grpc_call(image):
     )
 
     # call server
-    with grpc.secure_channel(target=SERVER) as channel:
+    with grpc.insecure_channel(target=SERVER) as channel:
         stub = proto.ObjectDetectionStub(channel)
-        response = stub.RunObjectDetection(request)
+        response = stub.RunDetection(request)
 
     # generate label
     label = np.zeros(image.shape[:2], dtype="uint8")
@@ -44,9 +44,13 @@ def grpc_call(image):
 
 def main():
     image = imageio.imread(sys.argv[1]).astype("uint8")
+    if image.ndim==2:
+        image = image[:, :, None]
+
     print(f"Loaded input image {sys.argv[1]}")
 
     label = grpc_call(image)
+    print(f"Found {label.max()} cells")
 
     imageio.imwrite(sys.argv[2], label)
     print(f"Label image saved to {sys.argv[1]}")

@@ -4,7 +4,7 @@ This is a minimal client implementation calling a local GRPC server implemeting 
 ### Steps to run this example
 Install dependencies
 ```
-pip install opencv-python-headless grpcio imageio
+pip install opencv-python-headless grpcio_tools imageio
 ```
 Generate the python bindings
 ```
