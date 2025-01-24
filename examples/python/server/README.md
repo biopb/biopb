@@ -1,4 +1,4 @@
-## Server implementation of Cellpose segmentation model
+## Server implementation of biopb.image service
 This is a minimal server implementation of the biopb.image protocol based on the [cellpose](https://www.cellpose.org/) model.
 
 ### Steps to run this example
