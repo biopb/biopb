@@ -13,5 +13,5 @@ export PYTHONPATH=$PYTHONPATH:gen/python
 ```
 Run client
 ```
-python examples/python/client/biopb_image_call.py <input_image_path> <output_label_path>
+python examples/python/biopb-image-client/biopb_image_call.py <input_image_path> <output_label_path>
 ```

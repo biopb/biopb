@@ -7,7 +7,7 @@ import grpc
 import imageio.v2 as imageio
 import biopb.image as proto
 
-SERVER = "127.0.0.1:50051"
+SERVER = "lacss.biopb.org"
 
 def grpc_call(image):
     request = proto.DetectionRequest(
@@ -18,16 +18,14 @@ def grpc_call(image):
                 size_y = image.shape[0],
                 size_c = image.shape[2],
                 dimension_order = "CXYZT",
-                dtype = "u1", # uint8
+                dtype = image.dtype.str,
             )
         ),
-        detection_settings = proto.DetectionSettings(
-            scaling_hint = 1.0,
-        ),
+        detection_settings = proto.DetectionSettings(),
     )
 
     # call server
-    with grpc.insecure_channel(target=SERVER) as channel:
+    with grpc.secure_channel(target=SERVER, credentials=grpc.ssl_channel_credentials()) as channel:
         stub = proto.ObjectDetectionStub(channel)
         response = stub.RunDetection(request)
 

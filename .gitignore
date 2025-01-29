@@ -1,3 +1,4 @@
 /gen/*
 .venv
 dist/**
+target/

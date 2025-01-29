@@ -13,5 +13,5 @@ export PYTHONPATH=$PYTHONPATH:gen/python
 ```
 Run server
 ```
-python examples/python/server/cellpose.py
+python examples/python/biopb-image-server/minimal_cellpose_server.py
 ```
