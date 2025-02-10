@@ -18,6 +18,7 @@ Below are public servers that implements the biopb protocol
   - Model: segformer as reported in [NIPS challenge paper](https://www.nature.com/articles/s41592-024-02233-6).
 
 ## Related project
+* [`napari-biopb`](https://github.com/jiyuuchc/napari-biopb) is a [Napari](https://napari.org) widget and a `biopb.image` client, allowing users to perform 2D/3D single-cell segmentation within the Napari environement.
 * [`trackmate-lacss`](https://github.com/jiyuuchc/TrackMate-Lacss) is a [`FIJI`](https://imagej.net/software/fiji/) plugin and a `biopb.image` client, designed as a cell detector/segmentor for [trackmate](https://imagej.net/plugins/trackmate/index). It works with any `biopb.image` servers, such as those listed above.
 
 ## Documentation
