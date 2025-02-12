@@ -1,4 +1,10 @@
-/gen/*
 .venv
-dist/**
+dist/
 target/
+.pytest_cache/**
+__pycache__/
+python/biopb/
+python/biopb.egg-info/
+python/LICENSE
+python/README.md
+descriptor.pb

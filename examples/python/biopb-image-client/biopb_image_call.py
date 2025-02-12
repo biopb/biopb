@@ -6,28 +6,25 @@ import numpy as np
 import grpc
 import imageio.v2 as imageio
 import biopb.image as proto
+from biopb.image.utils import serialize_from_numpy
 
 SERVER = "lacss.biopb.org"
 
 def grpc_call(image):
     request = proto.DetectionRequest(
-        image_data = proto.ImageData(
-            pixels = proto.Pixels(
-                bindata = proto.BinData(data=image.tobytes()),
-                size_x = image.shape[1],
-                size_y = image.shape[0],
-                size_c = image.shape[2],
-                dimension_order = "CXYZT",
-                dtype = image.dtype.str,
-            )
-        ),
+        image_data = proto.ImageData(pixels=serialize_from_numpy(image)),
         detection_settings = proto.DetectionSettings(),
     )
 
-    # call server
-    with grpc.secure_channel(target=SERVER, credentials=grpc.ssl_channel_credentials()) as channel:
+    # call server with HTTPS
+    with grpc.secure_channel(target=SERVER, credentials=grpc.ssl_channel_credentials()) as channel:        
         stub = proto.ObjectDetectionStub(channel)
         response = stub.RunDetection(request)
+
+    # for HTTP server use insecure_channel
+    # with grpc.insecure_channel(target=SERVER) as channel:        
+    #     stub = proto.ObjectDetectionStub(channel)
+    #     response = stub.RunDetection(request)
 
     # generate label
     label = np.zeros(image.shape[:2], dtype="uint8")
@@ -42,8 +39,8 @@ def grpc_call(image):
 
 def main():
     image = imageio.imread(sys.argv[1]).astype("uint8")
-    if image.ndim==2:
-        image = image[:, :, None]
+    if image.ndim==3 and image.shape[0] < 3:
+        image = image.tranpose(1, 2, 0)
 
     print(f"Loaded input image {sys.argv[1]}")
 

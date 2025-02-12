@@ -4,14 +4,10 @@ This is a minimal client implementation calling a local GRPC server implemeting 
 ### Steps to run this example
 Install dependencies
 ```
-pip install opencv-python-headless grpcio_tools imageio
+pip install biopb opencv-python-headless imageio
 ```
-Generate the python bindings
-```
-scripts/gen.sh
-export PYTHONPATH=$PYTHONPATH:gen/python
-```
+
 Run client
 ```
-python examples/python/biopb-image-client/biopb_image_call.py <input_image_path> <output_label_path>
+python biopb_image_call.py <input_image_path> <output_label_path>
 ```

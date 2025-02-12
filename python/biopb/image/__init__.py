@@ -1,3 +1,7 @@
+import importlib.metadata
+
+__version__ = importlib.metadata.version("biopb")
+
 from .rpc_object_detection_pb2_grpc import ObjectDetection
 from .rpc_object_detection_pb2_grpc import ObjectDetectionServicer
 from .rpc_object_detection_pb2_grpc import ObjectDetectionStub

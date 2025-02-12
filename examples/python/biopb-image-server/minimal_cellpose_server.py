@@ -5,51 +5,15 @@ import grpc
 import numpy as np
 import cv2
 import biopb.image as proto
+from biopb.image.utils import deserialize_to_numpy
 from skimage.measure import regionprops
 from cellpose import models
 
+# increase message size limit
 _MAX_MSG_SIZE=1024*1024*128
 
 def decode_image(pixels:proto.Pixels) -> np.ndarray:
-
-    def get_dtype(pixels:proto.Pixels) -> np.dtype:
-        dt = np.dtype(pixels.dtype)
-
-        if pixels.bindata.endianness == proto.BinData.Endianness.BIG:
-            dt = dt.newbyteorder(">")
-        else:
-            dt = dt.newbyteorder("<")
-        
-        return dt
-
-    if pixels.size_t > 1:
-        raise ValueError("Image data has a non-singleton T dimension.")
-
-    if pixels.size_c > 3:
-        raise ValueError("Image data has more than 3 channels.")
-
-    np_img = np.frombuffer(
-        pixels.bindata.data, 
-        dtype=get_dtype(pixels),
-    ).astype("float32")
-
-    # The dimension_order describe axis order but in the F_order convention
-    # Numpy default is C_order, so we reverse the sequence. Lacss expect the 
-    # final dimension order to be "ZYXC"
-    dim_order_c = pixels.dimension_order[::-1].upper()
-    dims = dict(
-        Z = pixels.size_z or 1,
-        Y = pixels.size_y or 1,
-        X = pixels.size_x or 1,
-        C = pixels.size_c or 1,
-        T = 1,
-    )
-    dim_orig = [dim_order_c.find(k) for k in "ZYXCT"]
-    shape_orig = [ dims[k] for k in dim_order_c ]
-
-    np_img = np_img.reshape(shape_orig).transpose(dim_orig)
-
-    np_img = np_img.squeeze(axis=-1) # remove T
+    np_img = deserialize_to_numpy(pixels)
 
     return np_img
 
@@ -57,10 +21,14 @@ def decode_image(pixels:proto.Pixels) -> np.ndarray:
 def process_input(request: proto.DetectionRequest):
     pixels = request.image_data.pixels
 
-    image = decode_image(pixels)
+    image = decode_image(pixels).astype("float32")
+
+    # use only the first channel
     image = image[..., :1]
-    if image.shape[0] == 1: # 2D
-        image = image.squeeze(0)
+    
+    assert image.shape[0] == 1 # 2D
+    
+    image = image.squeeze(0)
 
     settings = request.detection_settings
 
@@ -133,7 +101,7 @@ class CellposeServicer(proto.ObjectDetectionServicer):
 def main():
     print ("server starting ...")
 
-    model = models.Cellpose(model_type = modeltype, gpu=gpu)
+    model = models.Cellpose(model_type = "cyto3", gpu=True)
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=4),
@@ -145,13 +113,14 @@ def main():
         server,
     )
 
-    server.add_secure_port(f"127.0.0.1:{port}", grpc.local_server_credentials())
+    server.add_insecure_port("127.0.0.1:50051")
 
     server.start()
 
     print ("server starting ... ready")
 
     server.wait_for_termination()
+
 
 if __name__ == "__main__":
     main()

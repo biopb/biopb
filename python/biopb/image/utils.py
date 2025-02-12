@@ -65,7 +65,7 @@ def deserialize_to_numpy(pixels:Pixels) -> np.ndarray:
     np_img = np.frombuffer(
         pixels.bindata.data, 
         dtype=_get_dtype(pixels),
-    ).astype("float32")
+    )
 
     # The dimension_order describe axis order but in the F_order convention
     # Numpy default is C_order, so we reverse the sequence. Lacss expect the 
