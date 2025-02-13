@@ -4,15 +4,45 @@
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 
+    <groupId>io.github.jiyuuchc</groupId>
 	<name>biopb</name>
 	<description>gRPC/protobuf protocols for biomedical image processing</description>
 	<url>https://github.com/jiyuuchc/biopb</url>
-    <groupId>org.biopb</groupId>
     <artifactId>biopb</artifactId>
     <packaging>jar</packaging>
     <version>0.1.2</version>
 
-    <properties>
+	<licenses>
+	<license>
+		<name>MIT License</name>
+		<url>http://www.opensource.org/licenses/mit-license.php</url>
+	</license>
+	</licenses>
+
+	<developers>
+		<developer>
+		<name>Ji Yu</name>
+		<email>jyu@uchc.edu</email>
+		<organization>UConn Health</organization>
+		<organizationUrl>https://uchc.edu</organizationUrl>
+		</developer>
+	</developers>
+
+	<scm>
+		<connection>scm:git:git://github.com/jiyuuchc/biopb.git</connection>
+		<developerConnection>scm:git:ssh://github.com:jiyuuchc/biopb.git</developerConnection>
+		<url>http://github.com/jiyuuchc/biopb</url>
+	</scm>
+
+  	<distributionManagement>
+		<repository>
+		<id>ossrh</id>
+		<name>Central Repository OSSRH</name>
+		<url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+		</repository>
+	</distributionManagement>
+		
+	<properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <grpc.version>1.68.0</grpc.version>
         <protoc.version>3.25.3</protoc.version>
@@ -78,9 +108,63 @@
 			</extension>
 		</extensions>
 		<plugins>
+        <plugin>
+			<groupId>org.sonatype.central</groupId>
+				<artifactId>central-publishing-maven-plugin</artifactId>
+				<version>0.7.0</version>
+				<extensions>true</extensions>
+				<configuration>
+					<publishingServerId>ossrh</publishingServerId>
+				</configuration>
+			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
-				<artifactId>maven-antrun-plugin</artifactId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<version>2.9</version>
+				<configuration>
+					<javadocExecutable>${java.home}/bin/javadoc</javadocExecutable>
+					<source>8</source>
+				</configuration>
+				<executions>
+					<execution>
+						<id>attach-javadocs</id>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-source-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>attach-sources</id>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-gpg-plugin</artifactId>
+				<version>1.5</version>
+				<executions>
+					<execution>
+						<id>sign-artifacts</id>
+						<phase>verify</phase>
+						<goals>
+							<goal>sign</goal>
+						</goals>
+						<configuration>
+						<gpgArguments>
+							<arg>--pinentry-mode</arg>
+							<arg>loopback</arg>
+						</gpgArguments>
+						</configuration>
+					</execution>
+				</executions>
 			</plugin>
 			<plugin>
 				<groupId>org.xolstice.maven.plugins</groupId>
@@ -103,5 +187,4 @@
 			</plugin>
 		</plugins>
 	</build>
-
 </project>
