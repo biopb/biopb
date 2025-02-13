@@ -5,17 +5,6 @@ The main function will read a image file, query the lacss.biopb.org server, and 
 
 ### Steps to run this example
 
-1. copy or link the relavent protocol files to src/main/proto/
 ```
-cp -r ../../../biopb src/main/proto/
-```
-2. Build biopb java package
-```
-cd <project_dir>/java
-mvn clean install
-```
-3. build the client and run with maven
-```
-cd <proeject_dir>/examples/java/example-client
 mvn exec:java -Dexec.mainClass=org.biopb.image.example.Client -Dexec.args="<image-file-path>"
 ```

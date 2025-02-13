@@ -12,6 +12,4 @@ Run server
 python examples/python/biopb-image-server/minimal_cellpose_server.py
 ```
 
-Test server: see ../biopb-image-client
-  - Change the server address to localhost:50051
-  - Use HTTP protocol instead of HTTPS
+> **_NOTE:_**  This server runs at `localhost:50051` on HTTP (unencrypted).

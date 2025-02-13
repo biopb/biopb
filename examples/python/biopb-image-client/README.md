@@ -9,5 +9,5 @@ pip install biopb opencv-python-headless imageio
 
 Run client
 ```
-python biopb_image_call.py <input_image_path> <output_label_path>
+python biopb_image_client.py <input_image_path> <output_label_path>
 ```
