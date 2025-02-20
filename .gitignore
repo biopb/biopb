@@ -8,3 +8,6 @@ python/biopb.egg-info/
 python/LICENSE
 python/README.md
 descriptor.pb
+*.pt
+*.pth
+.ipynb_checkpoints/
