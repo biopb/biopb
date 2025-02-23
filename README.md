@@ -22,4 +22,4 @@ Below are public servers that implements the biopb protocol
 * [`trackmate-lacss`](https://github.com/jiyuuchc/TrackMate-Lacss) is a [`FIJI`](https://imagej.net/software/fiji/) plugin and a `biopb.image` client, designed as a cell detector/segmentor for [trackmate](https://imagej.net/plugins/trackmate/index). It works with any `biopb.image` servers, such as those listed above.
 
 ## Documentation
-[Documentation](https://jiyuuchc.github.io/biopb/)
+[Documentation](https://biopb.github.io/biopb/)
