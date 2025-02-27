@@ -1,6 +1,8 @@
 FROM python:3.10
+
 RUN useradd -m biopb
 ENV HOME=/home/biopb
+
 USER biopb
 WORKDIR $HOME
 
@@ -8,7 +10,11 @@ ENV PATH="$PATH:$HOME/.local/bin/"
 
 RUN wget https://huggingface.co/jiyuuchc/lacss3-base/resolve/main/lacss3-base?download=true -O lacss3-base
 
-RUN pip install --no-cache-dir lacss==0.9.5
+ARG VERSION=0.15.0
+
+RUN pip install --no-cache-dir lacss==$VERSION
+
+RUN pip uninstall -y opencv-python && pip install --no-cache-dir opencv-python-headless
 
 RUN mkdir jax_cache
 
