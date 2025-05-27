@@ -90,6 +90,12 @@
             <version>1.3.2</version>
         </dependency>
 
+		<dependency>
+			<groupId>net.imglib2</groupId>
+			<artifactId>imglib2</artifactId>
+			<version>7.1.5</version>
+		</dependency>
+
 		<!-- necessary for Java 9+ -->
 		<!-- <dependency> 
         	<groupId>org.apache.tomcat</groupId>
@@ -137,6 +143,7 @@
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-source-plugin</artifactId>
+				<version>3.2.1</version>
 				<executions>
 					<execution>
 						<id>attach-sources</id>
