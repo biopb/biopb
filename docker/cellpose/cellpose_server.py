@@ -14,6 +14,8 @@ from common import decode_image, TokenValidationInterceptor, BiopbServicerBase
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
+logger = logging.getLogger(__name__)
+
 _MAX_MSG_SIZE=1024*1024*128
 _TARGET_CELL_SIZE=30
 
@@ -31,7 +33,7 @@ def process_input(request: proto.DetectionRequest):
 
     else:
         diameter = _TARGET_CELL_SIZE / (settings.scaling_hint or 1.0)
-    
+
     if image.shape[0] == 1: # 2D
         image = image.squeeze(0)
 
@@ -85,41 +87,21 @@ class CellposeServicer(BiopbServicerBase):
         self._lock = threading.RLock()
 
     def RunDetection(self, request, context):
-        with self._lock:
+        with self._server_context(context):
+            logger.info(f"Received message of size {request.ByteSize()}")
 
-            logging.info(f"Received message of size {request.ByteSize()}")
+            image, kwargs = process_input(request)
 
-            try:
-                image, kwargs = process_input(request)
+            if image.ndim == 4:
+                raise ValueError("cellpose_server does not support 3D input")
 
-                if image.ndim == 4:
-                    raise ValueError("cellpose_server does not support 3D input")
+            logger.info(f"received image {image.shape}")
 
-                logging.info(f"received image {image.shape}")
+            preds = self.model.eval(image,  **kwargs,)
 
-                preds = self.model.eval(image,  **kwargs,)
+            response = process_result(preds, image)
 
-                response = process_result(preds, image)
-
-                logging.info(f"Reply with message of size {response.ByteSize()}")
-
-                return response
-            
-            except ValueError as e:
-                
-                logging.error(repr(e))
-
-                logging.error(traceback.format_exc())
-
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, repr(e))
-
-            except Exception as e:
-
-                logging.error(repr(e))
-
-                logging.error(traceback.format_exc())
-
-                context.abort(grpc.StatusCode.UNKNOWN, f"prediction failed with error: {repr(e)}")
+            logger.info(f"Reply with message of size {response.ByteSize()}")
 
 
 @app.command()
@@ -135,8 +117,6 @@ def main(
     gpu: bool = True,
     # max_image_size: int = 1088,
 ):
-    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
-
     print ("server starting ...")
 
     model = models.Cellpose(model_type = modeltype, gpu=gpu)
@@ -174,7 +154,7 @@ def main(
     else:
         server.add_insecure_port(f"{ip}:{port}")
 
-    logging.info(f"cellpose_server: listening on port {port}")
+    logger.info(f"cellpose_server: listening on port {port}")
 
     print ("server starting ... ready")
 

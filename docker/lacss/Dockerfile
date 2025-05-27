@@ -10,22 +10,20 @@ ENV PATH="$PATH:$HOME/.local/bin/"
 
 RUN wget https://huggingface.co/jiyuuchc/lacss3-base/resolve/main/lacss3-base?download=true -O lacss3-base
 
-ARG VERSION=0.15.0
-
-RUN pip install --no-cache-dir lacss==$VERSION
-
-RUN pip uninstall -y opencv-python && pip install --no-cache-dir opencv-python-headless
-
 RUN mkdir jax_cache
 
 # copy rest of the code
 COPY . .
 
+RUN pip install --no-cache-dir -r requirements.txt
+
+ARG VERSION=0.15.2
+RUN pip install --no-cache-dir --no-deps lacss==$VERSION
+
 EXPOSE 50051
 
 ENV JAX_COMPILATION_CACHE_DIR="./jax_cache"
 ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
-#ENV XLA_PYTHON_CLIENT_MEM_FRACTION
 
 ENTRYPOINT ["python", "-m", "lacss.deploy.remote_server"]
 
