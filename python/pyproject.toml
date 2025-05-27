@@ -10,7 +10,14 @@ authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
 readme = "README.md"
 license = {file = "LICENSE"}
+dependencies = [
+  "grpcio >= 1.66, < 2",
+  "protobuf >= 5.28, < 6",
+]
 
 [project.urls]
-Homepage = "https://github.com/jiyuuchc/biopb"
-Documentation = "https://jiyuuchc.github.io/biopb/"
+Homepage = "https://github.com/biopb/biopb"
+Documentation = "https://biopb.github.io/biopb/"
+
+grpcio_tools=1.66
+protobuf=5.29
