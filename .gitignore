@@ -12,3 +12,4 @@ descriptor.pb
 *.pth
 .ipynb_checkpoints/
 build
+java/.vscode/settings.json
