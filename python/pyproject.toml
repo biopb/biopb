@@ -18,6 +18,3 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/biopb/biopb"
 Documentation = "https://biopb.github.io/biopb/"
-
-grpcio_tools=1.66
-protobuf=5.29

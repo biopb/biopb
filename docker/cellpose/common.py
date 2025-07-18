@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import biopb.image as proto
 import grpc
 import numpy as np
-from biopb.image.utils import deserialize_to_numpy
+from biopb.image.utils import deserialize_to_numpy, serialize_from_numpy
 
 _AUTH_HEADER_KEY = "authorization"
 
@@ -22,6 +22,10 @@ def decode_image(pixels: proto.Pixels) -> np.ndarray:
     np_img = deserialize_to_numpy(pixels)
 
     return np_img
+
+
+def encode_image(image: np.ndarray, **kwargs) -> proto.Pixels:
+    return serialize_from_numpy(image, **kwargs)
 
 
 class TokenValidationInterceptor(grpc.ServerInterceptor):

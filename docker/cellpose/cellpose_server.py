@@ -10,7 +10,7 @@ import typer
 from typing import Optional
 from concurrent import futures
 from cellpose import models
-from common import decode_image, TokenValidationInterceptor, BiopbServicerBase
+from common import decode_image, encode_image, TokenValidationInterceptor, BiopbServicerBase
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -93,7 +93,7 @@ class CellposeServicer(BiopbServicerBase):
             image, kwargs = process_input(request)
 
             if image.ndim == 4:
-                raise ValueError("cellpose_server does not support 3D input")
+                raise ValueError("3D input not supported. Use the 'ProcessImage' service instead.")
 
             logger.info(f"received image {image.shape}")
 
@@ -103,6 +103,36 @@ class CellposeServicer(BiopbServicerBase):
 
             logger.info(f"Reply with message of size {response.ByteSize()}")
 
+
+    def Run(self, request, context):
+        with self._server_context(context):
+            logger.info(f"Received message of size {request.ByteSize()}")
+
+            pixels = request.image_data.pixels
+            image = decode_image(pixels)
+
+            if image.shape[-1] > 1:
+                channels = [1, 2]
+            else:
+                channels = [0, 0]
+
+            logger.info(f"Decoded image {image.shape}")
+
+            if image.shape[0] == 1: # 2D
+                image = image.squeeze(0)
+                mask = self.model.eval(image, channels = channels)[0]
+
+            else:
+                mask = self.model.eval(image, channels = channels, do_3D=True)[0]
+                
+            response = proto.ProcessResponse(
+                image_data = proto.ImageData(pixels = encode_image(mask)),
+            )
+
+            logger.info(f"Reply with message of size {response.ByteSize()}")
+
+            return response
+    
 
 @app.command()
 def main(
@@ -144,9 +174,12 @@ def main(
         options=(("grpc.max_receive_message_length", _MAX_MSG_SIZE),),
     )
 
+    servicer = CellposeServicer(model)
     proto.add_ObjectDetectionServicer_to_server(
-        CellposeServicer(model), 
-        server,
+        servicer, server,
+    )
+    proto.add_ProcessImageServicer_to_server(
+        servicer, server,
     )
 
     if local:
