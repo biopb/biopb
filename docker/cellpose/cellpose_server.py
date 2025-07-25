@@ -76,6 +76,8 @@ def process_result(preds, image):
         )
 
         response.detections.append(scored_roi)
+    
+    logger.debug(f"Found {len(response.detections)} detections")
 
     return response
 
@@ -102,6 +104,8 @@ class CellposeServicer(BiopbServicerBase):
             response = process_result(preds, image)
 
             logger.info(f"Reply with message of size {response.ByteSize()}")
+
+            return response
 
 
     def Run(self, request, context):
@@ -132,7 +136,7 @@ class CellposeServicer(BiopbServicerBase):
             logger.info(f"Reply with message of size {response.ByteSize()}")
 
             return response
-    
+
 
 @app.command()
 def main(
@@ -148,6 +152,8 @@ def main(
     # max_image_size: int = 1088,
 ):
     print ("server starting ...")
+
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     model = models.Cellpose(model_type = modeltype, gpu=gpu)
 
@@ -196,4 +202,5 @@ def main(
 
 
 if __name__ == "__main__":
+    logging.basicConfig()
     app()
