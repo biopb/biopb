@@ -13,6 +13,7 @@ RUN wget https://huggingface.co/jiyuuchc/lacss3-base/resolve/main/lacss3-base?do
 RUN mkdir jax_cache
 
 # copy rest of the code
+COPY --from=base . .
 COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt

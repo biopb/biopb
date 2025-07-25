@@ -10,6 +10,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # copy rest of the code
+COPY --from=base . .
 COPY . .
 
 EXPOSE 50051
