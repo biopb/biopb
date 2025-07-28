@@ -6,7 +6,6 @@ __pycache__/
 python/biopb/
 python/biopb.egg-info/
 python/LICENSE
-python/README.md
 descriptor.pb
 *.pt
 *.pth
