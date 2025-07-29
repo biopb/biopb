@@ -53,7 +53,7 @@ def main(
         logger.error(f"ObjectDetection call failed: {e}")
         return
     
-    logger.info("Testing ObjectDetection service...")
+    logger.info("Testing ProcessImage service...")
     try:
         with grpc.insecure_channel(SERVER) as channel:
             stub = proto.ProcessImageStub(channel)
