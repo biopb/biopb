@@ -1092,7 +1092,10 @@ def compute_masks(
             )
 
         mask = fill_holes_and_remove_small_masks(mask, min_size=15)
-    
+
+    else:
+        mask = np.zeros_like(cp_mask, dtype="uint32")
+
     return mask, p
 
 def main(args):

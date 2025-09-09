@@ -1,8 +1,5 @@
-import importlib.machinery
 import logging
-import traceback
 import threading
-import types
 from concurrent import futures
 from pathlib import Path
 
@@ -12,7 +9,7 @@ import torch
 import typer
 
 import biopb.image as proto
-from common import decode_image, TokenValidationInterceptor, BiopbServicerBase
+from common import decode_image, encode_image, TokenValidationInterceptor, BiopbServicerBase
 from predict import *
 from predict import _normalize
 
@@ -20,6 +17,7 @@ app = typer.Typer(pretty_exceptions_enable=False)
 
 _MAX_MSG_SIZE=1024*1024*128
 
+logger = logging.getLogger(__name__)
 
 def process_input(request: proto.DetectionRequest):
     pixels = request.image_data.pixels
@@ -70,11 +68,11 @@ class SegformerServicer(BiopbServicerBase):
         if img_data.shape[-1] == 1:
             img_data = np.repeat(img_data, 3, axis=-1)
         elif img_data.shape[-1] == 2:
-            raise ValueError("Model accept either 1-channel or 3-channel images.")
+            img_data = np.pad(img_data, [[0,0],[0,0],[0,1]])
 
         H, W = img_data.shape[:2]
-        H1 = (H - 1) // 32 * 32 + 32
-        W1 = (W - 1) // 32 * 32 + 32
+        H1 = max((H - 1) // 32 * 32 + 32, 256)
+        W1 = max((W - 1) // 32 * 32 + 32, 256)
         img_data = np.pad(img_data, [[0, H1-H], [0, W1-W], [0,0]])
 
         img_data = _normalize(img_data)
@@ -154,7 +152,7 @@ class SegformerServicer(BiopbServicerBase):
                 #                #
                 ##################
                 
-                model.load_state_dict(torch.load(args.model_path2, map_location=args.device))
+                model.load_state_dict(torch.load(self.model_path2, map_location=self.device))
                 model.eval()
                 
                 img1 = img_data
@@ -194,47 +192,54 @@ class SegformerServicer(BiopbServicerBase):
                 
             pred_mask = post_process(outputs.squeeze(0).cpu().numpy(), self.device)
 
-            return pred_mask
+            return pred_mask[:H, :W]
 
 
     def RunDetection(self, request, context):
-        with self._lock:
+        with self._server_context(context):
 
-            logging.info(f"Received message of size {request.ByteSize()}")
+            logger.info(f"Received message of size {request.ByteSize()}")
 
-            try:
-                image = process_input(request)
+            image = process_input(request)
 
-                if image.ndim == 4:
-                    raise ValueError(f"Model does not support 3D input, got shape {image.shape}")
+            if image.ndim == 4:
+                raise ValueError(f"Model does not support 3D input, got shape {image.shape}")
 
-                logging.info(f"received image {image.shape}")
+            logger.info(f"received image {image.shape}")
 
-                preds = self.predict(image)
+            preds = self.predict(image)
 
-                response = process_result(preds, image)
+            response = process_result(preds, image)
 
-                logging.info(f"Reply with message of size {response.ByteSize()}")
+            logger.info(f"Reply with message of size {response.ByteSize()}")
 
-                return response
-            
-            except ValueError as e:
+            return response
+        
+
+    def Run(self, request, context):
+        with self._server_context(context):
+            logger.info(f"Received message of size {request.ByteSize()}")
+
+            pixels = request.image_data.pixels
+
+            image = decode_image(pixels)
+
+            logger.info(f"Decoded image {image.shape}")
+
+            if image.shape[0] == 1: # 2D
+                image = image.squeeze(0)
+                mask = self.predict(image)
+
+            else:
+                raise ValueError(f"Model does not support 3D input, got shape {image.shape}")
                 
-                logging.error(repr(e))
+            response = proto.ProcessResponse(
+                image_data = proto.ImageData(pixels = encode_image(mask)),
+            )
 
-                logging.error(traceback.format_exc())
+            logger.info(f"Reply with message of size {response.ByteSize()}")
 
-                context.abort(grpc.StatusCode.INVALID_ARGUMENT, repr(e))
-
-            except Exception as e:
-
-                logging.error(repr(e))
-
-                logging.error(traceback.format_exc())
-
-                context.abort(grpc.StatusCode.UNKNOWN, f"prediction failed with error: {repr(e)}")
-
-
+            return response
 
 
 @app.command()
@@ -251,6 +256,7 @@ def main(
     model_path2 : Path = "./sub_model.pth"
 ):
     logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
+    # logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     print ("server starting ...")
 
@@ -281,9 +287,12 @@ def main(
         options=(("grpc.max_receive_message_length", _MAX_MSG_SIZE),),
     )
 
+    servicer = SegformerServicer(gpu, model_path, model_path2)
     proto.add_ObjectDetectionServicer_to_server(
-        SegformerServicer(gpu, model_path, model_path2), 
-        server,
+        servicer, server,
+    )
+    proto.add_ProcessImageServicer_to_server(
+        servicer, server,
     )
 
     if local:
@@ -291,7 +300,7 @@ def main(
     else:
         server.add_insecure_port(f"{ip}:{port}")
 
-    logging.info(f"segformer_server: listening on port {port}")
+    logger.info(f"segformer_server: listening on port {port}")
 
     print ("server starting ... ready")
 
