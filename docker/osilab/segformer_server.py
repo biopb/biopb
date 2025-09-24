@@ -56,15 +56,14 @@ def process_result(masks, image):
 class SegformerServicer(BiopbServicerBase):
 
     def __init__(self, gpu, model_path, model_path2):
+        super().__init__()
         self.model_path = model_path
         self.model_path2 = model_path2
         self.device = "cuda:0" if gpu else "cpu"
-        self._lock = threading.RLock()
+        self.model = torch.load(model_path, map_location=self.device)
+        self.model2 = torch.load(model_path2, map_location=self.device)
 
-    def predict(self, img_data):
-        hflip_tta = HorizontalFlip()
-        vflip_tta = VerticalFlip()
-
+    def _format_image(self, img_data):
         if img_data.shape[-1] == 1:
             img_data = np.repeat(img_data, 3, axis=-1)
         elif img_data.shape[-1] == 2:
@@ -75,17 +74,25 @@ class SegformerServicer(BiopbServicerBase):
         W1 = max((W - 1) // 32 * 32 + 32, 256)
         img_data = np.pad(img_data, [[0, H1-H], [0, W1-W], [0,0]])
 
-        img_data = _normalize(img_data)
-        img_data = img_data.astype("float32")
+        img_data = _normalize(img_data).astype("float32")
         img_data = np.moveaxis(img_data, -1, 0)
-        img_data = img_data[None, ...]
+        img_data = torch.FloatTensor(img_data).unsqueeze(0).to(self.device)
 
-        model = torch.load(self.model_path, map_location=self.device)
+        return img_data
+
+    def predict(self, img_data):
+        model = self.model
+        model.load_state_dict(self.model2)
         model.eval()
 
-        img_data = torch.from_numpy(img_data).to(self.device)
+        hflip_tta = HorizontalFlip()
+        vflip_tta = VerticalFlip()
+
+        H, W = img_data.shape[:2]
+        img_data = self._format_image(img_data)
+
         img_size = img_data.shape[-1] * img_data.shape[-2]
-        
+
         if img_size < 1150000 and 900000 < img_size:
             overlap = 0.5
         else:
@@ -105,95 +112,29 @@ class SegformerServicer(BiopbServicerBase):
             )
             outputs0 = outputs0.cpu().squeeze()
 
-            if img_size < 2000 * 2000 or img_size > 5000 * 5000:
-                
-                model.load_state_dict(torch.load(self.model_path2, map_location=self.device))
-                model.eval()
-                
-                img2 = hflip_tta.apply_aug_image(img_data, apply=True)
-                outputs2 = sliding_window_inference(
-                    img2,
-                    512,
-                    4,
-                    model,
-                    padding_mode="reflect",
-                    mode="gaussian",
-                    overlap=overlap,
-                    device="cpu",
-                )
-                outputs2 = hflip_tta.apply_deaug_mask(outputs2, apply=True)
-                outputs2 = outputs2.cpu().squeeze()
+            model.load_state_dict(self.model2)
+            model.eval()
+            img2 = hflip_tta.apply_aug_image(img_data, apply=True)
+            outputs2 = sliding_window_inference(
+                img2,
+                512,
+                4,
+                model,
+                padding_mode="reflect",
+                mode="gaussian",
+                overlap=overlap,
+                device="cpu",
+            )
+            outputs2 = hflip_tta.apply_deaug_mask(outputs2, apply=True)
+            outputs2 = outputs2.cpu().squeeze()
 
-                outputs = torch.zeros_like(outputs0)
-                outputs[0] = (outputs0[0] + outputs2[0]) / 2
-                outputs[1] = (outputs0[1] - outputs2[1]) / 2
-                outputs[2] = (outputs0[2] + outputs2[2]) / 2
-                
-            else:
-                # Hflip TTA
-                img2 = hflip_tta.apply_aug_image(img_data, apply=True)
-                outputs2 = sliding_window_inference(
-                    img2,
-                    512,
-                    4,
-                    model,
-                    padding_mode="reflect",
-                    mode="gaussian",
-                    overlap=overlap,
-                    device="cpu",
-                )
-                outputs2 = hflip_tta.apply_deaug_mask(outputs2, apply=True)
-                outputs2 = outputs2.cpu().squeeze()
-                img2 = img2.cpu()
-                
-                ##################
-                #                #
-                #    ensemble    #
-                #                #
-                ##################
-                
-                model.load_state_dict(torch.load(self.model_path2, map_location=self.device))
-                model.eval()
-                
-                img1 = img_data
-                outputs1 = sliding_window_inference(
-                    img1,
-                    512,
-                    4,
-                    model,
-                    padding_mode="reflect",
-                    mode="gaussian",
-                    overlap=overlap,
-                    device="cpu",
-                )
-                outputs1 = outputs1.cpu().squeeze()
-                
-                # Vflip TTA
-                img3 = vflip_tta.apply_aug_image(img_data, apply=True)
-                outputs3 = sliding_window_inference(
-                    img3,
-                    512,
-                    4,
-                    model,
-                    padding_mode="reflect",
-                    mode="gaussian",
-                    overlap=overlap,
-                    device="cpu",
-                )
-                outputs3 = vflip_tta.apply_deaug_mask(outputs3, apply=True)
-                outputs3 = outputs3.cpu().squeeze()
-                img3 = img3.cpu()
+        outputs = torch.zeros_like(outputs0)
+        outputs[0] = (outputs0[0] + outputs2[0]) / 2
+        outputs[1] = (outputs0[1] - outputs2[1]) / 2
+        outputs[2] = (outputs0[2] + outputs2[2]) / 2
+        pred_mask = post_process(outputs.cpu().numpy(), self.device)
 
-                # Merge Results
-                outputs = torch.zeros_like(outputs0)
-                outputs[0] = (outputs0[0] + outputs1[0] + outputs2[0] - outputs3[0]) / 4
-                outputs[1] = (outputs0[1] + outputs1[1] - outputs2[1] + outputs3[1]) / 4
-                outputs[2] = (outputs0[2] + outputs1[2] + outputs2[2] + outputs3[2]) / 4
-                
-            pred_mask = post_process(outputs.squeeze(0).cpu().numpy(), self.device)
-
-            return pred_mask[:H, :W]
-
+        return pred_mask[:H, :W]
 
     def RunDetection(self, request, context):
         with self._server_context(context):
