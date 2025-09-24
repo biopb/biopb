@@ -85,8 +85,8 @@ def process_result(preds, image):
 class CellposeServicer(BiopbServicerBase):
 
     def __init__(self, model):
+        super().__init__()
         self.model = model
-        self._lock = threading.RLock()
 
     def RunDetection(self, request, context):
         with self._server_context(context):
