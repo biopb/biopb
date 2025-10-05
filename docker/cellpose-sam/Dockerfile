@@ -17,6 +17,9 @@ RUN python -c 'from cellpose import models; models.CellposeModel(gpu=True)'
 COPY --from=base . .
 COPY . .
 
+# fix file permission 
+RUN chmod -R 777 /home/biopb/
+
 EXPOSE 50051
 
 ENTRYPOINT ["python", "./cellpose_server.py"]
