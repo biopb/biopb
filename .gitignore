@@ -4,13 +4,13 @@ target/
 .pytest_cache/**
 __pycache__/
 *.egg-info
-python/biopb/
 python/LICENSE
 descriptor.pb
 .ipynb_checkpoints/
 build
 java/.vscode/settings.json
-**/biopb/
+docker/**/biopb/
+python/**/biopb/
 *.pickle
 *.pkl
 *.pth

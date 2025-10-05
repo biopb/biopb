@@ -50,6 +50,9 @@ service ProcessImage {
     // Process the input image
     rpc Run(ProcessRequest) returns (ProcessResponse) ;
 
+    // Streaming version 
+    rpc RunStream(stream ProcessRequest) returns (stream ProcessResponse) ;
+
     // Query operation names. Server with a single op may not implement this
     // call.
     rpc GetOpNames(google.protobuf.Empty) returns (OpNames) ;
