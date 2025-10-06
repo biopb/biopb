@@ -4,7 +4,7 @@ This is a minimal server implementation of the biopb.image protocol based on the
 ### Steps to run this example
 Install dependencies
 ```
-pip install biopb cellpose opencv-python-headless grpcio-tools scikit-image
+pip install biopb cellpose
 ```
 
 Run server
