@@ -1,0 +1,22 @@
+name: Buf CI
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:  
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-action@v1
+        with:
+          # Publishing schema changes to the BSR requires a BSR authentication token.
+          token: ${{ secrets.BUF_TOKEN }}
+          # Include this line if you only want to set up the Action and do nothing else.
+          # setup_only: true
+          # Include a GitHub token to ensure API requests aren't rate limited.
+          # github_token: ${{ secrets.GITHUB_TOKEN }}
