@@ -16,5 +16,6 @@ pip install biopb
 ```
 
 ## Related project
-* [`napari-biopb`](https://github.com/jiyuuchc/napari-biopb) is a [Napari](https://napari.org) widget and a `biopb.image` client, allowing users to perform 2D/3D single-cell segmentation within the Napari environement.
-* [`trackmate-lacss`](https://github.com/jiyuuchc/TrackMate-Lacss) is a [`FIJI`](https://imagej.net/software/fiji/) plugin and a `biopb.image` client, designed as a cell detector/segmentor for [trackmate](https://imagej.net/plugins/trackmate/index). It works with any `biopb.image` servers, such as those listed above.
+* [`napari-biopb`](https://github.com/biopb/napari-biopb) is a [napari](https://napari.org) widget and a `biopb.image` client, allowing users to perform 2D/3D single-cell segmentation within the Napari environement.
+* [`trackmate-lacss`](https://github.com/biopb/TrackMate-Lacss) is a [`FIJI`](https://imagej.net/software/fiji/) plugin and a `biopb.image` client, designed as a cell detector/segmentor for [`trackmate`](https://imagej.net/plugins/trackmate/index). It works with any `biopb.image` servers.
+* [`biopb-server`](https://github.com/biopb/biopb-server) implement ready-to-deploy biopb servers (as Docker containers).
