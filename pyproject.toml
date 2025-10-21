@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biopb"
-version = "0.1.3"
+version = "0.1.4"
 requires-python = ">=3.8"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
