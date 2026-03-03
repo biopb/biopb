@@ -3,7 +3,8 @@ syntax = "proto3";
 package biopb.ome;
 
 option java_package = "biopb.ome";
-option java_outer_classname = "Rights";
+// Use a different outer class name to avoid conflict with the Rights message
+option java_outer_classname = "RightsProto";
 option java_multiple_files = true;
 
 // The rights holder of this data and the rights held.

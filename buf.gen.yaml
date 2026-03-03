@@ -25,5 +25,15 @@ plugins:
   # These are the RPC interfaces: ObjectDetectionStub, ProcessImageServicer, etc.
   - remote: buf.build/grpc/python:v1.75.1
     out: src/python/
+  
+  # Plugin 3: Generates Java protobuf message classes
+  # These are the Java data structures: DetectionRequest, Pixels, ImageData, etc.
+  - remote: buf.build/protocolbuffers/java:v32.1
+    out: target/generated-sources/protobuf/java
+  
+  # Plugin 4: Generates Java gRPC service stubs and servicers
+  # These are the Java RPC interfaces: ProcessImageGrpc, ObjectDetectionGrpc, etc.
+  - remote: buf.build/grpc/java:v1.79.0
+    out: target/generated-sources/protobuf/grpc
 inputs:
   - directory: proto
