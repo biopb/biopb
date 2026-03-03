@@ -17,8 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-  test = ["pytest >= 7.0, < 8"]
-  build = ["buf-cli"]  # Optional: for generating proto bindings during build
+  test = [
+    "pytest >= 7.0, < 8",
+    "opencv-python-headless",
+  ]
 
 [project.urls]
 Homepage = "https://github.com/biopb/biopb"
