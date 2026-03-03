@@ -1,9 +1,17 @@
 name: Buf CI
 on:
   push:
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
-  workflow_dispatch:  
+    paths:
+      - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+  workflow_dispatch:
 permissions:
   contents: read
   pull-requests: write
@@ -19,4 +27,4 @@ jobs:
           # Include this line if you only want to set up the Action and do nothing else.
           # setup_only: true
           # Include a GitHub token to ensure API requests aren't rate limited.
-          # github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
