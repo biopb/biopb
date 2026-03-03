@@ -1,8 +1,28 @@
+# Buf generation configuration for biopb
+#
+# This file defines how protobuf and gRPC code is generated for all supported languages.
+# Each language typically requires TWO plugins:
+#   1. protocolbuffers/<lang> - Generates protobuf message classes (data models)
+#   2. grpc/<lang> - Generates gRPC service stubs and servicers (RPC code)
+#
+# For Python specifically:
+#   - protocolbuffers/python -> generates *_pb2.py (message classes like DetectionRequest, Pixels)
+#   - grpc/python -> generates *_pb2_grpc.py (service stubs like ObjectDetectionStub)
+#
+# Both plugins are required for a complete gRPC implementation. The separation exists because:
+#   - Protobuf messages can be used without gRPC (e.g., for plain data serialization)
+#   - gRPC services depend on protobuf messages but add RPC semantics
+#
 version: v2
 clean: false
 plugins:
+  # Plugin 1: Generates protobuf message classes (*_pb2.py)
+  # These are the data structures: DetectionRequest, Pixels, ImageData, etc.
   - remote: buf.build/protocolbuffers/python:v32.1
     out: src/python/
+  
+  # Plugin 2: Generates gRPC service stubs and servicers (*_pb2_grpc.py)
+  # These are the RPC interfaces: ObjectDetectionStub, ProcessImageServicer, etc.
   - remote: buf.build/grpc/python:v1.75.1
     out: src/python/
 inputs:

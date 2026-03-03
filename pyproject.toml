@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
   test = ["pytest >= 7.0, < 8"]
+  build = ["buf-cli"]  # Optional: for generating proto bindings during build
 
 [project.urls]
 Homepage = "https://github.com/biopb/biopb"
@@ -25,3 +26,7 @@ Homepage = "https://github.com/biopb/biopb"
 [tool.setuptools.packages.find]
 where = ["src/python"]
 include = ["biopb*"]
+
+# Custom build hook: generate protobuf bindings before building
+[tool.setuptools.cmdclass]
+build_py = "build_proto.build_proto"
