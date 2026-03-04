@@ -26,7 +26,7 @@ dependencies = [
 Homepage = "https://github.com/biopb/biopb"
 
 [tool.setuptools.packages.find]
-where = ["src/python"]
+where = ["src/main/python"]
 include = ["biopb*"]
 
 # Custom build hook: generate protobuf bindings before building

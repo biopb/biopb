@@ -34,8 +34,8 @@ class build_proto(_build_py):
 
     def generate_proto(self):
         """Generate Python bindings from .proto files using buf."""
-        # Find project root (parent of src/python)
-        project_root = Path(__file__).resolve().parent.parent.parent
+        # Find project root (parent of src/main/python)
+        project_root = Path(__file__).resolve().parent.parent.parent.parent
 
         print(f"\n{'='*60}")
         print("Generating protobuf bindings with buf...")
