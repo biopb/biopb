@@ -19,12 +19,12 @@ plugins:
   # Plugin 1: Generates protobuf message classes (*_pb2.py)
   # These are the data structures: DetectionRequest, Pixels, ImageData, etc.
   - remote: buf.build/protocolbuffers/python:v32.1
-    out: src/python/
+    out: src/main/python/
   
   # Plugin 2: Generates gRPC service stubs and servicers (*_pb2_grpc.py)
   # These are the RPC interfaces: ObjectDetectionStub, ProcessImageServicer, etc.
   - remote: buf.build/grpc/python:v1.75.1
-    out: src/python/
+    out: src/main/python/
   
   # Plugin 3: Generates Java protobuf message classes
   # These are the Java data structures: DetectionRequest, Pixels, ImageData, etc.
