@@ -19,14 +19,16 @@ pip install biopb
 ### Java
 The Java binding contains util functions based on imglib2. To use in Maven based project:
 
+![Maven Central Version](https://img.shields.io/maven-central/v/io.github.jiyuuchc/biopb)
+
 ```xml
 <dependencies>
 <dependency>
 <groupId>io.github.jiyuuchc</groupId>
 <artifactId>biopb</artifactId>
-<version>0.1.2</version>
+<version>CURRENT_VERSION</version>
 </dependency>
-</dependencies>    
+</dependencies>
 ```
 
 ### Other languages
