@@ -20,13 +20,13 @@ public final class Utils {
     }
 
 	private static <T> long getIntervalSize(RandomAccessibleInterval<T> interval) {
-		long size = 1L;
-		for (int i = 0; i < interval.numDimensions(); i++) {
-			if ( interval.dimension(i) > 0 )
-				size = size * interval.dimension(i);
-		}
-		return size;
-	}
+        long size = 1L;
+        for (int i = 0; i < interval.numDimensions(); i++) {
+            if ( interval.dimension(i) > 0 )
+                size = size * interval.dimension(i);
+        }
+        return size;
+    }
 
     public static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(RandomAccessibleInterval<T> crop) {
         int nd = crop.numDimensions();

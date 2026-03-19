@@ -24,7 +24,7 @@ def serialize_from_numpy(np_img: np.ndarray, **kwargs)->Pixels:
     elif np_img.ndim == 3:
         np_img = np_img[np.newaxis, :, :, :]
     elif np_img.ndim != 4:
-        raise ValueError(f"Cannot intepret data of dim {np_img.ndim}.")
+        raise ValueError(f"Cannot interpret data of dim {np_img.ndim}.")
 
     return Pixels(
         bindata = BinData(data=np_img.tobytes(), endianness=endianness),
@@ -96,10 +96,24 @@ def deserialize_to_numpy(pixels:Pixels, *, singleton_t:bool=True) -> np.ndarray:
 
 
 def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
+    """Convert a ROI protobuf to a binary mask.
+
+    Args:
+        roi: ROI protobuf message containing shape (point, rectangle, polygon, or mask).
+        mask: Template numpy array defining output shape and dtype.
+
+    Returns:
+        Binary mask as numpy array with same shape/dtype as input mask.
+
+    Raises:
+        ValueError: If mask dimension is not 2 or 3.
+        NotImplementedError: For unsupported ROI types or 3D polygons.
+    """
     mask_ = np.zeros_like(mask, dtype="uint8")
     dim = mask_.ndim
-    
-    assert dim == 2 or dim == 3, f'Ilegal mask dimension {dim}.'
+
+    if dim not in (2, 3):
+        raise ValueError(f'Illegal mask dimension {dim}.')
 
     def _get_int_point(p):
         return (int(p.z), int(p.y), int(p.x))
@@ -120,9 +134,16 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
             mask_[tl[1]:br[1], tl[2]:br[2]] = 1
 
     elif roi_type == 'polygon':
-        import cv2
+        if dim != 2:
+            raise NotImplementedError('3D polygon not supported')
 
-        assert dim == 2, f'Unimplemented: 3d polygon'
+        try:
+            import cv2
+        except ImportError as e:
+            raise ImportError(
+                "cv2 (opencv-python) is required for polygon ROI conversion. "
+                "Install it with: pip install opencv-python"
+            ) from e
 
         points = np.array([_get_int_point(p)[1:] for p in roi.polygon.points])
         points = points.reshape(-1, 1, 2)[:, :, ::-1] # reverse x, y
@@ -150,7 +171,16 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
     return mask_.astype(mask.dtype)
 
 
-def mask_to_roi(mask: np.ndarray, *, bitoder:str='big') -> ROI:
+def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
+    """Convert a binary mask to a ROI protobuf.
+
+    Args:
+        mask: Binary mask as numpy array (2D or 3D).
+        bitorder: Bit order for packing ('big' or 'little'). Defaults to 'big'.
+
+    Returns:
+        ROI protobuf message containing the mask data.
+    """
     dim = mask.ndim
     
     if dim == 2:
@@ -176,8 +206,8 @@ def mask_to_roi(mask: np.ndarray, *, bitoder:str='big') -> ROI:
     roi = ROI( mask = Mask(
         rectangle = rect,
         bin_data = BinData(
-            data = np.packbits(pixels, bitorder=bitoder).tobytes(),
-            endianness = 0 if bitoder == 'big' else 1,
+            data = np.packbits(pixels, bitorder=bitorder).tobytes(),
+            endianness = 0 if bitorder == 'big' else 1,
         )),
     )
  

@@ -13,7 +13,6 @@ Requirements:
     buf CLI must be installed. See https://buf.build/docs/installation
 """
 
-import os
 import shutil
 import subprocess
 import sys
