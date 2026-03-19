@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools >= 61.0"]
+requires = ["setuptools >= 61.0", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "biopb"
-version = "0.1.4"
+dynamic = ["version"]
 requires-python = ">=3.8"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
   test = [
-    "pytest >= 7.0, < 8",
+    "pytest >= 7.0",
     "opencv-python-headless",
   ]
 
@@ -32,3 +32,6 @@ include = ["biopb*"]
 # Custom build hook: generate protobuf bindings before building
 [tool.setuptools.cmdclass]
 build_py = "build_proto.build_proto"
+
+# Version derived from git tags
+[tool.setuptools_scm]

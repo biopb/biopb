@@ -10,7 +10,7 @@
 	<url>https://github.com/jiyuuchc/biopb</url>
     <artifactId>biopb</artifactId>
     <packaging>jar</packaging>
-    <version>0.1.2</version>
+    <version>${revision}</version>
 
 	<licenses>
 	<license>
@@ -43,6 +43,7 @@
 	</distributionManagement>
 		
 	<properties>
+        <revision>0.0.0-SNAPSHOT</revision>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <grpc.version>1.68.0</grpc.version>
         <protoc.version>3.25.3</protoc.version>
@@ -113,6 +114,32 @@
 			</extension>
 		</extensions>
 		<plugins>
+			<!-- Flatten plugin to resolve CI-friendly versions like ${revision} -->
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>flatten-maven-plugin</artifactId>
+				<version>1.6.0</version>
+				<configuration>
+					<updatePomFile>true</updatePomFile>
+					<flattenMode>resolveCiFriendliesOnly</flattenMode>
+				</configuration>
+				<executions>
+					<execution>
+						<id>flatten</id>
+						<phase>process-resources</phase>
+						<goals>
+							<goal>flatten</goal>
+						</goals>
+					</execution>
+					<execution>
+						<id>flatten.clean</id>
+						<phase>clean</phase>
+						<goals>
+							<goal>clean</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
         <plugin>
 			<groupId>org.sonatype.central</groupId>
 				<artifactId>central-publishing-maven-plugin</artifactId>
