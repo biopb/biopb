@@ -1,12 +1,15 @@
 import numpy as np
 from . import Pixels, BinData, ROI, Rectangle, Point, Mask
 
-def serialize_from_numpy(np_img: np.ndarray, **kwargs)->Pixels:
+def serialize_from_numpy(np_img: np.ndarray, dimension_order: str = "CXYZT", **kwargs)->Pixels:
     '''  convert numpy array representation of image to protobuf representation
 
     Args:
-        np_img: image in numpy array. The dimension order is assumed to be [Y, X] for 
+        np_img: image in numpy array. The dimension order is assumed to be [Y, X] for
             2d array, [Y, X, C] for 3d array and [Z, Y, X, C] for 4D array
+        dimension_order: string describing dimension order in the output protobuf.
+            Default is "CXYZT" (C-order convention where first letter varies fastest).
+            Other common values are "XYZCT" (X varies fastest).
         **kwargs: additional metadata, e.g. physical_size_x etc (pixel size)
 
     Returns:
@@ -32,7 +35,7 @@ def serialize_from_numpy(np_img: np.ndarray, **kwargs)->Pixels:
         size_y = np_img.shape[1],
         size_c = np_img.shape[3],
         size_z = np_img.shape[0],
-        dimension_order = "CXYZT",
+        dimension_order = dimension_order,
         dtype = np_img.dtype.str,
         **kwargs,
     )

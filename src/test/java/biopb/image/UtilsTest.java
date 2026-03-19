@@ -226,6 +226,53 @@ public class UtilsTest {
         Assert.assertNotNull(deserialized);
     }
 
+    @Test
+    public void testDeserializeUint16() {
+        // Test with "u2" dtype (uint16)
+        int width = 4;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Short.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putShort((short) (i * 1000));
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("u2")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify dimensions
+        Assert.assertEquals(width, deserialized.dimension(0));
+        Assert.assertEquals(height, deserialized.dimension(1));
+        Assert.assertEquals(depth, deserialized.dimension(2));
+        Assert.assertEquals(channels, deserialized.dimension(3));
+
+        // Verify data
+        int expected = 0;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            net.imglib2.type.numeric.integer.UnsignedShortType pixel =
+                (net.imglib2.type.numeric.integer.UnsignedShortType) obj;
+            Assert.assertEquals(expected * 1000, pixel.get());
+            expected++;
+        }
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void testDeserializeUnsupportedDimensionOrder() {
         Pixels pixels = Pixels.newBuilder()
@@ -325,5 +372,72 @@ public class UtilsTest {
 
         RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
         Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testCXYZTDimensionOrder() {
+        // Test deserialization with CXYZT dimension order (Python default)
+        // In CXYZT: C varies fastest, then X, Y, Z
+        int width = 4;
+        int height = 3;
+        int depth = 2;
+        int channels = 2;
+
+        // Create buffer in CXYZT order: C fastest, then X, Y, Z
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Float.BYTES);
+        for (int z = 0; z < depth; z++) {
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    for (int c = 0; c < channels; c++) {
+                        buffer.putFloat((float) (z * 1000 + y * 100 + x * 10 + c));
+                    }
+                }
+            }
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("CXYZT")
+                .setBindata(bindata)
+                .setDtype("f4")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify dimensions are correct (should be in XYZC order after deserialization)
+        Assert.assertEquals(width, deserialized.dimension(0));
+        Assert.assertEquals(height, deserialized.dimension(1));
+        Assert.assertEquals(depth, deserialized.dimension(2));
+        Assert.assertEquals(channels, deserialized.dimension(3));
+    }
+
+    @Test
+    public void testSerializeWithCustomDimensionOrder() {
+        // Test serialization with custom dimension order
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(4, 3, 2, 2);
+
+        float value = 0.0f;
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(value);
+            value += 1.0f;
+        }
+
+        Pixels pixels = Utils.SerializeFromInterval(image, "CXYZT");
+
+        Assert.assertEquals("CXYZT", pixels.getDimensionOrder());
+        Assert.assertEquals(4, pixels.getSizeX());
+        Assert.assertEquals(3, pixels.getSizeY());
+        Assert.assertEquals(2, pixels.getSizeZ());
+        Assert.assertEquals(2, pixels.getSizeC());
     }
 }
