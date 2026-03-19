@@ -30,7 +30,7 @@ def main():
 
     image = imageio.imread(sys.argv[2]).astype("uint8")
     if image.ndim==3 and image.shape[0] < 3:
-        image = image.tranpose(1, 2, 0)
+        image = image.transpose(1, 2, 0)
 
     print(f"Loaded input image {sys.argv[2]}")
 
