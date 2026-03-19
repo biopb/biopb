@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package biopb.image;
+
+option java_package = "biopb.image";
+option java_multiple_files = true;
+
+import "google/protobuf/struct.proto";
+
+message OpSchema {
+
+    // Default values for kwargs - also documents expected keys
+    google.protobuf.Struct default_kwargs = 1;
+
+    // Human-readable description of the operation
+    string description = 2;
+
+}
+
+
+message OpNames {
+
+    // a list of op names
+    repeated string names = 1;
+
+    // Map from op_name to its schema.
+    // Provides discoverability for kwargs parameters.
+    map<string, OpSchema> op_schemas = 2;
+
+}

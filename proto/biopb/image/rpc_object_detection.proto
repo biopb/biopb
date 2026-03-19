@@ -7,9 +7,11 @@ option java_multiple_files = true;
 
 
 import "google/protobuf/any.proto";
+import "google/protobuf/empty.proto";
 
 import "biopb/image/detection_request.proto";
 import "biopb/image/detection_response.proto";
+import "biopb/image/op_schema.proto";
 
 service ObjectDetection {
 
@@ -43,6 +45,10 @@ service ObjectDetection {
     // adaptation, which in turn should be included in future inference request
     // as a DetectionSettings field.
     rpc RunModelAdaptation(stream DetectionRequest) returns (google.protobuf.Any) ;
+
+
+    // Query supported model names and their kwargs schemas.
+    rpc GetOpNames(google.protobuf.Empty) returns (OpNames) ;
 
 }
 

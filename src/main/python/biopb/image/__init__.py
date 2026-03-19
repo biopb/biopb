@@ -9,7 +9,8 @@ from biopb.image.rpc_object_detection_pb2_grpc import ObjectDetectionServicer
 from biopb.image.rpc_object_detection_pb2_grpc import ObjectDetectionStub
 from biopb.image.rpc_object_detection_pb2_grpc import add_ObjectDetectionServicer_to_server
 
-from biopb.image.rpc_process_image_pb2 import ProcessRequest, ProcessResponse, OpNames
+from biopb.image.rpc_process_image_pb2 import ProcessRequest, ProcessResponse
+from biopb.image.op_schema_pb2 import OpNames, OpSchema
 from biopb.image.rpc_process_image_pb2_grpc import ProcessImage, ProcessImageServicer, ProcessImageStub
 from biopb.image.rpc_process_image_pb2_grpc import add_ProcessImageServicer_to_server
 
