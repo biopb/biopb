@@ -22,7 +22,7 @@ service ObjectDetection {
     // The streaming version allows dynamic updating of the DetectionRequest and
     // getting updated results. For example, a client may request analyses at
     // several different settings on the same image. After initial request, the
-    // following streaming requests no long need to transmit the image pixel
+    // following streaming requests no longer need to transmit the image pixel
     // data anymore, but only the new parameter settings, which saves network
     // bandwidth.
     rpc RunDetectionStream(stream DetectionRequest) returns (stream DetectionResponse) ;
@@ -32,16 +32,16 @@ service ObjectDetection {
     // patches, instead of one large chunk of binary data. There are two use
     // cases for this call: (1) The image dataset is too large therefore sending
     // all data in one message would exceed GRPC message size limit; (2) The
-    // original data were taken as a grid scan so it is convinent to read/write
+    // original data were taken as a grid scan so it is convenient to read/write
     // as patches.
     rpc RunDetectionOnGrid(stream DetectionRequest) returns (DetectionResponse) ;
 
 
     // Run model adaptation based on the submitted stream of DetectionRequest,
-    // which may or may not contain ROI annotations. The all returns an opaque
-    // data strcuture representing the model configuration after model
-    // adaptation, which in turn should be included in future inference reuest
-    // as a DetectionSetting field.
+    // which may or may not contain ROI annotations. This call returns an opaque
+    // data structure representing the model configuration after model
+    // adaptation, which in turn should be included in future inference request
+    // as a DetectionSettings field.
     rpc RunModelAdaptation(stream DetectionRequest) returns (google.protobuf.Any) ;
 
 }

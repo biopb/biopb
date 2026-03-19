@@ -6,18 +6,18 @@ on:
     branches:
       - main
     paths:
-      - 'pom.xml'
-      - 'src/java/**'
+      - 'src/main/java/**'
+      - 'src/test/java/**'
       - 'proto/**'
-    tags:
-      - "v*"
+      - 'pom.xml'
   pull_request:
     branches:
       - main
     paths:
-      - 'pom.xml'
-      - 'src/java/**'
+      - 'src/main/java/**'
+      - 'src/test/java/**'
       - 'proto/**'
+      - 'pom.xml'
   workflow_dispatch:
 
 jobs:

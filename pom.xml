@@ -239,9 +239,6 @@
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-surefire-plugin</artifactId>
 				<version>3.1.2</version>
-				<configuration>
-					<testSourceDirectory>src/java/test/java</testSourceDirectory>
-				</configuration>
 			</plugin>
 		</plugins>
 	</build>
