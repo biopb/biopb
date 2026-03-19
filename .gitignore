@@ -142,3 +142,4 @@ _version.py
 package-lock.json
 package.json
 node_modules/
+.flattened-pom.xml
