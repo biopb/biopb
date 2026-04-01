@@ -1,6 +1,7 @@
 package biopb.image;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import org.junit.Test;
 import org.junit.Assert;
@@ -288,13 +289,14 @@ public class UtilsTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testDeserializeUnsupportedDtype() {
+        // Use a truly unsupported dtype (int64/i8 is not supported)
         Pixels pixels = Pixels.newBuilder()
                 .setDimensionOrder("XYZCT")
                 .setSizeX(10)
                 .setSizeY(10)
                 .setSizeZ(1)
                 .setSizeC(1)
-                .setDtype("int16")
+                .setDtype("i8")  // int64 - not supported
                 .build();
 
         Utils.DeserializeToInterval(pixels);
@@ -439,5 +441,290 @@ public class UtilsTest {
         Assert.assertEquals(3, pixels.getSizeY());
         Assert.assertEquals(2, pixels.getSizeZ());
         Assert.assertEquals(2, pixels.getSizeC());
+    }
+
+    @Test
+    public void testDeserializeWithPipePrefix() {
+        // Test dtype with "|" prefix (numpy native byteorder marker)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.put((byte) i);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("|u1")  // Pipe prefix from numpy
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeWithLittleEndianPrefix() {
+        // Test dtype with "<" prefix (little-endian marker)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Float.BYTES);
+        buffer.order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putFloat((float) i);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.LITTLE)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("<f4")  // Little-endian prefix
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeWithEqualsPrefix() {
+        // Test dtype with "=" prefix (numpy native byteorder)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Short.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putShort((short) i);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("=u2")  // Equals prefix from numpy
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeInt16() {
+        // Test with "i2" dtype (int16)
+        int width = 4;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Short.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putShort((short) (i * 100));
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("i2")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify dimensions
+        Assert.assertEquals(width, deserialized.dimension(0));
+        Assert.assertEquals(height, deserialized.dimension(1));
+        Assert.assertEquals(depth, deserialized.dimension(2));
+        Assert.assertEquals(channels, deserialized.dimension(3));
+
+        // Verify data
+        int expected = 0;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            net.imglib2.type.numeric.integer.ShortType pixel =
+                (net.imglib2.type.numeric.integer.ShortType) obj;
+            Assert.assertEquals(expected * 100, pixel.get());
+            expected++;
+        }
+    }
+
+    @Test
+    public void testDeserializeFloat64() {
+        // Test with "f8" dtype (float64/double)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Double.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putDouble((double) i * 0.5);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("f8")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify data
+        int expected = 0;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            net.imglib2.type.numeric.real.DoubleType pixel =
+                (net.imglib2.type.numeric.real.DoubleType) obj;
+            Assert.assertEquals(expected * 0.5, pixel.get(), 0.0001);
+            expected++;
+        }
+    }
+
+    @Test
+    public void testDeserializeInt8() {
+        // Test with "i1" dtype (int8)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.put((byte) (i - 4));  // Some negative values
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("i1")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeInt32() {
+        // Test with "i4" dtype (int32)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Integer.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putInt(i * 1000);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("i4")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeUint32() {
+        // Test with "u4" dtype (uint32)
+        int width = 3;
+        int height = 3;
+        int depth = 1;
+        int channels = 1;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Integer.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putInt(i * 1000000);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("u4")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
     }
 }

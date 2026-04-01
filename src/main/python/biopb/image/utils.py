@@ -1,5 +1,25 @@
+import warnings
+
 import numpy as np
 from . import Pixels, BinData, ROI, Rectangle, Point, Mask
+
+
+def _canonicalize_dtype(dtype_str: str) -> str:
+    """Strip byteorder prefix from dtype for serialization.
+
+    Byteorder is handled separately by BinData.endianness field, so the dtype
+    string should only contain the type kind and size (e.g., 'u1', 'f4', 'i2').
+
+    Args:
+        dtype_str: Numpy dtype string (e.g., '|u1', '<f4', '>i2', '=u2')
+
+    Returns:
+        Canonical dtype string without byteorder prefix (e.g., 'u1', 'f4', 'i2')
+    """
+    dt = np.dtype(dtype_str)
+    kind_map = {'u': 'u', 'i': 'i', 'f': 'f', 'c': 'c'}
+    return kind_map[dt.kind] + str(dt.itemsize)
+
 
 def serialize_from_numpy(np_img: np.ndarray, dimension_order: str = "CXYZT", **kwargs)->Pixels:
     '''  convert numpy array representation of image to protobuf representation
@@ -36,7 +56,7 @@ def serialize_from_numpy(np_img: np.ndarray, dimension_order: str = "CXYZT", **k
         size_c = np_img.shape[3],
         size_z = np_img.shape[0],
         dimension_order = dimension_order,
-        dtype = np_img.dtype.str,
+        dtype = _canonicalize_dtype(np_img.dtype.str),
         **kwargs,
     )
 
@@ -48,12 +68,27 @@ def deserialize_to_numpy(pixels:Pixels, *, singleton_t:bool=True) -> np.ndarray:
         pixels: protobuf data
     Keyword Args:
         singleton_t: data should have one time point
-    
+
     Returns:
         4d Numpy array in [Z, Y, X, C] order. Singleton dimensions are kept as is.
-        Note the np array has a fixed dimension order, independent of the input 
+        Note the np array has a fixed dimension order, independent of the input
         stream. The dtype and byteorder of the np array is the same as the input.
     '''
+    # Check for endianness conflict between dtype prefix and BinData field
+    dtype_str = pixels.dtype
+    if dtype_str and dtype_str[0] in '<>|=':
+        dtype_prefix = dtype_str[0]
+        # '=' means native byteorder, which could match either
+        if dtype_prefix != '=':
+            expected_endian = '<' if pixels.bindata.endianness == BinData.Endianness.LITTLE else '>'
+            if dtype_prefix != expected_endian:
+                endianness_name = "LITTLE" if pixels.bindata.endianness == BinData.Endianness.LITTLE else "BIG"
+                warnings.warn(
+                    f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
+                    f"but BinData.endianness={endianness_name}. "
+                    f"Using BinData.endianness as authoritative source."
+                )
+
     def _get_dtype(pixels:Pixels) -> np.dtype:
         dt = np.dtype(pixels.dtype)
 

@@ -2,6 +2,7 @@ package biopb.image;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.logging.Logger;
 
 import com.google.protobuf.ByteString;
 
@@ -12,13 +13,44 @@ import net.imglib2.converter.RealTypeConverters;
 import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.numeric.integer.UnsignedByteType;
 import net.imglib2.type.numeric.integer.UnsignedShortType;
+import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.ByteType;
+import net.imglib2.type.numeric.integer.ShortType;
+import net.imglib2.type.numeric.integer.IntType;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
 import net.imglib2.type.numeric.real.FloatType;
+import net.imglib2.type.numeric.real.DoubleType;
 
 public final class Utils {
     private Utils() {
         // Prevent instantiation
+    }
+
+    private static final Logger LOGGER = Logger.getLogger(Utils.class.getName());
+
+    /**
+     * Strip numpy byteorder prefixes from dtype string for backward compatibility.
+     *
+     * <p>Numpy dtype strings may include byteorder prefixes:
+     * <ul>
+     *   <li>'&gt;' - big-endian</li>
+     *   <li>'&lt;' - little-endian</li>
+     *   <li>'|' - native (for types that don't care about endianness)</li>
+     *   <li>'=' - native byteorder</li>
+     * </ul>
+     *
+     * <p>These prefixes are stripped since endianness is handled by BinData.endianness field.
+     *
+     * @param dtype the dtype string potentially containing prefixes
+     * @return the dtype string without byteorder prefixes
+     */
+    private static String stripDtypePrefix(String dtype) {
+        while (dtype.length() > 0 && (dtype.charAt(0) == '>' || dtype.charAt(0) == '<' ||
+               dtype.charAt(0) == '|' || dtype.charAt(0) == '=')) {
+            dtype = dtype.substring(1);
+        }
+        return dtype;
     }
 
 	private static <T> long getIntervalSize(RandomAccessibleInterval<T> interval) {
@@ -134,8 +166,13 @@ public final class Utils {
      * <p>Supported data types (dtype):
      * <ul>
      *   <li>"f4" or "float32" - 32-bit float</li>
+     *   <li>"f8" or "float64" - 64-bit float</li>
      *   <li>"u1" or "uint8" - 8-bit unsigned integer</li>
      *   <li>"u2" or "uint16" - 16-bit unsigned integer</li>
+     *   <li>"u4" or "uint32" - 32-bit unsigned integer</li>
+     *   <li>"i1" or "int8" - 8-bit signed integer</li>
+     *   <li>"i2" or "int16" - 16-bit signed integer</li>
+     *   <li>"i4" or "int32" - 32-bit signed integer</li>
      * </ul>
      *
      * <p>The dimension_order string describes how bytes are laid out in the input buffer.
@@ -147,7 +184,9 @@ public final class Utils {
      * </ol>
      *
      * <p>Byte order (endianness) is read from the BinData field and applied correctly.
-     * Dtype prefixes like "&gt;" (big-endian marker) are automatically stripped.
+     * Dtype prefixes like "&gt;", "&lt;", "|", "=" are automatically stripped for backward
+     * compatibility. Note that BinData.endianness is the authoritative source for endianness;
+     * a warning is logged if the dtype prefix conflicts with BinData.endianness.
      *
      * @param pixels the protobuf message containing serialized image data
      * @return a RandomAccessibleInterval in XYZC dimension order
@@ -175,9 +214,24 @@ public final class Utils {
         int zPos = dimOrder.indexOf('Z');
         int cPos = dimOrder.indexOf('C');
 
-        String dtype = pixels.getDtype();
-        if ( dtype.startsWith(">") ) {
-            dtype = dtype.substring(1);
+        String originalDtype = pixels.getDtype();
+        String dtype = stripDtypePrefix(originalDtype);
+
+        // Check for endianness conflict between dtype prefix and BinData field
+        if (originalDtype.length() > 0) {
+            char prefix = originalDtype.charAt(0);
+            if (prefix == '<' || prefix == '>') {
+                boolean dtypeIsLittleEndian = (prefix == '<');
+                boolean bindataIsLittleEndian = (pixels.getBindata().getEndianness() == BinData.Endianness.LITTLE);
+                if (dtypeIsLittleEndian != bindataIsLittleEndian) {
+                    LOGGER.warning(
+                        "Endianness conflict: dtype=" + originalDtype + " indicates " +
+                        (dtypeIsLittleEndian ? "little" : "big") + "-endian but " +
+                        "BinData.endianness=" + pixels.getBindata().getEndianness().name() + ". " +
+                        "Using BinData.endianness as authoritative source."
+                    );
+                }
+            }
         }
 
         ByteBuffer buffer = ByteBuffer.wrap(pixels.getBindata().getData().toByteArray());
@@ -212,6 +266,14 @@ public final class Utils {
             // Permute from buffer order to imglib2 XYZC convention
             return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
 
+        } else if (dtype.equals("f8") || dtype.equals("float64")) {
+            RandomAccessibleInterval<DoubleType> interval = new ArrayImgFactory<>(new DoubleType()).create(bufferDims);
+            for (DoubleType p : Views.flatIterable(interval)) {
+                p.set(buffer.getDouble());
+            }
+
+            return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
+
         } else if (dtype.equals("u1") || dtype.equals("uint8")) {
             RandomAccessibleInterval<UnsignedByteType> interval = new ArrayImgFactory<>(new UnsignedByteType()).create(bufferDims);
             for (UnsignedByteType p : Views.flatIterable(interval)) {
@@ -224,6 +286,38 @@ public final class Utils {
             RandomAccessibleInterval<UnsignedShortType> interval = new ArrayImgFactory<>(new UnsignedShortType()).create(bufferDims);
             for (UnsignedShortType p : Views.flatIterable(interval)) {
                 p.set(buffer.getShort() & 0xFFFF);
+            }
+
+            return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
+
+        } else if (dtype.equals("u4") || dtype.equals("uint32")) {
+            RandomAccessibleInterval<UnsignedIntType> interval = new ArrayImgFactory<>(new UnsignedIntType()).create(bufferDims);
+            for (UnsignedIntType p : Views.flatIterable(interval)) {
+                p.set(buffer.getInt() & 0xFFFFFFFFL);
+            }
+
+            return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
+
+        } else if (dtype.equals("i1") || dtype.equals("int8")) {
+            RandomAccessibleInterval<ByteType> interval = new ArrayImgFactory<>(new ByteType()).create(bufferDims);
+            for (ByteType p : Views.flatIterable(interval)) {
+                p.set(buffer.get());
+            }
+
+            return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
+
+        } else if (dtype.equals("i2") || dtype.equals("int16")) {
+            RandomAccessibleInterval<ShortType> interval = new ArrayImgFactory<>(new ShortType()).create(bufferDims);
+            for (ShortType p : Views.flatIterable(interval)) {
+                p.set(buffer.getShort());
+            }
+
+            return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
+
+        } else if (dtype.equals("i4") || dtype.equals("int32")) {
+            RandomAccessibleInterval<IntType> interval = new ArrayImgFactory<>(new IntType()).create(bufferDims);
+            for (IntType p : Views.flatIterable(interval)) {
+                p.set(buffer.getInt());
             }
 
             return permuteToXYZC(interval, xPos, yPos, zPos, cPos, numDims);
