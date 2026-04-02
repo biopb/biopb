@@ -276,12 +276,18 @@ public class UtilsTest {
 
     @Test(expected = IllegalArgumentException.class)
     public void testDeserializeUnsupportedDimensionOrder() {
+        ByteBuffer buffer = ByteBuffer.allocate(10 * 10 * Float.BYTES);
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
         Pixels pixels = Pixels.newBuilder()
                 .setDimensionOrder("INVALID")
                 .setSizeX(10)
                 .setSizeY(10)
                 .setSizeZ(1)
                 .setSizeC(1)
+                .setBindata(bindata)
                 .build();
 
         Utils.DeserializeToInterval(pixels);
@@ -302,13 +308,20 @@ public class UtilsTest {
         Utils.DeserializeToInterval(pixels);
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testSerializeUnsupportedDimensions() {
-        // Create a 5D image which is not supported
+    @Test
+    public void testSerialize5DImage() {
+        // Create a 5D image (2x2x2x2x2) - now supported
         ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
         RandomAccessibleInterval<FloatType> image5D = factory.create(2, 2, 2, 2, 2);
 
-        Utils.SerializeFromInterval(image5D);
+        Pixels pixels = Utils.SerializeFromInterval(image5D);
+
+        // Verify dimensions
+        Assert.assertEquals(2, pixels.getSizeX());
+        Assert.assertEquals(2, pixels.getSizeY());
+        Assert.assertEquals(2, pixels.getSizeZ());
+        Assert.assertEquals(2, pixels.getSizeC());
+        Assert.assertEquals(2, pixels.getSizeT());
     }
 
     @Test
@@ -726,5 +739,117 @@ public class UtilsTest {
 
         RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
         Assert.assertNotNull(deserialized);
+    }
+
+    @Test
+    public void testDeserializeWithOutputDimOrderZYXC() {
+        // Test deserialization with custom outputDimOrder
+        int width = 4;
+        int height = 3;
+        int depth = 2;
+        int channels = 2;
+
+        ByteBuffer buffer = ByteBuffer.allocate(width * height * depth * channels * Float.BYTES);
+        for (int i = 0; i < width * height * depth * channels; i++) {
+            buffer.putFloat((float) i);
+        }
+        buffer.flip();
+
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setBindata(bindata)
+                .setDtype("f4")
+                .setSizeX(width)
+                .setSizeY(height)
+                .setSizeZ(depth)
+                .setSizeC(channels)
+                .build();
+
+        // Default XYZC order
+        RandomAccessibleInterval<?> defaultOrder = Utils.DeserializeToInterval(pixels);
+        Assert.assertEquals(width, defaultOrder.dimension(0));  // X
+        Assert.assertEquals(height, defaultOrder.dimension(1)); // Y
+        Assert.assertEquals(depth, defaultOrder.dimension(2));  // Z
+        Assert.assertEquals(channels, defaultOrder.dimension(3)); // C
+
+        // Custom ZYXC order
+        RandomAccessibleInterval<?> zyxcOrder = Utils.DeserializeToInterval(pixels, "ZYXC");
+        Assert.assertEquals(depth, zyxcOrder.dimension(0));     // Z
+        Assert.assertEquals(height, zyxcOrder.dimension(1));    // Y
+        Assert.assertEquals(width, zyxcOrder.dimension(2));     // X
+        Assert.assertEquals(channels, zyxcOrder.dimension(3));  // C
+
+        // Custom CZYX order
+        RandomAccessibleInterval<?> czyxOrder = Utils.DeserializeToInterval(pixels, "CZYX");
+        Assert.assertEquals(channels, czyxOrder.dimension(0));  // C
+        Assert.assertEquals(depth, czyxOrder.dimension(1));     // Z
+        Assert.assertEquals(height, czyxOrder.dimension(2));    // Y
+        Assert.assertEquals(width, czyxOrder.dimension(3));     // X
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testDeserializeInvalidOutputDimOrder() {
+        ByteBuffer buffer = ByteBuffer.allocate(10 * 10 * Float.BYTES);
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setSizeX(10)
+                .setSizeY(10)
+                .setSizeZ(1)
+                .setSizeC(1)
+                .setDtype("f4")
+                .setBindata(bindata)
+                .build();
+
+        Utils.DeserializeToInterval(pixels, "INVALID");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testDeserializeOutputDimOrderMissingAxis() {
+        // Test that excluding a non-singleton dimension fails
+        ByteBuffer buffer = ByteBuffer.allocate(10 * 10 * 3 * Float.BYTES);
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setSizeX(10)
+                .setSizeY(10)
+                .setSizeZ(1)
+                .setSizeC(3)  // Non-singleton C
+                .setDtype("f4")
+                .setBindata(bindata)
+                .build();
+
+        Utils.DeserializeToInterval(pixels, "XYZ");  // Missing C, C is not singleton
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testDeserializeOutputDimOrderDuplicateAxis() {
+        ByteBuffer buffer = ByteBuffer.allocate(10 * 10 * Float.BYTES);
+        BinData bindata = BinData.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(buffer.array()))
+                .build();
+
+        Pixels pixels = Pixels.newBuilder()
+                .setDimensionOrder("XYZCT")
+                .setSizeX(10)
+                .setSizeY(10)
+                .setSizeZ(1)
+                .setSizeC(1)
+                .setDtype("f4")
+                .setBindata(bindata)
+                .build();
+
+        Utils.DeserializeToInterval(pixels, "XYZCC");  // Duplicate C
     }
 }
