@@ -15,6 +15,32 @@ message OpSchema {
     // Human-readable description of the operation
     string description = 2;
 
+    // Organizational labels for grouping/filtering ops.
+    // Examples: ["segmentation"], ["denoising", "pretrained"], ["cellpose", "cyto2"]
+    // Allows hierarchical organization (category + subcategory + model name).
+    repeated string labels = 3;
+
+    // Hints for expected input image dimensions.
+    // Helps clients determine if their image is compatible before calling.
+    InputShapeHint input_shape_hint = 4;
+
+}
+
+
+// Describes expected input image shape constraints.
+message InputShapeHint {
+
+    // Dimensions expected to be singleton (size = 1).
+    // Example: ["T", "Z"] means op expects a 2D image (single timepoint, single z-slice).
+    // Empty/unset means no specific singleton requirements.
+    // Valid values: "T", "Z", "C" (Y and X are always required to be > 1).
+    repeated string expected_singletons = 1;
+
+    // Dimensions that must have multiple values (size > 1).
+    // Example: ["T"] means op requires time-lapse data.
+    // Empty/unset means no specific multi-value requirements.
+    repeated string required_multivalue = 2;
+
 }
 
 

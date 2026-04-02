@@ -59,7 +59,7 @@ jobs:
           server-id: ossrh
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
           gpg-passphrase: GPG_PASSPHRASE
       - name: Publish to Maven Central
         run: mvn -B deploy -Drevision=${{ steps.version.outputs.VERSION }} -P release --file pom.xml
