@@ -318,17 +318,17 @@ public final class Utils {
             } else if (dtype.equals("f8")) {
                 buffer.putDouble(pixel.getRealDouble());
             } else if (dtype.equals("u1")) {
-                buffer.put((byte) pixel.getRealFloat());
+                buffer.put((byte) ((UnsignedByteType) pixel).get());
             } else if (dtype.equals("i1")) {
-                buffer.put((byte) pixel.getRealFloat());
+                buffer.put(((ByteType) pixel).get());
             } else if (dtype.equals("u2")) {
-                buffer.putShort((short) pixel.getRealFloat());
+                buffer.putShort((short) ((UnsignedShortType) pixel).get());
             } else if (dtype.equals("i2")) {
-                buffer.putShort((short) pixel.getRealFloat());
+                buffer.putShort(((ShortType) pixel).get());
             } else if (dtype.equals("u4")) {
-                buffer.putInt((int) pixel.getRealFloat());
+                buffer.putInt((int) ((UnsignedIntType) pixel).get());
             } else if (dtype.equals("i4")) {
-                buffer.putInt((int) pixel.getRealFloat());
+                buffer.putInt(((IntType) pixel).get());
             } else {
                 buffer.putFloat(pixel.getRealFloat());
             }

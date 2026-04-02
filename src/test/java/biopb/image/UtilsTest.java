@@ -8,6 +8,8 @@ import org.junit.Assert;
 
 import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.numeric.integer.UnsignedByteType;
+import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.IntType;
 import net.imglib2.type.numeric.real.FloatType;
 import net.imglib2.view.Views;
 import net.imglib2.RandomAccessibleInterval;
@@ -851,5 +853,82 @@ public class UtilsTest {
                 .build();
 
         Utils.DeserializeToInterval(pixels, "XYZCC");  // Duplicate C
+    }
+
+    @Test
+    public void testSerializeUint32LargeValues() {
+        // Test serialization of uint32 values beyond float precision threshold (>2^24)
+        // This tests the fix for getRealFloat() clipping bug
+        int width = 3;
+        int height = 3;
+
+        ArrayImgFactory<UnsignedIntType> factory = new ArrayImgFactory<>(new UnsignedIntType());
+        RandomAccessibleInterval<UnsignedIntType> image = factory.create(width, height);
+
+        // Use large values beyond float's 24-bit integer precision
+        long[] testValues = {
+            16_777_217L,      // Just beyond float precision threshold
+            300_000_000L,     // Large but representable
+            4_000_000_000L    // Near max uint32
+        };
+
+        int idx = 0;
+        for (UnsignedIntType pixel : Views.flatIterable(image)) {
+            pixel.set(testValues[idx % testValues.length]);
+            idx++;
+        }
+
+        // Serialize
+        Pixels pixels = Utils.SerializeFromInterval(image);
+        Assert.assertEquals("u4", pixels.getDtype());
+
+        // Deserialize
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify values are preserved exactly (round-trip test)
+        idx = 0;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            UnsignedIntType pixel = (UnsignedIntType) obj;
+            Assert.assertEquals(testValues[idx % testValues.length], pixel.get());
+            idx++;
+        }
+    }
+
+    @Test
+    public void testSerializeInt32LargeValues() {
+        // Test serialization of int32 values beyond float precision threshold
+        int width = 3;
+        int height = 3;
+
+        ArrayImgFactory<IntType> factory = new ArrayImgFactory<>(new IntType());
+        RandomAccessibleInterval<IntType> image = factory.create(width, height);
+
+        // Use large values beyond float's 24-bit integer precision
+        int[] testValues = {
+            16_777_217,       // Just beyond float precision threshold
+            2_000_000_000,    // Large positive
+            -2_000_000_000    // Large negative
+        };
+
+        int idx = 0;
+        for (IntType pixel : Views.flatIterable(image)) {
+            pixel.set(testValues[idx % testValues.length]);
+            idx++;
+        }
+
+        // Serialize
+        Pixels pixels = Utils.SerializeFromInterval(image);
+        Assert.assertEquals("i4", pixels.getDtype());
+
+        // Deserialize
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+
+        // Verify values are preserved exactly (round-trip test)
+        idx = 0;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            IntType pixel = (IntType) obj;
+            Assert.assertEquals(testValues[idx % testValues.length], pixel.get());
+            idx++;
+        }
     }
 }
