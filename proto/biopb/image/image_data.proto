@@ -60,7 +60,7 @@ message Pixels {
     // for large image dataset, it is necessary to send a stream of image
     // patches instead of one monolithic data structure of the whole dataset.
     // The offset values allows one to specify the relative locations of each
-    // patch.
+    // patch. These include spatial (x,y,z), channel (c), and time (t) offsets.
     optional uint32 offset_x = 22;
 
     optional uint32 offset_y = 23;
@@ -68,6 +68,8 @@ message Pixels {
     optional uint32 offset_z = 24;
 
     optional uint32 offset_t = 25;
+
+    optional uint32 offset_c = 26;
 
 }
 
