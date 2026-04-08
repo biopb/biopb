@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package biopb.tensor;
+
+option java_package = "biopb.tensor";
+option java_multiple_files = true;
+
+// Encoded into FlightEndpoint.ticket bytes
+// Opaque chunk identifier - server determines encoding based on backend
+message TensorTicket {
+  // Backend-specific chunk identifier
+  // - Zarr/N5: UTF-8 encoded chunk key (e.g., "0/1/2")
+  // - HDF5: Serialized chunk coordinates
+  // - OME-TIFF: Serialized {ifd_index, tile_row, tile_col}
+  // - TileDB: Native chunk query identifier
+  bytes chunk_id = 1;
+}
+
+// Encoded into FlightEndpoint.app_metadata bytes
+// Describes chunk bounds so client can map array coords to cached chunks
+message ChunkBounds {
+  // Chunk start position in array coordinates (per dimension)
+  repeated int64 start = 1;
+  // Chunk stop position in array coordinates (exclusive, per dimension)
+  repeated int64 stop = 2;
+}

@@ -212,7 +212,8 @@
 					<protoSourceRoot>${project.basedir}/proto</protoSourceRoot>
 					<includes>
 						<include>biopb/image/*.proto</include>
-						<include>biopb/ome/*.proto</include>						
+						<include>biopb/ome/*.proto</include>
+							<include>biopb/tensor/*.proto</include>						
 					</includes>
 					<!-- Skip cleanup to avoid file deletion issues on some systems -->
 					<skipCleanup>true</skipCleanup>

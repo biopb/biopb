@@ -34,6 +34,32 @@ pytest tests/python/grpc_services_test.py
 - Tests automatically skip unreachable hosts or unimplemented RPCs; this
   behaviour keeps the suite safe for CI and intermittent service availability.
 
+---
+
+## Adapter unit tests
+
+Basic adapter tests (`tensor_test.py`) use synthetic data and run standalone:
+
+```sh
+pytest src/test/python/tensor_test.py
+```
+
+### Extended adapter tests (require test data)
+
+Tests for `MultiFileOmeTiffAdapter` and `OmeZarrAdapter` require external
+test fixtures. Set `BIOPB_TEST_DATA_DIR` to skip setup:
+
+```sh
+export BIOPB_TEST_DATA_DIR=/path/to/test/data
+pytest src/test/python/tensor_extended_test.py
+```
+
+Tests automatically skip if fixtures are not found.
+
+Required fixtures:
+- `mm_test_data/` - Micro-Manager multi-file OME-TIFF dataset
+- `test.ome.zarr/` - OME-Zarr (OME-NGFF) dataset
+
 ### what is covered
 
 1.  **Connectivity** – a channel-ready check ensures the target host is

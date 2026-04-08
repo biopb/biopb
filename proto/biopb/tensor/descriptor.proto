@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package biopb.tensor;
+
+option java_package = "biopb.tensor";
+option java_multiple_files = true;
+
+// Encoded into FlightDescriptor.cmd bytes (identifies the tensor)
+message TensorDescriptor {
+  // Unique identifier for the tensor/array
+  string array_id = 1;
+
+  // Maps dimension index to semantic label (e.g., ["z", "y", "x"])
+  repeated string dim_labels = 2;
+
+  // Full array shape (per dimension)
+  repeated int64 shape = 3;
+
+  // Nominal chunk size per dimension (actual may vary for edge chunks)
+  repeated int64 chunk_shape = 4;
+
+  // Element dtype (numpy-style, e.g., "uint8", "float32", "float64")
+  string dtype = 5;
+
+  // Optional slice hint - if provided, GetFlightInfo returns only chunks
+  // covering this range. Leave unset/null to return all chunks.
+  SliceHint slice_hint = 6;
+
+  // Optional read-time options for virtual/scaled reads.
+  // These do not change tensor identity, only how a specific read request
+  // should be planned and served.
+  TensorReadOptions read_options = 7;
+}
+
+// Specifies a sub-region of the tensor for filtered endpoint discovery
+message SliceHint {
+  // Start indices (per dimension)
+  repeated int64 start = 1;
+  // Stop indices (exclusive, per dimension)
+  repeated int64 stop = 2;
+}
+
+// Placeholder for future ListFlights filtering criteria
+// Currently empty - server returns all tensors
+message TensorCriteria {
+  reserved 1 to 10; // Future: prefix, dtype_filter, shape_range, etc.
+}
+
+// Placeholder for future read options
+// Currently used for request-scoped virtual/scaled read planning.
+message TensorReadOptions {
+  // Per-dimension integer downsampling factors.
+  // Example: [1, 8, 8] means full resolution on the first axis and 8x reduced
+  // resolution on the remaining axes.
+  repeated int64 scale_hint = 1;
+
+  // Dynamic reduction/downsampling method selected by the client.
+  // Current Python implementation supports "stride" and "mean".
+  string reduction_method = 2;
+
+  reserved 3 to 10; // Future: compression_hint, cache_policy, device_hint, etc.
+}
+
+// Placeholder for future write options
+// Currently empty - server uses defaults
+message TensorWriteOptions {
+  reserved 1 to 10; // Future: transaction_id, atomic, overwrite_policy, etc.
+}
