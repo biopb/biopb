@@ -69,6 +69,11 @@ class ServerConfig:
     """
     host: str = "0.0.0.0"
     port: int = 8815
+    compute_backend: str = "auto"
+    gpu_min_input_mb: float = 4.0
+    gpu_min_linear_input_mb: float = 2.0
+    gpu_memory_safety_factor: int = 4
+    gpu_min_merged_chunks: int = 4
     sources: List[TensorSource] = field(default_factory=list)
 
 
@@ -111,6 +116,14 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     host = server_data.get("host", "0.0.0.0")
     port = server_data.get("port", 8815)
 
+    # Parse compute settings
+    compute_data = data.get("compute", {})
+    compute_backend = compute_data.get("backend", "auto")
+    gpu_min_input_mb = compute_data.get("gpu_min_input_mb", 4.0)
+    gpu_min_linear_input_mb = compute_data.get("gpu_min_linear_input_mb", 2.0)
+    gpu_memory_safety_factor = compute_data.get("gpu_memory_safety_factor", 4)
+    gpu_min_merged_chunks = compute_data.get("gpu_min_merged_chunks", 4)
+
     # Parse sources
     sources_data = data.get("sources", [])
     sources: List[TensorSource] = []
@@ -125,7 +138,16 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         )
         sources.append(source)
 
-    return ServerConfig(host=host, port=port, sources=sources)
+    return ServerConfig(
+        host=host,
+        port=port,
+        compute_backend=compute_backend,
+        gpu_min_input_mb=float(gpu_min_input_mb),
+        gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),
+        gpu_memory_safety_factor=int(gpu_memory_safety_factor),
+        gpu_min_merged_chunks=int(gpu_min_merged_chunks),
+        sources=sources,
+    )
 
 
 def discover_sources(source: TensorSource) -> List[TensorSource]:

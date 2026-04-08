@@ -55,7 +55,12 @@ message TensorReadOptions {
   repeated int64 scale_hint = 1;
 
   // Dynamic reduction/downsampling method selected by the client.
-  // Current Python implementation supports "stride" and "mean".
+  // Current implementation supports the visualization-oriented methods
+  // "nearest", "area", and "linear".
+  // Compatibility aliases are also accepted:
+  // - "stride" -> "nearest"
+  // - "decimate" -> "nearest"
+  // - "mean" -> "area"
   string reduction_method = 2;
 
   reserved 3 to 10; // Future: compression_hint, cache_policy, device_hint, etc.

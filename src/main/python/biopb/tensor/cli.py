@@ -18,7 +18,7 @@ from biopb.tensor.config import (
     resolve_all_sources,
     ServerConfig,
 )
-from biopb.tensor.adapter import ZarrAdapter, Hdf5Adapter, OmeTiffAdapter, MultiFileOmeTiffAdapter, OmeZarrAdapter
+from biopb.tensor.adapter import ZarrAdapter, Hdf5Adapter, OmeTiffAdapter, MultiFileOmeTiffAdapter, OmeZarrAdapter, configure_compute_backend
 from biopb.tensor.server import TensorFlightServer
 
 
@@ -112,6 +112,31 @@ def serve(
         256,
         "--cache-size",
         help="LRU cache size per adapter (number of chunks/tiles)",
+    ),
+    compute_backend: Optional[str] = typer.Option(
+        None,
+        "--compute-backend",
+        help="Compute backend policy: auto, cpu, or gpu",
+    ),
+    gpu_min_input_mb: Optional[float] = typer.Option(
+        None,
+        "--gpu-min-input-mb",
+        help="Minimum input size in MB before GPU is considered for area-like methods",
+    ),
+    gpu_min_linear_input_mb: Optional[float] = typer.Option(
+        None,
+        "--gpu-min-linear-input-mb",
+        help="Minimum input size in MB before GPU is considered for linear interpolation",
+    ),
+    gpu_memory_safety_factor: Optional[int] = typer.Option(
+        None,
+        "--gpu-memory-safety-factor",
+        help="Required free-GPU-memory multiplier over estimated working set",
+    ),
+    gpu_min_merged_chunks: Optional[int] = typer.Option(
+        None,
+        "--gpu-min-merged-chunks",
+        help="Minimum merged source chunk count before GPU is preferred",
     ):
     """Start the TensorFlight server.
 
@@ -126,6 +151,14 @@ def serve(
     host = host or server_config.host
     port = port or server_config.port
 
+    configure_compute_backend(
+        force_backend=compute_backend or server_config.compute_backend,
+        gpu_min_input_bytes=int((gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb) * 1024 * 1024),
+        gpu_min_linear_input_bytes=int((gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb) * 1024 * 1024),
+        gpu_memory_safety_factor=gpu_memory_safety_factor or server_config.gpu_memory_safety_factor,
+        gpu_min_merged_chunks=gpu_min_merged_chunks or server_config.gpu_min_merged_chunks,
+    )
+
     # Resolve sources (expand directories)
     sources = resolve_all_sources(server_config)
 
@@ -134,6 +167,14 @@ def serve(
         raise typer.Exit(1)
 
     console.print(f"[green]Loading {len(sources)} tensor source(s)...[/green]")
+    console.print(
+        "[green]Compute backend policy:[/green] "
+        f"backend={compute_backend or server_config.compute_backend}, "
+        f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
+        f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
+        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
+        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
+    )
 
     # Create adapters
     adapters = {}
@@ -186,6 +227,14 @@ def validate(
 
         console.print(f"[green]✓ Config valid[/green]")
         console.print(f"  Server: {server_config.host}:{server_config.port}")
+        console.print(
+            "  Compute: "
+            f"backend={server_config.compute_backend}, "
+            f"gpu_min_input_mb={server_config.gpu_min_input_mb}, "
+            f"gpu_min_linear_input_mb={server_config.gpu_min_linear_input_mb}, "
+            f"gpu_memory_safety_factor={server_config.gpu_memory_safety_factor}, "
+            f"gpu_min_merged_chunks={server_config.gpu_min_merged_chunks}"
+        )
         console.print(f"  Sources: {len(sources)} tensor(s)")
 
         for source in sources:

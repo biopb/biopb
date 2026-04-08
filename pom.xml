@@ -34,6 +34,13 @@
 		<url>http://github.com/jiyuuchc/biopb</url>
 	</scm>
 
+	<repositories>
+		<repository>
+			<id>scijava.public</id>
+			<url>https://maven.scijava.org/content/groups/public</url>
+		</repository>
+	</repositories>
+
   	<distributionManagement>
 		<repository>
 		<id>ossrh</id>
@@ -45,6 +52,7 @@
 	<properties>
         <revision>0.0.0-SNAPSHOT</revision>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+	<arrow.version>18.2.0</arrow.version>
         <grpc.version>1.68.0</grpc.version>
         <protoc.version>3.25.3</protoc.version>
         <maven.compiler.source>11</maven.compiler.source>
@@ -95,6 +103,30 @@
 			<groupId>net.imglib2</groupId>
 			<artifactId>imglib2</artifactId>
 			<version>7.1.5</version>
+		</dependency>
+
+		<dependency>
+			<groupId>net.imglib2</groupId>
+			<artifactId>imglib2-cache</artifactId>
+			<version>1.0.0-beta-19</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>flight-core</artifactId>
+			<version>${arrow.version}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-vector</artifactId>
+			<version>${arrow.version}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-memory-netty</artifactId>
+			<version>${arrow.version}</version>
 		</dependency>
 
 		<dependency>

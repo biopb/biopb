@@ -17,11 +17,21 @@ from dataclasses import dataclass
 from functools import lru_cache
 from math import lcm
 from typing import List, Optional, Tuple, Iterator
+import importlib
 import struct
 import os
 
 import numpy as np
 import pyarrow as pa
+
+try:
+    cp = importlib.import_module('cupy')
+    cupy_ndimage = importlib.import_module('cupyx.scipy.ndimage')
+    _HAS_CUPY = True
+except ImportError:
+    cp = None
+    cupy_ndimage = None
+    _HAS_CUPY = False
 
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
@@ -45,6 +55,17 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
+
+
+@dataclass
+class ComputeBackendOptions:
+    """Server-side compute backend selection options."""
+
+    force_backend: str = 'auto'
+    gpu_min_input_bytes: int = 4 * 1024 * 1024
+    gpu_min_linear_input_bytes: int = 2 * 1024 * 1024
+    gpu_memory_safety_factor: int = 4
+    gpu_min_merged_chunks: int = 4
 
 
 class BackendAdapter(ABC):
@@ -175,9 +196,43 @@ def _decode_chunk_id(chunk_id: bytes) -> Tuple[str, bytes]:
 
 
 _VIRTUAL_CHUNK_MAGIC = b'virt1'
-_DEFAULT_REDUCTION_METHOD = 'stride'
-_SUPPORTED_REDUCTION_METHODS = {'stride', 'mean'}
-_STRIDE_ALIASES = {'nearest', 'decimate'}
+_DEFAULT_REDUCTION_METHOD = 'nearest'
+_SUPPORTED_REDUCTION_METHODS = {'nearest', 'area', 'linear'}
+_METHOD_ALIASES = {
+    'stride': 'nearest',
+    'decimate': 'nearest',
+    'mean': 'area',
+}
+_GPU_PREFERRED_METHODS = {'area', 'linear'}
+_COMPUTE_BACKEND_OPTIONS = ComputeBackendOptions()
+
+
+def configure_compute_backend(**kwargs) -> ComputeBackendOptions:
+    """Update server-side compute backend selection options."""
+    global _COMPUTE_BACKEND_OPTIONS
+
+    options = ComputeBackendOptions(**{
+        **_COMPUTE_BACKEND_OPTIONS.__dict__,
+        **kwargs,
+    })
+    if options.force_backend not in {'auto', 'cpu', 'gpu'}:
+        raise ValueError("force_backend must be one of: auto, cpu, gpu")
+    if options.gpu_min_input_bytes < 0:
+        raise ValueError('gpu_min_input_bytes must be non-negative')
+    if options.gpu_min_linear_input_bytes < 0:
+        raise ValueError('gpu_min_linear_input_bytes must be non-negative')
+    if options.gpu_memory_safety_factor < 1:
+        raise ValueError('gpu_memory_safety_factor must be >= 1')
+    if options.gpu_min_merged_chunks < 1:
+        raise ValueError('gpu_min_merged_chunks must be >= 1')
+
+    _COMPUTE_BACKEND_OPTIONS = options
+    return _COMPUTE_BACKEND_OPTIONS
+
+
+def get_compute_backend_options() -> ComputeBackendOptions:
+    """Return current server-side compute backend selection options."""
+    return ComputeBackendOptions(**_COMPUTE_BACKEND_OPTIONS.__dict__)
 
 
 def _encode_int64_sequence(values: Tuple[int, ...]) -> bytes:
@@ -194,8 +249,7 @@ def _decode_int64_sequence(data: bytes, offset: int, length: int) -> Tuple[Tuple
 
 def _normalize_reduction_method(method: str) -> str:
     normalized = (method or _DEFAULT_REDUCTION_METHOD).strip().lower()
-    if normalized in _STRIDE_ALIASES:
-        normalized = 'stride'
+    normalized = _METHOD_ALIASES.get(normalized, normalized)
     if normalized not in _SUPPORTED_REDUCTION_METHODS:
         raise ValueError(
             f"Unsupported reduction method: {method}. "
@@ -272,9 +326,94 @@ def _logical_chunk_shape(
 
 
 def _output_dtype(base_dtype: str, reduction_method: str) -> str:
-    if reduction_method == 'mean':
-        return np.dtype(np.float64).str
     return np.dtype(base_dtype).str
+
+
+def _cast_reduced_array(data: np.ndarray, target_dtype: np.dtype) -> np.ndarray:
+    if np.issubdtype(target_dtype, np.integer):
+        info = np.iinfo(target_dtype)
+        data = np.rint(data)
+        data = np.clip(data, info.min, info.max)
+        return data.astype(target_dtype)
+
+    if np.issubdtype(target_dtype, np.floating):
+        return data.astype(target_dtype)
+
+    return data.astype(target_dtype)
+
+
+def _get_backend_override() -> str:
+    override = os.environ.get('BIOPB_TENSOR_FORCE_BACKEND', _COMPUTE_BACKEND_OPTIONS.force_backend).strip().lower()
+    if override in {'cpu', 'gpu', 'auto'}:
+        return override
+    return 'auto'
+
+
+def _get_gpu_free_bytes() -> int:
+    if not _HAS_CUPY:
+        return 0
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        return int(free_bytes)
+    except Exception:
+        return 0
+
+
+def _estimate_array_bytes(shape: Tuple[int, ...], dtype: np.dtype) -> int:
+    return int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+
+
+def _select_compute_backend(
+    source_shape: Tuple[int, ...],
+    dtype: np.dtype,
+    reduction_method: str,
+    scale_hint: Tuple[int, ...],
+    merged_chunk_count: int,
+) -> str:
+    reduction_method = _normalize_reduction_method(reduction_method)
+    override = _get_backend_override()
+
+    if override == 'cpu':
+        return 'cpu'
+
+    if override == 'gpu':
+        if _HAS_CUPY and (reduction_method != 'linear' or cupy_ndimage is not None):
+            return 'gpu'
+        return 'cpu'
+
+    if not _HAS_CUPY:
+        return 'cpu'
+
+    if reduction_method not in _GPU_PREFERRED_METHODS:
+        return 'cpu'
+
+    if reduction_method == 'linear' and cupy_ndimage is None:
+        return 'cpu'
+
+    input_bytes = _estimate_array_bytes(source_shape, dtype)
+    output_shape = tuple(source_shape[axis] // scale_hint[axis] for axis in range(len(source_shape)))
+    output_bytes = _estimate_array_bytes(output_shape, dtype)
+    total_bytes = input_bytes + output_bytes
+    min_input_bytes = (
+        _COMPUTE_BACKEND_OPTIONS.gpu_min_linear_input_bytes
+        if reduction_method == 'linear'
+        else _COMPUTE_BACKEND_OPTIONS.gpu_min_input_bytes
+    )
+
+    if input_bytes < min_input_bytes:
+        return 'cpu'
+
+    if (
+        merged_chunk_count < _COMPUTE_BACKEND_OPTIONS.gpu_min_merged_chunks
+        and input_bytes < (min_input_bytes * 2)
+    ):
+        return 'cpu'
+
+    free_bytes = _get_gpu_free_bytes()
+    if free_bytes > 0 and free_bytes < total_bytes * _COMPUTE_BACKEND_OPTIONS.gpu_memory_safety_factor:
+        return 'cpu'
+
+    return 'gpu'
 
 
 def _encode_virtual_chunk_payload(
@@ -326,10 +465,40 @@ def _downsample_block(
     data: np.ndarray,
     scale_hint: Tuple[int, ...],
     reduction_method: str,
+    backend: Optional[str] = None,
+    merged_chunk_count: int = 1,
 ) -> np.ndarray:
     reduction_method = _normalize_reduction_method(reduction_method)
-    if reduction_method == 'stride':
+    selected_backend = backend or _select_compute_backend(
+        source_shape=tuple(int(dim) for dim in data.shape),
+        dtype=np.dtype(data.dtype),
+        reduction_method=reduction_method,
+        scale_hint=scale_hint,
+        merged_chunk_count=merged_chunk_count,
+    )
+
+    if selected_backend == 'gpu':
+        try:
+            return _downsample_block_gpu(data, scale_hint, reduction_method)
+        except Exception:
+            pass
+
+    return _downsample_block_cpu(data, scale_hint, reduction_method)
+
+
+def _downsample_block_cpu(
+    data: np.ndarray,
+    scale_hint: Tuple[int, ...],
+    reduction_method: str,
+) -> np.ndarray:
+    reduction_method = _normalize_reduction_method(reduction_method)
+    if reduction_method == 'nearest':
         return data[tuple(slice(0, None, scale) for scale in scale_hint)]
+
+    target_shape = tuple(data.shape[axis] // scale_hint[axis] for axis in range(data.ndim))
+
+    if reduction_method == 'linear':
+        return _resample_linear(data, target_shape)
 
     reduced = np.asarray(data, dtype=np.float64)
     for axis in reversed(range(reduced.ndim)):
@@ -347,6 +516,72 @@ def _downsample_block(
         )
         reduced = reduced.reshape(new_shape).mean(axis=axis + 1)
     return reduced
+
+
+def _downsample_block_gpu(
+    data: np.ndarray,
+    scale_hint: Tuple[int, ...],
+    reduction_method: str,
+) -> np.ndarray:
+    if not _HAS_CUPY:
+        raise RuntimeError('CuPy is not available')
+
+    reduction_method = _normalize_reduction_method(reduction_method)
+    gpu_data = cp.asarray(data)
+
+    if reduction_method == 'nearest':
+        result = gpu_data[tuple(slice(0, None, scale) for scale in scale_hint)]
+        return cp.asnumpy(result)
+
+    if reduction_method == 'area':
+        reduced = gpu_data.astype(cp.float64)
+        for axis in reversed(range(reduced.ndim)):
+            scale = scale_hint[axis]
+            axis_size = reduced.shape[axis]
+            if axis_size % scale != 0:
+                raise ValueError(
+                    f"Area downsampling requires divisibility on axis {axis}: "
+                    f"size={axis_size}, scale={scale}"
+                )
+            new_shape = (
+                reduced.shape[:axis]
+                + (axis_size // scale, scale)
+                + reduced.shape[axis + 1:]
+            )
+            reduced = reduced.reshape(new_shape).mean(axis=axis + 1)
+        return cp.asnumpy(reduced)
+
+    if cupy_ndimage is None:
+        raise RuntimeError('cupyx.scipy.ndimage is not available')
+
+    target_shape = tuple(data.shape[axis] // scale_hint[axis] for axis in range(data.ndim))
+    zoom = tuple(target_shape[axis] / data.shape[axis] for axis in range(data.ndim))
+    result = cupy_ndimage.zoom(gpu_data.astype(cp.float32), zoom=zoom, order=1, mode='nearest')
+    return cp.asnumpy(result)
+
+
+def _resample_linear(data: np.ndarray, target_shape: Tuple[int, ...]) -> np.ndarray:
+    """Downsample using separable linear interpolation at output pixel centers."""
+    resampled = np.asarray(data, dtype=np.float64)
+
+    for axis, dst_len in enumerate(target_shape):
+        src_len = resampled.shape[axis]
+        if dst_len == src_len:
+            continue
+        if dst_len <= 0:
+            raise ValueError(f"Target shape must be positive on axis {axis}")
+
+        src_coords = np.arange(src_len, dtype=np.float64)
+        dst_coords = ((np.arange(dst_len, dtype=np.float64) + 0.5) * (src_len / dst_len)) - 0.5
+        dst_coords = np.clip(dst_coords, 0.0, float(max(src_len - 1, 0)))
+
+        resampled = np.apply_along_axis(
+            lambda values: np.interp(dst_coords, src_coords, values),
+            axis,
+            resampled,
+        )
+
+    return resampled
 
 
 def _shift_bounds(
@@ -489,8 +724,14 @@ def resolve_chunk_data(adapter: BackendAdapter, chunk_id: bytes) -> pa.RecordBat
         )
         source_block[target_slices] = chunk_data[source_slices]
 
-    reduced = _downsample_block(source_block, scale_hint, reduction_method)
-    reduced = np.asarray(reduced, dtype=np.dtype(_output_dtype(desc.dtype, reduction_method)))
+    reduced = _downsample_block(
+        source_block,
+        scale_hint,
+        reduction_method,
+        merged_chunk_count=len(endpoints),
+    )
+    target_dtype = np.dtype(_output_dtype(desc.dtype, reduction_method))
+    reduced = _cast_reduced_array(reduced, target_dtype)
     array = pa.array(reduced.ravel())
     return pa.RecordBatch.from_arrays([array], ["data"])
 

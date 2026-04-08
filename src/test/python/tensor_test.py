@@ -16,6 +16,8 @@ from biopb.tensor import (
     SliceHint,
     TensorReadOptions,
 )
+from biopb.tensor import adapter as tensor_adapter
+from biopb.tensor.config import parse_config
 
 
 class TestZarrAdapter:
@@ -115,6 +117,117 @@ class TestTensorFlightServer:
 
             server.unregister_tensor('tensor1')
             assert 'tensor1' not in server._tensors
+
+
+class TestTensorConfig:
+    """Tests for tensor server config parsing."""
+
+    def test_parse_compute_backend_options(self):
+        config = parse_config({
+            'server': {
+                'host': '127.0.0.1',
+                'port': 9000,
+            },
+            'compute': {
+                'backend': 'gpu',
+                'gpu_min_input_mb': 8,
+                'gpu_min_linear_input_mb': 3,
+                'gpu_memory_safety_factor': 6,
+                'gpu_min_merged_chunks': 5,
+            },
+            'sources': [],
+        })
+
+        assert config.compute_backend == 'gpu'
+        assert config.gpu_min_input_mb == 8.0
+        assert config.gpu_min_linear_input_mb == 3.0
+        assert config.gpu_memory_safety_factor == 6
+        assert config.gpu_min_merged_chunks == 5
+
+
+class TestComputeBackendSelection:
+    """Tests for internal CPU/GPU backend heuristics."""
+
+    def test_nearest_prefers_cpu(self, monkeypatch):
+        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
+        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
+
+        backend = tensor_adapter._select_compute_backend(
+            source_shape=(4096, 4096),
+            dtype=np.dtype('uint8'),
+            reduction_method='nearest',
+            scale_hint=(4, 4),
+            merged_chunk_count=8,
+        )
+
+        assert backend == 'cpu'
+
+    def test_large_linear_prefers_gpu(self, monkeypatch):
+        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
+        monkeypatch.setattr(tensor_adapter, 'cupy_ndimage', object())
+        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
+
+        backend = tensor_adapter._select_compute_backend(
+            source_shape=(4096, 4096),
+            dtype=np.dtype('uint16'),
+            reduction_method='linear',
+            scale_hint=(4, 4),
+            merged_chunk_count=8,
+        )
+
+        assert backend == 'gpu'
+
+    def test_force_cpu_override(self, monkeypatch):
+        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
+        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.setenv('BIOPB_TENSOR_FORCE_BACKEND', 'cpu')
+
+        backend = tensor_adapter._select_compute_backend(
+            source_shape=(8192, 8192),
+            dtype=np.dtype('uint16'),
+            reduction_method='area',
+            scale_hint=(4, 4),
+            merged_chunk_count=16,
+        )
+
+        assert backend == 'cpu'
+
+    def test_force_gpu_falls_back_without_cupy(self, monkeypatch):
+        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', False)
+        monkeypatch.setenv('BIOPB_TENSOR_FORCE_BACKEND', 'gpu')
+
+        backend = tensor_adapter._select_compute_backend(
+            source_shape=(8192, 8192),
+            dtype=np.dtype('uint16'),
+            reduction_method='area',
+            scale_hint=(4, 4),
+            merged_chunk_count=16,
+        )
+
+        assert backend == 'cpu'
+
+    def test_configure_compute_backend_updates_thresholds(self, monkeypatch):
+        monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
+        original = tensor_adapter.get_compute_backend_options()
+
+        try:
+            tensor_adapter.configure_compute_backend(
+                force_backend='gpu',
+                gpu_min_input_bytes=123,
+                gpu_min_linear_input_bytes=45,
+                gpu_memory_safety_factor=7,
+                gpu_min_merged_chunks=9,
+            )
+            options = tensor_adapter.get_compute_backend_options()
+            assert options.force_backend == 'gpu'
+            assert options.gpu_min_input_bytes == 123
+            assert options.gpu_min_linear_input_bytes == 45
+            assert options.gpu_memory_safety_factor == 7
+            assert options.gpu_min_merged_chunks == 9
+        finally:
+            tensor_adapter.configure_compute_backend(**original.__dict__)
 
 
 class TestTensorFlightClient:
@@ -220,6 +333,23 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    def test_scaled_nearest_view(self, server_client):
+        """Test visualization-oriented nearest downsampling alias."""
+        darr = server_client.get_array(
+            'test-tensor',
+            scale_hint=[2, 2],
+            reduction_method='nearest',
+        )
+
+        assert darr.shape == (64, 64)
+        assert darr.dtype == np.uint8
+
+        data = darr.compute()
+        assert data[:32, :32].mean() == 10.0
+        assert data[:32, 32:].mean() == 20.0
+        assert data[32:, :32].mean() == 30.0
+        assert data[32:, 32:].mean() == 40.0
+
     def test_scaled_mean_view(self, server_client):
         """Test explicit read_options-based mean downsampling."""
         darr = server_client.get_array(
@@ -228,13 +358,99 @@ class TestTensorFlightClient:
         )
 
         assert darr.shape == (64, 64)
-        assert darr.dtype == np.float64
+        assert darr.dtype == np.uint8
 
         data = darr.compute()
         assert data[:32, :32].mean() == 10.0
         assert data[:32, 32:].mean() == 20.0
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
+
+    def test_scaled_area_view(self, server_client):
+        """Test visualization-oriented area downsampling."""
+        darr = server_client.get_array(
+            'test-tensor',
+            read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='area'),
+        )
+
+        assert darr.shape == (64, 64)
+        assert darr.dtype == np.uint8
+
+        data = darr.compute()
+        assert data[:32, :32].mean() == 10.0
+        assert data[:32, 32:].mean() == 20.0
+        assert data[32:, :32].mean() == 30.0
+        assert data[32:, 32:].mean() == 40.0
+
+    def test_scaled_mean_view_rounds_and_preserves_dtype(self):
+        """Test mean downsampling preserves dtype with integer-safe rounding."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'mean-preserve.zarr')
+            source = np.array([
+                [0, 1, 4, 5],
+                [2, 3, 6, 7],
+                [8, 9, 12, 13],
+                [10, 11, 14, 15],
+            ], dtype=np.uint8)
+            arr = zarr.open_array(zarr_path, mode='w', shape=(4, 4), chunks=(2, 2), dtype='uint8')
+            arr[:] = source
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'mean-preserve', ['y', 'x'])
+            server = TensorFlightServer('grpc://localhost:8893')
+            server.register_tensor('mean-preserve', adapter)
+
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                with TensorFlightClient('grpc://localhost:8893', cache_bytes=10_000_000) as client:
+                    darr = client.get_array(
+                        'mean-preserve',
+                        read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='mean'),
+                    )
+                    assert darr.dtype == np.uint8
+                    np.testing.assert_array_equal(
+                        darr.compute(),
+                        np.array([[2, 6], [10, 14]], dtype=np.uint8),
+                    )
+            finally:
+                server.shutdown()
+
+    def test_scaled_linear_view(self):
+        """Test linear interpolation downsampling for visualization."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'linear.zarr')
+            source = np.array([
+                [0, 10, 40, 90],
+                [20, 30, 60, 110],
+                [80, 90, 120, 170],
+                [180, 190, 220, 255],
+            ], dtype=np.uint8)
+            arr = zarr.open_array(zarr_path, mode='w', shape=(4, 4), chunks=(2, 2), dtype='uint8')
+            arr[:] = source
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'linear', ['y', 'x'])
+            server = TensorFlightServer('grpc://localhost:8894')
+            server.register_tensor('linear', adapter)
+
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                with TensorFlightClient('grpc://localhost:8894', cache_bytes=10_000_000) as client:
+                    darr = client.get_array(
+                        'linear',
+                        read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='linear'),
+                    )
+                    assert darr.dtype == np.uint8
+                    np.testing.assert_array_equal(
+                        darr.compute(),
+                        np.array([[15, 75], [135, 191]], dtype=np.uint8),
+                    )
+            finally:
+                server.shutdown()
 
     def test_scaled_view_merges_small_chunks(self):
         """Test scaled reads when source chunks must be merged."""
