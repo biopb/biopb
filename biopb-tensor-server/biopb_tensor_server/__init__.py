@@ -1,0 +1,60 @@
+"""BioPB Tensor Arrow Flight server for multi-dimensional array storage.
+
+This package provides server-side components for exposing chunked
+multi-dimensional arrays through Apache Arrow Flight protocol.
+
+Key components:
+- TensorFlightServer: Flight server implementation
+- BackendAdapter: Abstract interface for storage backends
+- Adapters: ZarrAdapter, Hdf5Adapter, OmeTiffAdapter, OmeZarrAdapter
+
+Note: This package is not distributed via PyPI. Install locally with:
+    pip install -e biopb-tensor-server/
+"""
+
+from biopb_tensor_server.server import (
+    TensorFlightServer,
+    serve,
+)
+
+from biopb_tensor_server.base import (
+    BackendAdapter,
+    ChunkEndpoint,
+    TensorReadPlan,
+    ComputeBackendOptions,
+    build_arrow_schema,
+    configure_compute_backend,
+    get_compute_backend_options,
+    plan_tensor_read,
+    resolve_chunk_data,
+    _chunks_intersect,
+    _encode_chunk_id,
+    _decode_chunk_id,
+)
+
+from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+from biopb_tensor_server.adapters.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
+from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+
+__all__ = [
+    'TensorFlightServer',
+    'serve',
+    'BackendAdapter',
+    'ChunkEndpoint',
+    'TensorReadPlan',
+    'ComputeBackendOptions',
+    'build_arrow_schema',
+    'configure_compute_backend',
+    'get_compute_backend_options',
+    'plan_tensor_read',
+    'resolve_chunk_data',
+    '_chunks_intersect',
+    '_encode_chunk_id',
+    '_decode_chunk_id',
+    'ZarrAdapter',
+    'Hdf5Adapter',
+    'OmeTiffAdapter',
+    'MultiFileOmeTiffAdapter',
+    'OmeZarrAdapter',
+]

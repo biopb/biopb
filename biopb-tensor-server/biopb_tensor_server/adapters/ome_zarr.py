@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import numpy as np
 import pyarrow as pa
 
-from biopb.tensor.base import (
+from biopb_tensor_server.base import (
     BackendAdapter,
     ChunkEndpoint,
     TensorReadPlan,
@@ -18,7 +18,7 @@ from biopb.tensor.base import (
     _chunks_intersect,
     _normalize_reduction_method,
 )
-from biopb.tensor.zarr import ZarrAdapter
+from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
 

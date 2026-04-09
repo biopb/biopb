@@ -16,7 +16,8 @@ import os
 import pytest
 import numpy as np
 
-from biopb.tensor.adapter import MultiFileOmeTiffAdapter, OmeZarrAdapter
+from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter
+from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
 
 def get_test_data_dir():
@@ -104,6 +105,24 @@ class TestMultiFileOmeTiffAdapter:
             # Should return same data
             np.testing.assert_array_equal(data1, data2)
 
+    def test_get_metadata(self, mm_test_dir):
+        """Test metadata extraction from companion file."""
+        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test')
+        metadata = adapter.get_metadata()
+
+        # Should return metadata dict (Micro-Manager JSON or OME-XML)
+        assert isinstance(metadata, dict)
+        assert len(metadata) > 0
+
+        # Micro-Manager format has Summary section
+        if 'Summary' in metadata:
+            summary = metadata['Summary']
+            assert 'Width' in summary or 'Height' in summary
+            print(f"Micro-Manager metadata: Width={summary.get('Width')}, Height={summary.get('Height')}")
+        else:
+            # OME-XML format - keys may have namespace prefixes
+            print(f"OME-XML metadata keys: {list(metadata.keys())[:5]}")
+
 
 class TestOmeZarrAdapter:
     """Tests for OmeZarrAdapter."""
@@ -156,6 +175,24 @@ class TestOmeZarrAdapter:
         assert len(adapter.axes) > 0
         print(f"Axes: {adapter.axes}")
         print(f"Dim labels: {adapter.dim_labels}")
+
+    def test_get_metadata(self, ome_zarr_dir):
+        """Test get_metadata() returns .zattrs content."""
+        import zarr
+        root = zarr.open_group(ome_zarr_dir, mode='r')
+        arr = root['0']
+
+        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
+        metadata = adapter.get_metadata()
+
+        # Should return the OME-Zarr .zattrs content
+        assert isinstance(metadata, dict)
+        assert 'multiscales' in metadata
+
+        # Multiscales should have axes and datasets
+        multiscales = metadata['multiscales']
+        assert len(multiscales) > 0
+        print(f"Multiscales datasets: {multiscales[0].get('datasets', [])}")
 
     def test_get_chunk_endpoints(self, ome_zarr_dir):
         """Test chunk endpoint generation."""

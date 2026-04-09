@@ -1,13 +1,14 @@
 """OME-TIFF adapters for tensor storage."""
 
 import struct
+import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from functools import lru_cache
 
 import numpy as np
 import pyarrow as pa
 
-from biopb.tensor.base import (
+from biopb_tensor_server.base import (
     BackendAdapter,
     ChunkEndpoint,
     _decode_chunk_id,
@@ -70,6 +71,48 @@ def _decode_ome_multifile_tile(data: bytes) -> Tuple[int, int, Tuple[int, ...]]:
         indices.append(idx)
         offset += 8
     return file_index, ifd_index, tuple(indices)
+
+
+def _elementtree_to_dict(element) -> dict:
+    """Convert ElementTree element to JSON-serializable dict.
+
+    Handles nested elements, attributes, and text content.
+    Returns a dict suitable for json.dumps().
+
+    Args:
+        element: xml.etree.ElementTree.Element object
+
+    Returns:
+        JSON-serializable dictionary representation
+    """
+    result = {}
+
+    # Add attributes
+    for key, value in element.attrib.items():
+        result[f"@{key}"] = value
+
+    # Process child elements
+    for child in element:
+        child_data = _elementtree_to_dict(child)
+        child_tag = child.tag
+
+        # Handle multiple elements with same tag
+        if child_tag in result:
+            # Convert to list if not already
+            if not isinstance(result[child_tag], list):
+                result[child_tag] = [result[child_tag]]
+            result[child_tag].append(child_data)
+        else:
+            result[child_tag] = child_data
+
+    # Add text content if present
+    if element.text and element.text.strip():
+        if result:
+            result["#text"] = element.text.strip()
+        else:
+            return element.text.strip()
+
+    return result if result else ""
 
 
 # =============================================================================
@@ -238,6 +281,27 @@ class OmeTiffAdapter(BackendAdapter):
         data = self._get_decoded_tile(chunk_id)
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
+
+    def get_metadata(self) -> dict:
+        """Return OME metadata from TIFF file as JSON-serializable dict.
+
+        Uses tifffile's ome_metadata attribute which contains parsed OME-XML.
+
+        Returns:
+            OME-XML as JSON-serializable dict, or empty dict if no metadata.
+        """
+        if hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None:
+            ome_meta = self.tiff_file.ome_metadata
+            # tifffile may return string (raw XML) or ElementTree
+            if isinstance(ome_meta, str):
+                try:
+                    root = ET.fromstring(ome_meta)
+                    return _elementtree_to_dict(root)
+                except ET.ParseError:
+                    return {}
+            else:
+                return _elementtree_to_dict(ome_meta)
+        return {}
 
 
 # =============================================================================
@@ -460,3 +524,79 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         data = self._get_decoded_tile(chunk_id)
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
+
+    def get_metadata(self) -> dict:
+        """Return OME metadata from multi-file dataset.
+
+        First checks for companion _metadata.txt file (Micro-Manager format),
+        then falls back to embedded OME-XML from TIFF.
+
+        Returns:
+            OME-XML as JSON-serializable dict, or empty dict if no metadata.
+        """
+        import xml.etree.ElementTree as ET
+
+        # Check for companion _metadata.txt file
+        # Micro-Manager uses _metadata.txt with OME-XML content
+        metadata_patterns = ["_metadata.txt", "*_metadata.txt"]
+        for pattern in metadata_patterns:
+            metadata_files = list(self.directory.glob(pattern))
+            if metadata_files:
+                # Parse OME-XML from the companion file
+                try:
+                    return self._parse_metadata_txt(metadata_files[0])
+                except Exception:
+                    pass
+
+        # Fall back to embedded OME-XML from first TIFF file
+        if hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None:
+            ome_meta = self.tiff_file.ome_metadata
+            if isinstance(ome_meta, str):
+                try:
+                    root = ET.fromstring(ome_meta)
+                    return _elementtree_to_dict(root)
+                except ET.ParseError:
+                    return {}
+            else:
+                return _elementtree_to_dict(ome_meta)
+
+        return {}
+
+    def _parse_metadata_txt(self, metadata_path) -> dict:
+        """Parse OME-XML from companion metadata file.
+
+        Micro-Manager _metadata.txt contains JSON with OME-XML embedded,
+        or may contain raw OME-XML.
+
+        Args:
+            metadata_path: Path to _metadata.txt file
+
+        Returns:
+            OME-XML as JSON-serializable dict
+        """
+        import json
+
+        content = metadata_path.read_text()
+
+        # Try parsing as raw OME-XML first
+        try:
+            root = ET.fromstring(content)
+            return _elementtree_to_dict(root)
+        except ET.ParseError:
+            pass
+
+        # Try parsing as JSON (some Micro-Manager formats)
+        try:
+            data = json.loads(content)
+            # Look for OME-XML string in JSON structure
+            if isinstance(data, dict):
+                # Common Micro-Manager format: {"OME": "<OME>...</OME>"}
+                if "OME" in data and isinstance(data["OME"], str):
+                    root = ET.fromstring(data["OME"])
+                    return _elementtree_to_dict(root)
+                # Return JSON directly if no embedded XML
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        return {}

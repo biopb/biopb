@@ -843,5 +843,3 @@ def resolve_chunk_data(adapter: BackendAdapter, chunk_id: bytes) -> pa.RecordBat
     reduced = _cast_reduced_array(reduced, target_dtype)
     array = pa.array(reduced.ravel())
     return pa.RecordBatch.from_arrays([array], ["data"])
-
-

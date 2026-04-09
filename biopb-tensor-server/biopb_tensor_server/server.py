@@ -18,7 +18,8 @@ from biopb.tensor.ticket_pb2 import (
     TensorTicket, ChunkBounds
 )
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id
+
+from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id
 
 
 class TensorFlightServer(flight.FlightServerBase):

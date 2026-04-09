@@ -13,18 +13,22 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb.tensor.config import (
+from biopb_tensor_server.config import (
     load_config,
     resolve_all_sources,
     ServerConfig,
 )
-from biopb.tensor.adapter import ZarrAdapter, Hdf5Adapter, OmeTiffAdapter, MultiFileOmeTiffAdapter, OmeZarrAdapter, configure_compute_backend
-from biopb.tensor.server import TensorFlightServer
+from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+from biopb_tensor_server.adapters.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
+from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.base import configure_compute_backend
+from biopb_tensor_server.server import TensorFlightServer
 
 
 app = typer.Typer(
-    name="tensorflight",
-    help="TensorFlight: Arrow Flight server for multi-dimensional arrays",
+    name="biopb-tensor",
+    help="BioPB Tensor: Arrow Flight server for multi-dimensional arrays",
 )
 console = Console()
 
@@ -137,12 +141,13 @@ def serve(
         None,
         "--gpu-min-merged-chunks",
         help="Minimum merged source chunk count before GPU is preferred",
-    ):
+    ),
+):
     """Start the TensorFlight server.
 
     Example:
-        tensorflight serve --config tensorflight.toml
-        tensorflight serve -c config.toml --port 9000
+        biopb-tensor serve --config biopb-tensor.toml
+        biopb-tensor serve -c config.toml --port 9000
     """
     # Load config
     server_config = load_config(config)
@@ -219,13 +224,13 @@ def validate(
     """Validate a config file.
 
     Example:
-        tensorflight validate tensorflight.toml
+        biopb-tensor validate biopb-tensor.toml
     """
     try:
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
 
-        console.print(f"[green]✓ Config valid[/green]")
+        console.print("[green]✓ Config valid[/green]")
         console.print(f"  Server: {server_config.host}:{server_config.port}")
         console.print(
             "  Compute: "
@@ -256,7 +261,7 @@ def list_tensors(
     """List tensors defined in a config file.
 
     Example:
-        tensorflight list tensorflight.toml
+        biopb-tensor list biopb-tensor.toml
     """
     try:
         server_config = load_config(config)
@@ -287,8 +292,11 @@ def list_tensors(
 @app.command()
 def version():
     """Show version information."""
-    from biopb import __version__
-    console.print(f"TensorFlight version: {__version__}")
+    try:
+        from biopb import __version__
+        console.print(f"TensorFlight server (using biopb {__version__})")
+    except ImportError:
+        console.print("TensorFlight server")
 
 
 if __name__ == "__main__":

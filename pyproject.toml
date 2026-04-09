@@ -14,8 +14,6 @@ dependencies = [
   "protobuf >= 6.32.1",
   "grpcio",
   "numpy",
-  "typer[all] >= 0.9.0",
-  "tomli >= 2.0.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -25,17 +23,12 @@ dependencies = [
   ]
   tensor = [
     "pyarrow >= 14.0.0",
-    "zarr >= 2.0.0",
     "dask[array] >= 2024.0.0",
     "cachey >= 0.1.0",
-    "tifffile >= 2021.8.30",
   ]
   ome-zarr = [
     "ome-zarr >= 0.6.1",
   ]
-
-[project.scripts]
-  tensorflight = "biopb.tensor.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/biopb/biopb"

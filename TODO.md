@@ -22,11 +22,10 @@ Implemented (v0.1):
 
 ### High Priority
 
-- [ ] **Parse `_metadata.txt` for complete OME-XML**
-  - Current: Only reads OME-XML embedded in TIFF tags
-  - Needed: Parse companion metadata file for full dataset description
+- [x] **Parse `_metadata.txt` for complete OME-XML**
+  - Current: Reads companion _metadata.txt (Micro-Manager JSON format) and embedded OME-XML
   - File: `src/main/python/biopb/tensor/tiff.py` (MultiFileOmeTiffAdapter)
-  - Benefit: Correct channel/Z/T ordering for Micro-Manager datasets
+  - Implemented: `_parse_metadata_txt()` handles raw OME-XML and Micro-Manager JSON formats
 
 - [ ] **Handle incomplete multi-file datasets**
   - Current: Opens first file, relies on tifffile's auto-discovery
@@ -151,7 +150,9 @@ Implemented (v0.1):
 
 - [x] **Implement `get_metadata()` in all adapters**
   - OmeZarrAdapter: Returns parsed .zattrs (multiscales, axes, omero)
-  - Other adapters: Return empty dict
+  - OmeTiffAdapter: Returns embedded OME-XML as JSON-serializable dict
+  - MultiFileOmeTiffAdapter: Returns companion _metadata.txt (Micro-Manager JSON) or embedded OME-XML
+  - ZarrAdapter/Hdf5Adapter: Return empty dict (no OME metadata)
   - Files: `base.py`, `ome_zarr.py`, `zarr.py`, `hdf5.py`, `tiff.py`
 
 - [x] **Include metadata in FlightInfo**
@@ -197,13 +198,14 @@ Implemented (v0.1):
 - `src/main/python/biopb/tensor/base.py` - BackendAdapter interface + utilities
 - `src/main/python/biopb/tensor/zarr.py` - ZarrAdapter
 - `src/main/python/biopb/tensor/hdf5.py` - Hdf5Adapter
-- `src/main/python/biopb/tensor/tiff.py` - OmeTiffAdapter, MultiFileOmeTiffAdapter
+- `src/main/python/biopb/tensor/tiff.py` - OmeTiffAdapter, MultiFileOmeTiffAdapter (with metadata support)
 - `src/main/python/biopb/tensor/ome_zarr.py` - OmeZarrAdapter (precompute support)
 - `src/main/python/biopb/tensor/config.py` - Config parsing
 - `src/main/python/biopb/tensor/cli.py` - CLI entrypoint
 - `src/main/python/biopb/tensor/client.py` - Python client
 - `src/main/python/biopb/tensor/server.py` - Flight server
 - `src/test/python/tensor_test.py` - Adapter tests
+- `src/test/python/tensor_extended_test.py` - Extended tests (requires test data)
 
 ### Dependencies
 - Core: pyarrow, grpcio, tifffile, zarr, dask, cachey

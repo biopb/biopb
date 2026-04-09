@@ -6,7 +6,7 @@ from functools import lru_cache
 import numpy as np
 import pyarrow as pa
 
-from biopb.tensor.base import (
+from biopb_tensor_server.base import (
     BackendAdapter,
     ChunkEndpoint,
     _decode_chunk_id,

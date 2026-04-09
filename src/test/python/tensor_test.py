@@ -1,4 +1,4 @@
-"""Tests for TensorFlight server and client."""
+"""Tests for BioPB Tensor server and client."""
 
 import numpy as np
 import zarr
@@ -9,16 +9,18 @@ import time
 import pytest
 
 from biopb.tensor import (
-    ZarrAdapter,
-    OmeZarrAdapter,
-    TensorFlightServer,
     TensorFlightClient,
     TensorDescriptor,
     SliceHint,
     TensorReadOptions,
 )
-from biopb.tensor import base as tensor_adapter
-from biopb.tensor.config import parse_config
+from biopb_tensor_server import (
+    ZarrAdapter,
+    OmeZarrAdapter,
+    TensorFlightServer,
+)
+from biopb_tensor_server import base as tensor_adapter
+from biopb_tensor_server.config import parse_config
 
 
 class TestZarrAdapter:
