@@ -10,13 +10,14 @@ import pytest
 
 from biopb.tensor import (
     ZarrAdapter,
+    OmeZarrAdapter,
     TensorFlightServer,
     TensorFlightClient,
     TensorDescriptor,
     SliceHint,
     TensorReadOptions,
 )
-from biopb.tensor import adapter as tensor_adapter
+from biopb.tensor import base as tensor_adapter
 from biopb.tensor.config import parse_config
 
 
@@ -475,16 +476,17 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
-    def test_non_divisible_scaled_view_raises(self):
-        """Test unsupported chunk/scale combinations fail fast."""
+    def test_non_divisible_scaled_nearest_view(self):
+        """Test nearest downsampling returns ceil-sized output for edge chunks."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, 'invalid.zarr')
-            arr = zarr.open_array(zarr_path, mode='w', shape=(12, 12), chunks=(6, 6), dtype='uint8')
-            arr[:] = 1
+            zarr_path = os.path.join(tmpdir, 'nearest-edge.zarr')
+            source = np.arange(25, dtype=np.uint8).reshape(5, 5)
+            arr = zarr.open_array(zarr_path, mode='w', shape=(5, 5), chunks=(3, 3), dtype='uint8')
+            arr[:] = source
 
-            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'invalid', ['y', 'x'])
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'nearest-edge', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8892')
-            server.register_tensor('invalid', adapter)
+            server.register_tensor('nearest-edge', adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
             server_thread.start()
@@ -492,10 +494,316 @@ class TestTensorFlightClient:
 
             try:
                 with TensorFlightClient('grpc://localhost:8892', cache_bytes=10_000_000) as client:
-                    with pytest.raises(Exception):
-                        client.get_array('invalid', scale_hint=[4, 4], reduction_method='stride')
+                    darr = client.get_array('nearest-edge', scale_hint=[2, 2], reduction_method='nearest')
+                    assert darr.shape == (3, 3)
+                    np.testing.assert_array_equal(darr.compute(), source[::2, ::2])
             finally:
                 server.shutdown()
+
+    def test_non_divisible_scaled_area_slice_uses_edge_padding(self):
+        """Test area downsampling pads from the slice edge rather than reading past it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'area-edge.zarr')
+            source = np.arange(8, dtype=np.uint8).reshape(1, 8)
+            arr = zarr.open_array(zarr_path, mode='w', shape=(1, 8), chunks=(1, 3), dtype='uint8')
+            arr[:] = source
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'area-edge', ['y', 'x'])
+            server = TensorFlightServer('grpc://localhost:8895')
+            server.register_tensor('area-edge', adapter)
+
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                with TensorFlightClient('grpc://localhost:8895', cache_bytes=10_000_000) as client:
+                    darr = client.get_array(
+                        'area-edge',
+                        slice_hint=(slice(0, 1), slice(1, 6)),
+                        read_options=TensorReadOptions(scale_hint=[1, 2], reduction_method='area'),
+                    )
+                    assert darr.shape == (1, 3)
+                    np.testing.assert_array_equal(
+                        darr.compute(),
+                        np.array([[2, 4, 5]], dtype=np.uint8),
+                    )
+            finally:
+                server.shutdown()
+
+    def test_non_divisible_scaled_linear_view(self):
+        """Test linear downsampling uses ceil-sized output with padded edge support."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'linear-edge.zarr')
+            source = np.array([[0, 10, 20, 30, 40]], dtype=np.uint8)
+            arr = zarr.open_array(zarr_path, mode='w', shape=(1, 5), chunks=(1, 3), dtype='uint8')
+            arr[:] = source
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'linear-edge', ['y', 'x'])
+            server = TensorFlightServer('grpc://localhost:8896')
+            server.register_tensor('linear-edge', adapter)
+
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                with TensorFlightClient('grpc://localhost:8896', cache_bytes=10_000_000) as client:
+                    darr = client.get_array(
+                        'linear-edge',
+                        read_options=TensorReadOptions(scale_hint=[1, 2], reduction_method='linear'),
+                    )
+                    assert darr.shape == (1, 3)
+                    np.testing.assert_array_equal(
+                        darr.compute(),
+                        np.array([[5, 25, 40]], dtype=np.uint8),
+                    )
+            finally:
+                server.shutdown()
+
+
+class TestGetScaledReadPlan:
+    """Tests for BackendAdapter.get_scaled_read_plan default implementation."""
+
+    def test_default_uses_virtual_scaling(self):
+        """Test that default get_scaled_read_plan uses virtual scaling."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr[:] = np.arange(100 * 100, dtype=np.uint8).reshape(100, 100)
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
+
+            # Test that default implementation produces virtual scaling plan
+            plan = adapter.get_scaled_read_plan(
+                scale_hint=(2, 2),
+                slice_hint=None,
+                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+            )
+
+            # Should have virtual chunks (2x2 grid = 4 chunks)
+            assert len(plan.chunk_endpoints) == 4
+            assert list(plan.descriptor.shape) == [50, 50]
+            assert list(plan.descriptor.chunk_shape) == [25, 25]  # Virtual chunk shape
+
+    def test_virtual_scaling_with_slice(self):
+        """Test virtual scaling with slice hint."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr[:] = 1
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
+
+            plan = adapter.get_scaled_read_plan(
+                scale_hint=(2, 2),
+                slice_hint=SliceHint(start=[10, 10], stop=[50, 50]),
+                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+            )
+
+            # Shape should be (40/2, 40/2) = (20, 20)
+            assert list(plan.descriptor.shape) == [20, 20]
+
+
+class TestOmeZarrPrecompute:
+    """Tests for OmeZarrAdapter precomputed level support."""
+
+    def test_find_level_for_scale(self):
+        """Test _find_level_for_scale parses multiscales correctly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+
+            # Create OME-Zarr structure with multiscales
+            zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
+            os.makedirs(zarr_path)
+
+            # Create .zattrs with multiscales
+            zattrs = {
+                'multiscales': [{
+                    'name': 'test',
+                    'axes': [{'name': 'y', 'type': 'space'}, {'name': 'x', 'type': 'space'}],
+                    'datasets': [
+                        {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1, 1]}]},
+                        {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [2, 2]}]},
+                        {'path': '2', 'coordinateTransformations': [{'type': 'scale', 'scale': [4, 4]}]},
+                    ]
+                }]
+            }
+            with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
+                json.dump(zattrs, f)
+
+            # Create level arrays
+            import zarr
+            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+            zarr.open_array(os.path.join(zarr_path, '2'), mode='w', shape=(25, 25), chunks=(12, 12), dtype='uint8')
+
+            # Open base level and create adapter
+            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            adapter = OmeZarrAdapter(base_arr, 'test')
+
+            # Test finding levels
+            assert adapter._find_level_for_scale((1, 1)) == '0'
+            assert adapter._find_level_for_scale((2, 2)) == '1'
+            assert adapter._find_level_for_scale((4, 4)) == '2'
+            assert adapter._find_level_for_scale((3, 3)) is None  # No match
+
+    def test_get_scaled_read_plan_precompute(self):
+        """Test get_scaled_read_plan with precompute method."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+            import zarr
+
+            zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
+            os.makedirs(zarr_path)
+
+            zattrs = {
+                'multiscales': [{
+                    'name': 'test',
+                    'axes': [{'name': 'y', 'type': 'space'}, {'name': 'x', 'type': 'space'}],
+                    'datasets': [
+                        {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1, 1]}]},
+                        {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [2, 2]}]},
+                    ]
+                }]
+            }
+            with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
+                json.dump(zattrs, f)
+
+            # Create and populate level arrays
+            arr0 = zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr1 = zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+            arr0[:] = 1
+            arr1[:] = 2
+
+            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            adapter = OmeZarrAdapter(base_arr, 'test')
+
+            # Request with precompute method
+            plan = adapter.get_scaled_read_plan(
+                scale_hint=(2, 2),
+                slice_hint=None,
+                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='precompute'),
+            )
+
+            # Should return level 1's shape
+            assert list(plan.descriptor.shape) == [50, 50]
+            assert list(plan.descriptor.chunk_shape) == [25, 25]
+
+    def test_precompute_no_match_raises(self):
+        """Test that precompute raises error when no matching level."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+            import zarr
+
+            zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
+            os.makedirs(zarr_path)
+
+            zattrs = {
+                'multiscales': [{
+                    'name': 'test',
+                    'axes': [{'name': 'y'}, {'name': 'x'}],
+                    'datasets': [
+                        {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1, 1]}]},
+                        {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [2, 2]}]},
+                    ]
+                }]
+            }
+            with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
+                json.dump(zattrs, f)
+
+            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+
+            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            adapter = OmeZarrAdapter(base_arr, 'test')
+
+            # Request with non-matching scale
+            with pytest.raises(ValueError, match="No precomputed level matching"):
+                adapter.get_scaled_read_plan(
+                    scale_hint=(3, 3),
+                    slice_hint=None,
+                    read_options=TensorReadOptions(scale_hint=[3, 3], reduction_method='precompute'),
+                )
+
+    def test_precompute_falls_back_to_virtual_for_other_methods(self):
+        """Test that non-precompute methods use virtual scaling."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+            import zarr
+
+            zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
+            os.makedirs(zarr_path)
+
+            zattrs = {
+                'multiscales': [{
+                    'name': 'test',
+                    'axes': [{'name': 'y'}, {'name': 'x'}],
+                    'datasets': [
+                        {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1, 1]}]},
+                        {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [2, 2]}]},
+                    ]
+                }]
+            }
+            with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
+                json.dump(zattrs, f)
+
+            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+
+            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            adapter = OmeZarrAdapter(base_arr, 'test')
+
+            # Request with nearest method (not precompute)
+            plan = adapter.get_scaled_read_plan(
+                scale_hint=(2, 2),
+                slice_hint=None,
+                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+            )
+
+            # Should use virtual scaling (shape based on base / scale)
+            assert list(plan.descriptor.shape) == [50, 50]
+            # Virtual chunk shape is base_chunk / scale = 50/2 = 25
+            assert list(plan.descriptor.chunk_shape) == [25, 25]
+
+
+class TestSliceConversion:
+    """Tests for slice coordinate conversion."""
+
+    def test_convert_slice_to_level(self):
+        """Test slice conversion from base to level coordinates."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+            import zarr
+
+            zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
+            os.makedirs(zarr_path)
+
+            zattrs = {
+                'multiscales': [{
+                    'datasets': [
+                        {'path': '0', 'coordinateTransformations': [{'type': 'scale', 'scale': [1, 1]}]},
+                        {'path': '1', 'coordinateTransformations': [{'type': 'scale', 'scale': [4, 2]}]},
+                    ]
+                }]
+            }
+            with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
+                json.dump(zattrs, f)
+
+            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(25, 50), chunks=(12, 25), dtype='uint8')
+
+            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            adapter = OmeZarrAdapter(base_arr, 'test')
+
+            # Test slice conversion
+            level_slice = adapter._convert_slice_to_level(
+                SliceHint(start=[10, 20], stop=[50, 60]),
+                (4, 2)
+            )
+
+            assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
+            assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
 
 
 if __name__ == '__main__':

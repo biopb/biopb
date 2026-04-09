@@ -18,7 +18,7 @@ from biopb.tensor.ticket_pb2 import (
     TensorTicket, ChunkBounds
 )
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.adapter import BackendAdapter, plan_tensor_read, resolve_chunk_data
+from biopb.tensor.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -151,6 +151,8 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             FlightInfo with schema and chunk endpoints
         """
+        import json
+
         tensor_desc = self._parse_descriptor(descriptor)
 
         adapter = self._tensors.get(tensor_desc.array_id)
@@ -159,6 +161,11 @@ class TensorFlightServer(flight.FlightServerBase):
 
         read_plan = plan_tensor_read(adapter, tensor_desc)
         schema = adapter.get_arrow_schema(read_plan.descriptor)
+
+        # Populate metadata_json in response descriptor
+        metadata = adapter.get_metadata()
+        if metadata:
+            read_plan.descriptor.metadata_json = json.dumps(metadata)
 
         # Convert to FlightEndpoints
         endpoints = []
@@ -193,8 +200,6 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             FlightDataStream with the chunk data
         """
-        from biopb.tensor.adapter import _decode_chunk_id
-
         tensor_ticket = self._parse_ticket(ticket)
 
         # Decode array_id from chunk_id

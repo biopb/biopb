@@ -30,6 +30,12 @@ message TensorDescriptor {
   // These do not change tensor identity, only how a specific read request
   // should be planned and served.
   TensorReadOptions read_options = 7;
+
+  // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
+  // Contains: multiscales, axes, coordinateTransformations, channels, etc.
+  // For precomputed pyramids: multiscales[].datasets[].path and scale info.
+  // Empty string if no metadata available.
+  string metadata_json = 8;
 }
 
 // Specifies a sub-region of the tensor for filtered endpoint discovery

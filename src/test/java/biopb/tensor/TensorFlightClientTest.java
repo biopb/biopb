@@ -125,6 +125,50 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testScaledReadAcceptsClippedEdgeChunks() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorReadOptions readOptions = TensorReadOptions.newBuilder()
+                        .addScaleHint(2)
+                        .addScaleHint(2)
+                        .setReductionMethod("linear")
+                        .build();
+
+                TensorDescriptor descriptor = client.getDescriptor("test-array", readOptions);
+                Assert.assertEquals(Arrays.asList(3L, 3L), descriptor.getShapeList());
+                Assert.assertEquals(Arrays.asList(2L, 2L), descriptor.getChunkShapeList());
+
+                RandomAccessibleInterval<FloatType> scaled = client.getArray("test-array", readOptions);
+                Assert.assertEquals(0, server.getTotalChunkRequestCount());
+
+                Assert.assertEquals(3, scaled.dimension(0));
+                Assert.assertEquals(3, scaled.dimension(1));
+
+                Assert.assertEquals(1.0f, scaled.getAt(0, 0).get(), 0.0001f);
+                Assert.assertEquals(1, server.getChunkRequestCount("scaled-edge-0-0"));
+                Assert.assertEquals(1, server.getTotalChunkRequestCount());
+
+                Assert.assertEquals(3.0f, scaled.getAt(0, 2).get(), 0.0001f);
+                Assert.assertEquals(1, server.getChunkRequestCount("scaled-edge-0-1"));
+                Assert.assertEquals(2, server.getTotalChunkRequestCount());
+
+                Assert.assertEquals(7.0f, scaled.getAt(2, 0).get(), 0.0001f);
+                Assert.assertEquals(1, server.getChunkRequestCount("scaled-edge-1-0"));
+                Assert.assertEquals(3, server.getTotalChunkRequestCount());
+
+                Assert.assertEquals(9.0f, scaled.getAt(2, 2).get(), 0.0001f);
+                Assert.assertEquals(1, server.getChunkRequestCount("scaled-edge-1-1"));
+                Assert.assertEquals(4, server.getTotalChunkRequestCount());
+
+                Assert.assertEquals(9.0f, scaled.getAt(2, 2).get(), 0.0001f);
+                Assert.assertEquals(1, server.getChunkRequestCount("scaled-edge-1-1"));
+                Assert.assertEquals(4, server.getTotalChunkRequestCount());
+                Assert.assertEquals("linear", server.getLastReductionMethod());
+            }
+        }
+    }
+
+    @Test
     public void testScaledDescriptorConvenienceNormalizesAlias() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
@@ -274,6 +318,10 @@ public class TensorFlightClientTest {
             chunkData.put("scaled-0-1", new float[] {3});
             chunkData.put("scaled-1-0", new float[] {9});
             chunkData.put("scaled-1-1", new float[] {11});
+            chunkData.put("scaled-edge-0-0", new float[] {1, 2, 4, 5});
+            chunkData.put("scaled-edge-0-1", new float[] {3, 6});
+            chunkData.put("scaled-edge-1-0", new float[] {7, 8});
+            chunkData.put("scaled-edge-1-1", new float[] {9});
         }
 
         int getChunkRequestCount(String chunkId) {
@@ -319,7 +367,29 @@ public class TensorFlightClientTest {
                     ? requestDescriptor.getReadOptions()
                     : null;
 
-            if (readOptions != null
+                if (readOptions != null
+                    && readOptions.getScaleHintCount() == 2
+                    && readOptions.getScaleHint(0) == 2
+                    && readOptions.getScaleHint(1) == 2
+                    && "linear".equals(readOptions.getReductionMethod())) {
+                TensorDescriptor responseDescriptor = TensorDescriptor.newBuilder(baseDescriptor)
+                    .clearShape()
+                    .clearChunkShape()
+                    .addShape(3)
+                    .addShape(3)
+                    .addChunkShape(2)
+                    .addChunkShape(2)
+                    .setReadOptions(readOptions)
+                    .build();
+                return new FlightInfo(
+                    schema,
+                    FlightDescriptor.command(responseDescriptor.toByteArray()),
+                    scaledEdgeEndpoints(),
+                    -1,
+                    -1);
+                }
+
+                if (readOptions != null
                     && readOptions.getScaleHintCount() == 2
                     && readOptions.getScaleHint(0) == 2
                     && readOptions.getScaleHint(1) == 2) {
@@ -394,6 +464,15 @@ public class TensorFlightClientTest {
             endpoints.add(endpoint("scaled-0-1", 0, 1, 1, 2));
             endpoints.add(endpoint("scaled-1-0", 1, 0, 2, 1));
             endpoints.add(endpoint("scaled-1-1", 1, 1, 2, 2));
+            return endpoints;
+        }
+
+        private List<FlightEndpoint> scaledEdgeEndpoints() {
+            List<FlightEndpoint> endpoints = new ArrayList<>();
+            endpoints.add(endpoint("scaled-edge-0-0", 0, 0, 2, 2));
+            endpoints.add(endpoint("scaled-edge-0-1", 0, 2, 2, 3));
+            endpoints.add(endpoint("scaled-edge-1-0", 2, 0, 3, 2));
+            endpoints.add(endpoint("scaled-edge-1-1", 2, 2, 3, 3));
             return endpoints;
         }
 

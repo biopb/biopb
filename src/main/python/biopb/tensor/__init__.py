@@ -20,13 +20,29 @@ from biopb.tensor.descriptor_pb2 import (
     TensorWriteOptions,
 )
 
-from biopb.tensor.adapter import (
+# Import base classes and utilities from base module
+from biopb.tensor.base import (
     BackendAdapter,
     ChunkEndpoint,
-    ZarrAdapter,
-    Hdf5Adapter,
-    OmeTiffAdapter,
+    TensorReadPlan,
+    ComputeBackendOptions,
+    build_arrow_schema,
+    configure_compute_backend,
+    get_compute_backend_options,
+    plan_tensor_read,
+    resolve_chunk_data,
+    _chunks_intersect,
+    _encode_chunk_id,
+    _decode_chunk_id,
 )
+
+# Import concrete adapters from their respective modules
+from biopb.tensor.zarr import ZarrAdapter
+from biopb.tensor.hdf5 import Hdf5Adapter
+from biopb.tensor.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
+from biopb.tensor.ome_zarr import OmeZarrAdapter
+
+# Import server and client
 from biopb.tensor.server import (
     TensorFlightServer,
     serve,
@@ -44,12 +60,25 @@ __all__ = [
     'TensorCriteria',
     'TensorReadOptions',
     'TensorWriteOptions',
-    # Adapters
+    # Base classes and utilities
     'BackendAdapter',
     'ChunkEndpoint',
+    'TensorReadPlan',
+    'ComputeBackendOptions',
+    'build_arrow_schema',
+    'configure_compute_backend',
+    'get_compute_backend_options',
+    'plan_tensor_read',
+    'resolve_chunk_data',
+    '_chunks_intersect',
+    '_encode_chunk_id',
+    '_decode_chunk_id',
+    # Concrete adapters
     'ZarrAdapter',
     'Hdf5Adapter',
     'OmeTiffAdapter',
+    'MultiFileOmeTiffAdapter',
+    'OmeZarrAdapter',
     # Server
     'TensorFlightServer',
     'serve',

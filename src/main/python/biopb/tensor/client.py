@@ -98,6 +98,23 @@ class TensorFlightClient:
 
         raise ValueError(f"Tensor not found: {array_id}")
 
+    def get_metadata(self, array_id: str) -> dict:
+        """Get OME-compatible metadata for a tensor.
+
+        Args:
+            array_id: Tensor identifier
+
+        Returns:
+            Parsed metadata_json (multiscales, axes, omero, etc.)
+            per OME-NGFF schema, or empty dict if no metadata.
+        """
+        import json
+
+        desc = self.get_descriptor(array_id)
+        if desc.metadata_json:
+            return json.loads(desc.metadata_json)
+        return {}
+
     def get_array(
         self,
         array_id: str,
