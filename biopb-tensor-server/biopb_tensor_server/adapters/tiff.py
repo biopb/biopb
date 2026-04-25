@@ -1,9 +1,11 @@
-"""OME-TIFF adapters for tensor storage."""
+"""OME-TIFF adapters for tensor storage.
+
+Relies on OS page cache for raw data caching.
+"""
 
 import struct
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
-from functools import lru_cache
 
 import numpy as np
 import pyarrow as pa
@@ -128,7 +130,7 @@ class OmeTiffAdapter(BackendAdapter):
     - uint16 ndim
     - int64[ndim] tile indices
 
-    Uses LRU caching for decoded tiles to avoid repeated decompression.
+    Relies on OS page cache for raw data caching.
     """
 
     def __init__(
@@ -136,7 +138,6 @@ class OmeTiffAdapter(BackendAdapter):
         tiff_file,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
-        cache_size: int = 256
     ):
         """Initialize OME-TIFF adapter.
 
@@ -144,11 +145,9 @@ class OmeTiffAdapter(BackendAdapter):
             tiff_file: tifffile.TiffFile object
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels
-            cache_size: Number of tiles to cache (default 256)
         """
         self.tiff_file = tiff_file
         self.array_id = array_id
-        self.cache_size = cache_size
 
         # Get series info
         self.series = tiff_file.series[0]
@@ -183,10 +182,6 @@ class OmeTiffAdapter(BackendAdapter):
         # Non-spatial dimensions (like channel/time) have chunk size = 1
         self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
 
-        # Initialize LRU cache for decoded tiles
-        # Cache key is the chunk_id (bytes, which is hashable)
-        self._get_decoded_tile = lru_cache(maxsize=cache_size)(self._get_decoded_tile_uncached)
-
     def get_tensor_descriptor(self) -> TensorDescriptor:
         # Get dtype from first page
         first_page = self.tiff_file.pages[0]
@@ -207,25 +202,20 @@ class OmeTiffAdapter(BackendAdapter):
         endpoints = []
 
         # Iterate over all IFDs (pages/planes)
-        for ifd_index in range(len(self.tiff_file.pages)):
-            page = self.tiff_file.pages[ifd_index]
+        n_pages = len(self.tiff_file.pages)
 
-            if not page.is_tiled:
-                continue
-
+        for ifd_index in range(n_pages):
             # Compute plane offset in full array
-            # For XYZCT layout, each IFD corresponds to one (C, T, Z) combo
-            # This depends on the specific OME-TIFF structure
             plane_offset = ifd_index
 
             # Iterate over tiles in this page
             for tile_row in range(self.tiles_per_col):
                 for tile_col in range(self.tiles_per_row):
-                    # Compute chunk bounds
+                    # Compute chunk bounds using precomputed tile dimensions
                     y_start = tile_row * self.tile_length
-                    y_stop = min((tile_row + 1) * self.tile_length, page.shape[0])
+                    y_stop = min((tile_row + 1) * self.tile_length, self.series_shape[-2])
                     x_start = tile_col * self.tile_width
-                    x_stop = min((tile_col + 1) * self.tile_width, page.shape[1])
+                    x_stop = min((tile_col + 1) * self.tile_width, self.series_shape[-1])
 
                     # Full bounds including plane dimension
                     chunk_start = [plane_offset, y_start, x_start]
@@ -247,8 +237,8 @@ class OmeTiffAdapter(BackendAdapter):
 
         return endpoints
 
-    def _get_decoded_tile_uncached(self, chunk_id: bytes) -> np.ndarray:
-        """Decode a tile from the TIFF file (uncached)."""
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Decode a tile from the TIFF file (no caching - relies on OS page cache)."""
         _, backend_data = _decode_chunk_id(chunk_id)
         ifd_index, tile_indices = _decode_ome_tile(backend_data)
         tile_row, tile_col = tile_indices
@@ -274,11 +264,6 @@ class OmeTiffAdapter(BackendAdapter):
         if data.ndim == 3:
             data = data[0]
 
-        return data
-
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        # Use cached tile decoding
-        data = self._get_decoded_tile(chunk_id)
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
@@ -323,7 +308,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     - uint16 ndim
     - int64[ndim] tile indices
 
-    Uses LRU caching for decoded tiles.
+    Relies on OS page cache for raw data caching.
     """
 
     def __init__(
@@ -331,7 +316,6 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         directory: str,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
-        cache_size: int = 256
     ):
         """Initialize multi-file OME-TIFF adapter.
 
@@ -339,34 +323,75 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             directory: Path to directory containing multi-file dataset
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels
-            cache_size: Number of tiles to cache (default 256)
         """
         import tifffile
         from pathlib import Path
 
         self.directory = Path(directory)
         self.array_id = array_id
-        self.cache_size = cache_size
 
-        # Find all OME-TIFF files in directory
-        patterns = ["img_*.ome.tiff", "img_*.ome.tif", "*.ome.tiff", "*.ome.tif"]
-        tiff_files = []
-        for pattern in patterns:
-            tiff_files.extend(sorted(self.directory.glob(pattern)))
+        # Try to get explicit file list from _metadata.txt OME-XML
+        expected_files = self._parse_file_list_from_metadata()
+        self._missing_files = []
 
-        if not tiff_files:
-            raise ValueError(f"No OME-TIFF files found in {directory}")
+        if expected_files:
+            # Use explicit file list from metadata
+            tiff_files = []
+            for fname in expected_files:
+                fpath = self.directory / fname
+                if fpath.exists():
+                    tiff_files.append(fpath)
+                else:
+                    self._missing_files.append(fname)
 
-        # Open first file - tifffile auto-discovers related files via OME-XML
+            if self._missing_files:
+                import warnings
+                warnings.warn(
+                    f"Multi-file OME-TIFF dataset has missing files: {self._missing_files}. "
+                    f"Proceeding with {len(tiff_files)} available files."
+                )
+
+            if not tiff_files:
+                raise ValueError(
+                    f"No OME-TIFF files found in {directory}. "
+                    f"Expected files: {expected_files}, missing: {self._missing_files}"
+                )
+        else:
+            # Fall back to glob discovery (legacy behavior)
+            patterns = [
+                "img_*.ome.tiff", "img_*.ome.tif",
+                "*.ome.tiff", "*.ome.tif",
+                "img_channel*.tif", "img_*.tif",  # Micro-Manager standard format
+            ]
+            tiff_files = []
+            for pattern in patterns:
+                tiff_files.extend(sorted(self.directory.glob(pattern)))
+
+            if not tiff_files:
+                raise ValueError(f"No OME-TIFF files found in {directory}")
+
+        # Open first file to check for OME metadata and get tile info
         self.tiff_file = tifffile.TiffFile(str(tiff_files[0]))
+        self._tiff_sequence = None
 
-        # Get unified series info (spans all files)
-        if len(self.tiff_file.series) == 0:
-            raise ValueError("No series found in OME-TIFF dataset")
+        # Check if this is an OME-TIFF with auto-discovery
+        has_ome_metadata = hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None
 
-        self.series = self.tiff_file.series[0]
-        self.series_shape = self.series.shape
-        self.series_dims = self.series.dims
+        # For non-OME multi-file datasets, use TiffSequence to get proper multi-file shape
+        if not has_ome_metadata and len(tiff_files) > 1:
+            self._tiff_sequence = tifffile.TiffSequence([str(f) for f in tiff_files])
+            seq_shape = self._tiff_sequence.shape
+            if len(seq_shape) == 1:
+                first_page = self.tiff_file.pages[0]
+                seq_shape = (len(tiff_files), first_page.shape[0], first_page.shape[1])
+            self.series_shape = seq_shape
+            self.series_dims = tuple(['plane'] + list(self.tiff_file.series[0].dims))
+        else:
+            if len(self.tiff_file.series) == 0:
+                raise ValueError("No series found in OME-TIFF dataset")
+            self.series = self.tiff_file.series[0]
+            self.series_shape = self.series.shape
+            self.series_dims = self.series.dims
 
         # Get tile info from first page of first file
         first_page = self.tiff_file.pages[0]
@@ -394,18 +419,10 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         else:
             self.dim_labels = [d if isinstance(d, str) else str(d) for d in self.series_dims]
 
-        # Full shape
-        self.full_shape = list(self.series_shape)
-        self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
-
         # Build file index for IFD access
-        # Each file contains multiple IFDs (planes)
-        # We need to map global IFD index to (file_index, local_ifd_index)
-        self._file_ifd_map = []  # List of (file_path, local_ifd_count)
-        self._ifd_to_file = []   # Maps global IFD index to (file_index, local_ifd_index)
+        self._file_ifd_map = []
+        self._ifd_to_file = []
 
-        # For simple case: assume each file has same number of IFDs
-        # More complex: parse OME-XML to understand C,Z,T distribution
         global_ifd_index = 0
         for file_path in tiff_files:
             with tifffile.TiffFile(str(file_path)) as tf:
@@ -418,11 +435,15 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         self._total_ifds = global_ifd_index
         self._tiff_files = tiff_files
 
-        # Initialize LRU cache
-        self._get_decoded_tile = lru_cache(maxsize=cache_size)(self._get_decoded_tile_uncached)
+        # Full shape (adjust for partial datasets)
+        self.full_shape = list(self.series_shape)
+        if self._missing_files and len(self.full_shape) >= 2:
+            if self._total_ifds < self.full_shape[0]:
+                self.full_shape[0] = self._total_ifds
+
+        self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        # Get dtype from first page
         first_page = self.tiff_file.pages[0]
         dtype = first_page.dtype
 
@@ -442,16 +463,13 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         endpoints = []
 
-        # Iterate over all IFDs across all files
         for global_ifd_index in range(self._total_ifds):
             file_index, local_ifd_index = self._ifd_to_file[global_ifd_index]
             file_path = self._tiff_files[file_index]
 
-            # Open file to get page info
             with tifffile.TiffFile(str(file_path)) as tf:
                 page = tf.pages[local_ifd_index]
 
-                # Use pre-computed tile counts (handles both tiled and non-tiled)
                 tiles_per_row = self.tiles_per_row
                 tiles_per_col = self.tiles_per_col
 
@@ -484,8 +502,8 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         return endpoints
 
-    def _get_decoded_tile_uncached(self, chunk_id: bytes) -> np.ndarray:
-        """Decode a tile from the multi-file dataset (uncached)."""
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Decode a tile from the multi-file dataset (no caching)."""
         import tifffile
 
         _, backend_data = _decode_chunk_id(chunk_id)
@@ -498,7 +516,6 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             page = tf.pages[local_ifd_index]
 
             if self.is_tiled:
-                # Tiled: read specific tile
                 tiles_per_row = (page.shape[1] + self.tile_width - 1) // self.tile_width
                 tile_idx = tile_row * tiles_per_row + tile_col
 
@@ -518,31 +535,18 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             if data.ndim == 3:
                 data = data[0]
 
-            return data
-
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        data = self._get_decoded_tile(chunk_id)
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+            arr = pa.array(data.ravel())
+            return pa.RecordBatch.from_arrays([arr], ["data"])
 
     def get_metadata(self) -> dict:
-        """Return OME metadata from multi-file dataset.
-
-        First checks for companion _metadata.txt file (Micro-Manager format),
-        then falls back to embedded OME-XML from TIFF.
-
-        Returns:
-            OME-XML as JSON-serializable dict, or empty dict if no metadata.
-        """
+        """Return OME metadata from multi-file dataset."""
         import xml.etree.ElementTree as ET
 
         # Check for companion _metadata.txt file
-        # Micro-Manager uses _metadata.txt with OME-XML content
         metadata_patterns = ["_metadata.txt", "*_metadata.txt"]
         for pattern in metadata_patterns:
             metadata_files = list(self.directory.glob(pattern))
             if metadata_files:
-                # Parse OME-XML from the companion file
                 try:
                     return self._parse_metadata_txt(metadata_files[0])
                 except Exception:
@@ -563,40 +567,87 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         return {}
 
     def _parse_metadata_txt(self, metadata_path) -> dict:
-        """Parse OME-XML from companion metadata file.
-
-        Micro-Manager _metadata.txt contains JSON with OME-XML embedded,
-        or may contain raw OME-XML.
-
-        Args:
-            metadata_path: Path to _metadata.txt file
-
-        Returns:
-            OME-XML as JSON-serializable dict
-        """
+        """Parse OME-XML from companion metadata file."""
         import json
 
         content = metadata_path.read_text()
 
-        # Try parsing as raw OME-XML first
         try:
             root = ET.fromstring(content)
             return _elementtree_to_dict(root)
         except ET.ParseError:
             pass
 
-        # Try parsing as JSON (some Micro-Manager formats)
         try:
             data = json.loads(content)
-            # Look for OME-XML string in JSON structure
             if isinstance(data, dict):
-                # Common Micro-Manager format: {"OME": "<OME>...</OME>"}
                 if "OME" in data and isinstance(data["OME"], str):
                     root = ET.fromstring(data["OME"])
                     return _elementtree_to_dict(root)
-                # Return JSON directly if no embedded XML
                 return data
         except json.JSONDecodeError:
             pass
 
         return {}
+
+    def _parse_file_list_from_metadata(self) -> Optional[List[str]]:
+        """Extract ordered file list from metadata.txt or _metadata.txt."""
+        import json
+
+        metadata_patterns = ["metadata.txt", "_metadata.txt", "*_metadata.txt"]
+        metadata_files = []
+        for pattern in metadata_patterns:
+            metadata_files.extend(self.directory.glob(pattern))
+
+        if not metadata_files:
+            return None
+
+        content = metadata_files[0].read_text()
+
+        try:
+            root = ET.fromstring(content)
+            files = []
+            for tiff_data in root.iter():
+                if tiff_data.tag.endswith('TiffData') or tiff_data.tag == 'TiffData':
+                    for uuid_elem in tiff_data:
+                        if uuid_elem.tag.endswith('UUID') or uuid_elem.tag == 'UUID':
+                            filename = uuid_elem.get('FileName')
+                            if filename:
+                                files.append(filename)
+            return files if files else None
+        except ET.ParseError:
+            pass
+
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict) and "OME" in data and isinstance(data["OME"], str):
+                root = ET.fromstring(data["OME"])
+                files = []
+                for tiff_data in root.iter():
+                    if tiff_data.tag.endswith('TiffData') or tiff_data.tag == 'TiffData':
+                        for uuid_elem in tiff_data:
+                            if uuid_elem.tag.endswith('UUID') or uuid_elem.tag == 'UUID':
+                                filename = uuid_elem.get('FileName')
+                                if filename:
+                                    files.append(filename)
+                return files if files else None
+        except (json.JSONDecodeError, ET.ParseError):
+            pass
+
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                files_set = set()
+                for key in data.keys():
+                    if key.startswith('Coords-') or key.startswith('Metadata-'):
+                        if '/' in key:
+                            filename = key.split('/', 1)[1]
+                            if filename.endswith('.tif') or filename.endswith('.tiff'):
+                                files_set.add(filename)
+                if files_set:
+                    files = sorted(files_set)
+                    return files
+        except json.JSONDecodeError:
+            pass
+
+        return None

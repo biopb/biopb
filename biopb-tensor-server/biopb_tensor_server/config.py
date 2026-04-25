@@ -59,20 +59,47 @@ class TensorSource:
 
     Attributes:
         path: Path to file or directory
-        type: Storage type - "zarr", "hdf5", or "ome-tiff". Optional - auto-detected if None.
+        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", or "aics".
+              Optional - auto-detected if None.
         array_id: Unique identifier (required for files, auto-generated for directories)
         dim_labels: Dimension labels (optional)
         dataset: HDF5 dataset path (required for HDF5 type)
+        scene_index: Scene index for aics multi-scene files (optional)
     """
     path: Path
-    type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr"]] = None
+    type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "aics"]] = None
     array_id: Optional[str] = None
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
+    scene_index: Optional[int] = None  # For aics multi-scene files
 
     def __post_init__(self):
         if isinstance(self.path, str):
             self.path = Path(self.path)
+
+
+@dataclass
+class CacheConfig:
+    """Cache configuration for computed virtual chunks.
+
+    Attributes:
+        backend: Cache backend type - "memory" or "file"
+        memory_max_entries: Maximum number of cached entries (memory backend)
+        memory_max_bytes: Maximum total bytes to cache (memory backend, default 512 MB)
+        file_cache_dir: Directory for cache files (file backend, default /tmp/biopb-cache)
+        file_max_segment_bytes: Maximum bytes per segment file (file backend, default 64 MB)
+        file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
+    """
+    backend: str = "memory"
+    memory_max_entries: int = 1024
+    memory_max_bytes: int = 512 * 1024 * 1024  # 512 MB
+    file_cache_dir: Path = Path("/tmp/biopb-cache")
+    file_max_segment_bytes: int = 64 * 1024 * 1024  # 64 MB per segment
+    file_max_total_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GB total
+
+    def __post_init__(self):
+        if isinstance(self.file_cache_dir, str):
+            self.file_cache_dir = Path(self.file_cache_dir)
 
 
 @dataclass
@@ -82,6 +109,7 @@ class ServerConfig:
     Attributes:
         host: Server host
         port: Server port
+        cache: Cache configuration
         sources: List of tensor sources
     """
     host: str = "0.0.0.0"
@@ -91,6 +119,7 @@ class ServerConfig:
     gpu_min_linear_input_mb: float = 2.0
     gpu_memory_safety_factor: int = 4
     gpu_min_merged_chunks: int = 4
+    cache: CacheConfig = field(default_factory=CacheConfig)
     sources: List[TensorSource] = field(default_factory=list)
 
 
@@ -141,6 +170,30 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     gpu_memory_safety_factor = compute_data.get("gpu_memory_safety_factor", 4)
     gpu_min_merged_chunks = compute_data.get("gpu_min_merged_chunks", 4)
 
+    # Parse cache settings
+    cache_data = data.get("cache", {})
+    cache_backend = cache_data.get("backend", "memory")
+
+    # Parse memory backend settings
+    memory_max_entries = cache_data.get("max_entries", 1024)
+    memory_max_bytes = cache_data.get("max_bytes", 512 * 1024 * 1024)
+
+    # Parse file backend settings (convert MB/GB to bytes if specified)
+    file_cache_dir = Path(cache_data.get("file_cache_dir", "/tmp/biopb-cache"))
+    file_max_segment_mb = cache_data.get("file_max_segment_mb", 64)
+    file_max_segment_bytes = int(file_max_segment_mb) * 1024 * 1024
+    file_max_total_gb = cache_data.get("file_max_total_gb", 4)
+    file_max_total_bytes = int(file_max_total_gb) * 1024 * 1024 * 1024
+
+    cache_config = CacheConfig(
+        backend=cache_backend,
+        memory_max_entries=memory_max_entries,
+        memory_max_bytes=memory_max_bytes,
+        file_cache_dir=file_cache_dir,
+        file_max_segment_bytes=file_max_segment_bytes,
+        file_max_total_bytes=file_max_total_bytes,
+    )
+
     # Parse sources
     sources_data = data.get("sources", [])
     sources: List[TensorSource] = []
@@ -163,6 +216,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),
         gpu_memory_safety_factor=int(gpu_memory_safety_factor),
         gpu_min_merged_chunks=int(gpu_min_merged_chunks),
+        cache=cache_config,
         sources=sources,
     )
 
@@ -170,7 +224,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 def detect_source_type(path: Path) -> Optional[str]:
     """Detect source type from path characteristics.
 
-    Returns one of: "zarr", "ome-zarr", "ome-tiff", "ome-tiff-multifile"
+    Returns one of: "zarr", "ome-zarr", "ome-tiff", "ome-tiff-multifile", "aics"
     or None if type cannot be determined.
 
     Note: HDF5 is NOT auto-detected because it requires explicit dataset path.
@@ -179,6 +233,12 @@ def detect_source_type(path: Path) -> Optional[str]:
 
     if path.is_file():
         name = path.name.lower()
+
+        # aicsimageio-supported vendor formats
+        aics_extensions = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml']
+        for ext in aics_extensions:
+            if name.endswith(ext):
+                return 'aics'
 
         # OME-TIFF files
         if name.endswith('.ome.tiff') or name.endswith('.ome.tif'):
@@ -260,13 +320,18 @@ def scan_directory_for_sources(
         if item.is_file():
             detected_type = detect_source_type(item)
             if detected_type:
-                array_id = item.stem
-                discovered.append(TensorSource(
-                    type=detected_type,
-                    path=item,
-                    array_id=array_id,
-                    dim_labels=dim_labels,
-                ))
+                # Special handling for aics: expand to multiple scenes
+                if detected_type == "aics":
+                    sources = discover_aics_scenes(item, item.stem, dim_labels)
+                    discovered.extend(sources)
+                else:
+                    array_id = item.stem
+                    discovered.append(TensorSource(
+                        type=detected_type,
+                        path=item,
+                        array_id=array_id,
+                        dim_labels=dim_labels,
+                    ))
             elif item.name.lower().endswith('.h5') or item.name.lower().endswith('.hdf5'):
                 skipped_hdf5.append(item)
             else:
@@ -394,7 +459,57 @@ def _discover_by_type(
                             dim_labels=dim_labels,
                         ))
 
+    elif source_type == "aics":
+        # Discover aicsimageio-supported files and expand to scenes
+        aics_extensions = ["*.czi", "*.lif", "*.nd2", "*.dv", "*.lsm"]
+        for pattern in aics_extensions:
+            for file_path in sorted(path.glob(pattern)):
+                if file_path.is_file():
+                    sources = discover_aics_scenes(file_path, file_path.stem, dim_labels)
+                    discovered.extend(sources)
+
     return discovered
+
+
+def discover_aics_scenes(
+    path: Path,
+    stem: str,
+    dim_labels: Optional[List[str]] = None
+) -> List[TensorSource]:
+    """Discover all scenes in an aicsimageio-compatible file.
+
+    Opens the file with AICSImage to enumerate scenes, creating one
+    TensorSource per scene with array_id "{stem}_scene{i}".
+
+    Args:
+        path: Path to the aicsimageio-compatible file
+        stem: Base name for array_id (typically filename without extension)
+        dim_labels: Optional dimension labels
+
+    Returns:
+        List of TensorSource objects, one per scene
+    """
+    try:
+        from aicsimageio import AICSImage
+    except ImportError:
+        raise ImportError(
+            "aicsimageio is required for vendor format support. "
+            "Install with: pip install 'biopb-tensor-server[aics]'"
+        )
+
+    img = AICSImage(str(path))
+    sources = []
+
+    for i in range(len(img.scenes)):
+        sources.append(TensorSource(
+            type="aics",
+            path=path,
+            array_id=f"{stem}_scene{i}",
+            dim_labels=dim_labels,
+            scene_index=i,
+        ))
+
+    return sources
 
 
 def discover_sources(source: TensorSource) -> List[TensorSource]:
@@ -425,6 +540,11 @@ def discover_sources(source: TensorSource) -> List[TensorSource]:
     if path.is_file():
         detected_type = source.type or detect_source_type(path)
         if detected_type:
+            # Special handling for aics: one file may contain multiple scenes
+            if detected_type == "aics":
+                stem = source.array_id or path.stem
+                return discover_aics_scenes(path, stem, source.dim_labels)
+
             array_id = source.array_id or path.stem
             return [TensorSource(
                 type=detected_type,

@@ -20,6 +20,7 @@ from biopb.tensor.ticket_pb2 import (
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id
+from biopb_tensor_server.cache import CacheManager
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -211,8 +212,11 @@ class TensorFlightServer(flight.FlightServerBase):
         if adapter is None:
             raise flight.FlightServerError(f"Tensor not found: {array_id}")
 
-        # Read the chunk
-        record_batch = resolve_chunk_data(adapter, tensor_ticket.chunk_id)
+        # Get cache manager singleton (if initialized)
+        cache_manager = CacheManager.get_instance()
+
+        # Read the chunk (with caching for virtual chunks)
+        record_batch = resolve_chunk_data(adapter, tensor_ticket.chunk_id, cache_manager)
         return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
 
 

@@ -8,13 +8,17 @@ Implemented (v0.1):
 - [x] OmeTiffAdapter (single-file) with LRU caching
 - [x] MultiFileOmeTiffAdapter (basic)
 - [x] OmeZarrAdapter with precomputed pyramid support
+- [x] AicsImageIoAdapter for vendor formats (CZI, LIF, ND2, DV)
+  - Multi-scene file support (1 file → multiple tensors)
+  - Scene discovery with auto-expansion
+  - LRU caching at adapter level
 - [x] Client-side chunk caching with cachey
 - [x] Config support for all adapter types
 - [x] CLI with --cache-size option
 - [x] Virtual scaling (runtime downsampling)
 - [x] Precomputed multi-scale pyramid routing
 - [x] Metadata transmission protocol (metadata_json)
-- [x] Modular adapter architecture (base.py, zarr.py, hdf5.py, tiff.py, ome_zarr.py)
+- [x] Modular adapter architecture (base.py, zarr.py, hdf5.py, tiff.py, ome_zarr.py, aicsimageio.py)
 
 ---
 
@@ -96,17 +100,6 @@ Implemented (v0.1):
 - [ ] **Compression options**
   - Current: Raw Arrow serialization
   - Enhancement: Optional LZ4/ZSTD for network transfer
-
----
-
-## TODO: aicsimageio Integration
-
-### Low Priority (deferred)
-
-- [ ] **AicsImageIoAdapter**
-  - Wrap aicsimageio for vendor format support (CZI, LIF, ND2)
-  - Make it optional dependency (~50-100MB)
-  - Use fsspec for network transparency where supported
 
 ---
 
@@ -200,8 +193,9 @@ Implemented (v0.1):
 - `src/main/python/biopb/tensor/hdf5.py` - Hdf5Adapter
 - `src/main/python/biopb/tensor/tiff.py` - OmeTiffAdapter, MultiFileOmeTiffAdapter (with metadata support)
 - `src/main/python/biopb/tensor/ome_zarr.py` - OmeZarrAdapter (precompute support)
-- `src/main/python/biopb/tensor/config.py` - Config parsing
-- `src/main/python/biopb/tensor/cli.py` - CLI entrypoint
+- `biopb-tensor-server/biopb_tensor_server/adapters/aicsimageio.py` - AicsImageIoAdapter (vendor formats)
+- `biopb-tensor-server/biopb_tensor_server/config.py` - Config parsing, source discovery
+- `biopb-tensor-server/biopb_tensor_server/cli.py` - CLI entrypoint
 - `src/main/python/biopb/tensor/client.py` - Python client
 - `src/main/python/biopb/tensor/server.py` - Flight server
 - `src/test/python/tensor_test.py` - Adapter tests
@@ -209,4 +203,76 @@ Implemented (v0.1):
 
 ### Dependencies
 - Core: pyarrow, grpcio, tifffile, zarr, dask, cachey
-- Optional: ome-zarr (for OME-Zarr metadata), h5py (for HDF5)
+- Optional: ome-zarr (for OME-Zarr metadata), h5py (for HDF5), aicsimageio (for vendor formats)
+
+---
+
+## TODO: Multi-Field / Multi-Position Dataset Handling
+
+### Problem Statement
+
+Many microscopy acquisition formats support multiple fields of view (positions/FOVs) in a single dataset:
+
+| Format | Multi-field support | Current handling |
+|--------|--------------------|------------------|
+| Micro-Manager multi-file | `FOV_1/`, `FOV_2/` directories | Each FOV directory → separate source discovery (broken) |
+| Nikon ND2 | Single file with multiple positions | Single tensor (no position separation) |
+| Zeiss CZI | Scenes within file | Handled via aicsimageio scene expansion ✓ |
+| Leica LIF | Scenes within file | Handled via aicsimageio scene expansion ✓ |
+| OME-Zarr HCS plate | Wells/positions | Not handled (plate-specific client needed) |
+
+### Current Issues
+
+1. **Micro-Manager multi-file**: `detect_source_type()` doesn't recognize directories with `metadata.txt` + `img_channel*_*.tif` as `ome-tiff-multifile`. Each individual TIFF gets discovered as separate source.
+
+2. **Vendor formats with positions**: `aicsimageio` scene expansion handles multi-scene files, but position metadata may not be properly exposed.
+
+3. **Parent directory discovery**: Scanning `FOV_1/`, `FOV_2/` subdirectories produces separate tensors without relationship metadata.
+
+### Design Questions
+
+1. **Should multi-field be one tensor or many?**
+   - Option A: One tensor per position (current partial approach) - simpler, but loses dataset context
+   - Option B: One tensor with position dimension - unified, but requires client-side navigation
+   - Option C: Hierarchical metadata - tensor per position + dataset-level schema discovery
+
+2. **How to expose position metadata?**
+   - Add position index/name to `TensorDescriptor`?
+   - New `get_positions()` API on adapters?
+   - Schema discovery protocol (see TODO section)?
+
+3. **Config representation**:
+   - Explicit: `[[sources.path = "FOV_*/Default", type = "ome-tiff-multifile-multifield"]]`
+   - Auto-discovery: Detect position patterns in directory structure
+
+### High Priority
+
+- [ ] **Fix Micro-Manager multi-file detection**
+  - Update glob patterns: `img_channel*_position*_time*_z*.tif` (not just `.ome.tif`)
+  - Check for `metadata.txt` (not just `_metadata.txt`)
+  - Properly group files by position index
+
+- [ ] **Research multi-field support in vendor formats**
+  - Test ND2 with multiple positions
+  - Test CZI/LIF with multiple scenes vs positions
+  - Document how aicsimageio exposes position metadata
+
+### Medium Priority
+
+- [ ] **Design position metadata protocol**
+  - Add position info to `TensorDescriptor` or new message
+  - Consider relationship to OME-Zarr plate schema
+
+- [ ] **Implement position-aware directory scanning**
+  - Detect `FOV_*` / `Position_*` directory patterns
+  - Group by acquisition session (same metadata format)
+
+### Future
+
+- [ ] **OME-Zarr HCS plate support**
+  - Plate/well/position navigation
+  - Specialized `OmeZarrPlateClient` (see Metadata Transmission Protocol TODO)
+
+---
+
+## Notes

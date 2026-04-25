@@ -1,7 +1,9 @@
-"""Zarr adapter for tensor storage."""
+"""Zarr adapter for tensor storage.
+
+Relies on OS page cache for raw data caching.
+"""
 
 from typing import List, Optional
-from functools import lru_cache
 
 import numpy as np
 import pyarrow as pa
@@ -24,7 +26,7 @@ class ZarrAdapter(BackendAdapter):
     - N bytes: array_id (UTF-8)
     - M bytes: chunk key (UTF-8, e.g., "0/1/2")
 
-    Uses LRU caching for decoded chunks.
+    Relies on OS page cache for raw data caching.
     """
 
     def __init__(
@@ -32,7 +34,6 @@ class ZarrAdapter(BackendAdapter):
         zarr_array,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
-        cache_size: int = 256
     ):
         """Initialize Zarr adapter.
 
@@ -40,18 +41,13 @@ class ZarrAdapter(BackendAdapter):
             zarr_array: Zarr array object
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels
-            cache_size: Number of chunks to cache (default 256)
         """
         self.zarr_array = zarr_array
         self.array_id = array_id
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(zarr_array.ndim)]
-        self.cache_size = cache_size
 
-        # Initialize LRU cache for decoded chunks
-        self._get_chunk_data_cached = lru_cache(maxsize=cache_size)(self._get_chunk_data_uncached)
-
-    def _get_chunk_data_uncached(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from zarr (uncached)."""
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Read a chunk from zarr (no caching - relies on OS page cache)."""
         _, backend_data = _decode_chunk_id(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
@@ -63,10 +59,7 @@ class ZarrAdapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        return self.zarr_array[slices]
-
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        data = self._get_chunk_data_cached(chunk_id)
+        data = self.zarr_array[slices]
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 

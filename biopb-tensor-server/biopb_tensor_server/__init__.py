@@ -7,6 +7,7 @@ Key components:
 - TensorFlightServer: Flight server implementation
 - BackendAdapter: Abstract interface for storage backends
 - Adapters: ZarrAdapter, Hdf5Adapter, OmeTiffAdapter, OmeZarrAdapter
+- Cache: CacheManager, CacheConfig for caching computed virtual chunks
 
 Note: This package is not distributed via PyPI. Install locally with:
     pip install -e biopb-tensor-server/
@@ -37,6 +38,20 @@ from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
+from biopb_tensor_server.cache import (
+    CacheManager,
+    CacheBackend,
+    CacheEntry,
+    CacheKey,
+    CacheStats,
+    MemoryCacheBackend,
+    EntryState,
+)
+
+from biopb_tensor_server.config import (
+    CacheConfig,
+)
+
 __all__ = [
     'TensorFlightServer',
     'serve',
@@ -57,4 +72,12 @@ __all__ = [
     'OmeTiffAdapter',
     'MultiFileOmeTiffAdapter',
     'OmeZarrAdapter',
+    'CacheManager',
+    'CacheBackend',
+    'CacheEntry',
+    'CacheKey',
+    'CacheStats',
+    'MemoryCacheBackend',
+    'EntryState',
+    'CacheConfig',
 ]

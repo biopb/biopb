@@ -25,6 +25,9 @@ dependencies = [
   ome-zarr = [
     "ome-zarr >= 0.6.1",
   ]
+  aics = [
+    "aicsimageio >= 4.0.0",
+  ]
 
 [project.scripts]
   biopb-tensor = "biopb_tensor_server.cli:app"

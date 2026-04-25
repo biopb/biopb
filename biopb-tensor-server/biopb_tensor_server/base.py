@@ -10,13 +10,17 @@ Each adapter maps storage-specific chunk layouts to Arrow Flight endpoints:
 The adapters integrate with Arrow Flight's GetFlightInfo/DoGet flow:
 1. GetFlightInfo returns FlightEndpoints with chunk_id tickets
 2. DoGet uses the chunk_id to fetch the actual data
+
+Raw data caching relies on OS page cache. Virtual chunk (scaled read) caching
+uses the CacheManager with future/promise pattern for thread safety.
 """
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import lru_cache
 from math import lcm
-from typing import List, Optional, Tuple, Iterator
+from typing import List, Optional, Tuple, Iterator, TYPE_CHECKING
 import importlib
 import struct
 import os
@@ -35,6 +39,9 @@ except ImportError:
 
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.cache import CacheManager
 
 
 @dataclass
@@ -802,12 +809,89 @@ def plan_tensor_read(
     return adapter.get_scaled_read_plan(scale_hint, slice_hint, read_options)
 
 
-def resolve_chunk_data(adapter: BackendAdapter, chunk_id: bytes) -> pa.RecordBatch:
-    """Resolve either a real backend chunk or a virtual scaled chunk."""
+def resolve_chunk_data(
+    adapter: BackendAdapter,
+    chunk_id: bytes,
+    cache_manager: Optional[CacheManager] = None,
+) -> pa.RecordBatch:
+    """Resolve either a real backend chunk or a virtual scaled chunk.
+
+    For virtual chunks (scaled reads), uses cache if cache_manager is provided.
+    The cache uses future/promise pattern: only one thread computes while
+    others wait on the pending entry.
+
+    Args:
+        adapter: Backend adapter for the tensor
+        chunk_id: Encoded chunk identifier
+        cache_manager: Optional cache manager for caching virtual chunks
+
+    Returns:
+        Arrow RecordBatch containing the chunk data
+    """
+    from biopb_tensor_server.cache import CacheKey
+    from biopb_tensor_server.cache.base import EntryState
+
     array_id, backend_data = _decode_chunk_id(chunk_id)
+
+    # Not virtual chunk - delegate to adapter (no caching needed)
     if not backend_data.startswith(_VIRTUAL_CHUNK_MAGIC):
         return adapter.get_chunk_data(chunk_id)
 
+    # Virtual chunk - build cache key
+    source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)
+    cache_key = CacheKey(
+        array_id=array_id,
+        scale_hint=scale_hint,
+        source_start=source_start,
+        source_stop=source_stop,
+        valid_stop=valid_stop,
+        reduction_method=reduction_method,
+    )
+    key_bytes = cache_key.to_bytes()
+
+    if cache_manager is None:
+        # No cache - just compute
+        return _compute_virtual_chunk(adapter, backend_data)
+
+    # With cache - use future/promise pattern
+    entry, is_owner = cache_manager.start_compute(key_bytes, metadata={'array_id': array_id})
+
+    if is_owner:
+        # We own the computation - compute and complete
+        try:
+            result = _compute_virtual_chunk(adapter, backend_data)
+            size_bytes = sum(col.nbytes for col in result.columns)
+            cache_manager.complete_entry(key_bytes, result, size_bytes)
+        except Exception as e:
+            cache_manager.fail_entry(key_bytes, e)
+            raise
+    else:
+        # Another thread is computing - wait for it
+        # entry is acquired by start_compute, state may be PENDING
+        if entry.state == EntryState.PENDING:
+            # Wait outside lock (event is set by computing thread)
+            entry.wait_ready()  # Raises if computation failed
+
+    # Entry is now READY, acquired (ref_count >= 1)
+    # Release after getting data - Arrow buffers have their own ref counting
+    data = entry.data
+    cache_manager.release(key_bytes)
+    return data
+
+
+def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.RecordBatch:
+    """Compute a virtual scaled chunk from source data.
+
+    This is the internal computation logic extracted from resolve_chunk_data
+    for separation of concerns.
+
+    Args:
+        adapter: Backend adapter for the tensor
+        backend_data: Decoded virtual chunk payload
+
+    Returns:
+        Arrow RecordBatch containing the computed chunk data
+    """
     desc = adapter.get_tensor_descriptor()
     dtype = np.dtype(desc.dtype)
     source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)

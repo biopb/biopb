@@ -1,8 +1,10 @@
-"""HDF5 adapter for tensor storage."""
+"""HDF5 adapter for tensor storage.
+
+Relies on OS page cache for raw data caching.
+"""
 
 import struct
 from typing import List, Optional, Tuple
-from functools import lru_cache
 
 import numpy as np
 import pyarrow as pa
@@ -46,7 +48,7 @@ class Hdf5Adapter(BackendAdapter):
     - uint16 ndim
     - int64[ndim] chunk indices
 
-    Uses LRU caching for decoded chunks.
+    Relies on OS page cache for raw data caching.
     """
 
     def __init__(
@@ -54,7 +56,6 @@ class Hdf5Adapter(BackendAdapter):
         h5_dataset,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
-        cache_size: int = 256
     ):
         """Initialize HDF5 adapter.
 
@@ -62,18 +63,13 @@ class Hdf5Adapter(BackendAdapter):
             h5_dataset: h5py Dataset object
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels
-            cache_size: Number of chunks to cache (default 256)
         """
         self.h5_dataset = h5_dataset
         self.array_id = array_id
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(len(h5_dataset.shape))]
-        self.cache_size = cache_size
 
-        # Initialize LRU cache for decoded chunks
-        self._get_chunk_data_cached = lru_cache(maxsize=cache_size)(self._get_chunk_data_uncached)
-
-    def _get_chunk_data_uncached(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from HDF5 (uncached)."""
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Read a chunk from HDF5 (no caching - relies on OS page cache)."""
         _, backend_data = _decode_chunk_id(chunk_id)
         chunk_idx = _decode_backend_coords(backend_data)
         chunks = self.h5_dataset.chunks
@@ -83,10 +79,7 @@ class Hdf5Adapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        return self.h5_dataset[slices]
-
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        data = self._get_chunk_data_cached(chunk_id)
+        data = self.h5_dataset[slices]
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 

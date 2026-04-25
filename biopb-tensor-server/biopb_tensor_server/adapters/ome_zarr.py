@@ -1,9 +1,11 @@
-"""OME-Zarr adapter for tensor storage."""
+"""OME-Zarr adapter for tensor storage.
+
+Relies on OS page cache for raw data caching.
+"""
 
 import json
 import os
 from typing import List, Optional, Tuple
-from functools import lru_cache
 from urllib.parse import urlparse
 
 import numpy as np
@@ -35,6 +37,8 @@ class OmeZarrAdapter(BackendAdapter):
     Chunk ID format: Same as ZarrAdapter
     - array_id prefix
     - chunk key (UTF-8, e.g., "0/1/2")
+
+    Relies on OS page cache for raw data caching.
     """
 
     def __init__(
@@ -42,7 +46,6 @@ class OmeZarrAdapter(BackendAdapter):
         zarr_array,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
-        cache_size: int = 256,
         resolution_level: int = 0
     ):
         """Initialize OME-Zarr adapter.
@@ -51,12 +54,10 @@ class OmeZarrAdapter(BackendAdapter):
             zarr_array: Zarr array object (from specific resolution level)
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels (overrides OME metadata)
-            cache_size: Number of chunks to cache (default 256)
             resolution_level: Which resolution level to use (default 0)
         """
         self.zarr_array = zarr_array
         self.array_id = array_id
-        self.cache_size = cache_size
         self.resolution_level = resolution_level
 
         # Try to read OME metadata from .zattrs
@@ -67,7 +68,6 @@ class OmeZarrAdapter(BackendAdapter):
         # Read .zattrs from the zarr group root
         try:
             store = zarr_array.store
-            # Get the filesystem path from store
             store_str = str(store)
             if store_str.startswith('file://'):
                 store_path = str(urlparse(store_str).path)
@@ -77,7 +77,6 @@ class OmeZarrAdapter(BackendAdapter):
                 store_path = store_str
 
             # .zattrs is at the group root level
-            # If this is a level array (e.g., path/0), check parent for .zattrs
             zattrs_path = os.path.join(store_path, '.zattrs')
             if not os.path.exists(zattrs_path):
                 # Check parent directory (group root)
@@ -107,14 +106,11 @@ class OmeZarrAdapter(BackendAdapter):
         else:
             self.dim_labels = [f"dim{i}" for i in range(zarr_array.ndim)]
 
-        # Initialize LRU cache
-        self._get_chunk_data_cached = lru_cache(maxsize=cache_size)(self._get_chunk_data_uncached)
-
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
 
-    def _get_chunk_data_uncached(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from zarr (uncached)."""
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Read a chunk from zarr (no caching - relies on OS page cache)."""
         _, backend_data = _decode_chunk_id(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
@@ -125,7 +121,9 @@ class OmeZarrAdapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        return self.zarr_array[slices]
+        data = self.zarr_array[slices]
+        arr = pa.array(data.ravel())
+        return pa.RecordBatch.from_arrays([arr], ["data"])
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
@@ -177,11 +175,6 @@ class OmeZarrAdapter(BackendAdapter):
             ))
 
         return endpoints
-
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        data = self._get_chunk_data_cached(chunk_id)
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""
@@ -320,12 +313,11 @@ class OmeZarrAdapter(BackendAdapter):
         # Open the level array
         level_arr = self._open_level_array(path)
 
-        # Create adapter for this level (caches independently)
+        # Create adapter for this level
         level_adapter = ZarrAdapter(
             level_arr,
             array_id=f"{self.array_id}/{path}",
             dim_labels=self.dim_labels,
-            cache_size=self.cache_size,
         )
         self._level_adapters[path] = level_adapter
         return level_adapter
@@ -334,28 +326,23 @@ class OmeZarrAdapter(BackendAdapter):
         """Open the Zarr array at the given level path (relative to group root)."""
         import zarr
 
-        # Get the store from the current array
         store = self.zarr_array.store
 
-        # Get the store path
         store_str = str(store.path if hasattr(store, 'path') else store)
 
-        # If we're at a level (e.g., path ends with /0, /1, etc.), go to parent first
-        # to get the group root, then join with the target level path
         if store_str.startswith('file://'):
             store_path = urlparse(store_str).path
         else:
             store_path = store_str
 
-        # Check if we're at a level subdirectory (group root should have .zattrs or .zgroup)
-        # Navigate to the group root by looking for .zattrs
+        # Navigate to the group root
         current_path = store_path.rstrip('/')
         while current_path and current_path != '/':
             if os.path.exists(os.path.join(current_path, '.zattrs')):
                 break
             current_path = os.path.dirname(current_path)
 
-        # Now join with the target level path
+        # Join with the target level path
         level_path = os.path.join(current_path, path)
 
         return zarr.open_array(level_path, mode='r')

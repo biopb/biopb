@@ -5,10 +5,17 @@ from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
+# Optional aicsimageio adapter
+try:
+    from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+except ImportError:
+    AicsImageIoAdapter = None  # type: ignore
+
 __all__ = [
     'ZarrAdapter',
     'Hdf5Adapter',
     'OmeTiffAdapter',
     'MultiFileOmeTiffAdapter',
     'OmeZarrAdapter',
+    'AicsImageIoAdapter',
 ]
