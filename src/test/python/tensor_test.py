@@ -1,7 +1,6 @@
 """Tests for BioPB Tensor server and client."""
 
 import numpy as np
-import zarr
 import tempfile
 import os
 import threading
@@ -15,23 +14,37 @@ from biopb.tensor import (
     TensorReadOptions,
 )
 from biopb_tensor_server import (
+    TensorFlightServer,
     ZarrAdapter,
     OmeZarrAdapter,
-    TensorFlightServer,
 )
 from biopb_tensor_server import base as tensor_adapter
 from biopb_tensor_server.config import parse_config
 
 
+def _zarr_available() -> bool:
+    """Check if zarr is available with working numcodecs."""
+    try:
+        import zarr
+        zarr.open_array
+        return True
+    except ImportError:
+        return False
+
+
 class TestZarrAdapter:
     """Tests for ZarrAdapter."""
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_descriptor(self):
         """Test descriptor generation."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 200), chunks=(50, 100), dtype='uint16')
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(arr, 'test-array', ['y', 'x'])
             desc = adapter.get_tensor_descriptor()
 
@@ -41,12 +54,16 @@ class TestZarrAdapter:
             assert desc.dtype == '<u2'
             assert list(desc.dim_labels) == ['y', 'x']
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_chunk_endpoints(self):
         """Test chunk endpoint generation."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
             endpoints = adapter.get_chunk_endpoints()
 
@@ -57,12 +74,16 @@ class TestZarrAdapter:
             assert list(endpoints[0].bounds.start) == [0, 0]
             assert list(endpoints[0].bounds.stop) == [50, 50]
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_chunk_endpoints_with_slice_hint(self):
         """Test slice hint filtering."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
 
             # Request only top-right quadrant
@@ -75,8 +96,11 @@ class TestZarrAdapter:
             assert len(endpoints) == 1
             assert list(endpoints[0].bounds.start) == [0, 50]
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_chunk_data(self):
         """Test chunk data retrieval."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
@@ -85,6 +109,7 @@ class TestZarrAdapter:
             arr[:50, :50] = 1
             arr[:50, 50:] = 2
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
             endpoints = adapter.get_chunk_endpoints()
 
@@ -104,12 +129,16 @@ class TestZarrAdapter:
 class TestTensorFlightServer:
     """Tests for TensorFlightServer."""
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_register_and_list_tensors(self):
         """Test tensor registration."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(64, 64), chunks=(32, 32), dtype='uint8')
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(arr, 'tensor1', ['y', 'x'])
 
             server = TensorFlightServer('grpc://localhost:8899')
@@ -239,6 +268,11 @@ class TestTensorFlightClient:
     @pytest.fixture
     def server_client(self):
         """Start server and create client."""
+        if not _zarr_available():
+            pytest.skip("zarr not available")
+
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(128, 128), chunks=(64, 64), dtype='uint8')
@@ -250,6 +284,7 @@ class TestTensorFlightClient:
             arr[64:, 64:] = 40
 
             zarr_arr = zarr.open_array(zarr_path, mode='r')
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr_arr, 'test-tensor', ['y', 'x'])
 
             server = TensorFlightServer('grpc://localhost:8890')
@@ -267,17 +302,20 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_list_tensors(self, server_client):
         """Test listing tensors."""
         tensors = server_client.list_tensors()
         assert 'test-tensor' in tensors
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_array_shape(self, server_client):
         """Test array shape retrieval."""
         darr = server_client.get_array('test-tensor')
         assert darr.shape == (128, 128)
         assert darr.dtype == np.uint8
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_read_chunks(self, server_client):
         """Test reading different chunks."""
         darr = server_client.get_array('test-tensor')
@@ -298,6 +336,7 @@ class TestTensorFlightClient:
         data = darr[64:, 64:].compute()
         assert data.mean() == 40.0
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_cache_reuse(self, server_client):
         """Test that cache is reused."""
         darr = server_client.get_array('test-tensor')
@@ -319,6 +358,7 @@ class TestTensorFlightClient:
         # Data should be identical
         np.testing.assert_array_equal(data1, data2)
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_stride_view(self, server_client):
         """Test explicit per-call scaled reads using stride downsampling."""
         darr = server_client.get_array(
@@ -336,6 +376,7 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_nearest_view(self, server_client):
         """Test visualization-oriented nearest downsampling alias."""
         darr = server_client.get_array(
@@ -353,6 +394,7 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_mean_view(self, server_client):
         """Test explicit read_options-based mean downsampling."""
         darr = server_client.get_array(
@@ -369,6 +411,7 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_area_view(self, server_client):
         """Test visualization-oriented area downsampling."""
         darr = server_client.get_array(
@@ -385,8 +428,11 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_mean_view_rounds_and_preserves_dtype(self):
         """Test mean downsampling preserves dtype with integer-safe rounding."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'mean-preserve.zarr')
             source = np.array([
@@ -398,6 +444,7 @@ class TestTensorFlightClient:
             arr = zarr.open_array(zarr_path, mode='w', shape=(4, 4), chunks=(2, 2), dtype='uint8')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'mean-preserve', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8893')
             server.register_tensor('mean-preserve', adapter)
@@ -420,8 +467,11 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_linear_view(self):
         """Test linear interpolation downsampling for visualization."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'linear.zarr')
             source = np.array([
@@ -433,6 +483,7 @@ class TestTensorFlightClient:
             arr = zarr.open_array(zarr_path, mode='w', shape=(4, 4), chunks=(2, 2), dtype='uint8')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'linear', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8894')
             server.register_tensor('linear', adapter)
@@ -455,14 +506,18 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_view_merges_small_chunks(self):
         """Test scaled reads when source chunks must be merged."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'merged.zarr')
             source = np.arange(8 * 8, dtype=np.uint16).reshape(8, 8)
             arr = zarr.open_array(zarr_path, mode='w', shape=(8, 8), chunks=(1, 4), dtype='uint16')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'merged', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8891')
             server.register_tensor('merged', adapter)
@@ -478,14 +533,18 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_non_divisible_scaled_nearest_view(self):
         """Test nearest downsampling returns ceil-sized output for edge chunks."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'nearest-edge.zarr')
             source = np.arange(25, dtype=np.uint8).reshape(5, 5)
             arr = zarr.open_array(zarr_path, mode='w', shape=(5, 5), chunks=(3, 3), dtype='uint8')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'nearest-edge', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8892')
             server.register_tensor('nearest-edge', adapter)
@@ -502,14 +561,18 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_non_divisible_scaled_area_slice_uses_edge_padding(self):
         """Test area downsampling pads from the slice edge rather than reading past it."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'area-edge.zarr')
             source = np.arange(8, dtype=np.uint8).reshape(1, 8)
             arr = zarr.open_array(zarr_path, mode='w', shape=(1, 8), chunks=(1, 3), dtype='uint8')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'area-edge', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8895')
             server.register_tensor('area-edge', adapter)
@@ -533,14 +596,18 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_non_divisible_scaled_linear_view(self):
         """Test linear downsampling uses ceil-sized output with padded edge support."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'linear-edge.zarr')
             source = np.array([[0, 10, 20, 30, 40]], dtype=np.uint8)
             arr = zarr.open_array(zarr_path, mode='w', shape=(1, 5), chunks=(1, 3), dtype='uint8')
             arr[:] = source
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'linear-edge', ['y', 'x'])
             server = TensorFlightServer('grpc://localhost:8896')
             server.register_tensor('linear-edge', adapter)
@@ -567,13 +634,17 @@ class TestTensorFlightClient:
 class TestGetScaledReadPlan:
     """Tests for BackendAdapter.get_scaled_read_plan default implementation."""
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_default_uses_virtual_scaling(self):
         """Test that default get_scaled_read_plan uses virtual scaling."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
             arr[:] = np.arange(100 * 100, dtype=np.uint8).reshape(100, 100)
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
 
             # Test that default implementation produces virtual scaling plan
@@ -588,13 +659,17 @@ class TestGetScaledReadPlan:
             assert list(plan.descriptor.shape) == [50, 50]
             assert list(plan.descriptor.chunk_shape) == [25, 25]  # Virtual chunk shape
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_virtual_scaling_with_slice(self):
         """Test virtual scaling with slice hint."""
+        import zarr
+
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.zarr')
             arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
             arr[:] = 1
 
+            from biopb_tensor_server import ZarrAdapter
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
 
             plan = adapter.get_scaled_read_plan(
@@ -610,14 +685,21 @@ class TestGetScaledReadPlan:
 class TestOmeZarrPrecompute:
     """Tests for OmeZarrAdapter precomputed level support."""
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_find_level_for_scale(self):
         """Test _find_level_for_scale parses multiscales correctly."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import json
+        import json
+        import zarr
 
+        with tempfile.TemporaryDirectory() as tmpdir:
             # Create OME-Zarr structure with multiscales
             zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
-            os.makedirs(zarr_path)
+            root = zarr.open_group(zarr_path, mode='w')
+
+            # Create level arrays
+            root.create_dataset('0', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            root.create_dataset('1', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+            root.create_dataset('2', shape=(25, 25), chunks=(12, 12), dtype='uint8')
 
             # Create .zattrs with multiscales
             zattrs = {
@@ -634,14 +716,9 @@ class TestOmeZarrPrecompute:
             with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
                 json.dump(zattrs, f)
 
-            # Create level arrays
-            import zarr
-            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
-            zarr.open_array(os.path.join(zarr_path, '2'), mode='w', shape=(25, 25), chunks=(12, 12), dtype='uint8')
-
             # Open base level and create adapter
-            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            root = zarr.open_group(zarr_path, mode='r')
+            base_arr = root['0']
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Test finding levels
@@ -650,14 +727,21 @@ class TestOmeZarrPrecompute:
             assert adapter._find_level_for_scale((4, 4)) == '2'
             assert adapter._find_level_for_scale((3, 3)) is None  # No match
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_scaled_read_plan_precompute(self):
         """Test get_scaled_read_plan with precompute method."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import json
-            import zarr
+        import json
+        import zarr
 
+        with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
-            os.makedirs(zarr_path)
+            root = zarr.open_group(zarr_path, mode='w')
+
+            # Create and populate level arrays
+            arr0 = root.create_dataset('0', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr1 = root.create_dataset('1', shape=(50, 50), chunks=(25, 25), dtype='uint8')
+            arr0[:] = 1
+            arr1[:] = 2
 
             zattrs = {
                 'multiscales': [{
@@ -672,13 +756,8 @@ class TestOmeZarrPrecompute:
             with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
                 json.dump(zattrs, f)
 
-            # Create and populate level arrays
-            arr0 = zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-            arr1 = zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
-            arr0[:] = 1
-            arr1[:] = 2
-
-            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            root = zarr.open_group(zarr_path, mode='r')
+            base_arr = root['0']
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with precompute method
@@ -692,14 +771,18 @@ class TestOmeZarrPrecompute:
             assert list(plan.descriptor.shape) == [50, 50]
             assert list(plan.descriptor.chunk_shape) == [25, 25]
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_precompute_no_match_raises(self):
         """Test that precompute raises error when no matching level."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import json
-            import zarr
+        import json
+        import zarr
 
+        with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
-            os.makedirs(zarr_path)
+            root = zarr.open_group(zarr_path, mode='w')
+
+            root.create_dataset('0', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            root.create_dataset('1', shape=(50, 50), chunks=(25, 25), dtype='uint8')
 
             zattrs = {
                 'multiscales': [{
@@ -714,10 +797,8 @@ class TestOmeZarrPrecompute:
             with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
                 json.dump(zattrs, f)
 
-            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
-
-            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            root = zarr.open_group(zarr_path, mode='r')
+            base_arr = root['0']
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with non-matching scale
@@ -728,14 +809,18 @@ class TestOmeZarrPrecompute:
                     read_options=TensorReadOptions(scale_hint=[3, 3], reduction_method='precompute'),
                 )
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_precompute_falls_back_to_virtual_for_other_methods(self):
         """Test that non-precompute methods use virtual scaling."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import json
-            import zarr
+        import json
+        import zarr
 
+        with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
-            os.makedirs(zarr_path)
+            root = zarr.open_group(zarr_path, mode='w')
+
+            root.create_dataset('0', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            root.create_dataset('1', shape=(50, 50), chunks=(25, 25), dtype='uint8')
 
             zattrs = {
                 'multiscales': [{
@@ -750,10 +835,8 @@ class TestOmeZarrPrecompute:
             with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
                 json.dump(zattrs, f)
 
-            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(50, 50), chunks=(25, 25), dtype='uint8')
-
-            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            root = zarr.open_group(zarr_path, mode='r')
+            base_arr = root['0']
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with nearest method (not precompute)
@@ -772,14 +855,18 @@ class TestOmeZarrPrecompute:
 class TestSliceConversion:
     """Tests for slice coordinate conversion."""
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_convert_slice_to_level(self):
         """Test slice conversion from base to level coordinates."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import json
-            import zarr
+        import json
+        import zarr
 
+        with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, 'test.ome.zarr')
-            os.makedirs(zarr_path)
+            root = zarr.open_group(zarr_path, mode='w')
+
+            root.create_dataset('0', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            root.create_dataset('1', shape=(25, 50), chunks=(12, 25), dtype='uint8')
 
             zattrs = {
                 'multiscales': [{
@@ -792,10 +879,8 @@ class TestSliceConversion:
             with open(os.path.join(zarr_path, '.zattrs'), 'w') as f:
                 json.dump(zattrs, f)
 
-            zarr.open_array(os.path.join(zarr_path, '0'), mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-            zarr.open_array(os.path.join(zarr_path, '1'), mode='w', shape=(25, 50), chunks=(12, 25), dtype='uint8')
-
-            base_arr = zarr.open_array(os.path.join(zarr_path, '0'), mode='r')
+            root = zarr.open_group(zarr_path, mode='r')
+            base_arr = root['0']
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Test slice conversion

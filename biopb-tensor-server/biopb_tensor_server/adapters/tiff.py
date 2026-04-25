@@ -542,8 +542,8 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         """Return OME metadata from multi-file dataset."""
         import xml.etree.ElementTree as ET
 
-        # Check for companion _metadata.txt file
-        metadata_patterns = ["_metadata.txt", "*_metadata.txt"]
+        # Check for companion metadata.txt or _metadata.txt file
+        metadata_patterns = ["metadata.txt", "_metadata.txt", "*_metadata.txt"]
         for pattern in metadata_patterns:
             metadata_files = list(self.directory.glob(pattern))
             if metadata_files:

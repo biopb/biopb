@@ -71,6 +71,9 @@ class OmeZarrAdapter(BackendAdapter):
             store_str = str(store)
             if store_str.startswith('file://'):
                 store_path = str(urlparse(store_str).path)
+            elif hasattr(store, 'path'):
+                # DirectoryStore has 'path' attribute
+                store_path = str(store.path)
             elif hasattr(store, 'root'):
                 store_path = str(store.root)
             else:

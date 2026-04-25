@@ -101,6 +101,40 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return bounds.SerializeToString()
 
+    def _get_adapter_for_array_id(self, array_id: str) -> Optional[BackendAdapter]:
+        """Get adapter for an array_id, handling nested paths for level adapters.
+
+        For nested array_ids like "parent/level", finds the parent adapter
+        and delegates to its get_level_adapter method if available.
+
+        Args:
+            array_id: The array identifier (may contain "/" for nested paths)
+
+        Returns:
+            BackendAdapter for the array, or None if not found
+        """
+        # First try exact match
+        adapter = self._tensors.get(array_id)
+        if adapter is not None:
+            return adapter
+
+        # Check for nested path (e.g., "ome-zarr/1" for level 1)
+        if '/' in array_id:
+            # Split to find parent and level path
+            parts = array_id.split('/')
+            parent_id = parts[0]
+            level_path = '/'.join(parts[1:])
+
+            parent_adapter = self._tensors.get(parent_id)
+            if parent_adapter is not None and hasattr(parent_adapter, 'get_level_adapter'):
+                # Delegate to parent adapter's level adapter method
+                try:
+                    return parent_adapter.get_level_adapter(level_path)
+                except Exception:
+                    return None
+
+        return None
+
     def list_flights(
         self,
         context: flight.ServerCallContext,
@@ -207,8 +241,8 @@ class TensorFlightServer(flight.FlightServerBase):
         # Decode array_id from chunk_id
         array_id, _ = _decode_chunk_id(tensor_ticket.chunk_id)
 
-        # Get the adapter for this array
-        adapter = self._tensors.get(array_id)
+        # Get the adapter for this array (handles nested paths)
+        adapter = self._get_adapter_for_array_id(array_id)
         if adapter is None:
             raise flight.FlightServerError(f"Tensor not found: {array_id}")
 

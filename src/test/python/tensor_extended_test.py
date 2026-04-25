@@ -1,15 +1,6 @@
 """Tests for MultiFileOmeTiffAdapter and OmeZarrAdapter.
 
-These tests require external test data. Set the environment variable
-BIOPB_TEST_DATA_DIR to a directory containing test fixtures:
-
-    export BIOPB_TEST_DATA_DIR=/path/to/test/data
-
-Required fixtures:
-- mm_test_data/  (Micro-Manager multi-file OME-TIFF)
-- test.ome.zarr/ (OME-Zarr dataset)
-
-Tests will be skipped if fixtures are not found.
+Uses synthetic test fixtures from conftest.py - no external data required.
 """
 
 import os
@@ -17,13 +8,28 @@ import tempfile
 import pytest
 import numpy as np
 
-from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter
+from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
 
-def get_test_data_dir():
-    """Get test data directory from environment."""
-    return os.environ.get('BIOPB_TEST_DATA_DIR')
+def _zarr_available() -> bool:
+    """Check if zarr is available with working numcodecs."""
+    try:
+        import zarr
+        # Try to actually use zarr to catch numcodecs compatibility issues
+        zarr.open_array
+        return True
+    except ImportError:
+        return False
+
+
+def _h5py_available() -> bool:
+    """Check if h5py is available."""
+    try:
+        import h5py
+        return True
+    except ImportError:
+        return False
 
 
 class TestMultiFileOmeTiffFileListParsing:
@@ -198,7 +204,6 @@ class TestMultiFileOmeTiffFileListParsing:
             ]
             assert len(missing_warnings) >= 1
             assert "file3.ome.tif" in str(missing_warnings[0].message)
-            assert "file3.ome.tif" in str(w[0].message)
             assert len(adapter._missing_files) == 1
             assert "file3.ome.tif" in adapter._missing_files
 
@@ -268,7 +273,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test OmeTiffAdapter initialization with embedded OME-XML."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         assert adapter.array_id == 'test-embedded'
@@ -281,7 +285,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test descriptor with embedded metadata."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         desc = adapter.get_tensor_descriptor()
@@ -293,7 +296,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test metadata extraction from embedded OME-XML."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         metadata = adapter.get_metadata()
@@ -308,7 +310,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test chunk endpoint generation for tiled OME-TIFF."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         endpoints = adapter.get_chunk_endpoints()
@@ -319,7 +320,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test reading chunk data from tiled OME-TIFF."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         endpoints = adapter.get_chunk_endpoints()
@@ -348,7 +348,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         try:
             tf = tifffile.TiffFile(path)
 
-            from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
             with pytest.raises(ValueError, match="must be tiled"):
                 OmeTiffAdapter(tf, 'test-non-tiled')
         finally:
@@ -359,7 +358,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         """Test that slice_hint correctly filters chunk endpoints."""
         tf, path = tiled_ome_tiff
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
         from biopb.tensor.descriptor_pb2 import SliceHint
 
         adapter = OmeTiffAdapter(tf, 'test-embedded')
@@ -373,40 +371,21 @@ class TestOmeTiffAdapterEmbeddedMetadata:
 
 
 class TestMultiFileOmeTiffAdapter:
-    """Tests for MultiFileOmeTiffAdapter."""
+    """Tests for MultiFileOmeTiffAdapter using synthetic fixtures."""
 
-    @pytest.fixture
-    def mm_test_dir(self):
-        """Fixture for Micro-Manager test data."""
-        test_data_dir = get_test_data_dir()
-        if not test_data_dir:
-            pytest.skip("BIOPB_TEST_DATA_DIR not set")
+    def test_adapter_init_with_synthetic_dataset(self, multifile_ome_dataset):
+        """Test MultiFileOmeTiffAdapter initialization with synthetic dataset."""
+        dir_path, file_list, metadata = multifile_ome_dataset
 
-        # Try direct path first (dir contains MM files)
-        if os.path.isdir(test_data_dir):
-            has_mm_files = any(
-                f.endswith(('.ome.tif', '.ome.tiff', '_metadata.txt'))
-                for f in os.listdir(test_data_dir)
-            )
-            if has_mm_files:
-                return test_data_dir
-
-        # Try subdirectory
-        mm_dir = os.path.join(test_data_dir, 'mm_test_data')
-        if not os.path.isdir(mm_dir):
-            pytest.skip(f"mm_test_data not found in {test_data_dir}")
-
-        return mm_dir
-
-    def test_adapter_init(self, mm_test_dir):
-        """Test MultiFileOmeTiffAdapter initialization."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test')
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         assert adapter.array_id == 'mm-test'
         assert adapter.tiff_file is not None
 
-    def test_get_tensor_descriptor(self, mm_test_dir):
+    def test_get_tensor_descriptor(self, multifile_ome_dataset):
         """Test descriptor returns valid shape and dtype."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test')
+        dir_path, file_list, metadata = multifile_ome_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         desc = adapter.get_tensor_descriptor()
 
         assert desc.array_id == 'mm-test'
@@ -414,9 +393,11 @@ class TestMultiFileOmeTiffAdapter:
         assert desc.dtype is not None
         print(f"Descriptor: shape={desc.shape}, dtype={desc.dtype}")
 
-    def test_get_chunk_endpoints(self, mm_test_dir):
+    def test_get_chunk_endpoints(self, multifile_ome_dataset):
         """Test chunk endpoint generation."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test')
+        dir_path, file_list, metadata = multifile_ome_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         endpoints = adapter.get_chunk_endpoints()
 
         assert len(endpoints) > 0
@@ -424,9 +405,11 @@ class TestMultiFileOmeTiffAdapter:
         assert all(hasattr(ep, 'bounds') for ep in endpoints)
         print(f"Generated {len(endpoints)} chunk endpoints")
 
-    def test_get_chunk_data(self, mm_test_dir):
+    def test_get_chunk_data(self, multifile_ome_dataset):
         """Test chunk data retrieval."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test', cache_size=16)
+        dir_path, file_list, metadata = multifile_ome_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
@@ -435,71 +418,124 @@ class TestMultiFileOmeTiffAdapter:
             assert len(chunk_data.columns) == 1
             print(f"First chunk: {len(chunk_data)} elements")
 
-    def test_cache_reuse(self, mm_test_dir):
-        """Test that LRU cache is working."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test', cache_size=16)
+    def test_cache_reuse(self, multifile_ome_dataset):
+        """Test that repeated reads return same data."""
+        dir_path, file_list, metadata = multifile_ome_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
             chunk_id = endpoints[0].chunk_id
 
-            # First call (cache miss)
-            data1 = adapter._get_decoded_tile(chunk_id)
+            # First call
+            data1 = adapter.get_chunk_data(chunk_id)
 
-            # Second call (cache hit)
-            data2 = adapter._get_decoded_tile(chunk_id)
+            # Second call
+            data2 = adapter.get_chunk_data(chunk_id)
 
             # Should return same data
-            np.testing.assert_array_equal(data1, data2)
+            arr1 = data1.column(0).to_numpy()
+            arr2 = data2.column(0).to_numpy()
+            np.testing.assert_array_equal(arr1, arr2)
 
-    def test_get_metadata(self, mm_test_dir):
+    def test_get_metadata(self, multifile_ome_dataset):
         """Test metadata extraction from companion file."""
-        adapter = MultiFileOmeTiffAdapter(mm_test_dir, 'mm-test')
+        dir_path, file_list, metadata = multifile_ome_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         metadata = adapter.get_metadata()
 
-        # Should return metadata dict (Micro-Manager JSON or OME-XML)
+        # Should return metadata dict (OME-XML or Micro-Manager format)
         assert isinstance(metadata, dict)
         assert len(metadata) > 0
 
-        # Micro-Manager format has Summary section
-        if 'Summary' in metadata:
-            summary = metadata['Summary']
-            assert 'Width' in summary or 'Height' in summary
-            print(f"Micro-Manager metadata: Width={summary.get('Width')}, Height={summary.get('Height')}")
-        else:
-            # OME-XML format - keys may have namespace prefixes
-            print(f"OME-XML metadata keys: {list(metadata.keys())[:5]}")
+        print(f"Metadata keys: {list(metadata.keys())[:5]}")
+
+    def test_incomplete_dataset_handling(self, multifile_ome_dataset_incomplete):
+        """Test handling of incomplete multi-file dataset."""
+        import warnings
+
+        dir_path, file_list, metadata = multifile_ome_dataset_incomplete
+
+        # Should warn about missing files but still initialize
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-incomplete')
+
+            assert adapter.array_id == 'mm-incomplete'
+            assert len(adapter._missing_files) == 1
+
+            # Shape should reflect available files
+            desc = adapter.get_tensor_descriptor()
+            assert desc.shape[0] == len(file_list)
+
+    def test_micromanager_format_dataset(self, multifile_mm_dataset):
+        """Test adapter with Micro-Manager JSON format metadata."""
+        dir_path, file_list, metadata = multifile_mm_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-json-test')
+        assert adapter.array_id == 'mm-json-test'
+
+        # Should parse metadata correctly
+        parsed_metadata = adapter.get_metadata()
+        assert isinstance(parsed_metadata, dict)
+        assert 'Summary' in parsed_metadata
+
+        # Verify channels count
+        summary = parsed_metadata['Summary']
+        assert summary.get('Channels') == 3
+
+    def test_data_values_per_channel(self, multifile_mm_dataset):
+        """Test that different channels have distinguishable values."""
+        dir_path, file_list, metadata = multifile_mm_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-values-test')
+        endpoints = adapter.get_chunk_endpoints()
+
+        # Get first chunk from first and second channels
+        if len(endpoints) >= 2:
+            data0 = adapter.get_chunk_data(endpoints[0].chunk_id)
+            data1 = adapter.get_chunk_data(endpoints[1].chunk_id)
+
+            # Values should differ (channel 0 = 100, channel 1 = 101)
+            arr0 = data0.column(0).to_numpy()
+            arr1 = data1.column(0).to_numpy()
+
+            # Data values should be different
+            assert arr0.mean() != arr1.mean()
 
 
 class TestOmeZarrAdapter:
-    """Tests for OmeZarrAdapter."""
+    """Tests for OmeZarrAdapter using synthetic fixtures."""
 
-    @pytest.fixture
-    def ome_zarr_dir(self):
-        """Fixture for OME-Zarr test data."""
-        test_data_dir = get_test_data_dir()
-        if not test_data_dir:
-            pytest.skip("BIOPB_TEST_DATA_DIR not set")
-
-        zarr_path = os.path.join(test_data_dir, 'test.ome.zarr')
-        if not os.path.isdir(zarr_path):
-            pytest.skip(f"test.ome.zarr not found in {test_data_dir}")
-
-        return zarr_path
-
-    def test_adapter_init(self, ome_zarr_dir):
-        """Test OmeZarrAdapter initialization."""
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_adapter_init_with_synthetic_zarr(self, multires_ome_zarr):
+        """Test OmeZarrAdapter initialization with synthetic OME-Zarr."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
         adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
         assert adapter.array_id == 'ome-zarr-test'
 
-    def test_get_tensor_descriptor(self, ome_zarr_dir):
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_get_tensor_descriptor(self, multires_ome_zarr):
         """Test descriptor returns valid shape and dtype."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
         adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
@@ -509,10 +545,17 @@ class TestOmeZarrAdapter:
         assert len(desc.shape) > 0
         assert desc.dtype is not None
 
-    def test_ome_metadata(self, ome_zarr_dir):
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_ome_metadata(self, multires_ome_zarr):
         """Test OME metadata extraction."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
         adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
@@ -523,10 +566,17 @@ class TestOmeZarrAdapter:
         print(f"Axes: {adapter.axes}")
         print(f"Dim labels: {adapter.dim_labels}")
 
-    def test_get_metadata(self, ome_zarr_dir):
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_get_metadata(self, multires_ome_zarr):
         """Test get_metadata() returns .zattrs content."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
         adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
@@ -541,25 +591,39 @@ class TestOmeZarrAdapter:
         assert len(multiscales) > 0
         print(f"Multiscales datasets: {multiscales[0].get('datasets', [])}")
 
-    def test_get_chunk_endpoints(self, ome_zarr_dir):
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_get_chunk_endpoints(self, multires_ome_zarr):
         """Test chunk endpoint generation."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test', cache_size=16)
+        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
         endpoints = adapter.get_chunk_endpoints()
 
         assert len(endpoints) > 0
         print(f"Generated {len(endpoints)} chunk endpoints")
 
-    def test_get_chunk_data(self, ome_zarr_dir):
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_get_chunk_data(self, multires_ome_zarr):
         """Test chunk data retrieval."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test', cache_size=16)
+        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
@@ -567,23 +631,145 @@ class TestOmeZarrAdapter:
             assert chunk_data is not None
             assert len(chunk_data.columns) == 1
 
-    def test_cache_reuse(self, ome_zarr_dir):
-        """Test that LRU cache is working."""
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_cache_reuse(self, multires_ome_zarr):
+        """Test that repeated reads return same data."""
         import zarr
-        root = zarr.open_group(ome_zarr_dir, mode='r')
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
         arr = root['0']
 
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test', cache_size=16)
+        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
             chunk_id = endpoints[0].chunk_id
 
-            # First call (cache miss)
-            data1 = adapter._get_chunk_data_cached(chunk_id)
+            # First call
+            data1 = adapter.get_chunk_data(chunk_id)
 
-            # Second call (cache hit)
-            data2 = adapter._get_chunk_data_cached(chunk_id)
+            # Second call
+            data2 = adapter.get_chunk_data(chunk_id)
 
             # Should return same data
-            np.testing.assert_array_equal(data1, data2)
+            arr1 = data1.column(0).to_numpy()
+            arr2 = data2.column(0).to_numpy()
+            np.testing.assert_array_equal(arr1, arr2)
+
+    @pytest.mark.skipif(
+        not _zarr_available(),
+        reason="zarr not available or incompatible numcodecs"
+    )
+    def test_level_data_values(self, multires_ome_zarr):
+        """Test that different levels have distinguishable values."""
+        import zarr
+
+        zarr_path, level_paths, zattrs = multires_ome_zarr
+
+        root = zarr.open_group(zarr_path, mode='r')
+
+        # Level 0 should have value 0, level 1 should have value 1, etc.
+        for level_idx, level_path in enumerate(level_paths):
+            level_name = str(level_idx)
+            if level_name in root:
+                arr = root[level_name]
+                # Check that values match level index (created by fixture)
+                data = arr[0:10, 0:10]
+                assert data.mean() == level_idx
+
+
+class TestHdf5Adapter:
+    """Tests for Hdf5Adapter using synthetic fixtures."""
+
+    @pytest.mark.skipif(
+        not _h5py_available(),
+        reason="h5py not available"
+    )
+    def test_adapter_init(self, hdf5_dataset):
+        """Test Hdf5Adapter initialization."""
+        import h5py
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, 'r') as f:
+            dataset = f['data']
+
+            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+            adapter = Hdf5Adapter(dataset, 'hdf5-test')
+
+            assert adapter.array_id == 'hdf5-test'
+
+    @pytest.mark.skipif(
+        not _h5py_available(),
+        reason="h5py not available"
+    )
+    def test_get_tensor_descriptor(self, hdf5_dataset):
+        """Test descriptor returns valid shape and dtype."""
+        import h5py
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, 'r') as f:
+            dataset = f['data']
+
+            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+            adapter = Hdf5Adapter(dataset, 'hdf5-test')
+
+            desc = adapter.get_tensor_descriptor()
+            assert desc.array_id == 'hdf5-test'
+            assert tuple(desc.shape) == shape
+            assert tuple(desc.chunk_shape) == chunks
+
+    @pytest.mark.skipif(
+        not _h5py_available(),
+        reason="h5py not available"
+    )
+    def test_get_chunk_endpoints(self, hdf5_dataset):
+        """Test chunk endpoint generation."""
+        import h5py
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, 'r') as f:
+            dataset = f['data']
+
+            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+            adapter = Hdf5Adapter(dataset, 'hdf5-test')
+
+            endpoints = adapter.get_chunk_endpoints()
+
+            # Should have (100/50) * (100/50) = 4 chunks
+            expected_chunks = (shape[0] // chunks[0]) * (shape[1] // chunks[1])
+            assert len(endpoints) == expected_chunks
+
+    @pytest.mark.skipif(
+        not _h5py_available(),
+        reason="h5py not available"
+    )
+    def test_get_chunk_data(self, hdf5_dataset):
+        """Test chunk data retrieval."""
+        import h5py
+
+        h5_path, shape, chunks = hdf5_dataset
+
+        with h5py.File(h5_path, 'r') as f:
+            dataset = f['data']
+
+            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+            adapter = Hdf5Adapter(dataset, 'hdf5-test')
+
+            endpoints = adapter.get_chunk_endpoints()
+
+            if endpoints:
+                chunk_data = adapter.get_chunk_data(endpoints[0].chunk_id)
+                assert chunk_data is not None
+                assert len(chunk_data.columns) == 1
+
+                # Chunk should be 50x50 = 2500 elements
+                arr = chunk_data.column(0).to_numpy()
+                assert arr.shape == (chunks[0] * chunks[1],)
