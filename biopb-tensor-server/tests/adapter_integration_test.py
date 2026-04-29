@@ -53,7 +53,7 @@ class TestZarrIntegration:
 
         # Start server
         server = TensorFlightServer('grpc://localhost:8899')
-        server.register_tensor('zarr-integration', adapter)
+        server.register_source('zarr-integration', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -63,12 +63,12 @@ class TestZarrIntegration:
             # Connect client and compute
             client = TensorFlightClient('grpc://localhost:8899', cache_bytes=10_000_000)
 
-            # List tensors
-            tensors = client.list_tensors()
-            assert 'zarr-integration' in tensors
+            # List sources
+            sources = client.list_sources()
+            assert 'zarr-integration' in sources
 
-            # Get array
-            darr = client.get_array('zarr-integration')
+            # Get tensor (source_id matches tensor_id for single-tensor sources)
+            darr = client.get_tensor('zarr-integration', 'zarr-integration')
             assert darr.shape == shape
             assert darr.dtype == np.uint8
 
@@ -92,7 +92,7 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, 'zarr-scaled', ['y', 'x'])
 
         server = TensorFlightServer('grpc://localhost:8898')
-        server.register_tensor('zarr-scaled', adapter)
+        server.register_source('zarr-scaled', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -102,7 +102,7 @@ class TestZarrIntegration:
             client = TensorFlightClient('grpc://localhost:8898', cache_bytes=10_000_000)
 
             # Test stride downsampling
-            darr = client.get_array('zarr-scaled', scale_hint=[2, 2], reduction_method='stride')
+            darr = client.get_tensor('zarr-scaled', 'zarr-scaled', scale_hint=[2, 2], reduction_method='stride')
             expected_shape = (shape[0] // 2, shape[1] // 2)
             assert darr.shape == expected_shape
 
@@ -131,7 +131,7 @@ class TestOmeZarrIntegration:
         adapter = OmeZarrAdapter(arr, 'ome-zarr-integration')
 
         server = TensorFlightServer('grpc://localhost:8897')
-        server.register_tensor('ome-zarr-integration', adapter)
+        server.register_source('ome-zarr-integration', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -141,8 +141,7 @@ class TestOmeZarrIntegration:
             client = TensorFlightClient('grpc://localhost:8897', cache_bytes=10_000_000)
 
             # Test precompute method for scale 2
-            darr = client.get_array(
-                'ome-zarr-integration',
+            darr = client.get_tensor('ome-zarr-integration', 'ome-zarr-integration',
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='precompute')
             )
 
@@ -175,7 +174,7 @@ class TestOmeZarrIntegration:
         adapter = OmeZarrAdapter(arr, 'ome-zarr-virtual')
 
         server = TensorFlightServer('grpc://localhost:8896')
-        server.register_tensor('ome-zarr-virtual', adapter)
+        server.register_source('ome-zarr-virtual', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -185,11 +184,7 @@ class TestOmeZarrIntegration:
             client = TensorFlightClient('grpc://localhost:8896', cache_bytes=10_000_000)
 
             # Request scale 3 - no matching level, should use virtual scaling
-            darr = client.get_array(
-                'ome-zarr-virtual',
-                scale_hint=[3, 3],
-                reduction_method='nearest'
-            )
+            darr = client.get_tensor('ome-zarr-virtual', 'ome-zarr-virtual', scale_hint=[3, 3], reduction_method='nearest')
 
             # Virtual scaling gives ceil(shape/3)
             base_shape = (256, 256)
@@ -221,7 +216,7 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tf, 'ome-tiff-integration')
 
         server = TensorFlightServer('grpc://localhost:8895')
-        server.register_tensor('ome-tiff-integration', adapter)
+        server.register_source('ome-tiff-integration', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -230,7 +225,7 @@ class TestOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8895', cache_bytes=10_000_000)
 
-            darr = client.get_array('ome-tiff-integration')
+            darr = client.get_tensor('ome-tiff-integration', 'ome-tiff-integration')
             assert darr.shape == shape
             assert darr.dtype == np.uint16
 
@@ -257,7 +252,7 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tf, 'ome-tiff-channels')
 
         server = TensorFlightServer('grpc://localhost:8894')
-        server.register_tensor('ome-tiff-channels', adapter)
+        server.register_source('ome-tiff-channels', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -266,7 +261,7 @@ class TestOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8894', cache_bytes=10_000_000)
 
-            darr = client.get_array('ome-tiff-channels')
+            darr = client.get_tensor('ome-tiff-channels', 'ome-tiff-channels')
 
             # Read channel 0 (value = 1)
             data0 = darr[0:1].compute()
@@ -299,7 +294,7 @@ class TestMultiFileOmeTiffIntegration:
         adapter = MultiFileOmeTiffAdapter(dir_path, 'multifile-integration')
 
         server = TensorFlightServer('grpc://localhost:8893')
-        server.register_tensor('multifile-integration', adapter)
+        server.register_source('multifile-integration', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -308,7 +303,7 @@ class TestMultiFileOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8893', cache_bytes=10_000_000)
 
-            darr = client.get_array('multifile-integration')
+            darr = client.get_tensor('multifile-integration', 'multifile-integration')
 
             # Verify shape - should have n_files planes
             n_files = len(file_list)
@@ -334,7 +329,7 @@ class TestMultiFileOmeTiffIntegration:
         adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-integration')
 
         server = TensorFlightServer('grpc://localhost:8892')
-        server.register_tensor('mm-integration', adapter)
+        server.register_source('mm-integration', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -343,7 +338,7 @@ class TestMultiFileOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8892', cache_bytes=10_000_000)
 
-            darr = client.get_array('mm-integration')
+            darr = client.get_tensor('mm-integration', 'mm-integration')
 
             # Should have 3 channels (set by fixture)
             assert darr.shape[0] == 3
@@ -374,7 +369,7 @@ class TestHdf5Integration:
             adapter = Hdf5Adapter(dataset, 'hdf5-integration')
 
             server = TensorFlightServer('grpc://localhost:8891')
-            server.register_tensor('hdf5-integration', adapter)
+            server.register_source('hdf5-integration', adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
             server_thread.start()
@@ -383,7 +378,7 @@ class TestHdf5Integration:
             try:
                 client = TensorFlightClient('grpc://localhost:8891', cache_bytes=10_000_000)
 
-                darr = client.get_array('hdf5-integration')
+                darr = client.get_tensor('hdf5-integration', 'hdf5-integration')
                 assert darr.shape == shape
 
                 data = darr.compute()
@@ -409,7 +404,7 @@ class TestCacheIntegration:
         adapter = ZarrAdapter(arr, 'cache-test', ['y', 'x'])
 
         server = TensorFlightServer('grpc://localhost:8890')
-        server.register_tensor('cache-test', adapter)
+        server.register_source('cache-test', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -418,7 +413,7 @@ class TestCacheIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
 
-            darr = client.get_array('cache-test')
+            darr = client.get_tensor('cache-test', 'cache-test')
 
             # First read
             data1 = darr[:chunks[0], :chunks[1]].compute()
@@ -452,7 +447,7 @@ class TestCacheIntegration:
         adapter = ZarrAdapter(arr, 'cache-regions', ['y', 'x'])
 
         server = TensorFlightServer('grpc://localhost:8889')
-        server.register_tensor('cache-regions', adapter)
+        server.register_source('cache-regions', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -461,7 +456,7 @@ class TestCacheIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8889', cache_bytes=10_000_000)
 
-            darr = client.get_array('cache-regions')
+            darr = client.get_tensor('cache-regions', 'cache-regions')
 
             # Read first chunk
             data1 = darr[:chunks[0], :chunks[1]].compute()
@@ -496,7 +491,7 @@ class TestConcurrentAccess:
         adapter = ZarrAdapter(arr, 'concurrent-test', ['y', 'x'])
 
         server = TensorFlightServer('grpc://localhost:8888')
-        server.register_tensor('concurrent-test', adapter)
+        server.register_source('concurrent-test', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -506,7 +501,7 @@ class TestConcurrentAccess:
 
         def read_region(client_id):
             client = TensorFlightClient('grpc://localhost:8888', cache_bytes=10_000_000)
-            darr = client.get_array('concurrent-test')
+            darr = client.get_tensor('concurrent-test', 'concurrent-test')
             data = darr[:chunks[0], :chunks[1]].compute()
             results.append((client_id, data.mean()))
             client.close()

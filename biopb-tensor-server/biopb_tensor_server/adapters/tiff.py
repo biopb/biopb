@@ -5,7 +5,8 @@ Relies on OS page cache for raw data caching.
 
 import struct
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -17,8 +18,12 @@ from biopb_tensor_server.base import (
     _encode_chunk_id,
     _chunks_intersect,
 )
+from biopb_tensor_server.discovery import SourceClaim, get_file_identity
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.config import SourceConfig
 
 
 # =============================================================================
@@ -133,6 +138,54 @@ class OmeTiffAdapter(BackendAdapter):
     Relies on OS page cache for raw data caching.
     """
 
+    @classmethod
+    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim single OME-TIFF files.
+
+        Args:
+            path: Path to check (file or directory)
+            visited_identities: Set of already-visited file identities
+
+        Returns:
+            SourceClaim if this is an OME-TIFF file, None otherwise
+        """
+        if not path.is_file():
+            return None
+
+        name = path.name.lower()
+        # OME-TIFF extensions
+        if name.endswith('.ome.tiff') or name.endswith('.ome.tif'):
+            return SourceClaim(
+                source_type="ome-tiff",
+                primary_path=path,
+                claimed_paths={path},
+            )
+
+        # Plain TIFF files - also claim as ome-tiff (tifffile handles them)
+        if name.endswith('.tiff') or name.endswith('.tif'):
+            return SourceClaim(
+                source_type="ome-tiff",
+                primary_path=path,
+                claimed_paths={path},
+            )
+
+        return None
+
+    @classmethod
+    def create_from_config(cls, source: 'SourceConfig') -> 'OmeTiffAdapter':
+        """Create adapter instance from SourceConfig.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+
+        Returns:
+            OmeTiffAdapter instance
+        """
+        import tifffile
+
+        tiff = tifffile.TiffFile(str(source.url))
+        return cls(tiff, source.source_id, source.dim_labels)
+
     def __init__(
         self,
         tiff_file,
@@ -148,6 +201,10 @@ class OmeTiffAdapter(BackendAdapter):
         """
         self.tiff_file = tiff_file
         self.array_id = array_id
+
+        # Source-level metadata for DataSourceDescriptor
+        self._source_url = tiff_file.filename if hasattr(tiff_file, 'filename') else ""
+        self._source_type = "ome-tiff"
 
         # Get series info
         self.series = tiff_file.series[0]
@@ -311,6 +368,73 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     Relies on OS page cache for raw data caching.
     """
 
+    @classmethod
+    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim directories with multi-file OME-TIFF structure.
+
+        This is a multi-node claim that claims the directory + all TIFF files
+        + metadata file.
+
+        Args:
+            path: Path to check (file or directory)
+            visited_identities: Set of already-visited file identities
+
+        Returns:
+            SourceClaim with multi-node paths if valid structure, None otherwise
+        """
+        if not path.is_dir():
+            return None
+
+        # Check for metadata file or multiple img_*.ome.tiff files
+        metadata_file = path / '_metadata.txt'
+        img_files = list(path.glob('img_*.ome.tiff')) + list(path.glob('img_*.ome.tif'))
+
+        # Also check for other common patterns
+        if not metadata_file.exists() and len(img_files) <= 1:
+            # Check for other multi-file patterns
+            ome_files = list(path.glob('*.ome.tiff')) + list(path.glob('*.ome.tif'))
+            if len(ome_files) <= 1:
+                # No multi-file structure detected
+                return None
+
+        # Multi-node claim: claim the directory + all TIFF files + metadata
+        claimed = {path}
+
+        # Add all OME-TIFF files in the directory
+        for pattern in ['img_*.ome.tiff', 'img_*.ome.tif', '*.ome.tiff', '*.ome.tif']:
+            for img_file in path.glob(pattern):
+                identity = get_file_identity(img_file)
+                if identity not in visited_identities:
+                    claimed.add(img_file)
+
+        # Add metadata file if exists
+        if metadata_file.exists():
+            claimed.add(metadata_file)
+
+        # Also check for other metadata patterns
+        for meta_pattern in ['metadata.txt', '*_metadata.txt']:
+            for meta_file in path.glob(meta_pattern):
+                if meta_file.exists():
+                    claimed.add(meta_file)
+
+        return SourceClaim(
+            source_type="ome-tiff-multifile",
+            primary_path=path,
+            claimed_paths=claimed,
+        )
+
+    @classmethod
+    def create_from_config(cls, source: 'SourceConfig') -> 'MultiFileOmeTiffAdapter':
+        """Create adapter instance from SourceConfig.
+
+        Args:
+            source: SourceConfig with url (directory), source_id, dim_labels
+
+        Returns:
+            MultiFileOmeTiffAdapter instance
+        """
+        return cls(str(source.url), source.source_id, source.dim_labels)
+
     def __init__(
         self,
         directory: str,
@@ -329,6 +453,10 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         self.directory = Path(directory)
         self.array_id = array_id
+
+        # Source-level metadata for DataSourceDescriptor
+        self._source_url = str(directory)
+        self._source_type = "ome-tiff-multifile"
 
         # Try to get explicit file list from _metadata.txt OME-XML
         expected_files = self._parse_file_list_from_metadata()

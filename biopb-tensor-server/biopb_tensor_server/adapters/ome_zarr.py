@@ -5,7 +5,8 @@ Relies on OS page cache for raw data caching.
 
 import json
 import os
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Set, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse
 
 import numpy as np
@@ -21,8 +22,12 @@ from biopb_tensor_server.base import (
     _normalize_reduction_method,
 )
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.discovery import SourceClaim
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.config import SourceConfig
 
 
 class OmeZarrAdapter(BackendAdapter):
@@ -40,6 +45,76 @@ class OmeZarrAdapter(BackendAdapter):
 
     Relies on OS page cache for raw data caching.
     """
+
+    @classmethod
+    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim .zarr directories with OME multiscales metadata.
+
+        Args:
+            path: Path to check (file or directory)
+            visited_identities: Set of already-visited file identities
+
+        Returns:
+            SourceClaim if this is an OME-Zarr dataset, None otherwise
+        """
+        # Must be a directory ending in .zarr
+        if not path.is_dir() or not path.name.endswith('.zarr'):
+            return None
+
+        zattrs_path = path / '.zattrs'
+        if not zattrs_path.exists():
+            return None
+
+        try:
+            with open(zattrs_path) as f:
+                zattrs = json.load(f)
+            # Check for OME multiscales key
+            if 'multiscales' not in zattrs:
+                return None
+        except (json.JSONDecodeError, KeyError, IOError):
+            return None
+
+        return SourceClaim(
+            source_type="ome-zarr",
+            primary_path=path,
+            claimed_paths={path},
+        )
+
+    @classmethod
+    def create_from_config(cls, source: 'SourceConfig') -> 'OmeZarrAdapter':
+        """Create adapter instance from SourceConfig.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+
+        Returns:
+            OmeZarrAdapter instance
+        """
+        import zarr
+        import json
+
+        zarr_path = str(source.url)
+        store = zarr.DirectoryStore(zarr_path)
+
+        try:
+            with open(str(source.url / ".zattrs")) as f:
+                zattrs = json.load(f)
+
+            resolution_path = "0"
+            if 'multiscales' in zattrs and zattrs['multiscales']:
+                datasets = zattrs['multiscales'][0].get('datasets', [])
+                if datasets:
+                    resolution_path = datasets[0].get('path', '0')
+
+            root = zarr.open_group(zarr_path, mode='r')
+            if resolution_path in root:
+                arr = root[resolution_path]
+            else:
+                arr = zarr.open_array(store, mode='r')
+        except (json.JSONDecodeError, KeyError, FileNotFoundError):
+            arr = zarr.open_array(zarr_path, mode='r')
+
+        return cls(arr, source.source_id, source.dim_labels)
 
     def __init__(
         self,
@@ -59,6 +134,10 @@ class OmeZarrAdapter(BackendAdapter):
         self.zarr_array = zarr_array
         self.array_id = array_id
         self.resolution_level = resolution_level
+
+        # Source-level metadata for DataSourceDescriptor
+        self._source_url = str(zarr_array.store.path if hasattr(zarr_array.store, 'path') else str(zarr_array.store))
+        self._source_type = "ome-zarr"
 
         # Try to read OME metadata from .zattrs
         self.ome_metadata = {}

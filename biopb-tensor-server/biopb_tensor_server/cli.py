@@ -18,11 +18,9 @@ from biopb_tensor_server.config import (
     resolve_all_sources,
     ServerConfig,
     CacheConfig,
+    SourceConfig,
 )
-from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-from biopb_tensor_server.adapters.tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
-from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.base import configure_compute_backend
 from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.cache import CacheManager
@@ -37,76 +35,30 @@ app = typer.Typer(
 console = Console()
 
 
-def _create_adapter(source):
+def _create_source_adapter(source: SourceConfig, registry=None):
     """Create a backend adapter from a source config.
 
-    Raw data caching relies on OS page cache - no per-adapter LRU cache.
+    Uses the registry's get_adapter_for_type to find the adapter class,
+    then calls create_from_config to instantiate it.
+
+    Args:
+        source: SourceConfig with type, url, source_id, dim_labels
+        registry: Optional adapter registry (uses default if None)
+
+    Returns:
+        BackendAdapter instance
+
+    Raises:
+        ValueError: If source type is not registered
     """
-    if source.type == "zarr":
-        import zarr
-        arr = zarr.open_array(str(source.path), mode='r')
-        return ZarrAdapter(arr, source.array_id, source.dim_labels)
+    if registry is None:
+        registry = get_default_registry()
 
-    elif source.type == "hdf5":
-        import h5py
-        f = h5py.File(str(source.path), 'r')
-        dataset = f[source.dataset] if source.dataset else list(f.keys())[0]
-        return Hdf5Adapter(dataset, source.array_id, source.dim_labels)
-
-    elif source.type == "ome-tiff":
-        import tifffile
-        tiff = tifffile.TiffFile(str(source.path))
-        return OmeTiffAdapter(tiff, source.array_id, source.dim_labels)
-
-    elif source.type == "ome-tiff-multifile":
-        return MultiFileOmeTiffAdapter(
-            str(source.path),
-            source.array_id,
-            source.dim_labels,
-        )
-
-    elif source.type == "ome-zarr":
-        import zarr
-        import json
-        zarr_path = str(source.path)
-        store = zarr.DirectoryStore(zarr_path)
-
-        try:
-            with open(str(source.path / ".zattrs")) as f:
-                zattrs = json.load(f)
-
-            resolution_path = "0"
-            if 'multiscales' in zattrs and zattrs['multiscales']:
-                datasets = zattrs['multiscales'][0].get('datasets', [])
-                if datasets:
-                    resolution_path = datasets[0].get('path', '0')
-
-            root = zarr.open_group(zarr_path, mode='r')
-            if resolution_path in root:
-                arr = root[resolution_path]
-            else:
-                arr = zarr.open_array(store, mode='r')
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
-            arr = zarr.open_array(zarr_path, mode='r')
-
-        return OmeZarrAdapter(arr, source.array_id, source.dim_labels)
-
-    elif source.type == "aics":
-        from aicsimageio import AICSImage
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-
-        img = AICSImage(str(source.path))
-        if source.scene_index is not None:
-            img.set_scene(source.scene_index)
-        return AicsImageIoAdapter(
-            img,
-            source.scene_index or 0,
-            source.array_id,
-            source.dim_labels,
-        )
-
-    else:
+    adapter_cls = registry.get_adapter_for_type(source.type)
+    if adapter_cls is None:
         raise ValueError(f"Unknown source type: {source.type}")
+
+    return adapter_cls.create_from_config(source)
 
 
 @app.command()
@@ -216,10 +168,10 @@ def serve(
     sources = resolve_all_sources(server_config)
 
     if not sources:
-        console.print("[yellow]Warning: No tensor sources configured[/yellow]")
+        console.print("[yellow]Warning: No data sources configured[/yellow]")
         raise typer.Exit(1)
 
-    console.print(f"[green]Loading {len(sources)} tensor source(s)...[/green]")
+    console.print(f"[green]Loading {len(sources)} data source(s)...[/green]")
     console.print(
         "[green]Compute backend policy:[/green] "
         f"backend={compute_backend or server_config.compute_backend}, "
@@ -233,23 +185,30 @@ def serve(
     adapters = {}
     for source in sources:
         try:
-            adapter = _create_adapter(source)
-            adapters[source.array_id] = adapter
-            desc = adapter.get_tensor_descriptor()
-            console.print(f"  [blue]{source.array_id}[/blue]: shape={list(desc.shape)}, dtype={desc.dtype}")
+            adapter = _create_source_adapter(source)
+            adapters[source.source_id] = adapter
+            # Show tensors in this source
+            tensor_descs = adapter.list_tensor_descriptors()
+            if len(tensor_descs) == 1:
+                desc = tensor_descs[0]
+                console.print(f"  [blue]{source.source_id}[/blue]: shape={list(desc.shape)}, dtype={desc.dtype}")
+            else:
+                console.print(f"  [blue]{source.source_id}[/blue] ({len(tensor_descs)} tensors):")
+                for desc in tensor_descs:
+                    console.print(f"    [cyan]{desc.array_id}[/cyan]: shape={list(desc.shape)}, dtype={desc.dtype}")
         except Exception as e:
-            console.print(f"  [red]Failed to load {source.array_id}: {e}[/red]")
+            console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
 
     if not adapters:
-        console.print("[red]No tensors loaded successfully[/red]")
+        console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
     # Create and start server
     location = f"grpc://{host}:{port}"
     server = TensorFlightServer(location)
 
-    for array_id, adapter in adapters.items():
-        server.register_tensor(array_id, adapter)
+    for source_id, adapter in adapters.items():
+        server.register_source(source_id, adapter)
 
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
@@ -303,10 +262,10 @@ def validate(
                 f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024*1024)}, "
                 f"max_total_gb={server_config.cache.file_max_total_bytes // (1024*1024*1024)}"
             )
-        console.print(f"  Sources: {len(sources)} tensor(s)")
+        console.print(f"  Sources: {len(sources)} data source(s)")
 
         for source in sources:
-            console.print(f"    - {source.array_id} ({source.type}: {source.path})")
+            console.print(f"    - {source.source_id} ({source.type}: {source.path})")
 
     except Exception as e:
         console.print(f"[red]✗ Config invalid: {e}[/red]")
@@ -321,7 +280,7 @@ def list_tensors(
         help="Path to TOML config file",
     ),
 ):
-    """List tensors defined in a config file.
+    """List data sources and tensors defined in a config file.
 
     Example:
         biopb-tensor list biopb-tensor.toml
@@ -330,20 +289,43 @@ def list_tensors(
         server_config = load_config(config)
         sources = resolve_all_sources(server_config)
 
-        table = Table(title="Tensor Sources")
-        table.add_column("Array ID", style="cyan")
+        table = Table(title="Data Sources and Tensors")
+        table.add_column("Source ID", style="cyan")
         table.add_column("Type", style="green")
+        table.add_column("Tensor ID", style="magenta")
         table.add_column("Path")
-        table.add_column("Dim Labels")
+        table.add_column("Shape")
 
         for source in sources:
-            labels = ", ".join(source.dim_labels) if source.dim_labels else "-"
-            table.add_row(
-                source.array_id,
-                source.type,
-                str(source.path),
-                labels,
-            )
+            try:
+                adapter = _create_source_adapter(source)
+                tensor_descs = adapter.list_tensor_descriptors()
+                if len(tensor_descs) == 1:
+                    desc = tensor_descs[0]
+                    table.add_row(
+                        source.source_id,
+                        source.type,
+                        desc.array_id,
+                        str(source.path),
+                        str(list(desc.shape)),
+                    )
+                else:
+                    for desc in tensor_descs:
+                        table.add_row(
+                            source.source_id,
+                            source.type,
+                            desc.array_id,
+                            str(source.path),
+                            str(list(desc.shape)),
+                        )
+            except Exception as e:
+                table.add_row(
+                    source.source_id,
+                    source.type,
+                    "[red]Error[/red]",
+                    str(source.path),
+                    str(e),
+                )
 
         console.print(table)
 

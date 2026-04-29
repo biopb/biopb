@@ -1,77 +1,56 @@
-## Functional tests for a running endpoint
+## Test Structure
 
-A small pytest module exercises the **live** service listening on the
-machine (by default `127.0.0.1:50051`).  It does *not* spin up any dummy
-servers; instead it connects to whatever implementation is currently
-responding, issuing a couple of requests and optionally checking the
-standard gRPC health service.
+### Python tests
 
-### how to run
+**Server-side tests** (`biopb-tensor-server/tests/`):
+- `adapter_unit_test.py` - Adapter unit tests (ZarrAdapter, OmeZarrAdapter, config, compute backend)
+- `adapter_integration_test.py` - Integration tests with server/client
+- `multifield_test.py` - Multifield source tests (multiple tensors per source)
+- `tensor_extended_test.py` - Extended adapter tests (MultiFileOmeTiff, OmeZarr, HDF5)
+- `cache_test.py` - Cache module tests
 
-```sh
-pytest tests/python/grpc_services_test.py
-```
+**Client tests** (`src/test/python/`):
+- `tensor_test.py` - TensorFlightClient tests using new multifield API
 
-### configuration
+### Java tests (`src/test/java/`)
 
-- `SERVICE_SERVER` – address or URL of the combined
-  ProcessImage/ObjectDetection endpoint.  Examples:
+- `TensorFlightClientTest.java` - Java client tests using new multifield API
+- `image/UtilsTest.java` - Image utility tests
+- `image/Imglib2OrderTest.java` - Imglib2 dimension ordering tests
 
-  ```sh
-  127.0.0.1:50051             # insecure local port
-  http://proxy.example.com     # equivalent to above
-  https://proxy.example.com    # TLS-protected via nginx
-  https://proxy.example.com:443
-  ```
+## Running tests
 
-  If the scheme is `https` the test fixture will create a **secure channel**
-  using `grpc.secure_channel`.  By default the system's root certificate store
-  is used to verify the proxy certificate; to supply a custom CA bundle set
-  `SSL_CA_CERT` to the path of a PEM file containing one or more root certs.
-
-- (Legacy) `PROCESS_SERVER`/`DETECTION_SERVER` are still recognised but
-  unnecessary when the service is co‑hosted.
-- Tests automatically skip unreachable hosts or unimplemented RPCs; this
-  behaviour keeps the suite safe for CI and intermittent service availability.
-
----
-
-## Adapter unit tests
-
-Basic adapter tests (`tensor_test.py`) use synthetic data and run standalone:
+### Python
 
 ```sh
+# Run all tests
+pytest biopb-tensor-server/tests/ src/test/python/tensor_test.py
+
+# Run client tests only
 pytest src/test/python/tensor_test.py
+
+# Run server-side adapter tests only
+pytest biopb-tensor-server/tests/
 ```
 
-### Extended adapter tests (require test data)
-
-Tests for `MultiFileOmeTiffAdapter` and `OmeZarrAdapter` require external
-test fixtures. Set `BIOPB_TEST_DATA_DIR` to skip setup:
+### Java
 
 ```sh
-export BIOPB_TEST_DATA_DIR=/path/to/test/data
-pytest src/test/python/tensor_extended_test.py
+mvn -B test
 ```
 
-Tests automatically skip if fixtures are not found.
+## Test coverage
 
-Required fixtures:
-- `mm_test_data/` - Micro-Manager multi-file OME-TIFF dataset
-- `test.ome.zarr/` - OME-Zarr (OME-NGFF) dataset
+### Client tests
+- `list_sources()` returns DataSourceDescriptor with tensor metadata
+- `get_tensor(source_id, tensor_id)` returns lazy array
+- Chunk loading, caching, scaled reads
+- Error handling for invalid source/tensor IDs
 
-### what is covered
-
-1.  **Connectivity** – a channel-ready check ensures the target host is
-    reachable.
-2.  **Health check** – if the server implements the standard
-    `grpc.health.v1.Health` service and the `grpcio-health-checking`
-    package is installed, the test will validate that `SERVING` is
-    returned.
-3.  **ProcessImage.Run** – send a tiny dummy image, expect a
-    `ProcessResponse` with a serialisable payload.
-4.  **ObjectDetection.RunDetection** – similar lightweight call.
-5.  **ObjectDetection.RunDetectionStream** – exercise the streaming API.
-
-The module serves as a foundation; add further functional and regression
-checks as the service evolves.
+### Server-side tests
+- Adapter descriptor generation, chunk endpoints
+- ZarrAdapter, OmeZarrAdapter, Hdf5Adapter, OmeTiffAdapter
+- Multifield sources with varying tensor shapes
+- Compute backend selection (CPU/GPU heuristics)
+- OME-Zarr precomputed pyramid levels
+- Cache module internals

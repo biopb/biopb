@@ -1,12 +1,21 @@
 package biopb.tensor;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import biopb.tensor.ChunkBounds;
+import biopb.tensor.DataSourceDescriptor;
+import biopb.tensor.SliceHint;
+import biopb.tensor.TensorDescriptor;
+import biopb.tensor.TensorReadOptions;
+import biopb.tensor.TensorSelection;
+import biopb.tensor.TensorTicket;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
@@ -43,8 +52,9 @@ import net.imglib2.type.numeric.real.FloatType;
 /**
  * Client for accessing tensors from a TensorFlightServer.
  *
- * This client uses Apache Arrow Flight to discover tensors, request logical
- * read plans, and fetch chunk payloads from a TensorFlightServer.
+ * This client uses Apache Arrow Flight to discover data sources, request logical
+ * read plans, and fetch chunk payloads from a TensorFlightServer. It supports
+ * multifield acquisitions where tensors within a source have different shapes.
  *
  * The Java client returns lazy cell-backed images when the logical Flight
  * endpoint layout matches the descriptor chunk grid. In that case, imglib2's
@@ -53,9 +63,14 @@ import net.imglib2.type.numeric.real.FloatType;
  * Usage:
  * <pre>
  * TensorFlightClient client = new TensorFlightClient("localhost:8815");
- * RandomAccessibleInterval&lt;UnsignedByteType&gt; array = client.getArray("my-tensor");
+ *
+ * // List data sources (each may contain multiple tensors)
+ * Map&lt;String, DataSourceDescriptor&gt; sources = client.listSources();
+ *
+ * // Access a specific tensor within a source
+ * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source", "tensor-0");
  * long[] pos = {10, 20, 30};
- * UnsignedByteType pixel = array.getAt(pos);
+ * UnsignedByteType pixel = arr.getAt(pos);
  * client.close();
  * </pre>
  */
@@ -66,6 +81,7 @@ public class TensorFlightClient implements AutoCloseable {
     private final BufferAllocator allocator;
     private final FlightClient client;
     private final Map<String, TensorDescriptor> descriptors;
+    private final Map<String, DataSourceDescriptor> sources;
     private final long cacheBytes;
 
     /**
@@ -108,201 +124,162 @@ public class TensorFlightClient implements AutoCloseable {
         this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.client = FlightClient.builder(this.allocator, location).build();
         this.descriptors = new HashMap<>();
+        this.sources = new HashMap<>();
         this.cacheBytes = cacheBytes;
     }
 
     /**
-     * List available tensors on the server.
+     * List available data sources.
      *
-     * @return List of tensor IDs
+     * Each data source may contain multiple tensors (for multifield acquisitions
+     * where tensors have different shapes). The returned DataSourceDescriptor
+     * contains full tensor metadata (shape, dtype, chunk_shape) for all tensors.
+     *
+     * @return Map of source_id to DataSourceDescriptor
      */
-    public List<String> listTensors() throws IOException {
-        List<String> tensorIds = new ArrayList<>();
+    public Map<String, DataSourceDescriptor> listSources() throws IOException {
+        Map<String, DataSourceDescriptor> result = new HashMap<>();
         for (FlightInfo info : client.listFlights(Criteria.ALL)) {
-            TensorDescriptor descriptor = parseDescriptor(info.getDescriptor().getCommand());
-            descriptors.put(descriptor.getArrayId(), descriptor);
-            tensorIds.add(descriptor.getArrayId());
-        }
-        return tensorIds;
-    }
-
-    /**
-     * Register a tensor descriptor (for manual setup).
-     *
-     * @param descriptor The tensor descriptor
-     */
-    public void registerDescriptor(TensorDescriptor descriptor) {
-        descriptors.put(descriptor.getArrayId(), descriptor);
-    }
-
-    /**
-     * Get tensor descriptor for an array.
-     *
-     * @param arrayId Tensor identifier
-     * @return TensorDescriptor
-     */
-    public TensorDescriptor getDescriptor(String arrayId) {
-        TensorDescriptor descriptor = descriptors.get(arrayId);
-        if (descriptor != null) {
-            return descriptor;
-        }
-
-        try {
-            for (String tensorId : listTensors()) {
-                if (tensorId.equals(arrayId)) {
-                    return descriptors.get(arrayId);
-                }
+            DataSourceDescriptor sourceDesc = DataSourceDescriptor.parseFrom(
+                info.getDescriptor().getCommand());
+            result.put(sourceDesc.getSourceId(), sourceDesc);
+            // Cache tensor descriptors for quick lookup
+            for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
+                descriptors.put(tensorDesc.getArrayId(), tensorDesc);
             }
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to list tensors", e);
+        }
+        sources.putAll(result);
+        return result;
+    }
+
+    /**
+     * Get source-level OME/vendor metadata.
+     *
+     * Fetches metadata via GetFlightInfo for the first tensor in the source,
+     * since metadataJson is populated in the response TensorDescriptor.
+     *
+     * @param sourceId Source identifier
+     * @return Parsed metadata as Map, or empty map if no metadata
+     */
+    public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
+        if (!sources.containsKey(sourceId)) {
+            listSources();
+        }
+        DataSourceDescriptor sourceDesc = sources.get(sourceId);
+        if (sourceDesc == null) {
+            throw new IllegalArgumentException("Source not found: " + sourceId);
+        }
+        if (sourceDesc.getTensorsList().isEmpty()) {
+            return new HashMap<>();
         }
 
-        throw new IllegalArgumentException("Tensor not found: " + arrayId);
+        // Get metadata from first tensor via GetFlightInfo
+        TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
+        TensorSelection selection = TensorSelection.newBuilder()
+                .setSourceId(sourceId)
+                .setTensorId(firstTensor.getArrayId())
+                .build();
+        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()));
+        TensorDescriptor responseDesc = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
+
+        if (responseDesc.getMetadataJson().isEmpty()) {
+            return new HashMap<>();
+        }
+        return parseMetadataJson(responseDesc.getMetadataJson());
     }
 
     /**
-     * Get the request-specific descriptor for a tensor read.
+     * Get a RandomAccessibleInterval for a tensor within a data source.
      *
-     * @param arrayId Tensor identifier
-     * @param readOptions Request-scoped read options
-     * @return Logical descriptor returned by the Flight server
-     */
-    public TensorDescriptor getDescriptor(String arrayId, TensorReadOptions readOptions) {
-        return getDescriptor(arrayId, null, readOptions);
-    }
-
-    /**
-     * Get the request-specific descriptor for a scaled tensor read.
-     *
-     * @param arrayId Tensor identifier
-     * @param scaleHint Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @return Logical descriptor returned by the Flight server
-     */
-    public TensorDescriptor getDescriptor(
-            String arrayId,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        return getDescriptor(arrayId, null, buildReadOptions(scaleHint, reductionMethod));
-    }
-
-    /**
-     * Get the request-specific descriptor for a sliced and scaled tensor read.
-     *
-     * @param arrayId Tensor identifier
-     * @param sliceHint Optional slice hint
-     * @param scaleHint Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @return Logical descriptor returned by the Flight server
-     */
-    public TensorDescriptor getDescriptor(
-            String arrayId,
-            SliceHint sliceHint,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        return getDescriptor(arrayId, sliceHint, buildReadOptions(scaleHint, reductionMethod));
-    }
-
-    /**
-     * Get the request-specific descriptor for a tensor read.
-     *
-     * @param arrayId Tensor identifier
-     * @param sliceHint Optional slice hint
-     * @param readOptions Optional read options
-     * @return Logical descriptor returned by the Flight server
-     */
-    public TensorDescriptor getDescriptor(
-            String arrayId,
-            SliceHint sliceHint,
-            TensorReadOptions readOptions) {
-
-        return getRequestContext(arrayId, sliceHint, readOptions).descriptor;
-    }
-
-    /**
-     * Get a RandomAccessibleInterval for a tensor.
-     *
-     * @param arrayId Tensor identifier
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested logical array
+     * @return RandomAccessibleInterval containing the requested tensor
      */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getArray(
-            String arrayId) {
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId) {
 
-        return getArray(arrayId, (SliceHint) null, (TensorReadOptions) null);
+        return getTensor(sourceId, tensorId, null, (TensorReadOptions) null);
     }
 
     /**
      * Get a RandomAccessibleInterval for a tensor with read options.
      *
-     * @param arrayId Tensor identifier
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
      * @param readOptions Optional request-scoped read options
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested logical array
+     * @return RandomAccessibleInterval containing the requested tensor
      */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getArray(
-            String arrayId,
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId,
             TensorReadOptions readOptions) {
 
-        return getArray(arrayId, null, readOptions);
+        return getTensor(sourceId, tensorId, null, readOptions);
     }
 
     /**
      * Get a RandomAccessibleInterval for a tensor with slice and read options.
      *
-     * @param arrayId Tensor identifier
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
      * @param sliceHint Optional slice hint
      * @param readOptions Optional request-scoped read options
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested logical array
+     * @return RandomAccessibleInterval containing the requested tensor
      */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getArray(
-            String arrayId,
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId,
             SliceHint sliceHint,
             TensorReadOptions readOptions) {
 
-        RequestContext context = getRequestContext(arrayId, sliceHint, readOptions);
+        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, readOptions);
         return createArray(context);
     }
 
     /**
      * Convenience overload for scaled reads.
      *
-     * @param arrayId Tensor identifier
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
      * @param scaleHint Per-dimension scale factors
      * @param reductionMethod Requested reduction method
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested logical array
+     * @return RandomAccessibleInterval containing the requested tensor
      */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getArray(
-            String arrayId,
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId,
             long[] scaleHint,
             String reductionMethod) {
 
         TensorReadOptions readOptions = buildReadOptions(scaleHint, reductionMethod);
-        return getArray(arrayId, null, readOptions);
+        return getTensor(sourceId, tensorId, null, readOptions);
     }
 
     /**
      * Convenience overload for sliced scaled reads.
      *
-     * @param arrayId Tensor identifier
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
      * @param sliceHint Optional slice hint
      * @param scaleHint Per-dimension scale factors
      * @param reductionMethod Requested reduction method
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested logical array
+     * @return RandomAccessibleInterval containing the requested tensor
      */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getArray(
-            String arrayId,
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId,
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
 
         TensorReadOptions readOptions = buildReadOptions(scaleHint, reductionMethod);
-        return getArray(arrayId, sliceHint, readOptions);
+        return getTensor(sourceId, tensorId, sliceHint, readOptions);
     }
 
     @Override
@@ -316,39 +293,60 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    private RequestContext getRequestContext(
-            String arrayId,
+    private RequestContext getTensorContext(
+            String sourceId,
+            String tensorId,
             SliceHint sliceHint,
             TensorReadOptions readOptions) {
 
-        TensorDescriptor baseDescriptor = getDescriptor(arrayId);
+        // Ensure sources are loaded
+        if (sources.isEmpty()) {
+            try {
+                listSources();
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to list sources", e);
+            }
+        }
+
+        DataSourceDescriptor sourceDesc = sources.get(sourceId);
+        if (sourceDesc == null) {
+            throw new IllegalArgumentException("Source not found: " + sourceId);
+        }
+
+        // Find tensor descriptor to get shape for validation
+        TensorDescriptor baseDescriptor = null;
+        for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
+            if (desc.getArrayId().equals(tensorId)) {
+                baseDescriptor = desc;
+                break;
+            }
+        }
+        if (baseDescriptor == null) {
+            throw new IllegalArgumentException("Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
+        }
+
         TensorReadOptions normalizedReadOptions = normalizeReadOptions(baseDescriptor, readOptions);
-        TensorDescriptor requestDescriptor = buildRequestDescriptor(baseDescriptor, sliceHint, normalizedReadOptions);
-        FlightInfo info = client.getInfo(FlightDescriptor.command(requestDescriptor.toByteArray()));
-        TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
-        return new RequestContext(responseDescriptor, info.getEndpoints());
-    }
 
-    private TensorDescriptor buildRequestDescriptor(
-            TensorDescriptor baseDescriptor,
-            SliceHint sliceHint,
-            TensorReadOptions readOptions) {
-
-        TensorDescriptor.Builder builder = TensorDescriptor.newBuilder()
-                .setArrayId(baseDescriptor.getArrayId())
-                .addAllDimLabels(baseDescriptor.getDimLabelsList())
-                .addAllShape(baseDescriptor.getShapeList())
-                .addAllChunkShape(baseDescriptor.getChunkShapeList())
-                .setDtype(baseDescriptor.getDtype());
+        // Build TensorSelection for the request
+        TensorSelection.Builder selectionBuilder = TensorSelection.newBuilder()
+            .setSourceId(sourceId)
+            .setTensorId(tensorId);
 
         if (sliceHint != null) {
-            builder.setSliceHint(sliceHint);
+            selectionBuilder.setSliceHint(sliceHint);
         }
-        if (readOptions != null) {
-            builder.setReadOptions(readOptions);
+        if (normalizedReadOptions != null) {
+            selectionBuilder.setReadOptions(normalizedReadOptions);
         }
 
-        return builder.build();
+        TensorSelection selection = selectionBuilder.build();
+        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()));
+        TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+
+        // Cache the response descriptor
+        descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
+
+        return new RequestContext(responseDescriptor, info.getEndpoints());
     }
 
     private static TensorReadOptions buildReadOptions(long[] scaleHint, String reductionMethod) {
@@ -686,13 +684,9 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    private static TensorDescriptor parseDescriptor(byte[] bytes) throws IOException {
-        return TensorDescriptor.parseFrom(bytes);
-    }
-
     private static TensorDescriptor parseDescriptorUnchecked(byte[] bytes) {
         try {
-            return parseDescriptor(bytes);
+            return TensorDescriptor.parseFrom(bytes);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to parse TensorDescriptor", e);
         }
@@ -742,6 +736,21 @@ public class TensorFlightClient implements AutoCloseable {
             case "float32":
             default:
                 return new FloatType();
+        }
+    }
+
+    private static final Gson GSON = new Gson();
+
+    private static Map<String, Object> parseMetadataJson(String json) {
+        if (json == null || json.isEmpty()) {
+            return new HashMap<>();
+        }
+        try {
+            return GSON.fromJson(json, new TypeToken<Map<String, Object>>() {}.getType());
+        } catch (Exception e) {
+            Map<String, Object> result = new HashMap<>();
+            result.put("raw", json);
+            return result;
         }
     }
 

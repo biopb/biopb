@@ -77,3 +77,40 @@ message TensorReadOptions {
 message TensorWriteOptions {
   reserved 1 to 10; // Future: transaction_id, atomic, overwrite_policy, etc.
 }
+
+// Describes a data source containing one or more tensors.
+// Used in ListFlights response to provide full tensor metadata upfront.
+// Enables multifield support where tensors within a source have different shapes.
+message DataSourceDescriptor {
+  // Unique identifier for the data source (flight identifier)
+  string source_id = 1;
+
+  // File path, directory, or remote URL
+  string source_url = 2;
+
+  // Source type: "aics", "micromanager", "ome-zarr", "zarr", "hdf5", etc.
+  string source_type = 3;
+
+  // All tensor descriptors in this source
+  // metadata_json field not populated here (source-level metadata only)
+  repeated TensorDescriptor tensors = 4;
+
+  // Source-level OME/vendor metadata (JSON format)
+  string metadata_json = 5;
+}
+
+// Client request to access a specific tensor within a data source.
+// Used in GetFlightInfo request to select tensor_id from a source.
+message TensorSelection {
+  // Which data source (flight identifier)
+  string source_id = 1;
+
+  // Which tensor within the source
+  string tensor_id = 2;
+
+  // Optional sub-region to read
+  SliceHint slice_hint = 3;
+
+  // Optional scale/reduction options
+  TensorReadOptions read_options = 4;
+}

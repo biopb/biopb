@@ -17,9 +17,9 @@ import pyarrow.flight as flight
 from biopb.tensor.ticket_pb2 import (
     TensorTicket, ChunkBounds
 )
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection, DataSourceDescriptor
 
-from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id
+from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id, build_arrow_schema
 from biopb_tensor_server.cache import CacheManager
 
 
@@ -29,6 +29,9 @@ class TensorFlightServer(flight.FlightServerBase):
     This server exposes multi-dimensional arrays through the Flight protocol,
     with each chunk represented as a separate FlightEndpoint.
 
+    Supports multifield acquisitions where tensors within a data source
+    have different shapes (e.g., MicroManager multi-position datasets).
+
     Usage:
         # Create an adapter for your data
         import zarr
@@ -37,7 +40,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Start the server
         server = TensorFlightServer('grpc://0.0.0.0:8815')
-        server.register_tensor('my-tensor', adapter)
+        server.register_source('my-tensor', adapter)
         server.serve()
     """
 
@@ -49,35 +52,24 @@ class TensorFlightServer(flight.FlightServerBase):
             **kwargs: Additional arguments passed to FlightServerBase
         """
         super().__init__(location, **kwargs)
-        self._tensors: Dict[str, BackendAdapter] = {}
+        self._sources: Dict[str, BackendAdapter] = {}
 
-    def register_tensor(self, array_id: str, adapter: BackendAdapter) -> None:
-        """Register a tensor with the server.
-
-        Args:
-            array_id: Unique identifier for the tensor
-            adapter: Backend adapter for the tensor
-        """
-        self._tensors[array_id] = adapter
-
-    def unregister_tensor(self, array_id: str) -> None:
-        """Unregister a tensor from the server.
+    def register_source(self, source_id: str, adapter: BackendAdapter) -> None:
+        """Register a data source with the server.
 
         Args:
-            array_id: Unique identifier for the tensor
+            source_id: Unique identifier for the data source
+            adapter: Backend adapter for the data source
         """
-        self._tensors.pop(array_id, None)
+        self._sources[source_id] = adapter
 
-    def _parse_descriptor(self, descriptor: flight.FlightDescriptor) -> TensorDescriptor:
-        """Parse a TensorDescriptor from a FlightDescriptor.
+    def unregister_source(self, source_id: str) -> None:
+        """Unregister a data source from the server.
 
         Args:
-            descriptor: Flight descriptor with cmd bytes
-
-        Returns:
-            Parsed TensorDescriptor
+            source_id: Unique identifier for the data source
         """
-        return TensorDescriptor.FromString(descriptor.command)
+        self._sources.pop(source_id, None)
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
@@ -101,31 +93,31 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return bounds.SerializeToString()
 
-    def _get_adapter_for_array_id(self, array_id: str) -> Optional[BackendAdapter]:
-        """Get adapter for an array_id, handling nested paths for level adapters.
+    def _get_adapter_for_source_id(self, source_id: str) -> Optional[BackendAdapter]:
+        """Get adapter for a source_id, handling nested paths for level adapters.
 
-        For nested array_ids like "parent/level", finds the parent adapter
+        For nested source_ids like "parent/level", finds the parent adapter
         and delegates to its get_level_adapter method if available.
 
         Args:
-            array_id: The array identifier (may contain "/" for nested paths)
+            source_id: The source identifier (may contain "/" for nested paths)
 
         Returns:
-            BackendAdapter for the array, or None if not found
+            BackendAdapter for the source, or None if not found
         """
         # First try exact match
-        adapter = self._tensors.get(array_id)
+        adapter = self._sources.get(source_id)
         if adapter is not None:
             return adapter
 
         # Check for nested path (e.g., "ome-zarr/1" for level 1)
-        if '/' in array_id:
+        if '/' in source_id:
             # Split to find parent and level path
-            parts = array_id.split('/')
+            parts = source_id.split('/')
             parent_id = parts[0]
             level_path = '/'.join(parts[1:])
 
-            parent_adapter = self._tensors.get(parent_id)
+            parent_adapter = self._sources.get(parent_id)
             if parent_adapter is not None and hasattr(parent_adapter, 'get_level_adapter'):
                 # Delegate to parent adapter's level adapter method
                 try:
@@ -135,31 +127,53 @@ class TensorFlightServer(flight.FlightServerBase):
 
         return None
 
+    def _get_adapter_for_tensor(
+        self,
+        source_id: str,
+        tensor_id: str
+    ) -> Optional[BackendAdapter]:
+        """Get adapter for a specific tensor within a source.
+
+        Args:
+            source_id: The data source identifier
+            tensor_id: The tensor identifier within the source
+
+        Returns:
+            BackendAdapter for the specified tensor, or None if not found
+        """
+        source_adapter = self._get_adapter_for_source_id(source_id)
+        if source_adapter is None:
+            return None
+
+        return source_adapter.get_tensor_adapter(tensor_id)
+
     def list_flights(
         self,
         context: flight.ServerCallContext,
         criteria: bytes
     ) -> Iterator[flight.FlightInfo]:
-        """List all available tensors.
+        """List all available data sources.
+
+        Each flight represents a data source (which may contain multiple tensors).
+        The DataSourceDescriptor contains full tensor metadata upfront.
 
         Args:
             context: Server call context
             criteria: Unused criteria bytes
 
         Yields:
-            FlightInfo for each registered tensor
+            FlightInfo for each registered data source, with DataSourceDescriptor
         """
-        for array_id, adapter in self._tensors.items():
-            descriptor = adapter.get_tensor_descriptor()
-            schema = adapter.get_arrow_schema()
+        for source_id, adapter in self._sources.items():
+            source_desc = adapter.get_source_descriptor()
+            schema = build_arrow_schema(source_desc.tensors[0] if source_desc.tensors else adapter.get_tensor_descriptor())
 
-            # Create a FlightDescriptor for this tensor
+            # Create a FlightDescriptor for this source
             flight_descriptor = flight.FlightDescriptor.for_command(
-                descriptor.SerializeToString()
+                source_desc.SerializeToString()
             )
 
-            # Create a single endpoint for the tensor (all chunks)
-            # Clients will call GetFlightInfo with slice_hint to get chunk endpoints
+            # Create a single endpoint for listing (no specific tensor selected)
             endpoint = flight.FlightEndpoint(
                 ticket=flight.Ticket(b''),  # Empty ticket for listing
                 locations=[],
@@ -182,24 +196,39 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Args:
             context: Server call context
-            descriptor: Flight descriptor with TensorDescriptor
+            descriptor: Flight descriptor with TensorSelection
 
         Returns:
             FlightInfo with schema and chunk endpoints
         """
         import json
 
-        tensor_desc = self._parse_descriptor(descriptor)
+        selection = TensorSelection.FromString(descriptor.command)
 
-        adapter = self._tensors.get(tensor_desc.array_id)
-        if adapter is None:
-            raise flight.FlightServerError(f"Tensor not found: {tensor_desc.array_id}")
+        # Get tensor adapter for the specified source and tensor
+        tensor_adapter = self._get_adapter_for_tensor(selection.source_id, selection.tensor_id)
+        if tensor_adapter is None:
+            raise flight.FlightServerError(f"Tensor not found: {selection.source_id}/{selection.tensor_id}")
 
-        read_plan = plan_tensor_read(adapter, tensor_desc)
-        schema = adapter.get_arrow_schema(read_plan.descriptor)
+        # Build request descriptor for the specific tensor
+        base_desc = tensor_adapter.get_tensor_descriptor()
+        tensor_desc = TensorDescriptor(
+            array_id=selection.tensor_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
+        if selection.HasField('slice_hint'):
+            tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
+        if selection.HasField('read_options'):
+            tensor_desc.read_options.CopyFrom(selection.read_options)
+
+        read_plan = plan_tensor_read(tensor_adapter, tensor_desc)
+        schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
         # Populate metadata_json in response descriptor
-        metadata = adapter.get_metadata()
+        metadata = tensor_adapter.get_metadata()
         if metadata:
             read_plan.descriptor.metadata_json = json.dumps(metadata)
 
@@ -238,11 +267,37 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         tensor_ticket = self._parse_ticket(ticket)
 
-        # Decode array_id from chunk_id
+        # Decode array_id (source_id/tensor_id) from chunk_id
         array_id, _ = _decode_chunk_id(tensor_ticket.chunk_id)
 
-        # Get the adapter for this array (handles nested paths)
-        adapter = self._get_adapter_for_array_id(array_id)
+        # Find the adapter for this chunk
+        # The array_id in chunk_id may be:
+        # - Just source_id (for single tensor sources)
+        # - source_id/level_path (for OME-Zarr precomputed levels)
+        # - source_id/tensor_id (for multifield sources)
+
+        if '/' in array_id:
+            parts = array_id.split('/')
+            source_id = parts[0]
+            rest = '/'.join(parts[1:])
+
+            source_adapter = self._sources.get(source_id)
+            if source_adapter is None:
+                raise flight.FlightServerError(f"Source not found: {source_id}")
+
+            # Check if this is a level adapter path (OME-Zarr)
+            if hasattr(source_adapter, 'get_level_adapter'):
+                # Use get_level_adapter for nested paths
+                adapter = source_adapter.get_level_adapter(rest)
+            else:
+                # Use get_tensor_adapter for multifield paths
+                adapter = source_adapter.get_tensor_adapter(rest)
+        else:
+            # Single source_id - find the adapter
+            adapter = self._sources.get(array_id)
+            if adapter is None:
+                raise flight.FlightServerError(f"Tensor not found: {array_id}")
+
         if adapter is None:
             raise flight.FlightServerError(f"Tensor not found: {array_id}")
 
@@ -262,13 +317,13 @@ def serve(
     """Start a Flight server with the given adapters.
 
     Args:
-        adapters: Dictionary mapping array_id to BackendAdapter
+        adapters: Dictionary mapping source_id to BackendAdapter
         location: Server location
         **kwargs: Additional arguments passed to FlightServerBase
     """
     server = TensorFlightServer(location, **kwargs)
-    for array_id, adapter in adapters.items():
-        server.register_tensor(array_id, adapter)
+    for source_id, adapter in adapters.items():
+        server.register_source(source_id, adapter)
 
     print(f"Starting Flight server at {location}")
     server.serve()

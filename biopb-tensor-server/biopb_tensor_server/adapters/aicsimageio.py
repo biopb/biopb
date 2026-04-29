@@ -16,7 +16,8 @@ Chunk ID format:
 Relies on OS page cache for raw data caching.
 """
 
-from typing import TYPE_CHECKING, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import numpy as np
 import pyarrow as pa
@@ -27,11 +28,17 @@ from biopb_tensor_server.base import (
     _decode_chunk_id,
     _encode_chunk_id,
 )
+from biopb_tensor_server.discovery import SourceClaim
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, DataSourceDescriptor
 
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
+    from biopb_tensor_server.config import SourceConfig
+
+
+# Extensions supported by aicsimageio
+AICS_EXTENSIONS = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml']
 
 
 class AicsImageIoAdapter(BackendAdapter):
@@ -40,12 +47,61 @@ class AicsImageIoAdapter(BackendAdapter):
     Wraps a single scene from an AICSImage instance. Each scene in a multi-scene
     file should be wrapped by a separate adapter instance.
 
+    Supports multifield when scenes have different shapes - in that case,
+    each scene becomes a separate tensor within the source.
+
     Chunk ID format:
     - array_id prefix (via _encode_chunk_id)
     - chunk key (UTF-8, e.g., "0/1/2" for dask chunk indices)
 
     Relies on OS page cache for raw data caching.
     """
+
+    @classmethod
+    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim aicsimageio-supported vendor microscopy format files.
+
+        Args:
+            path: Path to check (file or directory)
+            visited_identities: Set of already-visited file identities
+
+        Returns:
+            SourceClaim if this is a supported vendor format file, None otherwise
+        """
+        if not path.is_file():
+            return None
+
+        name = path.name.lower()
+        for ext in AICS_EXTENSIONS:
+            if name.endswith(ext):
+                return SourceClaim(
+                    source_type="aics",
+                    primary_path=path,
+                    claimed_paths={path},
+                )
+        return None
+
+    @classmethod
+    def create_from_config(cls, source: 'SourceConfig') -> 'AicsImageIoAdapter':
+        """Create adapter instance from SourceConfig.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+
+        Returns:
+            AicsImageIoAdapter instance
+        """
+        from aicsimageio import AICSImage
+
+        img = AICSImage(str(source.url))
+        # Use first scene as default tensor
+        img.set_scene(0)
+        return cls(
+            img,
+            0,  # scene_index
+            source.source_id,
+            source.dim_labels,
+        )
 
     def __init__(
         self,
@@ -65,6 +121,10 @@ class AicsImageIoAdapter(BackendAdapter):
         self._aics_image = aics_image
         self.scene_index = scene_index
         self.array_id = array_id
+
+        # Source-level metadata for DataSourceDescriptor
+        self._source_url = str(aics_image.source.path if hasattr(aics_image, 'source') else "")
+        self._source_type = "aics"
 
         # Get dask array for lazy chunk access
         self._dask_data = aics_image.dask_data

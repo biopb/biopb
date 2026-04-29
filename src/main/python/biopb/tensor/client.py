@@ -20,18 +20,27 @@ from dask.delayed import delayed
 from cachey import Cache
 
 from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, TensorSelection, DataSourceDescriptor
 
 
 class TensorFlightClient:
     """Client for accessing tensors from a TensorFlightServer.
 
     This client provides lazy, cached access to multi-dimensional arrays
-    stored in a Flight server.
+    stored in a Flight server, with support for multifield acquisitions
+    where tensors within a source have different shapes.
 
     Usage:
         client = TensorFlightClient('grpc://localhost:8815')
-        arr = client.get_array('my-tensor')  # Returns dask.array
+
+        # List data sources (each may contain multiple tensors)
+        sources = client.list_sources()
+
+        # Get source-level metadata
+        metadata = client.get_source_metadata('my-source')
+
+        # Access a specific tensor
+        arr = client.get_tensor('my-source', 'tensor-0')  # Returns dask.array
         data = arr[0:100, 0:100].compute()   # Load slice
 
     Note:
@@ -59,74 +68,84 @@ class TensorFlightClient:
         """
         self._client = flight.FlightClient(location)
         self._cache = Cache(available_bytes=cache_bytes)
+        self._sources: Dict[str, DataSourceDescriptor] = {}
         self._descriptors: Dict[str, TensorDescriptor] = {}
         self._cache_hits: int = 0
         self._cache_misses: int = 0
         self._cache_lock = threading.Lock()
 
-    def list_tensors(self) -> List[str]:
-        """List available tensor IDs.
+    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
+        """List available data sources.
 
         Returns:
-            List of tensor identifiers
+            Dictionary mapping source_id to DataSourceDescriptor.
+            Each DataSourceDescriptor.tensors contains TensorDescriptor info
+            with shape/dtype for all tensors in that source.
         """
-        tensor_ids = []
+        source_descriptors = {}
         for info in self._client.list_flights():
-            desc = TensorDescriptor.FromString(info.descriptor.command)
-            tensor_ids.append(desc.array_id)
-            self._descriptors[desc.array_id] = desc
-        return tensor_ids
+            source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
+            source_descriptors[source_desc.source_id] = source_desc
+            # Cache tensor descriptors
+            for tensor_desc in source_desc.tensors:
+                self._descriptors[tensor_desc.array_id] = tensor_desc
+        self._sources = source_descriptors
+        return source_descriptors
 
-    def get_descriptor(self, array_id: str) -> TensorDescriptor:
-        """Get tensor metadata.
+    def get_source_metadata(self, source_id: str) -> dict:
+        """Get source-level OME/vendor metadata.
+
+        Fetches metadata via GetFlightInfo for the first tensor in the source,
+        since metadata_json is populated in the response TensorDescriptor.
 
         Args:
-            array_id: Tensor identifier
+            source_id: Source identifier
 
         Returns:
-            TensorDescriptor with shape, dtype, chunk_shape
-        """
-        if array_id in self._descriptors:
-            return self._descriptors[array_id]
-
-        # Fetch via list_flights
-        for info in self._client.list_flights():
-            desc = TensorDescriptor.FromString(info.descriptor.command)
-            self._descriptors[desc.array_id] = desc
-            if desc.array_id == array_id:
-                return desc
-
-        raise ValueError(f"Tensor not found: {array_id}")
-
-    def get_metadata(self, array_id: str) -> dict:
-        """Get OME-compatible metadata for a tensor.
-
-        Args:
-            array_id: Tensor identifier
-
-        Returns:
-            Parsed metadata_json (multiscales, axes, omero, etc.)
-            per OME-NGFF schema, or empty dict if no metadata.
+            Parsed metadata_json from GetFlightInfo response
+            (multiscales, axes, omero, etc. per OME-NGFF schema),
+            or empty dict if no metadata.
         """
         import json
 
-        desc = self.get_descriptor(array_id)
-        if desc.metadata_json:
-            return json.loads(desc.metadata_json)
+        if source_id not in self._sources:
+            self.list_sources()
+
+        source_desc = self._sources.get(source_id)
+        if source_desc is None:
+            raise ValueError(f"Source not found: {source_id}")
+
+        if not source_desc.tensors:
+            return {}
+
+        # Get metadata from first tensor via GetFlightInfo
+        first_tensor = source_desc.tensors[0]
+        selection = TensorSelection(
+            source_id=source_id,
+            tensor_id=first_tensor.array_id,
+        )
+        flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
+        info = self._client.get_flight_info(flight_desc)
+        response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+        if response_desc.metadata_json:
+            return json.loads(response_desc.metadata_json)
         return {}
 
-    def get_array(
+    def get_tensor(
         self,
-        array_id: str,
+        source_id: str,
+        tensor_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
         read_options: Optional[TensorReadOptions] = None,
     ) -> da.Array:
-        """Get a lazy dask array for a tensor.
+        """Get a lazy dask array for a tensor within a data source.
 
         Args:
-            array_id: Tensor identifier
+            source_id: Data source identifier
+            tensor_id: Tensor identifier within the source
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
@@ -135,8 +154,23 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
-        # Get tensor descriptor
-        desc = self.get_descriptor(array_id)
+        # Get tensor descriptor from cached source info
+        if source_id not in self._sources:
+            self.list_sources()
+
+        source_desc = self._sources.get(source_id)
+        if source_desc is None:
+            raise ValueError(f"Source not found: {source_id}")
+
+        # Find tensor descriptor
+        tensor_desc = None
+        for desc in source_desc.tensors:
+            if desc.array_id == tensor_id:
+                tensor_desc = desc
+                break
+
+        if tensor_desc is None:
+            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
 
         # Convert slice_hint to SliceHint proto
         slice_hint_proto = None
@@ -145,7 +179,7 @@ class TensorFlightClient:
             stops = []
             for s in slice_hint:
                 starts.append(s.start if s.start is not None else 0)
-                stops.append(s.stop if s.stop is not None else desc.shape[len(starts) - 1])
+                stops.append(s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1])
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
         if read_options is not None and (scale_hint is not None or reduction_method is not None):
@@ -157,23 +191,23 @@ class TensorFlightClient:
                 reduction_method=reduction_method or '',
             )
 
-        # Build descriptor with request-scoped read hints
-        desc_with_hint = TensorDescriptor(
-            array_id=desc.array_id,
-            dim_labels=desc.dim_labels,
-            shape=desc.shape,
-            chunk_shape=desc.chunk_shape,
-            dtype=desc.dtype,
+        # Build TensorSelection for the request
+        selection = TensorSelection(
+            source_id=source_id,
+            tensor_id=tensor_id,
         )
         if slice_hint_proto is not None:
-            desc_with_hint.slice_hint.CopyFrom(slice_hint_proto)
+            selection.slice_hint.CopyFrom(slice_hint_proto)
         if read_options is not None:
-            desc_with_hint.read_options.CopyFrom(read_options)
+            selection.read_options.CopyFrom(read_options)
 
         # Get flight info
-        flight_desc = flight.FlightDescriptor.for_command(desc_with_hint.SerializeToString())
+        flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
         info = self._client.get_flight_info(flight_desc)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+        # Cache the response descriptor
+        self._descriptors[response_desc.array_id] = response_desc
 
         # Parse endpoints into chunk info
         chunks = []

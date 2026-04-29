@@ -20,7 +20,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import lcm
-from typing import List, Optional, Tuple, Iterator, TYPE_CHECKING
+from pathlib import Path
+from typing import List, Optional, Tuple, Iterator, Set, TYPE_CHECKING
 import importlib
 import struct
 import os
@@ -38,10 +39,11 @@ except ImportError:
     _HAS_CUPY = False
 
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, DataSourceDescriptor
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache import CacheManager
+    from biopb_tensor_server.discovery import SourceClaim
 
 
 @dataclass
@@ -82,6 +84,42 @@ class BackendAdapter(ABC):
     and provides methods to discover chunks and read chunk data.
     """
 
+    # === Claim Protocol ===
+
+    @classmethod
+    @abstractmethod
+    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim a filesystem path as a data source.
+
+        This method is called during discovery to detect if this adapter
+        handles a given path. Adapters should check for format-specific
+        characteristics (file extensions, metadata files, etc.).
+
+        Args:
+            path: Path to check (file or directory)
+            visited_identities: Set of already-visited file identities
+                               (for symlink/hardlink detection)
+
+        Returns:
+            SourceClaim if this adapter handles this path, None otherwise
+
+        Example implementations:
+
+            ZarrAdapter.claim():
+                - Check if path is a .zarr directory
+                - Verify .zarray or .zattrs exists
+
+            OmeTiffAdapter.claim():
+                - Check if path is a .ome.tiff file
+
+            MultiFileOmeTiffAdapter.claim():
+                - Check if path is a directory with multi-file structure
+                - Return multi-node claim (directory + all TIFF files)
+        """
+        pass
+
+    # === Instance methods ===
+
     @abstractmethod
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return the TensorDescriptor for this tensor.
@@ -118,6 +156,55 @@ class BackendAdapter(ABC):
             Arrow RecordBatch containing the chunk's data
         """
         pass
+
+    # === Source-level methods (multifield support) ===
+
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """List all tensors available in this source.
+
+        Single tensor adapters return [self.get_tensor_descriptor()].
+        Multi tensor adapters return list of descriptors for all contained tensors.
+
+        The metadata_json field is NOT populated in these descriptors.
+        Metadata is returned via GetFlightInfo in the response TensorDescriptor.
+
+        Returns:
+            List of TensorDescriptor for all tensors in this source
+        """
+        return [self.get_tensor_descriptor()]
+
+    def get_tensor_adapter(self, tensor_id: str) -> 'BackendAdapter':
+        """Get BackendAdapter for a specific tensor within this source.
+
+        Single tensor adapters return self (tensor_id ignored/validated).
+        Multi tensor adapters return a new BackendAdapter for that tensor.
+
+        Args:
+            tensor_id: Identifier for the specific tensor within this source
+
+        Returns:
+            BackendAdapter for the specified tensor
+        """
+        # Default: single tensor adapter, return self
+        return self
+
+    def get_source_descriptor(self) -> DataSourceDescriptor:
+        """Build DataSourceDescriptor from this adapter.
+
+        Returns:
+            DataSourceDescriptor with source_id, source_type, tensor list.
+            metadata_json is NOT included here; it's populated in GetFlightInfo
+            response's TensorDescriptor instead.
+        """
+        descriptor = self.get_tensor_descriptor()
+
+        return DataSourceDescriptor(
+            source_id=descriptor.array_id,
+            source_url=self._source_url if hasattr(self, '_source_url') else "",
+            source_type=self._source_type if hasattr(self, '_source_type') else "",
+            tensors=self.list_tensor_descriptors(),
+            metadata_json="",  # Not populated; returned via GetFlightInfo instead
+        )
 
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
@@ -228,16 +315,15 @@ class BackendAdapter(ABC):
 
 def build_arrow_schema(desc: TensorDescriptor) -> pa.Schema:
     """Build an Arrow schema from a tensor descriptor."""
-    dtype = np.dtype(desc.dtype)
-    field = pa.field(
-        "data",
-        pa.from_numpy_dtype(dtype),
-    )
+    import importlib.metadata
 
+    dtype = np.dtype(desc.dtype)
+    field = pa.field("data", pa.from_numpy_dtype(dtype))
+
+    # Schema metadata: biopb version for compatibility tracking
+    # TensorDescriptor schema version matches biopb protobuf package version
     metadata = {
-        "tensor_shape": ",".join(str(s) for s in desc.shape),
-        "chunk_shape": ",".join(str(s) for s in desc.chunk_shape),
-        "dim_labels": ",".join(desc.dim_labels) if desc.dim_labels else "",
+        "tensor_schema_version": importlib.metadata.version("biopb"),
     }
 
     return pa.schema([field], metadata=metadata)
