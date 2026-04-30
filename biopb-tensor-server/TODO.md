@@ -3,9 +3,9 @@
 ## Current Status (v0.2)
 
 Completed:
-- [x] ZarrAdapter with LRU caching
-- [x] Hdf5Adapter with LRU caching
-- [x] OmeTiffAdapter (single-file) with LRU caching
+- [x] ZarrAdapter
+- [x] Hdf5Adapter
+- [x] OmeTiffAdapter (single-file)
 - [x] MultiFileOmeTiffAdapter (basic)
 - [x] OmeZarrAdapter with precomputed pyramid support
 - [x] AicsImageIoAdapter for vendor formats (CZI, LIF, ND2, DV)
