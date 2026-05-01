@@ -45,7 +45,15 @@ from biopb.tensor.client import TensorFlightClient
 # Version / constants
 # ---------------------------------------------------------------------------
 
-_VERSION = "0.1.0"
+try:
+    import importlib.metadata as _importlib_metadata
+except ImportError:
+    import importlib_metadata as _importlib_metadata
+
+try:
+    _VERSION = _importlib_metadata.version("biopb-tensor-server")
+except Exception:
+    _VERSION = "0.1.0"
 _SERVICE = "biopb-tensor-http"
 
 # Number of completed requests to track for latency percentiles

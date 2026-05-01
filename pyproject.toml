@@ -43,3 +43,4 @@ build_py = "build_proto.build_proto"
 
 # Version derived from git tags
 [tool.setuptools_scm]
+version_file = "src/main/python/biopb/_version.py"

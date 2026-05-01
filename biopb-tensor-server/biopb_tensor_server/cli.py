@@ -311,7 +311,7 @@ def list_tensors(
                         source.source_id,
                         source.type,
                         desc.array_id,
-                        str(source.path),
+                        str(source.url),
                         str(list(desc.shape)),
                     )
                 else:
@@ -320,7 +320,7 @@ def list_tensors(
                             source.source_id,
                             source.type,
                             desc.array_id,
-                            str(source.path),
+                            str(source.url),
                             str(list(desc.shape)),
                         )
             except Exception as e:
@@ -328,7 +328,7 @@ def list_tensors(
                     source.source_id,
                     source.type,
                     "[red]Error[/red]",
-                    str(source.path),
+                    str(source.url),
                     str(e),
                 )
 
@@ -342,6 +342,18 @@ def list_tensors(
 @app.command()
 def version():
     """Show version information."""
+    try:
+        from biopb_tensor_server import __version__ as tensor_version
+    except Exception:
+        tensor_version = "unknown"
+
+    try:
+        from biopb import __version__ as biopb_version
+    except Exception:
+        biopb_version = "unknown"
+
+    console.print(f"biopb-tensor-server: {tensor_version}")
+    console.print(f"biopb: {biopb_version}")
 
 @app.command()
 def launch(
@@ -515,8 +527,8 @@ def launch(
         flight_server.shutdown()
 
     try:
-        from biopb import __version__
-        console.print(f"TensorFlight server (using biopb {__version__})")
+        from biopb_tensor_server import __version__
+        console.print(f"TensorFlight server (using biopb-tensor-server {__version__})")
     except ImportError:
         console.print("TensorFlight server")
 

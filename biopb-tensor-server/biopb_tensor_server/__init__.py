@@ -52,6 +52,16 @@ from biopb_tensor_server.config import (
     CacheConfig,
 )
 
+try:
+    import importlib.metadata as _importlib_metadata
+except ImportError:
+    import importlib_metadata as _importlib_metadata
+
+try:
+    __version__ = _importlib_metadata.version("biopb-tensor-server")
+except Exception:
+    __version__ = "0.1.0"
+
 __all__ = [
     'TensorFlightServer',
     'serve',

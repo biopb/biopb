@@ -4,7 +4,7 @@ BioPB uses **git tags** as the single source of truth for version numbers.
 
 ## How It Works
 
-- **Python**: Uses `setuptools_scm` to derive version from git tags
+- **Python**: Uses `setuptools_scm` to derive version from git tags and writes a fallback `src/main/python/biopb/_version.py` for non-git builds
 - **Java**: CI injects version from tag via Maven's `-Drevision` flag
 
 ## Release Process
