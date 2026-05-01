@@ -290,6 +290,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "X-Biopb-Token", "Content-Type"],
+        expose_headers=["X-Shape", "X-Dtype", "X-Dim-Labels"],
     )
 
     # -----------------------------------------------------------------------
@@ -464,6 +465,9 @@ def create_app(
 
             # Compute (blocking)
             arr: np.ndarray = arr_lazy.compute()
+
+            if arr.dtype.byteorder not in ("=", "|"):
+                arr = arr.astype(arr.dtype.newbyteorder("="), copy=False)
 
             # Ensure C-contiguous layout for predictable byte order on the client
             arr = np.ascontiguousarray(arr)

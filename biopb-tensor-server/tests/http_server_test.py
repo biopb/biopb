@@ -214,6 +214,23 @@ class TestAuthentication:
         assert r.status_code == 401
 
 
+class TestCorsHeaders:
+    def test_slice_exposes_shape_dtype_headers_for_browser(self, dev_client):
+        tc, _ = dev_client
+        payload = {"source_id": "src0", "tensor_id": "t0"}
+        r = tc.post(
+            "/api/slice",
+            json=payload,
+            headers={"Origin": "http://127.0.0.1:3000"},
+        )
+        assert r.status_code == 200
+        exposed = r.headers.get("access-control-expose-headers", "")
+        exposed_lc = exposed.lower()
+        assert "x-shape" in exposed_lc
+        assert "x-dtype" in exposed_lc
+        assert "x-dim-labels" in exposed_lc
+
+
 # ===========================================================================
 # Unit tests — sources endpoints
 # ===========================================================================
@@ -309,6 +326,26 @@ class TestSliceEndpoint:
         arr = np.frombuffer(r.content, dtype="uint16").reshape(4, 8, 16)
         assert arr.shape == (4, 8, 16)
         assert np.all(arr == 0)  # fixture returns zeros
+
+    def test_slice_normalizes_big_endian_uint16_bytes(self, auth_client):
+        tc, mock_fc = auth_client
+
+        expected = np.array(
+            [[1, 256, 1024, 4095], [42, 512, 2048, 65535]],
+            dtype=np.uint16,
+        )
+        # Simulate an adapter that returns big-endian uint16 payloads.
+        be_arr = expected.astype(">u2", copy=False)
+        lazy = MagicMock()
+        lazy.compute.return_value = be_arr
+        mock_fc.get_tensor.return_value = lazy
+
+        r = self._post_slice(tc)
+        assert r.status_code == 200
+        assert r.headers["x-dtype"] == "uint16"
+
+        arr = np.frombuffer(r.content, dtype=np.uint16).reshape(expected.shape)
+        np.testing.assert_array_equal(arr, expected)
 
     def test_slice_with_range(self, auth_client):
         tc, _ = auth_client
