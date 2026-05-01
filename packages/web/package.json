@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "test": "echo \"No tests yet\"",
-    "lint": "next lint"
+    "lint": "eslint ."
   },
   "dependencies": {
     "next": "^14.2.14",
