@@ -20,14 +20,28 @@ interface ImageViewerProps {
 
 type NumericArray = Uint8Array | Uint16Array | Uint32Array | Float32Array | Float64Array | Int16Array | Int32Array;
 
+function normalizeDtype(dtype: string): string {
+  const dt = dtype.toLowerCase().replace(/\s+/g, "");
+  const core = dt.replace(/^[<>=|]/, "");
+
+  if (core === "u1" || core === "uint8") return "uint8";
+  if (core === "u2" || core === "uint16") return "uint16";
+  if (core === "u4" || core === "uint32") return "uint32";
+  if (core === "i2" || core === "int16") return "int16";
+  if (core === "i4" || core === "int32") return "int32";
+  if (core === "f4" || core === "float32" || core === "float") return "float32";
+  if (core === "f8" || core === "float64") return "float64";
+  return core;
+}
+
 function toNumericArray(dtype: string, buffer: ArrayBuffer): NumericArray {
-  const dt = dtype.toLowerCase();
-  if (dt.includes("uint16")) return new Uint16Array(buffer);
-  if (dt.includes("uint32")) return new Uint32Array(buffer);
-  if (dt.includes("int16")) return new Int16Array(buffer);
-  if (dt.includes("int32")) return new Int32Array(buffer);
-  if (dt.includes("float64")) return new Float64Array(buffer);
-  if (dt.includes("float32") || dt.includes("float")) return new Float32Array(buffer);
+  const dt = normalizeDtype(dtype);
+  if (dt === "uint16") return new Uint16Array(buffer);
+  if (dt === "uint32") return new Uint32Array(buffer);
+  if (dt === "int16") return new Int16Array(buffer);
+  if (dt === "int32") return new Int32Array(buffer);
+  if (dt === "float64") return new Float64Array(buffer);
+  if (dt === "float32") return new Float32Array(buffer);
   return new Uint8Array(buffer);
 }
 
@@ -47,6 +61,7 @@ function toGrayscaleRgba(
   dtype: string,
   buffer: ArrayBuffer,
 ): { rgba: Uint8ClampedArray; width: number; height: number } {
+  const dt = normalizeDtype(dtype);
   const labels = dimLabels.length ? dimLabels : shape.map((_, i) => `d${i}`);
   const axisMap = buildAxisMap(labels);
   const yIdx = axisMap.y ?? Math.max(0, shape.length - 2);
@@ -60,7 +75,9 @@ function toGrayscaleRgba(
 
   let minVal = Number.POSITIVE_INFINITY;
   let maxVal = Number.NEGATIVE_INFINITY;
-  if (dtype.toLowerCase().includes("float")) {
+  const needsNormalization = dt !== "uint8";
+
+  if (needsNormalization) {
     for (let i = 0; i < data.length; i++) {
       const v = Number(data[i]);
       if (v < minVal) minVal = v;
@@ -87,11 +104,9 @@ function toGrayscaleRgba(
       const raw = Number(data[flat] ?? 0);
 
       let gray = 0;
-      if (dtype.toLowerCase().includes("uint16")) {
-        gray = Math.max(0, Math.min(255, Math.round(raw / 257)));
-      } else if (dtype.toLowerCase().includes("uint8")) {
+      if (dt === "uint8") {
         gray = Math.max(0, Math.min(255, Math.round(raw)));
-      } else if (dtype.toLowerCase().includes("float")) {
+      } else if (needsNormalization) {
         const n = (raw - minVal) / Math.max(1e-8, maxVal - minVal);
         gray = Math.max(0, Math.min(255, Math.round(n * 255)));
       } else {
@@ -252,7 +267,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         if (cancelled) return;
         const shape = arr.shape.length ? arr.shape : descriptor.shape;
         const labels = arr.dimLabels.length ? arr.dimLabels : descriptor.dim_labels;
-        const { rgba, width, height } = toGrayscaleRgba(shape, labels, arr.dtype, arr.buffer);
+        const dtype = arr.dtype || descriptor.dtype || "uint8";
+        const { rgba, width, height } = toGrayscaleRgba(shape, labels, dtype, arr.buffer);
 
         const canvas = document.createElement("canvas");
         canvas.width = width;
@@ -280,12 +296,14 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
         const hostW = Math.max(1, host.clientWidth);
         const hostH = Math.max(1, host.clientHeight);
-        const fitScale = Math.min(hostW / Math.max(1, width), hostH / Math.max(1, height));
+        const fitScale = Math.min(1, hostW / Math.max(1, width), hostH / Math.max(1, height));
 
         viewport.scale.set(fitScale);
+        const offsetX = Math.round((hostW - width * fitScale) / 2);
+        const offsetY = Math.round((hostH - height * fitScale) / 2);
         viewport.position.set(
-          (hostW - width * fitScale) / 2,
-          (hostH - height * fitScale) / 2,
+          offsetX,
+          offsetY,
         );
       })
       .catch((e) => {

@@ -486,6 +486,16 @@ class TestMultiFileOmeTiffAdapter:
         summary = parsed_metadata['Summary']
         assert summary.get('Channels') == 3
 
+    def test_micromanager_dim_labels_use_channel_axis(self, multifile_mm_dataset):
+        """Micro-Manager metadata should map leading non-spatial axis to channel."""
+        dir_path, file_list, metadata = multifile_mm_dataset
+
+        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-dimlabels-test')
+        desc = adapter.get_tensor_descriptor()
+
+        assert desc.dim_labels[0] == 'c'
+        assert desc.dim_labels[-2:] == ['y', 'x']
+
     def test_data_values_per_channel(self, multifile_mm_dataset):
         """Test that different channels have distinguishable values."""
         dir_path, file_list, metadata = multifile_mm_dataset

@@ -76,6 +76,16 @@ describe("buildAxisMap", () => {
     expect(m).toEqual<AxisMap>({ t: 0, z: 1, c: 2, y: 3, x: 4 });
   });
 
+  it("does not duplicate z when labels are channel-first c,y,x", () => {
+    const m = buildAxisMap(["c", "y", "x"]);
+    expect(m).toEqual<AxisMap>({ t: null, z: null, c: 0, y: 1, x: 2 });
+  });
+
+  it("does not duplicate c when labels are z,y,x", () => {
+    const m = buildAxisMap(["z", "y", "x"]);
+    expect(m).toEqual<AxisMap>({ t: null, z: 0, c: null, y: 1, x: 2 });
+  });
+
   it("applies positional heuristic for unknown labels (last=x, second-last=y)", () => {
     const m = buildAxisMap(["a", "b"]);
     expect(m.x).toBe(1);

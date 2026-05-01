@@ -4,6 +4,7 @@ Relies on OS page cache for raw data caching.
 """
 
 import struct
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional, Set, Tuple, TYPE_CHECKING
@@ -201,6 +202,7 @@ class OmeTiffAdapter(BackendAdapter):
         """
         self.tiff_file = tiff_file
         self.array_id = array_id
+        self._io_lock = threading.Lock()
 
         # Source-level metadata for DataSourceDescriptor
         self._source_url = tiff_file.filename if hasattr(tiff_file, 'filename') else ""
@@ -214,13 +216,13 @@ class OmeTiffAdapter(BackendAdapter):
         # Get tile info from first page
         first_page = tiff_file.pages[0]
         if not first_page.is_tiled:
-            raise ValueError("OME-TIFF must be tiled")
+            raise ValueError("OME-TIFF pages must be tiled")
 
+        self.is_tiled = True
         self.tile_width = first_page.tilewidth
         self.tile_length = first_page.tilelength
         self.tiles_per_row = (first_page.shape[1] + self.tile_width - 1) // self.tile_width
         self.tiles_per_col = (first_page.shape[0] + self.tile_length - 1) // self.tile_length
-
         # Derive chunk shape (tile_y, tile_x) for each plane
         self.chunk_shape = [self.tile_length, self.tile_width]
 
@@ -300,29 +302,39 @@ class OmeTiffAdapter(BackendAdapter):
         ifd_index, tile_indices = _decode_ome_tile(backend_data)
         tile_row, tile_col = tile_indices
 
-        page = self.tiff_file.pages[ifd_index]
+        # tifffile TiffFile/page access is not safe under concurrent reads.
+        # Serialize IO to avoid corrupted page/tag parsing in parallel fetches.
+        with self._io_lock:
+            page = self.tiff_file.pages[ifd_index]
 
-        # Compute tile index
-        tile_idx = tile_row * self.tiles_per_row + tile_col
+            # Compute tile index
+            tile_idx = tile_row * self.tiles_per_row + tile_col
 
-        # Read tile using tifffile's low-level API
-        offset = page.dataoffsets[tile_idx]
-        bytecount = page.databytecounts[tile_idx]
+            if not self.is_tiled:
+                data = page.asarray()
+                if data.ndim == 3:
+                    data = data[0]
+                arr = pa.array(data.ravel())
+                return pa.RecordBatch.from_arrays([arr], ["data"])
 
-        fh = self.tiff_file.filehandle
-        fh.seek(offset)
-        raw_data = fh.read(bytecount)
+            # Read tile using tifffile's low-level API
+            offset = page.dataoffsets[tile_idx]
+            bytecount = page.databytecounts[tile_idx]
 
-        # Decode the tile
-        decoded = page.decode(raw_data, tile_idx)
-        data = decoded[0].squeeze()  # Remove singleton dimensions
+            fh = self.tiff_file.filehandle
+            fh.seek(offset)
+            raw_data = fh.read(bytecount)
 
-        # Ensure 2D output
-        if data.ndim == 3:
-            data = data[0]
+            # Decode the tile
+            decoded = page.decode(raw_data, tile_idx)
+            data = decoded[0].squeeze()  # Remove singleton dimensions
 
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+            # Ensure 2D output
+            if data.ndim == 3:
+                data = data[0]
+
+            arr = pa.array(data.ravel())
+            return pa.RecordBatch.from_arrays([arr], ["data"])
 
     def get_metadata(self) -> dict:
         """Return OME metadata from TIFF file as JSON-serializable dict.
@@ -524,7 +536,6 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         # Get tile info from first page of first file
         first_page = self.tiff_file.pages[0]
 
-        # Check if tiled - if not, we'll handle as single "tile" per plane
         if first_page.is_tiled:
             self.is_tiled = True
             self.tile_width = first_page.tilewidth
@@ -533,7 +544,6 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             self.tiles_per_col = (first_page.shape[0] + self.tile_length - 1) // self.tile_length
             self.chunk_shape = [self.tile_length, self.tile_width]
         else:
-            # Non-tiled: each IFD is a single chunk (the whole plane)
             self.is_tiled = False
             self.tile_width = first_page.shape[1]
             self.tile_length = first_page.shape[0]
@@ -546,6 +556,10 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             self.dim_labels = dim_labels
         else:
             self.dim_labels = [d if isinstance(d, str) else str(d) for d in self.series_dims]
+            # Micro-Manager metadata carries non-spatial axis semantics (channel/z/time).
+            # For multi-file datasets, tifffile often reports the leading axis as generic
+            # "plane" even when it is actually channel. Prefer metadata when available.
+            self._apply_metadata_axis_labels()
 
         # Build file index for IFD access
         self._file_ifd_map = []
@@ -570,6 +584,100 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                 self.full_shape[0] = self._total_ifds
 
         self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
+
+    def _apply_metadata_axis_labels(self) -> None:
+        """Refine inferred dim labels using Micro-Manager Summary metadata.
+
+        The first non-spatial axis in multi-file datasets can be reported as
+        a generic plane index by tifffile. When metadata exposes axis order
+        and intended dimensions, map that leading axis to c/z/t/p accordingly.
+        """
+        if not self.dim_labels:
+            return
+
+        lead = str(self.dim_labels[0]).lower()
+        if lead not in ("plane", "p", "i", "q"):
+            return
+
+        metadata = self.get_metadata()
+        if not isinstance(metadata, dict):
+            return
+
+        summary = metadata.get("Summary")
+        if not isinstance(summary, dict):
+            return
+
+        intended = summary.get("IntendedDimensions")
+        if not isinstance(intended, dict):
+            intended = {}
+
+        def _count(name: str, fallback_key: Optional[str] = None) -> int:
+            v = intended.get(name)
+            if v is None and fallback_key is not None:
+                v = summary.get(fallback_key)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+
+        axis_counts = {
+            "channel": _count("channel", "Channels"),
+            "z": _count("z", "Slices"),
+            "time": _count("time", "Frames"),
+            "position": _count("position", "Positions"),
+        }
+
+        axis_alias = {
+            "channel": "c",
+            "c": "c",
+            "z": "z",
+            "slice": "z",
+            "time": "t",
+            "t": "t",
+            "frame": "t",
+            "position": "p",
+            "pos": "p",
+            "p": "p",
+        }
+
+        leading_label: Optional[str] = None
+
+        axis_order = summary.get("AxisOrder")
+        ordered_axes: List[str] = []
+        if isinstance(axis_order, list):
+            ordered_axes = [str(a).strip().lower() for a in axis_order]
+        elif isinstance(axis_order, str):
+            ordered_axes = [a.strip().lower() for a in axis_order.split(",")]
+
+        # Prefer the first axis in declared order that has multiplicity > 1.
+        for axis_name in ordered_axes:
+            n = axis_counts.get(axis_name, 0)
+            if n > 1:
+                leading_label = axis_alias.get(axis_name)
+                if leading_label:
+                    break
+
+        # Fallback by common Micro-Manager precedence.
+        if leading_label is None:
+            if axis_counts["channel"] > 1:
+                leading_label = "c"
+            elif axis_counts["z"] > 1:
+                leading_label = "z"
+            elif axis_counts["time"] > 1:
+                leading_label = "t"
+            elif axis_counts["position"] > 1:
+                leading_label = "p"
+
+        if leading_label is not None:
+            self.dim_labels[0] = leading_label
+
+        # Normalize common spatial label variants for downstream axis mapping.
+        for idx, label in enumerate(self.dim_labels):
+            l = str(label).lower()
+            if l in ("y", "height"):
+                self.dim_labels[idx] = "y"
+            elif l in ("x", "width"):
+                self.dim_labels[idx] = "x"
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         first_page = self.tiff_file.pages[0]

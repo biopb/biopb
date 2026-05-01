@@ -194,7 +194,7 @@ export class TensorHttpClient {
     const res = await this.fetchBinary("/api/slice", req, this.chunkTimeoutMs);
 
     const shapeHeader = res.headers.get("X-Shape") ?? "";
-    const dtype = res.headers.get("X-Dtype") ?? "uint8";
+    const dtype = res.headers.get("X-Dtype") ?? "";
     const dimLabels = (res.headers.get("X-Dim-Labels") ?? "")
       .split(",")
       .filter(Boolean);

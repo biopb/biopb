@@ -296,6 +296,24 @@ describe("TensorHttpClient.slice", () => {
     const result = await c.slice({ source_id: "s", tensor_id: "t" });
     expect(result.dimLabels).toEqual([]);
   });
+
+  it("does not force uint8 when custom slice headers are unavailable", async () => {
+    const buf = makeBuffer(8);
+    mockFetch.mockResolvedValueOnce(
+      new Response(buf, {
+        status: 200,
+        headers: { "Content-Type": "application/octet-stream" },
+      }),
+    );
+
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const result = await c.slice({ source_id: "s", tensor_id: "t" });
+
+    expect(result.shape).toEqual([]);
+    expect(result.dtype).toBe("");
+    expect(result.dimLabels).toEqual([]);
+    expect(result.buffer.byteLength).toBe(8);
+  });
 });
 
 // ---------------------------------------------------------------------------

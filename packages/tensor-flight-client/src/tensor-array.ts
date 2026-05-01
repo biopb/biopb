@@ -44,14 +44,24 @@ export function buildAxisMap(dimLabels: string[]): AxisMap {
     else if (SPATIAL_X.has(l) && map.x === null) map.x = i;
   }
 
-  // Positional heuristic fallback for unlabelled / unknown axes:
-  // Last two unassigned dimensions → Y, X; one before that → Z
-  const ndim = labels.length;
-  if (ndim >= 1 && map.x === null) map.x = ndim - 1;
-  if (ndim >= 2 && map.y === null) map.y = ndim - 2;
-  if (ndim >= 3 && map.z === null) map.z = ndim - 3;
-  if (ndim >= 4 && map.c === null) map.c = ndim - 4;
-  if (ndim >= 5 && map.t === null) map.t = ndim - 5;
+  // Positional heuristic fallback for unlabelled / unknown axes using only
+  // dimensions that were not explicitly assigned above.
+  const unassigned: number[] = [];
+  for (let i = labels.length - 1; i >= 0; i--) {
+    if (i !== map.t && i !== map.z && i !== map.c && i !== map.y && i !== map.x) {
+      unassigned.push(i);
+    }
+  }
+  const takeFallback = (): number | null => {
+    const idx = unassigned.shift();
+    return idx === undefined ? null : idx;
+  };
+
+  if (map.x === null) map.x = takeFallback();
+  if (map.y === null) map.y = takeFallback();
+  if (map.z === null) map.z = takeFallback();
+  if (map.c === null) map.c = takeFallback();
+  if (map.t === null) map.t = takeFallback();
 
   return map;
 }
