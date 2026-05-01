@@ -13,6 +13,7 @@ Requirements:
     buf CLI must be installed. See https://buf.build/docs/installation
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -54,12 +55,18 @@ class build_proto(_build_py):
 
         print(f"Using buf: {buf_path}")
 
+        # Set up PATH to include node_modules/.bin for protoc-gen-es plugin
+        env = os.environ.copy()
+        node_bin = str(project_root / "node_modules" / ".bin")
+        env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
+
         # Run buf generate
         result = subprocess.run(
             ["buf", "generate"],
             cwd=project_root,
             capture_output=True,
             text=True,
+            env=env,
         )
 
         if result.returncode != 0:
