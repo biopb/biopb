@@ -20,7 +20,7 @@ Client (Python or TypeScript)
                                                     TensorFlightServer
                                                              │
                                               ┌──────────────────────────┐
-                                              │  BackendAdapter           │
+                                              │  BackendAdapter          │
                                               │  (Zarr / OME-Zarr /      │
                                               │   OME-TIFF / HDF5 / CZI) │
                                               └──────────────────────────┘

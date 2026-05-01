@@ -149,6 +149,7 @@ node_modules/
 packages/*/node_modules/
 packages/*/.next/
 packages/*/dist/
+packages/*/coverage/
 
 # Generated TypeScript protobuf bindings
 packages/tensor-flight-client/src/gen/
