@@ -1,0 +1,19 @@
+{
+  "name": "biopb-workspace",
+  "private": true,
+  "packageManager": "pnpm@9.12.3",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "dev:web": "pnpm --filter @biopb/web dev",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "buf:generate": "buf generate"
+  },
+  "dependencies": {
+    "@bufbuild/buf": "^1.66.0"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.2.4",
+    "typescript": "^5.6.3"
+  }
+}

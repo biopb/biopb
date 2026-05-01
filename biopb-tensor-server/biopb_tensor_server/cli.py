@@ -8,6 +8,10 @@ Commands:
 
 from pathlib import Path
 from typing import Optional
+import os
+import secrets
+import threading
+import webbrowser
 
 import typer
 from rich.console import Console
@@ -23,6 +27,7 @@ from biopb_tensor_server.config import (
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.base import configure_compute_backend
 from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
@@ -337,6 +342,178 @@ def list_tensors(
 @app.command()
 def version():
     """Show version information."""
+
+@app.command()
+def launch(
+    config: Path = typer.Option(
+        ...,
+        "--config", "-c",
+        exists=True,
+        help="Path to TOML config file",
+    ),
+    web_port: int = typer.Option(
+        8816,
+        "--web-port",
+        help="HTTP sidecar port",
+    ),
+    web_host: str = typer.Option(
+        "127.0.0.1",
+        "--web-host",
+        help="HTTP sidecar bind address",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Website access token (generated if blank)",
+        hide_input=True,
+    ),
+    dev_mode: bool = typer.Option(
+        False,
+        "--dev",
+        help="Enable dev mode (skips token check, localhost only)",
+    ),
+    open_browser: bool = typer.Option(
+        False,
+        "--open",
+        help="Open browser to the Next.js app after startup",
+    ),
+    next_url: str = typer.Option(
+        "http://localhost:3000",
+        "--next-url",
+        help="Base URL of the running Next.js web app",
+    ),
+):
+    """Launch the full BioPB Tensor stack (Flight server + HTTP sidecar).
+
+    This command starts:
+      1. The Arrow Flight server (data access)
+      2. The FastAPI HTTP sidecar (browser-friendly API)
+
+    Run the Next.js web app separately with ``pnpm --filter=web dev``,
+    or point --next-url to a production deployment.
+
+    Example:
+        biopb-tensor launch --config biopb-tensor.toml
+        biopb-tensor launch -c config.toml --web-port 9000 --dev
+    """
+    import re as _re
+
+    # --- Determine dev mode ---
+    env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
+    effective_dev_mode = dev_mode or env_dev
+
+    # Enforce: bypass only on localhost
+    if effective_dev_mode and web_host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            "[bold red]SECURITY WARNING:[/bold red] "
+            "BIOPB_WEB_DEV_BYPASS ignored because host is non-local; "
+            "website token enforcement remains enabled."
+        )
+        effective_dev_mode = False
+
+    # --- Token management ---
+    def _valid_token(t: str) -> bool:
+        t = t.strip()
+        return bool(t) and 16 <= len(t) <= 128 and _re.fullmatch(r"[A-Za-z0-9_\-]+", t)
+
+    if effective_dev_mode:
+        effective_token = None
+        console.print("[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]")
+    else:
+        env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
+        if token and _valid_token(token):
+            effective_token = token.strip()
+        elif env_token and _valid_token(env_token):
+            effective_token = env_token.strip()
+        else:
+            # Prompt up to 3 times, then auto-generate
+            effective_token = None
+            for attempt in range(3):
+                try:
+                    entered = typer.prompt(
+                        "Enter website access token (leave blank to auto-generate)",
+                        default="",
+                        hide_input=True,
+                    )
+                except Exception:
+                    break
+                entered = entered.strip()
+                if not entered:
+                    break
+                if _valid_token(entered):
+                    effective_token = entered
+                    break
+                console.print(
+                    f"[red]Invalid token (attempt {attempt + 1}/3): "
+                    "must be 16-128 URL-safe characters [A-Za-z0-9_-][/red]"
+                )
+            if effective_token is None:
+                effective_token = secrets.token_urlsafe(32)
+                console.print("[yellow]Auto-generated secure access token.[/yellow]")
+
+        access_url = f"{next_url}?token={effective_token}"
+        console.print(
+            f"\n[bold green]Access URL (shown once — do not share):[/bold green]\n  {access_url}\n"
+        )
+
+    # --- Load server config and start Flight ---
+    server_config = load_config(config)
+    host = server_config.host
+    port = server_config.port
+
+    configure_compute_backend(
+        force_backend=server_config.compute_backend,
+        gpu_min_input_bytes=int(server_config.gpu_min_input_mb * 1024 * 1024),
+        gpu_min_linear_input_bytes=int(server_config.gpu_min_linear_input_mb * 1024 * 1024),
+        gpu_memory_safety_factor=server_config.gpu_memory_safety_factor,
+        gpu_min_merged_chunks=server_config.gpu_min_merged_chunks,
+    )
+    CacheManager.initialize(server_config.cache)
+
+    sources = resolve_all_sources(server_config)
+    if not sources:
+        console.print("[red]No data sources configured[/red]")
+        raise typer.Exit(1)
+
+    adapters = {}
+    for source in sources:
+        try:
+            adapters[source.source_id] = _create_source_adapter(source)
+        except Exception as e:
+            console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
+
+    if not adapters:
+        console.print("[red]No sources loaded[/red]")
+        raise typer.Exit(1)
+
+    flight_location = f"grpc://{host}:{port}"
+    flight_server = TensorFlightServer(flight_location)
+    for source_id, adapter in adapters.items():
+        flight_server.register_source(source_id, adapter)
+
+    flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
+    flight_thread.start()
+    console.print(f"[green]Flight server started at {flight_location}[/green]")
+
+    if open_browser:
+        url = access_url if not effective_dev_mode else next_url
+        threading.Timer(1.5, webbrowser.open, args=(url,)).start()
+
+    # --- Start HTTP sidecar (blocks) ---
+    console.print(f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]")
+    console.print("Press Ctrl+C to stop\n")
+    try:
+        run_http_server(
+            flight_location=flight_location,
+            token=effective_token,
+            dev_mode=effective_dev_mode,
+            host=web_host,
+            port=web_port,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Shutting down...[/yellow]")
+        flight_server.shutdown()
+
     try:
         from biopb import __version__
         console.print(f"TensorFlight server (using biopb {__version__})")
