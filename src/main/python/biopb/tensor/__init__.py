@@ -6,6 +6,12 @@ for efficient multi-dimensional array storage and retrieval.
 Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
+- CLI diagnostics: biopb-cli command for inspecting sources and tensors
+
+The CLI module provides the `biopb-cli` command with three subcommands:
+- query: List sources and tensors from a running server
+- metadata: Inspect source metadata and tensor descriptors
+- stats: Compute min/max/mean statistics for a tensor
 
 Note: Server components have been moved to the biopb-tensor-server package.
 """

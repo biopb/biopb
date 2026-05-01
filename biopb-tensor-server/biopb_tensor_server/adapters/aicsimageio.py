@@ -247,10 +247,12 @@ class AicsImageIoAdapter(BackendAdapter):
             # ome_metadata is typically an OME object from ome-types
             # Convert to dict if it has a model_dump method (pydantic v2)
             # or dict method (pydantic v1)
+            # Use mode='json' to ensure Enum fields (UnitsElectricPotential, etc.)
+            # are serialized to their string representations
             if hasattr(ome_meta, 'model_dump'):
-                return ome_meta.model_dump()
+                return ome_meta.model_dump(mode='json')
             elif hasattr(ome_meta, 'dict'):
-                return ome_meta.dict()
+                return ome_meta.dict(by_alias=False, exclude_none=False)
             elif hasattr(ome_meta, '__dict__'):
                 # Fallback: try to extract serializable attributes
                 return {

@@ -7,7 +7,8 @@ Commands:
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+import json
 import os
 import secrets
 import threading
@@ -15,8 +16,10 @@ import webbrowser
 
 import typer
 from rich.console import Console
+from rich.json import JSON
 from rich.table import Table
 
+from biopb.tensor.client import TensorFlightClient
 from biopb_tensor_server.config import (
     load_config,
     resolve_all_sources,
@@ -38,6 +41,9 @@ app = typer.Typer(
     help="BioPB Tensor: Arrow Flight server for multi-dimensional arrays",
 )
 console = Console()
+
+diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
+app.add_typer(diag_app, name="diagnose")
 
 
 def _create_source_adapter(source: SourceConfig, registry=None):
