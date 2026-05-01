@@ -154,16 +154,9 @@ class OmeTiffAdapter(BackendAdapter):
             return None
 
         name = path.name.lower()
-        # OME-TIFF extensions
+        # Only claim actual OME-TIFF files (with .ome.tiff or .ome.tif extension)
+        # Plain TIFF files are handled by AicsImageIoAdapter (higher priority)
         if name.endswith('.ome.tiff') or name.endswith('.ome.tif'):
-            return SourceClaim(
-                source_type="ome-tiff",
-                primary_path=path,
-                claimed_paths={path},
-            )
-
-        # Plain TIFF files - also claim as ome-tiff (tifffile handles them)
-        if name.endswith('.tiff') or name.endswith('.tif'):
             return SourceClaim(
                 source_type="ome-tiff",
                 primary_path=path,
@@ -276,9 +269,20 @@ class OmeTiffAdapter(BackendAdapter):
                     x_start = tile_col * self.tile_width
                     x_stop = min((tile_col + 1) * self.tile_width, self.series_shape[-1])
 
-                    # Full bounds including plane dimension
-                    chunk_start = [plane_offset, y_start, x_start]
-                    chunk_stop = [plane_offset + 1, y_stop, x_stop]
+                    # Build chunk bounds to match dimensionality of full_shape
+                    n_dims = len(self.full_shape)
+                    chunk_start = [0] * n_dims
+                    chunk_stop = list(self.full_shape)
+
+                    # First dimension: plane indexed by ifd_index
+                    chunk_start[0] = plane_offset
+                    chunk_stop[0] = plane_offset + 1
+
+                    # Last two dimensions: y and x are tiled
+                    chunk_start[-2] = y_start
+                    chunk_stop[-2] = y_stop
+                    chunk_start[-1] = x_start
+                    chunk_stop[-1] = x_stop
 
                     if slice_hint is not None:
                         if not _chunks_intersect(
@@ -312,8 +316,6 @@ class OmeTiffAdapter(BackendAdapter):
 
             if not self.is_tiled:
                 data = page.asarray()
-                if data.ndim == 3:
-                    data = data[0]
                 arr = pa.array(data.ravel())
                 return pa.RecordBatch.from_arrays([arr], ["data"])
 
@@ -380,12 +382,120 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     Relies on OS page cache for raw data caching.
     """
 
+    @staticmethod
+    def _find_metadata_file(path: Path) -> Optional[Path]:
+        """Find metadata file in directory.
+
+        Checks for metadata files in priority order:
+        1. _metadata.txt (standard OME-XML format)
+        2. metadata.txt (MicroManager v1 JSON format)
+        3. DisplaySettings.json (MicroManager v2 format)
+
+        Args:
+            path: Directory to search
+
+        Returns:
+            Path to metadata file, or None if not found
+        """
+        # Check exact filenames first (most common cases)
+        for filename in ['_metadata.txt', 'metadata.txt', 'DisplaySettings.json']:
+            candidate = path / filename
+            if candidate.exists():
+                return candidate
+
+        # Check for wildcard patterns
+        for pattern in ['*_metadata.txt']:
+            matches = list(path.glob(pattern))
+            if matches:
+                return matches[0]
+
+        return None
+
+    @staticmethod
+    def _detect_tiff_sequence(path: Path) -> Optional[List[Path]]:
+        """Detect plain TIFF file sequences (e.g., ND000_aligned.tiff, ND001_aligned.tiff, ...).
+
+        A sequence is detected if:
+        1. Directory has 3+ TIFF files
+        2. Filenames contain sequential numbers
+        3. All files have the same file size (fastest validation)
+
+        Args:
+            path: Directory to check
+
+        Returns:
+            Sorted list of TIFF file paths if sequence detected, None otherwise
+        """
+        import re
+
+        # Gather all TIFF files (excluding those matching OME/MicroManager patterns)
+        all_tiffs = list(path.glob('*.tif')) + list(path.glob('*.tiff'))
+
+        # Filter out known OME and MicroManager patterns
+        exclude_patterns = {
+            '*.ome.tif', '*.ome.tiff',
+            'img_*.tif', 'img_*.tiff',
+            'img_channel*.tif', 'img_channel*.tiff',
+        }
+
+        tiff_files = []
+        for f in all_tiffs:
+            # Check if file matches any exclude pattern
+            excluded = False
+            for pattern in exclude_patterns:
+                if f.match(pattern):
+                    excluded = True
+                    break
+            if not excluded:
+                tiff_files.append(f)
+
+        # Need at least 3 files to consider it a sequence
+        if len(tiff_files) < 3:
+            return None
+
+        # Extract numbers from filenames
+        numbers = []
+        for f in tiff_files:
+            # Find all numbers in the filename
+            nums = re.findall(r'\d+', f.name)
+            if nums:
+                # Use the last number as the sequence index (most common pattern)
+                numbers.append((int(nums[-1]), f))
+            else:
+                # No numbers found, can't confirm it's a sequence
+                return None
+
+        if not numbers:
+            return None
+
+        # Sort by extracted number
+        numbers.sort(key=lambda x: x[0])
+        sorted_files = [f for _, f in numbers]
+
+        # Validate: all files should have the same size
+        # (proxy for same dimensions, fastest check)
+        try:
+            file_sizes = [f.stat().st_size for f in sorted_files]
+            if len(set(file_sizes)) > 1:
+                # File sizes differ - not a consistent sequence
+                return None
+        except OSError:
+            # Can't stat files
+            return None
+
+        return sorted_files
+
     @classmethod
     def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim directories with multi-file OME-TIFF structure.
+        """Claim directories with multi-file OME-TIFF structure or MicroManager format.
 
         This is a multi-node claim that claims the directory + all TIFF files
         + metadata file.
+
+        Supports:
+        - Standard OME-TIFF multi-file with _metadata.txt
+        - MicroManager v1 (JSON Coords/Metadata keys) with metadata.txt
+        - MicroManager v2 with DisplaySettings.json
 
         Args:
             path: Path to check (file or directory)
@@ -397,37 +507,65 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         if not path.is_dir():
             return None
 
-        # Check for metadata file or multiple img_*.ome.tiff files
-        metadata_file = path / '_metadata.txt'
-        img_files = list(path.glob('img_*.ome.tiff')) + list(path.glob('img_*.ome.tif'))
+        # Check for metadata file (any format)
+        metadata_file = cls._find_metadata_file(path)
 
-        # Also check for other common patterns
-        if not metadata_file.exists() and len(img_files) <= 1:
-            # Check for other multi-file patterns
-            ome_files = list(path.glob('*.ome.tiff')) + list(path.glob('*.ome.tif'))
-            if len(ome_files) <= 1:
-                # No multi-file structure detected
+        # Check for TIFF files in common patterns
+        tiff_patterns = [
+            'img_*.ome.tiff', 'img_*.ome.tif',  # OME-TIFF pattern
+            'img_*.tif', 'img_*.tiff',          # MicroManager standard pattern
+            'img_channel*.tif', 'img_channel*.tiff',  # MicroManager channel pattern
+            '*.ome.tiff', '*.ome.tif',          # Generic OME-TIFF
+        ]
+        tiff_files = []
+        for pattern in tiff_patterns:
+            tiff_files.extend(path.glob(pattern))
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_files = []
+        for f in tiff_files:
+            if f not in seen:
+                seen.add(f)
+                unique_files.append(f)
+        tiff_files = unique_files
+
+        # Determine if we have a valid multi-file structure
+        has_metadata = metadata_file is not None
+        tiff_count = len(tiff_files)
+
+        # Check for metadata + TIFF files OR 2+ OME/MicroManager TIFFs
+        if has_metadata and tiff_count >= 1:
+            # Has metadata (OME/MicroManager)
+            pass  # Proceed with claim
+        elif tiff_count >= 2:
+            # Multiple OME/MicroManager pattern TIFFs
+            pass  # Proceed with claim
+        else:
+            # Try detecting plain TIFF sequences as fallback
+            sequence_files = cls._detect_tiff_sequence(path)
+            if not sequence_files:
+                # No valid multi-file structure detected
                 return None
+            # Use detected sequence files
+            tiff_files = sequence_files
 
         # Multi-node claim: claim the directory + all TIFF files + metadata
         claimed = {path}
 
-        # Add all OME-TIFF files in the directory
-        for pattern in ['img_*.ome.tiff', 'img_*.ome.tif', '*.ome.tiff', '*.ome.tif']:
-            for img_file in path.glob(pattern):
+        # Add all detected TIFF files
+        for img_file in tiff_files:
+            try:
                 identity = get_file_identity(img_file)
                 if identity not in visited_identities:
                     claimed.add(img_file)
+            except OSError:
+                # Skip files we can't get identity for
+                pass
 
-        # Add metadata file if exists
-        if metadata_file.exists():
+        # Add metadata file if found
+        if metadata_file:
             claimed.add(metadata_file)
-
-        # Also check for other metadata patterns
-        for meta_pattern in ['metadata.txt', '*_metadata.txt']:
-            for meta_file in path.glob(meta_pattern):
-                if meta_file.exists():
-                    claimed.add(meta_file)
 
         return SourceClaim(
             source_type="ome-tiff-multifile",
@@ -502,13 +640,18 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                 "img_*.ome.tiff", "img_*.ome.tif",
                 "*.ome.tiff", "*.ome.tif",
                 "img_channel*.tif", "img_*.tif",  # Micro-Manager standard format
+                "*.tiff", "*.tif",  # Plain TIFF sequences
             ]
             tiff_files = []
+            seen = set()
             for pattern in patterns:
-                tiff_files.extend(sorted(self.directory.glob(pattern)))
+                for f in sorted(self.directory.glob(pattern)):
+                    if f not in seen:
+                        seen.add(f)
+                        tiff_files.append(f)
 
             if not tiff_files:
-                raise ValueError(f"No OME-TIFF files found in {directory}")
+                raise ValueError(f"No TIFF files found in {directory}")
 
         # Open first file to check for OME metadata and get tile info
         self.tiff_file = tifffile.TiffFile(str(tiff_files[0]))
@@ -522,10 +665,22 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             self._tiff_sequence = tifffile.TiffSequence([str(f) for f in tiff_files])
             seq_shape = self._tiff_sequence.shape
             if len(seq_shape) == 1:
-                first_page = self.tiff_file.pages[0]
-                seq_shape = (len(tiff_files), first_page.shape[0], first_page.shape[1])
+                # TiffSequence returned just (num_files,), need to get full shape from series
+                if len(self.tiff_file.series) > 0:
+                    # Use the full series shape and prepend the sequence length
+                    file_shape = self.tiff_file.series[0].shape
+                    seq_shape = (len(tiff_files),) + file_shape
+                    # Map 'other' dimension to 'z' for multi-page files
+                    file_dims = list(self.tiff_file.series[0].dims)
+                    if file_dims and file_dims[0] == 'other':
+                        file_dims[0] = 'z'
+                    self.series_dims = tuple(['t'] + file_dims)
+                else:
+                    # Fallback: just use first page shape
+                    first_page = self.tiff_file.pages[0]
+                    seq_shape = (len(tiff_files),) + first_page.shape
+                    self.series_dims = tuple(['t'] + ['y', 'x'][-len(first_page.shape):])
             self.series_shape = seq_shape
-            self.series_dims = tuple(['plane'] + list(self.tiff_file.series[0].dims))
         else:
             if len(self.tiff_file.series) == 0:
                 raise ValueError("No series found in OME-TIFF dataset")
@@ -716,8 +871,25 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                         x_start = tile_col * self.tile_width
                         x_stop = min((tile_col + 1) * self.tile_width, page.shape[1])
 
-                        chunk_start = [global_ifd_index, y_start, x_start]
-                        chunk_stop = [global_ifd_index + 1, y_stop, x_stop]
+                        # Build chunk bounds to match dimensionality of full_shape
+                        n_dims = len(self.full_shape)
+                        chunk_start = [0] * n_dims
+                        chunk_stop = list(self.full_shape)
+
+                        # First dimension: file/time indexed by file_index
+                        chunk_start[0] = file_index
+                        chunk_stop[0] = file_index + 1
+
+                        # Second dimension (if it exists): page/channel indexed by local_ifd_index
+                        if n_dims > 3:
+                            chunk_start[1] = local_ifd_index
+                            chunk_stop[1] = local_ifd_index + 1
+
+                        # Last two dimensions: y and x are tiled
+                        chunk_start[-2] = y_start
+                        chunk_stop[-2] = y_stop
+                        chunk_start[-1] = x_start
+                        chunk_stop[-1] = x_stop
 
                         if slice_hint is not None:
                             if not _chunks_intersect(
@@ -768,9 +940,6 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                 # Non-tiled: read entire page as single "tile"
                 data = page.asarray()
 
-            if data.ndim == 3:
-                data = data[0]
-
             arr = pa.array(data.ravel())
             return pa.RecordBatch.from_arrays([arr], ["data"])
 
@@ -803,8 +972,20 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         return {}
 
     def _parse_metadata_txt(self, metadata_path) -> dict:
-        """Parse OME-XML from companion metadata file."""
+        """Parse metadata file in various formats.
+
+        Supports:
+        - OME-XML format
+        - JSON with embedded OME-XML
+        - MicroManager v1 JSON (Coords/Metadata keys)
+        - MicroManager v2 DisplaySettings.json (returns empty dict)
+        """
         import json
+
+        # Handle DisplaySettings.json (MicroManager v2) - return empty dict
+        # File list will be determined by glob patterns in __init__
+        if metadata_path.name == 'DisplaySettings.json':
+            return {}
 
         content = metadata_path.read_text()
 
@@ -827,10 +1008,20 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         return {}
 
     def _parse_file_list_from_metadata(self) -> Optional[List[str]]:
-        """Extract ordered file list from metadata.txt or _metadata.txt."""
+        """Extract ordered file list from metadata file.
+
+        Supports:
+        - OME-XML format (_metadata.txt or metadata.txt)
+        - MicroManager v1 JSON (metadata.txt with Coords/Metadata keys)
+        - MicroManager v2 DisplaySettings.json (returns None to use glob patterns)
+
+        Returns:
+            List of filenames if metadata file can be parsed to extract file list,
+            None if no file list found or DisplaySettings.json (use glob fallback)
+        """
         import json
 
-        metadata_patterns = ["metadata.txt", "_metadata.txt", "*_metadata.txt"]
+        metadata_patterns = ["metadata.txt", "_metadata.txt", "DisplaySettings.json", "*_metadata.txt"]
         metadata_files = []
         for pattern in metadata_patterns:
             metadata_files.extend(self.directory.glob(pattern))
@@ -838,8 +1029,15 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         if not metadata_files:
             return None
 
-        content = metadata_files[0].read_text()
+        metadata_file = metadata_files[0]
 
+        # DisplaySettings.json (MicroManager v2): return None to use glob patterns
+        if metadata_file.name == 'DisplaySettings.json':
+            return None
+
+        content = metadata_file.read_text()
+
+        # Try OME-XML format
         try:
             root = ET.fromstring(content)
             files = []
@@ -854,6 +1052,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         except ET.ParseError:
             pass
 
+        # Try JSON with embedded OME-XML
         try:
             data = json.loads(content)
             if isinstance(data, dict) and "OME" in data and isinstance(data["OME"], str):
@@ -870,6 +1069,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         except (json.JSONDecodeError, ET.ParseError):
             pass
 
+        # Try MicroManager v1 JSON format (Coords/Metadata keys)
         try:
             data = json.loads(content)
             if isinstance(data, dict):

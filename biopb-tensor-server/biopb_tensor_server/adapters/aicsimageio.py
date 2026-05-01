@@ -38,7 +38,8 @@ if TYPE_CHECKING:
 
 
 # Extensions supported by aicsimageio
-AICS_EXTENSIONS = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml']
+# Now includes .tif and .tiff to handle all TIFF formats (not just OME-TIFF)
+AICS_EXTENSIONS = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml', '.tif', '.tiff']
 
 
 class AicsImageIoAdapter(BackendAdapter):

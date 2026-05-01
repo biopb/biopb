@@ -39,10 +39,13 @@ __all__ = [
 def get_default_registry() -> AdapterRegistry:
     """Get the default adapter registry with all built-in adapters.
 
-    Adapter registration order matters for claim priority:
-    - More specific adapters should be registered first
-    - OmeZarrAdapter before ZarrAdapter (OME-Zarr is a subset)
-    - MultiFileOmeTiffAdapter before OmeTiffAdapter (multi-file is more specific)
+    Adapter registration order (by priority/specificity, highest first):
+    1. AicsImageIoAdapter - Primary handler (well-maintained, supports CZI, LIF, ND2, DV, LSM, OIF, OIB, XML)
+    2. OmeZarrAdapter - OME-Zarr specific (more specific than generic Zarr)
+    3. ZarrAdapter - Generic Zarr fallback
+    4. MultiFileOmeTiffAdapter - Multi-file OME-TIFF/MicroManager datasets
+    5. OmeTiffAdapter - Single-file OME-TIFF only (.ome.tiff/.ome.tif extensions)
+    6. Hdf5Adapter - HDF5 files (requires explicit type in config)
 
     Returns:
         AdapterRegistry with all built-in adapters registered
@@ -50,14 +53,13 @@ def get_default_registry() -> AdapterRegistry:
     registry = AdapterRegistry()
 
     # Register in priority order (most specific first) with explicit type mapping
+    if AicsImageIoAdapter is not None:
+        registry.register_with_type("aics", AicsImageIoAdapter)
+
     registry.register_with_type("ome-zarr", OmeZarrAdapter)
     registry.register_with_type("zarr", ZarrAdapter)
     registry.register_with_type("ome-tiff-multifile", MultiFileOmeTiffAdapter)
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
-
-    # Optional aicsimageio adapter
-    if AicsImageIoAdapter is not None:
-        registry.register_with_type("aics", AicsImageIoAdapter)
 
     registry.register_with_type("hdf5", Hdf5Adapter)
 
