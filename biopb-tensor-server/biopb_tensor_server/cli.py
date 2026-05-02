@@ -7,7 +7,7 @@ Commands:
 """
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import json
 import os
 import secrets
@@ -216,7 +216,8 @@ def serve(
 
     # Create and start server
     location = f"grpc://{host}:{port}"
-    server = TensorFlightServer(location)
+    flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
+    server = TensorFlightServer(location, token=flight_token)
 
     for source_id, adapter in adapters.items():
         server.register_source(source_id, adapter)
@@ -393,12 +394,17 @@ def launch(
     open_browser: bool = typer.Option(
         False,
         "--open",
-        help="Open browser to the Next.js app after startup",
+        help="Open browser to the web app after startup",
     ),
-    next_url: str = typer.Option(
-        "http://localhost:3000",
-        "--next-url",
-        help="Base URL of the running Next.js web app",
+    web_url: str = typer.Option(
+        "http://localhost:5173",
+        "--web-url",
+        help="Base URL of the running web app (used for --open and CORS)",
+    ),
+    cors_origins: Optional[List[str]] = typer.Option(
+        None,
+        "--cors",
+        help="Extra CORS origin to allow (repeatable). Defaults to --web-url variants.",
     ),
 ):
     """Launch the full BioPB Tensor stack (Flight server + HTTP sidecar).
@@ -407,8 +413,8 @@ def launch(
       1. The Arrow Flight server (data access)
       2. The FastAPI HTTP sidecar (browser-friendly API)
 
-    Run the Next.js web app separately with ``pnpm --filter=web dev``,
-    or point --next-url to a production deployment.
+    Run the web app separately with ``pnpm --filter=web dev``,
+    or point --web-url to a production deployment.
 
     Example:
         biopb-tensor launch --config biopb-tensor.toml
@@ -469,9 +475,9 @@ def launch(
                 effective_token = secrets.token_urlsafe(32)
                 console.print("[yellow]Auto-generated secure access token.[/yellow]")
 
-        access_url = f"{next_url}?token={effective_token}"
+        access_url = f"{web_url}"
         console.print(
-            f"\n[bold green]Access URL (shown once — do not share):[/bold green]\n  {access_url}\n"
+            f"\n[bold green]Access token (shown once — do not share):[/bold green]\n  {effective_token}\n"
         )
 
     # --- Load server config and start Flight ---
@@ -514,8 +520,21 @@ def launch(
     console.print(f"[green]Flight server started at {flight_location}[/green]")
 
     if open_browser:
-        url = access_url if not effective_dev_mode else next_url
+        url = web_url
         threading.Timer(1.5, webbrowser.open, args=(url,)).start()
+
+    # --- Build effective CORS origins ---
+    if cors_origins:
+        effective_cors = list(cors_origins)
+    else:
+        # Derive from web_url: add both host variants
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(web_url)
+        base = f"{parsed.scheme}://{parsed.hostname}"
+        p = parsed.port
+        effective_cors = (
+            [f"{base}:{p}"] if p else [base]
+        )
 
     # --- Start HTTP sidecar (blocks) ---
     console.print(f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]")
@@ -527,6 +546,7 @@ def launch(
             dev_mode=effective_dev_mode,
             host=web_host,
             port=web_port,
+            cors_origins=effective_cors,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

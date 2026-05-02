@@ -28,15 +28,15 @@ Client (Python or TypeScript)
 
 The sidecar exists because browsers cannot speak gRPC directly. It wraps the
 existing Python `TensorFlightClient` and re-exposes its operations as plain
-HTTP so that the Next.js web app (and any other HTTP client) can use it
+HTTP so that the Vite web app (and any other HTTP client) can use it
 without a gRPC-Web proxy.
 
 ---
 
 ## 1. TensorFlightServer
 
-**Module:** `biopb_tensor_server.server`  
-**Class:** `TensorFlightServer(flight.FlightServerBase)`  
+**Module:** `biopb_tensor_server.server`
+**Class:** `TensorFlightServer(flight.FlightServerBase)`
 **Default location:** `grpc://0.0.0.0:8815`
 
 ### Registration
@@ -89,8 +89,8 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ## 2. FastAPI HTTP Sidecar
 
-**Module:** `biopb_tensor_server.http_server`  
-**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins) → FastAPI`  
+**Module:** `biopb_tensor_server.http_server`
+**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins) → FastAPI`
 **Default port:** `8816`
 
 ### Lifecycle
@@ -112,7 +112,7 @@ Authorization: Bearer <token>
 X-Biopb-Token: <token>
 ```
 
-`secrets.compare_digest` is used for timing-safe comparison.  
+`secrets.compare_digest` is used for timing-safe comparison.
 `dev_mode=True` skips the check entirely (enforced to localhost-only by the
 CLI launcher).
 
@@ -176,9 +176,9 @@ All error messages are passed through `_redact()` before storage:
 
 ### CORS
 
-Default allowed origins: `http://localhost:3000`, `http://127.0.0.1:3000`,
-`http://[::1]:3000`. Overridable via the `cors_origins` argument to
-`create_app`.
+Default allowed origins: `http://localhost:5173`, `http://127.0.0.1:5173`,
+`http://[::1]:5173` (Vite dev server port). Overridable via the `cors_origins`
+argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 
 ---
 
@@ -187,7 +187,10 @@ Default allowed origins: `http://localhost:3000`, `http://127.0.0.1:3000`,
 **Command:** `biopb-tensor launch`
 
 ```
-biopb-tensor launch --config biopb-tensor.toml [--web-port 8816] [--web-host 127.0.0.1] [--dev] [--open]
+biopb-tensor launch --config biopb-tensor.toml [--web-port 8816] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+
+# for grpc only (no sidecar)
+biopb-tensor serve ...
 ```
 
 Startup sequence:
@@ -196,10 +199,11 @@ Startup sequence:
    `--web-host` is not a loopback address.
 2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var → interactive
    prompt (3 attempts) → `secrets.token_urlsafe(32)` auto-generated.
-3. Print the one-time access URL: `http://localhost:3000?token=<value>`.
+3. Print the one-time access token.
 4. Load `biopb-tensor.toml` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
-6. Optionally schedule `webbrowser.open(url)` after 1.5 s.
+6. Derive CORS origins from `--web-url` (default `http://localhost:5173`) or
+   explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
 7. Call `run_http_server(...)` — **blocking** uvicorn call.
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
@@ -217,6 +221,9 @@ port = 8815
 max_bytes = 2_000_000_000   # 2 GB in-process
 
 [[sources]]
+url        = "/data/" # triggers recursive discovery
+
+[[sources]]
 source_id  = "my-zarr"
 type       = "zarr"
 url        = "/data/experiment.zarr"
@@ -230,9 +237,254 @@ url        = "/data/multiscale.zarr"
 
 ---
 
-## 5. Test Suite
+## 5. Client Packages (TypeScript)
 
-**Location:** `biopb-tensor-server/tests/`  
+The browser-facing side of biopb-tensor-server is split into two pnpm workspace
+packages:
+
+| Package | Purpose |
+|---------|---------|
+| `@biopb/tensor-flight-client` | HTTP client + lazy array API for the FastAPI sidecar |
+| `@biopb/web` | Vite + React static web application |
+
+Both packages live under `packages/` and are built together with
+`pnpm -r run build`.
+
+---
+
+## 6. @biopb/tensor-flight-client
+
+**Output:** ESM (`dist/index.js`, `dist/index.d.ts`)
+
+### TensorHttpClient
+
+Low-level HTTP wrapper around the sidecar's REST API.
+
+```ts
+const client = new TensorHttpClient("http://localhost:8816", token);
+```
+
+Internals:
+- Injects `Authorization: Bearer <token>` on every request when a token is
+  present.
+- Per-call timeouts: **3 s** for metadata/listing, **8 s** for binary chunks.
+- All non-OK responses throw `TensorApiError(status, message, detail)`.
+
+| Method | Endpoint |
+|--------|----------|
+| `livez()` | `GET /livez` |
+| `readyz()` | `GET /readyz` |
+| `listSources()` | `GET /api/sources` |
+| `getSource(id)` | `GET /api/sources/{id}` |
+| `getSourceMetadata(id)` | `GET /api/sources/{id}/metadata` |
+| `slice(req)` | `POST /api/slice` |
+| `diagnostics()` | `GET /api/diagnostics` |
+
+`slice()` parses the binary response headers (`X-Shape`, `X-Dtype`,
+`X-Dim-Labels`) and returns a `TypedNdArray`:
+
+```ts
+interface TypedNdArray {
+  buffer:    ArrayBuffer;   // C-contiguous numpy bytes
+  shape:     number[];
+  dtype:     string;        // e.g. "uint16", "float32"
+  dimLabels: string[];      // e.g. ["z", "y", "x"]
+}
+```
+
+### TensorArray
+
+Lazy accessor for a single tensor within a data source.
+
+```ts
+const ta = new TensorArray(client, sourceId, descriptor);
+const data = await ta.compute({ z: 3, scaleHint: [1, 2, 2], reductionMethod: "area" });
+```
+
+On `.compute(options)`:
+1. Builds per-axis `[start, stop)` ranges from `SliceOptions` (scalar → single
+   index, `[start, stop]` → range, `undefined` → full extent).
+2. Clamps ranges to `[0, shape[axis])`.
+3. Assembles and sends a `SliceRequest`.
+
+#### Axis mapping
+
+`buildAxisMap(dimLabels)` derives an `AxisMap` (`t | z | c | y | x → index`)
+from explicit labels with a positional heuristic fallback for unknown labels:
+
+| Axis | Recognized labels |
+|------|------------------|
+| `t`  | t, time, frame, frames |
+| `z`  | z, depth, plane, planes, slice |
+| `c`  | c, channel, channels, band, bands |
+| `y`  | y, height, row, rows |
+| `x`  | x, width, col, cols, column, columns |
+
+Fallback (when a label is not in any set): last unassigned dim → X,
+second-last → Y, third-last → Z, etc.
+
+`isAxisMapAmbiguous(dimLabels)` returns `true` when any label triggered the
+fallback; the web app surfaces a warning in that case.
+
+### computeScaleHint
+
+```ts
+computeScaleHint(tensorShape, axisMap, viewportW, viewportH, pixelBudget?, prevFactors?)
+  → ScaleVector { factors: number[], snapped: boolean }
+```
+
+Selects power-of-two downsampling factors for the Y/X axes:
+
+1. Compute `rawScale = max(dataH/viewportH, dataW/viewportW)`.
+2. Apply pixel-budget ceiling: `budgetFactor = sqrt(dataH×dataW / budget)`.
+3. `targetScale = max(rawScale, budgetFactor, 1)`.
+4. Snap to nearest power of two.
+5. Apply 20 % hysteresis: if the new factor is within ±20 % of `prevFactors`,
+   keep the previous factor to avoid oscillation at scale boundaries.
+
+All non-spatial axes remain at `1`.
+
+### TensorFlightClient
+
+Higher-level facade over `TensorHttpClient` that caches the source list and
+returns `LazyTensorArray` instances (wrapping `TensorArray`).
+
+---
+
+## 7. @biopb/web
+
+**Framework:** Vite + React + React Router v6
+**State management:** Zustand
+**Rendering:** Pixi.js v8 (WebGL)
+
+`@biopb/web` is a static Vite + React frontend for the BioPB TensorFlight viewer.
+
+Key responsibilities:
+- serve the browser UI (pure static files — no Node.js at runtime)
+- gate access via a bearer token stored in `sessionStorage`
+- initialize the client-side TensorFlight HTTP client
+- call the FastAPI sidecar (`VITE_TENSOR_API`, default `http://localhost:8816`) directly from the browser
+
+### Build
+
+```sh
+pnpm run build   # tsc + vite build → dist/
+pnpm run dev     # vite dev server (HMR)
+```
+
+Output is `dist/` — plain HTML/CSS/JS, ready for nginx or any static file server.
+
+From repo root:
+```bash
+pnpm --filter @biopb/web dev     # Vite dev server on :5173
+pnpm --filter @biopb/web build   # tsc + vite build → dist/
+```
+
+### nginx deployment
+
+Because React Router uses the HTML5 History API, nginx must fall back to `index.html` for all routes:
+
+```nginx
+location / {
+    root /path/to/dist;
+    try_files $uri $uri/ /index.html;
+}
+```
+
+The sidecar (`VITE_TENSOR_API`) must be reachable from the browser — configure CORS origins (default to localhost:5173) in the tensor server accordingly. I.e, for nginx deployment:
+
+```
+biopb-tensor launch config.toml --web-url https://yourdomain.com --token mytoken...
+```
+
+### Auth flow
+
+Token is stored in `sessionStorage` under key `biopb_token`.
+
+1. On load, `ClientBootstrap` reads `sessionStorage.getItem("biopb_token")`.
+2. If absent → redirect to `/unlock`.
+3. `/unlock` page: user pastes token → `sessionStorage.setItem("biopb_token", token)` → navigate to `/`.
+4. `ClientBootstrap` calls `initClient(apiBase, token)` → `TensorFlightClient` sends `Authorization: Bearer <token>` on every HTTP request to the sidecar.
+5. The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`; the FastAPI sidecar validates it via `HTTPBearer`.
+6. "Lock" button → `sessionStorage.removeItem("biopb_token")` → redirect to `/unlock`.
+
+Token is stored in `sessionStorage` (clears on tab close, not persisted across sessions).
+
+### Zustand store
+
+```ts
+{
+  client:          TensorHttpClient | null,
+  connectionState: "idle" | "connecting" | "connected" | "error",
+  sources:         DataSourceDescriptor[],
+  activeSourceId:  string | null,
+  activeTensorId:  string | null,
+  slice: {
+    t: number,
+    z: number,
+    c: number,
+    scaleFactors:    number[] | null,
+    reductionMethod: string,
+  },
+}
+```
+
+Actions: `initClient`, `loadSources`, `selectSource`, `setSlice`, `clearSession`.
+
+### Component tree
+
+```
+main.tsx  (BrowserRouter + Routes)
+├── /          → HomePage
+│   └── ClientBootstrap          — reads sessionStorage token, initialises store
+│       ├── SourceTree           — hierarchical source browser (sidebar)
+│       ├── ImageViewer          — Pixi.js canvas
+│       ├── SliceControls        — T/Z sliders, channel select
+│       └── MetaPanel            — OME metadata accordion
+└── /unlock    → UnlockPage      — token entry form
+```
+
+### File map
+
+- `packages/web/package.json`
+- `packages/web/vite.config.ts`
+- `packages/web/src/main.tsx`
+- `packages/web/src/ClientBootstrap.tsx`
+- `packages/web/src/store.ts`
+- `packages/web/src/pages/HomePage.tsx`
+- `packages/web/src/pages/UnlockPage.tsx`
+- `packages/web/src/components/`
+
+---
+
+## 8. Data Flow — Viewing a Slice
+
+```
+User moves Z slider
+  → setSlice({ z: 5 }) [Zustand]
+  → SliceControls re-renders (controlled input)
+  → ImageViewer effect fires (deps: activeSourceId, activeTensorId, slice)
+      → TensorArray.compute({ z: 5, scaleHint, reductionMethod })
+          → TensorHttpClient.slice(SliceRequest)
+              POST /api/slice  →  FastAPI sidecar  →  Flight server
+              ← octet-stream + X-Shape / X-Dtype / X-Dim-Labels
+          ← TypedNdArray { buffer, shape, dtype, dimLabels }
+      → toGrayscaleRgba(buffer, shape, dtype)   [uint16 → Uint8ClampedArray RGBA]
+      → new ImageData(rgba, w, h)
+      → HTMLCanvasElement.putImageData(…)
+      → Pixi.js Texture.from(canvas) → Sprite → stage.addChild
+```
+
+A request counter guards against race conditions: if a new request starts
+before the previous one resolves, the stale response is discarded.
+
+---
+
+## 9. Test Suite
+
+### Server tests
+
+**Location:** `biopb-tensor-server/tests/`
 **Runner:** pytest
 
 | File | Scope | Count |
@@ -248,12 +500,32 @@ url        = "/data/multiscale.zarr"
 `unittest.mock.MagicMock` replacing `TensorFlightClient` for unit tests, and
 a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
+### Client tests
+
+**Location:** `packages/tensor-flight-client/`
+**Runner:** vitest
+
+| Package | Tests |
+|---------|-------|
+| `@biopb/tensor-flight-client` | 45 — `buildAxisMap`, `isAxisMapAmbiguous`, `computeScaleHint`, `TensorArray.compute`, `TensorHttpClient` (all methods with mocked `fetch`) |
+
 ---
 
-## 6. Environment Variables (server-side)
+## 10. Environment Variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `BIOPB_TENSOR_ENDPOINT` | `grpc://localhost:8815` | Arrow Flight server location used by TensorFlightClient |
-| `BIOPB_TENSOR_TOKEN` | — | Pre-set sidecar token (skips CLI prompt) |
-| `BIOPB_WEB_DEV_BYPASS` | `0` | Enable dev-mode token bypass (localhost only) |
+| Variable | Where consumed | Purpose |
+|----------|---------------|---------|
+| `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
+| `BIOPB_TENSOR_TOKEN` | `biopb-tensor launch` (server) | Pre-set sidecar token (skips CLI prompt) |
+| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor launch` (server) | Enable dev-mode token bypass (localhost only) |
+| `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI sidecar (default `http://localhost:8816`) |
+
+---
+
+## 11. Security Model
+
+- Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
+- The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
+- The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
+- Dev mode (`biopb-tensor launch --dev`) disables token enforcement on the backend; the frontend still shows the unlock page but any string is accepted.
+- Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).

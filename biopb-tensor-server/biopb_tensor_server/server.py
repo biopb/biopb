@@ -9,7 +9,7 @@ The server supports:
 - DoGet: Fetch individual chunk data
 """
 
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, List, Optional
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -21,6 +21,41 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection, DataS
 
 from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id, build_arrow_schema
 from biopb_tensor_server.cache import CacheManager
+
+
+class _NoopMiddleware(flight.ServerMiddleware):
+    """Middleware instance that does nothing after a successful auth check."""
+
+    def sending_headers(self) -> dict:
+        return {}
+
+    def call_completed(self, exception: Optional[Exception]) -> None:
+        pass
+
+
+class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
+    """Reject calls whose Authorization header does not match the Bearer token.
+
+    Header value must be exactly ``Bearer <token>`` (case-sensitive).
+    When *token* is ``None`` or empty the factory is a no-op (auth disabled).
+    """
+
+    def __init__(self, token: Optional[str]) -> None:
+        self._expected = f"Bearer {token}" if token else None
+
+    def start_call(
+        self,
+        info: flight.CallInfo,
+        headers: dict,
+    ) -> Optional[flight.ServerMiddleware]:
+        if self._expected is None:
+            return _NoopMiddleware()
+        # Header values are lists; gRPC lowercases header names.
+        values: List[str] = headers.get("authorization", [])
+        bearer = values[0] if values else ""
+        if bearer != self._expected:
+            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
+        return _NoopMiddleware()
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -44,14 +79,22 @@ class TensorFlightServer(flight.FlightServerBase):
         server.serve()
     """
 
-    def __init__(self, location: str = 'grpc://0.0.0.0:8815', **kwargs):
+    def __init__(
+        self,
+        location: str = 'grpc://0.0.0.0:8815',
+        token: Optional[str] = None,
+        **kwargs,
+    ):
         """Initialize the Flight server.
 
         Args:
             location: Server location (e.g., 'grpc://0.0.0.0:8815')
+            token: Bearer token required on every call.  ``None`` disables auth.
             **kwargs: Additional arguments passed to FlightServerBase
         """
-        super().__init__(location, **kwargs)
+        middleware = kwargs.pop("middleware", {})
+        middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
+        super().__init__(location, middleware=middleware, **kwargs)
         self._sources: Dict[str, BackendAdapter] = {}
 
     def register_source(self, source_id: str, adapter: BackendAdapter) -> None:

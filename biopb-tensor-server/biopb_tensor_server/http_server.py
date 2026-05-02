@@ -261,9 +261,9 @@ def create_app(
     """
     if cors_origins is None:
         cors_origins = [
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://[::1]:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://[::1]:5173",
         ]
 
     # Lazy-init Flight client (first request will connect)
@@ -279,6 +279,7 @@ def create_app(
                     _client_holder["client"] = TensorFlightClient(
                         location=flight_location,
                         cache_bytes=cache_bytes,
+                        token=token,
                     )
                     diag.mark_connected()
                 except Exception as exc:

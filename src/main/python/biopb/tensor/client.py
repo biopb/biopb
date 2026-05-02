@@ -59,14 +59,21 @@ class TensorFlightClient:
         self,
         location: str = 'grpc://localhost:8815',
         cache_bytes: int = 1_000_000_000,  # 1GB default
+        token: Optional[str] = None,
     ):
         """Initialize the Flight client.
 
         Args:
             location: Flight server location
             cache_bytes: Maximum bytes for chunk cache (default 1GB)
+            token: Bearer token for server authentication.  ``None`` disables auth.
         """
         self._client = flight.FlightClient(location)
+        self._call_options = (
+            flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
+            if token
+            else flight.FlightCallOptions()
+        )
         self._cache = Cache(available_bytes=cache_bytes)
         self._sources: Dict[str, DataSourceDescriptor] = {}
         self._descriptors: Dict[str, TensorDescriptor] = {}
@@ -83,7 +90,7 @@ class TensorFlightClient:
             with shape/dtype for all tensors in that source.
         """
         source_descriptors = {}
-        for info in self._client.list_flights():
+        for info in self._client.list_flights(options=self._call_options):
             source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
             source_descriptors[source_desc.source_id] = source_desc
             # Cache tensor descriptors
@@ -125,7 +132,7 @@ class TensorFlightClient:
             tensor_id=first_tensor.array_id,
         )
         flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
-        info = self._client.get_flight_info(flight_desc)
+        info = self._client.get_flight_info(flight_desc, options=self._call_options)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         if response_desc.metadata_json:
@@ -203,7 +210,7 @@ class TensorFlightClient:
 
         # Get flight info
         flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
-        info = self._client.get_flight_info(flight_desc)
+        info = self._client.get_flight_info(flight_desc, options=self._call_options)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         # Cache the response descriptor
@@ -283,7 +290,7 @@ class TensorFlightClient:
 
             # Fetch from server
             ticket = TensorTicket(chunk_id=chunk_id)
-            reader = self._client.do_get(flight.Ticket(ticket.SerializeToString()))
+            reader = self._client.do_get(flight.Ticket(ticket.SerializeToString()), options=self._call_options)
 
             # Read all data from the stream
             table = reader.read_all()
