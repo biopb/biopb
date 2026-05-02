@@ -82,12 +82,16 @@ class SourceConfig:
         source_id: Unique identifier for the data source (auto-generated from URL if None)
         dim_labels: Dimension labels (optional, applies to all tensors in source)
         dataset: HDF5 dataset path (required for HDF5 type)
+        monitor: Enable live filesystem monitoring for this source (local directories only)
+                 When True, the server will watch for file add/delete events and update
+                 the catalog automatically.
     """
     url: str
     type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "aics"]] = None
     source_id: Optional[str] = None
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
+    monitor: bool = False  # Enable live filesystem monitoring
 
     def __post_init__(self):
         if self.url is None or self.url == "":
@@ -247,6 +251,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
             source_id=src_data.get("source_id"),  # Optional - auto-generated if None
             dim_labels=src_data.get("dim_labels"),
             dataset=src_data.get("dataset"),
+            monitor=src_data.get("monitor", False),  # Optional - default False
         )
         sources.append(source)
 

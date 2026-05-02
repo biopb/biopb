@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Set, Type, TYPE_CHECKING
 
@@ -101,12 +100,13 @@ def walk_with_identity_tracking(
         pass
 
 
-@dataclass
 class SourceClaim:
     """Represents a claimed data source.
 
     A claim describes what paths an adapter recognizes and wants to handle.
     Claims can be single-node (one file/dir) or multi-node (multiple files).
+
+    Uses __slots__ for memory efficiency when scanning large directories.
 
     Attributes:
         source_type: Type identifier ("zarr", "ome-tiff", "hdf5", etc.)
@@ -116,12 +116,38 @@ class SourceClaim:
         dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
     """
-    source_type: str
-    primary_path: Path
-    claimed_paths: Set[Path]
-    source_id: Optional[str] = None
-    dim_labels: Optional[List[str]] = None
-    extra_config: dict = field(default_factory=dict)
+
+    __slots__ = (
+        'source_type',
+        'primary_path',
+        'claimed_paths',
+        'source_id',
+        'dim_labels',
+        'extra_config',
+    )
+
+    def __init__(
+        self,
+        source_type: str,
+        primary_path: Path,
+        claimed_paths: Set[Path],
+        source_id: Optional[str] = None,
+        dim_labels: Optional[List[str]] = None,
+        extra_config: Optional[dict] = None,
+    ):
+        self.source_type = source_type
+        self.primary_path = primary_path
+        self.claimed_paths = claimed_paths
+        self.source_id = source_id
+        self.dim_labels = dim_labels
+        self.extra_config = extra_config if extra_config is not None else {}
+
+    def __repr__(self) -> str:
+        return (
+            f"SourceClaim(source_type={self.source_type!r}, "
+            f"primary_path={self.primary_path!r}, "
+            f"source_id={self.source_id!r})"
+        )
 
 
 class AdapterRegistry:

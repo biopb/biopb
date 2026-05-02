@@ -33,7 +33,7 @@ without a gRPC-Web proxy.
 
 ---
 
-## 1. TensorFlightServer
+## TensorFlightServer
 
 **Module:** `biopb_tensor_server.server`
 **Class:** `TensorFlightServer(flight.FlightServerBase)`
@@ -87,7 +87,7 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ---
 
-## 2. FastAPI HTTP Sidecar
+## FastAPI HTTP Sidecar
 
 **Module:** `biopb_tensor_server.http_server`
 **Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins) → FastAPI`
@@ -182,7 +182,7 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 
 ---
 
-## 3. CLI Launcher
+## CLI Launcher
 
 **Command:** `biopb-tensor launch`
 
@@ -210,7 +210,182 @@ Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
 ---
 
-## 4. Configuration (`biopb-tensor.toml`)
+## Discovery & Directory Monitoring
+
+### Discovery Protocol
+
+**Module:** `biopb_tensor_server.discovery`
+
+The discovery system uses a **claim-based protocol** where adapters "claim" filesystem paths they recognize. This enables:
+
+1. Extensible format detection — new adapters register and participate
+2. Cross-platform file identity tracking (symlink/hardlink safe via inode)
+3. Live filesystem monitoring support
+
+#### SourceClaim
+
+Lightweight claim object using `__slots__` for memory efficiency when scanning large directories:
+
+```python
+class SourceClaim:
+    __slots__ = ('source_type', 'primary_path', 'claimed_paths', 
+                 'source_id', 'dim_labels', 'extra_config')
+    
+    source_type: str      # "zarr", "ome-tiff", "hdf5", etc.
+    primary_path: Path    # Main entry point
+    claimed_paths: Set[Path]  # All consumed paths (multi-node claims)
+    source_id: str        # Auto-generated from URL hash
+    dim_labels: List[str] # Optional dimension labels
+    extra_config: dict    # Adapter-specific config (e.g., HDF5 dataset)
+```
+
+#### AdapterRegistry
+
+Adapters register with the registry and implement the `claim()` classmethod:
+
+```python
+class AdapterRegistry:
+    def register_with_type(source_type: str, adapter_cls: Type[BackendAdapter])
+    def get_claims_for_path(path: Path, visited: Set[str]) -> List[SourceClaim]
+    def get_adapter_for_type(source_type: str) -> Type[BackendAdapter]
+```
+
+Registration order (by priority/specificity):
+1. `AicsImageIoAdapter` — CZI, LIF, ND2, DV, LSM
+2. `OmeZarrAdapter` — OME-Zarr multiscales
+3. `ZarrAdapter` — Generic Zarr
+4. `MultiFileOmeTiffAdapter` — MicroManager datasets
+5. `OmeTiffAdapter` — Single-file OME-TIFF
+6. `Hdf5Adapter` — HDF5 (requires explicit config)
+
+#### DiscoveryState
+
+Bidirectional mappings for efficient source add/remove operations:
+
+```python
+class DiscoveryState:
+    claims: Dict[str, SourceClaim]           # source_id → claim
+    path_to_source: Dict[Path, str]          # primary_path → source_id
+    consumed_paths: Set[Path]                # all claimed paths
+    visited_identities: Set[str]             # inode-based dedup
+    
+    on_source_added: Callable[[SourceClaim], None]   # Callback
+    on_source_removed: Callable[[str], None]         # Callback
+```
+
+### Directory Monitoring
+
+**Modules:** `biopb_tensor_server.watcher`, `biopb_tensor_server.source_manager`
+
+Live filesystem monitoring for configured directories. When files are added or deleted, the tensor store catalog updates automatically.
+
+#### Architecture
+
+```
+Main Process                          Subprocess (isolated)
+┌─────────────────────┐              ┌─────────────────────┐
+│ TensorFlightServer  │              │ Watchdog Observer   │
+│ SourceManager       │              │ DebouncingHandler   │
+│         │           │              │                     │
+│         ▼           │   Queue      │   event_buffer      │
+│  get_events()       │◄─────────────│   (debounced)       │
+│         │           │   (events)   │                     │
+│         ▼           │              │                     │
+│  _process_event()   │   Event      │   loop checks       │
+│         │           │─────────────►│   shutdown_event    │
+│         ▼           │ (shutdown)   │                     │
+│  register_source()  │              │                     │
+│  unregister_source()│              │                     │
+└─────────────────────┘              └─────────────────────┘
+```
+
+Key design decisions:
+- **Subprocess isolation**: Watchdog runs in separate process for stability
+- **Unidirectional queue**: Events flow subprocess → parent only
+- **Shutdown via Event**: Clean signaling without queue contention
+- **Thread-safe updates**: Server mutations serialized via lock in main process
+- **Abstract interface**: `DirectoryWatcher` supports future PollVFS for NFS
+
+#### Watcher Interface
+
+```python
+class DirectoryWatcher(ABC):
+    def start(self, directories: Set[Path]) -> None
+    def stop(self) -> None
+    def get_events(self, timeout: float) -> List[WatcherEvent]
+    def is_running(self) -> bool
+```
+
+Implementations:
+- `WatchdogWatcher` — inode-based monitoring (local filesystems)
+- `PollVFSWatcher` — polling-based (placeholder for NFS/network mounts)
+
+#### Event Types
+
+```python
+class WatcherEventType(Enum):
+    CREATED = "created"   # New file/directory
+    DELETED = "deleted"   # Removed file/directory  
+    MOVED = "moved"       # Renamed/moved (old_path + new_path)
+```
+
+#### Debouncing
+
+Events are buffered for 1.5 seconds (configurable) to handle:
+- Rapid file operations (bulk data transfer, acquisition systems)
+- Partial detection of partially-written files
+- Transient files (create+delete pairs are collapsed and skipped)
+
+#### Move Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Move within monitored dir | Preserve `source_id`, update paths |
+| Move out of monitored dir | Treat as delete |
+| Move into monitored dir | Treat as create (new `source_id`) |
+
+#### SourceManager
+
+Coordinates watcher, discovery, and server catalog updates:
+
+```python
+class SourceManager:
+    def start() → None    # Start event processing thread
+    def stop() → None     # Stop thread and clean up
+    
+    # Callbacks (set on DiscoveryState)
+    def _on_source_added(claim)   # Create adapter, register with server
+    def _on_source_removed(source_id)  # Unregister from server
+```
+
+#### Configuration
+
+Enable monitoring per source in TOML:
+
+```toml
+[[sources]]
+url = "/data/acquisition/"
+monitor = true  # Enable live filesystem monitoring
+```
+
+Only local directories can be monitored (remote URLs not supported).
+
+#### Shutdown Sequence
+
+```python
+# CLI stop sequence:
+source_manager.stop()   # First: stop event processing thread
+watcher.stop()          # Then: signal subprocess shutdown
+    # → shutdown_event.set()
+    # → subprocess exits cleanly
+    # → process.join(5)
+    # → process.terminate() if needed
+    # → process.kill() as last resort
+```
+
+---
+
+## Configuration (`biopb-tensor.toml`)
 
 ```toml
 [server]
@@ -237,7 +412,7 @@ url        = "/data/multiscale.zarr"
 
 ---
 
-## 5. Client Packages (TypeScript)
+## Client Packages (TypeScript)
 
 The browser-facing side of biopb-tensor-server is split into two pnpm workspace
 packages:
@@ -252,7 +427,7 @@ Both packages live under `packages/` and are built together with
 
 ---
 
-## 6. @biopb/tensor-flight-client
+## @biopb/tensor-flight-client
 
 **Output:** ESM (`dist/index.js`, `dist/index.d.ts`)
 
@@ -351,7 +526,7 @@ returns `LazyTensorArray` instances (wrapping `TensorArray`).
 
 ---
 
-## 7. @biopb/web
+## @biopb/web
 
 **Framework:** Vite + React + React Router v6
 **State management:** Zustand
@@ -457,7 +632,7 @@ main.tsx  (BrowserRouter + Routes)
 
 ---
 
-## 8. Data Flow — Viewing a Slice
+## Data Flow — Viewing a Slice
 
 ```
 User moves Z slider
@@ -480,7 +655,7 @@ before the previous one resolves, the stale response is discarded.
 
 ---
 
-## 9. Test Suite
+## Test Suite
 
 ### Server tests
 
@@ -511,7 +686,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ---
 
-## 10. Environment Variables
+## Environment Variables
 
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
@@ -522,7 +697,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 
 ---
 
-## 11. Security Model
+## Security Model
 
 - Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.

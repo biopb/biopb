@@ -34,6 +34,8 @@ from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
+from biopb_tensor_server.watcher import WatchdogWatcher
+from biopb_tensor_server.source_manager import create_source_manager
 
 
 app = typer.Typer(
@@ -178,11 +180,20 @@ def serve(
     # Resolve sources (expand directories)
     sources = resolve_all_sources(server_config)
 
-    if not sources:
+    # Separate monitored sources from static sources
+    monitored_sources = [s for s in server_config.sources if s.monitor]
+    static_sources = [s for s in sources if not any(
+        s.url.startswith(ms.url) for ms in monitored_sources if not ms.is_remote
+    )]
+
+    if not sources and not monitored_sources:
         console.print("[yellow]Warning: No data sources configured[/yellow]")
         raise typer.Exit(1)
 
-    console.print(f"[green]Loading {len(sources)} data source(s)...[/green]")
+    console.print(f"[green]Loading {len(static_sources)} static data source(s)...[/green]")
+    if monitored_sources:
+        console.print(f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]")
+
     console.print(
         "[green]Compute backend policy:[/green] "
         f"backend={compute_backend or server_config.compute_backend}, "
@@ -192,11 +203,14 @@ def serve(
         f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
     )
 
-    # Create adapters
+    # Create registry for adapters
+    registry = get_default_registry()
+
+    # Create adapters for static sources
     adapters = {}
-    for source in sources:
+    for source in static_sources:
         try:
-            adapter = _create_source_adapter(source)
+            adapter = _create_source_adapter(source, registry)
             adapters[source.source_id] = adapter
             # Show tensors in this source
             tensor_descs = adapter.list_tensor_descriptors()
@@ -210,7 +224,7 @@ def serve(
         except Exception as e:
             console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
 
-    if not adapters:
+    if not adapters and not monitored_sources:
         console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
@@ -222,6 +236,32 @@ def serve(
     for source_id, adapter in adapters.items():
         server.register_source(source_id, adapter)
 
+    # Set up monitoring if configured
+    watcher = None
+    source_manager = None
+    if monitored_sources:
+        try:
+            watcher = WatchdogWatcher(debounce_window=1.5)
+            source_manager = create_source_manager(
+                server=server,
+                registry=registry,
+                watcher=watcher,
+                monitored_sources=monitored_sources,
+            )
+            if source_manager:
+                # Start watcher and manager
+                monitored_dirs = set()
+                for ms in monitored_sources:
+                    if not ms.is_remote and ms.local_path:
+                        monitored_dirs.add(ms.local_path)
+                watcher.start(monitored_dirs)
+                source_manager.start()
+                console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to start monitoring: {e}[/red]")
+            if watcher:
+                watcher.stop()
+
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
@@ -229,6 +269,10 @@ def serve(
         server.serve()
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
+        if source_manager:
+            source_manager.stop()
+        if watcher:
+            watcher.stop()
         server.shutdown()
 
 
@@ -494,19 +538,28 @@ def launch(
     )
     CacheManager.initialize(server_config.cache)
 
+    # Separate monitored sources from static sources
+    monitored_sources = [s for s in server_config.sources if s.monitor]
     sources = resolve_all_sources(server_config)
-    if not sources:
+    static_sources = [s for s in sources if not any(
+        s.url.startswith(ms.url) for ms in monitored_sources if not ms.is_remote
+    )]
+
+    if not sources and not monitored_sources:
         console.print("[red]No data sources configured[/red]")
         raise typer.Exit(1)
 
+    # Create registry for adapters
+    registry = get_default_registry()
+
     adapters = {}
-    for source in sources:
+    for source in static_sources:
         try:
-            adapters[source.source_id] = _create_source_adapter(source)
+            adapters[source.source_id] = _create_source_adapter(source, registry)
         except Exception as e:
             console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
 
-    if not adapters:
+    if not adapters and not monitored_sources:
         console.print("[red]No sources loaded[/red]")
         raise typer.Exit(1)
 
@@ -514,6 +567,31 @@ def launch(
     flight_server = TensorFlightServer(flight_location)
     for source_id, adapter in adapters.items():
         flight_server.register_source(source_id, adapter)
+
+    # Set up monitoring if configured
+    watcher = None
+    source_manager = None
+    if monitored_sources:
+        try:
+            watcher = WatchdogWatcher(debounce_window=1.5)
+            source_manager = create_source_manager(
+                server=flight_server,
+                registry=registry,
+                watcher=watcher,
+                monitored_sources=monitored_sources,
+            )
+            if source_manager:
+                monitored_dirs = set()
+                for ms in monitored_sources:
+                    if not ms.is_remote and ms.local_path:
+                        monitored_dirs.add(ms.local_path)
+                watcher.start(monitored_dirs)
+                source_manager.start()
+                console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to start monitoring: {e}[/red]")
+            if watcher:
+                watcher.stop()
 
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
     flight_thread.start()
@@ -550,6 +628,10 @@ def launch(
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
+        if source_manager:
+            source_manager.stop()
+        if watcher:
+            watcher.stop()
         flight_server.shutdown()
 
     try:
