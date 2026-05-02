@@ -39,7 +39,7 @@ export default function HomePage() {
         {activeSourceId && activeTensorId ? (
           <>
             <div className="viewer-canvas-wrap">
-              <ImageViewer sourceId={activeSourceId} tensorId={activeTensorId} />
+              <ImageViewer key={`${activeSourceId}:${activeTensorId}`} sourceId={activeSourceId} tensorId={activeTensorId} />
             </div>
             <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
             <MetaPanel sourceId={activeSourceId} />

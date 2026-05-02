@@ -23,8 +23,11 @@ export function ClientBootstrap() {
         const { token, apiBase, devMode: dm } = await res.json();
         initClient(apiBase ?? "http://localhost:8816", token ?? null, dm ?? false);
         await loadSources();
-      } catch {
-        // initClient will be null; the UI will show an error state
+      } catch (err) {
+        useAppStore.setState({
+          connectionState: "error",
+          connectionError: err instanceof Error ? err.message : "Failed to connect to server",
+        });
       }
     })();
   }, [initClient, loadSources]);

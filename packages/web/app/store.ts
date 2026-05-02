@@ -19,7 +19,6 @@ export interface SliceState {
   t: number;
   z: number;
   c: number;
-  scaleFactors: number[];
   reductionMethod: string;
 }
 
@@ -67,7 +66,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     t: 0,
     z: 0,
     c: 0,
-    scaleFactors: [],
     reductionMethod: "nearest",
   },
 
@@ -103,7 +101,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
     set({ activeSourceId: sourceId, activeTensorId: tid });
     // Reset slice to zero when switching source
-    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, scaleFactors: [] } }));
+    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0 } }));
   },
 
   setSlice(partial) {
@@ -111,8 +109,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   clearSession() {
-    // Clear the session cookie by navigating to /unlock
-    document.cookie = "biopb_session=; Max-Age=0; path=/";
+    // Cookie is httpOnly — must be deleted server-side via /api/logout
+    fetch("/api/logout", { method: "POST" }).catch(() => {});
     window.location.href = "/unlock";
   },
 }));

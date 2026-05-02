@@ -55,12 +55,37 @@ function computeStrides(shape: number[]): number[] {
   return strides;
 }
 
+/**
+ * Compute lo/hi contrast cutoffs using 1%–99% percentile normalization.
+ * Systematic sampling keeps cost O(1) for large tiles (≤65536 samples).
+ */
+function computePercentileCutoffs(
+  data: ArrayLike<number>,
+  lo = 0.01,
+  hi = 0.99,
+): [number, number] {
+  const n = data.length;
+  if (n === 0) return [0, 1];
+
+  const sampleSize = Math.min(n, 65536);
+  const step = n / sampleSize;
+  const sample = new Float32Array(sampleSize);
+  for (let i = 0; i < sampleSize; i++) {
+    sample[i] = Number(data[Math.floor(i * step)]);
+  }
+  sample.sort(); // numeric sort on TypedArray — no comparator needed
+
+  const loVal = sample[Math.floor(sampleSize * lo)]!;
+  const hiVal = sample[Math.min(sampleSize - 1, Math.ceil(sampleSize * hi))]!;
+  return loVal < hiVal ? [loVal, hiVal] : [0, 1];
+}
+
 function toGrayscaleRgba(
   shape: number[],
   dimLabels: string[],
   dtype: string,
   buffer: ArrayBuffer,
-): { rgba: Uint8ClampedArray; width: number; height: number } {
+): { rgba: Uint8ClampedArray<ArrayBuffer>; width: number; height: number } {
   const dt = normalizeDtype(dtype);
   const labels = dimLabels.length ? dimLabels : shape.map((_, i) => `d${i}`);
   const axisMap = buildAxisMap(labels);
@@ -73,20 +98,12 @@ function toGrayscaleRgba(
   const data = toNumericArray(dtype, buffer);
   const strides = computeStrides(shape);
 
-  let minVal = Number.POSITIVE_INFINITY;
-  let maxVal = Number.NEGATIVE_INFINITY;
   const needsNormalization = dt !== "uint8";
+  let loVal = 0;
+  let hiVal = 1;
 
   if (needsNormalization) {
-    for (let i = 0; i < data.length; i++) {
-      const v = Number(data[i]);
-      if (v < minVal) minVal = v;
-      if (v > maxVal) maxVal = v;
-    }
-    if (!Number.isFinite(minVal) || !Number.isFinite(maxVal) || minVal === maxVal) {
-      minVal = 0;
-      maxVal = 1;
-    }
+    [loVal, hiVal] = computePercentileCutoffs(data);
   }
 
   const rgba = new Uint8ClampedArray(width * height * 4);
@@ -107,7 +124,7 @@ function toGrayscaleRgba(
       if (dt === "uint8") {
         gray = Math.max(0, Math.min(255, Math.round(raw)));
       } else if (needsNormalization) {
-        const n = (raw - minVal) / Math.max(1e-8, maxVal - minVal);
+        const n = (raw - loVal) / Math.max(1e-8, hiVal - loVal);
         gray = Math.max(0, Math.min(255, Math.round(n * 255)));
       } else {
         gray = Math.max(0, Math.min(255, Math.round(raw)));
@@ -134,10 +151,11 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
   const slice = useAppStore((s) => s.slice);
-  const setSlice = useAppStore((s) => s.setSlice);
 
+  const [appReady, setAppReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const prevScaleRef = useRef<number[]>([]);
 
   const descriptor = useMemo(() => {
     const src = sources.find((s) => s.source_id === sourceId);
@@ -169,6 +187,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
       appRef.current = app;
       viewportRef.current = viewport;
+      setAppReady(true);
 
       let dragging = false;
       let lastX = 0;
@@ -196,6 +215,9 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         const current = viewport.scale.x || 1;
         const next = ev.deltaY < 0 ? current * 1.1 : current * 0.9;
         const clamped = Math.max(0.05, Math.min(40, next));
+        const ratio = clamped / current;
+        viewport.position.x = ev.offsetX - (ev.offsetX - viewport.position.x) * ratio;
+        viewport.position.y = ev.offsetY - (ev.offsetY - viewport.position.y) * ratio;
         viewport.scale.set(clamped);
       };
 
@@ -214,6 +236,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
     return () => {
       cancelled = true;
+      setAppReady(false);
       interactionCleanupRef.current?.();
       interactionCleanupRef.current = null;
       spriteRef.current?.destroy();
@@ -228,7 +251,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
   useEffect(() => {
     let cancelled = false;
-    if (!client || !descriptor) return;
+    if (!appReady || !client || !descriptor) return;
 
     const host = hostRef.current;
     if (!host) return;
@@ -243,12 +266,9 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       viewportW,
       viewportH,
       1_000_000,
-      slice.scaleFactors.length ? slice.scaleFactors : undefined,
+      prevScaleRef.current.length ? prevScaleRef.current : undefined,
     );
-
-    const prev = slice.scaleFactors;
-    const sameScale = prev.length === scale.factors.length && prev.every((v, i) => v === scale.factors[i]);
-    if (!sameScale) setSlice({ scaleFactors: scale.factors });
+    prevScaleRef.current = scale.factors;
 
     const tensor = client.getTensor(sourceId, tensorId);
     setLoading(true);
@@ -275,11 +295,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         canvas.height = height;
         const ctx = canvas.getContext("2d");
         if (!ctx) throw new Error("Failed to create 2D canvas context");
-        const rgbaArray: Uint8ClampedArray<ArrayBuffer> = new Uint8ClampedArray(
-          new ArrayBuffer(rgba.length),
-        );
-        rgbaArray.set(rgba);
-        ctx.putImageData(new ImageData(rgbaArray, width, height), 0, 0);
+        ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
 
         const tex = Texture.from(canvas);
         const sprite = new Sprite(tex);
@@ -317,12 +333,11 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       cancelled = true;
     };
   }, [
+    appReady,
     client,
     descriptor,
-    setSlice,
     slice.c,
     slice.reductionMethod,
-    slice.scaleFactors,
     slice.t,
     slice.z,
     sourceId,
