@@ -102,6 +102,7 @@ class AicsImageIoAdapter(BackendAdapter):
             0,  # scene_index
             source.source_id,
             source.dim_labels,
+            source_url=str(source.url),
         )
 
     def __init__(
@@ -110,6 +111,7 @@ class AicsImageIoAdapter(BackendAdapter):
         scene_index: int,
         array_id: str,
         dim_labels: Optional[List[str]] = None,
+        source_url: Optional[str] = None,
     ):
         """Initialize AICSImageIO adapter.
 
@@ -118,13 +120,20 @@ class AicsImageIoAdapter(BackendAdapter):
             scene_index: Index of the scene this adapter represents
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels (overrides auto-detected dims)
+            source_url: Optional source URL (overrides auto-detected path)
         """
         self._aics_image = aics_image
         self.scene_index = scene_index
         self.array_id = array_id
 
         # Source-level metadata for DataSourceDescriptor
-        self._source_url = str(aics_image.source.path if hasattr(aics_image, 'source') else "")
+        # Use provided source_url if available, otherwise try to extract from image
+        if source_url:
+            self._source_url = source_url
+        elif hasattr(aics_image, 'source') and hasattr(aics_image.source, 'path'):
+            self._source_url = str(aics_image.source.path)
+        else:
+            self._source_url = ""
         self._source_type = "aics"
 
         # Get dask array for lazy chunk access

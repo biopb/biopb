@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@biopb/tensor-flight-client": "workspace:*",
+    "@uiw/react-json-view": "2.0.0-alpha.42",
     "pixi.js": "^8.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

@@ -36,15 +36,19 @@ export function HomePage() {
       <main className="app-main">
         {activeSourceId && activeTensorId ? (
           <>
-            <div className="viewer-canvas-wrap">
-              <ImageViewer
-                key={`${activeSourceId}:${activeTensorId}`}
-                sourceId={activeSourceId}
-                tensorId={activeTensorId}
-              />
+            <div className="viewer-column">
+              <div className="viewer-canvas-wrap">
+                <ImageViewer
+                  key={`${activeSourceId}:${activeTensorId}`}
+                  sourceId={activeSourceId}
+                  tensorId={activeTensorId}
+                />
+              </div>
             </div>
-            <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
-            <MetaPanel sourceId={activeSourceId} />
+            <div className="control-column">
+              <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
+              <MetaPanel sourceId={activeSourceId} />
+            </div>
           </>
         ) : (
           <div

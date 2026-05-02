@@ -3,26 +3,85 @@
 import { useMemo, useState } from "react";
 import { useAppStore } from "../store";
 
-interface TreeNode {
-  name: string;
-  path: string;
-  children: Map<string, TreeNode>;
-  sourceIds: string[];
-}
-
-function createNode(name: string, path: string): TreeNode {
-  return { name, path, children: new Map(), sourceIds: [] };
-}
-
-function sourceLabel(sourceUrl: string): string {
+function getPathParts(url: string): string[] {
+  if (!url) return [];
   try {
-    const url = new URL(sourceUrl);
-    const parts = url.pathname.split("/").filter(Boolean);
-    return parts[parts.length - 1] || url.hostname || sourceUrl;
+    const parsed = new URL(url);
+    return parsed.pathname.split("/").filter(Boolean);
   } catch {
-    const parts = sourceUrl.split("/").filter(Boolean);
-    return parts[parts.length - 1] || sourceUrl;
+    return url.split("/").filter(Boolean);
   }
+}
+
+function tensorShortName(arrayId: string): string {
+  const parts = arrayId.split("/").filter(Boolean);
+  return parts[parts.length - 1] || arrayId;
+}
+
+function computeDisplayNames(allSources: { source_id: string; source_url: string }[]): Map<string, string> {
+  const result = new Map<string, string>();
+
+  // Get path parts for each source
+  const pathPartsMap = new Map<string, string[]>();
+  for (const src of allSources) {
+    pathPartsMap.set(src.source_id, getPathParts(src.source_url));
+  }
+
+  // Check if any names collide at the base level (last part only)
+  const baseNames = new Map<string, string[]>();
+  for (const [id, parts] of pathPartsMap) {
+    const base = parts[parts.length - 1] || id;
+    if (!baseNames.has(base)) baseNames.set(base, []);
+    baseNames.get(base)!.push(id);
+  }
+
+  // If no collisions, use base names directly
+  const hasCollision = Array.from(baseNames.values()).some(ids => ids.length > 1);
+
+  if (!hasCollision) {
+    for (const [id, parts] of pathPartsMap) {
+      result.set(id, parts[parts.length - 1] || id);
+    }
+    return result;
+  }
+
+  // Find the minimum depth needed to make all names unique
+  // Start with 2 parts (parent/filename), increase if still colliding
+  let depth = 2;
+  const maxDepth = Math.max(...Array.from(pathPartsMap.values()).map(p => p.length));
+
+  while (depth <= maxDepth) {
+    const namesAtDepth = new Map<string, string[]>();
+    for (const [id, parts] of pathPartsMap) {
+      // Take last `depth` parts
+      const nameParts = parts.slice(-depth);
+      const name = nameParts.join("/") || id;
+      if (!namesAtDepth.has(name)) namesAtDepth.set(name, []);
+      namesAtDepth.get(name)!.push(id);
+    }
+
+    // Check if all unique at this depth
+    const allUnique = Array.from(namesAtDepth.values()).every(ids => ids.length === 1);
+    if (allUnique) {
+      for (const [id, parts] of pathPartsMap) {
+        const nameParts = parts.slice(-depth);
+        result.set(id, nameParts.join("/") || id);
+      }
+      return result;
+    }
+
+    depth++;
+  }
+
+  // Fallback: use full paths
+  for (const [id, parts] of pathPartsMap) {
+    result.set(id, parts.join("/") || id);
+  }
+  return result;
+}
+
+function formatShape(shape: number[]): string {
+  return shape.join("×");
 }
 
 export function SourceTree() {
@@ -43,101 +102,97 @@ export function SourceTree() {
     });
   }, [query, sources]);
 
-  const tree = useMemo(() => {
-    const root = createNode("/", "");
+  const displayNames = useMemo(() => computeDisplayNames(filtered), [filtered]);
+
+  const rows: JSX.Element[] = useMemo(() => {
+    const result: JSX.Element[] = [];
+
     for (const src of filtered) {
-      let current = root;
-      const parts = src.source_url
-        .replace(/^\w+:\/\//, "")
-        .split("/")
-        .filter(Boolean);
-      const pathParts = parts.length > 0 ? parts : [src.source_id];
-      for (const part of pathParts) {
-        const nextPath = current.path ? `${current.path}/${part}` : part;
-        if (!current.children.has(part)) {
-          current.children.set(part, createNode(part, nextPath));
-        }
-        current = current.children.get(part) as TreeNode;
-      }
-      current.sourceIds.push(src.source_id);
-    }
-    return root;
-  }, [filtered]);
-
-  const byId = useMemo(() => new Map(sources.map((s) => [s.source_id, s])), [sources]);
-
-  const renderNode = (node: TreeNode, depth: number): JSX.Element[] => {
-    const rows: JSX.Element[] = [];
-
-    const childNodes = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
-    for (const child of childNodes) {
-      rows.push(
-        <div key={`dir:${child.path}`} className="tree-item" style={{ paddingLeft: 10 + depth * 12 }}>
-          <span style={{ opacity: 0.7 }}>{child.name}</span>
-        </div>,
-      );
-      rows.push(...renderNode(child, depth + 1));
-    }
-
-    for (const sourceId of node.sourceIds) {
-      const src = byId.get(sourceId);
-      if (!src) continue;
       const isActive = src.source_id === activeSourceId;
+      const displayName = displayNames.get(src.source_id) || src.source_id;
+      const hasMultipleTensors = src.tensors.length > 1;
+      const firstTensor = src.tensors[0];
 
-      rows.push(
+      result.push(
         <button
           key={`src:${src.source_id}`}
           className={`tree-item ${isActive ? "active" : ""}`}
-          style={{ width: "100%", textAlign: "left", paddingLeft: 10 + depth * 12 }}
-          onClick={() => selectSource(src.source_id)}
+          style={{
+            width: "100%",
+            textAlign: "left",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+          onClick={() => {
+            if (src.tensors.length === 1) {
+              selectSource(src.source_id, src.tensors[0]?.array_id);
+            } else {
+              selectSource(src.source_id);
+            }
+          }}
           title={src.source_url}
         >
-          <span>{sourceLabel(src.source_url)}</span>
-          <span className="tensor-pill" style={{ marginLeft: "auto" }}>
-            {src.tensors.length}
-          </span>
-        </button>,
+          <span style={{ flex: 1 }}>{displayName}</span>
+          {hasMultipleTensors ? (
+            <span className="tensor-pill">{src.tensors.length}</span>
+          ) : firstTensor ? (
+            <span className="dim-badge" title={formatShape(firstTensor.shape)}>
+              {formatShape(firstTensor.shape)}
+            </span>
+          ) : null}
+        </button>
       );
 
-      if (isActive) {
+      if (isActive && hasMultipleTensors) {
         for (const t of src.tensors) {
           const tActive = t.array_id === activeTensorId;
-          rows.push(
+          const tName = tensorShortName(t.array_id);
+          result.push(
             <button
               key={`tensor:${src.source_id}:${t.array_id}`}
-              className={`tree-item ${tActive ? "active" : ""}`}
-              style={{ width: "100%", textAlign: "left", paddingLeft: 24 + depth * 12, opacity: 0.9 }}
+              className={`tree-item tensor-item ${tActive ? "active" : ""}`}
+              style={{
+                width: "100%",
+                textAlign: "left",
+                paddingLeft: 24,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontSize: 12,
+              }}
               onClick={() => selectSource(src.source_id, t.array_id)}
-              title={`${t.array_id} (${t.dtype})`}
+              title={`${t.array_id}\nShape: ${formatShape(t.shape)}\nDtype: ${t.dtype}`}
             >
-              {t.array_id}
-            </button>,
+              <span style={{ flex: 1 }}>{tName}</span>
+            </button>
           );
         }
       }
     }
 
-    return rows;
-  };
+    return result;
+  }, [filtered, activeSourceId, activeTensorId, displayNames, selectSource]);
 
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
-      <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ padding: "0.5rem 1rem" }}>
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search sources"
           aria-label="Search sources"
+          style={{ width: "100%" }}
         />
       </div>
 
-      <div style={{ overflow: "auto", marginTop: 10 }}>
+      <div style={{ overflow: "auto" }}>
         {sourcesLoading ? (
-          <div style={{ opacity: 0.8 }}>Loading sources...</div>
+          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>Loading sources...</div>
         ) : filtered.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No sources</div>
+          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>No sources</div>
         ) : (
-          renderNode(tree, 0)
+          rows
         )}
       </div>
     </section>
