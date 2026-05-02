@@ -21,6 +21,9 @@ const SPATIAL_X = new Set(["x", "width", "col", "cols", "column", "columns"]);
 const SPATIAL_Z = new Set(["z", "depth", "plane", "planes", "slice"]);
 const TEMPORAL = new Set(["t", "time", "frame", "frames"]);
 const CHANNEL = new Set(["c", "channel", "channels", "band", "bands"]);
+const ALL_KNOWN_LABELS = new Set<string>([
+  ...TEMPORAL, ...SPATIAL_Z, ...CHANNEL, ...SPATIAL_Y, ...SPATIAL_X,
+]);
 
 export interface AxisMap {
   t: number | null;
@@ -68,9 +71,7 @@ export function buildAxisMap(dimLabels: string[]): AxisMap {
 
 /** Return true when any axis was inferred by heuristic (not explicit label). */
 export function isAxisMapAmbiguous(dimLabels: string[]): boolean {
-  const labels = dimLabels.map((l) => l.toLowerCase().trim());
-  const allKnown = [...TEMPORAL, ...SPATIAL_Z, ...CHANNEL, ...SPATIAL_Y, ...SPATIAL_X];
-  return labels.some((l) => !allKnown.includes(l));
+  return dimLabels.some((l) => !ALL_KNOWN_LABELS.has(l.toLowerCase().trim()));
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,10 @@ export function computeScaleHint(
     return { factors, snapped: false };
   }
 
+  if (viewportW <= 0 || viewportH <= 0) {
+    return { factors, snapped: false };
+  }
+
   // How many data pixels fit into the viewport?
   const rawScaleY = dataH / viewportH;
   const rawScaleX = dataW / viewportW;
@@ -137,16 +142,16 @@ export function computeScaleHint(
   const snappedLog2 = Math.round(log2);
   let snappedFactor = Math.max(1, Math.pow(2, snappedLog2));
 
-  // Hysteresis: don't switch scale unless deviation exceeds 20%
+  // Hysteresis: only leave the current scale level if the raw target is clearly
+  // outside the ±20% band around the previous level.
   if (prevFactors && prevFactors[yIdx] !== undefined) {
-    const prev = prevFactors[yIdx];
-    const ratio = snappedFactor / prev;
-    if (ratio > 1 - HYSTERESIS && ratio < 1 + HYSTERESIS) {
-      snappedFactor = prev; // stay on current level
+    const prev = prevFactors[yIdx] as number;
+    if (targetScale >= prev * (1 - HYSTERESIS) && targetScale <= prev * (1 + HYSTERESIS)) {
+      snappedFactor = prev;
     }
   }
 
-  const snapped = Math.round(snappedFactor) !== Math.round(targetScale);
+  const snapped = snappedFactor !== targetScale;
   factors[yIdx] = snappedFactor;
   factors[xIdx] = snappedFactor;
   // All other axes (T, Z, C) stay at 1
@@ -186,12 +191,15 @@ function toRange(
  * Call .compute(options) to fetch data from the server.
  */
 export class TensorArray {
-  readonly descriptor: TensorDescriptor;
+  protected _descriptor: TensorDescriptor;
   readonly sourceId: string;
-  readonly axisMap: AxisMap;
-  readonly axisMapAmbiguous: boolean;
+  protected _axisMap: AxisMap;
+  protected _axisMapAmbiguous: boolean;
+  protected readonly _client: TensorHttpClient;
 
-  private readonly _client: TensorHttpClient;
+  get descriptor(): TensorDescriptor { return this._descriptor; }
+  get axisMap(): AxisMap { return this._axisMap; }
+  get axisMapAmbiguous(): boolean { return this._axisMapAmbiguous; }
 
   constructor(
     client: TensorHttpClient,
@@ -200,9 +208,9 @@ export class TensorArray {
   ) {
     this._client = client;
     this.sourceId = sourceId;
-    this.descriptor = descriptor;
-    this.axisMap = buildAxisMap(descriptor.dim_labels);
-    this.axisMapAmbiguous = isAxisMapAmbiguous(descriptor.dim_labels);
+    this._descriptor = descriptor;
+    this._axisMap = buildAxisMap(descriptor.dim_labels);
+    this._axisMapAmbiguous = isAxisMapAmbiguous(descriptor.dim_labels);
   }
 
   get ndim(): number {

@@ -9,7 +9,7 @@
  */
 
 import { TensorHttpClient } from "./client.js";
-import { TensorArray } from "./tensor-array.js";
+import { TensorArray, buildAxisMap, isAxisMapAmbiguous } from "./tensor-array.js";
 import type { DataSourceDescriptor } from "./types.js";
 
 export class TensorFlightClient {
@@ -38,8 +38,7 @@ export class TensorFlightClient {
   /** List all data sources from the server. */
   async listSources(): Promise<DataSourceDescriptor[]> {
     const sources = await this._http.listSources();
-    this._sources.clear();
-    for (const s of sources) this._sources.set(s.source_id, s);
+    this._sources = new Map(sources.map((s) => [s.source_id, s]));
     return sources;
   }
 
@@ -81,11 +80,11 @@ export class TensorFlightClient {
  * Used when getTensor() is called before listSources().
  */
 class LazyTensorArray extends TensorArray {
-  private _resolved = false;
+  /** Single shared resolution promise — prevents concurrent duplicate getSource() calls. */
+  private _resolvePromise: Promise<void> | null = null;
   private readonly _pendingSourceId: string;
   private readonly _pendingTensorId: string;
   private readonly _sourceCache: Map<string, DataSourceDescriptor>;
-  private readonly _pendingHttp: TensorHttpClient;
 
   constructor(
     client: TensorHttpClient,
@@ -93,7 +92,7 @@ class LazyTensorArray extends TensorArray {
     tensorId: string,
     sourceCache: Map<string, DataSourceDescriptor>,
   ) {
-    // Placeholder descriptor — will be replaced on first compute
+    // Placeholder descriptor — replaced on first compute() via _doResolve()
     super(client, sourceId, {
       array_id: tensorId,
       dim_labels: [],
@@ -101,30 +100,28 @@ class LazyTensorArray extends TensorArray {
       chunk_shape: [],
       dtype: "uint8",
     });
-    this._pendingHttp = client;
     this._pendingSourceId = sourceId;
     this._pendingTensorId = tensorId;
     this._sourceCache = sourceCache;
   }
 
   override async compute(options = {}): Promise<import("./types.js").TypedNdArray> {
-    if (!this._resolved) {
-      // Resolve from server
-      const source = await this._pendingHttp.getSource(this._pendingSourceId);
-      this._sourceCache.set(source.source_id, source);
-      const td = source.tensors.find((t) => t.array_id === this._pendingTensorId);
-      if (!td) {
-        throw new Error(
-          `Tensor '${this._pendingTensorId}' not found in source '${this._pendingSourceId}'`,
-        );
-      }
-      // Mutate the internal descriptor (acceptable here since this object owns it)
-      (this as unknown as { descriptor: typeof td }).descriptor = td;
-      (this as unknown as { axisMap: unknown }).axisMap =
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        (await import("./tensor-array.js")).buildAxisMap(td.dim_labels);
-      this._resolved = true;
-    }
+    this._resolvePromise ??= this._doResolve();
+    await this._resolvePromise;
     return super.compute(options);
+  }
+
+  private async _doResolve(): Promise<void> {
+    const source = await this._client.getSource(this._pendingSourceId);
+    this._sourceCache.set(source.source_id, source);
+    const td = source.tensors.find((t) => t.array_id === this._pendingTensorId);
+    if (!td) {
+      throw new Error(
+        `Tensor '${this._pendingTensorId}' not found in source '${this._pendingSourceId}'`,
+      );
+    }
+    this._descriptor = td;
+    this._axisMap = buildAxisMap(td.dim_labels);
+    this._axisMapAmbiguous = isAxisMapAmbiguous(td.dim_labels);
   }
 }

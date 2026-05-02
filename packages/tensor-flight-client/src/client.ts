@@ -35,23 +35,6 @@ export class TensorApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Timeout helpers
-// ---------------------------------------------------------------------------
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const id = setTimeout(
-      () => reject(new TensorApiError(408, `Timeout after ${ms}ms (${label})`)),
-      ms,
-    );
-    promise.then(
-      (v) => { clearTimeout(id); resolve(v); },
-      (e) => { clearTimeout(id); reject(e); },
-    );
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -92,20 +75,30 @@ export class TensorHttpClient {
     timeoutMs?: number,
   ): Promise<T> {
     const url = `${this.base}${path}`;
-    const promise = fetch(url, {
-      ...options,
-      headers: { ...this.headers(), ...(options?.headers as Record<string, string> ?? {}) },
-    }).then(async (res) => {
+    const controller = new AbortController();
+    const timeoutId = timeoutMs != null
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers: { ...this.headers(), ...(options?.headers as Record<string, string> ?? {}) },
+        signal: controller.signal,
+      });
       if (!res.ok) {
         let detail: unknown;
         try { detail = await res.json(); } catch { /* ignore */ }
         throw new TensorApiError(res.status, res.statusText, detail);
       }
       return res.json() as Promise<T>;
-    });
-    return timeoutMs != null
-      ? withTimeout(promise, timeoutMs, path)
-      : promise;
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
+      }
+      throw e;
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    }
   }
 
   private async fetchBinary(
@@ -114,22 +107,31 @@ export class TensorHttpClient {
     timeoutMs?: number,
   ): Promise<Response> {
     const url = `${this.base}${path}`;
-    const promise = fetch(url, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(body),
-    }).then((res) => {
+    const controller = new AbortController();
+    const timeoutId = timeoutMs != null
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
       if (!res.ok) {
-        return res.json().then(
-          (detail) => { throw new TensorApiError(res.status, res.statusText, detail); },
-          () => { throw new TensorApiError(res.status, res.statusText); },
-        );
+        let detail: unknown;
+        try { detail = await res.json(); } catch { /* ignore */ }
+        throw new TensorApiError(res.status, res.statusText, detail);
       }
       return res;
-    });
-    return timeoutMs != null
-      ? withTimeout(promise, timeoutMs, path)
-      : promise;
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
+      }
+      throw e;
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    }
   }
 
   // -------------------------------------------------------------------------
