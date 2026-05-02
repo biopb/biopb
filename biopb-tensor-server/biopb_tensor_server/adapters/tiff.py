@@ -751,7 +751,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             return
 
         lead = str(self.dim_labels[0]).lower()
-        if lead not in ("plane", "p", "i", "q"):
+        if lead not in ("plane", "p", "i", "q", "t"):
             return
 
         metadata = self.get_metadata()
