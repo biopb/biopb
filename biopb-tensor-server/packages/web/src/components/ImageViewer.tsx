@@ -156,6 +156,18 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const prevScaleRef = useRef<number[]>([]);
+  const isFirstLoadRef = useRef(true);
+
+  // Track current source/tensor to reset pan-zoom when switching
+  const prevSourceIdRef = useRef<string>(sourceId);
+  const prevTensorIdRef = useRef<string>(tensorId);
+
+  // Reset first load flag when switching to a different source or tensor
+  if (prevSourceIdRef.current !== sourceId || prevTensorIdRef.current !== tensorId) {
+    prevSourceIdRef.current = sourceId;
+    prevTensorIdRef.current = tensorId;
+    isFirstLoadRef.current = true;
+  }
 
   const descriptor = useMemo(() => {
     const src = sources.find((s) => s.source_id === sourceId);
@@ -312,15 +324,16 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
         const hostW = Math.max(1, host.clientWidth);
         const hostH = Math.max(1, host.clientHeight);
-        const fitScale = Math.min(1, hostW / Math.max(1, width), hostH / Math.max(1, height));
 
-        viewport.scale.set(fitScale);
-        const offsetX = Math.round((hostW - width * fitScale) / 2);
-        const offsetY = Math.round((hostH - height * fitScale) / 2);
-        viewport.position.set(
-          offsetX,
-          offsetY,
-        );
+        if (isFirstLoadRef.current) {
+          // First load: fit image to window and center
+          const fitScale = Math.min(1, hostW / Math.max(1, width), hostH / Math.max(1, height));
+          viewport.scale.set(fitScale);
+          const offsetX = Math.round((hostW - width * fitScale) / 2);
+          const offsetY = Math.round((hostH - height * fitScale) / 2);
+          viewport.position.set(offsetX, offsetY);
+          isFirstLoadRef.current = false;
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
