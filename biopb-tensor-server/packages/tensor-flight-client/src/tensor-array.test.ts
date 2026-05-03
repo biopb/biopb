@@ -146,29 +146,34 @@ describe("isAxisMapAmbiguous", () => {
 describe("computeScaleHint", () => {
   const axisMap: AxisMap = { t: null, z: null, c: null, y: 0, x: 1 };
 
-  it("returns [1,1] when data fits in viewport", () => {
-    // 256×256 data, 1024×1024 viewport → scale < 1 → clamped to 1
-    const { factors } = computeScaleHint([256, 256], axisMap, 1024, 1024);
+  it("returns [1,1] with default zoom (viewportZoom=1)", () => {
+    // effectiveTargetScale = max(1/1, 1) = 1
+    // maxScale varies by tensor size, but min(maxScale, 1) = 1
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024);
     expect(factors).toEqual([1, 1]);
   });
 
-  it("returns [2,2] for 2× zoom-out (2048 data, 1024 viewport)", () => {
-    const { factors } = computeScaleHint([2048, 2048], axisMap, 1024, 1024, 10_000_000);
-    // rawScale = 2048/1024 = 2 → snap to power-of-two 2
-    expect(factors[0]).toBe(2);
-    expect(factors[1]).toBe(2);
+  it("pixel_budget determines maxScale (upper bound on scale)", () => {
+    // 4096×4096 = 16M pixels, budget 100 → maxScale = sqrt(16M/100) ≈ 400
+    // effectiveTargetScale = 1 (default zoom)
+    // min(400, 1) = 1, snapped to 1
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 100);
+    expect(factors[0]).toBe(1);
   });
 
-  it("returns [4,4] for 4× zoom-out (4096 data, 1024 viewport)", () => {
-    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 10_000_000);
-    expect(factors[0]).toBe(4);
-    expect(factors[1]).toBe(4);
+  it("zoomed-out (viewportZoom<1) increases scale", () => {
+    // viewportZoom=0.5 → effectiveTargetScale = max(1/0.5, 1) = 2
+    // maxScale = 4 (for 4096×4096 with 1M budget)
+    // min(4, 2) = 2
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 1_000_000, 0.5);
+    expect(factors).toEqual([2, 2]);
   });
 
-  it("pixel_budget tightens the scale up", () => {
-    // 4096×4096 = 16M pixels, budget 100 → factor ≥ sqrt(16M/100) ≈ 400 → snap to 512
-    const { factors } = computeScaleHint([4096, 4096], axisMap, 4096, 4096, 100);
-    expect(factors[0]).toBeGreaterThan(1);
+  it("zoomed-in (viewportZoom>1) capped at scale=1", () => {
+    // viewportZoom=2 → effectiveTargetScale = max(1/2, 1) = 1
+    // min(maxScale, 1) = 1 always
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 1_000_000, 2);
+    expect(factors).toEqual([1, 1]);
   });
 
   it("returns all-1 when y or x axis is null", () => {
@@ -179,15 +184,26 @@ describe("computeScaleHint", () => {
 
   it("preserves non-spatial axes at 1 for 4-D tensor", () => {
     const zyx: AxisMap = { t: null, z: 0, c: null, y: 1, x: 2 };
-    const { factors } = computeScaleHint([10, 4096, 4096], zyx, 1024, 1024, 10_000_000);
+    const { factors } = computeScaleHint([10, 4096, 4096], zyx, 1024, 1024);
     expect(factors[0]).toBe(1); // z axis untouched
     expect(factors[1]).toBe(factors[2]); // y and x should match
+    expect(factors[1]).toBe(1); // default zoom gives scale=1
   });
 
-  it("hysteresis: no change when at prev factor within 20%", () => {
-    // Scale 2, prev was 2 → should stay at 2
-    const { factors: f1 } = computeScaleHint([2048, 2048], axisMap, 1024, 1024, 10_000_000, [2, 2]);
-    expect(f1).toEqual([2, 2]);
+  it("very zoomed-out can reach maxScale", () => {
+    // viewportZoom=0.25 → effectiveTargetScale = max(1/0.25, 1) = 4
+    // maxScale = 4 (for 4096×4096 with 1M budget)
+    // min(4, 4) = 4
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 1_000_000, 0.25);
+    expect(factors).toEqual([4, 4]);
+  });
+
+  it("zoomed-out beyond maxScale clamps to maxScale", () => {
+    // viewportZoom=0.1 → effectiveTargetScale = max(1/0.1, 1) = 10
+    // maxScale = 4 (for 4096×4096 with 1M budget)
+    // min(4, 10) = 4
+    const { factors } = computeScaleHint([4096, 4096], axisMap, 1024, 1024, 1_000_000, 0.1);
+    expect(factors).toEqual([4, 4]);
   });
 });
 

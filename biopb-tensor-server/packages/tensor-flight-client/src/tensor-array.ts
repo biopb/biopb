@@ -85,17 +85,18 @@ export interface ScaleVector {
   snapped: boolean;
 }
 
-const HYSTERESIS = 0.2; // 20% band before switching scale level
-
 /**
  * Compute power-of-two scale hint for a 2D viewport.
+ *
+ * Pure function: computes optimal scale factors without hysteresis.
+ * Hysteresis should be implemented at the caller level.
  *
  * @param tensorShape   Full shape of the tensor.
  * @param axisMap       Axis index mapping from buildAxisMap().
  * @param viewportW     Viewport width in physical pixels (already DPR-scaled).
  * @param viewportH     Viewport height in physical pixels (already DPR-scaled).
  * @param pixelBudget   Maximum output megapixels (default 1.0).
- * @param prevFactors   Previously used scale factors (for hysteresis).
+ * @param viewportZoom  Current viewport zoom level (1.0 = fit-to-window).
  */
 export function computeScaleHint(
   tensorShape: number[],
@@ -103,7 +104,7 @@ export function computeScaleHint(
   viewportW: number,
   viewportH: number,
   pixelBudget = 1_000_000,
-  prevFactors?: number[],
+  viewportZoom = 1,
 ): ScaleVector {
   const ndim = tensorShape.length;
   const factors = new Array<number>(ndim).fill(1);
@@ -126,32 +127,19 @@ export function computeScaleHint(
     return { factors, snapped: false };
   }
 
-  // How many data pixels fit into the viewport?
-  const rawScaleY = dataH / viewportH;
-  const rawScaleX = dataW / viewportW;
-  // Use the larger factor (more conservative / lower resolution)
-  const rawScale = Math.max(rawScaleY, rawScaleX);
+  const maxScale = Math.max(1, Math.sqrt((dataH * dataW) / pixelBudget));
 
-  // Budget limit: don't request more pixels than the budget
-  const budgetPixels = pixelBudget;
-  const budgetFactor = Math.sqrt((dataH * dataW) / budgetPixels);
-  const targetScale = Math.max(rawScale, budgetFactor, 1);
+  // effectiveTargetScale: zoomed in (viewportZoom>1) means smaller scale (more detail)
+  const effectiveTargetScale = Math.max(1 / viewportZoom, 1);
 
-  // Snap to nearest power of two
-  const log2 = Math.log2(targetScale);
+  const clampedTargetScale = Math.min(maxScale, effectiveTargetScale);
+
+  // Snap to nearest power of two (pure, no hysteresis)
+  const log2 = Math.log2(clampedTargetScale);
   const snappedLog2 = Math.round(log2);
-  let snappedFactor = Math.max(1, Math.pow(2, snappedLog2));
+  const snappedFactor = Math.max(1, Math.pow(2, snappedLog2));
 
-  // Hysteresis: only leave the current scale level if the raw target is clearly
-  // outside the ±20% band around the previous level.
-  if (prevFactors && prevFactors[yIdx] !== undefined) {
-    const prev = prevFactors[yIdx] as number;
-    if (targetScale >= prev * (1 - HYSTERESIS) && targetScale <= prev * (1 + HYSTERESIS)) {
-      snappedFactor = prev;
-    }
-  }
-
-  const snapped = snappedFactor !== targetScale;
+  const snapped = snappedFactor !== effectiveTargetScale;
   factors[yIdx] = snappedFactor;
   factors[xIdx] = snappedFactor;
   // All other axes (T, Z, C) stay at 1

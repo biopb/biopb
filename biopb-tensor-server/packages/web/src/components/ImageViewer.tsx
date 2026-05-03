@@ -2,10 +2,10 @@
 
 import {
   Application,
-  Container,
   Sprite,
   Texture,
 } from "pixi.js";
+import { Viewport } from "pixi-viewport";
 import {
   buildAxisMap,
   computeScaleHint,
@@ -140,13 +140,34 @@ function toGrayscaleRgba(
   return { rgba, width, height };
 }
 
+const HYSTERESIS = 0.2; // 20% threshold
+
+/**
+ * Check if scale factors differ enough to warrant a reload.
+ * Hysteresis prevents rapid switching when zooming small amounts.
+ */
+function shouldReload(
+  newFactors: number[],
+  loadedFactors: number[],
+): boolean {
+  if (loadedFactors.length === 0) return true; // First load
+  for (let i = 0; i < newFactors.length; i++) {
+    const newVal = newFactors[i] ?? 1;
+    const loadedVal = loadedFactors[i] ?? 1;
+    // Only reload if scale changed by more than 20%
+    if (newVal < loadedVal * (1 - HYSTERESIS) || newVal > loadedVal * (1 + HYSTERESIS)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const appRef = useRef<Application | null>(null);
-  const viewportRef = useRef<Container | null>(null);
+  const viewportRef = useRef<Viewport | null>(null);
   const spriteRef = useRef<Sprite | null>(null);
   const textureRef = useRef<Texture | null>(null);
-  const interactionCleanupRef = useRef<(() => void) | null>(null);
 
   const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
@@ -155,8 +176,12 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const [appReady, setAppReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const prevScaleRef = useRef<number[]>([]);
+
+  const loadedScaleFactorsRef = useRef<number[]>([]);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const isFirstLoadRef = useRef(true);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queuedScaleFactorsRef = useRef<number[] | null>(null);
 
   // Track current source/tensor to reset pan-zoom when switching
   const prevSourceIdRef = useRef<string>(sourceId);
@@ -167,6 +192,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     prevSourceIdRef.current = sourceId;
     prevTensorIdRef.current = tensorId;
     isFirstLoadRef.current = true;
+    loadedScaleFactorsRef.current = [];
   }
 
   const descriptor = useMemo(() => {
@@ -174,6 +200,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
   }, [sourceId, sources, tensorId]);
 
+  // Setup PixiJS Application and Viewport
   useEffect(() => {
     let cancelled = false;
     const host = hostRef.current;
@@ -194,63 +221,74 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       host.innerHTML = "";
       host.appendChild(app.canvas);
 
-      const viewport = new Container();
+      // Initial viewport - world size will be updated when tensor is loaded
+      const viewport = new Viewport({
+        events: app.renderer.events,
+        screenWidth: host.clientWidth,
+        screenHeight: host.clientHeight,
+        worldWidth: 1000,
+        worldHeight: 1000,
+      });
       app.stage.addChild(viewport);
+
+      viewport
+        .drag()
+        .decelerate()
+        .clamp({ direction: "all" })
+        .pinch()
+        .wheel();
 
       appRef.current = app;
       viewportRef.current = viewport;
       setAppReady(true);
 
-      let dragging = false;
-      let lastX = 0;
-      let lastY = 0;
+      // Listen for zoom changes to trigger reload
+      viewport.on("zoomed-end", () => {
+        if (!descriptor || !client) return;
+        const currentZoom = viewport.scale.x;
+        const hostW = Math.max(1, host.clientWidth);
+        const hostH = Math.max(1, host.clientHeight);
+        const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
+        const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
 
-      const onPointerDown = (ev: PointerEvent) => {
-        dragging = true;
-        lastX = ev.clientX;
-        lastY = ev.clientY;
-      };
-      const onPointerMove = (ev: PointerEvent) => {
-        if (!dragging) return;
-        const dx = ev.clientX - lastX;
-        const dy = ev.clientY - lastY;
-        lastX = ev.clientX;
-        lastY = ev.clientY;
-        viewport.position.x += dx;
-        viewport.position.y += dy;
-      };
-      const onPointerUp = () => {
-        dragging = false;
-      };
-      const onWheel = (ev: WheelEvent) => {
-        ev.preventDefault();
-        const current = viewport.scale.x || 1;
-        const next = ev.deltaY < 0 ? current * 1.1 : current * 0.9;
-        const clamped = Math.max(0.05, Math.min(40, next));
-        const ratio = clamped / current;
-        viewport.position.x = ev.offsetX - (ev.offsetX - viewport.position.x) * ratio;
-        viewport.position.y = ev.offsetY - (ev.offsetY - viewport.position.y) * ratio;
-        viewport.scale.set(clamped);
-      };
+        const axisMap = buildAxisMap(descriptor.dim_labels);
+        const scale = computeScaleHint(
+          descriptor.shape,
+          axisMap,
+          viewportW,
+          viewportH,
+          1_000_000,
+          currentZoom,
+        );
 
-      app.canvas.addEventListener("pointerdown", onPointerDown);
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-      app.canvas.addEventListener("wheel", onWheel, { passive: false });
+        if (shouldReload(scale.factors, loadedScaleFactorsRef.current)) {
+          // Queue the request - store scale factors
+          queuedScaleFactorsRef.current = scale.factors;
 
-      interactionCleanupRef.current = () => {
-        app.canvas.removeEventListener("pointerdown", onPointerDown);
-        window.removeEventListener("pointermove", onPointerMove);
-        window.removeEventListener("pointerup", onPointerUp);
-        app.canvas.removeEventListener("wheel", onWheel);
-      };
+          // Cancel previous debounce timer
+          if (debounceTimerRef.current) {
+            clearTimeout(debounceTimerRef.current);
+          }
+
+          // Start new debounce timer (300ms)
+          debounceTimerRef.current = setTimeout(() => {
+            if (queuedScaleFactorsRef.current) {
+              triggerTensorFetch(queuedScaleFactorsRef.current);
+              queuedScaleFactorsRef.current = null;
+            }
+          }, 300);
+        }
+      });
     })();
 
     return () => {
       cancelled = true;
       setAppReady(false);
-      interactionCleanupRef.current?.();
-      interactionCleanupRef.current = null;
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      abortControllerRef.current?.abort();
       spriteRef.current?.destroy();
       textureRef.current?.destroy(true);
       appRef.current?.destroy(true, { children: true, texture: true });
@@ -261,42 +299,39 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!appReady || !client || !descriptor) return;
-
+  // Function to fetch tensor with cancellation support
+  const triggerTensorFetch = (scaleFactors: number[]) => {
+    const viewport = viewportRef.current;
     const host = hostRef.current;
-    if (!host) return;
+    if (!viewport || !host || !client || !descriptor) return;
 
-    const viewportW = Math.max(1, Math.floor(host.clientWidth * window.devicePixelRatio));
-    const viewportH = Math.max(1, Math.floor(host.clientHeight * window.devicePixelRatio));
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
 
-    const axisMap = buildAxisMap(descriptor.dim_labels);
-    const scale = computeScaleHint(
-      descriptor.shape,
-      axisMap,
-      viewportW,
-      viewportH,
-      1_000_000,
-      prevScaleRef.current.length ? prevScaleRef.current : undefined,
-    );
-    prevScaleRef.current = scale.factors;
-
-    const tensor = client.getTensor(sourceId, tensorId);
     setLoading(true);
     setError(null);
+
+    // Get full tensor dimensions from descriptor
+    const axisMap = buildAxisMap(descriptor.dim_labels);
+    const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
+    const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
+    const fullHeight = descriptor.shape[yIdx] ?? 1;
+    const fullWidth = descriptor.shape[xIdx] ?? 1;
+
+    const tensor = client.getTensor(sourceId, tensorId);
 
     tensor
       .compute({
         t: slice.t,
         z: slice.z,
         c: slice.c,
-        scaleHint: scale.factors,
+        scaleHint: scaleFactors,
         reductionMethod: slice.reductionMethod,
         pixelBudget: 1_000_000,
       })
       .then((arr) => {
-        if (cancelled) return;
+        if (signal.aborted) return;
         const shape = arr.shape.length ? arr.shape : descriptor.shape;
         const labels = arr.dimLabels.length ? arr.dimLabels : descriptor.dim_labels;
         const dtype = arr.dtype || descriptor.dtype || "uint8";
@@ -315,36 +350,72 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         textureRef.current?.destroy(true);
         textureRef.current = tex;
 
-        const viewport = viewportRef.current;
-        if (!viewport) return;
+        // Scale sprite to occupy full tensor extent in world coordinates
+        // (returned data is at scaleFactor, so sprite dimensions = returned_size * scaleFactor)
+        const scaleFactorY = scaleFactors[yIdx] ?? 1;
+        const scaleFactorX = scaleFactors[xIdx] ?? 1;
+        sprite.width = width * scaleFactorX;
+        sprite.height = height * scaleFactorY;
 
         viewport.removeChildren();
         viewport.addChild(sprite);
         spriteRef.current = sprite;
 
+        // World size is FIXED to full tensor dimensions (independent of scale factors)
+        viewport.worldWidth = fullWidth;
+        viewport.worldHeight = fullHeight;
+        viewport.clamp({ direction: "all" });
+
+        loadedScaleFactorsRef.current = scaleFactors;
+
         const hostW = Math.max(1, host.clientWidth);
         const hostH = Math.max(1, host.clientHeight);
 
         if (isFirstLoadRef.current) {
-          // First load: fit image to window and center
-          const fitScale = Math.min(1, hostW / Math.max(1, width), hostH / Math.max(1, height));
+          // Fit full tensor to screen
+          const fitScale = Math.min(1, hostW / Math.max(1, fullWidth), hostH / Math.max(1, fullHeight));
           viewport.scale.set(fitScale);
-          const offsetX = Math.round((hostW - width * fitScale) / 2);
-          const offsetY = Math.round((hostH - height * fitScale) / 2);
+          const offsetX = Math.round((hostW - fullWidth * fitScale) / 2);
+          const offsetY = Math.round((hostH - fullHeight * fitScale) / 2);
           viewport.position.set(offsetX, offsetY);
           isFirstLoadRef.current = false;
         }
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!signal.aborted) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!signal.aborted) {
+          setLoading(false);
+        }
       });
+  };
 
-    return () => {
-      cancelled = true;
-    };
+  // Fetch tensor when slice/source/tensor changes
+  useEffect(() => {
+    if (!appReady || !client || !descriptor) return;
+
+    const host = hostRef.current;
+    const viewport = viewportRef.current;
+    if (!host || !viewport) return;
+
+    const viewportW = Math.max(1, Math.floor(host.clientWidth * window.devicePixelRatio));
+    const viewportH = Math.max(1, Math.floor(host.clientHeight * window.devicePixelRatio));
+
+    const axisMap = buildAxisMap(descriptor.dim_labels);
+    const currentZoom = viewport.scale.x;
+    const scale = computeScaleHint(
+      descriptor.shape,
+      axisMap,
+      viewportW,
+      viewportH,
+      1_000_000,
+      currentZoom,
+    );
+
+    triggerTensorFetch(scale.factors);
   }, [
     appReady,
     client,
