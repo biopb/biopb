@@ -2,6 +2,7 @@
 
 import {
   Application,
+  Graphics,
   Sprite,
   Texture,
 } from "pixi.js";
@@ -250,6 +251,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const viewportRef = useRef<Viewport | null>(null);
   const spriteRef = useRef<Sprite | null>(null);
   const textureRef = useRef<Texture | null>(null);
+  const backgroundRef = useRef<Graphics | null>(null);
 
   const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
@@ -262,6 +264,10 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const loadedRegionRef = useRef<LoadedRegion | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sliceRef = useRef(slice);  // Keep current slice for event handlers
+
+  // Update sliceRef whenever slice changes
+  sliceRef.current = slice;
 
   // Track current source/tensor to reset when switching
   const prevSourceIdRef = useRef<string>(sourceId);
@@ -316,6 +322,13 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       });
       app.stage.addChild(viewport);
 
+      // Add background to show pending-data regions when panning
+      const background = new Graphics();
+      background.rect(0, 0, fullWidth, fullHeight);
+      background.fill({ color: 0x1a1a2e });  // Dark blue-gray for "no data" cue
+      viewport.addChild(background);
+      backgroundRef.current = background;
+
       // Set initial fit-to-window scale
       const hostW = Math.max(1, host.clientWidth);
       const hostH = Math.max(1, host.clientHeight);
@@ -327,7 +340,6 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
       viewport
         .drag()
-        .decelerate()
         .clamp({ direction: "all" })
         .pinch()
         .wheel();
@@ -420,11 +432,13 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       abortControllerRef.current?.abort();
       spriteRef.current?.destroy();
       textureRef.current?.destroy(true);
+      backgroundRef.current?.destroy();
       appRef.current?.destroy(true, { children: true, texture: true });
       appRef.current = null;
       viewportRef.current = null;
       spriteRef.current = null;
       textureRef.current = null;
+      backgroundRef.current = null;
     };
   }, [descriptor]);
 
@@ -464,13 +478,13 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
     tensor
       .compute({
-        t: slice.t,
-        z: slice.z,
-        c: slice.c,
+        t: sliceRef.current.t,
+        z: sliceRef.current.z,
+        c: sliceRef.current.c,
         y: sliceRange.y,
         x: sliceRange.x,
         scaleHint: scaleFactors,
-        reductionMethod: slice.reductionMethod,
+        reductionMethod: sliceRef.current.reductionMethod,
         pixelBudget: 1_000_000,
       })
       .then((arr) => {
@@ -533,8 +547,12 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         sprite.width = width * scaleFactorX;
         sprite.height = height * scaleFactorY;
 
-        viewport.removeChildren();
-        viewport.addChild(sprite);
+        // Remove old sprite, keep background (background is always first child)
+        if (spriteRef.current) {
+          viewport.removeChild(spriteRef.current);
+          spriteRef.current.destroy();
+        }
+        viewport.addChild(sprite);  // Adds on top of background
         spriteRef.current = sprite;
 
         // World size fixed to full tensor dimensions

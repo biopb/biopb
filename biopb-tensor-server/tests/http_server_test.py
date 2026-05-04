@@ -375,6 +375,134 @@ class TestSliceEndpoint:
         r = tc.post("/api/slice", json={"source_id": "src0", "tensor_id": "t0"})
         assert r.status_code == 401
 
+    def test_slice_applies_client_side_cropping(self, auth_client):
+        """Verify slice_hint is NOT passed to backend; slicing is done client-side."""
+        tc, mock_fc = auth_client
+
+        # Create a mock dask array that tracks slicing
+        mock_dask = MagicMock()
+        mock_dask.__getitem__ = MagicMock(return_value=mock_dask)
+        mock_dask.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
+
+        mock_fc.get_tensor.return_value = mock_dask
+
+        r = self._post_slice(tc, slice_start=[0, 0, 0], slice_stop=[2, 4, 8])
+        assert r.status_code == 200
+
+        # Verify get_tensor was called with slice_hint=None (client-side cropping)
+        call_kwargs = mock_fc.get_tensor.call_args.kwargs
+        assert call_kwargs.get("slice_hint") is None
+
+        # Verify slicing was applied on the dask array
+        mock_dask.__getitem__.assert_called_once()
+
+
+# ===========================================================================
+# Unit tests — chunk endpoint
+# ===========================================================================
+
+
+class TestChunkEndpoint:
+    def _make_ticket_hex(self, chunk_id: bytes = b"test-chunk") -> str:
+        """Create a hex-encoded TensorTicket string."""
+        from biopb.tensor.ticket_pb2 import TensorTicket
+        ticket = TensorTicket(chunk_id=chunk_id)
+        return ticket.SerializeToString().hex()
+
+    def test_chunk_returns_octet_stream(self, auth_client):
+        tc, mock_fc = auth_client
+        ticket_hex = self._make_ticket_hex()
+
+        # Mock do_get to return a table
+        mock_reader = MagicMock()
+        mock_table = MagicMock()
+        mock_column = MagicMock()
+        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
+        mock_table.column.return_value = mock_column
+        mock_reader.read_all.return_value = mock_table
+
+        mock_fc._client.do_get.return_value = mock_reader
+        mock_fc._call_options = MagicMock()
+
+        r = tc.get(
+            f"/api/sources/src0/ticket/{ticket_hex}",
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        assert "application/octet-stream" in r.headers["content-type"]
+
+    def test_chunk_xshape_header(self, auth_client):
+        tc, mock_fc = auth_client
+        ticket_hex = self._make_ticket_hex()
+
+        mock_reader = MagicMock()
+        mock_table = MagicMock()
+        mock_column = MagicMock()
+        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
+        mock_table.column.return_value = mock_column
+        mock_reader.read_all.return_value = mock_table
+
+        mock_fc._client.do_get.return_value = mock_reader
+        mock_fc._call_options = MagicMock()
+
+        r = tc.get(
+            f"/api/sources/src0/ticket/{ticket_hex}",
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        shape = [int(x) for x in r.headers["x-shape"].split(",")]
+        assert shape == [16, 16]
+
+    def test_chunk_xdtype_header(self, auth_client):
+        tc, mock_fc = auth_client
+        ticket_hex = self._make_ticket_hex()
+
+        mock_reader = MagicMock()
+        mock_table = MagicMock()
+        mock_column = MagicMock()
+        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
+        mock_table.column.return_value = mock_column
+        mock_reader.read_all.return_value = mock_table
+
+        mock_fc._client.do_get.return_value = mock_reader
+        mock_fc._call_options = MagicMock()
+
+        r = tc.get(
+            f"/api/sources/src0/ticket/{ticket_hex}",
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        assert r.headers["x-dtype"] == "uint16"
+
+    def test_chunk_invalid_hex_returns_400(self, auth_client):
+        tc, _ = auth_client
+        r = tc.get(
+            "/api/sources/src0/ticket/invalid_hex!",
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 400
+        assert "Invalid ticket" in r.json()["detail"]
+
+    def test_chunk_without_auth_returns_401(self, auth_client):
+        tc, _ = auth_client
+        ticket_hex = self._make_ticket_hex()
+        r = tc.get(f"/api/sources/src0/ticket/{ticket_hex}")
+        assert r.status_code == 401
+
+    def test_chunk_flight_error_returns_502(self, auth_client):
+        tc, mock_fc = auth_client
+        ticket_hex = self._make_ticket_hex()
+
+        import pyarrow.flight as flight
+        mock_fc._client.do_get.side_effect = flight.FlightServerError("Chunk not found")
+        mock_fc._call_options = MagicMock()
+
+        r = tc.get(
+            f"/api/sources/src0/ticket/{ticket_hex}",
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 502
+
 
 # ===========================================================================
 # Unit tests — diagnostics

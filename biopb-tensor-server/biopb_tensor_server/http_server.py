@@ -32,12 +32,15 @@ from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.flight as flight
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from biopb.tensor.descriptor_pb2 import SliceHint, TensorReadOptions
+from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
 from biopb.tensor.client import TensorFlightClient
 
 
@@ -385,9 +388,9 @@ def create_app(
             diag.mark_error("LIST_SOURCES_FAILED", str(exc))
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
-    # NOTE: the /metadata route must be registered before the greedy
+    # NOTE: the /metadata and /ticket routes must be registered before the greedy
     # {source_id:path} route, otherwise Starlette's first-match routing
-    # would shadow it.
+    # would shadow them.
     @app.get("/api/sources/{source_id:path}/metadata")
     async def get_source_metadata(source_id: str, request: Request) -> JSONResponse:
         _check_token(request)
@@ -403,6 +406,84 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
             diag.mark_error("GET_METADATA_FAILED", str(exc))
+            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+
+    # -----------------------------------------------------------------------
+    # Chunk (binary response via ticket)
+    # -----------------------------------------------------------------------
+
+    @app.get("/api/sources/{source_id:path}/ticket/{ticket_hex}")
+    async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Response:
+        """Fetch a chunk's raw binary data by hex-encoded ticket.
+
+        Path params:
+          - source_id: Data source identifier
+          - ticket_hex: TensorTicket.SerializeToString() encoded as hex string
+
+        Response headers:
+          X-Shape        — comma-separated dimensions of the returned chunk
+          X-Dtype        — numpy dtype string (e.g. "uint16", "float32")
+          X-Chunk-Start  — comma-separated start coordinates of the chunk
+          X-Chunk-Stop   — comma-separated stop coordinates of the chunk (exclusive)
+
+        Response body:
+          C-contiguous raw bytes of the numpy array (no framing).
+        """
+        _check_token(request)
+        t0 = time.monotonic()
+
+        try:
+            # Decode hex string to bytes
+            ticket_bytes = bytes.fromhex(ticket_hex)
+
+            # Parse TensorTicket to validate
+            tensor_ticket = TensorTicket.FromString(ticket_bytes)
+
+            # Get Flight client
+            client = _get_client()
+
+            # Fetch chunk data via do_get
+            reader = client._client.do_get(
+                flight.Ticket(ticket_bytes),
+                options=client._call_options,
+            )
+
+            # Read all data from the stream
+            table = reader.read_all()
+
+            # Convert to numpy
+            arr = table.column(0).to_numpy()
+
+            # Ensure C-contiguous layout
+            if arr.dtype.byteorder not in ("=", "|"):
+                arr = arr.astype(arr.dtype.newbyteorder("="), copy=False)
+            arr = np.ascontiguousarray(arr)
+
+            elapsed = (time.monotonic() - t0) * 1000
+            diag.latency.record(elapsed)
+
+            # Build response headers
+            headers = {
+                "X-Shape": ",".join(str(d) for d in arr.shape),
+                "X-Dtype": str(arr.dtype),
+                "X-Chunk-Start": "",  # Not available from do_get alone
+                "X-Chunk-Stop": "",   # Not available from do_get alone
+            }
+
+            return Response(
+                content=arr.tobytes(),
+                media_type="application/octet-stream",
+                headers=headers,
+            )
+
+        except ValueError as exc:
+            # Invalid hex string or protobuf parse error
+            raise HTTPException(status_code=400, detail=f"Invalid ticket: {exc}")
+        except flight.FlightError as exc:
+            diag.mark_error("CHUNK_FETCH_FAILED", str(exc))
+            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+        except Exception as exc:
+            diag.mark_error("CHUNK_FAILED", str(exc))
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
     @app.get("/api/sources/{source_id:path}")
@@ -463,14 +544,19 @@ def create_app(
             scale_hint = req.scale_hint or None
             reduction_method = req.reduction_method or None
 
-            # Get lazy dask array
+            # Get lazy dask array WITHOUT slice_hint (client-side cropping for correct size at scale)
             arr_lazy = client.get_tensor(
                 source_id=req.source_id,
                 tensor_id=req.tensor_id,
-                slice_hint=slice_hint,
+                slice_hint=None,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,
             )
+
+            # Apply slice on dask array BEFORE compute (lazy slicing)
+            # This ensures proper cropping when scale_hint is used
+            if slice_hint is not None:
+                arr_lazy = arr_lazy[slice_hint]
 
             # Compute (blocking)
             arr: np.ndarray = arr_lazy.compute()
