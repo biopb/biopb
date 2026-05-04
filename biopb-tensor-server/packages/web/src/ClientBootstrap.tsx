@@ -5,6 +5,8 @@ import { useAppStore } from "./store";
 export function ClientBootstrap() {
   const initClient = useAppStore((s) => s.initClient);
   const loadSources = useAppStore((s) => s.loadSources);
+  const startCatalogPolling = useAppStore((s) => s.startCatalogPolling);
+  const stopCatalogPolling = useAppStore((s) => s.stopCatalogPolling);
   const initialised = useRef(false);
   const navigate = useNavigate();
 
@@ -25,6 +27,7 @@ export function ClientBootstrap() {
           // Dev mode active - bypass token requirement
           initClient(apiBase, null, true);
           await loadSources();
+          startCatalogPolling();
           return;
         }
 
@@ -37,6 +40,7 @@ export function ClientBootstrap() {
 
         initClient(apiBase, token, false);
         await loadSources();
+        startCatalogPolling();
       } catch (err) {
         useAppStore.setState({
           connectionState: "error",
@@ -45,7 +49,14 @@ export function ClientBootstrap() {
         });
       }
     })();
-  }, [initClient, loadSources, navigate]);
+  }, [initClient, loadSources, startCatalogPolling, navigate]);
+
+  // Stop polling on unmount
+  useEffect(() => {
+    return () => {
+      stopCatalogPolling();
+    };
+  }, [stopCatalogPolling]);
 
   return null;
 }

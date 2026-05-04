@@ -30,13 +30,21 @@ export interface AppState {
   // Slice controls
   slice: SliceState;
 
+  // Catalog polling
+  pollingInterval: number;
+
   // Actions
   initClient: (apiBase: string, token: string | null, devMode: boolean) => void;
   loadSources: () => Promise<void>;
-  selectSource: (sourceId: string, tensorId?: string) => void;
+  selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   clearSession: () => void;
+  startCatalogPolling: () => void;
+  stopCatalogPolling: () => void;
 }
+
+// Internal timer storage (non-reactive, module-level)
+let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
 
 export const useAppStore = create<AppState>((set, get) => ({
   client: null,
@@ -58,6 +66,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     reductionMethod: "nearest",
   },
 
+  pollingInterval: 60000,
+
   initClient(apiBase, token, devMode) {
     set({
       client: new TensorFlightClient(apiBase, token),
@@ -74,7 +84,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ sourcesLoading: true });
     try {
       const sources = await client.listSources();
-      set({ sources, sourcesLoading: false, connectionState: "connected" });
+      // Sort sources by source_url for consistent display and comparison
+      const sorted = sources.sort((a, b) => a.source_url.localeCompare(b.source_url));
+      set({ sources: sorted, sourcesLoading: false, connectionState: "connected" });
     } catch (err) {
       set({
         sourcesLoading: false,
@@ -85,6 +97,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   selectSource(sourceId, tensorId) {
+    if (!sourceId) {
+      set({ activeSourceId: null, activeTensorId: null });
+      return;
+    }
     const { sources } = get();
     const src = sources.find((s) => s.source_id === sourceId);
     const tid = tensorId ?? src?.tensors[0]?.array_id ?? null;
@@ -99,5 +115,43 @@ export const useAppStore = create<AppState>((set, get) => ({
   clearSession() {
     sessionStorage.removeItem("biopb_token");
     window.location.href = "/unlock";
+  },
+
+  startCatalogPolling() {
+    const pollingTimerId = setInterval(async () => {
+      const { client, sources, activeSourceId, selectSource } = get();
+      if (!client || get().connectionState !== "connected") return;
+
+      try {
+        const newSources = await client.listSources();
+        const sorted = newSources.sort((a, b) => a.source_url.localeCompare(b.source_url));
+
+        // Compare source_urls to detect changes
+        const oldUrls = sources.map((s) => s.source_url).join(",");
+        const newUrls = sorted.map((s) => s.source_url).join(",");
+
+        if (oldUrls !== newUrls) {
+          set({ sources: sorted });
+
+          // Clear selection if active source was removed
+          if (activeSourceId && !sorted.find((s) => s.source_id === activeSourceId)) {
+            selectSource(null);
+          }
+        }
+      } catch (err) {
+        // Silent failure - don't change connection state for transient errors
+        console.warn("Catalog polling error:", err);
+      }
+    }, get().pollingInterval);
+
+    // Store timer ID for cleanup
+    _pollingTimerId = pollingTimerId;
+  },
+
+  stopCatalogPolling() {
+    if (_pollingTimerId) {
+      clearInterval(_pollingTimerId);
+      _pollingTimerId = undefined;
+    }
   },
 }));
