@@ -150,6 +150,10 @@ class ServerConfig:
     Attributes:
         host: Server host
         port: Server port
+        watcher_type: Filesystem watcher type - "auto", "watchdog", or "pollvfs"
+            "auto": Auto-detect based on filesystem (NFS uses pollvfs, local uses watchdog)
+            "watchdog": Force inotify-based watcher (local filesystems only)
+            "pollvfs": Force polling-based watcher (for NFS/network mounts)
         cache: Cache configuration
         sources: List of data sources (each may contain multiple tensors)
     """
@@ -160,6 +164,7 @@ class ServerConfig:
     gpu_min_linear_input_mb: float = 2.0
     gpu_memory_safety_factor: int = 4
     gpu_min_merged_chunks: int = 4
+    watcher_type: str = "auto"
     cache: CacheConfig = field(default_factory=CacheConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
@@ -202,6 +207,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     server_data = data.get("server", {})
     host = server_data.get("host", "0.0.0.0")
     port = server_data.get("port", 8815)
+    watcher_type = server_data.get("watcher_type", "auto")
 
     # Parse compute settings
     compute_data = data.get("compute", {})
@@ -258,6 +264,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     return ServerConfig(
         host=host,
         port=port,
+        watcher_type=watcher_type,
         compute_backend=compute_backend,
         gpu_min_input_mb=float(gpu_min_input_mb),
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),

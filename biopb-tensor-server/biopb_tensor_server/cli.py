@@ -34,7 +34,7 @@ from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
-from biopb_tensor_server.watcher import WatchdogWatcher
+from biopb_tensor_server.watcher import get_watcher
 from biopb_tensor_server.source_manager import create_source_manager
 
 
@@ -241,7 +241,18 @@ def serve(
     source_manager = None
     if monitored_sources:
         try:
-            watcher = WatchdogWatcher(debounce_window=1.5)
+            # Collect monitored dirs for auto-detection
+            monitored_dirs = set()
+            for ms in monitored_sources:
+                if not ms.is_remote and ms.local_path:
+                    monitored_dirs.add(ms.local_path)
+
+            # Use auto-detection to select appropriate watcher (watchdog or pollvfs)
+            watcher = get_watcher(
+                watcher_type=server_config.watcher_type,
+                directories=monitored_dirs,
+                debounce_window=1.5,
+            )
             source_manager = create_source_manager(
                 server=server,
                 registry=registry,
@@ -250,10 +261,6 @@ def serve(
             )
             if source_manager:
                 # Start watcher and manager
-                monitored_dirs = set()
-                for ms in monitored_sources:
-                    if not ms.is_remote and ms.local_path:
-                        monitored_dirs.add(ms.local_path)
                 watcher.start(monitored_dirs)
                 source_manager.start()
                 console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
@@ -573,7 +580,18 @@ def launch(
     source_manager = None
     if monitored_sources:
         try:
-            watcher = WatchdogWatcher(debounce_window=1.5)
+            # Collect monitored dirs for auto-detection
+            monitored_dirs = set()
+            for ms in monitored_sources:
+                if not ms.is_remote and ms.local_path:
+                    monitored_dirs.add(ms.local_path)
+
+            # Use auto-detection to select appropriate watcher (watchdog or pollvfs)
+            watcher = get_watcher(
+                watcher_type=server_config.watcher_type,
+                directories=monitored_dirs,
+                debounce_window=1.5,
+            )
             source_manager = create_source_manager(
                 server=flight_server,
                 registry=registry,
@@ -581,10 +599,6 @@ def launch(
                 monitored_sources=monitored_sources,
             )
             if source_manager:
-                monitored_dirs = set()
-                for ms in monitored_sources:
-                    if not ms.is_remote and ms.local_path:
-                        monitored_dirs.add(ms.local_path)
                 watcher.start(monitored_dirs)
                 source_manager.start()
                 console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")

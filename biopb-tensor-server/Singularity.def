@@ -1,0 +1,42 @@
+BootStrap: docker
+From: ghcr.io/jiyuuchc/biopb-tensor-server:latest
+
+%files
+    # Copy custom config to replace the default
+    default-config.toml /app/config/default-config.toml
+    # Copy the config-aware entrypoint
+    singularity-entrypoint.sh /usr/local/bin/singularity-entrypoint.sh
+
+%post
+    # Make entrypoint executable
+    chmod +x /usr/local/bin/singularity-entrypoint.sh
+
+%runscript
+    exec /usr/local/bin/singularity-entrypoint.sh "$@"
+
+%environment
+    # Default environment variables (can be overridden at runtime with --env)
+    export CONFIG_FILE=/app/config/default-config.toml
+    export NGINX_PORT=8000
+    export WEB_PORT=8816
+
+%labels
+    Author BioPB Team
+    Version 1.0
+
+%help
+    BioPB Tensor Server with baked-in configuration
+
+    Usage:
+        singularity run biopb-tensor-server.sif
+
+    With data mounted:
+        singularity run --bind /path/to/data:/data biopb-tensor-server.sif
+
+    Override config at runtime:
+        singularity run --env CONFIG_FILE=/other/config.toml \
+            --bind /other/config.toml:/other/config.toml \
+            biopb-tensor-server.sif
+
+    Override nginx port (for HPC environments):
+        singularity run --env NGINX_PORT=8080 biopb-tensor-server.sif

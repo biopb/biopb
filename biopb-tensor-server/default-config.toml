@@ -7,4 +7,4 @@ backend = "auto"
 
 [[sources]]
 url = "/data"
-monitor = false
+monitor = true
