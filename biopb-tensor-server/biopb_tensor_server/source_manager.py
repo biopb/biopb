@@ -390,7 +390,17 @@ class SourceManager:
 
             # Register with server
             self._server.register_source(claim.source_id, adapter)
+
+            # Update path tracking for move handling
+            self._path_to_source_id[claim.primary_path.resolve()] = claim.source_id
+
             logger.info(f"Registered source with server: {claim.source_id}")
+
+        except Exception as e:
+            logger.error(
+                f"Failed to create/register source {claim.source_id}: {e}",
+                exc_info=True,
+            )
 
         except Exception as e:
             logger.error(
@@ -408,6 +418,15 @@ class SourceManager:
         """
         try:
             self._server.unregister_source(source_id)
+
+            # Remove path tracking
+            paths_to_remove = [
+                path for path, sid in self._path_to_source_id.items()
+                if sid == source_id
+            ]
+            for path in paths_to_remove:
+                self._path_to_source_id.pop(path, None)
+
             logger.info(f"Unregistered source from server: {source_id}")
         except Exception as e:
             logger.error(
@@ -458,10 +477,20 @@ def create_source_manager(
         logger.warning("No valid directories to monitor")
         return None
 
-    # Create discovery state with existing sources
+    # Create discovery state (empty - will be populated after SourceManager is created)
     discovery_state = DiscoveryState()
 
-    # Populate discovery state from existing sources in monitored directories
+    # Create source manager FIRST (sets up callbacks on discovery_state)
+    manager = SourceManager(
+        server=server,
+        registry=registry,
+        discovery_state=discovery_state,
+        watcher=watcher,
+        monitored_dirs=monitored_dirs,
+        dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
+    )
+
+    # NOW populate discovery state - callbacks will fire and register sources with server
     for source in monitored_sources:
         if source.is_remote:
             continue
@@ -478,18 +507,8 @@ def create_source_manager(
             dim_labels=source.dim_labels,
         )
 
-        # Merge claims into our discovery state
+        # Merge claims into our discovery state (callbacks fire here!)
         for claim in state.get_all_claims():
             discovery_state.add_claim(claim)
-
-    # Create source manager
-    manager = SourceManager(
-        server=server,
-        registry=registry,
-        discovery_state=discovery_state,
-        watcher=watcher,
-        monitored_dirs=monitored_dirs,
-        dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
-    )
 
     return manager

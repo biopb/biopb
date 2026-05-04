@@ -328,7 +328,7 @@ def validate(
         console.print(f"  Sources: {len(sources)} data source(s)")
 
         for source in sources:
-            console.print(f"    - {source.source_id} ({source.type}: {source.path})")
+            console.print(f"    - {source.source_id} ({source.type}: {source.url})")
 
     except Exception as e:
         console.print(f"[red]✗ Config invalid: {e}[/red]")

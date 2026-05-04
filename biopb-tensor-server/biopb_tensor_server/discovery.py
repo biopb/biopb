@@ -278,6 +278,9 @@ class DiscoveryState:
             str(claim.primary_path), claim.source_type
         )
 
+        # Update claim's source_id (important for callbacks)
+        claim.source_id = source_id
+
         # Store claim
         self.claims[source_id] = claim
         self.path_to_source[claim.primary_path] = source_id
