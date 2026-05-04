@@ -396,7 +396,7 @@ class PollVFSWatcher(DirectoryWatcher):
     Detects: CREATED, DELETED (moves detected as delete+create pair).
 
     Args:
-        poll_interval: Time between scans (seconds)
+        poll_interval: Time between scans (seconds, default 30.0)
         debounce_window: Time window for debouncing events (seconds)
 
     Example:
@@ -411,7 +411,7 @@ class PollVFSWatcher(DirectoryWatcher):
 
     def __init__(
         self,
-        poll_interval: float = 5.0,
+        poll_interval: float = 30.0,
         debounce_window: float = 1.5,
     ):
         self._poll_interval = poll_interval

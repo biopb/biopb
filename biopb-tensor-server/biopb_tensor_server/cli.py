@@ -251,6 +251,7 @@ def serve(
             watcher = get_watcher(
                 watcher_type=server_config.watcher_type,
                 directories=monitored_dirs,
+                poll_interval=server_config.poll_interval,
                 debounce_window=1.5,
             )
             source_manager = create_source_manager(
@@ -590,6 +591,7 @@ def launch(
             watcher = get_watcher(
                 watcher_type=server_config.watcher_type,
                 directories=monitored_dirs,
+                poll_interval=server_config.poll_interval,
                 debounce_window=1.5,
             )
             source_manager = create_source_manager(

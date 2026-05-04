@@ -165,6 +165,7 @@ class ServerConfig:
     gpu_memory_safety_factor: int = 4
     gpu_min_merged_chunks: int = 4
     watcher_type: str = "auto"
+    poll_interval: float = 30.0  # Polling interval for pollvfs watcher (seconds)
     cache: CacheConfig = field(default_factory=CacheConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
@@ -208,6 +209,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     host = server_data.get("host", "0.0.0.0")
     port = server_data.get("port", 8815)
     watcher_type = server_data.get("watcher_type", "auto")
+    poll_interval = server_data.get("poll_interval", 30.0)
 
     # Parse compute settings
     compute_data = data.get("compute", {})
@@ -265,6 +267,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         host=host,
         port=port,
         watcher_type=watcher_type,
+        poll_interval=float(poll_interval),
         compute_backend=compute_backend,
         gpu_min_input_mb=float(gpu_min_input_mb),
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),
