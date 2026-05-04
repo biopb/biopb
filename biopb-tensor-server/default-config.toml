@@ -1,0 +1,10 @@
+[server]
+host = "0.0.0.0"
+port = 8815
+
+[compute]
+backend = "auto"
+
+[[sources]]
+url = "/data"
+monitor = false

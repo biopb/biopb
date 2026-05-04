@@ -1,0 +1,63 @@
+# Stage 1: Webapp build (Node.js)
+FROM node:20-slim AS webapp-builder
+WORKDIR /app
+
+# Copy pre-built webapp (built locally with: VITE_TENSOR_API="" pnpm --filter @biopb/web build)
+COPY biopb-tensor-server/packages/web/dist ./biopb-tensor-server/packages/web/dist
+
+# Stage 2: Python build
+FROM python:3.11-slim AS python-builder
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built biopb wheel (built locally with: pip wheel . --no-deps -w wheels/)
+COPY wheels/biopb-*.whl /app/wheels/
+
+# Copy tensor server source
+COPY biopb-tensor-server/pyproject.toml ./tensor-server/
+COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
+
+# Install biopb from local wheel, then tensor server with all extras
+# Include aicsimageio extras for vendor formats (nd2, czi, lif, etc.)
+# Pin numpy<2 for aicsimageio compatibility (requires tifffile<2023.3.15)
+# Pin exact versions from local .venv for zarr/numcodecs compatibility
+WORKDIR /app/tensor-server
+RUN pip install --no-cache-dir /app/wheels/biopb-*.whl \
+    && pip install --no-cache-dir ".[web,ome-zarr,aics]" \
+    && pip install --no-cache-dir bioformats-jar aicsimageio[nd2] \
+    && pip install --no-cache-dir "numpy<2" "zarr==2.15.0" "numcodecs==0.12.1"
+
+# Stage 3: Runtime (nginx + python)
+FROM python:3.11-slim
+WORKDIR /app
+
+# Install nginx, Java (for bioformats-jar), and runtime deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx \
+    libgl1 \
+    default-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python packages
+COPY --from=python-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=python-builder /usr/local/bin /usr/local/bin
+
+# Copy webapp build output
+COPY --from=webapp-builder /app/biopb-tensor-server/packages/web/dist /var/www/html
+
+# Copy entrypoint, config, and nginx config
+COPY biopb-tensor-server/docker-entrypoint.sh /usr/local/bin/
+COPY biopb-tensor-server/nginx.conf /etc/nginx/nginx.conf
+COPY biopb-tensor-server/default-config.toml /app/config/
+
+# Create data directory and set permissions
+RUN mkdir -p /data \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Expose ports: nginx (80), gRPC (8815), sidecar (8816)
+EXPOSE 80 8815 8816
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["launch"]
