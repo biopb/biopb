@@ -265,6 +265,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sliceRef = useRef(slice);  // Keep current slice for event handlers
+  const pressedKeysRef = useRef<Set<string>>(new Set());  // Track held keys for slice navigation
+  const sliceWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Debounce for scroll c/t/z
 
   // Update sliceRef whenever slice changes
   sliceRef.current = slice;
@@ -343,6 +345,61 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         .clamp({ direction: "all" })
         .pinch()
         .wheel();
+
+      // Make canvas focusable for keyboard events
+      app.canvas.setAttribute("tabindex", "0");
+      (app.canvas as HTMLCanvasElement).style.outline = "none";
+
+      // Track pressed keys for slice navigation
+      const handleKeyDown = (e: KeyboardEvent) => {
+        const key = e.key.toLowerCase();
+        if (key === "c" || key === "t" || key === "z") {
+          pressedKeysRef.current.add(key);
+          e.preventDefault();  // Prevent browser shortcuts
+        }
+      };
+      const handleKeyUp = (e: KeyboardEvent) => {
+        const key = e.key.toLowerCase();
+        pressedKeysRef.current.delete(key);
+      };
+
+      app.canvas.addEventListener("keydown", handleKeyDown);
+      app.canvas.addEventListener("keyup", handleKeyUp);
+
+      // Focus canvas on mount so keyboard events work
+      (app.canvas as HTMLCanvasElement).focus();
+
+      // Intercept wheel before viewport's zoom handler so c/t/z + scroll never zooms.
+      app.canvas.addEventListener("wheel", (e: WheelEvent) => {
+        const keys = pressedKeysRef.current;
+        if (keys.has("c") || keys.has("t") || keys.has("z")) {
+          // Slice navigation mode - prevent zoom and update slice
+          e.preventDefault();
+          e.stopPropagation();
+          if (sliceWheelTimerRef.current) {
+            clearTimeout(sliceWheelTimerRef.current);
+          }
+          sliceWheelTimerRef.current = setTimeout(() => {
+            const delta = Math.sign(e.deltaY) * -1;  // Scroll up = increment
+            const currentSlice = sliceRef.current;
+
+            // Get axis bounds
+            const axisMap = buildAxisMap(descriptor.dim_labels);
+            const shape = descriptor.shape;
+
+            if (keys.has("t") && axisMap.t !== null) {
+              const tMax = Math.max(0, (shape[axisMap.t] ?? 1) - 1);
+              useAppStore.getState().setSlice({ t: Math.max(0, Math.min(tMax, currentSlice.t + delta)) });
+            } else if (keys.has("z") && axisMap.z !== null) {
+              const zMax = Math.max(0, (shape[axisMap.z] ?? 1) - 1);
+              useAppStore.getState().setSlice({ z: Math.max(0, Math.min(zMax, currentSlice.z + delta)) });
+            } else if (keys.has("c") && axisMap.c !== null) {
+              const cMax = Math.max(0, (shape[axisMap.c] ?? 1) - 1);
+              useAppStore.getState().setSlice({ c: Math.max(0, Math.min(cMax, currentSlice.c + delta)) });
+            }
+          }, 150);
+        }
+      }, { capture: true, passive: false });
 
       appRef.current = app;
       viewportRef.current = viewport;
@@ -425,9 +482,14 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       cancelled = true;
       setAppReady(false);
       loadedRegionRef.current = null;  // Reset for next viewport
+      pressedKeysRef.current.clear();  // Reset pressed keys
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
+      }
+      if (sliceWheelTimerRef.current) {
+        clearTimeout(sliceWheelTimerRef.current);
+        sliceWheelTimerRef.current = null;
       }
       abortControllerRef.current?.abort();
       spriteRef.current?.destroy();
