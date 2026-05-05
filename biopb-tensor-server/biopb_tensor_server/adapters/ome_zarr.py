@@ -216,7 +216,7 @@ class OmeZarrAdapter(BackendAdapter):
             dtype=self.zarr_array.dtype.str,
         )
 
-    def get_chunk_endpoints(
+    def _get_raw_chunk_endpoints(
         self,
         slice_hint: Optional[SliceHint] = None
     ) -> List[ChunkEndpoint]:

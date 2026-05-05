@@ -305,7 +305,7 @@ class AicsImageIoAdapter(BackendAdapter):
             source_url=self._source_url,
         )
 
-    def get_chunk_endpoints(
+    def _get_raw_chunk_endpoints(
         self,
         slice_hint: Optional[SliceHint] = None
     ) -> List[ChunkEndpoint]:

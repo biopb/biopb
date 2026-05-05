@@ -42,6 +42,11 @@ from biopb_tensor_server.downsample import (
     _downsample_block,
 )
 
+# Arrow IPC has ~2GB batch size limit due to 32-bit offsets
+# Use a safe threshold slightly below the actual limit
+# (Also defined in cache/base.py for use by cache module)
+MAX_ARROW_BATCH_BYTES = 2 * 1024 * 1024 * 1024 - 1  # ~2GB
+
 if TYPE_CHECKING:
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.discovery import SourceClaim
@@ -65,6 +70,17 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
+
+
+def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
+    """Estimate chunk size in bytes from shape and dtype."""
+    num_elements = int(np.prod(shape, dtype=np.int64))
+    return num_elements * np.dtype(dtype).itemsize
+
+
+def needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
+    """Check if chunk exceeds Arrow batch limit."""
+    return estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES
 
 
 class BackendAdapter(ABC):
@@ -119,12 +135,46 @@ class BackendAdapter(ABC):
         """
         pass
 
-    @abstractmethod
     def get_chunk_endpoints(
         self,
         slice_hint: Optional[SliceHint] = None
     ) -> List[ChunkEndpoint]:
-        """Get chunk endpoints covering the tensor (or a slice of it).
+        """Get chunk endpoints, splitting oversized chunks if needed.
+
+        This method wraps the adapter-specific chunk discovery logic with
+        automatic splitting of chunks that exceed the Arrow batch size limit.
+
+        Args:
+            slice_hint: Optional slice range. If provided, return only chunks
+                       that intersect this range. If None, return all chunks.
+
+        Returns:
+            List of ChunkEndpoint objects with chunk_id and bounds.
+            Large chunks may be split into multiple sub-endpoints.
+        """
+        raw_endpoints = self._get_raw_chunk_endpoints(slice_hint)
+        desc = self.get_tensor_descriptor()
+
+        final_endpoints = []
+        for ep in raw_endpoints:
+            chunk_shape = tuple(stop - start for start, stop in zip(ep.bounds.start, ep.bounds.stop))
+            if needs_splitting(chunk_shape, desc.dtype):
+                sub_endpoints = self._split_chunk_endpoint(ep, desc.dtype)
+                final_endpoints.extend(sub_endpoints)
+            else:
+                final_endpoints.append(ep)
+
+        return final_endpoints
+
+    @abstractmethod
+    def _get_raw_chunk_endpoints(
+        self,
+        slice_hint: Optional[SliceHint] = None
+    ) -> List[ChunkEndpoint]:
+        """Get raw chunk endpoints from the backend (before splitting).
+
+        Subclasses implement this to return their native chunk layout.
+        The base class get_chunk_endpoints() handles splitting logic.
 
         Args:
             slice_hint: Optional slice range. If provided, return only chunks
@@ -134,6 +184,67 @@ class BackendAdapter(ABC):
             List of ChunkEndpoint objects with chunk_id and bounds
         """
         pass
+
+    def _split_chunk_endpoint(
+        self,
+        ep: ChunkEndpoint,
+        dtype: str,
+    ) -> List[ChunkEndpoint]:
+        """Split an oversized endpoint into sub-endpoints within size limit.
+
+        Strategy: split along the largest axis for even division.
+        Each sub-endpoint has:
+        - chunk_id: parent_chunk_id with split encoding
+        - bounds: sub-bounds within parent (absolute coordinates)
+
+        Args:
+            ep: ChunkEndpoint to split
+            dtype: Data type string for size calculation
+
+        Returns:
+            List of sub-endpoints that each fit within the Arrow batch limit
+        """
+        parent_bounds = ep.bounds
+        parent_shape = tuple(stop - start for start, stop in zip(parent_bounds.start, parent_bounds.stop))
+        item_size = np.dtype(dtype).itemsize
+
+        # Calculate how many splits needed
+        parent_bytes = int(np.prod(parent_shape)) * item_size
+        n_splits = int(np.ceil(parent_bytes / MAX_ARROW_BATCH_BYTES))
+
+        # Choose axis with largest dimension
+        split_axis = max(range(len(parent_shape)), key=lambda ax: parent_shape[ax])
+
+        sub_endpoints = []
+        axis_size = parent_shape[split_axis]
+        # Compute sub-chunk size on split axis (distribute evenly, last one may be smaller)
+        sub_axis_size = axis_size // n_splits
+
+        for i in range(n_splits):
+            sub_start = list(parent_bounds.start)
+            sub_stop = list(parent_bounds.stop)
+
+            # Calculate sub-chunk bounds on split axis
+            axis_start = parent_bounds.start[split_axis] + i * sub_axis_size
+            axis_stop = min(
+                parent_bounds.start[split_axis] + (i + 1) * sub_axis_size,
+                parent_bounds.stop[split_axis]
+            )
+
+            sub_start[split_axis] = axis_start
+            sub_stop[split_axis] = axis_stop
+
+            sub_bounds = ChunkBounds(start=sub_start, stop=sub_stop)
+
+            # Encode split chunk_id
+            sub_chunk_id = _encode_chunk_id(
+                _decode_chunk_id(ep.chunk_id)[0],
+                _encode_split_chunk_payload(ep.chunk_id, sub_bounds, parent_bounds)
+            )
+
+            sub_endpoints.append(ChunkEndpoint(chunk_id=sub_chunk_id, bounds=sub_bounds))
+
+        return sub_endpoints
 
     @abstractmethod
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
@@ -410,6 +521,7 @@ def _decode_chunk_id(chunk_id: bytes) -> Tuple[str, bytes]:
 
 
 _VIRTUAL_CHUNK_MAGIC = b'virt1'
+_SPLIT_CHUNK_MAGIC = b'split1'
 
 
 def _encode_int64_sequence(values: Tuple[int, ...]) -> bytes:
@@ -526,6 +638,67 @@ def _decode_virtual_chunk_payload(
     return source_start, source_stop, valid_stop, scale_hint, reduction_method
 
 
+def _encode_split_chunk_payload(
+    parent_chunk_id: bytes,
+    sub_bounds: ChunkBounds,
+    parent_bounds: ChunkBounds,
+) -> bytes:
+    """Encode a split sub-chunk identifier.
+
+    Format:
+    - 6 bytes: magic (_SPLIT_CHUNK_MAGIC)
+    - 4 bytes: parent_chunk_id length (uint32, big-endian)
+    - N bytes: parent_chunk_id
+    - 2 bytes: ndim (uint16, big-endian)
+    - 8*ndim bytes: sub_bounds.start (int64, big-endian)
+    - 8*ndim bytes: sub_bounds.stop (int64, big-endian)
+    - 8*ndim bytes: parent_bounds.start (int64, big-endian)
+    - 8*ndim bytes: parent_bounds.stop (int64, big-endian)
+    """
+    ndim = len(sub_bounds.start)
+    return b''.join([
+        _SPLIT_CHUNK_MAGIC,
+        struct.pack('>I', len(parent_chunk_id)),
+        parent_chunk_id,
+        struct.pack('>H', ndim),
+        _encode_int64_sequence(tuple(sub_bounds.start)),
+        _encode_int64_sequence(tuple(sub_bounds.stop)),
+        _encode_int64_sequence(tuple(parent_bounds.start)),
+        _encode_int64_sequence(tuple(parent_bounds.stop)),
+    ])
+
+
+def _decode_split_chunk_payload(
+    data: bytes,
+) -> Tuple[bytes, ChunkBounds, ChunkBounds]:
+    """Decode split sub-chunk payload.
+
+    Returns:
+        Tuple of (parent_chunk_id, sub_bounds, parent_bounds)
+    """
+    if not data.startswith(_SPLIT_CHUNK_MAGIC):
+        raise ValueError('Chunk payload is not a split chunk')
+
+    offset = len(_SPLIT_CHUNK_MAGIC)
+    parent_id_len = struct.unpack('>I', data[offset:offset + 4])[0]
+    offset += 4
+    parent_chunk_id = data[offset:offset + parent_id_len]
+    offset += parent_id_len
+
+    ndim = struct.unpack('>H', data[offset:offset + 2])[0]
+    offset += 2
+
+    sub_start, offset = _decode_int64_sequence(data, offset, ndim)
+    sub_stop, offset = _decode_int64_sequence(data, offset, ndim)
+    parent_start, offset = _decode_int64_sequence(data, offset, ndim)
+    parent_stop, offset = _decode_int64_sequence(data, offset, ndim)
+
+    sub_bounds = ChunkBounds(start=list(sub_start), stop=list(sub_stop))
+    parent_bounds = ChunkBounds(start=list(parent_start), stop=list(parent_stop))
+
+    return parent_chunk_id, sub_bounds, parent_bounds
+
+
 def _record_batch_to_numpy(
     record_batch: pa.RecordBatch,
     bounds: ChunkBounds,
@@ -616,10 +789,11 @@ def resolve_chunk_data(
     chunk_id: bytes,
     cache_manager: Optional[CacheManager] = None,
 ) -> pa.RecordBatch:
-    """Resolve either a real backend chunk or a virtual scaled chunk.
+    """Resolve either a real backend chunk, a split chunk, or a virtual scaled chunk.
 
-    For virtual chunks (scaled reads), uses cache if cache_manager is provided.
-    For real chunks, uses file-based cache if available (for persistence across restarts).
+    For split chunks: slice from cached/fresh parent chunk.
+    For virtual chunks (scaled reads): uses cache if cache_manager is provided.
+    For real chunks: uses file-based cache if available (for persistence across restarts).
 
     Args:
         adapter: Backend adapter for the tensor
@@ -633,8 +807,13 @@ def resolve_chunk_data(
 
     array_id, backend_data = _decode_chunk_id(chunk_id)
 
+    is_split = backend_data.startswith(_SPLIT_CHUNK_MAGIC)
     is_virtual = backend_data.startswith(_VIRTUAL_CHUNK_MAGIC)
     is_file_backend = cache_manager is not None and isinstance(cache_manager.backend, ArrowFileBackend)
+
+    # Split chunk - slice from parent
+    if is_split:
+        return _resolve_split_chunk(adapter, backend_data, is_file_backend, cache_manager, array_id)
 
     # Real chunk - cache only if file backend (for persistence)
     if not is_virtual:
@@ -677,6 +856,59 @@ def resolve_chunk_data(
     data = entry.data
     cache_manager.release(key_bytes)
     return data
+
+
+def _resolve_split_chunk(
+    adapter: BackendAdapter,
+    backend_data: bytes,
+    is_file_backend: bool,
+    cache_manager: Optional[CacheManager],
+    array_id: str,
+) -> pa.RecordBatch:
+    """Resolve a split sub-chunk by slicing from cached/fresh parent.
+
+    Caching strategy:
+    - Memory backend: no caching, slice from fresh parent read
+    - File backend: cache parent, slice from cached parent
+
+    Args:
+        adapter: Backend adapter for the tensor
+        backend_data: Split chunk payload
+        is_file_backend: True if using file-based cache
+        cache_manager: Optional cache manager
+        array_id: Array identifier
+
+    Returns:
+        Arrow RecordBatch containing the sub-chunk data
+    """
+    parent_chunk_id, sub_bounds, parent_bounds = _decode_split_chunk_payload(backend_data)
+    desc = adapter.get_tensor_descriptor()
+    dtype = np.dtype(desc.dtype)
+
+    if is_file_backend and cache_manager is not None:
+        # File backend: cache parent for efficiency
+        def compute_parent():
+            result = adapter.get_chunk_data(parent_chunk_id)
+            return result, sum(col.nbytes for col in result.columns)
+
+        entry = cache_manager.get_or_acquire(parent_chunk_id, compute_parent, metadata={'array_id': array_id})
+        parent_data = entry.data
+        cache_manager.release(parent_chunk_id)
+    else:
+        # Memory backend: read fresh (OS page cache handles this)
+        parent_data = adapter.get_chunk_data(parent_chunk_id)
+
+    # Slice parent to sub-chunk
+    parent_arr = _record_batch_to_numpy(parent_data, parent_bounds, desc.dtype)
+
+    sub_slices = tuple(
+        slice(sub_bounds.start[ax] - parent_bounds.start[ax],
+              sub_bounds.stop[ax] - parent_bounds.start[ax])
+        for ax in range(len(sub_bounds.start))
+    )
+    sub_arr = parent_arr[sub_slices]
+
+    return pa.RecordBatch.from_arrays([pa.array(sub_arr.ravel())], ["data"])
 
 
 def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.RecordBatch:

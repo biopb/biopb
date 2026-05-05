@@ -156,7 +156,7 @@ class Hdf5Adapter(BackendAdapter):
             dtype=self.h5_dataset.dtype.str,
         )
 
-    def get_chunk_endpoints(
+    def _get_raw_chunk_endpoints(
         self,
         slice_hint: Optional[SliceHint] = None
     ) -> List[ChunkEndpoint]:

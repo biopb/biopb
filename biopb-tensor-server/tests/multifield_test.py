@@ -80,7 +80,7 @@ class MockMultifieldAdapter(BackendAdapter):
             metadata_json="",  # Not populated; returned via GetFlightInfo instead
         )
 
-    def get_chunk_endpoints(self, slice_hint=None) -> list:
+    def _get_raw_chunk_endpoints(self, slice_hint=None) -> list:
         return []
 
     def get_chunk_data(self, chunk_id: bytes):
@@ -114,7 +114,7 @@ class MockSingleTensorAdapter(BackendAdapter):
             dtype=self.dtype,
         )
 
-    def get_chunk_endpoints(self, slice_hint=None) -> list:
+    def _get_raw_chunk_endpoints(self, slice_hint=None) -> list:
         # Single chunk covering entire tensor
         from biopb_tensor_server.base import _encode_chunk_id
         from biopb.tensor.ticket_pb2 import ChunkBounds
