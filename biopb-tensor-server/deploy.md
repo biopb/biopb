@@ -65,8 +65,9 @@ docker run -d \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_DIR` | `/data` | Directory containing microscopy files |
-| `MONITOR` | `false` | Enable live filesystem monitoring (NFS/Lustre: keep false) |
+| `CONFIG_FILE` | `/app/config/default-config.toml` | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
+| `DATA_DIR` | `/data` | Directory containing microscopy files (used when generating config) |
+| `MONITOR` | `true` | Enable live filesystem monitoring (NFS/Lustre: set to false) |
 | `HOST` | `0.0.0.0` | gRPC server host |
 | `PORT` | `8815` | gRPC server port |
 | `WEB_PORT` | `8816` | HTTP sidecar port (internal) |
@@ -74,23 +75,44 @@ docker run -d \
 | `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Base temp directory (avoids multi-user collisions on shared /tmp) |
+
+### Configuration Methods
+
+The container uses a unified entrypoint that supports two configuration methods:
+
+1. **Config file**: If `CONFIG_FILE` is set and the file exists, uses that TOML file
+2. **Environment variables**: Otherwise, generates config from `DATA_DIR`, `HOST`, `PORT`, etc.
+
+Docker sets `CONFIG_FILE=/app/config/default-config.toml` by default, so it uses the baked-in config. Singularity inherits this behavior; use `--cleanenv` to generate from env vars instead.
 
 ### Examples
 
 ```bash
-# With custom data directory
-docker run -d -p 80:80 -v /path/to/images:/data \
-    -e DATA_DIR=/data -e BIOPB_TENSOR_TOKEN=mytoken \
+# Basic run (uses baked-in default-config.toml)
+docker run -d -p 80:80 -v ~/data:/data \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server:latest
+
+# With custom config file
+docker run -d -p 80:80 \
+    -v ~/my-config.toml:/custom.toml \
+    -v ~/data:/data \
+    -e CONFIG_FILE=/custom.toml \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server:latest
+
+# Generate config from env vars (unset CONFIG_FILE)
+docker run -d -p 80:80 -v ~/data:/data \
+    -e CONFIG_FILE="" \
+    -e DATA_DIR=/data \
+    -e COMPUTE_BACKEND=cpu \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
 # Dev mode (localhost only, no token required)
 docker run -d -p 80:80 -v ~/data:/data \
     -e BIOPB_WEB_DEV_BYPASS=true \
-    biopb-tensor-server:latest
-
-# Force CPU backend
-docker run -d -p 80:80 -v ~/data:/data \
-    -e COMPUTE_BACKEND=cpu -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
 # gRPC only (no webapp)
@@ -117,16 +139,14 @@ curl http://localhost/readyz
 
 ## Singularity Usage (HPC)
 
-### Convert Docker Image to SIF
+### Build from Docker Image
 
 ```bash
-singularity build biopb-tensor-server.sif docker://biopb-tensor-server:latest
-```
-
-Or from local Docker image:
-
-```bash
+# From local Docker image
 singularity build biopb-tensor-server.sif docker-daemon://biopb-tensor-server:latest
+
+# Or from published Docker image
+singularity build biopb-tensor-server.sif docker://ghcr.io/jiyuuchc/biopb-tensor-server:latest
 ```
 
 ### Basic Singularity Run
@@ -135,6 +155,50 @@ singularity build biopb-tensor-server.sif docker-daemon://biopb-tensor-server:la
 singularity run \
     --bind ~/data:/data \
     --env BIOPB_TENSOR_TOKEN=your_secure_token \
+    biopb-tensor-server.sif
+```
+
+By default, Singularity inherits the Docker image's `CONFIG_FILE` environment variable, so it uses the baked-in config. To generate config from env vars instead:
+
+```bash
+# Use --cleanenv to not inherit Docker env vars, then set your own
+singularity run --cleanenv \
+    --bind ~/data:/data \
+    --env DATA_DIR=/data \
+    --env NGINX_PORT=8080 \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+```
+
+### Configuration Options
+
+**Method 1: Use baked-in config (default)**
+```bash
+singularity run \
+    --bind ~/data:/data \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+```
+
+**Method 2: Generate from environment variables**
+```bash
+singularity run --cleanenv \
+    --bind ~/data:/data \
+    --env DATA_DIR=/data \
+    --env HOST=0.0.0.0 \
+    --env PORT=8815 \
+    --env NGINX_PORT=8080 \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+```
+
+**Method 3: Custom config file**
+```bash
+singularity run \
+    --bind ~/my-config.toml:/custom.toml \
+    --bind ~/data:/data \
+    --env CONFIG_FILE=/custom.toml \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 ```
 
@@ -160,25 +224,6 @@ singularity run \
     --bind ~/data:/data \
     --env NGINX_PORT=8080 \
     --env BIOPB_WEB_DEV_BYPASS=true \
-    biopb-tensor-server.sif
-```
-
-### NFS/Lustre Considerations
-
-**Important:** The `MONITOR=false` default is intentional. Live filesystem monitoring uses inotify which:
-- Works on local filesystems (ext4, xfs)
-- Has issues on NFS (delayed/cross-node events)
-- Does NOT work on Lustre (no inotify support)
-
-For shared filesystems, restart the container when new data arrives to refresh the catalog.
-
-If you have a local filesystem and want monitoring:
-
-```bash
-singularity run \
-    --bind ~/data:/data \
-    --env MONITOR=true \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 ```
 
@@ -230,7 +275,7 @@ Common causes:
 ### Files not appearing in webapp
 
 - Check mount path matches `DATA_DIR`: `-v ~/data:/data` with default `DATA_DIR=/data`
-- Restart container to refresh catalog (monitor=false means no auto-discovery)
+- On NFS/Lustre, set `MONITOR=false` and restart container to refresh catalog
 - Check file format is supported
 
 ### ND2 files fail to load

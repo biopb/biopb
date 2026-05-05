@@ -48,16 +48,19 @@ COPY --from=python-builder /usr/local/bin /usr/local/bin
 COPY --from=webapp-builder /app/biopb-tensor-server/packages/web/dist /var/www/html
 
 # Copy entrypoint, config, and nginx config
-COPY biopb-tensor-server/docker-entrypoint.sh /usr/local/bin/
+COPY biopb-tensor-server/entrypoint.sh /usr/local/bin/
 COPY biopb-tensor-server/nginx.conf /etc/nginx/nginx.conf
 COPY biopb-tensor-server/default-config.toml /app/config/
 
+# Set default config file (can be overridden at runtime)
+ENV CONFIG_FILE=/app/config/default-config.toml
+
 # Create data directory and set permissions
 RUN mkdir -p /data \
-    && chmod +x /usr/local/bin/docker-entrypoint.sh
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 # Expose ports: nginx (80), gRPC (8815), sidecar (8816)
 EXPOSE 80 8815 8816
 
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["entrypoint.sh"]
 CMD ["launch"]
