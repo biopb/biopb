@@ -370,6 +370,7 @@ class ArrowFileBackend(CacheBackend):
         metadata: Optional[dict] = None,
     ) -> CacheEntry:
         """Get existing entry or create pending and compute."""
+        is_owner = False
         with self._lock:
             entry = self._entries.get(key)
 
@@ -381,7 +382,7 @@ class ArrowFileBackend(CacheBackend):
                     return entry
 
                 if entry.state == EntryState.PENDING:
-                    # Pending - wait outside lock
+                    # Pending - wait outside lock (another thread is computing)
                     self._pending_waits += 1
 
             else:
@@ -403,7 +404,7 @@ class ArrowFileBackend(CacheBackend):
                         self._hits += 1
                         return entry
 
-                # No entry - create pending
+                # No entry - create pending, we own the computation
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
@@ -411,8 +412,18 @@ class ArrowFileBackend(CacheBackend):
                 )
                 self._entries[key] = entry
                 self._misses += 1
+                is_owner = True
 
-        # If pending, wait for it (outside lock)
+        # If we created the pending entry, we must compute
+        if is_owner:
+            try:
+                data, size_bytes = compute_fn()
+                self.complete_entry(key, data, size_bytes)
+            except Exception as e:
+                self.fail_entry(key, e)
+                raise
+
+        # If pending (either waiting on another thread or we just completed), wait
         if entry.state == EntryState.PENDING:
             if not entry.wait_ready(self._config.pending_timeout):
                 raise TimeoutError("Cache computation timed out for key")

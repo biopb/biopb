@@ -619,63 +619,61 @@ def resolve_chunk_data(
     """Resolve either a real backend chunk or a virtual scaled chunk.
 
     For virtual chunks (scaled reads), uses cache if cache_manager is provided.
-    The cache uses future/promise pattern: only one thread computes while
-    others wait on the pending entry.
+    For real chunks, uses file-based cache if available (for persistence across restarts).
 
     Args:
         adapter: Backend adapter for the tensor
         chunk_id: Encoded chunk identifier
-        cache_manager: Optional cache manager for caching virtual chunks
+        cache_manager: Optional cache manager for caching chunks
 
     Returns:
         Arrow RecordBatch containing the chunk data
     """
-    from biopb_tensor_server.cache import CacheKey
-    from biopb_tensor_server.cache.base import EntryState
+    from biopb_tensor_server.cache import CacheKey, ArrowFileBackend
 
     array_id, backend_data = _decode_chunk_id(chunk_id)
 
-    # Not virtual chunk - delegate to adapter (no caching needed)
-    if not backend_data.startswith(_VIRTUAL_CHUNK_MAGIC):
-        return adapter.get_chunk_data(chunk_id)
+    is_virtual = backend_data.startswith(_VIRTUAL_CHUNK_MAGIC)
+    is_file_backend = cache_manager is not None and isinstance(cache_manager.backend, ArrowFileBackend)
 
-    # Virtual chunk - build cache key
+    # Real chunk - cache only if file backend (for persistence)
+    if not is_virtual:
+        if not is_file_backend:
+            # Memory backend: skip cache, rely on OS page cache
+            return adapter.get_chunk_data(chunk_id)
+
+        # File backend: cache real chunks for persistence across restarts
+        key_bytes = chunk_id  # Use chunk_id directly as stable cache key
+
+        def compute_fn():
+            result = adapter.get_chunk_data(chunk_id)
+            return result, sum(col.nbytes for col in result.columns)
+
+        entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
+        data = entry.data
+        cache_manager.release(key_bytes)
+        return data
+
+    # Virtual chunk - compute directly if no cache
+    if cache_manager is None:
+        return _compute_virtual_chunk(adapter, backend_data)
+
+    # Build cache key from payload fields
     source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)
-    cache_key = CacheKey(
+    key_bytes = CacheKey(
         array_id=array_id,
         scale_hint=scale_hint,
         source_start=source_start,
         source_stop=source_stop,
         valid_stop=valid_stop,
         reduction_method=reduction_method,
-    )
-    key_bytes = cache_key.to_bytes()
+    ).to_bytes()
 
-    if cache_manager is None:
-        # No cache - just compute
-        return _compute_virtual_chunk(adapter, backend_data)
+    def compute_fn():
+        result = _compute_virtual_chunk(adapter, backend_data)
+        return result, sum(col.nbytes for col in result.columns)
 
-    # With cache - use future/promise pattern
-    entry, is_owner = cache_manager.start_compute(key_bytes, metadata={'array_id': array_id})
-
-    if is_owner:
-        # We own the computation - compute and complete
-        try:
-            result = _compute_virtual_chunk(adapter, backend_data)
-            size_bytes = sum(col.nbytes for col in result.columns)
-            cache_manager.complete_entry(key_bytes, result, size_bytes)
-        except Exception as e:
-            cache_manager.fail_entry(key_bytes, e)
-            raise
-    else:
-        # Another thread is computing - wait for it
-        # entry is acquired by start_compute, state may be PENDING
-        if entry.state == EntryState.PENDING:
-            # Wait outside lock (event is set by computing thread)
-            entry.wait_ready()  # Raises if computation failed
-
-    # Entry is now READY, acquired (ref_count >= 1)
-    # Release after getting data - Arrow buffers have their own ref counting
+    entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
     data = entry.data
     cache_manager.release(key_bytes)
     return data

@@ -33,6 +33,7 @@ from biopb_tensor_server.discovery import (
     AdapterRegistry,
     DiscoveryState,
     SourceClaim,
+    discover_sources,
     get_file_identity,
 )
 from biopb_tensor_server.watcher import (
@@ -77,7 +78,7 @@ class SourceManager:
         server: TensorFlightServer,
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
-        watcher: DirectoryWatcher,
+        watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
         dim_labels: Optional[List[str]] = None,
     ):
@@ -107,6 +108,9 @@ class SourceManager:
 
     def start(self) -> None:
         """Start the event processing loop."""
+        if self._watcher is None:
+            return  # Static-only mode; no filesystem events to process
+
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
             return
@@ -402,12 +406,6 @@ class SourceManager:
                 exc_info=True,
             )
 
-        except Exception as e:
-            logger.error(
-                f"Failed to create/register source {claim.source_id}: {e}",
-                exc_info=True,
-            )
-
     def _on_source_removed(self, source_id: str) -> None:
         """Callback when source is removed from DiscoveryState.
 
@@ -438,21 +436,30 @@ class SourceManager:
 def create_source_manager(
     server: TensorFlightServer,
     registry: AdapterRegistry,
-    watcher: DirectoryWatcher,
-    monitored_sources: List[SourceConfig],
+    watcher: Optional[DirectoryWatcher],
+    monitored_sources: Optional[List[SourceConfig]] = None,
+    static_sources: Optional[List[SourceConfig]] = None,
 ) -> Optional[SourceManager]:
-    """Create a SourceManager for monitored sources.
+    """Create a SourceManager for all configured sources.
+
+    Handles both static sources (explicit config, registered once) and
+    monitored sources (filesystem-discovered, kept live via watcher).
+    Both paths use the same DiscoveryState/callback machinery.
 
     Args:
         server: TensorFlightServer instance
         registry: AdapterRegistry for adapter creation
-        watcher: DirectoryWatcher for filesystem events
-        monitored_sources: List of SourceConfig with monitor=True
+        watcher: DirectoryWatcher for filesystem events (None for static-only)
+        monitored_sources: SourceConfig entries with monitor=True
+        static_sources: Explicit SourceConfig entries (monitor=False)
 
     Returns:
-        SourceManager if there are monitored sources, None otherwise
+        SourceManager if there are any sources, None otherwise
     """
-    if not monitored_sources:
+    monitored_sources = monitored_sources or []
+    static_sources = static_sources or []
+
+    if not monitored_sources and not static_sources:
         return None
 
     # Extract monitored directories
@@ -473,8 +480,8 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
 
-    if not monitored_dirs:
-        logger.warning("No valid directories to monitor")
+    if not monitored_dirs and not static_sources:
+        logger.warning("No valid sources to serve")
         return None
 
     # Create discovery state (empty - will be populated after SourceManager is created)
@@ -490,7 +497,20 @@ def create_source_manager(
         dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
     )
 
-    # NOW populate discovery state - callbacks will fire and register sources with server
+    # Seed static sources as direct claims (explicit config, no filesystem walk)
+    # These are added first so monitored discovery skips paths already claimed.
+    for source in static_sources:
+        claim = SourceClaim(
+            source_type=source.type,
+            primary_path=Path(source.url),
+            claimed_paths={Path(source.url)},
+            source_id=source.source_id,
+            dim_labels=source.dim_labels,
+            extra_config={'dataset': source.dataset} if source.dataset else {},
+        )
+        discovery_state.add_claim(claim)  # fires _on_source_added callback
+
+    # Filesystem discovery for monitored sources (callbacks fire here too)
     for source in monitored_sources:
         if source.is_remote:
             continue
@@ -499,15 +519,12 @@ def create_source_manager(
         if local_path is None:
             continue
 
-        # Scan for existing sources
-        from biopb_tensor_server.discovery import discover_sources as claim_based_discover
-        state = claim_based_discover(
+        state = discover_sources(
             local_path,
             registry,
             dim_labels=source.dim_labels,
         )
 
-        # Merge claims into our discovery state (callbacks fire here!)
         for claim in state.get_all_claims():
             discovery_state.add_claim(claim)
 

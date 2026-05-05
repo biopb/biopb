@@ -2,6 +2,7 @@
 
 Commands:
     serve      Start the Flight server
+    launch     Start the Flight server and HTTP sidecar for web app
     validate   Validate a config file
     list       List tensors in a config file
 """
@@ -16,10 +17,8 @@ import webbrowser
 
 import typer
 from rich.console import Console
-from rich.json import JSON
 from rich.table import Table
 
-from biopb.tensor.client import TensorFlightClient
 from biopb_tensor_server.config import (
     load_config,
     resolve_all_sources,
@@ -32,7 +31,6 @@ from biopb_tensor_server.base import configure_compute_backend
 from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.watcher import get_watcher
 from biopb_tensor_server.source_manager import create_source_manager
@@ -46,6 +44,159 @@ console = Console()
 
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
+
+
+def _setup_flight_server(
+    server_config: ServerConfig,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    compute_backend: Optional[str] = None,
+    gpu_min_input_mb: Optional[float] = None,
+    gpu_min_linear_input_mb: Optional[float] = None,
+    gpu_memory_safety_factor: Optional[int] = None,
+    gpu_min_merged_chunks: Optional[int] = None,
+) -> Tuple[TensorFlightServer, Optional[object], Optional[object]]:
+    """Set up the Flight server with cache, sources, and monitoring.
+
+    Args:
+        server_config: Loaded server configuration
+        host: Override host
+        port: Override port
+        compute_backend: Override compute backend policy
+        gpu_* params: Override GPU policy parameters
+
+    Returns:
+        Tuple of (flight_server, source_manager, watcher)
+
+    Raises:
+        typer.Exit: If no sources configured or no sources loaded successfully
+    """
+    # Apply overrides
+    host = host or server_config.host
+    port = port or server_config.port
+
+    configure_compute_backend(
+        force_backend=compute_backend or server_config.compute_backend,
+        gpu_min_input_bytes=int((gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb) * 1024 * 1024),
+        gpu_min_linear_input_bytes=int((gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb) * 1024 * 1024),
+        gpu_memory_safety_factor=gpu_memory_safety_factor or server_config.gpu_memory_safety_factor,
+        gpu_min_merged_chunks=gpu_min_merged_chunks or server_config.gpu_min_merged_chunks,
+    )
+
+    # Initialize cache manager for virtual chunks
+    cache_config = server_config.cache
+    if cache_config.backend == "memory":
+        CacheManager.initialize(cache_config)
+        console.print(
+            "[green]Virtual chunk cache initialized:[/green] "
+            f"backend=memory, "
+            f"max_entries={cache_config.memory_max_entries}, "
+            f"max_bytes={cache_config.memory_max_bytes // (1024*1024)}MB"
+        )
+        console.print("[green]Raw chunk cache: OS page cache[/green]")
+    elif cache_config.backend == "file":
+        manager = CacheManager.initialize(cache_config)
+        console.print(
+            "[green]Virtual chunk cache initialized:[/green] "
+            f"backend=file, "
+            f"cache_dir={cache_config.file_cache_dir}, "
+            f"max_segment_mb={cache_config.file_max_segment_bytes // (1024*1024)}, "
+            f"max_total_gb={cache_config.file_max_total_bytes // (1024*1024*1024)}"
+        )
+        # Check for recovery status
+        if isinstance(manager.backend, ArrowFileBackend):
+            recovery_status = manager.backend.get_recovery_status()
+            if recovery_status:
+                console.print(
+                    "[yellow]Cache recovery completed:[/yellow] "
+                    f"recovered={recovery_status.recovered_entries} entries "
+                    f"({recovery_status.recovered_bytes // (1024*1024)}MB), "
+                    f"lost={recovery_status.lost_entries} entries"
+                )
+                if recovery_status.errors:
+                    for err in recovery_status.errors[:3]:
+                        console.print(f"[red]  Error: {err}[/red]")
+        console.print("[green]Raw chunk cache: OS page cache[/green]")
+    else:
+        console.print(f"[yellow]Warning: Unknown cache backend '{cache_config.backend}', using memory[/yellow]")
+        CacheManager.initialize(CacheConfig())
+
+    # Resolve and separate sources
+    sources = resolve_all_sources(server_config)
+    monitored_sources = [s for s in server_config.sources if s.monitor]
+    static_sources = sources  # all expanded static entries; DiscoveryState deduplicates
+
+    if not static_sources and not monitored_sources:
+        console.print("[yellow]Warning: No data sources configured[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]Loading {len(static_sources)} static data source(s)...[/green]")
+    if monitored_sources:
+        console.print(f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]")
+
+    console.print(
+        "[green]Compute backend policy:[/green] "
+        f"backend={compute_backend or server_config.compute_backend}, "
+        f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
+        f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
+        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
+        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
+    )
+
+    # Create registry for adapters
+    registry = get_default_registry()
+
+    # Create and start server
+    location = f"grpc://{host}:{port}"
+    flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
+    server = TensorFlightServer(location, token=flight_token)
+
+    # Set up watcher for monitored sources (None for static-only configs)
+    watcher = None
+    source_manager = None
+    monitored_dirs = set()
+    if monitored_sources:
+        try:
+            monitored_dirs = {
+                ms.local_path
+                for ms in monitored_sources
+                if not ms.is_remote and ms.local_path
+            }
+            watcher = get_watcher(
+                watcher_type=server_config.watcher_type,
+                directories=monitored_dirs,
+                poll_interval=server_config.poll_interval,
+                debounce_window=1.5,
+            )
+        except Exception as e:
+            console.print(f"[red]Failed to create watcher: {e}[/red]")
+
+    # Register all sources (both static and monitored) through unified discovery
+    source_manager = create_source_manager(
+        server=server,
+        registry=registry,
+        watcher=watcher,
+        monitored_sources=monitored_sources,
+        static_sources=static_sources,
+    )
+
+    if source_manager is None:
+        console.print("[red]No sources loaded successfully[/red]")
+        raise typer.Exit(1)
+
+    if watcher and source_manager:
+        try:
+            watcher.start(monitored_dirs)
+            source_manager.start()
+            console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to start monitoring: {e}[/red]")
+            watcher.stop()
+            watcher = None
+
+    console.print(f"[green]Flight server ready at {location}[/green]")
+
+    return server, source_manager, watcher
 
 
 def _create_source_adapter(source: SourceConfig, registry=None):
@@ -124,152 +275,20 @@ def serve(
         biopb-tensor serve --config biopb-tensor.toml
         biopb-tensor serve -c config.toml --port 9000
     """
-    # Load config
     server_config = load_config(config)
 
-    # Apply overrides
-    host = host or server_config.host
-    port = port or server_config.port
-
-    configure_compute_backend(
-        force_backend=compute_backend or server_config.compute_backend,
-        gpu_min_input_bytes=int((gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb) * 1024 * 1024),
-        gpu_min_linear_input_bytes=int((gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb) * 1024 * 1024),
-        gpu_memory_safety_factor=gpu_memory_safety_factor or server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks or server_config.gpu_min_merged_chunks,
+    server, source_manager, watcher = _setup_flight_server(
+        server_config,
+        host=host,
+        port=port,
+        compute_backend=compute_backend,
+        gpu_min_input_mb=gpu_min_input_mb,
+        gpu_min_linear_input_mb=gpu_min_linear_input_mb,
+        gpu_memory_safety_factor=gpu_memory_safety_factor,
+        gpu_min_merged_chunks=gpu_min_merged_chunks,
     )
 
-    # Initialize cache manager for virtual chunks
-    cache_config = server_config.cache
-    if cache_config.backend == "memory":
-        CacheManager.initialize(cache_config)
-        console.print(
-            "[green]Virtual chunk cache initialized:[/green] "
-            f"backend=memory, "
-            f"max_entries={cache_config.memory_max_entries}, "
-            f"max_bytes={cache_config.memory_max_bytes // (1024*1024)}MB"
-        )
-        console.print("[green]Raw chunk cache: OS page cache[/green]")
-    elif cache_config.backend == "file":
-        manager = CacheManager.initialize(cache_config)
-        console.print(
-            "[green]Virtual chunk cache initialized:[/green] "
-            f"backend=file, "
-            f"cache_dir={cache_config.file_cache_dir}, "
-            f"max_segment_mb={cache_config.file_max_segment_bytes // (1024*1024)}, "
-            f"max_total_gb={cache_config.file_max_total_bytes // (1024*1024*1024)}"
-        )
-        # Check for recovery status
-        if isinstance(manager.backend, ArrowFileBackend):
-            recovery_status = manager.backend.get_recovery_status()
-            if recovery_status:
-                console.print(
-                    "[yellow]Cache recovery completed:[/yellow] "
-                    f"recovered={recovery_status.recovered_entries} entries "
-                    f"({recovery_status.recovered_bytes // (1024*1024)}MB), "
-                    f"lost={recovery_status.lost_entries} entries"
-                )
-                if recovery_status.errors:
-                    for err in recovery_status.errors[:3]:
-                        console.print(f"[red]  Error: {err}[/red]")
-        console.print("[green]Raw chunk cache: OS page cache[/green]")
-    else:
-        console.print(f"[yellow]Warning: Unknown cache backend '{cache_config.backend}', using memory[/yellow]")
-        CacheManager.initialize(CacheConfig())
-
-    # Resolve sources (expand directories)
-    sources = resolve_all_sources(server_config)
-
-    # Separate monitored sources from static sources
-    monitored_sources = [s for s in server_config.sources if s.monitor]
-    static_sources = [s for s in sources if not any(
-        s.url.startswith(ms.url) for ms in monitored_sources if not ms.is_remote
-    )]
-
-    if not sources and not monitored_sources:
-        console.print("[yellow]Warning: No data sources configured[/yellow]")
-        raise typer.Exit(1)
-
-    console.print(f"[green]Loading {len(static_sources)} static data source(s)...[/green]")
-    if monitored_sources:
-        console.print(f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]")
-
-    console.print(
-        "[green]Compute backend policy:[/green] "
-        f"backend={compute_backend or server_config.compute_backend}, "
-        f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
-        f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
-        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
-        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
-    )
-
-    # Create registry for adapters
-    registry = get_default_registry()
-
-    # Create adapters for static sources
-    adapters = {}
-    for source in static_sources:
-        try:
-            adapter = _create_source_adapter(source, registry)
-            adapters[source.source_id] = adapter
-            # Show tensors in this source
-            tensor_descs = adapter.list_tensor_descriptors()
-            if len(tensor_descs) == 1:
-                desc = tensor_descs[0]
-                console.print(f"  [blue]{source.source_id}[/blue]: shape={list(desc.shape)}, dtype={desc.dtype}")
-            else:
-                console.print(f"  [blue]{source.source_id}[/blue] ({len(tensor_descs)} tensors):")
-                for desc in tensor_descs:
-                    console.print(f"    [cyan]{desc.array_id}[/cyan]: shape={list(desc.shape)}, dtype={desc.dtype}")
-        except Exception as e:
-            console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
-
-    if not adapters and not monitored_sources:
-        console.print("[red]No sources loaded successfully[/red]")
-        raise typer.Exit(1)
-
-    # Create and start server
-    location = f"grpc://{host}:{port}"
-    flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
-    server = TensorFlightServer(location, token=flight_token)
-
-    for source_id, adapter in adapters.items():
-        server.register_source(source_id, adapter)
-
-    # Set up monitoring if configured
-    watcher = None
-    source_manager = None
-    if monitored_sources:
-        try:
-            # Collect monitored dirs for auto-detection
-            monitored_dirs = set()
-            for ms in monitored_sources:
-                if not ms.is_remote and ms.local_path:
-                    monitored_dirs.add(ms.local_path)
-
-            # Use auto-detection to select appropriate watcher (watchdog or pollvfs)
-            watcher = get_watcher(
-                watcher_type=server_config.watcher_type,
-                directories=monitored_dirs,
-                poll_interval=server_config.poll_interval,
-                debounce_window=1.5,
-            )
-            source_manager = create_source_manager(
-                server=server,
-                registry=registry,
-                watcher=watcher,
-                monitored_sources=monitored_sources,
-            )
-            if source_manager:
-                # Start watcher and manager
-                watcher.start(monitored_dirs)
-                source_manager.start()
-                console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
-        except Exception as e:
-            console.print(f"[red]Failed to start monitoring: {e}[/red]")
-            if watcher:
-                watcher.stop()
-
+    location = f"grpc://{host or server_config.host}:{port or server_config.port}"
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
@@ -534,84 +553,12 @@ def launch(
 
     # --- Load server config and start Flight ---
     server_config = load_config(config)
-    host = server_config.host
-    port = server_config.port
 
-    configure_compute_backend(
-        force_backend=server_config.compute_backend,
-        gpu_min_input_bytes=int(server_config.gpu_min_input_mb * 1024 * 1024),
-        gpu_min_linear_input_bytes=int(server_config.gpu_min_linear_input_mb * 1024 * 1024),
-        gpu_memory_safety_factor=server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=server_config.gpu_min_merged_chunks,
-    )
-    CacheManager.initialize(server_config.cache)
+    flight_server, source_manager, watcher = _setup_flight_server(server_config)
 
-    # Separate monitored sources from static sources
-    monitored_sources = [s for s in server_config.sources if s.monitor]
-    sources = resolve_all_sources(server_config)
-    static_sources = [s for s in sources if not any(
-        s.url.startswith(ms.url) for ms in monitored_sources if not ms.is_remote
-    )]
-
-    if not sources and not monitored_sources:
-        console.print("[red]No data sources configured[/red]")
-        raise typer.Exit(1)
-
-    # Create registry for adapters
-    registry = get_default_registry()
-
-    adapters = {}
-    for source in static_sources:
-        try:
-            adapters[source.source_id] = _create_source_adapter(source, registry)
-        except Exception as e:
-            console.print(f"  [red]Failed to load {source.source_id}: {e}[/red]")
-
-    if not adapters and not monitored_sources:
-        console.print("[red]No sources loaded[/red]")
-        raise typer.Exit(1)
-
-    flight_location = f"grpc://{host}:{port}"
-    flight_server = TensorFlightServer(flight_location)
-    for source_id, adapter in adapters.items():
-        flight_server.register_source(source_id, adapter)
-
-    # Set up monitoring if configured
-    watcher = None
-    source_manager = None
-    if monitored_sources:
-        try:
-            # Collect monitored dirs for auto-detection
-            monitored_dirs = set()
-            for ms in monitored_sources:
-                if not ms.is_remote and ms.local_path:
-                    monitored_dirs.add(ms.local_path)
-
-            # Use auto-detection to select appropriate watcher (watchdog or pollvfs)
-            watcher = get_watcher(
-                watcher_type=server_config.watcher_type,
-                directories=monitored_dirs,
-                poll_interval=server_config.poll_interval,
-                debounce_window=1.5,
-            )
-            source_manager = create_source_manager(
-                server=flight_server,
-                registry=registry,
-                watcher=watcher,
-                monitored_sources=monitored_sources,
-            )
-            if source_manager:
-                watcher.start(monitored_dirs)
-                source_manager.start()
-                console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
-        except Exception as e:
-            console.print(f"[red]Failed to start monitoring: {e}[/red]")
-            if watcher:
-                watcher.stop()
-
+    flight_location = f"grpc://{server_config.host}:{server_config.port}"
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
     flight_thread.start()
-    console.print(f"[green]Flight server started at {flight_location}[/green]")
 
     if open_browser:
         url = web_url

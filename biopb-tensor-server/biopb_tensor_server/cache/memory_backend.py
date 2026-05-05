@@ -135,11 +135,12 @@ class MemoryCacheBackend(CacheBackend):
 
         This implements the future/promise pattern:
         1. Check if entry exists (READY) -> acquire, return
-        2. Check if entry PENDING -> wait, then acquire, return
+        2. Check if entry PENDING -> wait for it, then acquire, return
         3. No entry -> create PENDING, compute, complete, acquire, return
 
         Returns entry with ref_count >= 1 (acquired).
         """
+        is_owner = False
         with self._lock:
             entry = self._entries.get(key)
 
@@ -152,11 +153,11 @@ class MemoryCacheBackend(CacheBackend):
                     return entry
 
                 if entry.state == EntryState.PENDING:
-                    # Pending - wait outside lock
+                    # Pending - wait outside lock (another thread is computing)
                     self._pending_waits += 1
 
             else:
-                # No entry - create pending
+                # No entry - create pending, we own the computation
                 entry = CacheEntry(
                     state=EntryState.PENDING,
                     created_at=time.time(),
@@ -164,8 +165,18 @@ class MemoryCacheBackend(CacheBackend):
                 )
                 self._entries[key] = entry
                 self._misses += 1
+                is_owner = True
 
-        # If pending, wait for it (outside lock)
+        # If we created the pending entry, we must compute
+        if is_owner:
+            try:
+                data, size_bytes = compute_fn()
+                self.complete_entry(key, data, size_bytes)
+            except Exception as e:
+                self.fail_entry(key, e)
+                raise
+
+        # If pending (either waiting on another thread or we just completed), wait
         if entry.state == EntryState.PENDING:
             if not entry.wait_ready(self._config.pending_timeout):
                 raise TimeoutError(f"Cache computation timed out for key")
