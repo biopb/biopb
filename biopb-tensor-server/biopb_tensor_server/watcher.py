@@ -621,7 +621,8 @@ def detect_nfs_mount(path: Path) -> bool:
 def get_watcher(
     watcher_type: str = "auto",
     directories: Optional[Set[Path]] = None,
-    **kwargs,
+    debounce_window: float = 1.5,
+    poll_interval: float = 30.0,
 ) -> DirectoryWatcher:
     """Factory function to create appropriate watcher.
 
@@ -631,7 +632,8 @@ def get_watcher(
             - "watchdog": Force watchdog/inotify-based watcher
             - "pollvfs": Force polling-based watcher (for NFS)
         directories: Paths to monitor (used for auto-detection when watcher_type="auto")
-        **kwargs: Arguments passed to watcher constructor
+        debounce_window: Time window for debouncing events (seconds)
+        poll_interval: Time between scans for PollVFS watcher (seconds)
 
     Returns:
         DirectoryWatcher instance
@@ -643,11 +645,11 @@ def get_watcher(
         # Auto-detect based on mount type
         if directories and any(detect_nfs_mount(d) for d in directories):
             logger.info("Auto-detected NFS mount, using PollVFS watcher")
-            return PollVFSWatcher(**kwargs)
-        return WatchdogWatcher(**kwargs)
+            return PollVFSWatcher(poll_interval=poll_interval, debounce_window=debounce_window)
+        return WatchdogWatcher(debounce_window=debounce_window)
     elif watcher_type == "watchdog":
-        return WatchdogWatcher(**kwargs)
+        return WatchdogWatcher(debounce_window=debounce_window)
     elif watcher_type == "pollvfs":
-        return PollVFSWatcher(**kwargs)
+        return PollVFSWatcher(poll_interval=poll_interval, debounce_window=debounce_window)
     else:
         raise ValueError(f"Unknown watcher type: {watcher_type}")

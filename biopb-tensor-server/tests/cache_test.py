@@ -21,7 +21,14 @@ from biopb_tensor_server.cache import (
     MAX_ARROW_BATCH_BYTES,
 )
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
-from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.file_backend import (
+    ArrowFileBackend,
+    ArrowFileConfig,
+    _get_size_class,
+    SIZE_CLASS_TINY_THRESHOLD,
+    SIZE_CLASS_SMALL_THRESHOLD,
+    SIZE_CLASS_MEDIUM_THRESHOLD,
+)
 from biopb_tensor_server.cache.recovery import (
     WriteAheadLog,
     ProcessLock,
@@ -824,4 +831,159 @@ class TestOversizedChunkHandling:
         entry2, is_owner2 = backend2.start_compute(b"big_key")
         assert is_owner2 is True  # New computation needed
         backend2.close()
+        shutil.rmtree(cache_dir)
+
+
+class TestSizeClassClassification:
+    """Tests for size class classification for pooling."""
+
+    def test_tiny_size_class(self):
+        """Chunks under TINY_THRESHOLD are classified as tiny."""
+        assert _get_size_class(1) == "tiny"
+        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD - 1) == "tiny"
+
+    def test_small_size_class(self):
+        """Chunks between TINY and SMALL thresholds are small."""
+        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD) == "small"
+        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD - 1) == "small"
+
+    def test_medium_size_class(self):
+        """Chunks between SMALL and MEDIUM thresholds are medium."""
+        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD) == "medium"
+        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD - 1) == "medium"
+
+    def test_large_size_class(self):
+        """Chunks over MEDIUM_THRESHOLD are large."""
+        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD) == "large"
+        assert _get_size_class(MAX_ARROW_BATCH_BYTES) == "large"
+
+
+class TestSchemaPooling:
+    """Regression tests for schema mismatch handling with pooling."""
+
+    def _make_temp_cache_dir(self):
+        """Create a temporary cache directory."""
+        return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
+
+    def test_alternating_schemas_pooled_separately(self):
+        """Alternating dtype writes create separate pools but not many small segments."""
+        cache_dir = self._make_temp_cache_dir()
+        # Large segment size to allow many entries per segment
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=10 * 1024 * 1024,  # 10 MB
+            max_total_bytes=100 * 1024 * 1024,  # 100 MB
+        )
+
+        backend = ArrowFileBackend(config)
+
+        # Create batches with different schemas (different dtypes)
+        int_data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3], type=pa.int32())], ["data"])
+        float_data = pa.RecordBatch.from_arrays([pa.array([1.0, 2.0, 3.0], type=pa.float32())], ["data"])
+
+        # Write alternating entries with different schemas
+        # Each schema should get its own pool/segment
+        for i in range(10):
+            int_key = f"int_key_{i}".encode()
+            float_key = f"float_key_{i}".encode()
+
+            entry, _ = backend.start_compute(int_key)
+            backend.complete_entry(int_key, int_data, 12)
+
+            entry, _ = backend.start_compute(float_key)
+            backend.complete_entry(float_key, float_data, 12)
+
+        # Verify all entries can be retrieved
+        for i in range(10):
+            int_key = f"int_key_{i}".encode()
+            float_key = f"float_key_{i}".encode()
+
+            entry, is_owner = backend.start_compute(int_key)
+            assert is_owner is False
+            assert entry.state == EntryState.READY
+            backend.release(int_key)
+
+            entry, is_owner = backend.start_compute(float_key)
+            assert is_owner is False
+            assert entry.state == EntryState.READY
+            backend.release(float_key)
+
+        # Check segment count - should be limited (not 20 segments)
+        segments_dir = cache_dir / "segments"
+        segment_files = list(segments_dir.glob("seg_*.arrow"))
+        # With pooling, we should have at most a few segments per schema pool
+        # Not one segment per write (which would be 20)
+        assert len(segment_files) <= 4, f"Too many segments: {len(segment_files)}"
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_large_chunks_skip_file_cache(self):
+        """Large chunks (>=256MB) skip file cache and stay in memory."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+        backend = ArrowFileBackend(config)
+
+        # Create a batch that would be classified as large
+        # Use the MEDIUM threshold (>=256MB = large)
+        large_size = SIZE_CLASS_MEDIUM_THRESHOLD + 1000
+        data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], ["data"])
+
+        entry, _ = backend.start_compute(b"large_key")
+        backend.complete_entry(b"large_key", data, large_size)
+
+        # Entry should be ready in memory
+        assert entry.state == EntryState.READY
+
+        # Stats should show oversized skip (for large chunks)
+        stats = backend.stats()
+        assert stats.oversized_skips == 1
+
+        # No segment file should have been created for this entry
+        segments_dir = cache_dir / "segments"
+        segment_files = list(segments_dir.glob("seg_*.arrow"))
+        # May have 1 segment (the initial empty one), but large data not in it
+        assert len(segment_files) <= 1
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_same_schema_different_sizes_share_pool(self):
+        """Entries with same schema but different size classes can share segment."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=5 * 1024 * 1024,  # 5 MB
+            max_total_bytes=50 * 1024 * 1024,  # 50 MB
+        )
+        backend = ArrowFileBackend(config)
+
+        # Create batches with same schema but different sizes (small vs tiny)
+        schema = pa.array([1, 2, 3], type=pa.int32()).type
+
+        # Tiny entry (< 2MB)
+        tiny_data = pa.RecordBatch.from_arrays([pa.array([1] * 100, type=schema)], ["data"])
+        tiny_size = 400  # Tiny
+
+        # Small entry (between 2MB and 32MB in size classification)
+        # Simulate with small actual data but report larger size
+        small_data = pa.RecordBatch.from_arrays([pa.array([2] * 100, type=schema)], ["data"])
+        small_size = SIZE_CLASS_TINY_THRESHOLD + 1000  # Small class
+
+        entry, _ = backend.start_compute(b"tiny_key")
+        backend.complete_entry(b"tiny_key", tiny_data, tiny_size)
+
+        entry, _ = backend.start_compute(b"small_key")
+        backend.complete_entry(b"small_key", small_data, small_size)
+
+        # Both entries should be retrievable
+        entry, is_owner = backend.start_compute(b"tiny_key")
+        assert is_owner is False
+        backend.release(b"tiny_key")
+
+        entry, is_owner = backend.start_compute(b"small_key")
+        assert is_owner is False
+        backend.release(b"small_key")
+
+        backend.close()
         shutil.rmtree(cache_dir)

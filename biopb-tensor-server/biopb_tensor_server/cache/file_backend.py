@@ -16,7 +16,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 import pyarrow as pa
 
@@ -37,6 +37,26 @@ from biopb_tensor_server.cache.recovery import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Size class thresholds derived from Arrow batch limit (~2GB)
+SIZE_CLASS_TINY_THRESHOLD = MAX_ARROW_BATCH_BYTES // 1000   # ~2MB
+SIZE_CLASS_SMALL_THRESHOLD = MAX_ARROW_BATCH_BYTES // 64    # ~32MB
+SIZE_CLASS_MEDIUM_THRESHOLD = MAX_ARROW_BATCH_BYTES // 8    # ~256MB
+
+SizeClass = Literal["tiny", "small", "medium", "large"]
+
+
+def _get_size_class(size_bytes: int) -> SizeClass:
+    """Classify chunk size for pooling."""
+    if size_bytes < SIZE_CLASS_TINY_THRESHOLD:
+        return "tiny"
+    elif size_bytes < SIZE_CLASS_SMALL_THRESHOLD:
+        return "small"
+    elif size_bytes < SIZE_CLASS_MEDIUM_THRESHOLD:
+        return "medium"
+    else:
+        return "large"
 
 
 @dataclass
@@ -88,10 +108,14 @@ class ArrowFileBackend(CacheBackend):
         # Mmap handles for fast reads
         self._segment_mmaps: Dict[int, pa.MemoryMappedFile] = {}
 
-        # Active segment for writing
-        self._active_segment_id: int = 0
-        self._active_segment_writer: Optional[pa.RecordBatchStreamWriter] = None
-        self._active_segment_path: Optional[Path] = None
+        # Multiple active writers for pooling: segment_id -> writer
+        # This allows keeping multiple segments open for different (schema, size_class) pools
+        self._pool_writers: Dict[int, pa.RecordBatchStreamWriter] = {}
+        self._pool_paths: Dict[int, Path] = {}
+        self._pool_schemas: Dict[int, pa.Schema] = {}
+
+        # Pool tracking: (schema_key, size_class) -> segment_id for open segments
+        self._open_pools: Dict[Tuple[str, SizeClass], int] = {}
 
         # Statistics
         self._hits: int = 0
@@ -139,10 +163,8 @@ class ArrowFileBackend(CacheBackend):
         # Rebuild metadata index from segment files
         self._rebuild_index_from_segments()
 
-        # Find next segment ID and create active segment if needed
-        self._active_segment_id = max(self._segments.keys(), default=0) + 1
-        if len(self._segments) == 0:
-            self._create_new_segment()
+        # Find next segment ID (segments are created lazily when first write happens)
+        self._next_segment_id = max(self._segments.keys(), default=0) + 1
 
     def _recover(self) -> RecoveryStatus:
         """Recover from crash: clean up incomplete writes."""
@@ -242,38 +264,63 @@ class ArrowFileBackend(CacheBackend):
                 except OSError:
                     pass
 
-    def _create_new_segment(self) -> None:
-        """Create a new segment file path for writing.
+    def _get_schema_key(self, schema: pa.Schema) -> str:
+        """Get hashable key from schema (types, not metadata)."""
+        # Schema equality ignores metadata values, so use types
+        return repr(schema.types)
 
-        Writer is created lazily when first batch is written.
-        """
+    def _create_segment_for_pool(
+        self,
+        pool_key: Tuple[str, SizeClass],
+        schema: pa.Schema,
+    ) -> int:
+        """Create a new segment for a specific pool and return its ID."""
+        segment_id = self._next_segment_id
+        self._next_segment_id += 1
+
         segments_dir = self._config.cache_dir / "segments"
-        self._active_segment_path = segments_dir / f"seg_{self._active_segment_id:04d}.arrow"
-
-        # Ensure directory exists
         segments_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = segments_dir / f"seg_{segment_id:04d}.arrow"
 
-        # Track segment info (writer created on first write)
-        self._segments[self._active_segment_id] = SegmentInfo(
+        # Create writer
+        sink = pa.OSFile(str(segment_path), 'wb')
+        writer = pa.RecordBatchStreamWriter(sink, schema)
+
+        # Track segment
+        self._segments[segment_id] = SegmentInfo(
             size_bytes=0,
             created_at=time.time(),
             last_access_time=time.time(),
             entry_count=0,
         )
-        self._active_segment_writer = None
 
-    def _close_active_segment(self) -> None:
-        """Close active segment writer and open mmap for reading."""
-        if self._active_segment_writer is not None:
-            self._active_segment_writer.close()
-            self._active_segment_writer = None
+        # Register in pool tracking
+        self._pool_writers[segment_id] = writer
+        self._pool_paths[segment_id] = segment_path
+        self._pool_schemas[segment_id] = schema
+        self._open_pools[pool_key] = segment_id
 
-            # Open mmap for the now-complete segment
-            if self._active_segment_path and self._active_segment_path.exists():
-                mmap = pa.memory_map(str(self._active_segment_path), 'r')
-                self._segment_mmaps[self._active_segment_id] = mmap
+        return segment_id
 
-            self._active_segment_path = None
+    def _close_segment(self, segment_id: int) -> None:
+        """Close a specific segment's writer and open mmap for reading."""
+        writer = self._pool_writers.pop(segment_id, None)
+        if writer is not None:
+            writer.close()
+
+        path = self._pool_paths.pop(segment_id, None)
+        schema = self._pool_schemas.pop(segment_id, None)
+
+        # Remove from open pools
+        self._open_pools = {
+            k: v for k, v in self._open_pools.items()
+            if v != segment_id
+        }
+
+        # Open mmap for reading
+        if path and path.exists():
+            mmap = pa.memory_map(str(path), 'r')
+            self._segment_mmaps[segment_id] = mmap
 
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
@@ -316,6 +363,14 @@ class ArrowFileBackend(CacheBackend):
             self._metadata.pop(key, None)
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
+
+        # Close any open writer for this segment
+        writer = self._pool_writers.pop(seg_id, None)
+        if writer:
+            writer.close()
+        self._pool_paths.pop(seg_id, None)
+        self._pool_schemas.pop(seg_id, None)
+        self._open_pools = {k: v for k, v in self._open_pools.items() if v != seg_id}
 
         # Close and remove mmap
         mmap = self._segment_mmaps.pop(seg_id, None)
@@ -508,6 +563,16 @@ class ArrowFileBackend(CacheBackend):
             if entry is None or entry.state != EntryState.PENDING:
                 return
 
+            # Determine pool for this entry
+            size_class = _get_size_class(size_bytes)
+
+            # Handle LARGE chunks - skip file cache, use memory only
+            if size_class == "large":
+                logger.debug(f"Skipping file cache for large chunk: {size_bytes} bytes")
+                entry.set_ready(data, size_bytes)
+                self._oversized_skips += 1
+                return
+
             # Evict if needed before storing
             while self._get_total_size() + size_bytes > self._config.max_total_bytes:
                 if not self._evict_least_recently_used_segment():
@@ -523,17 +588,37 @@ class ArrowFileBackend(CacheBackend):
             new_schema = data.schema.with_metadata(schema_meta)
             batch_with_key = data.cast(new_schema)
 
-            # Write to active segment
-            if self._active_segment_writer is None:
-                self._create_new_segment()
-                # Create writer with schema from first batch
-                sink = pa.OSFile(str(self._active_segment_path), 'wb')
-                self._active_segment_writer = pa.RecordBatchStreamWriter(sink, batch_with_key.schema)
+            schema_key = self._get_schema_key(batch_with_key.schema)
+            pool_key = (schema_key, size_class)
 
-            self._active_segment_writer.write_batch(batch_with_key)
+            # Find or create segment for this pool
+            segment_id = self._open_pools.get(pool_key)
+
+            if segment_id is None:
+                # No segment for this pool - create one
+                segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
+            elif segment_id not in self._pool_writers:
+                # Pool's segment was closed (shouldn't happen, but handle it)
+                segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
+
+            # Get the writer for this segment
+            writer = self._pool_writers.get(segment_id)
+            if writer is None:
+                # Shouldn't happen, but create if missing
+                path = self._pool_paths.get(segment_id)
+                if path is None:
+                    segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
+                    writer = self._pool_writers[segment_id]
+                else:
+                    sink = pa.OSFile(str(path), 'wb')
+                    writer = pa.RecordBatchStreamWriter(sink, batch_with_key.schema)
+                    self._pool_writers[segment_id] = writer
+
+            # Write batch
+            writer.write_batch(batch_with_key)
 
             # Update segment info
-            seg_info = self._segments.get(self._active_segment_id)
+            seg_info = self._segments.get(segment_id)
             if seg_info:
                 seg_info.size_bytes += size_bytes
                 seg_info.entry_count += 1
@@ -541,7 +626,7 @@ class ArrowFileBackend(CacheBackend):
 
             # Update metadata index
             self._metadata[key] = SegmentEntryInfo(
-                segment_id=self._active_segment_id,
+                segment_id=segment_id,
                 offset=seg_info.entry_count - 1 if seg_info else 0,
                 size_bytes=size_bytes,
                 metadata=entry.metadata,
@@ -549,11 +634,9 @@ class ArrowFileBackend(CacheBackend):
                 last_access_time=time.time(),
             )
 
-            # Check if segment exceeds max size
+            # Check if segment exceeds max size - close it
             if seg_info and seg_info.size_bytes >= self._config.max_segment_bytes:
-                self._close_active_segment()
-                self._active_segment_id += 1
-                self._create_new_segment()
+                self._close_segment(segment_id)
 
             # Mark entry as ready
             entry.set_ready(data, size_bytes)
@@ -599,8 +682,13 @@ class ArrowFileBackend(CacheBackend):
     def clear(self) -> None:
         """Clear all evictable entries and delete all segments."""
         with self._lock:
-            # Close active segment
-            self._close_active_segment()
+            # Close all pool writers
+            for writer in self._pool_writers.values():
+                writer.close()
+            self._pool_writers.clear()
+            self._pool_paths.clear()
+            self._pool_schemas.clear()
+            self._open_pools.clear()
 
             # Close all mmaps
             for mmap in self._segment_mmaps.values():
@@ -621,9 +709,8 @@ class ArrowFileBackend(CacheBackend):
             if self._wal:
                 self._wal.clear()
 
-            # Create new active segment
-            self._active_segment_id = 1
-            self._create_new_segment()
+            # Reset segment ID counter
+            self._next_segment_id = 1
 
     def stats(self) -> CacheStats:
         """Return cache statistics."""
@@ -654,10 +741,13 @@ class ArrowFileBackend(CacheBackend):
         Only releases locks and closes handles.
         """
         with self._lock:
-            # Close active segment writer if it has data
-            if self._active_segment_writer is not None:
-                self._active_segment_writer.close()
-                self._active_segment_writer = None
+            # Close all pool writers
+            for writer in self._pool_writers.values():
+                writer.close()
+            self._pool_writers.clear()
+            self._pool_paths.clear()
+            self._pool_schemas.clear()
+            self._open_pools.clear()
 
             # Close all mmap handles
             for mmap in self._segment_mmaps.values():
