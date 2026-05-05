@@ -34,6 +34,7 @@ from biopb_tensor_server.downsample import (
     configure_compute_backend,
     get_compute_backend_options,
     _normalize_reduction_method,
+    _ceil_div,
     _logical_shape_for_scale,
     _pad_array_edge,
     _output_dtype,
@@ -236,20 +237,51 @@ class BackendAdapter(ABC):
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
         base_chunk_shape = tuple(int(dim) for dim in base_desc.chunk_shape)
-        source_start, source_stop = _normalized_slice_bounds(base_shape, slice_hint)
-        source_shape = tuple(stop - start for start, stop in zip(source_start, source_stop))
+        ndim = len(base_shape)
 
         reduction_method = _normalize_reduction_method(
             read_options.reduction_method if read_options else None
         )
 
-        logical_shape = _logical_shape_for_scale(source_shape, scale_hint)
+        # Step 1: find intersecting real chunks (slice_hint is in source coordinates)
+        source_start, source_stop = _normalized_slice_bounds(base_shape, slice_hint)
+        real_endpoints = self.get_chunk_endpoints(
+            SliceHint(start=list(source_start), stop=list(source_stop))
+            if slice_hint is not None else None
+        )
+
+        # Step 2: snap the real-chunk bounding box to lcm-group boundaries so that
+        # each virtual chunk covers a whole number of real chunks and a whole number
+        # of output pixels (handles cases like z-chunk=1, scale=2).
+        lcm_per_axis = tuple(lcm(base_chunk_shape[ax], scale_hint[ax]) for ax in range(ndim))
+        if real_endpoints:
+            bbox_start = tuple(
+                min(int(ep.bounds.start[ax]) for ep in real_endpoints) for ax in range(ndim)
+            )
+            bbox_stop = tuple(
+                max(int(ep.bounds.stop[ax]) for ep in real_endpoints) for ax in range(ndim)
+            )
+        else:
+            bbox_start = source_start
+            bbox_stop = source_start
+
+        snapped_start = tuple(
+            (bbox_start[ax] // lcm_per_axis[ax]) * lcm_per_axis[ax]
+            for ax in range(ndim)
+        )
+        snapped_stop = tuple(
+            min(_ceil_div(bbox_stop[ax], lcm_per_axis[ax]) * lcm_per_axis[ax], base_shape[ax])
+            for ax in range(ndim)
+        )
+        snapped_shape = tuple(snapped_stop[ax] - snapped_start[ax] for ax in range(ndim))
+
+        logical_shape = _logical_shape_for_scale(snapped_shape, scale_hint)
         logical_chunk_shape = _logical_chunk_shape(base_chunk_shape, scale_hint, logical_shape)
 
         endpoints: List[ChunkEndpoint] = []
 
         def iter_virtual_chunks(dim: int = 0, logical_offset: Tuple[int, ...] = ()):
-            if dim == len(logical_shape):
+            if dim == ndim:
                 yield logical_offset
                 return
             axis_chunk = logical_chunk_shape[dim]
@@ -259,20 +291,21 @@ class BackendAdapter(ABC):
 
         for logical_start in iter_virtual_chunks():
             logical_stop = tuple(
-                min(logical_start[axis] + logical_chunk_shape[axis], logical_shape[axis])
-                for axis in range(len(logical_shape))
+                min(logical_start[ax] + logical_chunk_shape[ax], logical_shape[ax])
+                for ax in range(ndim)
             )
             source_chunk_start = tuple(
-                source_start[axis] + logical_start[axis] * scale_hint[axis]
-                for axis in range(len(logical_shape))
+                snapped_start[ax] + logical_start[ax] * scale_hint[ax]
+                for ax in range(ndim)
             )
             source_chunk_stop = tuple(
-                source_start[axis] + logical_stop[axis] * scale_hint[axis]
-                for axis in range(len(logical_shape))
+                snapped_start[ax] + logical_stop[ax] * scale_hint[ax]
+                for ax in range(ndim)
             )
+            # Clip to array boundary; edge virtual chunks may extend past valid data
             valid_chunk_stop = tuple(
-                min(source_chunk_stop[axis], source_stop[axis])
-                for axis in range(len(logical_shape))
+                min(source_chunk_stop[ax], base_shape[ax])
+                for ax in range(ndim)
             )
             payload = _encode_virtual_chunk_payload(
                 source_start=source_chunk_start,
@@ -293,8 +326,10 @@ class BackendAdapter(ABC):
             chunk_shape=list(logical_chunk_shape),
             dtype=_output_dtype(base_desc.dtype, reduction_method),
         )
-        if slice_hint is not None:
-            logical_desc.slice_hint.CopyFrom(slice_hint)
+        # Report realized slice in source coordinates (snapped to chunk/lcm boundaries)
+        if snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
+            logical_desc.slice_hint.start[:] = list(snapped_start)
+            logical_desc.slice_hint.stop[:] = list(snapped_stop)
         if read_options is not None:
             logical_desc.read_options.CopyFrom(read_options)
 
@@ -529,19 +564,31 @@ def plan_tensor_read(
     source_shape = tuple(stop - start for start, stop in zip(source_start, source_stop))
     scale_hint = _normalized_scale_hint(base_shape, read_options)
 
+    ndim = len(base_shape)
     if scale_hint is None:
         # No scaling - direct read from base
         chunk_endpoints = adapter.get_chunk_endpoints(
             SliceHint(start=list(source_start), stop=list(source_stop))
-            if source_start != tuple(0 for _ in base_shape) or source_stop != base_shape
-            else None
+            if slice_hint is not None else None
         )
+        # Realized bounds = bounding box of intersecting chunks (always non-negative)
+        if chunk_endpoints:
+            realized_start = tuple(
+                min(int(ep.bounds.start[ax]) for ep in chunk_endpoints) for ax in range(ndim)
+            )
+            realized_stop = tuple(
+                max(int(ep.bounds.stop[ax]) for ep in chunk_endpoints) for ax in range(ndim)
+            )
+        else:
+            realized_start = source_start
+            realized_stop = source_start
+        realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
         logical_endpoints = [
             ChunkEndpoint(
                 chunk_id=endpoint.chunk_id,
                 bounds=ChunkBounds(
-                    start=[int(endpoint.bounds.start[axis] - source_start[axis]) for axis in range(len(base_shape))],
-                    stop=[int(endpoint.bounds.stop[axis] - source_start[axis]) for axis in range(len(base_shape))],
+                    start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
+                    stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
                 ),
             )
             for endpoint in chunk_endpoints
@@ -549,12 +596,13 @@ def plan_tensor_read(
         logical_desc = TensorDescriptor(
             array_id=base_desc.array_id,
             dim_labels=base_desc.dim_labels,
-            shape=list(source_shape),
-            chunk_shape=[min(int(chunk), int(size)) for chunk, size in zip(base_chunk_shape, source_shape)],
+            shape=list(realized_shape),
+            chunk_shape=[min(int(chunk), int(size)) for chunk, size in zip(base_chunk_shape, realized_shape)],
             dtype=base_desc.dtype,
         )
-        if slice_hint is not None:
-            logical_desc.slice_hint.CopyFrom(slice_hint)
+        if realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
+            logical_desc.slice_hint.start[:] = list(realized_start)
+            logical_desc.slice_hint.stop[:] = list(realized_stop)
         if read_options is not None:
             logical_desc.read_options.CopyFrom(read_options)
         return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=logical_endpoints)

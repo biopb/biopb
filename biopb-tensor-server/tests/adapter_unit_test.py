@@ -274,8 +274,9 @@ class TestGetScaledReadPlan:
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
             )
 
-            # Shape should be (40/2, 40/2) = (20, 20)
-            assert list(plan.descriptor.shape) == [20, 20]
+            # Slice [10,10]->[50,50] intersects chunk [0,50]x[0,50].
+            # Realized (snapped) source bounds = [0,0]->[50,50] -> shape (50/2, 50/2) = (25, 25)
+            assert list(plan.descriptor.shape) == [25, 25]
 
 
 class TestOmeZarrPrecompute:

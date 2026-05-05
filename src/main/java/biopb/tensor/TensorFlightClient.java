@@ -31,9 +31,11 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 
+import net.imglib2.FinalInterval;
 import net.imglib2.Interval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
+import net.imglib2.view.Views;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
 import net.imglib2.cache.img.SingleCellArrayImg;
@@ -237,7 +239,42 @@ public class TensorFlightClient implements AutoCloseable {
             TensorReadOptions readOptions) {
 
         RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, readOptions);
-        return createArray(context);
+        RandomAccessibleInterval<T> rai = createArray(context);
+
+        // Crop to the originally requested region.
+        // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
+        // descriptor.shape may be larger than the requested extent.
+        if (sliceHint != null && context.descriptor.hasSliceHint()) {
+            SliceHint realized = context.descriptor.getSliceHint();
+            int ndim = context.descriptor.getShapeCount();
+            long[] cropMin = new long[ndim];
+            long[] cropMax = new long[ndim];
+            boolean needsCrop = false;
+            for (int ax = 0; ax < ndim; ax++) {
+                long reqStart = sliceHint.getStart(ax);
+                long reqStop  = sliceHint.getStop(ax);
+                long retStart = realized.getStart(ax);
+                long scale = 1L;
+                if (context.descriptor.hasReadOptions()
+                        && context.descriptor.getReadOptions().getScaleHintCount() > ax) {
+                    scale = context.descriptor.getReadOptions().getScaleHint(ax);
+                }
+                if (scale > 1L) {
+                    cropMin[ax] = (reqStart - retStart) / scale;
+                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
+                } else {
+                    cropMin[ax] = reqStart - retStart;
+                    cropMax[ax] = reqStop  - retStart - 1L;
+                }
+                if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
+                    needsCrop = true;
+                }
+            }
+            if (needsCrop) {
+                rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
+            }
+        }
+        return rai;
     }
 
     /**

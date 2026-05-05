@@ -231,11 +231,36 @@ class TensorFlightClient:
             chunk_bounds_list.append(bounds)
 
         # Build dask array from chunks
-        return self._build_dask_array(
+        dask_arr = self._build_dask_array(
             desc=response_desc,
             chunks=chunks,
             chunk_bounds=chunk_bounds_list,
         )
+
+        # Crop to the originally requested region.
+        # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
+        # the returned descriptor.shape may be larger than what was requested.
+        # We crop the dask array back to the exact requested region here.
+        if slice_hint_proto is not None and response_desc.HasField('slice_hint'):
+            realized = response_desc.slice_hint
+            ndim = len(response_desc.shape)
+            scale = list(read_options.scale_hint) if read_options and len(read_options.scale_hint) > 0 else None
+            crop = []
+            for ax in range(ndim):
+                req_start = int(slice_hint_proto.start[ax])
+                req_stop = int(slice_hint_proto.stop[ax])
+                ret_start = int(realized.start[ax])
+                s = int(scale[ax]) if scale and ax < len(scale) else 1
+                if s > 1:
+                    logical_start = (req_start - ret_start) // s
+                    logical_stop = (req_stop - ret_start + s - 1) // s
+                else:
+                    logical_start = req_start - ret_start
+                    logical_stop = req_stop - ret_start
+                crop.append(slice(logical_start, logical_stop))
+            dask_arr = dask_arr[tuple(crop)]
+
+        return dask_arr
 
     def _build_dask_array(
         self,
