@@ -16,6 +16,7 @@ from biopb.tensor import (
 from biopb_tensor_server import ZarrAdapter, OmeZarrAdapter
 from biopb_tensor_server.config import parse_config
 from biopb_tensor_server import base as tensor_adapter
+from biopb_tensor_server import downsample as _ds
 
 
 def _zarr_available() -> bool:
@@ -147,11 +148,11 @@ class TestComputeBackendSelection:
     """Tests for internal CPU/GPU backend heuristics."""
 
     def test_nearest_prefers_cpu(self, monkeypatch):
-        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
-        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.setattr(_ds, '_HAS_CUPY', True)
+        monkeypatch.setattr(_ds, '_get_gpu_free_bytes', lambda: 1 << 30)
         monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
 
-        backend = tensor_adapter._select_compute_backend(
+        backend = _ds._select_compute_backend(
             source_shape=(4096, 4096),
             dtype=np.dtype('uint8'),
             reduction_method='nearest',
@@ -162,12 +163,12 @@ class TestComputeBackendSelection:
         assert backend == 'cpu'
 
     def test_large_linear_prefers_gpu(self, monkeypatch):
-        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
-        monkeypatch.setattr(tensor_adapter, 'cupy_ndimage', object())
-        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.setattr(_ds, '_HAS_CUPY', True)
+        monkeypatch.setattr(_ds, 'cupy_ndimage', object())
+        monkeypatch.setattr(_ds, '_get_gpu_free_bytes', lambda: 1 << 30)
         monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
 
-        backend = tensor_adapter._select_compute_backend(
+        backend = _ds._select_compute_backend(
             source_shape=(4096, 4096),
             dtype=np.dtype('uint16'),
             reduction_method='linear',
@@ -178,11 +179,11 @@ class TestComputeBackendSelection:
         assert backend == 'gpu'
 
     def test_force_cpu_override(self, monkeypatch):
-        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', True)
-        monkeypatch.setattr(tensor_adapter, '_get_gpu_free_bytes', lambda: 1 << 30)
+        monkeypatch.setattr(_ds, '_HAS_CUPY', True)
+        monkeypatch.setattr(_ds, '_get_gpu_free_bytes', lambda: 1 << 30)
         monkeypatch.setenv('BIOPB_TENSOR_FORCE_BACKEND', 'cpu')
 
-        backend = tensor_adapter._select_compute_backend(
+        backend = _ds._select_compute_backend(
             source_shape=(8192, 8192),
             dtype=np.dtype('uint16'),
             reduction_method='area',
@@ -193,10 +194,10 @@ class TestComputeBackendSelection:
         assert backend == 'cpu'
 
     def test_force_gpu_falls_back_without_cupy(self, monkeypatch):
-        monkeypatch.setattr(tensor_adapter, '_HAS_CUPY', False)
+        monkeypatch.setattr(_ds, '_HAS_CUPY', False)
         monkeypatch.setenv('BIOPB_TENSOR_FORCE_BACKEND', 'gpu')
 
-        backend = tensor_adapter._select_compute_backend(
+        backend = _ds._select_compute_backend(
             source_shape=(8192, 8192),
             dtype=np.dtype('uint16'),
             reduction_method='area',
