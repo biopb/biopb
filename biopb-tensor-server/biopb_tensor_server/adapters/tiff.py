@@ -7,21 +7,19 @@ import struct
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
-import numpy as np
 import pyarrow as pa
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
+from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.chunk import (
     ChunkEndpoint,
-    _decode_chunk_id,
-    _encode_chunk_id,
-    _chunks_intersect,
+    encode_chunk_id,
+    get_backend_data,
 )
 from biopb_tensor_server.discovery import SourceClaim, get_file_identity
-from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -234,75 +232,54 @@ class OmeTiffAdapter(BackendAdapter):
         # Non-spatial dimensions (like channel/time) have chunk size = 1
         self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def list_tensor_descriptors(self):
         # Get dtype from first page
         first_page = self.tiff_file.pages[0]
         dtype = first_page.dtype
 
-        return TensorDescriptor(
+        return [TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=self.full_shape,
             chunk_shape=self.chunk_shape,
             dtype=str(dtype),
-        )
+        )]
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
-        endpoints = []
-
-        # Iterate over all IFDs (pages/planes)
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this OME-TIFF file."""
         n_pages = len(self.tiff_file.pages)
 
         for ifd_index in range(n_pages):
-            # Compute plane offset in full array
             plane_offset = ifd_index
 
-            # Iterate over tiles in this page
             for tile_row in range(self.tiles_per_col):
                 for tile_col in range(self.tiles_per_row):
-                    # Compute chunk bounds using precomputed tile dimensions
                     y_start = tile_row * self.tile_length
                     y_stop = min((tile_row + 1) * self.tile_length, self.series_shape[-2])
                     x_start = tile_col * self.tile_width
                     x_stop = min((tile_col + 1) * self.tile_width, self.series_shape[-1])
 
-                    # Build chunk bounds to match dimensionality of full_shape
                     n_dims = len(self.full_shape)
                     chunk_start = [0] * n_dims
                     chunk_stop = list(self.full_shape)
 
-                    # First dimension: plane indexed by ifd_index
                     chunk_start[0] = plane_offset
                     chunk_stop[0] = plane_offset + 1
-
-                    # Last two dimensions: y and x are tiled
                     chunk_start[-2] = y_start
                     chunk_stop[-2] = y_stop
                     chunk_start[-1] = x_start
                     chunk_stop[-1] = x_stop
 
-                    if slice_hint is not None:
-                        if not _chunks_intersect(
-                            chunk_start, chunk_stop,
-                            list(slice_hint.start), list(slice_hint.stop)
-                        ):
-                            continue
+                    chunk_id = encode_chunk_id(self.array_id, _encode_ome_tile(ifd_index, (tile_row, tile_col)))
 
-                    chunk_id = _encode_chunk_id(self.array_id, _encode_ome_tile(ifd_index, (tile_row, tile_col)))
-
-                    endpoints.append(ChunkEndpoint(
+                    yield ChunkEndpoint(
                         chunk_id=chunk_id,
                         bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-                    ))
-
-        return endpoints
+                    )
 
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
         """Decode a tile from the TIFF file (no caching - relies on OS page cache)."""
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         ifd_index, tile_indices = _decode_ome_tile(backend_data)
         tile_row, tile_col = tile_indices
 
@@ -598,8 +575,9 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             array_id: Unique identifier for this tensor
             dim_labels: Optional dimension labels
         """
-        import tifffile
         from pathlib import Path
+
+        import tifffile
 
         self.directory = Path(directory)
         self.array_id = array_id
@@ -828,31 +806,27 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         # Normalize common spatial label variants for downstream axis mapping.
         for idx, label in enumerate(self.dim_labels):
-            l = str(label).lower()
-            if l in ("y", "height"):
+            label_lower = str(label).lower()
+            if label_lower in ("y", "height"):
                 self.dim_labels[idx] = "y"
-            elif l in ("x", "width"):
+            elif label_lower in ("x", "width"):
                 self.dim_labels[idx] = "x"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def list_tensor_descriptors(self):
         first_page = self.tiff_file.pages[0]
         dtype = first_page.dtype
 
-        return TensorDescriptor(
+        return [TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=self.full_shape,
             chunk_shape=self.chunk_shape,
             dtype=str(dtype),
-        )
+        )]
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this multi-file OME-TIFF dataset."""
         import tifffile
-
-        endpoints = []
 
         for global_ifd_index in range(self._total_ifds):
             file_index, local_ifd_index = self._ifd_to_file[global_ifd_index]
@@ -871,50 +845,37 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                         x_start = tile_col * self.tile_width
                         x_stop = min((tile_col + 1) * self.tile_width, page.shape[1])
 
-                        # Build chunk bounds to match dimensionality of full_shape
                         n_dims = len(self.full_shape)
                         chunk_start = [0] * n_dims
                         chunk_stop = list(self.full_shape)
 
-                        # First dimension: file/time indexed by file_index
                         chunk_start[0] = file_index
                         chunk_stop[0] = file_index + 1
 
-                        # Second dimension (if it exists): page/channel indexed by local_ifd_index
                         if n_dims > 3:
                             chunk_start[1] = local_ifd_index
                             chunk_stop[1] = local_ifd_index + 1
 
-                        # Last two dimensions: y and x are tiled
                         chunk_start[-2] = y_start
                         chunk_stop[-2] = y_stop
                         chunk_start[-1] = x_start
                         chunk_stop[-1] = x_stop
 
-                        if slice_hint is not None:
-                            if not _chunks_intersect(
-                                chunk_start, chunk_stop,
-                                list(slice_hint.start), list(slice_hint.stop)
-                            ):
-                                continue
-
-                        chunk_id = _encode_chunk_id(
+                        chunk_id = encode_chunk_id(
                             self.array_id,
                             _encode_ome_multifile_tile(file_index, local_ifd_index, (tile_row, tile_col))
                         )
 
-                        endpoints.append(ChunkEndpoint(
+                        yield ChunkEndpoint(
                             chunk_id=chunk_id,
                             bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-                        ))
-
-        return endpoints
+                        )
 
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
         """Decode a tile from the multi-file dataset (no caching)."""
         import tifffile
 
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         file_index, local_ifd_index, tile_indices = _decode_ome_multifile_tile(backend_data)
         tile_row, tile_col = tile_indices
 

@@ -6,17 +6,22 @@ and scaled read planning.
 
 import os
 import tempfile
-import pytest
-import numpy as np
 
+import numpy as np
+import pytest
 from biopb.tensor import (
     SliceHint,
+    TensorDescriptor,
     TensorReadOptions,
 )
-from biopb_tensor_server import ZarrAdapter, OmeZarrAdapter
+
+from biopb_tensor_server import (
+    OmeZarrAdapter,
+    ZarrAdapter,
+    base as tensor_adapter,
+    downsample as _ds,
+)
 from biopb_tensor_server.config import parse_config
-from biopb_tensor_server import base as tensor_adapter
-from biopb_tensor_server import downsample as _ds
 
 
 def _zarr_available() -> bool:
@@ -208,25 +213,26 @@ class TestComputeBackendSelection:
         assert backend == 'cpu'
 
     def test_configure_compute_backend_updates_thresholds(self, monkeypatch):
+        from biopb_tensor_server import get_compute_backend_options, configure_compute_backend
         monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
-        original = tensor_adapter.get_compute_backend_options()
+        original = get_compute_backend_options()
 
         try:
-            tensor_adapter.configure_compute_backend(
+            configure_compute_backend(
                 force_backend='gpu',
                 gpu_min_input_bytes=123,
                 gpu_min_linear_input_bytes=45,
                 gpu_memory_safety_factor=7,
                 gpu_min_merged_chunks=9,
             )
-            options = tensor_adapter.get_compute_backend_options()
+            options = get_compute_backend_options()
             assert options.force_backend == 'gpu'
             assert options.gpu_min_input_bytes == 123
             assert options.gpu_min_linear_input_bytes == 45
             assert options.gpu_memory_safety_factor == 7
             assert options.gpu_min_merged_chunks == 9
         finally:
-            tensor_adapter.configure_compute_backend(**original.__dict__)
+            configure_compute_backend(**original.__dict__)
 
 
 class TestGetScaledReadPlan:
@@ -245,11 +251,14 @@ class TestGetScaledReadPlan:
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
 
             # Test that default implementation produces virtual scaling plan
-            plan = adapter.get_scaled_read_plan(
-                scale_hint=(2, 2),
-                slice_hint=None,
+            request_desc = TensorDescriptor(
+                array_id='test',
+                shape=[100, 100],
+                chunk_shape=[50, 50],
+                dtype='uint8',
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
             )
+            plan = adapter.get_read_plan(request_desc)
 
             # Should have virtual chunks (2x2 grid = 4 chunks)
             assert len(plan.chunk_endpoints) == 4
@@ -268,11 +277,15 @@ class TestGetScaledReadPlan:
 
             adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
 
-            plan = adapter.get_scaled_read_plan(
-                scale_hint=(2, 2),
+            request_desc = TensorDescriptor(
+                array_id='test',
+                shape=[100, 100],
+                chunk_shape=[50, 50],
+                dtype='uint8',
                 slice_hint=SliceHint(start=[10, 10], stop=[50, 50]),
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
             )
+            plan = adapter.get_read_plan(request_desc)
 
             # Slice [10,10]->[50,50] intersects chunk [0,50]x[0,50].
             # Realized (snapped) source bounds = [0,0]->[50,50] -> shape (50/2, 50/2) = (25, 25)
@@ -286,6 +299,7 @@ class TestOmeZarrPrecompute:
     def test_find_level_for_scale(self):
         """Test _find_level_for_scale parses multiscales correctly."""
         import json
+
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -328,6 +342,7 @@ class TestOmeZarrPrecompute:
     def test_get_scaled_read_plan_precompute(self):
         """Test get_scaled_read_plan with precompute method."""
         import json
+
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -358,11 +373,14 @@ class TestOmeZarrPrecompute:
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with precompute method
-            plan = adapter.get_scaled_read_plan(
-                scale_hint=(2, 2),
-                slice_hint=None,
+            request_desc = TensorDescriptor(
+                array_id='test',
+                shape=[100, 100],
+                chunk_shape=[50, 50],
+                dtype='uint8',
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='precompute'),
             )
+            plan = adapter.get_read_plan(request_desc)
 
             # Should return level 1's shape
             assert list(plan.descriptor.shape) == [50, 50]
@@ -372,6 +390,7 @@ class TestOmeZarrPrecompute:
     def test_precompute_no_match_raises(self):
         """Test that precompute raises error when no matching level."""
         import json
+
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -399,17 +418,21 @@ class TestOmeZarrPrecompute:
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with non-matching scale
+            request_desc = TensorDescriptor(
+                array_id='test',
+                shape=[100, 100],
+                chunk_shape=[50, 50],
+                dtype='uint8',
+                read_options=TensorReadOptions(scale_hint=[3, 3], reduction_method='precompute'),
+            )
             with pytest.raises(ValueError, match="No precomputed level matching"):
-                adapter.get_scaled_read_plan(
-                    scale_hint=(3, 3),
-                    slice_hint=None,
-                    read_options=TensorReadOptions(scale_hint=[3, 3], reduction_method='precompute'),
-                )
+                adapter.get_read_plan(request_desc)
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_precompute_falls_back_to_virtual_for_other_methods(self):
         """Test that non-precompute methods use virtual scaling."""
         import json
+
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -437,11 +460,14 @@ class TestOmeZarrPrecompute:
             adapter = OmeZarrAdapter(base_arr, 'test')
 
             # Request with nearest method (not precompute)
-            plan = adapter.get_scaled_read_plan(
-                scale_hint=(2, 2),
-                slice_hint=None,
+            request_desc = TensorDescriptor(
+                array_id='test',
+                shape=[100, 100],
+                chunk_shape=[50, 50],
+                dtype='uint8',
                 read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
             )
+            plan = adapter.get_read_plan(request_desc)
 
             # Should use virtual scaling (shape based on base / scale)
             assert list(plan.descriptor.shape) == [50, 50]
@@ -456,6 +482,7 @@ class TestSliceConversion:
     def test_convert_slice_to_level(self):
         """Test slice conversion from base to level coordinates."""
         import json
+
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:

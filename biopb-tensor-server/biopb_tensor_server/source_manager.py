@@ -26,7 +26,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (

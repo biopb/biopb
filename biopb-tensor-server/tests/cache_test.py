@@ -1,88 +1,35 @@
 """Thread-safety tests for cache module."""
 
-import os
 import shutil
+import tempfile
 import threading
 import time
-import tempfile
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
 from biopb_tensor_server.cache import (
-    CacheBackend,
-    CacheEntry,
-    CacheKey,
-    CacheStats,
-    CacheManager,
-    MemoryCacheBackend,
-    EntryState,
     MAX_ARROW_BATCH_BYTES,
+    CacheEntry,
+    CacheManager,
+    EntryState,
+    MemoryCacheBackend,
 )
-from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import (
+    SIZE_CLASS_MEDIUM_THRESHOLD,
+    SIZE_CLASS_SMALL_THRESHOLD,
+    SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
     _get_size_class,
-    SIZE_CLASS_TINY_THRESHOLD,
-    SIZE_CLASS_SMALL_THRESHOLD,
-    SIZE_CLASS_MEDIUM_THRESHOLD,
 )
+from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.recovery import (
-    WriteAheadLog,
     ProcessLock,
-    RecoveryStatus,
+    WriteAheadLog,
 )
 from biopb_tensor_server.config import CacheConfig
-
-
-class TestCacheKey:
-    """Tests for CacheKey serialization."""
-
-    def test_to_bytes_roundtrip(self):
-        """Test consistent serialization."""
-        key1 = CacheKey(
-            array_id="test-array",
-            scale_hint=(2, 2, 2),
-            source_start=(0, 0, 0),
-            source_stop=(100, 100, 100),
-            valid_stop=(100, 100, 100),
-            reduction_method="nearest",
-        )
-        key2 = CacheKey(
-            array_id="test-array",
-            scale_hint=(2, 2, 2),
-            source_start=(0, 0, 0),
-            source_stop=(100, 100, 100),
-            valid_stop=(100, 100, 100),
-            reduction_method="nearest",
-        )
-        assert key1.to_bytes() == key2.to_bytes()
-
-    def test_different_keys_different_bytes(self):
-        """Different keys produce different bytes."""
-        key1 = CacheKey(array_id="array1", scale_hint=(2, 2), source_start=(0, 0),
-                        source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        key2 = CacheKey(array_id="array2", scale_hint=(2, 2), source_start=(0, 0),
-                        source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        assert key1.to_bytes() != key2.to_bytes()
-
-    def test_different_scale_different_bytes(self):
-        """Different scales produce different bytes."""
-        key1 = CacheKey(array_id="test", scale_hint=(2, 2), source_start=(0, 0),
-                        source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        key2 = CacheKey(array_id="test", scale_hint=(4, 4), source_start=(0, 0),
-                        source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        assert key1.to_bytes() != key2.to_bytes()
-
-    def test_to_string_readable(self):
-        """Human readable representation."""
-        key = CacheKey(array_id="test", scale_hint=(2, 2), source_start=(0, 0),
-                       source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        s = key.to_string()
-        assert "test" in s
-        assert "nearest" in s
 
 
 class TestCacheEntry:
@@ -477,30 +424,6 @@ class TestConcurrentCompute:
         result = entry2.wait_ready(timeout=0.1)
         assert result is False  # Timeout occurred
         backend.close()
-
-
-class TestCacheKeyIntegration:
-    """Tests for CacheKey with virtual chunk parameters."""
-
-    def test_cache_key_from_virtual_chunk_params(self):
-        """CacheKey from virtual chunk decode."""
-        key = CacheKey(
-            array_id="test-array",
-            scale_hint=(2, 2, 2),
-            source_start=(0, 0, 0),
-            source_stop=(128, 128, 128),
-            valid_stop=(128, 128, 128),
-            reduction_method="nearest",
-        )
-        assert len(key.to_bytes()) > 0
-
-    def test_different_regions_different_keys(self):
-        """Different regions produce different keys."""
-        key1 = CacheKey(array_id="test", scale_hint=(2, 2), source_start=(0, 0),
-                        source_stop=(100, 100), valid_stop=(100, 100), reduction_method="nearest")
-        key2 = CacheKey(array_id="test", scale_hint=(2, 2), source_start=(100, 0),
-                        source_stop=(200, 100), valid_stop=(200, 100), reduction_method="nearest")
-        assert key1.to_bytes() != key2.to_bytes()
 
 
 class TestArrowFileBackend:

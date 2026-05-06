@@ -17,10 +17,9 @@ Key components:
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Set, Type, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Set, Type
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter

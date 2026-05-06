@@ -4,7 +4,6 @@ Unit tests use FastAPI TestClient with a mocked TensorFlightClient.
 Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 """
 
-import json
 import threading
 import time
 from types import SimpleNamespace
@@ -12,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-
 from fastapi.testclient import TestClient
 
 from biopb_tensor_server.http_server import create_app
@@ -581,7 +579,8 @@ class TestIntegration:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         import zarr
-        from biopb_tensor_server import ZarrAdapter, TensorFlightServer
+
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
         # Create a small Zarr array
         zarr_path = str(tmp_path / "test.zarr")

@@ -8,21 +8,20 @@ Implements:
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Optional, Callable, Tuple
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
+    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
-    CacheKey,
     CacheStats,
     EntryState,
-    MAX_ARROW_BATCH_BYTES,
 )
 
 
@@ -179,7 +178,7 @@ class MemoryCacheBackend(CacheBackend):
         # If pending (either waiting on another thread or we just completed), wait
         if entry.state == EntryState.PENDING:
             if not entry.wait_ready(self._config.pending_timeout):
-                raise TimeoutError(f"Cache computation timed out for key")
+                raise TimeoutError("Cache computation timed out for key")
 
         # Now acquire and return
         with self._lock:

@@ -21,9 +21,6 @@ Authentication:
 from __future__ import annotations
 
 import collections
-import json
-import math
-import os
 import re
 import secrets
 import threading
@@ -32,17 +29,13 @@ from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor.client import TensorFlightClient
+from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
-from biopb.tensor.descriptor_pb2 import SliceHint, TensorReadOptions
-from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
-from biopb.tensor.client import TensorFlightClient
-
 
 # ---------------------------------------------------------------------------
 # Version / constants

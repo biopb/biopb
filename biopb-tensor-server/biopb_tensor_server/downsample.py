@@ -9,10 +9,10 @@ This module is self-contained (no protobuf / Arrow dependencies) and handles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
 import importlib
 import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import numpy as np
 

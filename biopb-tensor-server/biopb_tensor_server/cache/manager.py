@@ -7,14 +7,17 @@ safe concurrent computation of virtual chunks.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
 import threading
+from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import CacheBackend, CacheEntry, CacheStats
-from biopb_tensor_server.cache.memory_backend import MemoryCacheBackend, MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.memory_backend import (
+    MemoryCacheBackend,
+    MemoryCacheConfig,
+)
 from biopb_tensor_server.config import CacheConfig
 
 

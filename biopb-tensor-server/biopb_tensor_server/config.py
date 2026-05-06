@@ -41,22 +41,20 @@ dataset = "/images"
 
 from __future__ import annotations
 
-import hashlib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Literal
+from typing import Any, Dict, List, Literal, Optional
 
+from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
-    DiscoveryState,
-    SourceClaim,
     AdapterRegistry,
+    SourceClaim,
     discover_sources as claim_based_discover,
     generate_source_id,
-    is_remote_url,
     get_file_identity,
+    is_remote_url,
 )
-from biopb_tensor_server.adapters import get_default_registry
 
 # Alias for backward compatibility with internal usage
 _is_remote_url = is_remote_url
@@ -415,7 +413,7 @@ def scan_directory_for_sources(
 
     # Print warnings for skipped files (only at top level to avoid spam)
     if skipped_hdf5 and directory == directory:
-        print(f"Warning: Skipped HDF5 files (require explicit 'type' and 'dataset' in config):")
+        print("Warning: Skipped HDF5 files (require explicit 'type' and 'dataset' in config):")
         for h5_path in skipped_hdf5[:5]:  # Limit to 5 to avoid spam
             print(f"  - {h5_path}")
         if len(skipped_hdf5) > 5:

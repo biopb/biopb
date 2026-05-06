@@ -6,25 +6,22 @@ Relies on OS page cache for raw data caching.
 import json
 import os
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-import numpy as np
 import pyarrow as pa
-
-from biopb_tensor_server.base import (
-    BackendAdapter,
-    ChunkEndpoint,
-    TensorReadPlan,
-    _decode_chunk_id,
-    _encode_chunk_id,
-    _chunks_intersect,
-    _normalize_reduction_method,
-)
-from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.discovery import SourceClaim
+from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions
+
+from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.base import BackendAdapter, TensorReadPlan
+from biopb_tensor_server.chunk import (
+    ChunkEndpoint,
+    encode_chunk_id,
+    get_backend_data,
+)
+from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.downsample import _normalize_reduction_method
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -90,8 +87,9 @@ class OmeZarrAdapter(BackendAdapter):
         Returns:
             OmeZarrAdapter instance
         """
-        import zarr
         import json
+
+        import zarr
 
         zarr_path = str(source.url)
         store = zarr.DirectoryStore(zarr_path)
@@ -193,7 +191,7 @@ class OmeZarrAdapter(BackendAdapter):
 
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
         """Read a chunk from zarr (no caching - relies on OS page cache)."""
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
         chunks = self.zarr_array.chunks
@@ -207,24 +205,20 @@ class OmeZarrAdapter(BackendAdapter):
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        return TensorDescriptor(
+    def list_tensor_descriptors(self):
+        return [TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
             chunk_shape=list(self.zarr_array.chunks),
             dtype=self.zarr_array.dtype.str,
-        )
+        )]
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this OME-Zarr array."""
         shape = self.zarr_array.shape
         chunks = self.zarr_array.chunks
         ndim = len(shape)
-
-        endpoints = []
 
         def iter_chunk_indices(dim: int = 0, prefix: Tuple[int, ...] = ()):
             if dim == ndim:
@@ -241,22 +235,13 @@ class OmeZarrAdapter(BackendAdapter):
                 for d, idx in enumerate(chunk_idx)
             ]
 
-            if slice_hint is not None:
-                if not _chunks_intersect(
-                    chunk_start, chunk_stop,
-                    list(slice_hint.start), list(slice_hint.stop)
-                ):
-                    continue
-
             chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = _encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
+            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
 
-            endpoints.append(ChunkEndpoint(
+            yield ChunkEndpoint(
                 chunk_id=chunk_id,
                 bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            ))
-
-        return endpoints
+            )
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""
@@ -282,23 +267,28 @@ class OmeZarrAdapter(BackendAdapter):
         """Return OME-Zarr .zattrs content directly."""
         return self.ome_metadata
 
-    def get_scaled_read_plan(
-        self,
-        scale_hint: Tuple[int, ...],
-        slice_hint: Optional[SliceHint],
-        read_options: Optional[TensorReadOptions],
-    ) -> TensorReadPlan:
+    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
         """Return read plan for requested scale.
 
         Supports "precompute" method to use precomputed pyramid levels.
         Falls back to virtual scaling for other methods.
         """
+        # Extract parameters from request_desc
+        slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
+        read_options = request_desc.read_options if request_desc.HasField('read_options') else None
+
+        # Compute scale_hint from read_options
+        base_desc = self.get_tensor_descriptor()
+        base_shape = tuple(int(dim) for dim in base_desc.shape)
+        from biopb_tensor_server.base import _normalized_scale_hint
+        scale_hint = _normalized_scale_hint(base_shape, read_options)
+
         reduction_method = _normalize_reduction_method(
             read_options.reduction_method if read_options else None
         )
 
         # "precompute" method: use precomputed level if exact match
-        if reduction_method == 'precompute':
+        if reduction_method == 'precompute' and scale_hint is not None:
             level_path = self._find_level_for_scale(scale_hint)
 
             if level_path is None:
@@ -315,7 +305,7 @@ class OmeZarrAdapter(BackendAdapter):
             return self._plan_from_precomputed(level_path, level_slice)
 
         # Other methods: use default virtual scaling
-        return super().get_scaled_read_plan(scale_hint, slice_hint, read_options)
+        return super().get_read_plan(request_desc)
 
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[str]:
         """Find precomputed level with exact scale match."""

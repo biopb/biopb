@@ -12,10 +12,10 @@ Usage:
 from biopb_tensor_server.base import BackendAdapter
 from biopb_tensor_server.discovery import AdapterRegistry
 
-from .zarr import ZarrAdapter
 from .hdf5 import Hdf5Adapter
-from .tiff import OmeTiffAdapter, MultiFileOmeTiffAdapter
 from .ome_zarr import OmeZarrAdapter
+from .tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
+from .zarr import ZarrAdapter
 
 # Optional aicsimageio adapter
 try:

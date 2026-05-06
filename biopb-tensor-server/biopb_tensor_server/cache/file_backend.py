@@ -10,22 +10,21 @@ Implements segmented storage with:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, Literal, Optional, Tuple
 
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
+    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
     CacheStats,
     EntryState,
-    MAX_ARROW_BATCH_BYTES,
 )
 from biopb_tensor_server.cache.recovery import (
     ProcessLock,
@@ -34,7 +33,6 @@ from biopb_tensor_server.cache.recovery import (
     SegmentInfo,
     WriteAheadLog,
 )
-
 
 logger = logging.getLogger(__name__)
 

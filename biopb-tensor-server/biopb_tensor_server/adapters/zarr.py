@@ -4,20 +4,19 @@ Relies on OS page cache for raw data caching.
 """
 
 from pathlib import Path
-from typing import List, Optional, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set
 
-import numpy as np
 import pyarrow as pa
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
+from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.chunk import (
     ChunkEndpoint,
-    _decode_chunk_id,
-    _encode_chunk_id,
+    encode_chunk_id,
+    get_backend_data,
 )
 from biopb_tensor_server.discovery import SourceClaim
-from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -131,7 +130,7 @@ class ZarrAdapter(BackendAdapter):
 
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
         """Read a chunk from zarr (no caching - relies on OS page cache)."""
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
         chunks = self.zarr_array.chunks
@@ -146,24 +145,20 @@ class ZarrAdapter(BackendAdapter):
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        return TensorDescriptor(
+    def list_tensor_descriptors(self):
+        return [TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
             chunk_shape=list(self.zarr_array.chunks),
             dtype=self.zarr_array.dtype.str,
-        )
+        )]
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this zarr array."""
         shape = self.zarr_array.shape
         chunks = self.zarr_array.chunks
         ndim = len(shape)
-
-        endpoints = []
 
         def iter_chunk_indices(dim: int = 0, prefix: tuple = ()):
             if dim == ndim:
@@ -180,23 +175,10 @@ class ZarrAdapter(BackendAdapter):
                 for d, idx in enumerate(chunk_idx)
             ]
 
-            # Filter by slice_hint
-            if slice_hint is not None:
-                # Check intersection
-                intersects = True
-                for d in range(ndim):
-                    if chunk_stop[d] <= slice_hint.start[d] or chunk_start[d] >= slice_hint.stop[d]:
-                        intersects = False
-                        break
-                if not intersects:
-                    continue
-
             chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = _encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
+            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
 
-            endpoints.append(ChunkEndpoint(
+            yield ChunkEndpoint(
                 chunk_id=chunk_id,
                 bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            ))
-
-        return endpoints
+            )

@@ -4,16 +4,17 @@ Tests the full pipeline from adapter registration through client access
 to dask compute for each adapter type.
 """
 
-import os
+import importlib.util
 import threading
 import time
-import pytest
-import numpy as np
 
+import numpy as np
+import pytest
 from biopb.tensor import (
     TensorFlightClient,
     TensorReadOptions,
 )
+
 from biopb_tensor_server import TensorFlightServer
 
 
@@ -29,11 +30,7 @@ def _zarr_available() -> bool:
 
 def _h5py_available() -> bool:
     """Check if h5py is available."""
-    try:
-        import h5py
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("h5py") is not None
 
 
 class TestZarrIntegration:
@@ -43,6 +40,7 @@ class TestZarrIntegration:
     def test_server_client_roundtrip(self, simple_zarr_array):
         """Test basic server -> client -> dask compute workflow."""
         import zarr
+
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -84,6 +82,7 @@ class TestZarrIntegration:
     def test_scaled_read_integration(self, simple_zarr_array):
         """Test scaled reads through server/client."""
         import zarr
+
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -121,6 +120,7 @@ class TestOmeZarrIntegration:
     def test_precompute_level_access(self, multires_ome_zarr):
         """Test accessing precomputed pyramid levels."""
         import zarr
+
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
@@ -164,6 +164,7 @@ class TestOmeZarrIntegration:
     def test_virtual_scaling_with_ome_zarr(self, multires_ome_zarr):
         """Test virtual scaling when no matching precomputed level."""
         import zarr
+
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
@@ -208,6 +209,7 @@ class TestOmeTiffIntegration:
     def test_tiled_tiff_read(self, tiled_ome_tiff):
         """Test reading from tiled OME-TIFF through server."""
         import tifffile
+
         from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
 
         tiff_path, shape, tile_info = tiled_ome_tiff
@@ -244,6 +246,7 @@ class TestOmeTiffIntegration:
     def test_channel_access(self, tiled_ome_tiff):
         """Test accessing different channels through server."""
         import tifffile
+
         from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
 
         tiff_path, shape, tile_info = tiled_ome_tiff
@@ -359,6 +362,7 @@ class TestHdf5Integration:
     def test_hdf5_read(self, hdf5_dataset):
         """Test reading from HDF5 through server."""
         import h5py
+
         from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 
         h5_path, shape, chunks = hdf5_dataset
@@ -396,6 +400,7 @@ class TestCacheIntegration:
     def test_cache_hit_multiple_reads(self, simple_zarr_array):
         """Test that repeated reads hit cache."""
         import zarr
+
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -439,6 +444,7 @@ class TestCacheIntegration:
     def test_different_regions_different_cache_entries(self, simple_zarr_array):
         """Test that different regions create different cache entries."""
         import zarr
+
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -481,8 +487,10 @@ class TestConcurrentAccess:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_concurrent_reads_same_region(self, simple_zarr_array):
         """Test concurrent reads of same region hit same cache."""
-        import zarr
         import concurrent.futures
+
+        import zarr
+
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -518,6 +526,6 @@ class TestConcurrentAccess:
                 np.testing.assert_array_equal(datas[0], data)
 
             server.shutdown()
-        except Exception as e:
+        except Exception:
             server.shutdown()
             raise

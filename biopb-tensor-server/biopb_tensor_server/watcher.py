@@ -32,9 +32,9 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from multiprocessing import Process, Queue, Event
+from multiprocessing import Event, Process, Queue
 from pathlib import Path
-from typing import List, Optional, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Set
 
 if TYPE_CHECKING:
     from multiprocessing.process import Process as _Process
@@ -239,8 +239,8 @@ def _run_watchdog_subprocess(
         directories: Set of directory paths to monitor
         debounce_window: Time window for debouncing events
     """
-    from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
 
     # Event buffer for debouncing: path -> (event_type, timestamp, old_path)
     event_buffer: dict = {}
@@ -295,7 +295,7 @@ def _run_watchdog_subprocess(
     for directory in directories:
         try:
             observer.schedule(handler, str(directory), recursive=True)
-        except Exception as e:
+        except Exception:
             # Log to queue as error (main process will handle)
             queue.put(WatcherEvent(
                 event_type=WatcherEventType.DELETED,  # Use as error signal

@@ -9,8 +9,6 @@ This module is designed to be importable from both:
 """
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -114,7 +112,7 @@ def create_multifile_ome_dataset(
     skip_file_idx = n_files - 1 if not complete else -1
 
     # Build OME-XML metadata
-    ome_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
   <Image ID="Image:0" Name="test">
 """

@@ -5,21 +5,19 @@ Relies on OS page cache for raw data caching.
 
 import struct
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
-import numpy as np
 import pyarrow as pa
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
+from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.chunk import (
     ChunkEndpoint,
-    _decode_chunk_id,
-    _encode_chunk_id,
-    _chunks_intersect,
+    encode_chunk_id,
+    get_backend_data,
 )
 from biopb_tensor_server.discovery import SourceClaim
-from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -134,7 +132,7 @@ class Hdf5Adapter(BackendAdapter):
 
     def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
         """Read a chunk from HDF5 (no caching - relies on OS page cache)."""
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         chunk_idx = _decode_backend_coords(backend_data)
         chunks = self.h5_dataset.chunks
 
@@ -147,26 +145,21 @@ class Hdf5Adapter(BackendAdapter):
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        return TensorDescriptor(
+    def list_tensor_descriptors(self):
+        return [TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.h5_dataset.shape),
             chunk_shape=list(self.h5_dataset.chunks),
             dtype=self.h5_dataset.dtype.str,
-        )
+        )]
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this HDF5 dataset."""
         shape = self.h5_dataset.shape
         chunks = self.h5_dataset.chunks
         ndim = len(shape)
 
-        endpoints = []
-
-        # Iterate over all chunk indices
         def iter_chunk_indices(dim: int = 0, prefix: Tuple[int, ...] = ()):
             if dim == ndim:
                 yield prefix
@@ -182,18 +175,9 @@ class Hdf5Adapter(BackendAdapter):
                 for d, idx in enumerate(chunk_idx)
             ]
 
-            if slice_hint is not None:
-                if not _chunks_intersect(
-                    chunk_start, chunk_stop,
-                    list(slice_hint.start), list(slice_hint.stop)
-                ):
-                    continue
+            chunk_id = encode_chunk_id(self.array_id, _encode_backend_coords(chunk_idx))
 
-            chunk_id = _encode_chunk_id(self.array_id, _encode_backend_coords(chunk_idx))
-
-            endpoints.append(ChunkEndpoint(
+            yield ChunkEndpoint(
                 chunk_id=chunk_id,
                 bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            ))
-
-        return endpoints
+            )

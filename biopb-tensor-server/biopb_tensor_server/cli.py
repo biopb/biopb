@@ -7,34 +7,32 @@ Commands:
     list       List tensors in a config file
 """
 
-from pathlib import Path
-from typing import List, Optional, Tuple
-import json
 import os
 import secrets
 import threading
 import webbrowser
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb_tensor_server.config import (
-    load_config,
-    resolve_all_sources,
-    ServerConfig,
-    CacheConfig,
-    SourceConfig,
-)
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.base import configure_compute_backend
-from biopb_tensor_server.server import TensorFlightServer
-from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
-from biopb_tensor_server.watcher import get_watcher
+from biopb_tensor_server.config import (
+    CacheConfig,
+    ServerConfig,
+    SourceConfig,
+    load_config,
+    resolve_all_sources,
+)
+from biopb_tensor_server.http_server import run as run_http_server
+from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.source_manager import create_source_manager
-
+from biopb_tensor_server.watcher import get_watcher
 
 app = typer.Typer(
     name="biopb-tensor",

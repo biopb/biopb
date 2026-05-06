@@ -3,18 +3,18 @@
 Imports fixture factory functions from fixtures module and wraps them as pytest fixtures.
 """
 
-import pytest
 import tempfile
 
+import pytest
+
 from biopb_tensor_server.fixtures import (
+    create_hdf5_dataset,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
     create_multiresolution_ome_zarr,
     create_tiled_ome_tiff,
-    create_hdf5_dataset,
     create_zarr_array,
 )
-
 
 # =============================================================================
 # pytest fixtures using the factory functions

@@ -44,3 +44,15 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["biopb_tensor_server*"]
+
+[tool.ruff.lint]
+# Enable specific rules for import cleanup
+select = [
+    "F401", # Unused imports
+    "I",    # Import sorting (isort)
+]
+
+[tool.ruff.lint.isort]
+# Optional: customize isort behavior
+combine-as-imports = true
+force-single-line = false

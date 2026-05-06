@@ -13,13 +13,10 @@ from typing import Dict, Iterator, List, Optional
 
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection
+from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
-from biopb.tensor.ticket_pb2 import (
-    TensorTicket, ChunkBounds
-)
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection, DataSourceDescriptor
-
-from biopb_tensor_server.base import BackendAdapter, plan_tensor_read, resolve_chunk_data, _decode_chunk_id, build_arrow_schema
+from biopb_tensor_server.base import BackendAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
 
 
@@ -209,7 +206,7 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         for source_id, adapter in self._sources.items():
             source_desc = adapter.get_source_descriptor()
-            schema = build_arrow_schema(source_desc.tensors[0] if source_desc.tensors else adapter.get_tensor_descriptor())
+            schema = adapter.get_arrow_schema(source_desc.tensors[0] if source_desc.tensors else adapter.get_tensor_descriptor())
 
             # Create a FlightDescriptor for this source
             flight_descriptor = flight.FlightDescriptor.for_command(
@@ -267,7 +264,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if selection.HasField('read_options'):
             tensor_desc.read_options.CopyFrom(selection.read_options)
 
-        read_plan = plan_tensor_read(tensor_adapter, tensor_desc)
+        read_plan = tensor_adapter.get_read_plan(tensor_desc)
         schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
         # Populate metadata_json in response descriptor
@@ -311,7 +308,7 @@ class TensorFlightServer(flight.FlightServerBase):
         tensor_ticket = self._parse_ticket(ticket)
 
         # Decode array_id (source_id/tensor_id) from chunk_id
-        array_id, _ = _decode_chunk_id(tensor_ticket.chunk_id)
+        array_id, *_ = decode_chunk_id(tensor_ticket.chunk_id)
 
         # Find the adapter for this chunk
         # The array_id in chunk_id may be:
@@ -348,7 +345,7 @@ class TensorFlightServer(flight.FlightServerBase):
         cache_manager = CacheManager.get_instance()
 
         # Read the chunk (with caching for virtual chunks)
-        record_batch = resolve_chunk_data(adapter, tensor_ticket.chunk_id, cache_manager)
+        record_batch = adapter.resolve_chunk_data(tensor_ticket.chunk_id, cache_manager)
         return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
 
 

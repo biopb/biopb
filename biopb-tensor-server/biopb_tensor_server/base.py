@@ -17,51 +17,45 @@ uses the CacheManager with future/promise pattern for thread safety.
 
 from __future__ import annotations
 
+import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import lcm
 from pathlib import Path
-from typing import List, Optional, Tuple, Set, TYPE_CHECKING
-import struct
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
-
+from biopb.tensor.descriptor_pb2 import (
+    DataSourceDescriptor,
+    SliceHint,
+    TensorDescriptor,
+    TensorReadOptions,
+)
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, DataSourceDescriptor
+
+from biopb_tensor_server.chunk import (
+    ChunkEndpoint,
+    decode_chunk_id,
+    encode_chunk_id,
+    get_backend_data,
+)
 from biopb_tensor_server.downsample import (
-    ComputeBackendOptions,
-    configure_compute_backend,
-    get_compute_backend_options,
-    _normalize_reduction_method,
-    _ceil_div,
-    _logical_shape_for_scale,
-    _pad_array_edge,
-    _output_dtype,
     _cast_reduced_array,
+    _ceil_div,
     _downsample_block,
+    _logical_shape_for_scale,
+    _normalize_reduction_method,
+    _output_dtype,
+    _pad_array_edge,
 )
 
-# Arrow IPC has ~2GB batch size limit due to 32-bit offsets
-# Use a safe threshold slightly below the actual limit
-# (Also defined in cache/base.py for use by cache module)
 MAX_ARROW_BATCH_BYTES = 2 * 1024 * 1024 * 1024 - 1  # ~2GB
+_VIRTUAL_CHUNK_MAGIC = b'virt1'  # Magic prefix to identify virtual chunk payloads
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.discovery import SourceClaim
-
-
-@dataclass
-class ChunkEndpoint:
-    """A chunk with its metadata for Flight endpoint creation.
-
-    Attributes:
-        chunk_id: Backend-specific chunk identifier (bytes)
-        bounds: Array coordinates (start, stop) for this chunk
-    """
-    chunk_id: bytes
-    bounds: ChunkBounds
 
 
 @dataclass
@@ -70,17 +64,6 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
-
-
-def estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
-    """Estimate chunk size in bytes from shape and dtype."""
-    num_elements = int(np.prod(shape, dtype=np.int64))
-    return num_elements * np.dtype(dtype).itemsize
-
-
-def needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
-    """Check if chunk exceeds Arrow batch limit."""
-    return estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES
 
 
 class BackendAdapter(ABC):
@@ -124,158 +107,20 @@ class BackendAdapter(ABC):
         """
         pass
 
-    # === Instance methods ===
+    # === flight methods ===
 
     @abstractmethod
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the TensorDescriptor for this tensor.
-
-        Returns:
-            TensorDescriptor with array_id, shape, chunk_shape, dtype, dim_labels
-        """
-        pass
-
-    def get_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
-        """Get chunk endpoints, splitting oversized chunks if needed.
-
-        This method wraps the adapter-specific chunk discovery logic with
-        automatic splitting of chunks that exceed the Arrow batch size limit.
-
-        Args:
-            slice_hint: Optional slice range. If provided, return only chunks
-                       that intersect this range. If None, return all chunks.
-
-        Returns:
-            List of ChunkEndpoint objects with chunk_id and bounds.
-            Large chunks may be split into multiple sub-endpoints.
-        """
-        raw_endpoints = self._get_raw_chunk_endpoints(slice_hint)
-        desc = self.get_tensor_descriptor()
-
-        final_endpoints = []
-        for ep in raw_endpoints:
-            chunk_shape = tuple(stop - start for start, stop in zip(ep.bounds.start, ep.bounds.stop))
-            if needs_splitting(chunk_shape, desc.dtype):
-                sub_endpoints = self._split_chunk_endpoint(ep, desc.dtype)
-                final_endpoints.extend(sub_endpoints)
-            else:
-                final_endpoints.append(ep)
-
-        return final_endpoints
-
-    @abstractmethod
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
-        """Get raw chunk endpoints from the backend (before splitting).
-
-        Subclasses implement this to return their native chunk layout.
-        The base class get_chunk_endpoints() handles splitting logic.
-
-        Args:
-            slice_hint: Optional slice range. If provided, return only chunks
-                       that intersect this range. If None, return all chunks.
-
-        Returns:
-            List of ChunkEndpoint objects with chunk_id and bounds
-        """
-        pass
-
-    def _split_chunk_endpoint(
-        self,
-        ep: ChunkEndpoint,
-        dtype: str,
-    ) -> List[ChunkEndpoint]:
-        """Split an oversized endpoint into sub-endpoints within size limit.
-
-        Strategy: split along the largest axis for even division.
-        Each sub-endpoint has:
-        - chunk_id: parent_chunk_id with split encoding
-        - bounds: sub-bounds within parent (absolute coordinates)
-
-        Args:
-            ep: ChunkEndpoint to split
-            dtype: Data type string for size calculation
-
-        Returns:
-            List of sub-endpoints that each fit within the Arrow batch limit
-        """
-        parent_bounds = ep.bounds
-        parent_shape = tuple(stop - start for start, stop in zip(parent_bounds.start, parent_bounds.stop))
-        item_size = np.dtype(dtype).itemsize
-
-        # Calculate how many splits needed
-        parent_bytes = int(np.prod(parent_shape)) * item_size
-        n_splits = int(np.ceil(parent_bytes / MAX_ARROW_BATCH_BYTES))
-
-        # Choose axis with largest dimension
-        split_axis = max(range(len(parent_shape)), key=lambda ax: parent_shape[ax])
-
-        sub_endpoints = []
-        axis_size = parent_shape[split_axis]
-        # Compute sub-chunk size on split axis (distribute evenly, last one may be smaller)
-        sub_axis_size = axis_size // n_splits
-
-        for i in range(n_splits):
-            sub_start = list(parent_bounds.start)
-            sub_stop = list(parent_bounds.stop)
-
-            # Calculate sub-chunk bounds on split axis
-            axis_start = parent_bounds.start[split_axis] + i * sub_axis_size
-            axis_stop = min(
-                parent_bounds.start[split_axis] + (i + 1) * sub_axis_size,
-                parent_bounds.stop[split_axis]
-            )
-
-            sub_start[split_axis] = axis_start
-            sub_stop[split_axis] = axis_stop
-
-            sub_bounds = ChunkBounds(start=sub_start, stop=sub_stop)
-
-            # Encode split chunk_id
-            sub_chunk_id = _encode_chunk_id(
-                _decode_chunk_id(ep.chunk_id)[0],
-                _encode_split_chunk_payload(ep.chunk_id, sub_bounds, parent_bounds)
-            )
-
-            sub_endpoints.append(ChunkEndpoint(chunk_id=sub_chunk_id, bounds=sub_bounds))
-
-        return sub_endpoints
-
-    @abstractmethod
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Read a chunk's data as an Arrow RecordBatch.
-
-        Args:
-            chunk_id: Backend-specific chunk identifier
-
-        Returns:
-            Arrow RecordBatch containing the chunk's data
-        """
-        pass
-
-    # === Source-level methods (multifield support) ===
-
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors available in this source.
-
-        Single tensor adapters return [self.get_tensor_descriptor()].
-        Multi tensor adapters return list of descriptors for all contained tensors.
-
-        The metadata_json field is NOT populated in these descriptors.
-        Metadata is returned via GetFlightInfo in the response TensorDescriptor.
 
         Returns:
             List of TensorDescriptor for all tensors in this source
         """
-        return [self.get_tensor_descriptor()]
+        pass
+
 
     def get_tensor_adapter(self, tensor_id: str) -> 'BackendAdapter':
-        """Get BackendAdapter for a specific tensor within this source.
+        """ Factory method to return adapter with specific tensor context.
 
         Usually this is just self. But multi-tensor adapters may return 
         a new BackendAdapter for that tensor.
@@ -287,6 +132,7 @@ class BackendAdapter(ABC):
             BackendAdapter for the specified tensor
         """
         return self
+
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -303,8 +149,83 @@ class BackendAdapter(ABC):
             source_url=self._source_url if hasattr(self, '_source_url') else "",
             source_type=self._source_type if hasattr(self, '_source_type') else "",
             tensors=self.list_tensor_descriptors(),
-            metadata_json="",  # Not populated; returned via GetFlightInfo instead
+            metadata_json="",  # filled by GetFlightInfo()
         )
+
+
+    # === tensor methods ===
+
+    @abstractmethod
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Get raw chunk endpoints from the backend (before filtering/splitting).
+
+        Subclasses implement this to return their native chunk layout.
+        The base class get_chunk_endpoints() handles filtering and splitting.
+
+        Returns:
+            Iterator of ChunkEndpoint objects with chunk_id and bounds.
+            Adapters enumerate ALL chunks; filtering is done by base class.
+        """
+        pass
+
+
+    @abstractmethod
+    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
+        """Read a chunk's data as an Arrow RecordBatch.
+
+        Args:
+            chunk_id: Backend-specific chunk identifier
+
+        Returns:
+            Arrow RecordBatch containing the chunk's data
+        """
+        pass
+
+
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        """Return the TensorDescriptor for this adapter.
+
+        Returns:
+            TensorDescriptor with array_id, shape, chunk_shape, dtype, dim_labels
+        """
+        return self.list_tensor_descriptors()[0]  # Default: single tensor
+
+
+    def get_chunk_endpoints(
+        self,
+        slice_hint: Optional[SliceHint] = None
+    ) -> List[ChunkEndpoint]:
+        """Get unscaled chunk endpoints, filtering by slice_hint.
+
+        This method wraps the adapter-specific chunk discovery logic with
+        filtering by slice_hint (only chunks intersecting the slice).
+
+        Note: Chunk splitting is handled in get_read_plan() for oversized chunks.
+
+        Args:
+            slice_hint: Optional slice range. If provided, return only chunks
+                       that intersect this range. If None, return all chunks.
+
+        Returns:
+            List of ChunkEndpoint objects with chunk_id and bounds.
+        """
+        raw_endpoints = self.get_raw_chunk_endpoints()
+
+        # Filter by slice_hint if provided
+        if slice_hint is not None:
+            slice_start = list(slice_hint.start)
+            slice_stop = list(slice_hint.stop)
+            filtered_endpoints = [
+                ep for ep in raw_endpoints
+                if _chunks_intersect(
+                    list(ep.bounds.start), list(ep.bounds.stop),
+                    slice_start, slice_stop
+                )
+            ]
+            return filtered_endpoints
+
+        return list(raw_endpoints)
+
 
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
@@ -312,10 +233,23 @@ class BackendAdapter(ABC):
         Returns:
             Arrow Schema with tensor extension type
         """
-        return build_arrow_schema(desc or self.get_tensor_descriptor())
+        import importlib.metadata
+
+        desc = desc or self.get_tensor_descriptor()
+
+        dtype = np.dtype(desc.dtype)
+        field = pa.field("data", pa.from_numpy_dtype(dtype))
+
+        # Schema metadata: biopb version for compatibility tracking
+        metadata = {
+            "tensor_schema_version": importlib.metadata.version("biopb"),
+        }
+
+        return pa.schema([field], metadata=metadata)
+
 
     def get_metadata(self) -> dict:
-        """Return OME-compatible metadata as dict.
+        """Return metadata as dict. In most cases this is OME metadata.
 
         For OME-Zarr: returns parsed .zattrs (multiscales, axes, omero, etc.)
         For OME-TIFF: returns extracted OME-XML as JSON-compatible dict
@@ -326,141 +260,225 @@ class BackendAdapter(ABC):
         """
         return {}
 
-    def get_scaled_read_plan(
-        self,
-        scale_hint: Tuple[int, ...],
-        slice_hint: Optional[SliceHint],
-        read_options: Optional[TensorReadOptions],
-    ) -> TensorReadPlan:
-        """Return read plan for requested scale.
 
-        Default implementation: virtual scaling (compute virtual chunks from base).
-        Override in OmeZarrAdapter to support precomputed levels via method="precompute".
-
-        Args:
-            scale_hint: Per-dimension scale factors
-            slice_hint: Optional slice in base coordinates
-            read_options: Optional read options including reduction_method
-
-        Returns:
-            TensorReadPlan with descriptor and chunk endpoints
+    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
+        """Plan a logical tensor read by delegating to adapter.
         """
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
-        base_chunk_shape = tuple(int(dim) for dim in base_desc.chunk_shape)
-        ndim = len(base_shape)
-
+        chunk_shape = tuple(int(dim) for dim in base_desc.chunk_shape)
+        slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
+        read_options = request_desc.read_options if request_desc.HasField('read_options') else None
+        source_start, source_stop = _normalized_slice_bounds(base_shape, slice_hint)
+        scale_hint = _normalized_scale_hint(base_shape, read_options)
         reduction_method = _normalize_reduction_method(
             read_options.reduction_method if read_options else None
         )
+        ndim = len(base_shape)
 
-        # Step 1: find intersecting real chunks (slice_hint is in source coordinates)
-        source_start, source_stop = _normalized_slice_bounds(base_shape, slice_hint)
+        # find intersecting real chunks (slice_hint is in source coordinates)
         real_endpoints = self.get_chunk_endpoints(
             SliceHint(start=list(source_start), stop=list(source_stop))
             if slice_hint is not None else None
         )
+        realized_start = tuple(
+            min(int(ep.bounds.start[ax]) for ep in real_endpoints) for ax in range(ndim)
+        )
+        realized_stop = tuple(
+            max(int(ep.bounds.stop[ax]) for ep in real_endpoints) for ax in range(ndim)
+        )
+        realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
 
-        # Step 2: snap the real-chunk bounding box to lcm-group boundaries so that
-        # each virtual chunk covers a whole number of real chunks and a whole number
-        # of output pixels (handles cases like z-chunk=1, scale=2).
-        lcm_per_axis = tuple(lcm(base_chunk_shape[ax], scale_hint[ax]) for ax in range(ndim))
-        if real_endpoints:
-            bbox_start = tuple(
-                min(int(ep.bounds.start[ax]) for ep in real_endpoints) for ax in range(ndim)
+        if scale_hint is None:
+            # Real branch: check for oversized chunks and split if needed
+            logical_endpoints: List[ChunkEndpoint] = []
+            for endpoint in real_endpoints:
+                chunk_shape = tuple(int(stop - start) for start, stop in zip(endpoint.bounds.start, endpoint.bounds.stop))
+                if _needs_splitting(chunk_shape, base_desc.dtype):
+                    shifted_bounds = ChunkBounds(
+                        start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
+                        stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
+                    )
+                    shifted_endpoint = ChunkEndpoint(chunk_id=endpoint.chunk_id, bounds=shifted_bounds)
+                    sub_endpoints = _split_endpoint(base_desc.array_id, shifted_endpoint, base_desc.dtype, is_virtual=False)
+                    logical_endpoints.extend(sub_endpoints)
+                else:
+                    logical_endpoints.append(ChunkEndpoint(
+                        chunk_id=endpoint.chunk_id,
+                        bounds=ChunkBounds(
+                            start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
+                            stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
+                        ),
+                    ))
+            logical_desc = TensorDescriptor(
+                array_id=base_desc.array_id,
+                dim_labels=base_desc.dim_labels,
+                shape=list(realized_shape),
+                chunk_shape=list(chunk_shape),
+                dtype=base_desc.dtype,
             )
-            bbox_stop = tuple(
-                max(int(ep.bounds.stop[ax]) for ep in real_endpoints) for ax in range(ndim)
-            )
+
+            if realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
+                logical_desc.slice_hint.start[:] = list(realized_start)
+                logical_desc.slice_hint.stop[:] = list(realized_stop)
+
         else:
-            bbox_start = source_start
-            bbox_stop = source_start
+            lcm_per_axis = tuple(lcm(chunk_shape[ax], scale_hint[ax]) for ax in range(ndim))
 
-        snapped_start = tuple(
-            (bbox_start[ax] // lcm_per_axis[ax]) * lcm_per_axis[ax]
-            for ax in range(ndim)
-        )
-        snapped_stop = tuple(
-            min(_ceil_div(bbox_stop[ax], lcm_per_axis[ax]) * lcm_per_axis[ax], base_shape[ax])
-            for ax in range(ndim)
-        )
-        snapped_shape = tuple(snapped_stop[ax] - snapped_start[ax] for ax in range(ndim))
-
-        logical_shape = _logical_shape_for_scale(snapped_shape, scale_hint)
-        logical_chunk_shape = _logical_chunk_shape(base_chunk_shape, scale_hint, logical_shape)
-
-        endpoints: List[ChunkEndpoint] = []
-
-        def iter_virtual_chunks(dim: int = 0, logical_offset: Tuple[int, ...] = ()):
-            if dim == ndim:
-                yield logical_offset
-                return
-            axis_chunk = logical_chunk_shape[dim]
-            axis_extent = logical_shape[dim]
-            for axis_start in range(0, axis_extent, axis_chunk):
-                yield from iter_virtual_chunks(dim + 1, logical_offset + (axis_start,))
-
-        for logical_start in iter_virtual_chunks():
-            logical_stop = tuple(
-                min(logical_start[ax] + logical_chunk_shape[ax], logical_shape[ax])
+            snapped_start = tuple(
+                (realized_start[ax] // lcm_per_axis[ax]) * lcm_per_axis[ax]
                 for ax in range(ndim)
             )
-            source_chunk_start = tuple(
-                snapped_start[ax] + logical_start[ax] * scale_hint[ax]
+            snapped_stop = tuple(
+                min(_ceil_div(realized_stop[ax], lcm_per_axis[ax]) * lcm_per_axis[ax], base_shape[ax])
                 for ax in range(ndim)
             )
-            source_chunk_stop = tuple(
-                snapped_start[ax] + logical_stop[ax] * scale_hint[ax]
-                for ax in range(ndim)
-            )
-            # Clip to array boundary; edge virtual chunks may extend past valid data
-            valid_chunk_stop = tuple(
-                min(source_chunk_stop[ax], base_shape[ax])
-                for ax in range(ndim)
-            )
-            payload = _encode_virtual_chunk_payload(
-                source_start=source_chunk_start,
-                source_stop=source_chunk_stop,
-                valid_stop=valid_chunk_stop,
-                scale_hint=scale_hint,
-                reduction_method=reduction_method,
-            )
-            endpoints.append(ChunkEndpoint(
-                chunk_id=_encode_chunk_id(base_desc.array_id, payload),
-                bounds=ChunkBounds(start=list(logical_start), stop=list(logical_stop)),
-            ))
+            snapped_shape = tuple(snapped_stop[ax] - snapped_start[ax] for ax in range(ndim))
 
-        logical_desc = TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=list(logical_shape),
-            chunk_shape=list(logical_chunk_shape),
-            dtype=_output_dtype(base_desc.dtype, reduction_method),
-        )
-        # Report realized slice in source coordinates (snapped to chunk/lcm boundaries)
-        if snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
-            logical_desc.slice_hint.start[:] = list(snapped_start)
-            logical_desc.slice_hint.stop[:] = list(snapped_stop)
+            logical_shape = _logical_shape_for_scale(snapped_shape, scale_hint)
+            logical_chunk_shape = _logical_chunk_shape(chunk_shape, scale_hint, logical_shape)
+            output_dtype = _output_dtype(base_desc.dtype, reduction_method)
+
+            logical_endpoints: List[ChunkEndpoint] = []
+
+            def iter_virtual_chunks(dim: int = 0, logical_offset: Tuple[int, ...] = ()):
+                if dim == ndim:
+                    yield logical_offset
+                    return
+                axis_chunk = logical_chunk_shape[dim]
+                axis_extent = logical_shape[dim]
+                for axis_start in range(0, axis_extent, axis_chunk):
+                    yield from iter_virtual_chunks(dim + 1, logical_offset + (axis_start,))
+
+            for logical_start in iter_virtual_chunks():
+                logical_stop = tuple(
+                    min(logical_start[ax] + logical_chunk_shape[ax], logical_shape[ax])
+                    for ax in range(ndim)
+                )
+                source_chunk_start = tuple(
+                    snapped_start[ax] + logical_start[ax] * scale_hint[ax]
+                    for ax in range(ndim)
+                )
+                source_chunk_stop = tuple(
+                    snapped_start[ax] + logical_stop[ax] * scale_hint[ax]
+                    for ax in range(ndim)
+                )
+                # Clip to array boundary; edge virtual chunks may extend past valid data
+                valid_chunk_stop = tuple(
+                    min(source_chunk_stop[ax], base_shape[ax])
+                    for ax in range(ndim)
+                )
+
+                # Check if virtual chunk needs splitting
+                virtual_chunk_shape = tuple(logical_stop[ax] - logical_start[ax] for ax in range(ndim))
+                if _needs_splitting(virtual_chunk_shape, output_dtype):
+                    # Create virtual chunk payload (without split info first)
+                    base_payload = _encode_virtual_chunk_payload(
+                        source_start=source_chunk_start,
+                        source_stop=source_chunk_stop,
+                        valid_stop=valid_chunk_stop,
+                        scale_hint=scale_hint,
+                        reduction_method=reduction_method,
+                    )
+                    # Create endpoint with bounds, then split
+                    virtual_ep = ChunkEndpoint(
+                        chunk_id=encode_chunk_id(base_desc.array_id, base_payload),
+                        bounds=ChunkBounds(start=list(logical_start), stop=list(logical_stop)),
+                    )
+                    sub_endpoints = _split_endpoint(base_desc.array_id, virtual_ep, output_dtype, is_virtual=True)
+                    logical_endpoints.extend(sub_endpoints)
+                else:
+                    payload = _encode_virtual_chunk_payload(
+                        source_start=source_chunk_start,
+                        source_stop=source_chunk_stop,
+                        valid_stop=valid_chunk_stop,
+                        scale_hint=scale_hint,
+                        reduction_method=reduction_method,
+                    )
+                    logical_endpoints.append(ChunkEndpoint(
+                        chunk_id=encode_chunk_id(base_desc.array_id, payload),
+                        bounds=ChunkBounds(start=list(logical_start), stop=list(logical_stop)),
+                    ))
+
+            logical_desc = TensorDescriptor(
+                array_id=base_desc.array_id,
+                dim_labels=base_desc.dim_labels,
+                shape=list(logical_shape),
+                chunk_shape=list(logical_chunk_shape),
+                dtype=_output_dtype(base_desc.dtype, reduction_method),
+            )
+
+            if snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
+                logical_desc.slice_hint.start[:] = list(snapped_start)
+                logical_desc.slice_hint.stop[:] = list(snapped_stop)
+
         if read_options is not None:
             logical_desc.read_options.CopyFrom(read_options)
 
-        return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=endpoints)
+        return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=logical_endpoints)    
 
 
-def build_arrow_schema(desc: TensorDescriptor) -> pa.Schema:
-    """Build an Arrow schema from a tensor descriptor."""
-    import importlib.metadata
+    def resolve_chunk_data(
+        self, chunk_id: bytes,  cache_manager: Optional[CacheManager] = None,
+    ) -> pa.RecordBatch:
+        """Resolve either a real backend chunk, a split chunk, or a virtual scaled chunk.
 
-    dtype = np.dtype(desc.dtype)
-    field = pa.field("data", pa.from_numpy_dtype(dtype))
+        Args:
+            adapter: Backend adapter for the tensor
+            chunk_id: Encoded chunk identifier
+            cache_manager: Optional cache manager for caching chunks
 
-    # Schema metadata: biopb version for compatibility tracking
-    # TensorDescriptor schema version matches biopb protobuf package version
-    metadata = {
-        "tensor_schema_version": importlib.metadata.version("biopb"),
-    }
+        Returns:
+            Arrow RecordBatch containing the chunk data
+        """
+        from biopb_tensor_server.cache import ArrowFileBackend
 
-    return pa.schema([field], metadata=metadata)
+        desc = self.get_tensor_descriptor()
+        array_id, backend_data, split_index, split_max = decode_chunk_id(chunk_id)
+
+        is_virtual = backend_data.startswith(_VIRTUAL_CHUNK_MAGIC)
+        is_file_backend = cache_manager is not None and isinstance(cache_manager.backend, ArrowFileBackend)
+
+        should_cache = cache_manager is not None and (is_virtual or is_file_backend)
+
+        # Use chunk_id directly as stable cache key (for both virtual and regular chunks)
+        key_bytes = chunk_id
+
+        def compute_fn():
+            if is_virtual:
+                source_start, _, valid_stop, _, _ =  _decode_virtual_chunk_payload(backend_data)
+                parent_bounds = ChunkBounds(
+                    start=list(source_start),
+                    stop=list(valid_stop),
+                )
+
+                result = _compute_virtual_chunk(self, backend_data)
+
+                if split_max > 1:
+                    # Slice the virtual chunk result
+                    result = _slice_result(result, parent_bounds, split_index, split_max, desc.dtype)
+            else:
+                # For real chunks, get the bounds from the backend
+                result = self.get_chunk_data(chunk_id)
+
+                if split_max > 1:
+                    parent_bounds = _get_chunk_bounds_from_backend_key(self, backend_data)
+                    result = _slice_result(result, parent_bounds, split_index, split_max, desc.dtype)
+
+            return result, sum(col.nbytes for col in result.columns)
+
+        if should_cache:
+            entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
+            data = entry.data
+            cache_manager.release(key_bytes)
+
+        else:
+            data, _ = compute_fn()
+
+        return data
+
+
+# === helper functions ===
 
 
 def _chunks_intersect(
@@ -484,56 +502,6 @@ def _chunks_intersect(
         if ce <= ss or cs >= se:
             return False
     return True
-
-
-def _encode_chunk_id(array_id: str, backend_data: bytes) -> bytes:
-    """Encode array_id and backend-specific data into chunk_id.
-
-    Format:
-    - 4 bytes: array_id length (uint32, big-endian)
-    - N bytes: array_id (UTF-8)
-    - M bytes: backend_data
-
-    Args:
-        array_id: Tensor identifier
-        backend_data: Backend-specific chunk data
-
-    Returns:
-        Encoded chunk_id bytes
-    """
-    array_id_bytes = array_id.encode('utf-8')
-    return struct.pack('>I', len(array_id_bytes)) + array_id_bytes + backend_data
-
-
-def _decode_chunk_id(chunk_id: bytes) -> Tuple[str, bytes]:
-    """Decode array_id and backend data from chunk_id.
-
-    Args:
-        chunk_id: Encoded chunk identifier
-
-    Returns:
-        Tuple of (array_id, backend_data)
-    """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
-    array_id = chunk_id[4:4+array_id_len].decode('utf-8')
-    backend_data = chunk_id[4+array_id_len:]
-    return array_id, backend_data
-
-
-_VIRTUAL_CHUNK_MAGIC = b'virt1'
-_SPLIT_CHUNK_MAGIC = b'split1'
-
-
-def _encode_int64_sequence(values: Tuple[int, ...]) -> bytes:
-    return b''.join(struct.pack('>q', value) for value in values)
-
-
-def _decode_int64_sequence(data: bytes, offset: int, length: int) -> Tuple[Tuple[int, ...], int]:
-    values = []
-    for _ in range(length):
-        values.append(struct.unpack('>q', data[offset:offset + 8])[0])
-        offset += 8
-    return tuple(values), offset
 
 
 def _normalized_slice_bounds(
@@ -598,105 +566,130 @@ def _logical_chunk_shape(
     return tuple(virtual_chunk)
 
 
-def _encode_virtual_chunk_payload(
-    source_start: Tuple[int, ...],
-    source_stop: Tuple[int, ...],
-    valid_stop: Tuple[int, ...],
-    scale_hint: Tuple[int, ...],
-    reduction_method: str,
-) -> bytes:
-    method_bytes = reduction_method.encode('utf-8')
-    ndim = len(source_start)
-    return b''.join([
-        _VIRTUAL_CHUNK_MAGIC,
-        struct.pack('>H', ndim),
-        _encode_int64_sequence(source_start),
-        _encode_int64_sequence(source_stop),
-        _encode_int64_sequence(valid_stop),
-        _encode_int64_sequence(scale_hint),
-        struct.pack('>H', len(method_bytes)),
-        method_bytes,
-    ])
+def _get_chunk_bounds_from_backend_key(
+    adapter: BackendAdapter,
+    backend_key: bytes,
+) -> ChunkBounds:
+    """Get chunk bounds from backend key by finding matching endpoint.
 
-
-def _decode_virtual_chunk_payload(
-    data: bytes,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], str]:
-    if not data.startswith(_VIRTUAL_CHUNK_MAGIC):
-        raise ValueError('Chunk payload is not a virtual chunk')
-
-    offset = len(_VIRTUAL_CHUNK_MAGIC)
-    ndim = struct.unpack('>H', data[offset:offset + 2])[0]
-    offset += 2
-    source_start, offset = _decode_int64_sequence(data, offset, ndim)
-    source_stop, offset = _decode_int64_sequence(data, offset, ndim)
-    valid_stop, offset = _decode_int64_sequence(data, offset, ndim)
-    scale_hint, offset = _decode_int64_sequence(data, offset, ndim)
-    method_len = struct.unpack('>H', data[offset:offset + 2])[0]
-    offset += 2
-    reduction_method = data[offset:offset + method_len].decode('utf-8')
-    return source_start, source_stop, valid_stop, scale_hint, reduction_method
-
-
-def _encode_split_chunk_payload(
-    parent_chunk_id: bytes,
-    sub_bounds: ChunkBounds,
-    parent_bounds: ChunkBounds,
-) -> bytes:
-    """Encode a split sub-chunk identifier.
-
-    Format:
-    - 6 bytes: magic (_SPLIT_CHUNK_MAGIC)
-    - 4 bytes: parent_chunk_id length (uint32, big-endian)
-    - N bytes: parent_chunk_id
-    - 2 bytes: ndim (uint16, big-endian)
-    - 8*ndim bytes: sub_bounds.start (int64, big-endian)
-    - 8*ndim bytes: sub_bounds.stop (int64, big-endian)
-    - 8*ndim bytes: parent_bounds.start (int64, big-endian)
-    - 8*ndim bytes: parent_bounds.stop (int64, big-endian)
-    """
-    ndim = len(sub_bounds.start)
-    return b''.join([
-        _SPLIT_CHUNK_MAGIC,
-        struct.pack('>I', len(parent_chunk_id)),
-        parent_chunk_id,
-        struct.pack('>H', ndim),
-        _encode_int64_sequence(tuple(sub_bounds.start)),
-        _encode_int64_sequence(tuple(sub_bounds.stop)),
-        _encode_int64_sequence(tuple(parent_bounds.start)),
-        _encode_int64_sequence(tuple(parent_bounds.stop)),
-    ])
-
-
-def _decode_split_chunk_payload(
-    data: bytes,
-) -> Tuple[bytes, ChunkBounds, ChunkBounds]:
-    """Decode split sub-chunk payload.
+    Args:
+        adapter: Backend adapter for the tensor
+        backend_key: Backend-specific chunk identifier
 
     Returns:
-        Tuple of (parent_chunk_id, sub_bounds, parent_bounds)
+        ChunkBounds for the matching chunk
     """
-    if not data.startswith(_SPLIT_CHUNK_MAGIC):
-        raise ValueError('Chunk payload is not a split chunk')
+    # Iterate through all endpoints to find matching one
+    for endpoint in adapter.get_raw_chunk_endpoints():
+        # Decode the endpoint's chunk_id to get its backend_data
+        endpoint_backend_data = get_backend_data(endpoint.chunk_id)
+        # For unsplit real chunks, backend_data == backend_key
+        if endpoint_backend_data == backend_key:
+            return endpoint.bounds
 
-    offset = len(_SPLIT_CHUNK_MAGIC)
-    parent_id_len = struct.unpack('>I', data[offset:offset + 4])[0]
-    offset += 4
-    parent_chunk_id = data[offset:offset + parent_id_len]
-    offset += parent_id_len
+    raise ValueError(f"Could not find chunk bounds for backend_key: {backend_key}")
 
-    ndim = struct.unpack('>H', data[offset:offset + 2])[0]
-    offset += 2
 
-    sub_start, offset = _decode_int64_sequence(data, offset, ndim)
-    sub_stop, offset = _decode_int64_sequence(data, offset, ndim)
-    parent_start, offset = _decode_int64_sequence(data, offset, ndim)
-    parent_stop, offset = _decode_int64_sequence(data, offset, ndim)
+def _split_endpoint(
+    array_id: str,
+    ep: ChunkEndpoint,
+    dtype: str,
+    is_virtual: bool,
+) -> List[ChunkEndpoint]:
+    """Split an oversized endpoint into sub-endpoints within size limit.
 
-    sub_bounds = ChunkBounds(start=list(sub_start), stop=list(sub_stop))
-    parent_bounds = ChunkBounds(start=list(parent_start), stop=list(parent_stop))
+    Strategy: split along the largest axis for even division.
+    Each sub-endpoint has:
+    - chunk_id: parent payload with split_index/split_max encoded
+    - bounds: sub-bounds within parent (logical coordinates)
 
-    return parent_chunk_id, sub_bounds, parent_bounds
+    Args:
+        array_id: Tensor identifier
+        ep: ChunkEndpoint to split
+        dtype: Data type string for size calculation
+        is_virtual: True if this is a virtual chunk
+
+    Returns:
+        List of sub-endpoints that each fit within the Arrow batch limit
+    """
+    parent_shape = tuple(stop - start for start, stop in zip(ep.bounds.start, ep.bounds.stop))
+    item_size = np.dtype(dtype).itemsize
+
+    # Calculate how many splits needed
+    parent_bytes = int(np.prod(parent_shape)) * item_size
+    n_splits = int(np.ceil(parent_bytes / MAX_ARROW_BATCH_BYTES))
+
+    # Choose axis with largest dimension
+    split_axis = max(range(len(parent_shape)), key=lambda ax: parent_shape[ax])
+
+    axis_size = parent_shape[split_axis]
+    sub_axis_size = axis_size // n_splits
+
+    # Get parent backend_data from chunk_id
+    parent_backend_data = get_backend_data(ep.chunk_id)
+
+    sub_endpoints = []
+    for i in range(n_splits):
+        # Calculate sub-chunk bounds on split axis (in logical coordinates)
+        axis_start = ep.bounds.start[split_axis] + i * sub_axis_size
+        axis_stop = min(ep.bounds.start[split_axis] + (i + 1) * sub_axis_size, ep.bounds.stop[split_axis])
+
+        sub_start = list(ep.bounds.start)
+        sub_stop = list(ep.bounds.stop)
+        sub_start[split_axis] = axis_start
+        sub_stop[split_axis] = axis_stop
+
+        sub_bounds = ChunkBounds(start=sub_start, stop=sub_stop)
+
+        sub_chunk_id = encode_chunk_id(array_id, parent_backend_data, i, n_splits)
+
+        sub_endpoints.append(ChunkEndpoint(chunk_id=sub_chunk_id, bounds=sub_bounds))
+
+    return sub_endpoints
+
+
+def _slice_result(
+    record_batch: pa.RecordBatch,
+    parent_bounds: ChunkBounds,
+    split_index: int,
+    split_max: int,
+    dtype: str,
+) -> pa.RecordBatch:
+    """Slice a RecordBatch along the largest axis based on split info.
+
+    Args:
+        record_batch: Full chunk data as RecordBatch
+        parent_bounds: Original bounds of the full chunk
+        split_index: Which sub-chunk (0 to split_max-1)
+        split_max: Total number of splits
+        dtype: Data type string for size calculation
+
+    Returns:
+        Smaller RecordBatch containing the sub-chunk data
+    """
+    parent_shape = tuple(stop - start for start, stop in zip(parent_bounds.start, parent_bounds.stop))
+    parent_arr = _record_batch_to_numpy(record_batch, parent_bounds, dtype)
+
+    # Find axis with largest dimension
+    split_axis = max(range(len(parent_shape)), key=lambda ax: parent_shape[ax])
+
+    # Compute sub-chunk bounds on split axis
+    axis_size = parent_shape[split_axis]
+    sub_axis_size = axis_size // split_max
+
+    axis_start = split_index * sub_axis_size
+    axis_stop = min((split_index + 1) * sub_axis_size, axis_size)
+
+    # Build slice tuple
+    slices = tuple(
+        slice(0, parent_shape[ax]) if ax != split_axis
+        else slice(axis_start, axis_stop)
+        for ax in range(len(parent_shape))
+    )
+
+    sub_arr = parent_arr[slices]
+    array = pa.array(sub_arr.ravel())
+    return pa.RecordBatch.from_arrays([array], ["data"])
 
 
 def _record_batch_to_numpy(
@@ -709,213 +702,12 @@ def _record_batch_to_numpy(
     return np.asarray(array, dtype=np.dtype(dtype)).reshape(chunk_shape)
 
 
-def _shift_bounds(
-    bounds: ChunkBounds,
-    logical_origin: Tuple[int, ...],
-    scale_hint: Tuple[int, ...],
-) -> ChunkBounds:
-    start = [int((bounds.start[axis] - logical_origin[axis]) // scale_hint[axis]) for axis in range(len(bounds.start))]
-    stop = [int((bounds.stop[axis] - logical_origin[axis]) // scale_hint[axis]) for axis in range(len(bounds.stop))]
-    return ChunkBounds(start=start, stop=stop)
-
-
-def plan_tensor_read(
-    adapter: BackendAdapter,
-    request_desc: TensorDescriptor,
-) -> TensorReadPlan:
-    """Plan a logical tensor read by delegating to adapter.
-
-    For unscaled reads: direct chunk mapping from base.
-    For scaled reads: delegates to adapter's get_scaled_read_plan().
-    """
-    base_desc = adapter.get_tensor_descriptor()
-    base_shape = tuple(int(dim) for dim in base_desc.shape)
-    base_chunk_shape = tuple(int(dim) for dim in base_desc.chunk_shape)
-    slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
-    read_options = request_desc.read_options if request_desc.HasField('read_options') else None
-    source_start, source_stop = _normalized_slice_bounds(base_shape, slice_hint)
-    source_shape = tuple(stop - start for start, stop in zip(source_start, source_stop))
-    scale_hint = _normalized_scale_hint(base_shape, read_options)
-
-    ndim = len(base_shape)
-    if scale_hint is None:
-        # No scaling - direct read from base
-        chunk_endpoints = adapter.get_chunk_endpoints(
-            SliceHint(start=list(source_start), stop=list(source_stop))
-            if slice_hint is not None else None
-        )
-        # Realized bounds = bounding box of intersecting chunks (always non-negative)
-        if chunk_endpoints:
-            realized_start = tuple(
-                min(int(ep.bounds.start[ax]) for ep in chunk_endpoints) for ax in range(ndim)
-            )
-            realized_stop = tuple(
-                max(int(ep.bounds.stop[ax]) for ep in chunk_endpoints) for ax in range(ndim)
-            )
-        else:
-            realized_start = source_start
-            realized_stop = source_start
-        realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
-        logical_endpoints = [
-            ChunkEndpoint(
-                chunk_id=endpoint.chunk_id,
-                bounds=ChunkBounds(
-                    start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
-                    stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
-                ),
-            )
-            for endpoint in chunk_endpoints
-        ]
-        logical_desc = TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=list(realized_shape),
-            chunk_shape=[min(int(chunk), int(size)) for chunk, size in zip(base_chunk_shape, realized_shape)],
-            dtype=base_desc.dtype,
-        )
-        if realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
-            logical_desc.slice_hint.start[:] = list(realized_start)
-            logical_desc.slice_hint.stop[:] = list(realized_stop)
-        if read_options is not None:
-            logical_desc.read_options.CopyFrom(read_options)
-        return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=logical_endpoints)
-
-    # Scaled read - delegate to adapter
-    return adapter.get_scaled_read_plan(scale_hint, slice_hint, read_options)
-
-
-def resolve_chunk_data(
-    adapter: BackendAdapter,
-    chunk_id: bytes,
-    cache_manager: Optional[CacheManager] = None,
-) -> pa.RecordBatch:
-    """Resolve either a real backend chunk, a split chunk, or a virtual scaled chunk.
-
-    For split chunks: slice from cached/fresh parent chunk.
-    For virtual chunks (scaled reads): uses cache if cache_manager is provided.
-    For real chunks: uses file-based cache if available (for persistence across restarts).
-
-    Args:
-        adapter: Backend adapter for the tensor
-        chunk_id: Encoded chunk identifier
-        cache_manager: Optional cache manager for caching chunks
-
-    Returns:
-        Arrow RecordBatch containing the chunk data
-    """
-    from biopb_tensor_server.cache import CacheKey, ArrowFileBackend
-
-    array_id, backend_data = _decode_chunk_id(chunk_id)
-
-    is_split = backend_data.startswith(_SPLIT_CHUNK_MAGIC)
-    is_virtual = backend_data.startswith(_VIRTUAL_CHUNK_MAGIC)
-    is_file_backend = cache_manager is not None and isinstance(cache_manager.backend, ArrowFileBackend)
-
-    # Split chunk - slice from parent
-    if is_split:
-        return _resolve_split_chunk(adapter, backend_data, is_file_backend, cache_manager, array_id)
-
-    # Real chunk - cache only if file backend (for persistence)
-    if not is_virtual:
-        if not is_file_backend:
-            # Memory backend: skip cache, rely on OS page cache
-            return adapter.get_chunk_data(chunk_id)
-
-        # File backend: cache real chunks for persistence across restarts
-        key_bytes = chunk_id  # Use chunk_id directly as stable cache key
-
-        def compute_fn():
-            result = adapter.get_chunk_data(chunk_id)
-            return result, sum(col.nbytes for col in result.columns)
-
-        entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
-        data = entry.data
-        cache_manager.release(key_bytes)
-        return data
-
-    # Virtual chunk - compute directly if no cache
-    if cache_manager is None:
-        return _compute_virtual_chunk(adapter, backend_data)
-
-    # Build cache key from payload fields
-    source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)
-    key_bytes = CacheKey(
-        array_id=array_id,
-        scale_hint=scale_hint,
-        source_start=source_start,
-        source_stop=source_stop,
-        valid_stop=valid_stop,
-        reduction_method=reduction_method,
-    ).to_bytes()
-
-    def compute_fn():
-        result = _compute_virtual_chunk(adapter, backend_data)
-        return result, sum(col.nbytes for col in result.columns)
-
-    entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
-    data = entry.data
-    cache_manager.release(key_bytes)
-    return data
-
-
-def _resolve_split_chunk(
-    adapter: BackendAdapter,
-    backend_data: bytes,
-    is_file_backend: bool,
-    cache_manager: Optional[CacheManager],
-    array_id: str,
-) -> pa.RecordBatch:
-    """Resolve a split sub-chunk by slicing from cached/fresh parent.
-
-    Caching strategy:
-    - Memory backend: no caching, slice from fresh parent read
-    - File backend: cache parent, slice from cached parent
-
-    Args:
-        adapter: Backend adapter for the tensor
-        backend_data: Split chunk payload
-        is_file_backend: True if using file-based cache
-        cache_manager: Optional cache manager
-        array_id: Array identifier
-
-    Returns:
-        Arrow RecordBatch containing the sub-chunk data
-    """
-    parent_chunk_id, sub_bounds, parent_bounds = _decode_split_chunk_payload(backend_data)
-    desc = adapter.get_tensor_descriptor()
-    dtype = np.dtype(desc.dtype)
-
-    if is_file_backend and cache_manager is not None:
-        # File backend: cache parent for efficiency
-        def compute_parent():
-            result = adapter.get_chunk_data(parent_chunk_id)
-            return result, sum(col.nbytes for col in result.columns)
-
-        entry = cache_manager.get_or_acquire(parent_chunk_id, compute_parent, metadata={'array_id': array_id})
-        parent_data = entry.data
-        cache_manager.release(parent_chunk_id)
-    else:
-        # Memory backend: read fresh (OS page cache handles this)
-        parent_data = adapter.get_chunk_data(parent_chunk_id)
-
-    # Slice parent to sub-chunk
-    parent_arr = _record_batch_to_numpy(parent_data, parent_bounds, desc.dtype)
-
-    sub_slices = tuple(
-        slice(sub_bounds.start[ax] - parent_bounds.start[ax],
-              sub_bounds.stop[ax] - parent_bounds.start[ax])
-        for ax in range(len(sub_bounds.start))
-    )
-    sub_arr = parent_arr[sub_slices]
-
-    return pa.RecordBatch.from_arrays([pa.array(sub_arr.ravel())], ["data"])
-
-
 def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.RecordBatch:
     """Compute a virtual scaled chunk from source data.
 
     This is the internal computation logic extracted from resolve_chunk_data
-    for separation of concerns.
+    for separation of concerns. Returns the full virtual chunk before any
+    splitting is applied.
 
     Args:
         adapter: Backend adapter for the tensor
@@ -926,6 +718,7 @@ def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.R
     """
     desc = adapter.get_tensor_descriptor()
     dtype = np.dtype(desc.dtype)
+    # Decode payload - split_index/split_max are ignored here (slicing done in resolve_chunk_data)
     source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)
     source_slice = SliceHint(start=list(source_start), stop=list(valid_stop))
     endpoints = adapter.get_chunk_endpoints(source_slice)
@@ -959,3 +752,83 @@ def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.R
     reduced = _cast_reduced_array(reduced, target_dtype)
     array = pa.array(reduced.ravel())
     return pa.RecordBatch.from_arrays([array], ["data"])
+
+def _encode_virtual_chunk_payload(
+    source_start: Tuple[int, ...],
+    source_stop: Tuple[int, ...],
+    valid_stop: Tuple[int, ...],
+    scale_hint: Tuple[int, ...],
+    reduction_method: str,
+) -> bytes:
+    """Encode virtual chunk payload with optional split info.
+
+    Format:
+    - 5 bytes: magic (_VIRTUAL_CHUNK_MAGIC)
+    - 2 bytes: ndim (uint16, big-endian)
+    - 8*ndim bytes: source_start (int64, big-endian)
+    - 8*ndim bytes: source_stop (int64, big-endian)
+    - 8*ndim bytes: valid_stop (int64, big-endian)
+    - 8*ndim bytes: scale_hint (int64, big-endian)
+    - 2 bytes: method length (uint16, big-endian)
+    - N bytes: reduction_method (UTF-8)
+
+    Unsplit chunks have split_index=0, split_max=1 (encoded at end).
+    """
+    def encode_int64_sequence(values: Tuple[int, ...]) -> bytes:
+        return b''.join(struct.pack('>q', value) for value in values)
+
+    method_bytes = reduction_method.encode('utf-8')
+    ndim = len(source_start)
+    return b''.join([
+        _VIRTUAL_CHUNK_MAGIC,
+        struct.pack('>H', ndim),
+        encode_int64_sequence(source_start),
+        encode_int64_sequence(source_stop),
+        encode_int64_sequence(valid_stop),
+        encode_int64_sequence(scale_hint),
+        struct.pack('>H', len(method_bytes)),
+        method_bytes,
+    ])
+
+
+def _decode_virtual_chunk_payload(
+    data: bytes,
+) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], str]:
+    """Decode virtual chunk payload including split info.
+
+    Returns:
+        Tuple of (source_start, source_stop, valid_stop, scale_hint, reduction_method, split_index, split_max)
+    """
+    if not data.startswith(_VIRTUAL_CHUNK_MAGIC):
+        raise ValueError('Chunk payload is not a virtual chunk')
+
+    def decode_int64_sequence(data: bytes, offset: int, length: int) -> Tuple[Tuple[int, ...], int]:
+        values = []
+        for _ in range(length):
+            values.append(struct.unpack('>q', data[offset:offset + 8])[0])
+            offset += 8
+        return tuple(values), offset
+
+    offset = len(_VIRTUAL_CHUNK_MAGIC)
+    ndim = struct.unpack('>H', data[offset:offset + 2])[0]
+    offset += 2
+    source_start, offset = decode_int64_sequence(data, offset, ndim)
+    source_stop, offset = decode_int64_sequence(data, offset, ndim)
+    valid_stop, offset = decode_int64_sequence(data, offset, ndim)
+    scale_hint, offset = decode_int64_sequence(data, offset, ndim)
+    method_len = struct.unpack('>H', data[offset:offset + 2])[0]
+    offset += 2
+    reduction_method = data[offset:offset + method_len].decode('utf-8')
+    offset += method_len
+
+    return source_start, source_stop, valid_stop, scale_hint, reduction_method
+
+def _estimate_chunk_bytes(shape: Tuple[int, ...], dtype: str) -> int:
+    """Estimate chunk size in bytes from shape and dtype."""
+    num_elements = int(np.prod(shape, dtype=np.int64))
+    return num_elements * np.dtype(dtype).itemsize
+
+
+def _needs_splitting(chunk_shape: Tuple[int, ...], dtype: str) -> bool:
+    """Check if chunk exceeds Arrow batch limit."""
+    return _estimate_chunk_bytes(chunk_shape, dtype) > MAX_ARROW_BATCH_BYTES

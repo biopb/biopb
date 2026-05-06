@@ -17,23 +17,23 @@ Relies on OS page cache for raw data caching.
 """
 
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set
 
-import numpy as np
 import pyarrow as pa
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
+from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.chunk import (
     ChunkEndpoint,
-    _decode_chunk_id,
-    _encode_chunk_id,
+    encode_chunk_id,
+    get_backend_data,
 )
 from biopb_tensor_server.discovery import SourceClaim
-from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, DataSourceDescriptor
 
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
+
     from biopb_tensor_server.config import SourceConfig
 
 
@@ -155,7 +155,7 @@ class AicsImageIoAdapter(BackendAdapter):
         """
         if self._dask_data is None:
             raise ValueError("Cannot get chunk data from source-level adapter")
-        _, backend_data = _decode_chunk_id(chunk_id)
+        backend_data = get_backend_data(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
 
@@ -175,44 +175,8 @@ class AicsImageIoAdapter(BackendAdapter):
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the TensorDescriptor for this tensor.
-
-        Scene-level: returns descriptor for cached dask_data.
-        Source-level: returns descriptor for first scene (default tensor).
-        """
-        if self._dask_data is not None:
-            # Scene-level: use cached dask_data
-            chunks = self._dask_data.chunks
-            chunk_shape = [c[0] if c else 1 for c in chunks]
-            return TensorDescriptor(
-                array_id=self.array_id,
-                dim_labels=self.dim_labels,
-                shape=list(self._dask_data.shape),
-                chunk_shape=chunk_shape,
-                dtype=self._dask_data.dtype.str,
-            )
-
-        # Source-level: return first scene descriptor with source array_id
-        descriptors = self.list_tensor_descriptors()
-        if descriptors:
-            first_desc = descriptors[0]
-            # Use source array_id for default tensor
-            return TensorDescriptor(
-                array_id=self.array_id,
-                dim_labels=first_desc.dim_labels,
-                shape=first_desc.shape,
-                chunk_shape=first_desc.chunk_shape,
-                dtype=first_desc.dtype,
-            )
-
-        raise ValueError("No scenes available")
-
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors (scenes) available in this source.
-
-        Scene-level: returns [self.get_tensor_descriptor()].
-        Source-level: returns descriptors for all scenes (cached).
 
         Optimization: Uses OME metadata for shapes without scene switching.
         Chunk info is NOT populated - clients should call get_flight_info
@@ -221,9 +185,6 @@ class AicsImageIoAdapter(BackendAdapter):
         Returns:
             List of TensorDescriptor for all scenes in this source
         """
-        if self.scene_index is not None:
-            return [self.get_tensor_descriptor()]
-
         # Source-level: use cached descriptors if available
         if self._cached_descriptors is not None:
             return self._cached_descriptors
@@ -305,28 +266,16 @@ class AicsImageIoAdapter(BackendAdapter):
             source_url=self._source_url,
         )
 
-    def _get_raw_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
-        """Get chunk endpoints covering the tensor (or a slice of it).
+    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
+        """Yield all chunk endpoints for this dask array.
 
         Only valid for scene-level adapters.
-
-        Args:
-            slice_hint: Optional slice range. If provided, return only chunks
-                       that intersect this range.
-
-        Returns:
-            List of ChunkEndpoint objects with chunk_id and bounds
         """
         if self._dask_data is None:
             raise ValueError("Cannot get chunks from source-level adapter")
         shape = self._dask_data.shape
         chunks = self._dask_data.chunks
         ndim = len(shape)
-
-        endpoints = []
 
         def iter_chunk_indices(dim: int = 0, prefix: tuple = ()):
             if dim == ndim:
@@ -337,7 +286,6 @@ class AicsImageIoAdapter(BackendAdapter):
                     yield from iter_chunk_indices(dim + 1, prefix + (i,))
 
         for chunk_idx in iter_chunk_indices():
-            # Compute chunk bounds from chunk sizes
             chunk_start = []
             chunk_stop = []
             for d, idx in enumerate(chunk_idx):
@@ -347,25 +295,13 @@ class AicsImageIoAdapter(BackendAdapter):
                 chunk_start.append(start)
                 chunk_stop.append(min(stop, shape[d]))
 
-            # Filter by slice_hint
-            if slice_hint is not None:
-                intersects = True
-                for d in range(ndim):
-                    if chunk_stop[d] <= slice_hint.start[d] or chunk_start[d] >= slice_hint.stop[d]:
-                        intersects = False
-                        break
-                if not intersects:
-                    continue
-
             chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = _encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
+            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
 
-            endpoints.append(ChunkEndpoint(
+            yield ChunkEndpoint(
                 chunk_id=chunk_id,
                 bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            ))
-
-        return endpoints
+            )
 
     def get_metadata(self) -> dict:
         """Return OME metadata from the aicsimageio file.

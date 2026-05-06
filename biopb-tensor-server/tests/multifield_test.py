@@ -2,12 +2,17 @@
 
 import threading
 import time
-import pytest
-import numpy as np
 
+import numpy as np
 from biopb.tensor import TensorFlightClient
+
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.base import BackendAdapter, ChunkEndpoint, TensorDescriptor, DataSourceDescriptor
+from biopb_tensor_server.base import (
+    BackendAdapter,
+    ChunkEndpoint,
+    DataSourceDescriptor,
+    TensorDescriptor,
+)
 
 
 class MockMultifieldAdapter(BackendAdapter):
@@ -80,8 +85,8 @@ class MockMultifieldAdapter(BackendAdapter):
             metadata_json="",  # Not populated; returned via GetFlightInfo instead
         )
 
-    def _get_raw_chunk_endpoints(self, slice_hint=None) -> list:
-        return []
+    def get_raw_chunk_endpoints(self):
+        return iter([])
 
     def get_chunk_data(self, chunk_id: bytes):
         return None
@@ -114,16 +119,20 @@ class MockSingleTensorAdapter(BackendAdapter):
             dtype=self.dtype,
         )
 
-    def _get_raw_chunk_endpoints(self, slice_hint=None) -> list:
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
+
+    def get_raw_chunk_endpoints(self):
         # Single chunk covering entire tensor
-        from biopb_tensor_server.base import _encode_chunk_id
         from biopb.tensor.ticket_pb2 import ChunkBounds
 
-        chunk_id = _encode_chunk_id(self.array_id, b"0")
-        return [ChunkEndpoint(
+        from biopb_tensor_server.base import encode_chunk_id
+
+        chunk_id = encode_chunk_id(self.array_id, b"0")
+        yield ChunkEndpoint(
             chunk_id=chunk_id,
             bounds=ChunkBounds(start=[0] * len(self.shape), stop=list(self.shape)),
-        )]
+        )
 
     def get_chunk_data(self, chunk_id: bytes):
         import pyarrow as pa

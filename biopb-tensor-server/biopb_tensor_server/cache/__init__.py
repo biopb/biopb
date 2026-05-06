@@ -8,7 +8,6 @@ Exports:
     - CacheManager: Singleton manager for cache operations
     - CacheBackend: Abstract interface for cache storage
     - CacheEntry: Cached data with state and ref_count
-    - CacheKey: Unique identifier for cached virtual chunks
     - CacheStats: Cache statistics for monitoring
     - EntryState: PENDING, READY, or ERROR states
     - MemoryCacheBackend: In-memory LRU cache backend
@@ -20,22 +19,23 @@ Exports:
 """
 
 from biopb_tensor_server.cache.base import (
+    MAX_ARROW_BATCH_BYTES,
     CacheBackend,
     CacheEntry,
-    CacheKey,
     CacheStats,
     EntryState,
-    MAX_ARROW_BATCH_BYTES,
 )
-from biopb_tensor_server.cache.manager import CacheManager
-from biopb_tensor_server.cache.memory_backend import MemoryCacheBackend, MemoryCacheConfig
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.manager import CacheManager
+from biopb_tensor_server.cache.memory_backend import (
+    MemoryCacheBackend,
+    MemoryCacheConfig,
+)
 from biopb_tensor_server.cache.recovery import RecoveryStatus
 
 __all__ = [
     "CacheBackend",
     "CacheEntry",
-    "CacheKey",
     "CacheManager",
     "CacheStats",
     "EntryState",

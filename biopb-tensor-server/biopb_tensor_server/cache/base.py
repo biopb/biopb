@@ -9,14 +9,13 @@ Reference counting prevents eviction of entries being actively served.
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple, Callable
-import threading
+from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
-
 
 # Arrow IPC has ~2GB batch size limit due to 32-bit offsets
 # Use a safe threshold slightly below the actual limit
@@ -28,46 +27,6 @@ class EntryState(Enum):
     PENDING = "pending"      # Being computed, other threads should wait
     READY = "ready"          # Computed and available
     ERROR = "error"          # Computation failed
-
-
-@dataclass
-class CacheKey:
-    """Unique identifier for a cached virtual chunk."""
-    array_id: str
-    scale_hint: Tuple[int, ...]
-    source_start: Tuple[int, ...]
-    source_stop: Tuple[int, ...]
-    valid_stop: Tuple[int, ...]
-    reduction_method: str
-
-    def to_bytes(self) -> bytes:
-        """Serialize to stable binary format."""
-        import struct
-        array_id_bytes = self.array_id.encode('utf-8')
-        method_bytes = self.reduction_method.encode('utf-8')
-        ndim = len(self.source_start)
-
-        parts = [
-            struct.pack('>I', len(array_id_bytes)),
-            array_id_bytes,
-            struct.pack('>H', ndim),
-        ]
-        for values in [self.scale_hint, self.source_start, self.source_stop, self.valid_stop]:
-            parts.append(b''.join(struct.pack('>q', v) for v in values))
-
-        parts.extend([
-            struct.pack('>H', len(method_bytes)),
-            method_bytes,
-        ])
-        return b''.join(parts)
-
-    def to_string(self) -> str:
-        """Human-readable representation."""
-        scale_str = ','.join(str(s) for s in self.scale_hint)
-        start_str = ','.join(str(s) for s in self.source_start)
-        stop_str = ','.join(str(s) for s in self.source_stop)
-        valid_str = ','.join(str(s) for s in self.valid_stop)
-        return f"{self.array_id}:{self.reduction_method}:scale={scale_str}:start={start_str}:stop={stop_str}:valid={valid_str}"
 
 
 @dataclass

@@ -3,13 +3,15 @@
 Uses synthetic test fixtures from conftest.py - no external data required.
 """
 
+import importlib.util
 import os
 import tempfile
-import pytest
-import numpy as np
 
-from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
+import numpy as np
+import pytest
+
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
 
 
 def _zarr_available() -> bool:
@@ -22,15 +24,8 @@ def _zarr_available() -> bool:
     except ImportError:
         return False
 
-
 def _h5py_available() -> bool:
-    """Check if h5py is available."""
-    try:
-        import h5py
-        return True
-    except ImportError:
-        return False
-
+    return importlib.util.find_spec("h5py") is not None
 
 class TestMultiFileOmeTiffFileListParsing:
     """Tests for _parse_file_list_from_metadata method."""
@@ -43,8 +38,9 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_parse_raw_ome_xml(self, temp_metadata_dir):
         """Test parsing raw OME-XML format."""
-        import tifffile
         from pathlib import Path
+
+        import tifffile
 
         # Create _metadata.txt with OME-XML
         ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -79,8 +75,9 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_parse_json_embedded_ome_xml(self, temp_metadata_dir):
         """Test parsing Micro-Manager JSON format with embedded OME-XML."""
-        import tifffile
         from pathlib import Path
+
+        import tifffile
 
         # Create _metadata.txt with JSON format
         ome_xml = """<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
@@ -115,9 +112,10 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_parse_pure_json_coords_keys(self, temp_metadata_dir):
         """Test parsing Micro-Manager standard metadata.txt with Coords keys."""
-        import tifffile
         import json
         from pathlib import Path
+
+        import tifffile
 
         # Create metadata.txt with Micro-Manager standard format
         metadata_content = json.dumps({
@@ -147,8 +145,9 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_parse_missing_metadata(self, temp_metadata_dir):
         """Test that None is returned when no metadata file exists."""
-        import tifffile
         from pathlib import Path
+
+        import tifffile
 
         # Create a TIFF file but no _metadata.txt
         tif_path = Path(temp_metadata_dir) / "img_001.ome.tif"
@@ -162,9 +161,10 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_partial_dataset_warning(self, temp_metadata_dir):
         """Test that missing files are tracked and warning is issued."""
-        import tifffile
         import warnings
         from pathlib import Path
+
+        import tifffile
 
         # Create _metadata.txt with OME-XML referencing 3 files
         ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -209,8 +209,9 @@ class TestMultiFileOmeTiffFileListParsing:
 
     def test_shape_adjustment_for_partial_dataset(self, temp_metadata_dir):
         """Test that shape is adjusted for partial datasets."""
-        import tifffile
         from pathlib import Path
+
+        import tifffile
 
         # Create _metadata.txt
         ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -245,8 +246,9 @@ class TestOmeTiffAdapterEmbeddedMetadata:
     @pytest.fixture
     def tiled_ome_tiff(self):
         """Create a tiled OME-TIFF with embedded metadata."""
-        import tifffile
         import tempfile
+
+        import tifffile
 
         data = np.random.randint(0, 65535, (3, 128, 128), dtype=np.uint16)
 
@@ -334,8 +336,9 @@ class TestOmeTiffAdapterEmbeddedMetadata:
 
     def test_non_tiled_raises_error(self):
         """Test that non-tiled TIFF raises ValueError."""
-        import tifffile
         import tempfile
+
+        import tifffile
 
         # Create non-tiled TIFF
         data = np.zeros((64, 64), dtype=np.uint16)
