@@ -7,6 +7,20 @@ interface MetaPanelProps {
   sourceId: string;
 }
 
+function isEmptyForDisplay(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return true;
+    return value.every(isEmptyForDisplay);
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return true;
+    return entries.every(([, v]) => isEmptyForDisplay(v));
+  }
+  return false;
+}
+
 function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
   const [expanded, setExpanded] = useState(depth < 2);
 
@@ -57,7 +71,8 @@ function JsonNode({ value, depth = 0 }: { value: unknown; depth?: number }) {
   }
 
   if (typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
+    const allEntries = Object.entries(value as Record<string, unknown>);
+    const entries = allEntries.filter(([, v]) => !isEmptyForDisplay(v));
     if (entries.length === 0) return <span style={{ color: "#64748b" }}>{}</span>;
     if (!expanded) {
       return (

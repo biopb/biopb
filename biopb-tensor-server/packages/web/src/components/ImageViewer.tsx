@@ -14,6 +14,7 @@ import {
 } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
+import { type ColorValue, getColorMultipliers } from "../utils/colorUtils";
 
 interface ImageViewerProps {
   sourceId: string;
@@ -74,8 +75,8 @@ function computeStrides(shape: number[]): number[] {
 
 function computePercentileCutoffs(
   data: ArrayLike<number>,
-  lo = 0.01,
-  hi = 0.99,
+  lo: number,
+  hi: number,
 ): [number, number] {
   const n = data.length;
   if (n === 0) return [0, 1];
@@ -93,11 +94,15 @@ function computePercentileCutoffs(
   return loVal < hiVal ? [loVal, hiVal] : [0, 1];
 }
 
-function toGrayscaleRgba(
+function toPseudoColorRgba(
   shape: number[],
   dimLabels: string[],
   dtype: string,
   buffer: ArrayBuffer,
+  color: ColorValue = "auto",
+  channelName?: string,
+  percentileLo = 0.01,
+  percentileHi = 0.99,
 ): { rgba: Uint8ClampedArray<ArrayBuffer>; width: number; height: number } {
   const dt = normalizeDtype(dtype);
   const labels = dimLabels.length ? dimLabels : shape.map((_, i) => `d${i}`);
@@ -116,8 +121,11 @@ function toGrayscaleRgba(
   let hiVal = 1;
 
   if (needsNormalization) {
-    [loVal, hiVal] = computePercentileCutoffs(data);
+    [loVal, hiVal] = computePercentileCutoffs(data, percentileLo, percentileHi);
   }
+
+  // Get RGB multipliers for the color (works for both presets and hex colors, resolves "auto")
+  const [rMult, gMult, bMult] = getColorMultipliers(color, channelName);
 
   const rgba = new Uint8ClampedArray(width * height * 4);
   const coords = new Array<number>(shape.length).fill(0);
@@ -143,9 +151,10 @@ function toGrayscaleRgba(
         gray = Math.max(0, Math.min(255, Math.round(raw)));
       }
 
-      rgba[out++] = gray;
-      rgba[out++] = gray;
-      rgba[out++] = gray;
+      // Apply color multipliers
+      rgba[out++] = Math.round(gray * rMult);
+      rgba[out++] = Math.round(gray * gMult);
+      rgba[out++] = Math.round(gray * bMult);
       rgba[out++] = 255;
     }
   }
@@ -256,6 +265,13 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
   const slice = useAppStore((s) => s.slice);
+  const channelColors = useAppStore((s) => s.channelColors);
+  const channelNames = useAppStore((s) => s.channelNames);
+  const getChannelColor = useAppStore((s) => s.getChannelColor);
+
+  // Compute percentile cutoffs from state
+  const percentileLo = slice.useMinMax ? 0 : slice.percentileScale / 100;
+  const percentileHi = slice.useMinMax ? 1 : 1 - slice.percentileScale / 100;
 
   const [appReady, setAppReady] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -265,11 +281,21 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sliceRef = useRef(slice);  // Keep current slice for event handlers
+  const colorRef = useRef<ColorValue>("auto");  // Keep current color for rendering
   const pressedKeysRef = useRef<Set<string>>(new Set());  // Track held keys for slice navigation
   const sliceWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Debounce for scroll c/t/z
 
   // Update sliceRef whenever slice changes
   sliceRef.current = slice;
+
+  // Update colorRef whenever color changes
+  colorRef.current = getChannelColor(sourceId, slice.c);
+
+  // Get current channel name for color resolution
+  const currentChannelName = useMemo(() => {
+    const names = channelNames[sourceId];
+    return names?.[slice.c] ?? undefined;
+  }, [channelNames, sourceId, slice.c]);
 
   // Track current source/tensor to reset when switching
   const prevSourceIdRef = useRef<string>(sourceId);
@@ -554,7 +580,16 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         const shape = arr.shape.length ? arr.shape : descriptor.shape;
         const labels = arr.dimLabels.length ? arr.dimLabels : descriptor.dim_labels;
         const dtype = arr.dtype || descriptor.dtype || "uint8";
-        const { rgba, width, height } = toGrayscaleRgba(shape, labels, dtype, arr.buffer);
+        const { rgba, width, height } = toPseudoColorRgba(
+          shape,
+          labels,
+          dtype,
+          arr.buffer,
+          colorRef.current,
+          currentChannelName,
+          percentileLo,
+          percentileHi,
+        );
 
         const canvas = document.createElement("canvas");
         canvas.width = width;
@@ -682,6 +717,15 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     slice.z,
     sourceId,
     tensorId,
+    // Re-render when color changes
+    getChannelColor(sourceId, slice.c),
+    // Re-render when channel name is loaded (for auto color resolution)
+    currentChannelName,
+    // Re-render when intensity scaling changes
+    percentileLo,
+    percentileHi,
+    slice.useMinMax,
+    slice.percentileScale,
   ]);
 
   return (
