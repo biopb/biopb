@@ -16,6 +16,7 @@ Chunk ID format:
 Relies on OS page cache for raw data caching.
 """
 
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set
 
@@ -120,6 +121,7 @@ class AicsImageIoAdapter(BackendAdapter):
         source_id: str,
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
+        io_lock: Optional[threading.Lock] = None,
     ):
         """Initialize AICSImageIO adapter.
 
@@ -129,10 +131,20 @@ class AicsImageIoAdapter(BackendAdapter):
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides auto-detected dims)
             source_url: Optional source URL
+            io_lock: Optional thread lock for IO serialization. Source-level
+                     adapters create a new lock if None; scene-level adapters
+                     receive the lock from the source-level adapter.
         """
         self._aics_image = aics_image
         self.scene_index = scene_index
         self.source_id = source_id
+
+        # Thread lock for serializing IO operations
+        # Source-level creates lock, scene-level receives from source
+        if io_lock is not None:
+            self._io_lock = io_lock
+        else:
+            self._io_lock = threading.Lock()
 
         # Source-level metadata for DataSourceDescriptor
         if source_url:
@@ -177,8 +189,10 @@ class AicsImageIoAdapter(BackendAdapter):
             stop = start + chunk_sizes[idx]
             slices.append(slice(start, stop))
 
-        # Compute the chunk data from dask array
-        return self._dask_data[tuple(slices)].compute()
+        # Serialize IO to avoid corrupted reads in parallel fetches.
+        # aicsimageio backends may not be thread-safe for concurrent reads.
+        with self._io_lock:
+            return self._dask_data[tuple(slices)].compute()
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter.
@@ -289,6 +303,7 @@ class AicsImageIoAdapter(BackendAdapter):
             source_id=self.source_id,
             dim_labels=self.dim_labels,
             source_url=self._source_url,
+            io_lock=self._io_lock,
         )
         # Set tensor name for multi-tensor context
         adapter._tensor_name = tensor_id

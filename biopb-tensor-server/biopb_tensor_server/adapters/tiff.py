@@ -585,6 +585,10 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         self._source_url = str(directory)
         self._source_type = "ome-tiff-multifile"
 
+        # Thread lock for serializing IO operations
+        # Needed because underlying codecs (libjpeg, openjpeg, etc.) may not be thread-safe
+        self._io_lock = threading.Lock()
+
         # Try to get explicit file list from _metadata.txt OME-XML
         expected_files = self._parse_file_list_from_metadata()
         self._missing_files = []
@@ -882,27 +886,30 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         file_path = self._tiff_files[file_index]
 
-        with tifffile.TiffFile(str(file_path)) as tf:
-            page = tf.pages[local_ifd_index]
+        # Serialize IO and decoding to avoid issues with non-thread-safe codecs
+        # (libjpeg-turbo, openjpeg, etc. may have global state)
+        with self._io_lock:
+            with tifffile.TiffFile(str(file_path)) as tf:
+                page = tf.pages[local_ifd_index]
 
-            if self.is_tiled:
-                tiles_per_row = (page.shape[1] + self.tile_width - 1) // self.tile_width
-                tile_idx = tile_row * tiles_per_row + tile_col
+                if self.is_tiled:
+                    tiles_per_row = (page.shape[1] + self.tile_width - 1) // self.tile_width
+                    tile_idx = tile_row * tiles_per_row + tile_col
 
-                offset = page.dataoffsets[tile_idx]
-                bytecount = page.databytecounts[tile_idx]
+                    offset = page.dataoffsets[tile_idx]
+                    bytecount = page.databytecounts[tile_idx]
 
-                fh = tf.filehandle
-                fh.seek(offset)
-                raw_data = fh.read(bytecount)
+                    fh = tf.filehandle
+                    fh.seek(offset)
+                    raw_data = fh.read(bytecount)
 
-                decoded = page.decode(raw_data, tile_idx)
-                data = decoded[0].squeeze()
-            else:
-                # Non-tiled: read entire page as single "tile"
-                data = page.asarray()
+                    decoded = page.decode(raw_data, tile_idx)
+                    data = decoded[0].squeeze()
+                else:
+                    # Non-tiled: read entire page as single "tile"
+                    data = page.asarray()
 
-            return data
+                return data
 
     def get_metadata(self) -> dict:
         """Return OME metadata from multi-file dataset."""
