@@ -195,7 +195,6 @@ class TensorFlightServer(flight.FlightServerBase):
         """List all available data sources.
 
         Each flight represents a data source (which may contain multiple tensors).
-        The DataSourceDescriptor contains full tensor metadata upfront.
 
         Args:
             context: Server call context

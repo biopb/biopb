@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.base import configure_compute_backend
+from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (

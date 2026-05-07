@@ -142,10 +142,8 @@ class BackendAdapter(ABC):
             Some field are delayed fil, e.g., metadata_json.
             response's TensorDescriptor instead.
         """
-        descriptor = self.get_tensor_descriptor()
-
         return DataSourceDescriptor(
-            source_id=descriptor.array_id,
+            source_id=self.array_id,
             source_url=self._source_url if hasattr(self, '_source_url') else "",
             source_type=self._source_type if hasattr(self, '_source_type') else "",
             tensors=self.list_tensor_descriptors(),
