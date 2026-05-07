@@ -557,19 +557,15 @@ def create_app(
             scale_hint = req.scale_hint or None
             reduction_method = req.reduction_method or None
 
-            # Get lazy dask array WITHOUT slice_hint (client-side cropping for correct size at scale)
+            # Pass slice_hint to gRPC for optimized slicing (in world coordinates)
+            # slice_hint is applied BEFORE scaling, so coordinates are in original tensor units
             arr_lazy = client.get_tensor(
                 source_id=req.source_id,
                 tensor_id=req.tensor_id,
-                slice_hint=None,
+                slice_hint=slice_hint,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,
             )
-
-            # Apply slice on dask array BEFORE compute (lazy slicing)
-            # This ensures proper cropping when scale_hint is used
-            if slice_hint is not None:
-                arr_lazy = arr_lazy[slice_hint]
 
             # Compute (blocking)
             arr: np.ndarray = arr_lazy.compute()

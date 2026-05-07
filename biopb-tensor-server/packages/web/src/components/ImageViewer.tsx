@@ -189,35 +189,82 @@ function getVisibleWorldBounds(
 /**
  * Compute tensor slice range from visible bounds with 50% buffer.
  * World coordinates = original tensor indices (world is sized to full tensor).
+ * IMPORTANT: slice coordinates are snapped to be divisible by scaleFactors
+ * to avoid 1-pixel shift issues when server processes slice_hint with scale_hint.
  */
 function computeSliceRange(
   visibleBounds: VisibleBounds,
   axisMap: AxisMap,
   tensorShape: number[],
+  scaleFactors: number[],
 ): { y: [number, number]; x: [number, number] } {
   const yIdx = axisMap.y ?? 0;
   const xIdx = axisMap.x ?? 1;
   const fullHeight = tensorShape[yIdx] ?? 1;
   const fullWidth = tensorShape[xIdx] ?? 1;
+  const scaleY = scaleFactors[yIdx] ?? 1;
+  const scaleX = scaleFactors[xIdx] ?? 1;
 
   // 50% buffer margin for smooth panning (in world units)
   const marginY = visibleBounds.height * 0.5;
   const marginX = visibleBounds.width * 0.5;
 
-  // World coords = original tensor indices, no division by scaleFactor needed
-  const yStart = Math.max(0, Math.floor(visibleBounds.y - marginY));
-  const yEnd = Math.min(fullHeight, Math.ceil(visibleBounds.y + visibleBounds.height + marginY));
-  const xStart = Math.max(0, Math.floor(visibleBounds.x - marginX));
-  const xEnd = Math.min(fullWidth, Math.ceil(visibleBounds.x + visibleBounds.width + marginX));
+  // World coords = original tensor indices
+  // Snap to scale factor divisibility to avoid rounding issues
+  const yStartRaw = Math.max(0, Math.floor(visibleBounds.y - marginY));
+  const yEndRaw = Math.min(fullHeight, Math.ceil(visibleBounds.y + visibleBounds.height + marginY));
+  const xStartRaw = Math.max(0, Math.floor(visibleBounds.x - marginX));
+  const xEndRaw = Math.min(fullWidth, Math.ceil(visibleBounds.x + visibleBounds.width + marginX));
+
+  // Snap to multiples of scale factor (floor for start, ceil for end)
+  const yStart = scaleY > 1 ? Math.floor(yStartRaw / scaleY) * scaleY : yStartRaw;
+  const yEnd = scaleY > 1 ? Math.ceil(yEndRaw / scaleY) * scaleY : yEndRaw;
+  const xStart = scaleX > 1 ? Math.floor(xStartRaw / scaleX) * scaleX : xStartRaw;
+  const xEnd = scaleX > 1 ? Math.ceil(xEndRaw / scaleX) * scaleX : xEndRaw;
+
+  // Clamp again after snapping
+  const yStartClamped = Math.max(0, yStart);
+  const yEndClamped = Math.min(fullHeight, yEnd);
+  const xStartClamped = Math.max(0, xStart);
+  const xEndClamped = Math.min(fullWidth, xEnd);
 
   return {
-    y: [yStart, yEnd],
-    x: [xStart, xEnd],
+    y: [yStartClamped, yEndClamped],
+    x: [xStartClamped, xEndClamped],
   };
 }
 
 /**
+ * Check if reload needed based on visible region coverage (no scale check).
+ * Used at event time to decide whether to queue a reload.
+ */
+function shouldReloadCheck(
+  visibleBounds: VisibleBounds,
+  loadedRegion: LoadedRegion | null,
+): boolean {
+  if (!loadedRegion) return true;
+
+  // Check region coverage: reload when visible region extends outside loaded region
+  const visibleEndX = visibleBounds.x + visibleBounds.width;
+  const visibleEndY = visibleBounds.y + visibleBounds.height;
+  const loadedEndX = loadedRegion.x + loadedRegion.width;
+  const loadedEndY = loadedRegion.y + loadedRegion.height;
+
+  // Small tolerance to avoid reload on rounding errors at clamped edges
+  const TOLERANCE = 1.0;
+
+  // Reload if any edge of visible region is outside loaded region (beyond tolerance)
+  if (visibleBounds.x < loadedRegion.x - TOLERANCE) return true;
+  if (visibleBounds.y < loadedRegion.y - TOLERANCE) return true;
+  if (visibleEndX > loadedEndX + TOLERANCE) return true;
+  if (visibleEndY > loadedEndY + TOLERANCE) return true;
+
+  return false;
+}
+
+/**
  * Check if reload needed: scale change OR viewport extends outside loaded region.
+ * Used when both current scaleFactors and visibleBounds are known.
  */
 function shouldReload(
   newScaleFactors: number[],
@@ -235,23 +282,7 @@ function shouldReload(
     }
   }
 
-  // Check region coverage: reload when visible region extends outside loaded region
-  const visibleEndX = visibleBounds.x + visibleBounds.width;
-  const visibleEndY = visibleBounds.y + visibleBounds.height;
-  const loadedEndX = loadedRegion.x + loadedRegion.width;
-  const loadedEndY = loadedRegion.y + loadedRegion.height;
-
-  // Small tolerance to avoid reload on rounding errors at clamped edges
-  // 1 world unit = 1 pixel, missing 1 pixel is negligible
-  const TOLERANCE = 1.0;
-
-  // Reload if any edge of visible region is outside loaded region (beyond tolerance)
-  if (visibleBounds.x < loadedRegion.x - TOLERANCE) return true;
-  if (visibleBounds.y < loadedRegion.y - TOLERANCE) return true;
-  if (visibleEndX > loadedEndX + TOLERANCE) return true;
-  if (visibleEndY > loadedEndY + TOLERANCE) return true;
-
-  return false;
+  return shouldReloadCheck(visibleBounds, loadedRegion);
 }
 
 export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
@@ -433,17 +464,17 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
       console.log("Viewport created: fitScale=%.3f, worldSize=%dx%d", fitScale, fullWidth, fullHeight);
 
-      // Helper to queue reload with debounce
-      const queueReload = (scaleFactors: number[]) => {
+      // Helper to queue reload with debounce - actual values computed at fetch time
+      const queueReload = () => {
         if (debounceTimerRef.current) {
           clearTimeout(debounceTimerRef.current);
         }
         debounceTimerRef.current = setTimeout(() => {
-          triggerTensorFetch(scaleFactors);
-        }, 300);
+          triggerTensorFetch();
+        }, 150);  // Shorter debounce to reduce stale-state window
       };
 
-      // Listen for zoom changes
+      // Listen for zoom changes - compute scale at event time for hysteresis check only
       viewport.on("zoomed-end", () => {
         if (!descriptor || !client) return;
         const currentZoom = viewport.scale.x;
@@ -468,38 +499,25 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         const fullWidth = descriptor.shape[xIdx] ?? 1;
 
         const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
+        // Use full shouldReload to check scale hysteresis AND region coverage
         if (shouldReload(scale.factors, visibleBounds, loadedRegionRef.current)) {
-          queueReload(scale.factors);
+          queueReload();
         }
       });
 
-      // Listen for pan changes
+      // Listen for pan changes - region coverage check is sufficient
       viewport.on("moved-end", () => {
         if (!descriptor || !client) return;
-        const currentZoom = viewport.scale.x;
-        const hostW = Math.max(1, host.clientWidth);
-        const hostH = Math.max(1, host.clientHeight);
-        const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
-        const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
-
         const axisMap = buildAxisMap(descriptor.dim_labels);
-        const scale = computeScaleHint(
-          descriptor.shape,
-          axisMap,
-          viewportW,
-          viewportH,
-          1_000_000,
-          currentZoom,
-        );
-
         const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
         const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
         const fullHeight = descriptor.shape[yIdx] ?? 1;
         const fullWidth = descriptor.shape[xIdx] ?? 1;
 
         const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
-        if (shouldReload(scale.factors, visibleBounds, loadedRegionRef.current)) {
-          queueReload(scale.factors);
+        // For pan, only need to check region coverage
+        if (shouldReloadCheck(visibleBounds, loadedRegionRef.current)) {
+          queueReload();
         }
       });
     })();
@@ -531,7 +549,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   }, [descriptor]);
 
   // Function to fetch tensor with cancellation support
-  const triggerTensorFetch = (scaleFactors: number[], forceFull = false) => {
+  // Computes scaleFactors and sliceRange at fetch time for consistency
+  const triggerTensorFetch = (forceFull = false) => {
     const viewport = viewportRef.current;
     const host = hostRef.current;
     if (!viewport || !host || !client || !descriptor) return;
@@ -549,8 +568,25 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     const fullHeight = descriptor.shape[yIdx] ?? 1;
     const fullWidth = descriptor.shape[xIdx] ?? 1;
 
-    // On initial load (forceFull), request full tensor extent
-    // On subsequent loads, request visible region + buffer
+    // Compute scaleFactors from current viewport zoom (at fetch time)
+    const currentZoom = viewport.scale.x;
+    const hostW = Math.max(1, host.clientWidth);
+    const hostH = Math.max(1, host.clientHeight);
+    const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
+    const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
+
+    const scale = computeScaleHint(
+      descriptor.shape,
+      axisMap,
+      viewportW,
+      viewportH,
+      1_000_000,
+      currentZoom,
+    );
+    const scaleFactors = scale.factors;
+
+    // Compute sliceRange from current viewport visibleBounds (at fetch time)
+    // Both scaleFactors and sliceRange are now computed from SAME viewport state
     let sliceRange: { y: [number, number]; x: [number, number] };
     if (forceFull) {
       sliceRange = {
@@ -559,7 +595,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       };
     } else {
       const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
-      sliceRange = computeSliceRange(visibleBounds, axisMap, descriptor.shape);
+      sliceRange = computeSliceRange(visibleBounds, axisMap, descriptor.shape, scaleFactors);
     }
 
     const tensor = client.getTensor(sourceId, tensorId);
@@ -685,28 +721,9 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     const viewport = viewportRef.current;
     if (!host || !viewport) return;
 
-    const axisMap = buildAxisMap(descriptor.dim_labels);
-    const hostW = Math.max(1, host.clientWidth);
-    const hostH = Math.max(1, host.clientHeight);
-    const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
-    const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
-
-    // viewport.scale.x is correct (world size was set during viewport creation)
-    const currentZoom = viewport.scale.x;
-    const scale = computeScaleHint(
-      descriptor.shape,
-      axisMap,
-      viewportW,
-      viewportH,
-      1_000_000,
-      currentZoom,
-    );
-
-    console.log("computeScaleHint: currentZoom=%.3f, scaleFactors=%s", currentZoom, scale.factors.join(","));
-
     // First fetch for this viewport should load full tensor
     const isInitialFetch = loadedRegionRef.current === null;
-    triggerTensorFetch(scale.factors, isInitialFetch);
+    triggerTensorFetch(isInitialFetch);
   }, [
     appReady,
     client,
