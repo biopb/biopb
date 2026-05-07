@@ -320,12 +320,13 @@ class TensorFlightClient:
             # Read all data from the stream
             table = reader.read_all()
 
-            # Convert to numpy
-            arr = table.column(0).to_numpy()
+            # Extract data from list column (each row is one chunk's flattened data)
+            # Data column is list<dtype>, we get the first row's list
+            arr = table.column("data").to_numpy()[0]  # First row's data list
 
-            # Reshape to chunk shape
-            chunk_shape = tuple(stop - start for start, stop in zip(bounds.start, bounds.stop))
-            arr = arr.reshape(chunk_shape)
+            # Get shape from shape column (list<int64>)
+            shape = tuple(table.column("shape").to_pylist()[0])
+            arr = arr.reshape(shape)
 
             # Cache the result
             self._cache.put(cache_key, arr, cost=arr.nbytes)

@@ -420,22 +420,31 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
 
+        Schema format:
+        - data: list<dtype> - flattened tensor elements per chunk
+        - shape: list<int64> - shape tuple per chunk
+        - chunk_id: binary - chunk identifier per chunk
+
+        Each RecordBatch has 1 row per chunk, making data self-describing.
+
         Returns:
-            Arrow Schema with tensor extension type
+            Arrow Schema with data, shape, and chunk_id fields
         """
         import importlib.metadata
 
         desc = desc or self.get_tensor_descriptor()
 
         dtype = np.dtype(desc.dtype)
-        field = pa.field("data", pa.from_numpy_dtype(dtype))
+        data_field = pa.field("data", pa.list_(pa.from_numpy_dtype(dtype)))
+        shape_field = pa.field("shape", pa.list_(pa.int64()))
+        chunk_id_field = pa.field("chunk_id", pa.binary())
 
         # Schema metadata: biopb version for compatibility tracking
         metadata = {
             "tensor_schema_version": importlib.metadata.version("biopb"),
         }
 
-        return pa.schema([field], metadata=metadata)
+        return pa.schema([data_field, shape_field, chunk_id_field], metadata=metadata)
 
 
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
@@ -650,11 +659,15 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 )
 
                 # compute_virtual_chunk now returns numpy array directly
+                # The result is already downscaled, so result_arr.shape is the logical shape
                 result_arr = compute_virtual_chunk(self, backend_data)
 
                 if split_max > 1:
                     # Slice the numpy array directly
                     result_arr = slice_array(result_arr, parent_bounds, split_index, split_max)
+
+                # For virtual chunks, use result_arr.shape (already downscaled)
+                logical_shape = list(result_arr.shape)
             else:
                 # For real chunks, get the numpy array directly
                 result_arr = self.get_chunk_array(chunk_id)
@@ -677,8 +690,21 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 if split_max > 1:
                     result_arr = slice_array(result_arr, parent_bounds, split_index, split_max)
 
-            # Convert to RecordBatch only at final output
-            result = pa.RecordBatch.from_arrays([pa.array(result_arr.ravel())], ["data"])
+                # For real chunks, use logical shape from bounds (may differ from raw array shape)
+                logical_shape = [int(stop - start) for start, stop in zip(parent_bounds.start, parent_bounds.stop)]
+
+            # Convert to RecordBatch with 1 row per chunk
+            # data: list<dtype> - flattened tensor elements
+            # shape: list<int64> - LOGICAL chunk shape (from bounds for real chunks, from result for virtual)
+            # chunk_id: binary - chunk identifier
+            result = pa.RecordBatch.from_arrays(
+                [
+                    pa.array([result_arr.ravel()]),  # list of flattened elements
+                    pa.array([logical_shape]),       # logical shape
+                    pa.array([chunk_id]),            # binary chunk identifier
+                ],
+                ["data", "shape", "chunk_id"]
+            )
             size_bytes = result_arr.nbytes
             logger.debug(f"resolve_chunk_data: computed {size_bytes} bytes")
             return result, size_bytes

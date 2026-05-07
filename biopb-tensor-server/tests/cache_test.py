@@ -63,7 +63,10 @@ class TestCacheEntry:
 
     def test_set_ready(self):
         """Mark entry ready."""
-        data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], ["data"])
+        data = pa.RecordBatch.from_arrays(
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
         entry = CacheEntry(state=EntryState.PENDING)
         entry.set_ready(data, size_bytes=24)
         assert entry.state == EntryState.READY
@@ -85,7 +88,10 @@ class TestCacheEntry:
 
         def complete():
             time.sleep(0.1)
-            data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], ["data"])
+            data = pa.RecordBatch.from_arrays(
+                [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array([b"test"])],
+                ["data", "shape", "chunk_id"]
+            )
             entry.set_ready(data, 24)
 
         thread = threading.Thread(target=complete)
@@ -116,8 +122,11 @@ class TestMemoryCacheBackend:
     """Tests for thread-safe MemoryCacheBackend."""
 
     def _make_data(self, values) -> pa.RecordBatch:
-        """Helper to create RecordBatch."""
-        return pa.RecordBatch.from_arrays([pa.array(values)], ["data"])
+        """Helper to create RecordBatch with new schema format."""
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
     def test_start_compute_creates_pending(self):
         """First request creates pending entry."""
@@ -144,7 +153,7 @@ class TestMemoryCacheBackend:
         entry2, is_owner2 = backend.start_compute(b"key1")
         assert is_owner2 is False
         assert entry2.state == EntryState.READY
-        assert entry2.data.column(0).to_pylist() == [1, 2, 3]
+        assert entry2.data.column(0).to_pylist() == [[1, 2, 3]]
         backend.close()
 
     def test_start_compute_pending_wait(self):
@@ -322,7 +331,10 @@ class TestCacheManager:
         entry, is_owner = manager.start_compute(b"key1", metadata={"test": True})
         assert is_owner is True
 
-        data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], ["data"])
+        data = pa.RecordBatch.from_arrays(
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
         manager.complete_entry(b"key1", data, 24)
 
         assert entry.state == EntryState.READY
@@ -364,7 +376,10 @@ class TestConcurrentCompute:
                 with compute_lock:
                     compute_counts[0] += 1
                 time.sleep(0.1)  # Simulate computation
-                data = pa.RecordBatch.from_arrays([pa.array([worker_id])], ["data"])
+                data = pa.RecordBatch.from_arrays(
+                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array([b"test"])],
+                    ["data", "shape", "chunk_id"]
+                )
                 backend.complete_entry(b"key1", data, 8)
             else:
                 entry.wait_ready(timeout=5.0)
@@ -390,7 +405,10 @@ class TestConcurrentCompute:
         def worker(key, value):
             entry, is_owner = backend.start_compute(key)
             assert is_owner is True
-            data = pa.RecordBatch.from_arrays([pa.array([value])], ["data"])
+            data = pa.RecordBatch.from_arrays(
+                [pa.array([[value]]), pa.array([[1]]), pa.array([b"test"])],
+                ["data", "shape", "chunk_id"]
+            )
             backend.complete_entry(key, data, 8)
             results[key] = value
             backend.release(key)
@@ -430,8 +448,11 @@ class TestArrowFileBackend:
     """Tests for persistent Arrow file cache backend."""
 
     def _make_data(self, values) -> pa.RecordBatch:
-        """Helper to create RecordBatch."""
-        return pa.RecordBatch.from_arrays([pa.array(values)], ["data"])
+        """Helper to create RecordBatch with new schema format."""
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
     def _make_temp_cache_dir(self):
         """Create a temporary cache directory."""
@@ -476,7 +497,7 @@ class TestArrowFileBackend:
         entry2, is_owner2 = backend2.start_compute(b"key1")
         assert is_owner2 is False  # Already cached
         assert entry2.state == EntryState.READY
-        assert entry2.data.column(0).to_pylist() == [1, 2, 3]
+        assert entry2.data.column(0).to_pylist() == [[1, 2, 3]]
         backend2.release(b"key1")
         backend2.close()
         shutil.rmtree(cache_dir)
@@ -547,7 +568,10 @@ class TestArrowFileBackend:
                 with compute_lock:
                     compute_counts[0] += 1
                 time.sleep(0.1)
-                data = pa.RecordBatch.from_arrays([pa.array([worker_id])], ["data"])
+                data = pa.RecordBatch.from_arrays(
+                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array([b"test"])],
+                    ["data", "shape", "chunk_id"]
+                )
                 backend.complete_entry(b"key1", data, 8)
             else:
                 entry.wait_ready(timeout=5.0)
@@ -588,7 +612,10 @@ class TestArrowFileBackendRecovery:
     """Tests for crash recovery."""
 
     def _make_data(self, values) -> pa.RecordBatch:
-        return pa.RecordBatch.from_arrays([pa.array(values)], ["data"])
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
     def _make_temp_cache_dir(self):
         return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
@@ -706,7 +733,10 @@ class TestOversizedChunkHandling:
     """Tests for oversized chunk handling (>2GB)."""
 
     def _make_data(self, values) -> pa.RecordBatch:
-        return pa.RecordBatch.from_arrays([pa.array(values)], ["data"])
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
     def test_memory_backend_skips_oversized(self):
         """Memory backend skips caching oversized chunks."""
@@ -801,8 +831,14 @@ class TestSchemaPooling:
         backend = ArrowFileBackend(config)
 
         # Create batches with different schemas (different dtypes)
-        int_data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3], type=pa.int32())], ["data"])
-        float_data = pa.RecordBatch.from_arrays([pa.array([1.0, 2.0, 3.0], type=pa.float32())], ["data"])
+        int_data = pa.RecordBatch.from_arrays(
+            [pa.array([[1, 2, 3]], type=pa.list_(pa.int32())), pa.array([[3]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
+        float_data = pa.RecordBatch.from_arrays(
+            [pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float32())), pa.array([[3]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
         # Write alternating entries with different schemas
         # Each schema should get its own pool/segment
@@ -850,7 +886,10 @@ class TestSchemaPooling:
         # Create a batch that would be classified as large
         # Use the MEDIUM threshold (>=256MB = large)
         large_size = SIZE_CLASS_MEDIUM_THRESHOLD + 1000
-        data = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], ["data"])
+        data = pa.RecordBatch.from_arrays(
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
 
         entry, _ = backend.start_compute(b"large_key")
         backend.complete_entry(b"large_key", data, large_size)
@@ -882,15 +921,21 @@ class TestSchemaPooling:
         backend = ArrowFileBackend(config)
 
         # Create batches with same schema but different sizes (small vs tiny)
-        schema = pa.array([1, 2, 3], type=pa.int32()).type
+        list_type = pa.list_(pa.int32())
 
         # Tiny entry (< 2MB)
-        tiny_data = pa.RecordBatch.from_arrays([pa.array([1] * 100, type=schema)], ["data"])
+        tiny_data = pa.RecordBatch.from_arrays(
+            [pa.array([[1] * 100], type=list_type), pa.array([[100]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
         tiny_size = 400  # Tiny
 
         # Small entry (between 2MB and 32MB in size classification)
         # Simulate with small actual data but report larger size
-        small_data = pa.RecordBatch.from_arrays([pa.array([2] * 100, type=schema)], ["data"])
+        small_data = pa.RecordBatch.from_arrays(
+            [pa.array([[2] * 100], type=list_type), pa.array([[100]]), pa.array([b"test"])],
+            ["data", "shape", "chunk_id"]
+        )
         small_size = SIZE_CLASS_TINY_THRESHOLD + 1000  # Small class
 
         entry, _ = backend.start_compute(b"tiny_key")
