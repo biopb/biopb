@@ -55,14 +55,31 @@ class build_proto(_build_py):
 
         print(f"Using buf: {buf_path}")
 
-        # Set up PATH to include node_modules/.bin for protoc-gen-es plugin
+        # Check if protoc-gen-es is available (TypeScript plugin)
+        node_bin = project_root / "node_modules" / ".bin"
+        es_plugin = node_bin / "protoc-gen-es"
+
+        # Use full config if es plugin available, otherwise use Python-only config
+        if es_plugin.exists() and es_plugin.is_file():
+            config_file = None  # Default buf.gen.yaml
+            print("Using full config (includes TypeScript plugin)")
+        else:
+            config_file = project_root / "buf.gen.ci.yaml"
+            print(f"protoc-gen-es not found, using Python-only config: {config_file}")
+
+        # Set up PATH to include node_modules/.bin for any local plugins
         env = os.environ.copy()
-        node_bin = str(project_root / "node_modules" / ".bin")
-        env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
+        if node_bin.exists():
+            env["PATH"] = f"{str(node_bin)}{os.pathsep}{env.get('PATH', '')}"
+
+        # Build buf generate command
+        cmd = ["buf", "generate"]
+        if config_file:
+            cmd.extend(["--template", str(config_file)])
 
         # Run buf generate
         result = subprocess.run(
-            ["buf", "generate"],
+            cmd,
             cwd=project_root,
             capture_output=True,
             text=True,
