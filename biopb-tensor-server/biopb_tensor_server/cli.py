@@ -30,6 +30,7 @@ from biopb_tensor_server.config import (
     resolve_all_sources,
 )
 from biopb_tensor_server.http_server import run as run_http_server
+from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.source_manager import create_source_manager
 from biopb_tensor_server.watcher import get_watcher
@@ -231,6 +232,11 @@ def serve(
         exists=True,
         help="Path to TOML config file",
     ),
+    log_level: Optional[str] = typer.Option(
+        None,
+        "--log-level", "-l",
+        help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
+    ),
     host: Optional[str] = typer.Option(
         None,
         "--host", "-h",
@@ -272,8 +278,13 @@ def serve(
     Example:
         biopb-tensor serve --config biopb-tensor.toml
         biopb-tensor serve -c config.toml --port 9000
+        biopb-tensor serve -c config.toml --log-level DEBUG
     """
     server_config = load_config(config)
+
+    # Setup logging with priority: CLI > env > config > default
+    effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
+    setup_logging(effective_log_level)
 
     server, source_manager, watcher = _setup_flight_server(
         server_config,
@@ -439,6 +450,11 @@ def launch(
         exists=True,
         help="Path to TOML config file",
     ),
+    log_level: Optional[str] = typer.Option(
+        None,
+        "--log-level", "-l",
+        help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
+    ),
     web_port: int = typer.Option(
         8816,
         "--web-port",
@@ -488,8 +504,16 @@ def launch(
     Example:
         biopb-tensor launch --config biopb-tensor.toml
         biopb-tensor launch -c config.toml --web-port 9000 --dev
+        biopb-tensor launch -c config.toml --log-level DEBUG
     """
     import re as _re
+
+    # --- Load server config and setup logging ---
+    server_config = load_config(config)
+
+    # Setup logging with priority: CLI > env > config > default
+    effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
+    setup_logging(effective_log_level)
 
     # --- Determine dev mode ---
     env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
@@ -549,9 +573,7 @@ def launch(
             f"\n[bold green]Access token (shown once — do not share):[/bold green]\n  {effective_token}\n"
         )
 
-    # --- Load server config and start Flight ---
-    server_config = load_config(config)
-
+    # --- Start Flight server ---
     flight_server, source_manager, watcher = _setup_flight_server(server_config)
 
     flight_location = f"grpc://{server_config.host}:{server_config.port}"

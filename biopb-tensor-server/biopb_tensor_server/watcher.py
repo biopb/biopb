@@ -167,20 +167,21 @@ class WatchdogWatcher(DirectoryWatcher):
         # Resolve directories to absolute paths
         resolved_dirs = {d.resolve() for d in directories}
 
-        logger.info(f"Starting watchdog watcher for: {resolved_dirs}")
+        logger.info(f"Starting watchdog watcher for: {resolved_dirs}, debounce_window={self._debounce_window}s")
         self._process = Process(
             target=_run_watchdog_subprocess,
             args=(self._queue, self._shutdown_event, resolved_dirs, self._debounce_window),
             daemon=True,
         )
         self._process.start()
+        logger.debug(f"Watcher subprocess started with PID {self._process.pid}")
 
     def stop(self) -> None:
         """Stop watcher subprocess gracefully."""
         if self._process is None:
             return
 
-        logger.info("Stopping watchdog watcher")
+        logger.info(f"Stopping watchdog watcher (PID {self._process.pid})")
 
         # Signal shutdown via Event (clean, no queue contention)
         self._shutdown_event.set()
@@ -189,7 +190,7 @@ class WatchdogWatcher(DirectoryWatcher):
         self._process.join(timeout=5)
 
         if self._process.is_alive():
-            logger.warning("Watcher process did not terminate gracefully, killing")
+            logger.warning(f"Watcher process {self._process.pid} did not terminate gracefully, killing")
             self._process.terminate()
             self._process.join(timeout=2)
 
@@ -198,6 +199,7 @@ class WatchdogWatcher(DirectoryWatcher):
                 self._process.join(timeout=1)
 
         self._process = None
+        logger.debug("Watcher subprocess stopped")
 
     def get_events(self, timeout: float = 0.1) -> List[WatcherEvent]:
         """Poll for debounced events from subprocess."""
@@ -211,6 +213,8 @@ class WatchdogWatcher(DirectoryWatcher):
                 events.append(event)
             except queue.Empty:
                 break
+        if events:
+            logger.debug(f"Received {len(events)} watcher events")
         return events
 
     def is_running(self) -> bool:
@@ -438,20 +442,21 @@ class PollVFSWatcher(DirectoryWatcher):
         # Resolve directories to absolute paths
         resolved_dirs = {d.resolve() for d in directories}
 
-        logger.info(f"Starting PollVFS watcher for: {resolved_dirs}")
+        logger.info(f"Starting PollVFS watcher for: {resolved_dirs}, poll_interval={self._poll_interval}s")
         self._process = Process(
             target=_run_pollvfs_subprocess,
             args=(self._queue, self._shutdown_event, resolved_dirs, self._poll_interval, self._debounce_window),
             daemon=True,
         )
         self._process.start()
+        logger.debug(f"PollVFS subprocess started with PID {self._process.pid}")
 
     def stop(self) -> None:
         """Stop watcher subprocess gracefully."""
         if self._process is None:
             return
 
-        logger.info("Stopping PollVFS watcher")
+        logger.info(f"Stopping PollVFS watcher (PID {self._process.pid})")
 
         # Signal shutdown via Event
         self._shutdown_event.set()
@@ -460,7 +465,7 @@ class PollVFSWatcher(DirectoryWatcher):
         self._process.join(timeout=5)
 
         if self._process.is_alive():
-            logger.warning("PollVFS watcher did not terminate gracefully, killing")
+            logger.warning(f"PollVFS process {self._process.pid} did not terminate gracefully, killing")
             self._process.terminate()
             self._process.join(timeout=2)
 
@@ -469,6 +474,7 @@ class PollVFSWatcher(DirectoryWatcher):
                 self._process.join(timeout=1)
 
         self._process = None
+        logger.debug("PollVFS subprocess stopped")
 
     def get_events(self, timeout: float = 0.1) -> List[WatcherEvent]:
         """Poll for debounced events from subprocess."""
@@ -482,6 +488,8 @@ class PollVFSWatcher(DirectoryWatcher):
                 events.append(event)
             except queue.Empty:
                 break
+        if events:
+            logger.debug(f"PollVFS received {len(events)} watcher events")
         return events
 
     def is_running(self) -> bool:

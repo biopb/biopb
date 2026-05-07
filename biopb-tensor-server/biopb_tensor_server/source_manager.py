@@ -166,6 +166,7 @@ class SourceManager:
             event: WatcherEvent from the watcher
         """
         try:
+            logger.debug(f"Processing event: {event.event_type.value} {event.path}")
             if event.event_type == WatcherEventType.CREATED:
                 self._handle_created(event.path, event.is_directory)
             elif event.event_type == WatcherEventType.DELETED:

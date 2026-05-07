@@ -10,16 +10,20 @@ This module is self-contained (no protobuf / Arrow dependencies) and handles:
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 try:
     cp = importlib.import_module('cupy')
     cupy_ndimage = importlib.import_module('cupyx.scipy.ndimage')
     _HAS_CUPY = True
+    logger.debug("CuPy available: GPU backend enabled")
 except ImportError:
     cp = None
     cupy_ndimage = None
@@ -69,6 +73,13 @@ def configure_compute_backend(**kwargs) -> ComputeBackendOptions:
         raise ValueError('gpu_min_merged_chunks must be >= 1')
 
     _COMPUTE_BACKEND_OPTIONS = options
+    logger.debug(
+        f"Compute backend configured: force_backend={options.force_backend}, "
+        f"gpu_min_input_bytes={options.gpu_min_input_bytes}, "
+        f"gpu_min_linear_input_bytes={options.gpu_min_linear_input_bytes}, "
+        f"gpu_memory_safety_factor={options.gpu_memory_safety_factor}, "
+        f"gpu_min_merged_chunks={options.gpu_min_merged_chunks}"
+    )
     return _COMPUTE_BACKEND_OPTIONS
 
 
@@ -211,20 +222,26 @@ def _select_compute_backend(
     override = _get_backend_override()
 
     if override == 'cpu':
+        logger.debug("Backend forced to CPU via override")
         return 'cpu'
 
     if override == 'gpu':
         if _HAS_CUPY and (reduction_method != 'linear' or cupy_ndimage is not None):
+            logger.debug("Backend forced to GPU via override")
             return 'gpu'
+        logger.debug("Backend forced to GPU but CuPy unavailable, falling back to CPU")
         return 'cpu'
 
     if not _HAS_CUPY:
+        logger.debug("Backend auto: CuPy unavailable, using CPU")
         return 'cpu'
 
     if reduction_method not in _GPU_PREFERRED_METHODS:
+        logger.debug(f"Backend auto: method '{reduction_method}' not GPU-preferred, using CPU")
         return 'cpu'
 
     if reduction_method == 'linear' and cupy_ndimage is None:
+        logger.debug("Backend auto: linear method requires cupyx.scipy.ndimage, using CPU")
         return 'cpu'
 
     input_bytes = _estimate_array_bytes(source_shape, dtype)
@@ -238,18 +255,28 @@ def _select_compute_backend(
     )
 
     if input_bytes < min_input_bytes:
+        logger.debug(f"Backend auto: input {input_bytes}B < threshold {min_input_bytes}B, using CPU")
         return 'cpu'
 
     if (
         merged_chunk_count < _COMPUTE_BACKEND_OPTIONS.gpu_min_merged_chunks
         and input_bytes < (min_input_bytes * 2)
     ):
+        logger.debug(
+            f"Backend auto: merged_chunks {merged_chunk_count} < threshold, input small, using CPU"
+        )
         return 'cpu'
 
     free_bytes = _get_gpu_free_bytes()
     if free_bytes > 0 and free_bytes < total_bytes * _COMPUTE_BACKEND_OPTIONS.gpu_memory_safety_factor:
+        logger.debug(
+            f"Backend auto: GPU free {free_bytes}B < required {total_bytes * _COMPUTE_BACKEND_OPTIONS.gpu_memory_safety_factor}B, using CPU"
+        )
         return 'cpu'
 
+    logger.debug(
+        f"Backend auto: selected GPU for {reduction_method}, input {input_bytes}B, shape {source_shape}"
+    )
     return 'gpu'
 
 
@@ -269,10 +296,17 @@ def _downsample_block(
         merged_chunk_count=merged_chunk_count,
     )
 
+    logger.debug(
+        f"downsample_block: shape={data.shape}, scale={scale_hint}, method={reduction_method}, backend={selected_backend}"
+    )
+
     if selected_backend == 'gpu':
         try:
-            return _downsample_block_gpu(data, scale_hint, reduction_method)
-        except Exception:
+            result = _downsample_block_gpu(data, scale_hint, reduction_method)
+            logger.debug(f"downsample_block: GPU downsampling succeeded, output shape={result.shape}")
+            return result
+        except Exception as e:
+            logger.warning(f"downsample_block: GPU failed ({e}), falling back to CPU")
             pass
 
     return _downsample_block_cpu(data, scale_hint, reduction_method)

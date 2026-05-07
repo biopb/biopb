@@ -1,6 +1,7 @@
 [server]
 host = "0.0.0.0"
 port = 8815
+log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
 [compute]
 backend = "auto"

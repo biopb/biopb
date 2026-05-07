@@ -9,6 +9,7 @@ The server supports:
 - DoGet: Fetch individual chunk data
 """
 
+import logging
 from typing import Dict, Iterator, List, Optional
 
 import pyarrow as pa
@@ -18,6 +19,8 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 from biopb_tensor_server.base import BackendAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
+
+logger = logging.getLogger(__name__)
 
 
 class _NoopMiddleware(flight.ServerMiddleware):
@@ -102,6 +105,7 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter: Backend adapter for the data source
         """
         self._sources[source_id] = adapter
+        logger.debug(f"Registered source: {source_id}")
 
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source from the server.
@@ -110,6 +114,7 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id: Unique identifier for the data source
         """
         self._sources.pop(source_id, None)
+        logger.debug(f"Unregistered source: {source_id}")
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
@@ -243,10 +248,14 @@ class TensorFlightServer(flight.FlightServerBase):
         import json
 
         selection = TensorSelection.FromString(descriptor.command)
+        logger.debug(
+            f"get_flight_info: source_id={selection.source_id}, tensor_id={selection.tensor_id}"
+        )
 
         # Get tensor adapter for the specified source and tensor
         tensor_adapter = self._get_adapter_for_tensor(selection.source_id, selection.tensor_id)
         if tensor_adapter is None:
+            logger.warning(f"Tensor not found: {selection.source_id}/{selection.tensor_id}")
             raise flight.FlightServerError(f"Tensor not found: {selection.source_id}/{selection.tensor_id}")
 
         # Build request descriptor for the specific tensor
@@ -260,6 +269,7 @@ class TensorFlightServer(flight.FlightServerBase):
         )
         if selection.HasField('slice_hint'):
             tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
+            logger.debug(f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}")
         if selection.HasField('read_options'):
             tensor_desc.read_options.CopyFrom(selection.read_options)
 
@@ -282,6 +292,7 @@ class TensorFlightServer(flight.FlightServerBase):
             )
             endpoints.append(endpoint)
 
+        logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
         return flight.FlightInfo(
             schema=schema,
             descriptor=flight.FlightDescriptor.for_command(read_plan.descriptor.SerializeToString()),
@@ -305,6 +316,7 @@ class TensorFlightServer(flight.FlightServerBase):
             FlightDataStream with the chunk data
         """
         tensor_ticket = self._parse_ticket(ticket)
+        logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
         # Decode array_id (source_id/tensor_id) from chunk_id
         array_id, *_ = decode_chunk_id(tensor_ticket.chunk_id)
@@ -319,9 +331,11 @@ class TensorFlightServer(flight.FlightServerBase):
             parts = array_id.split('/')
             source_id = parts[0]
             rest = '/'.join(parts[1:])
+            logger.debug(f"do_get: nested path source_id={source_id}, rest={rest}")
 
             source_adapter = self._sources.get(source_id)
             if source_adapter is None:
+                logger.warning(f"Source not found: {source_id}")
                 raise flight.FlightServerError(f"Source not found: {source_id}")
 
             # Check if this is a level adapter path (OME-Zarr)
@@ -335,9 +349,11 @@ class TensorFlightServer(flight.FlightServerBase):
             # Single source_id - find the adapter
             adapter = self._sources.get(array_id)
             if adapter is None:
+                logger.warning(f"Tensor not found: {array_id}")
                 raise flight.FlightServerError(f"Tensor not found: {array_id}")
 
         if adapter is None:
+            logger.warning(f"Tensor not found: {array_id}")
             raise flight.FlightServerError(f"Tensor not found: {array_id}")
 
         # Get cache manager singleton (if initialized)
@@ -345,6 +361,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Read the chunk (with caching for virtual chunks)
         record_batch = adapter.resolve_chunk_data(tensor_ticket.chunk_id, cache_manager)
+        batch_size = sum(col.nbytes for col in record_batch.columns)
+        logger.debug(f"do_get: returning {batch_size} bytes")
         return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
 
 

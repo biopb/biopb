@@ -21,6 +21,7 @@ Authentication:
 from __future__ import annotations
 
 import collections
+import logging
 import re
 import secrets
 import threading
@@ -36,6 +37,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Version / constants
@@ -272,14 +275,17 @@ def create_app(
         with _client_lock:
             if _client_holder["client"] is None:
                 try:
+                    logger.debug(f"Connecting to Flight server at {flight_location}")
                     _client_holder["client"] = TensorFlightClient(
                         location=flight_location,
                         cache_bytes=cache_bytes,
                         token=token,
                     )
                     diag.mark_connected()
+                    logger.info(f"Connected to Flight server at {flight_location}")
                 except Exception as exc:
                     diag.mark_error("CONNECTION_FAILED", str(exc))
+                    logger.error(f"Failed to connect to Flight server: {exc}")
                     raise
             return _client_holder["client"]
 
@@ -373,12 +379,15 @@ def create_app(
             result = []
             for source_id, desc in sources.items():
                 result.append(_source_desc_to_dict(desc))
-            diag.latency.record((time.monotonic() - t0) * 1000)
+            elapsed = (time.monotonic() - t0) * 1000
+            diag.latency.record(elapsed)
+            logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
             return JSONResponse(result)
         except HTTPException:
             raise
         except Exception as exc:
             diag.mark_error("LIST_SOURCES_FAILED", str(exc))
+            logger.error(f"list_sources failed: {exc}")
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
     # NOTE: the /metadata and /ticket routes must be registered before the greedy
@@ -425,6 +434,8 @@ def create_app(
         _check_token(request)
         t0 = time.monotonic()
 
+        logger.debug(f"get_chunk: source={source_id}, ticket_hex={ticket_hex[:16]}...")
+
         try:
             # Decode hex string to bytes
             ticket_bytes = bytes.fromhex(ticket_hex)
@@ -454,6 +465,7 @@ def create_app(
 
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
+            logger.debug(f"get_chunk: returned shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms")
 
             # Build response headers
             headers = {
@@ -471,12 +483,15 @@ def create_app(
 
         except ValueError as exc:
             # Invalid hex string or protobuf parse error
+            logger.warning(f"get_chunk: invalid ticket: {exc}")
             raise HTTPException(status_code=400, detail=f"Invalid ticket: {exc}")
         except flight.FlightError as exc:
             diag.mark_error("CHUNK_FETCH_FAILED", str(exc))
+            logger.error(f"get_chunk: Flight error: {exc}")
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
         except Exception as exc:
             diag.mark_error("CHUNK_FAILED", str(exc))
+            logger.error(f"get_chunk: unexpected error: {exc}")
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
     @app.get("/api/sources/{source_id:path}")
@@ -514,6 +529,11 @@ def create_app(
         """
         _check_token(request)
         t0 = time.monotonic()
+
+        logger.debug(
+            f"slice: source={req.source_id}, tensor={req.tensor_id}, "
+            f"slice={req.slice_start}-{req.slice_stop}, scale={req.scale_hint}, method={req.reduction_method}"
+        )
 
         if req.pixel_budget is not None:
             diag.pixel_budget = req.pixel_budget
@@ -562,6 +582,7 @@ def create_app(
 
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
+            logger.debug(f"slice: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms")
 
             # Build response headers
             headers = {
@@ -593,6 +614,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
             diag.mark_error("SLICE_FAILED", str(exc))
+            logger.error(f"slice failed: {exc}")
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
     return app

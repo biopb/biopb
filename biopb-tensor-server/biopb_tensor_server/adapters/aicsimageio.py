@@ -175,6 +175,27 @@ class AicsImageIoAdapter(BackendAdapter):
         arr = pa.array(data.ravel())
         return pa.RecordBatch.from_arrays([arr], ["data"])
 
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        """Return the TensorDescriptor for this adapter.
+
+        For scene-level adapters, computes actual chunk_shape from dask array.
+        For source-level adapters, delegates to list_tensor_descriptors()[0].
+        """
+        if self._dask_data is not None:
+            # Scene-level: compute from dask array
+            chunks = self._dask_data.chunks
+            # Use max chunk size per axis as representative chunk_shape
+            chunk_shape = [max(c) for c in chunks]
+            return TensorDescriptor(
+                array_id=self.array_id,
+                dim_labels=self.dim_labels if self.dim_labels else [],
+                shape=list(self._dask_data.shape),
+                chunk_shape=chunk_shape,
+                dtype=self._dask_data.dtype.str,
+            )
+        # Source-level: default behavior
+        return self.list_tensor_descriptors()[0]
+
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors (scenes) available in this source.
 

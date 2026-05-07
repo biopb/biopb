@@ -17,12 +17,15 @@ Key components:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Set, Type
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
+
+logger = logging.getLogger(__name__)
 
 
 def get_file_identity(path: Path) -> str:
@@ -207,10 +210,12 @@ class AdapterRegistry:
                 claim = adapter_cls.claim(path, visited_identities)
                 if claim is not None:
                     claims.append(claim)
+                    logger.debug(f"Adapter {adapter_cls.__name__} claimed {path} as {claim.source_type}")
                     # Update type mapping for factory use
                     self._type_to_adapter[claim.source_type] = adapter_cls
-            except Exception:
+            except Exception as e:
                 # Adapter claim() should not raise, but handle gracefully
+                logger.debug(f"Adapter {adapter_cls.__name__} claim() raised exception: {e}")
                 continue
         return claims
 
@@ -373,11 +378,14 @@ def discover_sources(
     if state is None:
         state = DiscoveryState()
 
+    logger.debug(f"discover_sources: scanning {root}")
+
     # Get identity for root itself
     try:
         root_identity = get_file_identity(root)
         state.visited_identities.add(root_identity)
     except OSError:
+        logger.debug(f"discover_sources: cannot get identity for {root}")
         return state
 
     # Check if root itself is a data source (e.g., a .zarr directory)
@@ -387,10 +395,13 @@ def discover_sources(
         if claim.dim_labels is None and dim_labels is not None:
             claim.dim_labels = dim_labels
         state.add_claim(claim)
+        logger.info(f"discover_sources: root {root} claimed as {claim.source_type}")
         return state  # Root claimed, no need to recurse
 
     # Walk filesystem
+    paths_scanned = 0
     for path in walk_with_identity_tracking(root, state.visited_identities):
+        paths_scanned += 1
         if state.is_path_claimed(path):
             continue
 
@@ -408,6 +419,7 @@ def discover_sources(
                     pass
             state.add_claim(claim)
 
+    logger.debug(f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources")
     return state
 
 

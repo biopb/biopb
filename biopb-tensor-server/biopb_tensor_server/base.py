@@ -17,6 +17,7 @@ uses the CacheManager with future/promise pattern for thread safety.
 
 from __future__ import annotations
 
+import logging
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ from biopb_tensor_server.downsample import (
     _output_dtype,
     _pad_array_edge,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_ARROW_BATCH_BYTES = 2 * 1024 * 1024 * 1024 - 1  # ~2GB
 _VIRTUAL_CHUNK_MAGIC = b'virt1'  # Magic prefix to identify virtual chunk payloads
@@ -274,6 +277,16 @@ class BackendAdapter(ABC):
         )
         ndim = len(base_shape)
 
+        # Validate chunk_shape dimensionality
+        if len(chunk_shape) != ndim:
+            logger.error(
+                f"chunk_shape dimensionality mismatch: tensor {base_desc.array_id} has "
+                f"shape={base_shape} ({ndim}D) but chunk_shape={chunk_shape} ({len(chunk_shape)}D)"
+            )
+            raise ValueError(
+                f"chunk_shape dimensionality mismatch: expected {ndim}, got {len(chunk_shape)}"
+            )
+
         # find intersecting real chunks (slice_hint is in source coordinates)
         real_endpoints = self.get_chunk_endpoints(
             SliceHint(start=list(source_start), stop=list(source_stop))
@@ -439,6 +452,11 @@ class BackendAdapter(ABC):
 
         should_cache = cache_manager is not None and (is_virtual or is_file_backend)
 
+        logger.debug(
+            f"resolve_chunk_data: array_id={array_id}, virtual={is_virtual}, "
+            f"split={split_index}/{split_max}, cache={should_cache}"
+        )
+
         # Use chunk_id directly as stable cache key (for both virtual and regular chunks)
         key_bytes = chunk_id
 
@@ -463,7 +481,9 @@ class BackendAdapter(ABC):
                     parent_bounds = _get_chunk_bounds_from_backend_key(self, backend_data)
                     result = _slice_result(result, parent_bounds, split_index, split_max, desc.dtype)
 
-            return result, sum(col.nbytes for col in result.columns)
+            size_bytes = sum(col.nbytes for col in result.columns)
+            logger.debug(f"resolve_chunk_data: computed {size_bytes} bytes")
+            return result, size_bytes
 
         if should_cache:
             entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
@@ -718,8 +738,13 @@ def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.R
     dtype = np.dtype(desc.dtype)
     # Decode payload - split_index/split_max are ignored here (slicing done in resolve_chunk_data)
     source_start, source_stop, valid_stop, scale_hint, reduction_method = _decode_virtual_chunk_payload(backend_data)
+    logger.debug(
+        f"_compute_virtual_chunk: source_start={source_start}, source_stop={source_stop}, "
+        f"scale={scale_hint}, method={reduction_method}"
+    )
     source_slice = SliceHint(start=list(source_start), stop=list(valid_stop))
     endpoints = adapter.get_chunk_endpoints(source_slice)
+    logger.debug(f"_compute_virtual_chunk: found {len(endpoints)} source chunks")
     source_shape = tuple(int(stop - start) for start, stop in zip(source_start, source_stop))
     valid_shape = tuple(int(stop - start) for start, stop in zip(source_start, valid_stop))
     source_block = np.zeros(valid_shape, dtype=dtype)
@@ -748,6 +773,7 @@ def _compute_virtual_chunk(adapter: BackendAdapter, backend_data: bytes) -> pa.R
     )
     target_dtype = np.dtype(_output_dtype(desc.dtype, reduction_method))
     reduced = _cast_reduced_array(reduced, target_dtype)
+    logger.debug(f"_compute_virtual_chunk: output shape={reduced.shape}, dtype={target_dtype}")
     array = pa.array(reduced.ravel())
     return pa.RecordBatch.from_arrays([array], ["data"])
 
