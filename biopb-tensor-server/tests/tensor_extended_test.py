@@ -318,21 +318,19 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         # Should have 3 planes * 4 tiles per plane (128x128 / 32x32)
         assert len(endpoints) == 3 * 4 * 4  # 48 tiles total
 
-    def test_get_chunk_data(self, tiled_ome_tiff):
-        """Test reading chunk data from tiled OME-TIFF."""
+    def test_get_chunk_array(self, tiled_ome_tiff):
+        """Test reading chunk array from tiled OME-TIFF."""
         tf, path = tiled_ome_tiff
 
         adapter = OmeTiffAdapter(tf, 'test-embedded')
 
         endpoints = adapter.get_chunk_endpoints()
         if endpoints:
-            chunk_data = adapter.get_chunk_data(endpoints[0].chunk_id)
-            assert chunk_data is not None
-            assert len(chunk_data.columns) == 1
+            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
+            assert chunk_arr is not None
 
-            # Tile should be 32x32 = 1024 pixels
-            arr = chunk_data.column(0).to_numpy()
-            assert arr.shape == (1024,)
+            # Tile should be 32x32
+            assert chunk_arr.shape == (32, 32)
 
     def test_non_tiled_raises_error(self):
         """Test that non-tiled TIFF raises ValueError."""
@@ -408,18 +406,17 @@ class TestMultiFileOmeTiffAdapter:
         assert all(hasattr(ep, 'bounds') for ep in endpoints)
         print(f"Generated {len(endpoints)} chunk endpoints")
 
-    def test_get_chunk_data(self, multifile_ome_dataset):
-        """Test chunk data retrieval."""
+    def test_get_chunk_array(self, multifile_ome_dataset):
+        """Test chunk array retrieval."""
         dir_path, file_list, metadata = multifile_ome_dataset
 
         adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
-            chunk_data = adapter.get_chunk_data(endpoints[0].chunk_id)
-            assert chunk_data is not None
-            assert len(chunk_data.columns) == 1
-            print(f"First chunk: {len(chunk_data)} elements")
+            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
+            assert chunk_arr is not None
+            print(f"First chunk: shape {chunk_arr.shape}")
 
     def test_cache_reuse(self, multifile_ome_dataset):
         """Test that repeated reads return same data."""
@@ -432,14 +429,12 @@ class TestMultiFileOmeTiffAdapter:
             chunk_id = endpoints[0].chunk_id
 
             # First call
-            data1 = adapter.get_chunk_data(chunk_id)
+            arr1 = adapter.get_chunk_array(chunk_id)
 
             # Second call
-            data2 = adapter.get_chunk_data(chunk_id)
+            arr2 = adapter.get_chunk_array(chunk_id)
 
             # Should return same data
-            arr1 = data1.column(0).to_numpy()
-            arr2 = data2.column(0).to_numpy()
             np.testing.assert_array_equal(arr1, arr2)
 
     def test_get_metadata(self, multifile_ome_dataset):
@@ -508,13 +503,10 @@ class TestMultiFileOmeTiffAdapter:
 
         # Get first chunk from first and second channels
         if len(endpoints) >= 2:
-            data0 = adapter.get_chunk_data(endpoints[0].chunk_id)
-            data1 = adapter.get_chunk_data(endpoints[1].chunk_id)
+            arr0 = adapter.get_chunk_array(endpoints[0].chunk_id)
+            arr1 = adapter.get_chunk_array(endpoints[1].chunk_id)
 
             # Values should differ (channel 0 = 100, channel 1 = 101)
-            arr0 = data0.column(0).to_numpy()
-            arr1 = data1.column(0).to_numpy()
-
             # Data values should be different
             assert arr0.mean() != arr1.mean()
 
@@ -627,8 +619,8 @@ class TestOmeZarrAdapter:
         not _zarr_available(),
         reason="zarr not available or incompatible numcodecs"
     )
-    def test_get_chunk_data(self, multires_ome_zarr):
-        """Test chunk data retrieval."""
+    def test_get_chunk_array(self, multires_ome_zarr):
+        """Test chunk array retrieval."""
         import zarr
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
@@ -640,9 +632,8 @@ class TestOmeZarrAdapter:
         endpoints = adapter.get_chunk_endpoints()
 
         if endpoints:
-            chunk_data = adapter.get_chunk_data(endpoints[0].chunk_id)
-            assert chunk_data is not None
-            assert len(chunk_data.columns) == 1
+            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
+            assert chunk_arr is not None
 
     @pytest.mark.skipif(
         not _zarr_available(),
@@ -664,14 +655,12 @@ class TestOmeZarrAdapter:
             chunk_id = endpoints[0].chunk_id
 
             # First call
-            data1 = adapter.get_chunk_data(chunk_id)
+            arr1 = adapter.get_chunk_array(chunk_id)
 
             # Second call
-            data2 = adapter.get_chunk_data(chunk_id)
+            arr2 = adapter.get_chunk_array(chunk_id)
 
             # Should return same data
-            arr1 = data1.column(0).to_numpy()
-            arr2 = data2.column(0).to_numpy()
             np.testing.assert_array_equal(arr1, arr2)
 
     @pytest.mark.skipif(
@@ -764,8 +753,8 @@ class TestHdf5Adapter:
         not _h5py_available(),
         reason="h5py not available"
     )
-    def test_get_chunk_data(self, hdf5_dataset):
-        """Test chunk data retrieval."""
+    def test_get_chunk_array(self, hdf5_dataset):
+        """Test chunk array retrieval."""
         import h5py
 
         h5_path, shape, chunks = hdf5_dataset
@@ -779,10 +768,8 @@ class TestHdf5Adapter:
             endpoints = adapter.get_chunk_endpoints()
 
             if endpoints:
-                chunk_data = adapter.get_chunk_data(endpoints[0].chunk_id)
-                assert chunk_data is not None
-                assert len(chunk_data.columns) == 1
+                chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
+                assert chunk_arr is not None
 
-                # Chunk should be 50x50 = 2500 elements
-                arr = chunk_data.column(0).to_numpy()
-                assert arr.shape == (chunks[0] * chunks[1],)
+                # Chunk should be chunks[0] x chunks[1]
+                assert chunk_arr.shape == (chunks[0], chunks[1])

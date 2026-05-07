@@ -88,8 +88,8 @@ class MockMultifieldAdapter(BackendAdapter):
     def get_raw_chunk_endpoints(self):
         return iter([])
 
-    def get_chunk_data(self, chunk_id: bytes):
-        return None
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        return np.zeros((1, 1), dtype='uint8')
 
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
@@ -104,12 +104,19 @@ class MockSingleTensorAdapter(BackendAdapter):
         return None
 
     def __init__(self, array_id: str, shape: tuple, dtype: str, value: int = 0):
-        self.array_id = array_id
+        # Parse array_id to get source_id and tensor_name
+        # array_id format: source_id/tensor_name for multi-tensor
+        if '/' in array_id:
+            self.source_id, self._tensor_name = array_id.split('/', 1)
+        else:
+            self.source_id = array_id
+            self._tensor_name = None
         self.shape = shape
         self.dtype = dtype
         self.value = value
         self._source_url = ""
         self._source_type = "mock-single"
+        self._tensor_context = True  # Always in tensor context for mocks
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
@@ -134,12 +141,9 @@ class MockSingleTensorAdapter(BackendAdapter):
             bounds=ChunkBounds(start=[0] * len(self.shape), stop=list(self.shape)),
         )
 
-    def get_chunk_data(self, chunk_id: bytes):
-        import pyarrow as pa
-        # Return data based on value
-        data = np.full(self.shape, self.value, dtype=self.dtype)
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Return mock chunk data as numpy array."""
+        return np.full(self.shape, self.value, dtype=self.dtype)
 
 
 class TestMultifieldSourceLevel:

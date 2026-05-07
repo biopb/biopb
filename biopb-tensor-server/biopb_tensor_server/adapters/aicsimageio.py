@@ -19,6 +19,7 @@ Relies on OS page cache for raw data caching.
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set
 
+import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -52,6 +53,9 @@ class AicsImageIoAdapter(BackendAdapter):
     Multi-scene files expose each scene as a separate tensor within the source.
     Each scene is identified by its scene_id from img.scenes.
 
+    Multi-tensor source: Each scene is a separate tensor.
+    Use get_tensor_adapter(scene_id) to access specific scenes.
+
     Supports lazy loading via dask arrays.
 
     Chunk ID format:
@@ -60,6 +64,9 @@ class AicsImageIoAdapter(BackendAdapter):
 
     Relies on OS page cache for raw data caching.
     """
+
+    # Multi-tensor source: has multiple scenes
+    _single_tensor_source = False
 
     @classmethod
     def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
@@ -101,7 +108,7 @@ class AicsImageIoAdapter(BackendAdapter):
         return cls(
             img,
             scene_index=None,  # Source-level adapter
-            array_id=source.source_id,
+            source_id=source.source_id,
             dim_labels=source.dim_labels,
             source_url=str(source.url),
         )
@@ -110,7 +117,7 @@ class AicsImageIoAdapter(BackendAdapter):
         self,
         aics_image: "AICSImage",
         scene_index: Optional[int],
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
     ):
@@ -119,13 +126,13 @@ class AicsImageIoAdapter(BackendAdapter):
         Args:
             aics_image: AICSImage instance
             scene_index: None for source-level, int for scene-level
-            array_id: Unique identifier for this tensor/source
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides auto-detected dims)
             source_url: Optional source URL
         """
         self._aics_image = aics_image
         self.scene_index = scene_index
-        self.array_id = array_id
+        self.source_id = source_id
 
         # Source-level metadata for DataSourceDescriptor
         if source_url:
@@ -148,8 +155,8 @@ class AicsImageIoAdapter(BackendAdapter):
             self.dim_labels = dim_labels  # Used as default for all scenes
             self._cached_descriptors = None  # Cached on first list_tensor_descriptors call
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Read a chunk from the aicsimageio dask array (no caching).
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Read a chunk from the aicsimageio dask array as numpy array (no caching).
 
         Only valid for scene-level adapters.
         """
@@ -171,20 +178,17 @@ class AicsImageIoAdapter(BackendAdapter):
             slices.append(slice(start, stop))
 
         # Compute the chunk data from dask array
-        data = self._dask_data[tuple(slices)].compute()
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+        return self._dask_data[tuple(slices)].compute()
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the TensorDescriptor for this adapter.
+        """Return TensorDescriptor for this adapter.
 
-        For scene-level adapters, computes actual chunk_shape from dask array.
-        For source-level adapters, delegates to list_tensor_descriptors()[0].
+        For scene-level adapters (scene_index is set): returns descriptor for that scene.
+        For source-level adapters (scene_index=None): returns first scene descriptor.
         """
         if self._dask_data is not None:
             # Scene-level: compute from dask array
             chunks = self._dask_data.chunks
-            # Use max chunk size per axis as representative chunk_shape
             chunk_shape = [max(c) for c in chunks]
             return TensorDescriptor(
                 array_id=self.array_id,
@@ -193,7 +197,7 @@ class AicsImageIoAdapter(BackendAdapter):
                 chunk_shape=chunk_shape,
                 dtype=self._dask_data.dtype.str,
             )
-        # Source-level: default behavior
+        # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
@@ -263,7 +267,7 @@ class AicsImageIoAdapter(BackendAdapter):
             tensor_id: Scene identifier (scene_id from img.scenes)
 
         Returns:
-            AicsImageIoAdapter for the specified scene
+            AicsImageIoAdapter for the specified scene, with tensor context set
         """
         if self.scene_index is not None:
             # Scene-level: return self if matching, else error
@@ -279,13 +283,18 @@ class AicsImageIoAdapter(BackendAdapter):
         except ValueError:
             raise ValueError(f"Unknown scene: {tensor_id}")
 
-        return AicsImageIoAdapter(
+        adapter = AicsImageIoAdapter(
             self._aics_image,
             scene_index=scene_idx,
-            array_id=f"{self.array_id}/{tensor_id}",
+            source_id=self.source_id,
             dim_labels=self.dim_labels,
             source_url=self._source_url,
         )
+        # Set tensor name for multi-tensor context
+        adapter._tensor_name = tensor_id
+        adapter._tensor_context = True
+
+        return adapter
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this dask array.

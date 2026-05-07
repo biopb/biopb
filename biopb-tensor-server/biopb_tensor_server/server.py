@@ -210,7 +210,10 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         for source_id, adapter in self._sources.items():
             source_desc = adapter.get_source_descriptor()
-            schema = adapter.get_arrow_schema(source_desc.tensors[0] if source_desc.tensors else adapter.get_tensor_descriptor())
+            # Use empty schema for source listing - actual tensor schemas
+            # come from get_flight_info(tensor_selection). The flight
+            # descriptor contains DataSourceDescriptor with tensor metadata.
+            schema = pa.schema([])
 
             # Create a FlightDescriptor for this source
             flight_descriptor = flight.FlightDescriptor.for_command(

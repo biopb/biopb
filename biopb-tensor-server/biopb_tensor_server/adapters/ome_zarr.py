@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -40,8 +41,17 @@ class OmeZarrAdapter(BackendAdapter):
     - array_id prefix
     - chunk key (UTF-8, e.g., "0/1/2")
 
+    Note: This adapter can be used in two ways:
+    1. Source-level: Manages multiple resolution levels, get_level_adapter() returns
+       ZarrAdapter instances for specific levels
+    2. Level-specific: Created with a specific level array, acts as single-tensor
+
     Relies on OS page cache for raw data caching.
     """
+
+    # Default: single-tensor (level-specific usage)
+    # get_level_adapter() returns ZarrAdapter instances which are also single-tensor
+    _single_tensor_source = True
 
     @classmethod
     def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
@@ -117,7 +127,7 @@ class OmeZarrAdapter(BackendAdapter):
     def __init__(
         self,
         zarr_array,
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
         resolution_level: int = 0
     ):
@@ -125,12 +135,12 @@ class OmeZarrAdapter(BackendAdapter):
 
         Args:
             zarr_array: Zarr array object (from specific resolution level)
-            array_id: Unique identifier for this tensor
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides OME metadata)
             resolution_level: Which resolution level to use (default 0)
         """
         self.zarr_array = zarr_array
-        self.array_id = array_id
+        self.source_id = source_id
         self.resolution_level = resolution_level
 
         # Source-level metadata for DataSourceDescriptor
@@ -189,8 +199,8 @@ class OmeZarrAdapter(BackendAdapter):
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Read a chunk from zarr (no caching - relies on OS page cache)."""
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Read a chunk from zarr as numpy array (no caching - relies on OS page cache)."""
         backend_data = get_backend_data(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
@@ -201,18 +211,19 @@ class OmeZarrAdapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        data = self.zarr_array[slices]
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+        return self.zarr_array[slices]
 
-    def list_tensor_descriptors(self):
-        return [TensorDescriptor(
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
             chunk_shape=list(self.zarr_array.chunks),
             dtype=self.zarr_array.dtype.str,
-        )]
+        )
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this OME-Zarr array."""
@@ -280,8 +291,8 @@ class OmeZarrAdapter(BackendAdapter):
         # Compute scale_hint from read_options
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
-        from biopb_tensor_server.base import _normalized_scale_hint
-        scale_hint = _normalized_scale_hint(base_shape, read_options)
+        from biopb_tensor_server.chunk import normalized_scale_hint
+        scale_hint = normalized_scale_hint(base_shape, read_options)
 
         reduction_method = _normalize_reduction_method(
             read_options.reduction_method if read_options else None
@@ -377,7 +388,7 @@ class OmeZarrAdapter(BackendAdapter):
             path: Level path (e.g., "0", "1", "2" for OME-Zarr)
 
         Returns:
-            ZarrAdapter for the level array
+            ZarrAdapter for the level array with tensor context set
         """
         if path in self._level_adapters:
             return self._level_adapters[path]
@@ -388,9 +399,14 @@ class OmeZarrAdapter(BackendAdapter):
         # Create adapter for this level
         level_adapter = ZarrAdapter(
             level_arr,
-            array_id=f"{self.array_id}/{path}",
+            source_id=self.source_id,
             dim_labels=self.dim_labels,
         )
+        # Set tensor name for multi-tensor context
+        level_adapter._tensor_name = path
+        level_adapter._tensor_context = True
+
+        self._level_adapters[path] = level_adapter
         self._level_adapters[path] = level_adapter
         return level_adapter
 

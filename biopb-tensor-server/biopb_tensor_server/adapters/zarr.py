@@ -6,6 +6,7 @@ Relies on OS page cache for raw data caching.
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set
 
+import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -110,26 +111,26 @@ class ZarrAdapter(BackendAdapter):
     def __init__(
         self,
         zarr_array,
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
         """Initialize Zarr adapter.
 
         Args:
             zarr_array: Zarr array object
-            array_id: Unique identifier for this tensor
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
         self.zarr_array = zarr_array
-        self.array_id = array_id
+        self.source_id = source_id
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(zarr_array.ndim)]
 
         # Source-level metadata for DataSourceDescriptor
         self._source_url = str(zarr_array.store.path if hasattr(zarr_array.store, 'path') else str(zarr_array.store))
         self._source_type = "zarr"
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Read a chunk from zarr (no caching - relies on OS page cache)."""
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Read a chunk from zarr as numpy array (no caching - relies on OS page cache)."""
         backend_data = get_backend_data(chunk_id)
         chunk_key = backend_data.decode('utf-8')
         chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
@@ -141,18 +142,19 @@ class ZarrAdapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        data = self.zarr_array[slices]
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+        return self.zarr_array[slices]
 
-    def list_tensor_descriptors(self):
-        return [TensorDescriptor(
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.zarr_array.shape),
             chunk_shape=list(self.zarr_array.chunks),
             dtype=self.zarr_array.dtype.str,
-        )]
+        )
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this zarr array."""

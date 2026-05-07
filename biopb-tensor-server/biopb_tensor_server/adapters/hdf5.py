@@ -7,6 +7,7 @@ import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
+import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -112,26 +113,26 @@ class Hdf5Adapter(BackendAdapter):
     def __init__(
         self,
         h5_dataset,
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
         """Initialize HDF5 adapter.
 
         Args:
             h5_dataset: h5py Dataset object
-            array_id: Unique identifier for this tensor
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
         self.h5_dataset = h5_dataset
-        self.array_id = array_id
+        self.source_id = source_id
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(len(h5_dataset.shape))]
 
         # Source-level metadata for DataSourceDescriptor
         self._source_url = h5_dataset.file.filename if hasattr(h5_dataset, 'file') else ""
         self._source_type = "hdf5"
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Read a chunk from HDF5 (no caching - relies on OS page cache)."""
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Read a chunk from HDF5 as numpy array (no caching - relies on OS page cache)."""
         backend_data = get_backend_data(chunk_id)
         chunk_idx = _decode_backend_coords(backend_data)
         chunks = self.h5_dataset.chunks
@@ -141,18 +142,19 @@ class Hdf5Adapter(BackendAdapter):
             for d, idx in enumerate(chunk_idx)
         )
 
-        data = self.h5_dataset[slices]
-        arr = pa.array(data.ravel())
-        return pa.RecordBatch.from_arrays([arr], ["data"])
+        return self.h5_dataset[slices]
 
-    def list_tensor_descriptors(self):
-        return [TensorDescriptor(
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=list(self.h5_dataset.shape),
             chunk_shape=list(self.h5_dataset.chunks),
             dtype=self.h5_dataset.dtype.str,
-        )]
+        )
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this HDF5 dataset."""

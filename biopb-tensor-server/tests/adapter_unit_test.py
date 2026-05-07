@@ -95,8 +95,8 @@ class TestZarrAdapter:
             assert list(endpoints[0].bounds.start) == [0, 50]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_chunk_data(self):
-        """Test chunk data retrieval."""
+    def test_get_chunk_array(self):
+        """Test chunk array retrieval."""
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -110,16 +110,14 @@ class TestZarrAdapter:
             adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
             endpoints = adapter.get_chunk_endpoints()
 
-            # Get first chunk data
-            batch = adapter.get_chunk_data(endpoints[0].chunk_id)
-            data = batch.column(0).to_numpy().reshape(50, 50)
-
+            # Get first chunk array
+            data = adapter.get_chunk_array(endpoints[0].chunk_id)
+            assert data.shape == (50, 50)
             assert data.mean() == 1.0
 
-            # Get second chunk data
-            batch = adapter.get_chunk_data(endpoints[1].chunk_id)
-            data = batch.column(0).to_numpy().reshape(50, 50)
-
+            # Get second chunk array
+            data = adapter.get_chunk_array(endpoints[1].chunk_id)
+            assert data.shape == (50, 50)
             assert data.mean() == 2.0
 
 

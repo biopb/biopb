@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
+import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -181,18 +182,18 @@ class OmeTiffAdapter(BackendAdapter):
     def __init__(
         self,
         tiff_file,
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
         """Initialize OME-TIFF adapter.
 
         Args:
             tiff_file: tifffile.TiffFile object
-            array_id: Unique identifier for this tensor
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
         self.tiff_file = tiff_file
-        self.array_id = array_id
+        self.source_id = source_id
         self._io_lock = threading.Lock()
 
         # Source-level metadata for DataSourceDescriptor
@@ -232,18 +233,19 @@ class OmeTiffAdapter(BackendAdapter):
         # Non-spatial dimensions (like channel/time) have chunk size = 1
         self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
 
-    def list_tensor_descriptors(self):
-        # Get dtype from first page
+    def get_tensor_descriptor(self) -> TensorDescriptor:
         first_page = self.tiff_file.pages[0]
         dtype = first_page.dtype
-
-        return [TensorDescriptor(
+        return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=self.full_shape,
             chunk_shape=self.chunk_shape,
             dtype=str(dtype),
-        )]
+        )
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this OME-TIFF file."""
@@ -277,8 +279,8 @@ class OmeTiffAdapter(BackendAdapter):
                         bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
                     )
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Decode a tile from the TIFF file (no caching - relies on OS page cache)."""
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Decode a tile from the TIFF file as numpy array (no caching - relies on OS page cache)."""
         backend_data = get_backend_data(chunk_id)
         ifd_index, tile_indices = _decode_ome_tile(backend_data)
         tile_row, tile_col = tile_indices
@@ -292,9 +294,7 @@ class OmeTiffAdapter(BackendAdapter):
             tile_idx = tile_row * self.tiles_per_row + tile_col
 
             if not self.is_tiled:
-                data = page.asarray()
-                arr = pa.array(data.ravel())
-                return pa.RecordBatch.from_arrays([arr], ["data"])
+                return page.asarray()
 
             # Read tile using tifffile's low-level API
             offset = page.dataoffsets[tile_idx]
@@ -312,8 +312,7 @@ class OmeTiffAdapter(BackendAdapter):
             if data.ndim == 3:
                 data = data[0]
 
-            arr = pa.array(data.ravel())
-            return pa.RecordBatch.from_arrays([arr], ["data"])
+            return data
 
     def get_metadata(self) -> dict:
         """Return OME metadata from TIFF file as JSON-serializable dict.
@@ -565,14 +564,14 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     def __init__(
         self,
         directory: str,
-        array_id: str,
+        source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
         """Initialize multi-file OME-TIFF adapter.
 
         Args:
             directory: Path to directory containing multi-file dataset
-            array_id: Unique identifier for this tensor
+            source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
         from pathlib import Path
@@ -580,7 +579,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         import tifffile
 
         self.directory = Path(directory)
-        self.array_id = array_id
+        self.source_id = source_id
 
         # Source-level metadata for DataSourceDescriptor
         self._source_url = str(directory)
@@ -812,17 +811,19 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             elif label_lower in ("x", "width"):
                 self.dim_labels[idx] = "x"
 
-    def list_tensor_descriptors(self):
+    def get_tensor_descriptor(self) -> TensorDescriptor:
         first_page = self.tiff_file.pages[0]
         dtype = first_page.dtype
-
-        return [TensorDescriptor(
+        return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=self.full_shape,
             chunk_shape=self.chunk_shape,
             dtype=str(dtype),
-        )]
+        )
+
+    def list_tensor_descriptors(self):
+        return [self.get_tensor_descriptor()]
 
     def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
         """Yield all chunk endpoints for this multi-file OME-TIFF dataset."""
@@ -871,8 +872,8 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                             bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
                         )
 
-    def get_chunk_data(self, chunk_id: bytes) -> pa.RecordBatch:
-        """Decode a tile from the multi-file dataset (no caching)."""
+    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
+        """Decode a tile from the multi-file dataset as numpy array (no caching)."""
         import tifffile
 
         backend_data = get_backend_data(chunk_id)
@@ -901,8 +902,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                 # Non-tiled: read entire page as single "tile"
                 data = page.asarray()
 
-            arr = pa.array(data.ravel())
-            return pa.RecordBatch.from_arrays([arr], ["data"])
+            return data
 
     def get_metadata(self) -> dict:
         """Return OME metadata from multi-file dataset."""
