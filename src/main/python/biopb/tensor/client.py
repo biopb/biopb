@@ -12,6 +12,7 @@ Features:
 import logging
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 import threading
@@ -27,6 +28,131 @@ from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, TensorSelection, DataSourceDescriptor
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Module-level pools for worker-local connection caching (pickle-safe)
+# ==============================================================================
+#
+# Each entry stores (pid, resource) to detect forked processes. When a process
+# forks after pool was populated, the child detects pid mismatch and creates
+# fresh connections (inherited gRPC sockets are broken).
+#
+_CONNECTION_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, flight.FlightClient]] = {}
+_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Cache]] = {}
+_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
+_POOL_LOCK = threading.Lock()
+
+
+def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int):
+    """Get cached FlightClient, Cache, and CallOptions for a connection namespace.
+
+    Creates resources lazily on first call per (location, token) key.
+    Thread-safe via lock. Fork-safe: stale entries from parent process
+    are detected and cleaned up before use.
+
+    Each worker process has its own pool after unpickle. If a process
+    forks after pool was populated, the child detects pid mismatch and
+    creates fresh connections.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Cache size for worker-local cache
+
+    Returns:
+        Tuple of (FlightClient, Cache, FlightCallOptions)
+    """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    with _POOL_LOCK:
+        # Fork-safety: detect and clean up inherited stale connections
+        if key in _CONNECTION_POOL:
+            pool_pid, client = _CONNECTION_POOL[key]
+            if pool_pid != current_pid:
+                # Forked child - inherited gRPC socket is broken, close it
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                del _CONNECTION_POOL[key]
+
+        if key in _CACHE_POOL:
+            pool_pid, cache = _CACHE_POOL[key]
+            if pool_pid != current_pid:
+                del _CACHE_POOL[key]
+
+        # Create fresh resources for current process
+        if key not in _CONNECTION_POOL:
+            _CONNECTION_POOL[key] = (current_pid, flight.FlightClient(location))
+        if key not in _CACHE_POOL:
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=cache_bytes))
+        if key not in _CALL_OPTS_POOL:
+            if token:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions(
+                    headers=[(b"authorization", f"Bearer {token}".encode())]
+                )
+            else:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions()
+
+    return (
+        _CONNECTION_POOL[key][1],  # client
+        _CACHE_POOL[key][1],       # cache
+        _CALL_OPTS_POOL[key],      # call_options
+    )
+
+
+def _fetch_chunk_distributed(
+    location: str,
+    token: Optional[str],
+    chunk_id: bytes,
+    bounds_start: Tuple[int, ...],
+    bounds_stop: Tuple[int, ...],
+    cache_bytes: int,
+) -> np.ndarray:
+    """Fetch a chunk from Flight server using worker-local resources.
+
+    This function is pickle-safe because it has no closure references to
+    non-serializable objects (FlightClient). Connection and cache are
+    obtained from module-level pools at runtime.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        chunk_id: Chunk identifier bytes
+        bounds_start: Chunk start coordinates as tuple
+        bounds_stop: Chunk stop coordinates as tuple
+        cache_bytes: Cache size for worker-local cache
+
+    Returns:
+        numpy array with chunk data
+    """
+    client, cache, call_options = _get_worker_resources(location, token, cache_bytes)
+
+    # Cache lookup
+    cache_key = chunk_id.hex()
+    cached = cache.get(cache_key)
+    if cached is not None:
+        logger.debug(f"fetch_chunk_distributed: cache hit for {cache_key[:16]}")
+        return cached
+
+    logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
+
+    # Fetch from server
+    ticket = TensorTicket(chunk_id=chunk_id)
+    reader = client.do_get(flight.Ticket(ticket.SerializeToString()), options=call_options)
+    table = reader.read_all()
+    arr = table.column(0).to_numpy()
+
+    # Reshape to chunk shape
+    chunk_shape = tuple(stop - start for start, stop in zip(bounds_start, bounds_stop))
+    arr = arr.reshape(chunk_shape)
+
+    # Cache the result
+    cache.put(cache_key, arr, cost=arr.nbytes)
+
+    return arr
 
 
 def _parse_version(version_str: str) -> Tuple[int, int, int]:
@@ -86,15 +212,11 @@ class TensorFlightClient:
         data = arr[0:100, 0:100].compute()   # Load slice
 
     Note:
-        This client is NOT compatible with dask.distributed. The FlightClient
-        is not pickle-serializable, which causes task serialization to fail
-        when the scheduler tries to send tasks to workers. Use with the local
-        dask scheduler only.
-
-        For distributed use, consider:
-        - Creating connections inside delayed functions (per-task overhead)
-        - Using a shared cache layer (e.g., Redis, memcached)
-        - Implementing a custom dask WorkerPlugin for connection pooling
+        This client IS compatible with dask.distributed. The dask arrays
+        returned by get_tensor() use a pickle-safe design where FlightClient
+        connections are created lazily in each worker from stored connection
+        parameters. Each worker maintains its own connection pool and LRU
+        cache keyed by (location, token).
     """
 
     def __init__(
@@ -111,18 +233,20 @@ class TensorFlightClient:
             token: Bearer token for server authentication.  ``None`` disables auth.
         """
         logger.info(f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}")
+        # Store pickle-safe connection parameters
+        self._location = location
+        self._token = token
+        self._cache_bytes = cache_bytes
+        # Create FlightClient for direct API calls (list_flights, get_flight_info, uploads)
         self._client = flight.FlightClient(location)
         self._call_options = (
             flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
             if token
             else flight.FlightCallOptions()
         )
-        self._cache = Cache(available_bytes=cache_bytes)
+        # Cache descriptors for metadata
         self._sources: Dict[str, DataSourceDescriptor] = {}
         self._descriptors: Dict[str, TensorDescriptor] = {}
-        self._cache_hits: int = 0
-        self._cache_misses: int = 0
-        self._cache_lock = threading.Lock()
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
@@ -329,9 +453,6 @@ class TensorFlightClient:
         shape = tuple(desc.shape)
         dtype = np.dtype(desc.dtype)
 
-        # Determine dask chunk sizes from the actual chunk bounds
-        # We need to build a grid of chunks
-
         # Create a mapping from chunk index to chunk_id and bounds
         chunk_map = {}
         axis_starts = [sorted({int(bounds.start[axis]) for bounds in chunk_bounds}) for axis in range(len(shape))]
@@ -340,7 +461,6 @@ class TensorFlightClient:
             for starts in axis_starts
         ]
         for chunk_id, bounds in zip(chunks, chunk_bounds):
-            # Compute chunk index from bounds
             chunk_idx = tuple(
                 axis_index_maps[d][int(bounds.start[d])]
                 for d in range(len(shape))
@@ -396,10 +516,16 @@ class TensorFlightClient:
         blocks = np.empty(grid_shape, dtype=object)
         for chunk_idx, (chunk_id, bounds) in chunk_map.items():
             chunk_shape = tuple(stop - start for start, stop in zip(bounds.start, bounds.stop))
-            # Use dask.delayed to wrap the fetch function
-            # The actual fetch + cache lookup happens at .compute() time
+            # Use pickle-safe module-level function with connection params
             delayed_arr = da.from_delayed(
-                delayed(fetch_chunk)(chunk_id, bounds),
+                delayed(_fetch_chunk_distributed)(
+                    self._location,
+                    self._token,
+                    chunk_id,
+                    tuple(bounds.start),
+                    tuple(bounds.stop),
+                    self._cache_bytes,
+                ),
                 shape=chunk_shape,
                 dtype=dtype,
             )
@@ -626,24 +752,29 @@ class TensorFlightClient:
         self._client.close()
 
     def cache_info(self) -> Dict:
-        """Return cache statistics.
+        """Return cache statistics from the pooled cache for this connection.
 
         Returns:
             Dictionary with cache size and item count
         """
-        import threading
-        # cachey doesn't expose hits/misses, so we track them ourselves
+        key = (self._location, self._token)
+        pool_entry = _CACHE_POOL.get(key)
+        if pool_entry is None:
+            return {"size_bytes": 0, "max_bytes": self._cache_bytes, "item_count": 0}
+        cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
         return {
-            "size_bytes": self._cache.total_bytes,
-            "max_bytes": self._cache.available_bytes,
-            "item_count": len(self._cache.data),
-            "hits": getattr(self, "_cache_hits", 0),
-            "misses": getattr(self, "_cache_misses", 0),
+            "size_bytes": cache.total_bytes,
+            "max_bytes": cache.available_bytes,
+            "item_count": len(cache.data),
         }
 
     def cache_clear(self):
-        """Clear the chunk cache."""
-        self._cache.clear()
+        """Clear the pooled cache for this connection namespace."""
+        key = (self._location, self._token)
+        pool_entry = _CACHE_POOL.get(key)
+        if pool_entry is not None:
+            cache = pool_entry[1]
+            cache.clear()
 
     def __enter__(self):
         return self

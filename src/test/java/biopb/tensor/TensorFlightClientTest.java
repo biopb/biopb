@@ -235,6 +235,84 @@ public class TensorFlightClientTest {
         }
     }
 
+    @Test
+    public void testSerializableTensorImgSerialization() throws Exception {
+        // Clear connection pool before test
+        TensorConnectionPool.clear();
+
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                // Get tensor - should return SerializableTensorImg
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+                Assert.assertTrue(image instanceof SerializableTensorImg);
+
+                // Verify initial data access
+                Assert.assertEquals(4, image.dimension(0));
+                Assert.assertEquals(4, image.dimension(1));
+                Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
+                int initialRequests = server.getTotalChunkRequestCount();
+
+                // Serialize to bytes
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(baos);
+                oos.writeObject(image);
+                oos.close();
+                byte[] serialized = baos.toByteArray();
+
+                // Deserialize
+                java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(serialized);
+                java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bais);
+                RandomAccessibleInterval<FloatType> deserialized =
+                    (RandomAccessibleInterval<FloatType>) ois.readObject();
+
+                // Verify deserialized image dimensions
+                Assert.assertEquals(4, deserialized.dimension(0));
+                Assert.assertEquals(4, deserialized.dimension(1));
+
+                // Access data - should trigger lazy reconstruction
+                Assert.assertEquals(1.0f, deserialized.getAt(0, 0).get(), 0.0001f);
+                Assert.assertEquals(6.0f, deserialized.getAt(1, 1).get(), 0.0001f);
+
+                // Verify connection pool was used
+                Assert.assertTrue(TensorConnectionPool.getConnectionCount() > 0);
+            }
+        }
+    }
+
+    @Test
+    public void testSerializableTensorImgMultipleDeserialization() throws Exception {
+        // Clear connection pool before test
+        TensorConnectionPool.clear();
+
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                RandomAccessibleInterval<FloatType> image = client.getTensor("test-source", "test-tensor");
+
+                // Serialize
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(baos);
+                oos.writeObject(image);
+                oos.close();
+                byte[] serialized = baos.toByteArray();
+
+                // Deserialize multiple times
+                for (int i = 0; i < 3; i++) {
+                    java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(serialized);
+                    java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bais);
+                    RandomAccessibleInterval<FloatType> deserialized =
+                        (RandomAccessibleInterval<FloatType>) ois.readObject();
+
+                    // Verify each deserialization works
+                    Assert.assertEquals(4, deserialized.dimension(0));
+                    Assert.assertEquals(1.0f, deserialized.getAt(0, 0).get(), 0.0001f);
+                }
+
+                // Connection pool should reuse same connection
+                Assert.assertEquals(1, TensorConnectionPool.getConnectionCount());
+            }
+        }
+    }
+
     private static class TestFlightServer implements AutoCloseable {
         private final BufferAllocator allocator;
         private final FlightServer server;

@@ -101,6 +101,8 @@ public class TensorFlightClient implements AutoCloseable {
     private final BufferAllocator allocator;
     private final FlightClient client;
     private final CredentialCallOption authOption;
+    private final Location location;
+    private final String token;
     private final Map<String, TensorDescriptor> descriptors;
     private final Map<String, DataSourceDescriptor> sources;
     private final long cacheBytes;
@@ -166,14 +168,43 @@ public class TensorFlightClient implements AutoCloseable {
      */
     public TensorFlightClient(Location location, long cacheBytes, String token) {
         LOGGER.info("Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
+        this.location = location;
         this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.client = FlightClient.builder(this.allocator, location).build();
+        this.token = token;
         this.authOption = (token != null && !token.isEmpty())
             ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
             : null;
         this.descriptors = new HashMap<>();
         this.sources = new HashMap<>();
         this.cacheBytes = cacheBytes;
+    }
+
+    /**
+     * Get the Flight server location.
+     *
+     * @return Location used for this client
+     */
+    public Location getLocation() {
+        return location;
+    }
+
+    /**
+     * Get the authentication token.
+     *
+     * @return Bearer token (null if no authentication)
+     */
+    public String getToken() {
+        return token;
+    }
+
+    /**
+     * Get the cache size in bytes.
+     *
+     * @return Maximum cache size for cell images
+     */
+    public long getCacheBytes() {
+        return cacheBytes;
     }
 
     /**
@@ -277,7 +308,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param sliceHint Optional slice hint
      * @param readOptions Optional request-scoped read options
      * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
+     * @return SerializableTensorImg containing the requested tensor (implements RandomAccessibleInterval)
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
             String sourceId,
@@ -321,7 +352,10 @@ public class TensorFlightClient implements AutoCloseable {
                 rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
             }
         }
-        return rai;
+
+        // Return SerializableTensorImg wrapper for serialization support
+        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, tensorId,
+                sliceHint, readOptions, context.descriptor, rai);
     }
 
     /**

@@ -423,15 +423,16 @@ class TestCacheIntegration:
             # First read
             data1 = darr[:chunks[0], :chunks[1]].compute()
 
-            # Check cache state
-            cache = client._cache
-            initial_nbytes = cache.nbytes
+            # Check cache state via cache_info()
+            info1 = client.cache_info()
+            initial_bytes = info1["size_bytes"]
 
             # Second read - same region
             data2 = darr[:chunks[0], :chunks[1]].compute()
 
             # Cache should have same size (hit, no new data)
-            assert cache.nbytes == initial_nbytes
+            info2 = client.cache_info()
+            assert info2["size_bytes"] == initial_bytes
 
             # Data should be identical
             np.testing.assert_array_equal(data1, data2)
@@ -466,12 +467,11 @@ class TestCacheIntegration:
 
             # Read first chunk
             data1 = darr[:chunks[0], :chunks[1]].compute()
-            cache = client._cache
-            nbytes1 = sum(cache.nbytes.values()) if isinstance(cache.nbytes, dict) else cache.nbytes
+            nbytes1 = client.cache_info()["size_bytes"]
 
             # Read second chunk (different region)
             data2 = darr[chunks[0]:chunks[0]*2, chunks[1]:chunks[1]*2].compute()
-            nbytes2 = sum(cache.nbytes.values()) if isinstance(cache.nbytes, dict) else cache.nbytes
+            nbytes2 = client.cache_info()["size_bytes"]
 
             # Cache should have grown
             assert nbytes2 > nbytes1
