@@ -190,11 +190,11 @@ class TensorFlightServer(flight.FlightServerBase):
         if source_adapter is None:
             return None
 
-        # Check for level adapter (OME-Zarr) first
-        if hasattr(source_adapter, 'get_level_adapter'):
+        # Check for level adapter (OME-Zarr) only when there's an explicit level path
+        if rest is not None and hasattr(source_adapter, 'get_level_adapter'):
             return source_adapter.get_level_adapter(rest)
 
-        # Otherwise get tensor adapter
+        # Otherwise get tensor adapter (for virtual scaling or single-tensor sources)
         return source_adapter.get_tensor_adapter(rest)            
 
     def list_flights(
