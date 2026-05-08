@@ -448,6 +448,22 @@ def compute_virtual_chunk(adapter: "BackendAdapter", backend_data: bytes) -> np.
     for endpoint in endpoints:
         # Use get_chunk_array directly - returns numpy array with proper shape
         chunk_data = adapter.get_chunk_array(endpoint.chunk_id)
+
+        # Defensive reshape: backends may squeeze singleton dimensions (e.g., TIFF tiles)
+        # but chunk bounds expect full-dimensional arrays. Restore expected shape.
+        expected_chunk_shape = tuple(
+            int(stop - start) for start, stop in zip(endpoint.bounds.start, endpoint.bounds.stop)
+        )
+        if chunk_data.shape != expected_chunk_shape:
+            # Only reshape if sizes match (singleton dims were squeezed)
+            if chunk_data.size == int(np.prod(expected_chunk_shape)):
+                chunk_data = chunk_data.reshape(expected_chunk_shape)
+            else:
+                raise ValueError(
+                    f"Chunk data size mismatch: got {chunk_data.size} elements "
+                    f"but expected {int(np.prod(expected_chunk_shape))} for shape {expected_chunk_shape}"
+                )
+
         overlap_start = [max(int(endpoint.bounds.start[axis]), source_start[axis]) for axis in range(len(valid_shape))]
         overlap_stop = [min(int(endpoint.bounds.stop[axis]), valid_stop[axis]) for axis in range(len(valid_shape))]
         source_slices = tuple(

@@ -659,8 +659,22 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 # For real chunks, get the numpy array directly
                 result_arr = self.get_chunk_array(chunk_id)
 
+                # Defensive reshape: backends may squeeze singleton dimensions
+                # Get expected bounds from backend_data
+                parent_bounds = get_chunk_bounds_from_backend_key(self, backend_data)
+                expected_shape = tuple(
+                    int(stop - start) for start, stop in zip(parent_bounds.start, parent_bounds.stop)
+                )
+                if result_arr.shape != expected_shape:
+                    if result_arr.size == int(np.prod(expected_shape)):
+                        result_arr = result_arr.reshape(expected_shape)
+                    else:
+                        raise ValueError(
+                            f"Chunk data size mismatch: got {result_arr.size} elements "
+                            f"but expected {int(np.prod(expected_shape))} for shape {expected_shape}"
+                        )
+
                 if split_max > 1:
-                    parent_bounds = get_chunk_bounds_from_backend_key(self, backend_data)
                     result_arr = slice_array(result_arr, parent_bounds, split_index, split_max)
 
             # Convert to RecordBatch only at final output

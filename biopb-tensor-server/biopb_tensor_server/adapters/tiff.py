@@ -306,11 +306,7 @@ class OmeTiffAdapter(BackendAdapter):
 
             # Decode the tile
             decoded = page.decode(raw_data, tile_idx)
-            data = decoded[0].squeeze()  # Remove singleton dimensions
-
-            # Ensure 2D output
-            if data.ndim == 3:
-                data = data[0]
+            data = decoded[0]
 
             return data
 
@@ -904,7 +900,7 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
                     raw_data = fh.read(bytecount)
 
                     decoded = page.decode(raw_data, tile_idx)
-                    data = decoded[0].squeeze()
+                    data = decoded[0]
                 else:
                     # Non-tiled: read entire page as single "tile"
                     data = page.asarray()
