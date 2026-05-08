@@ -373,13 +373,12 @@ class TestSliceEndpoint:
         r = tc.post("/api/slice", json={"source_id": "src0", "tensor_id": "t0"})
         assert r.status_code == 401
 
-    def test_slice_applies_client_side_cropping(self, auth_client):
-        """Verify slice_hint is NOT passed to backend; slicing is done client-side."""
+    def test_slice_passes_slice_hint_to_backend(self, auth_client):
+        """Verify slice_hint IS passed to backend for server-side slicing."""
         tc, mock_fc = auth_client
 
-        # Create a mock dask array that tracks slicing
+        # Create a mock dask array
         mock_dask = MagicMock()
-        mock_dask.__getitem__ = MagicMock(return_value=mock_dask)
         mock_dask.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
 
         mock_fc.get_tensor.return_value = mock_dask
@@ -387,12 +386,10 @@ class TestSliceEndpoint:
         r = self._post_slice(tc, slice_start=[0, 0, 0], slice_stop=[2, 4, 8])
         assert r.status_code == 200
 
-        # Verify get_tensor was called with slice_hint=None (client-side cropping)
+        # Verify get_tensor was called with slice_hint (server-side slicing)
         call_kwargs = mock_fc.get_tensor.call_args.kwargs
-        assert call_kwargs.get("slice_hint") is None
-
-        # Verify slicing was applied on the dask array
-        mock_dask.__getitem__.assert_called_once()
+        assert call_kwargs.get("slice_hint") is not None
+        assert call_kwargs["slice_hint"] == (slice(0, 2), slice(0, 4), slice(0, 8))
 
 
 # ===========================================================================

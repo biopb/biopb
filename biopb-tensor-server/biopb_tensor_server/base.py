@@ -514,7 +514,12 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 dtype=base_desc.dtype,
             )
 
-            if realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
+            # Always set slice_hint when user requested a slice, so client can crop correctly
+            # This is needed even when realized bounds equal full bounds (single-chunk arrays)
+            if slice_hint is not None:
+                logical_desc.slice_hint.start[:] = list(realized_start)
+                logical_desc.slice_hint.stop[:] = list(realized_stop)
+            elif realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
                 logical_desc.slice_hint.start[:] = list(realized_start)
                 logical_desc.slice_hint.stop[:] = list(realized_stop)
 
@@ -604,7 +609,12 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 dtype=_output_dtype(base_desc.dtype, reduction_method),
             )
 
-            if snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
+            # Always set slice_hint when user requested a slice, so client can crop correctly
+            # This is needed even when snapped bounds equal full bounds (single-chunk arrays)
+            if slice_hint is not None:
+                logical_desc.slice_hint.start[:] = list(snapped_start)
+                logical_desc.slice_hint.stop[:] = list(snapped_stop)
+            elif snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
                 logical_desc.slice_hint.start[:] = list(snapped_start)
                 logical_desc.slice_hint.stop[:] = list(snapped_stop)
 
