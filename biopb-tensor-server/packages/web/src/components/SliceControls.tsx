@@ -95,8 +95,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const zMax = axisMap.z !== null ? Math.max(0, zSize - 1) : 0;
   const cMax = axisMap.c !== null ? Math.max(0, cSize - 1) : 0;
 
-  // Show color picker if channel axis exists (even for single channel)
-  const showColorPicker = axisMap.c !== null;
+  // Always show color picker - pseudo-color rendering is useful for any image
+  const showColorPicker = true;
 
   // Handle preset color selection
   const handlePresetChange = (value: string) => {
