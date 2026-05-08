@@ -6,6 +6,9 @@ Provides centralized logging setup with configurable level via:
 - Config file [server.log_level]
 
 Default level is INFO, which shows operational messages without debug noise.
+
+By default (scope_to_biopb=True), logging level changes only affect the
+biopb_tensor_server package hierarchy, not external packages like grpc, numpy, etc.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ def setup_logging(
     level: LogLevel | str = "INFO",
     format: str = DEFAULT_LOG_FORMAT,
     datefmt: str = DEFAULT_DATE_FORMAT,
+    scope_to_biopb: bool = True,
 ) -> None:
     """Configure logging for biopb-tensor-server.
 
@@ -42,9 +46,12 @@ def setup_logging(
         level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         format: Log message format string
         datefmt: Datetime format string for timestamps
+        scope_to_biopb: If True, only configure biopb_tensor_server logger hierarchy.
+                        If False, configure the root logger (affects all packages).
 
     Example:
-        setup_logging("DEBUG")  # Show all messages
+        setup_logging("DEBUG")  # Show all messages (scoped to biopb_tensor_server)
+        setup_logging("DEBUG", scope_to_biopb=False)  # Affects all packages
         setup_logging("WARNING")  # Only warnings and errors
     """
     level_map = {
@@ -59,14 +66,28 @@ def setup_logging(
     level_str = str(level).upper()
     numeric_level = level_map.get(level_str, logging.INFO)
 
-    # Configure root logger
-    logging.basicConfig(
-        level=numeric_level,
-        format=format,
-        datefmt=datefmt,
-        handlers=[logging.StreamHandler()],
-    )
+    if scope_to_biopb:
+        # Configure only the biopb_tensor_server logger hierarchy
+        logger = logging.getLogger("biopb_tensor_server")
+        logger.setLevel(numeric_level)
 
-    # Log the configuration
-    logger = logging.getLogger(__name__)
-    logger.debug(f"Logging configured: level={level_str}")
+        # Add a handler if none exists
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(format, datefmt))
+            logger.addHandler(handler)
+
+        # Log the configuration
+        logger.debug(f"Logging configured: level={level_str}, scope=biopb_tensor_server")
+    else:
+        # Configure root logger (affects all packages)
+        logging.basicConfig(
+            level=numeric_level,
+            format=format,
+            datefmt=datefmt,
+            handlers=[logging.StreamHandler()],
+        )
+
+        # Log the configuration
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Logging configured: level={level_str}, scope=root")

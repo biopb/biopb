@@ -149,6 +149,8 @@ class ServerConfig:
         host: Server host
         port: Server port
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_scope_to_biopb: If True, logging level changes only affect biopb_tensor_server
+                            packages, not external packages like grpc, numpy, etc.
         watcher_type: Filesystem watcher type - "auto", "watchdog", or "pollvfs"
             "auto": Auto-detect based on filesystem (NFS uses pollvfs, local uses watchdog)
             "watchdog": Force inotify-based watcher (local filesystems only)
@@ -159,6 +161,7 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8815
     log_level: str = "INFO"
+    log_scope_to_biopb: bool = True
     compute_backend: str = "auto"
     gpu_min_input_mb: float = 4.0
     gpu_min_linear_input_mb: float = 2.0
@@ -209,6 +212,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     host = server_data.get("host", "0.0.0.0")
     port = server_data.get("port", 8815)
     log_level = server_data.get("log_level", "INFO")
+    log_scope_to_biopb = server_data.get("log_scope_to_biopb", True)
     watcher_type = server_data.get("watcher_type", "auto")
     poll_interval = server_data.get("poll_interval", 30.0)
 
@@ -268,6 +272,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         host=host,
         port=port,
         log_level=log_level,
+        log_scope_to_biopb=log_scope_to_biopb,
         watcher_type=watcher_type,
         poll_interval=float(poll_interval),
         compute_backend=compute_backend,

@@ -237,6 +237,11 @@ def serve(
         "--log-level", "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
+    log_scope_biopb: bool = typer.Option(
+        True,
+        "--log-scope-biopb/--log-scope-all",
+        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+    ),
     host: Optional[str] = typer.Option(
         None,
         "--host", "-h",
@@ -284,7 +289,7 @@ def serve(
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
-    setup_logging(effective_log_level)
+    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
 
     server, source_manager, watcher = _setup_flight_server(
         server_config,
@@ -455,6 +460,11 @@ def launch(
         "--log-level", "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
+    log_scope_biopb: bool = typer.Option(
+        True,
+        "--log-scope-biopb/--log-scope-all",
+        help="Scope logging to biopb_tensor_server only (default) or affect all packages",
+    ),
     web_port: int = typer.Option(
         8816,
         "--web-port",
@@ -513,7 +523,7 @@ def launch(
 
     # Setup logging with priority: CLI > env > config > default
     effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
-    setup_logging(effective_log_level)
+    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
 
     # --- Determine dev mode ---
     env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
