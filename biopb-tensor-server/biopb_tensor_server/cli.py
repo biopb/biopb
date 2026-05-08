@@ -54,6 +54,7 @@ def _setup_flight_server(
     gpu_min_linear_input_mb: Optional[float] = None,
     gpu_memory_safety_factor: Optional[int] = None,
     gpu_min_merged_chunks: Optional[int] = None,
+    writable: Optional[bool] = None,
 ) -> Tuple[TensorFlightServer, Optional[object], Optional[object]]:
     """Set up the Flight server with cache, sources, and monitoring.
 
@@ -73,6 +74,8 @@ def _setup_flight_server(
     # Apply overrides
     host = host or server_config.host
     port = port or server_config.port
+    effective_writable = writable if writable is not None else server_config.writable
+    write_dir = server_config.write_dir
 
     configure_compute_backend(
         force_backend=compute_backend or server_config.compute_backend,
@@ -148,7 +151,7 @@ def _setup_flight_server(
     # Create and start server
     location = f"grpc://{host}:{port}"
     flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
-    server = TensorFlightServer(location, token=flight_token)
+    server = TensorFlightServer(location, token=flight_token, writable=effective_writable, write_dir=write_dir)
 
     # Set up watcher for monitored sources (None for static-only configs)
     watcher = None
@@ -277,6 +280,11 @@ def serve(
         "--gpu-min-merged-chunks",
         help="Minimum merged source chunk count before GPU is preferred",
     ),
+    writable: bool = typer.Option(
+        False,
+        "--writable",
+        help="Enable write mode for source creation and data upload",
+    ),
 ):
     """Start the TensorFlight server.
 
@@ -300,6 +308,7 @@ def serve(
         gpu_min_linear_input_mb=gpu_min_linear_input_mb,
         gpu_memory_safety_factor=gpu_memory_safety_factor,
         gpu_min_merged_chunks=gpu_min_merged_chunks,
+        writable=writable,
     )
 
     location = f"grpc://{host or server_config.host}:{port or server_config.port}"

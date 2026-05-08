@@ -9,6 +9,10 @@ Features:
 - Numpy-compatible slicing and operations
 """
 
+import logging
+import importlib.metadata
+import json
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 import threading
 
@@ -19,8 +23,46 @@ import dask.array as da
 from dask.delayed import delayed
 from cachey import Cache
 
-from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
+from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, TensorSelection, DataSourceDescriptor
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_version(version_str: str) -> Tuple[int, int, int]:
+    """Parse semantic version string to (major, minor, patch) tuple."""
+    # Handle dev versions like "0.3.1.dev43+g..."
+    base = version_str.split('.dev')[0].split('+')[0]
+    parts = base.split('.')
+    major = int(parts[0]) if len(parts) > 0 else 0
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    patch = int(parts[2]) if len(parts) > 2 else 0
+    return (major, minor, patch)
+
+
+def _check_schema_version(schema: pa.Schema) -> None:
+    """Check schema metadata version and warn if client version is older."""
+    if schema.metadata is None:
+        return
+
+    server_version_bytes = schema.metadata.get(b'tensor_schema_version')
+    if server_version_bytes is None:
+        return
+
+    server_version = server_version_bytes.decode('utf-8')
+    try:
+        client_version = importlib.metadata.version('biopb')
+    except importlib.metadata.PackageNotFoundError:
+        return
+
+    server_parsed = _parse_version(server_version)
+    client_parsed = _parse_version(client_version)
+
+    if client_parsed < server_parsed:
+        logger.warning(
+            f"Client version {client_version} is older than server schema version {server_version}. "
+            f"Consider upgrading biopb client for compatibility."
+        )
 
 
 class TensorFlightClient:
@@ -68,6 +110,7 @@ class TensorFlightClient:
             cache_bytes: Maximum bytes for chunk cache (default 1GB)
             token: Bearer token for server authentication.  ``None`` disables auth.
         """
+        logger.info(f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}")
         self._client = flight.FlightClient(location)
         self._call_options = (
             flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
@@ -97,6 +140,7 @@ class TensorFlightClient:
             for tensor_desc in source_desc.tensors:
                 self._descriptors[tensor_desc.array_id] = tensor_desc
         self._sources = source_descriptors
+        logger.info(f"list_sources: returned {len(source_descriptors)} sources")
         return source_descriptors
 
     def get_source_metadata(self, source_id: str) -> dict:
@@ -161,6 +205,7 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
+        logger.debug(f"get_tensor: source_id={source_id}, tensor_id={tensor_id}")
         # Get tensor descriptor from cached source info
         if source_id not in self._sources:
             self.list_sources()
@@ -212,6 +257,9 @@ class TensorFlightClient:
         flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
         info = self._client.get_flight_info(flight_desc, options=self._call_options)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+        # Check schema version compatibility
+        _check_schema_version(info.schema)
 
         # Cache the response descriptor
         self._descriptors[response_desc.array_id] = response_desc
@@ -308,11 +356,13 @@ class TensorFlightClient:
             if cached is not None:
                 with self._cache_lock:
                     self._cache_hits += 1
+                logger.debug(f"fetch_chunk: cache hit for {cache_key[:16]}")
                 return cached
 
             with self._cache_lock:
                 self._cache_misses += 1
 
+            logger.debug(f"fetch_chunk: fetching {cache_key[:16]} from server")
             # Fetch from server
             ticket = TensorTicket(chunk_id=chunk_id)
             reader = self._client.do_get(flight.Ticket(ticket.SerializeToString()), options=self._call_options)
@@ -361,8 +411,218 @@ class TensorFlightClient:
         # Use da.block to combine chunks into a single array
         return da.block(blocks.tolist())
 
+    # ====================
+    # Upload API
+    # ====================
+
+    def upload_array(
+        self,
+        arr: da.Array,
+        source_name: str,
+        chunk_shape: Optional[Sequence[int]] = None,
+        dim_labels: Optional[Sequence[str]] = None,
+        ome_metadata: Optional[dict] = None,
+    ) -> str:
+        """Upload dask array to server.
+
+        Args:
+            arr: Dask array to upload
+            source_name: Source identifier format:
+                - "cache:my-name" → cache-backed (ephemeral)
+                - "cache:" → cache-backed with server-generated name
+                - "ome_zarr:my-name" → zarr-backed (persistent)
+                - "ome_zarr:" → zarr-backed with server-generated name
+            chunk_shape: Override chunk shape. If None, uses arr.chunksize with
+                         automatic rechunking if chunks are non-uniform.
+            dim_labels: Optional dimension labels
+            ome_metadata: Optional OME metadata dict
+
+        Returns:
+            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
+        """
+        # Determine target chunk shape
+        if chunk_shape is None:
+            chunk_shape = arr.chunksize
+
+            # Check if dask chunks are non-uniform
+            needs_rechunk = not all(
+                len(set(arr.chunks[d])) == 1
+                for d in range(arr.ndim)
+            )
+
+            if needs_rechunk:
+                uniform_chunks = tuple(
+                    max(arr.chunks[d]) if arr.chunks[d] else arr.shape[d]
+                    for d in range(arr.ndim)
+                )
+                arr = arr.rechunk(uniform_chunks)
+                chunk_shape = uniform_chunks
+        else:
+            if tuple(chunk_shape) != tuple(arr.chunksize):
+                arr = arr.rechunk(tuple(chunk_shape))
+
+        # Create source
+        source_id = self.create_source(
+            source_name=source_name,
+            shape=arr.shape,
+            dtype=arr.dtype.str,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+            ome_metadata=ome_metadata,
+        )
+
+        # Upload chunks
+        ndim = arr.ndim
+        chunk_shape_tuple = tuple(chunk_shape)
+        chunks_per_dim = [
+            (arr.shape[d] + chunk_shape_tuple[d] - 1) // chunk_shape_tuple[d]
+            for d in range(ndim)
+        ]
+
+        from itertools import product
+        for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
+            chunk_start = [idx * chunk_shape_tuple[d] for d, idx in enumerate(chunk_idx)]
+            chunk_stop = [
+                min((idx + 1) * chunk_shape_tuple[d], arr.shape[d])
+                for d, idx in enumerate(chunk_idx)
+            ]
+
+            bounds = ChunkBounds(start=chunk_start, stop=chunk_stop)
+
+            slices = tuple(
+                slice(chunk_start[d], chunk_stop[d])
+                for d in range(arr.ndim)
+            )
+            chunk_data = arr[slices].compute()
+            self.upload_chunk(source_id, bounds, chunk_data)
+
+        return source_id
+
+    def upload_zarr(
+        self,
+        zarr_path: str,
+        source_name: str,
+        chunk_shape: Optional[Sequence[int]] = None,
+        dim_labels: Optional[Sequence[str]] = None,
+        ome_metadata: Optional[dict] = None,
+    ) -> str:
+        """Upload local zarr to server.
+
+        Args:
+            zarr_path: Path to local zarr directory
+            source_name: Source identifier format:
+                - "cache:my-name" → cache-backed (ephemeral)
+                - "cache:" → cache-backed with server-generated name
+                - "ome_zarr:my-name" → zarr-backed (persistent)
+                - "ome_zarr:" → zarr-backed with server-generated name
+            chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
+            dim_labels: Optional dimension labels (read from zarr if not provided)
+            ome_metadata: Optional OME metadata (read from zarr if not provided)
+
+        Returns:
+            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
+        """
+        import zarr
+
+        arr = zarr.open_array(zarr_path, mode='r')
+
+        # Read metadata from local zarr if not provided
+        zattrs_path = Path(zarr_path) / '.zattrs'
+        if zattrs_path.exists():
+            with open(zattrs_path) as f:
+                zattrs = json.load(f)
+            if ome_metadata is None and 'multiscales' in zattrs:
+                ome_metadata = zattrs
+            if dim_labels is None and 'multiscales' in zattrs:
+                axes = zattrs['multiscales'][0].get('axes', [])
+                dim_labels = [
+                    ax.get('name') if isinstance(ax, dict) else str(ax)
+                    for ax in axes
+                ]
+
+        dask_arr = da.from_zarr(zarr_path)
+        effective_chunk_shape = chunk_shape or arr.chunks
+
+        return self.upload_array(
+            dask_arr,
+            source_name=source_name,
+            chunk_shape=effective_chunk_shape,
+            dim_labels=dim_labels,
+            ome_metadata=ome_metadata,
+        )
+
+    def create_source(
+        self,
+        source_name: str,
+        shape: Sequence[int],
+        dtype: str,
+        chunk_shape: Sequence[int],
+        dim_labels: Optional[Sequence[str]] = None,
+        ome_metadata: Optional[dict] = None,
+    ) -> str:
+        """Create source on server (internal).
+
+        Args:
+            source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
+                         "cache:" or "ome_zarr:" → server-generated name
+            shape: Array shape
+            dtype: Data type string (numpy format)
+            chunk_shape: Chunk size per dimension
+            dim_labels: Optional dimension labels
+            ome_metadata: Optional OME metadata dict
+
+        Returns:
+            source_id assigned by server
+        """
+        req_desc = TensorDescriptor(
+            array_id=source_name,
+            shape=list(shape),
+            dtype=dtype,
+            chunk_shape=list(chunk_shape),
+            dim_labels=list(dim_labels or []),
+            metadata_json=json.dumps(ome_metadata) if ome_metadata else "",
+        )
+
+        desc = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
+        writer, reader = self._client.do_put(desc, pa.schema([]), options=self._call_options)
+        writer.close()
+
+        metadata = reader.read()
+        response_desc = TensorDescriptor.FromString(metadata.to_pybytes())
+        logger.info(f"create_source: created {response_desc.array_id}")
+        return response_desc.array_id
+
+    def upload_chunk(
+        self,
+        source_id: str,
+        bounds: ChunkBounds,
+        data: np.ndarray,
+    ) -> None:
+        """Upload single chunk (internal).
+
+        Args:
+            source_id: Source identifier
+            bounds: Chunk start/stop coordinates
+            data: Numpy array with chunk data
+        """
+        upload = ChunkUpload(
+            source_id=source_id,
+            bounds=bounds,
+        )
+
+        desc = flight.FlightDescriptor.for_command(upload.SerializeToString())
+        schema = pa.schema([pa.field("data", pa.from_numpy_dtype(data.dtype))])
+
+        writer, reader = self._client.do_put(desc, schema, options=self._call_options)
+        batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
+        writer.write_batch(batch)
+        writer.close()
+        reader.read()
+        logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
+
     def close(self):
         """Close the Flight client."""
+        logger.info("Closing Flight client")
         self._client.close()
 
     def cache_info(self) -> Dict:

@@ -7,16 +7,23 @@ The server supports:
 - ListFlights: Browse available tensors
 - GetFlightInfo: Get tensor metadata and chunk endpoints
 - DoGet: Fetch individual chunk data
+- DoPut: Upload data (when writable mode enabled)
 """
 
+import hashlib
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection
-from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
+from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import BackendAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
 
@@ -83,6 +90,8 @@ class TensorFlightServer(flight.FlightServerBase):
         self,
         location: str = 'grpc://0.0.0.0:8815',
         token: Optional[str] = None,
+        writable: bool = False,
+        write_dir: Optional[Path] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -90,12 +99,16 @@ class TensorFlightServer(flight.FlightServerBase):
         Args:
             location: Server location (e.g., 'grpc://0.0.0.0:8815')
             token: Bearer token required on every call.  ``None`` disables auth.
+            writable: Enable write mode for source creation and data upload
+            write_dir: Directory for zarr-backed uploaded sources (required if writable)
             **kwargs: Additional arguments passed to FlightServerBase
         """
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)
         self._sources: Dict[str, BackendAdapter] = {}
+        self._writable = writable
+        self._write_dir = write_dir
 
     def register_source(self, source_id: str, adapter: BackendAdapter) -> None:
         """Register a data source with the server.
@@ -138,39 +151,6 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return bounds.SerializeToString()
 
-    def _get_adapter_for_source_id(self, source_id: str) -> Optional[BackendAdapter]:
-        """Get adapter for a source_id, handling nested paths for level adapters.
-
-        For nested source_ids like "parent/level", finds the parent adapter
-        and delegates to its get_level_adapter method if available.
-
-        Args:
-            source_id: The source identifier (may contain "/" for nested paths)
-
-        Returns:
-            BackendAdapter for the source, or None if not found
-        """
-        # First try exact match
-        adapter = self._sources.get(source_id)
-        if adapter is not None:
-            return adapter
-
-        # Check for nested path (e.g., "ome-zarr/1" for level 1)
-        if '/' in source_id:
-            # Split to find parent and level path
-            parts = source_id.split('/')
-            parent_id = parts[0]
-            level_path = '/'.join(parts[1:])
-
-            parent_adapter = self._sources.get(parent_id)
-            if parent_adapter is not None and hasattr(parent_adapter, 'get_level_adapter'):
-                # Delegate to parent adapter's level adapter method
-                try:
-                    return parent_adapter.get_level_adapter(level_path)
-                except Exception:
-                    return None
-
-        return None
 
     def _get_adapter_for_tensor(
         self,
@@ -186,11 +166,36 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             BackendAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self._get_adapter_for_source_id(source_id)
+        source_adapter = self._sources.get(source_id)
         if source_adapter is None:
             return None
 
         return source_adapter.get_tensor_adapter(tensor_id)
+
+
+    def _get_adapter_for_chunk(self, chunk_id: bytes) -> Optional[BackendAdapter]:
+        """Get adapter for a specific chunk based on its chunk_id.
+
+        Args:
+            chunk_id: The chunk identifier bytes
+
+        Returns:
+            BackendAdapter responsible for the chunk, or None if not found
+        """ 
+        array_id, *_ = decode_chunk_id(chunk_id)
+        source_id, *rest = array_id.split('/')
+        rest = '/'.join(rest) if rest else None
+
+        source_adapter = self._sources.get(source_id)
+        if source_adapter is None:
+            return None
+
+        # Check for level adapter (OME-Zarr) first
+        if hasattr(source_adapter, 'get_level_adapter'):
+            return source_adapter.get_level_adapter(rest)
+
+        # Otherwise get tensor adapter
+        return source_adapter.get_tensor_adapter(rest)            
 
     def list_flights(
         self,
@@ -321,43 +326,9 @@ class TensorFlightServer(flight.FlightServerBase):
         tensor_ticket = self._parse_ticket(ticket)
         logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-        # Decode array_id (source_id/tensor_id) from chunk_id
-        array_id, *_ = decode_chunk_id(tensor_ticket.chunk_id)
-
-        # Find the adapter for this chunk
-        # The array_id in chunk_id may be:
-        # - Just source_id (for single tensor sources)
-        # - source_id/level_path (for OME-Zarr precomputed levels)
-        # - source_id/tensor_id (for multifield sources)
-
-        if '/' in array_id:
-            parts = array_id.split('/')
-            source_id = parts[0]
-            rest = '/'.join(parts[1:])
-            logger.debug(f"do_get: nested path source_id={source_id}, rest={rest}")
-
-            source_adapter = self._sources.get(source_id)
-            if source_adapter is None:
-                logger.warning(f"Source not found: {source_id}")
-                raise flight.FlightServerError(f"Source not found: {source_id}")
-
-            # Check if this is a level adapter path (OME-Zarr)
-            if hasattr(source_adapter, 'get_level_adapter'):
-                # Use get_level_adapter for nested paths
-                adapter = source_adapter.get_level_adapter(rest)
-            else:
-                # Use get_tensor_adapter for multifield paths
-                adapter = source_adapter.get_tensor_adapter(rest)
-        else:
-            # Single source_id - find the adapter
-            adapter = self._sources.get(array_id)
-            if adapter is None:
-                logger.warning(f"Tensor not found: {array_id}")
-                raise flight.FlightServerError(f"Tensor not found: {array_id}")
-
+        adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
         if adapter is None:
-            logger.warning(f"Tensor not found: {array_id}")
-            raise flight.FlightServerError(f"Tensor not found: {array_id}")
+            raise flight.FlightServerError(f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}...")
 
         # Get cache manager singleton (if initialized)
         cache_manager = CacheManager.get_instance()
@@ -367,6 +338,223 @@ class TensorFlightServer(flight.FlightServerBase):
         batch_size = sum(col.nbytes for col in record_batch.columns)
         logger.debug(f"do_get: returning {batch_size} bytes")
         return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
+
+    def do_put(
+        self,
+        context: flight.ServerCallContext,
+        descriptor: flight.FlightDescriptor,
+        reader: flight.MetadataRecordBatchReader,
+        writer: flight.FlightMetadataWriter,
+    ) -> None:
+        """Handle source creation and chunk upload.
+
+        Args:
+            context: Server call context
+            descriptor: Flight descriptor with command bytes
+            reader: Flight data stream reader
+            writer: Flight metadata writer for responses
+
+        Raises:
+            FlightUnauthenticatedError: If server not in write mode
+            FlightServerError: If source/chunk creation fails
+        """
+        if not self._writable:
+            raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+        command = descriptor.command
+
+        # Try TensorDescriptor (source creation)
+        try:
+            req_desc = TensorDescriptor.FromString(command)
+            if req_desc.shape and req_desc.dtype:
+                self._handle_create_source(req_desc, writer)
+                return
+        except Exception:
+            pass
+
+        # Chunk upload - use ChunkUpload wrapper
+        try:
+            upload = ChunkUpload.FromString(command)
+            self._handle_chunk_upload(upload, reader)
+            return
+        except Exception as e:
+            raise flight.FlightServerError(f"Invalid upload command: {e}")
+
+    def _handle_create_source(
+        self,
+        req_desc: TensorDescriptor,
+        writer: flight.FlightMetadataWriter
+    ) -> None:
+        """Create source from TensorDescriptor.
+
+        array_id format in request:
+        - "cache:name" → cache-backed with given name
+        - "cache:" → cache-backed with server-generated name
+        - "ome_zarr:name" → zarr-backed with given name
+        - "ome_zarr:" → zarr-backed with server-generated name
+
+        Args:
+            req_desc: TensorDescriptor request
+            writer: Flight metadata writer for response
+        """
+        array_id = req_desc.array_id
+
+        if array_id.startswith('cache:'):
+            # Cache-backed source
+            provided_name = array_id[6:]  # After 'cache:'
+            if provided_name:
+                source_id = f"cache_{hashlib.sha256(provided_name.encode()).hexdigest()[:12]}"
+            else:
+                source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
+
+            ome_metadata = json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
+
+            adapter = CachedSourceAdapter(
+                source_id=source_id,
+                shape=list(req_desc.shape),
+                dtype=req_desc.dtype,
+                chunk_shape=list(req_desc.chunk_shape),
+                dim_labels=list(req_desc.dim_labels) if req_desc.dim_labels else None,
+                ome_metadata=ome_metadata,
+            )
+            self.register_source(source_id, adapter)
+
+            logger.info(f"Created cache-backed source: {source_id}")
+
+        elif array_id.startswith('ome_zarr:'):
+            # Zarr-backed source
+            import zarr
+
+            provided_name = array_id[9:]  # After 'ome_zarr:'
+            zarr_name = provided_name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+
+            if self._write_dir is None:
+                raise flight.FlightServerError("write_dir not configured for zarr-backed sources")
+
+            zarr_path = self._write_dir / f"{zarr_name}.zarr"
+            zarr_path.mkdir(parents=True, exist_ok=True)
+
+            store = zarr.DirectoryStore(str(zarr_path))
+            arr = zarr.create(
+                store=store,
+                shape=req_desc.shape,
+                dtype=req_desc.dtype,
+                chunks=req_desc.chunk_shape,
+            )
+
+            # Write OME metadata
+            if req_desc.metadata_json:
+                zattrs = json.loads(req_desc.metadata_json)
+            else:
+                zattrs = self._build_minimal_ome_metadata(req_desc)
+
+            with open(zarr_path / '.zattrs', 'w') as f:
+                json.dump(zattrs, f)
+
+            source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
+
+            adapter = OmeZarrAdapter(arr, source_id, list(req_desc.dim_labels) if req_desc.dim_labels else None)
+
+            self.register_source(source_id, adapter)
+
+            logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
+
+        else:
+            raise flight.FlightServerError(f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix")
+
+        # Return TensorDescriptor with actual source_id via writer
+        response_desc = TensorDescriptor(
+            array_id=source_id,
+            dim_labels=req_desc.dim_labels,
+            shape=req_desc.shape,
+            chunk_shape=req_desc.chunk_shape,
+            dtype=req_desc.dtype,
+        )
+        writer.write(response_desc.SerializeToString())
+
+    def _handle_chunk_upload(
+        self,
+        upload: ChunkUpload,
+        reader: flight.MetadataRecordBatchReader
+    ) -> None:
+        """Write chunk data.
+
+        For OmeZarr-backed sources: enforces chunk_bounds aligns with chunk_shape.
+        For cache-backed sources: arbitrary bounds allowed.
+        """
+        table = reader.read_all()
+        data = table.column(0).to_numpy()
+
+        adapter = self._sources.get(upload.source_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Source not found: {upload.source_id}")
+
+        bounds = upload.bounds
+
+        # Check chunk alignment for OmeZarr-backed sources
+        if hasattr(adapter, 'zarr_array'):
+            desc = adapter.get_tensor_descriptor()
+            chunk_shape = list(desc.chunk_shape)
+
+            # Verify start aligns to chunk_shape grid
+            for d, (start, chunk_size) in enumerate(zip(bounds.start, chunk_shape)):
+                if start % chunk_size != 0:
+                    raise flight.FlightServerError(
+                        f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
+                    )
+
+            # Verify chunk size matches (or is edge chunk)
+            actual_size = [stop - start for start, stop in zip(bounds.start, bounds.stop)]
+            for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
+                if actual != expected and actual > expected:
+                    raise flight.FlightServerError(
+                        f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
+                    )
+
+            # Convert bounds to chunk_idx for zarr
+            chunk_idx = tuple(int(s // cs) for s, cs in zip(bounds.start, chunk_shape))
+            if hasattr(adapter, 'write_chunk'):
+                adapter.write_chunk(chunk_idx, data)
+            else:
+                raise flight.FlightServerError(f"Source does not support writes")
+
+        elif isinstance(adapter, CachedSourceAdapter):
+            # Cache-backed sources accept arbitrary bounds
+            adapter.write_chunk(bounds, data)
+
+        else:
+            raise flight.FlightServerError(f"Source type does not support writes")
+
+        logger.debug(f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}")
+
+    def _build_minimal_ome_metadata(self, desc: TensorDescriptor) -> dict:
+        """Build minimal OME-Zarr metadata from TensorDescriptor."""
+        dim_labels = list(desc.dim_labels) if desc.dim_labels else [f"dim{i}" for i in range(len(desc.shape))]
+
+        axes = []
+        for i, label in enumerate(dim_labels):
+            if label.lower() in ('x', 'y', 'z'):
+                axes.append({'name': label, 'type': 'space'})
+            elif label.lower() in ('c', 'channel'):
+                axes.append({'name': label, 'type': 'channel'})
+            elif label.lower() in ('t', 'time'):
+                axes.append({'name': label, 'type': 'time'})
+            else:
+                axes.append({'name': label})
+
+        return {
+            'multiscales': [{
+                'version': '0.4',
+                'axes': axes,
+                'datasets': [{
+                    'path': '0',
+                    'coordinateTransformations': [{
+                        'type': 'scale',
+                        'scale': [1.0] * len(desc.shape)
+                    }]
+                }]
+            }]
+        }
 
 
 def serve(

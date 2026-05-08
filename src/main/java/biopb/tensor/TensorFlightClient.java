@@ -5,8 +5,10 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Logger;
 
 import biopb.tensor.ChunkBounds;
+import biopb.tensor.ChunkUpload;
 import biopb.tensor.DataSourceDescriptor;
 import biopb.tensor.SliceHint;
 import biopb.tensor.TensorDescriptor;
@@ -21,15 +23,30 @@ import com.google.protobuf.InvalidProtocolBufferException;
 
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightClient;
+import org.apache.arrow.flight.FlightClient.ClientStreamListener;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.Ticket;
+import org.apache.arrow.flight.CallHeaders;
+import org.apache.arrow.flight.AsyncPutListener;
+import org.apache.arrow.flight.grpc.CredentialCallOption;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.UInt1Vector;
+import org.apache.arrow.vector.UInt2Vector;
+import org.apache.arrow.vector.UInt4Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.Types;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import net.imglib2.FinalInterval;
 import net.imglib2.Interval;
@@ -78,10 +95,12 @@ import net.imglib2.type.numeric.real.FloatType;
  */
 public class TensorFlightClient implements AutoCloseable {
 
+    private static final Logger LOGGER = Logger.getLogger(TensorFlightClient.class.getName());
     private static final String DEFAULT_REDUCTION_METHOD = "nearest";
 
     private final BufferAllocator allocator;
     private final FlightClient client;
+    private final CredentialCallOption authOption;
     private final Map<String, TensorDescriptor> descriptors;
     private final Map<String, DataSourceDescriptor> sources;
     private final long cacheBytes;
@@ -93,7 +112,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param port Server port
      */
     public TensorFlightClient(String host, int port) {
-        this(Location.forGrpcInsecure(host, port), 100_000_000L);
+        this(Location.forGrpcInsecure(host, port), 100_000_000L, null);
     }
 
     /**
@@ -104,7 +123,19 @@ public class TensorFlightClient implements AutoCloseable {
      * @param cacheBytes Maximum cache size in bytes
      */
     public TensorFlightClient(String host, int port, long cacheBytes) {
-        this(Location.forGrpcInsecure(host, port), cacheBytes);
+        this(Location.forGrpcInsecure(host, port), cacheBytes, null);
+    }
+
+    /**
+     * Create a new TensorFlightClient with authentication token.
+     *
+     * @param host Server host
+     * @param port Server port
+     * @param cacheBytes Maximum cache size in bytes
+     * @param token Bearer token for authentication (null disables auth)
+     */
+    public TensorFlightClient(String host, int port, long cacheBytes, String token) {
+        this(Location.forGrpcInsecure(host, port), cacheBytes, token);
     }
 
     /**
@@ -113,7 +144,7 @@ public class TensorFlightClient implements AutoCloseable {
      * @param location Flight server location
      */
     public TensorFlightClient(Location location) {
-        this(location, 100_000_000L);
+        this(location, 100_000_000L, null);
     }
 
     /**
@@ -123,8 +154,23 @@ public class TensorFlightClient implements AutoCloseable {
      * @param cacheBytes Maximum cache size in bytes
      */
     public TensorFlightClient(Location location, long cacheBytes) {
+        this(location, cacheBytes, null);
+    }
+
+    /**
+     * Create a new TensorFlightClient for an Arrow Flight location with authentication.
+     *
+     * @param location Flight server location
+     * @param cacheBytes Maximum cache size in bytes
+     * @param token Bearer token for authentication (null disables auth)
+     */
+    public TensorFlightClient(Location location, long cacheBytes, String token) {
+        LOGGER.info("Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
         this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.client = FlightClient.builder(this.allocator, location).build();
+        this.authOption = (token != null && !token.isEmpty())
+            ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
+            : null;
         this.descriptors = new HashMap<>();
         this.sources = new HashMap<>();
         this.cacheBytes = cacheBytes;
@@ -141,7 +187,7 @@ public class TensorFlightClient implements AutoCloseable {
      */
     public Map<String, DataSourceDescriptor> listSources() throws IOException {
         Map<String, DataSourceDescriptor> result = new HashMap<>();
-        for (FlightInfo info : client.listFlights(Criteria.ALL)) {
+        for (FlightInfo info : client.listFlights(Criteria.ALL, authOption)) {
             DataSourceDescriptor sourceDesc = DataSourceDescriptor.parseFrom(
                 info.getDescriptor().getCommand());
             result.put(sourceDesc.getSourceId(), sourceDesc);
@@ -151,6 +197,7 @@ public class TensorFlightClient implements AutoCloseable {
             }
         }
         sources.putAll(result);
+        LOGGER.info("listSources: returned " + result.size() + " sources");
         return result;
     }
 
@@ -181,7 +228,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .setSourceId(sourceId)
                 .setTensorId(firstTensor.getArrayId())
                 .build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()));
+        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()), authOption);
         TensorDescriptor responseDesc = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
 
         if (responseDesc.getMetadataJson().isEmpty()) {
@@ -321,6 +368,7 @@ public class TensorFlightClient implements AutoCloseable {
 
     @Override
     public void close() {
+        LOGGER.info("Closing Flight client");
         try {
             client.close();
         } catch (InterruptedException e) {
@@ -330,11 +378,16 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
+    // Note: Upload API (uploadCellImg) not yet implemented for Java client.
+    // Use the Python client for upload functionality.
+
     private RequestContext getTensorContext(
             String sourceId,
             String tensorId,
             SliceHint sliceHint,
             TensorReadOptions readOptions) {
+
+        LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
         // Ensure sources are loaded
         if (sources.isEmpty()) {
@@ -377,7 +430,8 @@ public class TensorFlightClient implements AutoCloseable {
         }
 
         TensorSelection selection = selectionBuilder.build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()));
+        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()), authOption);
+        checkSchemaVersion(info);
         TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
 
         // Cache the response descriptor
@@ -585,11 +639,12 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     private double[] fetchChunkValues(byte[] chunkId) {
+        LOGGER.fine("fetchChunk: chunkId=" + bytesToHex(chunkId, 16));
         TensorTicket tensorTicket = TensorTicket.newBuilder()
                 .setChunkId(ByteString.copyFrom(chunkId))
                 .build();
 
-        try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()))) {
+        try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
             double[] values = new double[0];
             while (stream.next()) {
                 List<FieldVector> vectors = stream.getRoot().getFieldVectors();
@@ -670,6 +725,70 @@ public class TensorFlightClient implements AutoCloseable {
             position[axis] = remaining % shape[axis];
             remaining /= shape[axis];
         }
+    }
+
+    private static String bytesToHex(byte[] bytes, int limit) {
+        StringBuilder sb = new StringBuilder();
+        int len = Math.min(bytes.length, limit);
+        for (int i = 0; i < len; i++) {
+            sb.append(String.format("%02x", bytes[i]));
+        }
+        if (bytes.length > limit) {
+            sb.append("...");
+        }
+        return sb.toString();
+    }
+
+    private static void checkSchemaVersion(FlightInfo info) {
+        java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
+        if (!schemaOpt.isPresent()) {
+            return;
+        }
+        Schema schema = schemaOpt.get();
+        Map<String, String> metadata = schema.getCustomMetadata();
+        if (metadata == null) {
+            return;
+        }
+        String serverVersion = metadata.get("tensor_schema_version");
+        if (serverVersion == null || serverVersion.isEmpty()) {
+            return;
+        }
+        String clientVersion = getClientVersion();
+        if (clientVersion == null) {
+            return;
+        }
+        int[] serverParsed = parseVersion(serverVersion);
+        int[] clientParsed = parseVersion(clientVersion);
+        if (clientParsed[0] < serverParsed[0]
+                || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
+                || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1] && clientParsed[2] < serverParsed[2])) {
+            LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
+                    + serverVersion + ". Consider upgrading biopb client for compatibility.");
+        }
+    }
+
+    private static String getClientVersion() {
+        try {
+            return System.getProperty("biopb.version",
+                    java.util.jar.Manifest.class.getProtectionDomain().getCodeSource().getLocation().toString());
+        } catch (Exception e) {
+            // Try package version from manifest
+            Package pkg = TensorFlightClient.class.getPackage();
+            if (pkg != null && pkg.getImplementationVersion() != null) {
+                return pkg.getImplementationVersion();
+            }
+            return null;
+        }
+    }
+
+    private static int[] parseVersion(String version) {
+        // Handle dev versions like "0.3.1.dev43+g..."
+        String base = version.split(".dev")[0].split("+")[0];
+        String[] parts = base.split("\\.");
+        int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
+        int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
+        int patch = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
+        return new int[]{major, minor, patch};
     }
 
     private static long[] toLongArray(List<Long> values) {

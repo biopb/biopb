@@ -302,7 +302,7 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         )
 
 
-    def get_tensor_adapter(self, tensor_id: str) -> 'BackendAdapter':
+    def get_tensor_adapter(self, tensor_id: str|None) -> 'BackendAdapter':
         """Factory method to return adapter with specific tensor context.
 
         Transitions the adapter from source context to tensor context.
@@ -319,7 +319,7 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         self._tensor_context = True
         # Only set _tensor_name if it's different from source_id
         # (for multi-tensor sources or when tensor is a sub-component)
-        if tensor_id != self.source_id:
+        if tensor_id and tensor_id != self.source_id:
             self._tensor_name = tensor_id
         return self
 

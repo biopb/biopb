@@ -24,3 +24,12 @@ message ChunkBounds {
   // Chunk stop position in array coordinates (exclusive, per dimension)
   repeated int64 stop = 2;
 }
+
+// Wrapper for chunk upload DoPut
+// FlightDescriptor.command bytes for uploading chunk data
+message ChunkUpload {
+  // Source identifier (e.g., "cache_abc123" or "ome_zarr_def456")
+  string source_id = 1;
+  // Chunk bounds (start/stop coordinates)
+  ChunkBounds bounds = 2;
+}

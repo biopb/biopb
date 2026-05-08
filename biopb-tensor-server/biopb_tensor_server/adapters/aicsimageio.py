@@ -283,19 +283,19 @@ class AicsImageIoAdapter(BackendAdapter):
         Returns:
             AicsImageIoAdapter for the specified scene, with tensor context set
         """
-        if self.scene_index is not None:
-            # Scene-level: return self if matching, else error
-            scene_ids = self._aics_image.scenes
-            if self.scene_index < len(scene_ids) and scene_ids[self.scene_index] == tensor_id:
-                return self
-            raise ValueError(f"Unknown tensor: {tensor_id}")
-
-        # Source-level: find scene index by scene_id
+        # Source-level: lazy initialize tensor level adapters
         scene_ids = list(self._aics_image.scenes)
         try:
             scene_idx = scene_ids.index(tensor_id)
         except ValueError:
             raise ValueError(f"Unknown scene: {tensor_id}")
+        
+        if hasattr(self, '_tensor_adapters'):
+            # Check if adapter already exists for this scene
+            if tensor_id in self._tensor_adapters:
+                return self._tensor_adapters[tensor_id]
+        else:
+            self._tensor_adapters = {}
 
         adapter = AicsImageIoAdapter(
             self._aics_image,
@@ -305,9 +305,8 @@ class AicsImageIoAdapter(BackendAdapter):
             source_url=self._source_url,
             io_lock=self._io_lock,
         )
-        # Set tensor name for multi-tensor context
-        adapter._tensor_name = tensor_id
-        adapter._tensor_context = True
+        _ = super(AicsImageIoAdapter, adapter).get_tensor_adapter(tensor_id)  # Set tensor context in base class
+        self._tensor_adapters[tensor_id] = adapter
 
         return adapter
 

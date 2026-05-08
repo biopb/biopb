@@ -4,7 +4,7 @@ Relies on OS page cache for raw data caching.
 """
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -143,6 +143,29 @@ class ZarrAdapter(BackendAdapter):
         )
 
         return self.zarr_array[slices]
+
+    def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
+        """Write chunk data to zarr array.
+
+        Args:
+            chunk_idx: Chunk coordinates (e.g., (0, 1, 2))
+            data: Numpy array with chunk data
+        """
+        chunks = self.zarr_array.chunks
+        slices = tuple(
+            slice(idx * chunks[d], (idx + 1) * chunks[d])
+            for d, idx in enumerate(chunk_idx)
+        )
+
+        # Handle edge chunks - pad if data smaller than expected
+        expected_shape = tuple(s.stop - s.start for s in slices)
+        if data.shape != expected_shape:
+            padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
+            src_slices = tuple(slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape))
+            padded[src_slices] = data[src_slices]
+            data = padded
+
+        self.zarr_array[slices] = data
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

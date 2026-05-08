@@ -155,6 +155,8 @@ class ServerConfig:
             "auto": Auto-detect based on filesystem (NFS uses pollvfs, local uses watchdog)
             "watchdog": Force inotify-based watcher (local filesystems only)
             "pollvfs": Force polling-based watcher (for NFS/network mounts)
+        writable: Enable write mode for source creation and data upload
+        write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
         sources: List of data sources (each may contain multiple tensors)
     """
@@ -169,6 +171,8 @@ class ServerConfig:
     gpu_min_merged_chunks: int = 4
     watcher_type: str = "auto"
     poll_interval: float = 30.0  # Polling interval for pollvfs watcher (seconds)
+    writable: bool = False  # Enable write mode
+    write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
@@ -215,6 +219,9 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     log_scope_to_biopb = server_data.get("log_scope_to_biopb", True)
     watcher_type = server_data.get("watcher_type", "auto")
     poll_interval = server_data.get("poll_interval", 30.0)
+    writable = server_data.get("writable", False)
+    write_dir_str = server_data.get("write_dir", None)
+    write_dir = Path(write_dir_str) if write_dir_str else None
 
     # Parse compute settings
     compute_data = data.get("compute", {})
@@ -280,6 +287,8 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),
         gpu_memory_safety_factor=int(gpu_memory_safety_factor),
         gpu_min_merged_chunks=int(gpu_min_merged_chunks),
+        writable=writable,
+        write_dir=write_dir,
         cache=cache_config,
         sources=sources,
     )
