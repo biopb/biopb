@@ -1,7 +1,7 @@
 "use client";
 
 import { buildAxisMap } from "@biopb/tensor-flight-client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
 import {
   PRESET_COLORS,
@@ -10,6 +10,9 @@ import {
   isHexColor,
   resolveAutoColor,
 } from "../utils/colorUtils";
+
+// Debounce delay for slider updates (matches ImageViewer's keyboard+wheel debounce)
+const SLIDER_DEBOUNCE_MS = 150;
 
 interface SliceControlsProps {
   sourceId: string;
@@ -33,6 +36,32 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
 
   // Track custom color picker state (separate from preset dropdown)
   const [useCustomColor, setUseCustomColor] = useState(false);
+
+  // Debounce timer ref for slider updates
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Local state for slider values (for immediate visual feedback)
+  const [localT, setLocalT] = useState(slice.t);
+  const [localZ, setLocalZ] = useState(slice.z);
+  const [localC, setLocalC] = useState(slice.c);
+  const [localPercentile, setLocalPercentile] = useState(slice.percentileScale);
+
+  // Sync local state when store slice changes (e.g., from keyboard navigation in ImageViewer)
+  useEffect(() => {
+    setLocalT(slice.t);
+    setLocalZ(slice.z);
+    setLocalC(slice.c);
+    setLocalPercentile(slice.percentileScale);
+  }, [slice.t, slice.z, slice.c, slice.percentileScale]);
+
+  // Cleanup debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+      }
+    };
+  }, []);
 
   // Load channel names when source changes
   useEffect(() => {
@@ -123,11 +152,18 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               type="range"
               min={0}
               max={tMax}
-              value={clamp(slice.t, 0, tMax)}
-              onChange={(e) => setSlice({ t: Number(e.target.value) })}
+              value={clamp(localT, 0, tMax)}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setLocalT(val);
+                if (debounceRef.current) clearTimeout(debounceRef.current);
+                debounceRef.current = setTimeout(() => {
+                  setSlice({ t: val });
+                }, SLIDER_DEBOUNCE_MS);
+              }}
               style={{ flex: 1 }}
             />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{slice.t}/{tMax}</span>
+            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localT}/{tMax}</span>
           </label>
         )}
 
@@ -138,11 +174,18 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               type="range"
               min={0}
               max={zMax}
-              value={clamp(slice.z, 0, zMax)}
-              onChange={(e) => setSlice({ z: Number(e.target.value) })}
+              value={clamp(localZ, 0, zMax)}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setLocalZ(val);
+                if (debounceRef.current) clearTimeout(debounceRef.current);
+                debounceRef.current = setTimeout(() => {
+                  setSlice({ z: val });
+                }, SLIDER_DEBOUNCE_MS);
+              }}
               style={{ flex: 1 }}
             />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{slice.z}/{zMax}</span>
+            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localZ}/{zMax}</span>
           </label>
         )}
 
@@ -153,11 +196,18 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               type="range"
               min={0}
               max={cMax}
-              value={clamp(slice.c, 0, cMax)}
-              onChange={(e) => setSlice({ c: Number(e.target.value) })}
+              value={clamp(localC, 0, cMax)}
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setLocalC(val);
+                if (debounceRef.current) clearTimeout(debounceRef.current);
+                debounceRef.current = setTimeout(() => {
+                  setSlice({ c: val });
+                }, SLIDER_DEBOUNCE_MS);
+              }}
               style={{ flex: 1 }}
             />
-            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{slice.c}/{cMax}</span>
+            <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>{localC}/{cMax}</span>
           </label>
         )}
 
@@ -165,7 +215,10 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 20, fontSize: 11, color: "#64748b" }}>Int</span>
           <button
-            onClick={() => setSlice({ useMinMax: true, percentileScale: 0 })}
+            onClick={() => {
+              setLocalPercentile(0);
+              setSlice({ useMinMax: true, percentileScale: 0 });
+            }}
             disabled={slice.useMinMax}
             style={{
               padding: "2px 6px",
@@ -184,12 +237,19 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             min={0}
             max={4}
             step={0.1}
-            value={slice.percentileScale}
-            onChange={(e) => setSlice({ percentileScale: Number(e.target.value), useMinMax: false })}
+            value={localPercentile}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              setLocalPercentile(val);
+              if (debounceRef.current) clearTimeout(debounceRef.current);
+              debounceRef.current = setTimeout(() => {
+                setSlice({ percentileScale: val, useMinMax: false });
+              }, SLIDER_DEBOUNCE_MS);
+            }}
             style={{ flex: 1 }}
           />
           <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
-            {slice.useMinMax ? "0-100" : `${slice.percentileScale.toFixed(1)}-${(100 - slice.percentileScale).toFixed(1)}`}
+            {slice.useMinMax ? "0-100" : `${localPercentile.toFixed(1)}-${(100 - localPercentile).toFixed(1)}`}
           </span>
         </div>
 
