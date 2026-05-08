@@ -8,7 +8,9 @@ Commands:
 
 from typing import Optional, Tuple
 import json
+import time
 
+import dask
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -21,6 +23,12 @@ app = typer.Typer(
     help="Diagnostic tools for TensorFlight servers",
 )
 console = Console()
+
+
+def _log_timing(start_time: float) -> None:
+    """Print elapsed time since start_time."""
+    elapsed = time.time() - start_time
+    console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
 def _create_flight_client(location: str, cache_bytes: int) -> TensorFlightClient:
@@ -78,11 +86,13 @@ def query(
         biopb-diagnose query --server grpc://localhost:8815
         biopb-diagnose query -s grpc://myhost:9000
     """
+    start_time = time.time()
     client = _create_flight_client(server, cache_bytes)
     try:
         sources = client.list_sources()
         if not sources:
             console.print(f"[yellow]No sources found on {server}[/yellow]")
+            _log_timing(start_time)
             return
 
         table = Table(title="Available Tensor Sources")
@@ -112,6 +122,7 @@ def query(
             f"[green]Cache:[/green] {cache_info.get('size_bytes', 0):,} bytes  "
             f"hits={cache_info.get('hits', 0)} misses={cache_info.get('misses', 0)}"
         )
+        _log_timing(start_time)
     except typer.Exit:
         raise
     except Exception as exc:
@@ -149,6 +160,7 @@ def metadata(
         biopb-diagnose metadata my-source --tensor pos_0
         biopb-diagnose metadata my-source -s grpc://myhost:9000
     """
+    start_time = time.time()
     client = _create_flight_client(server, cache_bytes)
     try:
         sources = client.list_sources()
@@ -195,6 +207,7 @@ def metadata(
         else:
             console.print("[yellow]No metadata available[/yellow]")
 
+        _log_timing(start_time)
     except typer.Exit:
         raise
     except Exception as exc:
@@ -236,6 +249,7 @@ def stats(
         biopb-diagnose stats my-source pos_0 --slice 0:100,0:100
         biopb-diagnose stats my-source pos_0 -S 0:512 -s grpc://myhost:9000
     """
+    start_time = time.time()
     client = _create_flight_client(server, cache_bytes)
     try:
         selection = _parse_slice_hint(slice_hint)
@@ -247,13 +261,14 @@ def stats(
 
         arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
 
-        # Compute statistics
+        # Compute all statistics in a single graph execution
+        min_val, max_val, mean_val = dask.compute(arr.min(), arr.max(), arr.mean())
         stats_dict = {
             "shape": str(list(arr.shape)),
             "dtype": str(arr.dtype),
-            "min": float(arr.min().compute()),
-            "max": float(arr.max().compute()),
-            "mean": float(arr.mean().compute()),
+            "min": float(min_val),
+            "max": float(max_val),
+            "mean": float(mean_val),
             "count": int(arr.size),
         }
 
@@ -265,6 +280,7 @@ def stats(
                 stats_table.add_row(key, str(value))
 
         console.print(stats_table)
+        _log_timing(start_time)
 
     except typer.Exit:
         raise
