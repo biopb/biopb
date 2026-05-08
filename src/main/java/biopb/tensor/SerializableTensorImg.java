@@ -409,12 +409,26 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                 if (vectors.isEmpty()) {
                     throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
                 }
-                org.apache.arrow.vector.FieldVector vector = vectors.get(0);
+
+                // Read "data" column - it's a ListArray with 1 row per chunk
+                org.apache.arrow.vector.FieldVector dataVector = stream.getRoot().getVector("data");
+                if (dataVector == null) {
+                    throw new IllegalStateException("Chunk payload missing 'data' column");
+                }
+
+                // Each row is one chunk's data as a list
                 int rowCount = stream.getRoot().getRowCount();
-                int offset = values.length;
-                values = java.util.Arrays.copyOf(values, offset + rowCount);
-                for (int i = 0; i < rowCount; i++) {
-                    values[offset + i] = asDouble(vector.getObject(i));
+                for (int row = 0; row < rowCount; row++) {
+                    Object rowObj = dataVector.getObject(row);
+                    if (!(rowObj instanceof java.util.List)) {
+                        throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                    }
+                    java.util.List<?> dataList = (java.util.List<?>) rowObj;
+                    int offset = values.length;
+                    values = java.util.Arrays.copyOf(values, offset + dataList.size());
+                    for (int i = 0; i < dataList.size(); i++) {
+                        values[offset + i] = asDouble(dataList.get(i));
+                    }
                 }
             }
             return values;

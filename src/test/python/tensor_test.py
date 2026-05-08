@@ -112,14 +112,14 @@ class TestTensorFlightClient:
         data1 = darr[:64, :64].compute()
 
         # Check cache has entries
-        cache_info = server_client._cache
-        initial_bytes = cache_info.nbytes
+        cache_info = server_client.cache_info()
+        initial_bytes = cache_info["size_bytes"]
 
         # Second read - should hit cache
         data2 = darr[:64, :64].compute()
 
-        # nbytes should be same (cache hit)
-        assert cache_info.nbytes == initial_bytes
+        # size_bytes should be same (cache hit)
+        assert server_client.cache_info()["size_bytes"] == initial_bytes
 
         # Data should be identical
         np.testing.assert_array_equal(data1, data2)

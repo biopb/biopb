@@ -213,19 +213,21 @@ class TestStatsCommand:
     def test_stats_computes_values(self):
         """Test that stats computes min, max, mean."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
-            mock_client = _build_mock_client()
-            mock_fc_class.return_value = mock_client
+            with patch("biopb.tensor.cli.dask.compute") as mock_compute:
+                mock_client = _build_mock_client()
+                mock_fc_class.return_value = mock_client
+                mock_compute.return_value = (10, 200, 100.5)
 
-            result = runner.invoke(app, ["stats", "my-source", "pos_0"])
+                result = runner.invoke(app, ["stats", "my-source", "pos_0"])
 
-            assert result.exit_code == 0
-            assert "min" in result.stdout
-            assert "max" in result.stdout
-            assert "mean" in result.stdout
-            assert "10" in result.stdout
-            assert "200" in result.stdout
-            assert "100.5" in result.stdout
-            mock_client.close.assert_called_once()
+                assert result.exit_code == 0
+                assert "min" in result.stdout
+                assert "max" in result.stdout
+                assert "mean" in result.stdout
+                assert "10" in result.stdout
+                assert "200" in result.stdout
+                assert "100.5" in result.stdout
+                mock_client.close.assert_called_once()
 
     def test_stats_with_slice(self):
         """Test that stats respects --slice option."""

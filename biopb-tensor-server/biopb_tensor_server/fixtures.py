@@ -89,11 +89,15 @@ def create_multifile_ome_dataset(
     image_shape: Tuple[int, int] = (64, 64),
     dtype: np.dtype = np.uint16,
 ) -> Tuple[str, List[str], Dict]:
-    """Create multi-file OME-TIFF dataset with _metadata.txt containing OME-XML.
+    """Create multi-file OME-TIFF dataset with companion _metadata.txt file.
 
     Creates a directory with:
-    - _metadata.txt (OME-XML format referencing TIFF files)
-    - img_001.ome.tif, img_002.ome.tif, etc.
+    - _metadata.txt (OME-XML companion file referencing TIFF files)
+    - img_001.tif, img_002.tif, etc. (plain TIFFs, no embedded OME-XML)
+
+    Uses companion-file approach (separate OME-XML) rather than embedded
+    OME-XML in each file. This tests the adapter's ability to use TiffSequence
+    for multi-file aggregation while parsing companion file metadata.
 
     Args:
         tmpdir: Temporary directory to create dataset in
@@ -111,14 +115,13 @@ def create_multifile_ome_dataset(
     file_list = []
     skip_file_idx = n_files - 1 if not complete else -1
 
-    # Build OME-XML metadata
+    # Build OME-XML metadata (companion file format)
     ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
   <Image ID="Image:0" Name="test">
 """
-
     for i in range(n_files):
-        filename = f"img_{i+1:03d}.ome.tif"
+        filename = f"img_{i+1:03d}.tif"
         uuid = f"urn:uuid:test-{i}"
         ome_xml += f"""    <TiffData FirstC="{i}" FirstT="0" FirstZ="0">
       <UUID FileName="{filename}">{uuid}</UUID>
@@ -127,13 +130,13 @@ def create_multifile_ome_dataset(
         if i != skip_file_idx:
             filepath = dir_path / filename
             data = np.full(image_shape, i + 1, dtype=dtype)
-            tifffile.imwrite(str(filepath), data, photometric="minisblack")
+            tifffile.imwrite(str(filepath), data)
             file_list.append(filename)
 
     ome_xml += """  </Image>
 </OME>"""
 
-    # Write metadata file
+    # Write companion metadata file
     metadata_path = dir_path / "_metadata.txt"
     metadata_path.write_text(ome_xml)
 

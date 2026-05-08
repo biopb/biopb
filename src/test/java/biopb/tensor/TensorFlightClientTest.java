@@ -24,6 +24,13 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.impl.UnionListWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -515,27 +522,34 @@ public class TensorFlightClientTest {
                 FlightProducer.ServerStreamListener listener) {
 
             TensorTicket tensorTicket = parseTicket(ticket.getBytes());
-            String chunkId = tensorTicket.getChunkId().toString(StandardCharsets.UTF_8);
-            chunkRequests.computeIfAbsent(chunkId, ignored -> new AtomicInteger()).incrementAndGet();
-            float[] values = chunkData.get(chunkId);
+            String chunkIdStr = tensorTicket.getChunkId().toString(StandardCharsets.UTF_8);
+            chunkRequests.computeIfAbsent(chunkIdStr, ignored -> new AtomicInteger()).incrementAndGet();
+            float[] values = chunkData.get(chunkIdStr);
             if (values == null) {
-                listener.error(new IllegalArgumentException("Unknown chunk: " + chunkId));
+                listener.error(new IllegalArgumentException("Unknown chunk: " + chunkIdStr));
                 return;
             }
 
-            try (Float4Vector vector = new Float4Vector("data", allocator)) {
-                vector.allocateNew(values.length);
-                for (int i = 0; i < values.length; i++) {
-                    vector.setSafe(i, values[i]);
-                }
-                vector.setValueCount(values.length);
+            // Create ListVector with Float4 inner type
+            Field innerField = new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null);
+            Field listField = new Field("data", FieldType.nullable(ArrowType.List.INSTANCE), Collections.singletonList(innerField));
+            ListVector dataVector = new ListVector(listField, allocator, null);
+            dataVector.allocateNew();
 
-                try (VectorSchemaRoot root = VectorSchemaRoot.of(vector)) {
-                    root.setRowCount(values.length);
-                    listener.start(root);
-                    listener.putNext();
-                    listener.completed();
-                }
+            UnionListWriter writer = dataVector.getWriter();
+            writer.startList();
+            writer.setPosition(0);
+            for (float v : values) {
+                writer.writeFloat4(v);
+            }
+            writer.endList();
+            dataVector.setValueCount(1);
+
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(dataVector)) {
+                root.setRowCount(1);
+                listener.start(root);
+                listener.putNext();
+                listener.completed();
             }
         }
 
@@ -582,10 +596,10 @@ public class TensorFlightClientTest {
         }
 
         private static org.apache.arrow.vector.types.pojo.Schema createSchema(BufferAllocator allocator) {
-            try (Float4Vector vector = new Float4Vector("data", allocator);
-                    VectorSchemaRoot root = VectorSchemaRoot.of(vector)) {
-                return root.getSchema();
-            }
+            // Schema: data (list<float4>)
+            Field innerField = new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null);
+            Field listField = new Field("data", FieldType.nullable(ArrowType.List.INSTANCE), Collections.singletonList(innerField));
+            return new org.apache.arrow.vector.types.pojo.Schema(Collections.singletonList(listField));
         }
 
         private static TensorSelection parseSelection(byte[] bytes) {

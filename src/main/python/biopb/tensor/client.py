@@ -143,11 +143,11 @@ def _fetch_chunk_distributed(
     ticket = TensorTicket(chunk_id=chunk_id)
     reader = client.do_get(flight.Ticket(ticket.SerializeToString()), options=call_options)
     table = reader.read_all()
-    arr = table.column(0).to_numpy()
+    arr = table.column("data").to_numpy()[0]  # First row's data list
 
-    # Reshape to chunk shape
-    chunk_shape = tuple(stop - start for start, stop in zip(bounds_start, bounds_stop))
-    arr = arr.reshape(chunk_shape)
+    # Get shape from shape column (list<int64>)
+    shape = tuple(table.column("shape").to_pylist()[0])
+    arr = arr.reshape(shape)
 
     # Cache the result
     cache.put(cache_key, arr, cost=arr.nbytes)

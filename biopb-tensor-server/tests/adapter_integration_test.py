@@ -287,7 +287,6 @@ class TestOmeTiffIntegration:
 class TestMultiFileOmeTiffIntegration:
     """Integration tests for MultiFileOmeTiffAdapter with server/client."""
 
-    @pytest.mark.skip(reason="Requires proper multi-file OME-TIFF with embedded metadata; fixture creates companion file which tifffile handles differently")
     def test_multifile_read(self, multifile_ome_dataset):
         """Test reading from multi-file OME-TIFF through server."""
         from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter
