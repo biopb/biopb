@@ -37,6 +37,16 @@ dependencies = [
   aics = [
     "aicsimageio >= 4.0.0",
   ]
+  dicom = [
+    "pydicom >= 2.4.0",
+  ]
+  nifti = [
+    "nibabel >= 5.0.0",
+  ]
+  medical = [
+    "pydicom >= 2.4.0",
+    "nibabel >= 5.0.0",
+  ]
 
 [project.scripts]
   biopb-tensor = "biopb_tensor_server.cli:app"

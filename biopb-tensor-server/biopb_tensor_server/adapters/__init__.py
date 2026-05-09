@@ -23,6 +23,18 @@ try:
 except ImportError:
     AicsImageIoAdapter = None  # type: ignore
 
+# Optional medical imaging adapters
+try:
+    from .dicom import DicomAdapter, DicomSeriesAdapter
+except ImportError:
+    DicomAdapter = None  # type: ignore
+    DicomSeriesAdapter = None  # type: ignore
+
+try:
+    from .nifti import NiftiAdapter
+except ImportError:
+    NiftiAdapter = None  # type: ignore
+
 __all__ = [
     'get_default_registry',
     'AdapterRegistry',
@@ -33,6 +45,9 @@ __all__ = [
     'MultiFileOmeTiffAdapter',
     'OmeZarrAdapter',
     'AicsImageIoAdapter',
+    'DicomAdapter',
+    'DicomSeriesAdapter',
+    'NiftiAdapter',
 ]
 
 
@@ -45,7 +60,10 @@ def get_default_registry() -> AdapterRegistry:
     3. ZarrAdapter - Generic Zarr fallback
     4. MultiFileOmeTiffAdapter - Multi-file OME-TIFF/MicroManager datasets
     5. OmeTiffAdapter - Single-file OME-TIFF only (.ome.tiff/.ome.tif extensions)
-    6. Hdf5Adapter - HDF5 files (requires explicit type in config)
+    6. DicomSeriesAdapter - Multi-file DICOM series (directories with same SeriesInstanceUID)
+    7. DicomAdapter - Single DICOM files (.dcm)
+    8. NiftiAdapter - NIfTI files (.nii, .nii.gz)
+    9. Hdf5Adapter - HDF5 files (requires explicit type in config)
 
     Returns:
         AdapterRegistry with all built-in adapters registered
@@ -60,6 +78,14 @@ def get_default_registry() -> AdapterRegistry:
     registry.register_with_type("zarr", ZarrAdapter)
     registry.register_with_type("ome-tiff-multifile", MultiFileOmeTiffAdapter)
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
+
+    # Medical imaging adapters
+    if DicomSeriesAdapter is not None:
+        registry.register_with_type("dicom-series", DicomSeriesAdapter)
+    if DicomAdapter is not None:
+        registry.register_with_type("dicom", DicomAdapter)
+    if NiftiAdapter is not None:
+        registry.register_with_type("nifti", NiftiAdapter)
 
     registry.register_with_type("hdf5", Hdf5Adapter)
 
