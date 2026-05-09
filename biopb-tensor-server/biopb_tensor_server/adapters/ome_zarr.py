@@ -1,26 +1,18 @@
 """OME-Zarr adapter for tensor storage.
 
-Relies on OS page cache for raw data caching.
+Extends ZarrAdapter with OME multiscales metadata support.
 """
 
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-import numpy as np
-import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
-from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.base import BackendAdapter, TensorReadPlan
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.base import TensorReadPlan
 from biopb_tensor_server.discovery import SourceClaim
 from biopb_tensor_server.downsample import _normalize_reduction_method
 
@@ -28,7 +20,7 @@ if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
 
 
-class OmeZarrAdapter(BackendAdapter):
+class OmeZarrAdapter(ZarrAdapter):
     """Adapter for OME-Zarr (OME-NGFF) datasets.
 
     Extends ZarrAdapter with OME metadata support:
@@ -137,12 +129,12 @@ class OmeZarrAdapter(BackendAdapter):
             dim_labels: Optional dimension labels (overrides OME metadata)
             resolution_level: Which resolution level to use (default 0)
         """
-        self.zarr_array = zarr_array
-        self.source_id = source_id
-        self.resolution_level = resolution_level
+        # Initialize base ZarrAdapter first
+        # We'll override dim_labels below if OME metadata provides better ones
+        super().__init__(zarr_array, source_id, dim_labels)
 
-        # Source-level metadata for DataSourceDescriptor
-        self._source_url = str(zarr_array.store.path if hasattr(zarr_array.store, 'path') else str(zarr_array.store))
+        self.resolution_level = resolution_level
+        # Override source type to ome-zarr
         self._source_type = "ome-zarr"
 
         # Try to read OME metadata from .zattrs
@@ -183,97 +175,15 @@ class OmeZarrAdapter(BackendAdapter):
         except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError):
             pass
 
-        # Set dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
-        elif self.axes:
+        # Override dimension labels from OME metadata if not explicitly provided
+        if dim_labels is None and self.axes:
             self.dim_labels = [
                 ax.get('name', f'dim{i}') if isinstance(ax, dict) else str(ax)
                 for i, ax in enumerate(self.axes)
             ]
-        else:
-            self.dim_labels = [f"dim{i}" for i in range(zarr_array.ndim)]
 
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from zarr as numpy array (no caching - relies on OS page cache)."""
-        backend_data = get_backend_data(chunk_id)
-        chunk_key = backend_data.decode('utf-8')
-        chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
-        chunks = self.zarr_array.chunks
-
-        slices = tuple(
-            slice(idx * chunks[d], (idx + 1) * chunks[d])
-            for d, idx in enumerate(chunk_idx)
-        )
-
-        return self.zarr_array[slices]
-
-    def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
-        """Write chunk data to zarr array.
-
-        Args:
-            chunk_idx: Chunk coordinates (e.g., (0, 1, 2))
-            data: Numpy array with chunk data
-        """
-        chunks = self.zarr_array.chunks
-        slices = tuple(
-            slice(idx * chunks[d], (idx + 1) * chunks[d])
-            for d, idx in enumerate(chunk_idx)
-        )
-
-        # Handle edge chunks - pad if data smaller than expected
-        expected_shape = tuple(s.stop - s.start for s in slices)
-        if data.shape != expected_shape:
-            padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
-            src_slices = tuple(slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape))
-            padded[src_slices] = data[src_slices]
-            data = padded
-
-        self.zarr_array[slices] = data
-
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        return TensorDescriptor(
-            array_id=self.array_id,
-            dim_labels=self.dim_labels,
-            shape=list(self.zarr_array.shape),
-            chunk_shape=list(self.zarr_array.chunks),
-            dtype=self.zarr_array.dtype.str,
-        )
-
-    def list_tensor_descriptors(self):
-        return [self.get_tensor_descriptor()]
-
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this OME-Zarr array."""
-        shape = self.zarr_array.shape
-        chunks = self.zarr_array.chunks
-        ndim = len(shape)
-
-        def iter_chunk_indices(dim: int = 0, prefix: Tuple[int, ...] = ()):
-            if dim == ndim:
-                yield prefix
-            else:
-                n_chunks = (shape[dim] + chunks[dim] - 1) // chunks[dim]
-                for i in range(n_chunks):
-                    yield from iter_chunk_indices(dim + 1, prefix + (i,))
-
-        for chunk_idx in iter_chunk_indices():
-            chunk_start = [idx * chunks[d] for d, idx in enumerate(chunk_idx)]
-            chunk_stop = [
-                min((idx + 1) * chunks[d], shape[d])
-                for d, idx in enumerate(chunk_idx)
-            ]
-
-            chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
-
-            yield ChunkEndpoint(
-                chunk_id=chunk_id,
-                bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            )
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""
@@ -427,7 +337,6 @@ class OmeZarrAdapter(BackendAdapter):
         level_adapter._tensor_name = path
         level_adapter._tensor_context = True
 
-        self._level_adapters[path] = level_adapter
         self._level_adapters[path] = level_adapter
         return level_adapter
 
