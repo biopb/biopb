@@ -423,12 +423,12 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         Schema format:
         - data: list<dtype> - flattened tensor elements per chunk
         - shape: list<int64> - shape tuple per chunk
-        - chunk_id: binary - chunk identifier per chunk
+        - dtype: string - numpy dtype string per chunk
 
         Each RecordBatch has 1 row per chunk, making data self-describing.
 
         Returns:
-            Arrow Schema with data, shape, and chunk_id fields
+            Arrow Schema with data, shape, and dtype fields
         """
         import importlib.metadata
 
@@ -437,14 +437,14 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         dtype = np.dtype(desc.dtype)
         data_field = pa.field("data", pa.list_(pa.from_numpy_dtype(dtype)))
         shape_field = pa.field("shape", pa.list_(pa.int64()))
-        chunk_id_field = pa.field("chunk_id", pa.binary())
+        dtype_field = pa.field("dtype", pa.string())
 
         # Schema metadata: biopb version for compatibility tracking
         metadata = {
             "tensor_schema_version": importlib.metadata.version("biopb"),
         }
 
-        return pa.schema([data_field, shape_field, chunk_id_field], metadata=metadata)
+        return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)
 
 
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
@@ -706,14 +706,15 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
             # Convert to RecordBatch with 1 row per chunk
             # data: list<dtype> - flattened tensor elements
             # shape: list<int64> - LOGICAL chunk shape (from bounds for real chunks, from result for virtual)
-            # chunk_id: binary - chunk identifier
+            # dtype: string - numpy dtype string
+            dtype_str = str(result_arr.dtype)
             result = pa.RecordBatch.from_arrays(
                 [
                     pa.array([result_arr.ravel()]),  # list of flattened elements
                     pa.array([logical_shape]),       # logical shape
-                    pa.array([chunk_id]),            # binary chunk identifier
+                    pa.array([dtype_str]),           # numpy dtype string
                 ],
-                ["data", "shape", "chunk_id"]
+                ["data", "shape", "dtype"]
             )
             size_bytes = result_arr.nbytes
             logger.debug(f"resolve_chunk_data: computed {size_bytes} bytes")
