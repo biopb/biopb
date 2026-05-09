@@ -19,15 +19,15 @@ COPY wheels/biopb-*.whl /app/wheels/
 COPY biopb-tensor-server/pyproject.toml ./tensor-server/
 COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
 
-# Install biopb from local wheel, then tensor server with all extras
-# Include aicsimageio extras for vendor formats (nd2, czi, lif, etc.)
-# Pin numpy<2 for aicsimageio compatibility (requires tifffile<2023.3.15)
-# Pin exact versions from local .venv for zarr/numcodecs compatibility
+# Install with correct order:
+# 1. First pin zarr/numcodecs for compatibility
+# 2. Then install biopb + tensor server with all extras (web, ome-zarr, aics, medical)
+# 3. Finally add bioformats-jar for LSM/OIF/OIB (BioFormats fallback for CZI/LIF)
 WORKDIR /app/tensor-server
-RUN pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir ".[web,ome-zarr,aics]" \
-    && pip install --no-cache-dir bioformats-jar aicsimageio[nd2] \
-    && pip install --no-cache-dir "numpy<2" "zarr==2.15.0" "numcodecs==0.12.1"
+RUN pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
+    && pip install --no-cache-dir /app/wheels/biopb-*.whl \
+    && pip install --no-cache-dir ".[web,ome-zarr,aics,medical]" \
+    && pip install --no-cache-dir bioformats-jar
 
 # Stage 3: Runtime (nginx + python)
 FROM python:3.11-slim

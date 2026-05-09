@@ -16,6 +16,7 @@ Chunk ID format:
 Relies on OS page cache for raw data caching.
 """
 
+import importlib
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set
@@ -39,9 +40,33 @@ if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
 
 
-# Extensions supported by aicsimageio
-# Now includes .tif and .tiff to handle all TIFF formats (not just OME-TIFF)
-AICS_EXTENSIONS = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml', '.tif', '.tiff']
+def _get_available_extensions() -> List[str]:
+    """Detect file extensions with at least one importable aicsimageio reader.
+
+    Uses aicsimageio's FORMAT_IMPLEMENTATIONS to check which readers are
+    actually available (have their required dependencies installed).
+
+    Returns:
+        Sorted list of extensions (e.g., ['.czi', '.lif', '.tif', '.tiff'])
+    """
+    import aicsimageio.formats as formats
+
+    extensions = []
+    for ext, reader_paths in formats.FORMAT_IMPLEMENTATIONS.items():
+        for reader_path in reader_paths:
+            try:
+                module_path, cls_name = reader_path.rsplit('.', 1)
+                module = importlib.import_module(module_path)
+                getattr(module, cls_name)
+                extensions.append(f'.{ext}')
+                break
+            except (ImportError, AttributeError, ModuleNotFoundError):
+                continue
+    return sorted(set(extensions))
+
+
+# Build extension list at module load time based on installed readers
+AICS_EXTENSIONS = _get_available_extensions()
 
 
 class AicsImageIoAdapter(BackendAdapter):
