@@ -19,7 +19,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.chunk import encode_chunk_id, get_backend_data
+from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
 
 
 class MockMetadataWriter:
@@ -102,92 +102,7 @@ class TestCachedSourceAdapter:
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
 
-    def test_get_chunk_endpoints_empty(self):
-        """Empty source has no endpoints before any chunks written."""
-        adapter = CachedSourceAdapter(
-            source_id="test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        endpoints = list(adapter.get_raw_chunk_endpoints())
-        assert len(endpoints) == 0  # No chunks written yet
-
-    def test_get_chunk_endpoints_after_write(self):
-        """Endpoints enumerate actually-written chunks."""
-        CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
-        CacheManager.initialize(config)
-
-        adapter = CachedSourceAdapter(
-            source_id="test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        # Write two chunks at specific positions
-        data1 = np.ones((50, 50), dtype=np.uint8)
-        adapter.write_chunk(ChunkBounds(start=[0, 0], stop=[50, 50]), data1)
-
-        data2 = np.ones((50, 50), dtype=np.uint8)
-        adapter.write_chunk(ChunkBounds(start=[50, 50], stop=[100, 100]), data2)
-
-        endpoints = list(adapter.get_raw_chunk_endpoints())
-
-        # Should have exactly 2 endpoints (the ones we wrote)
-        assert len(endpoints) == 2
-
-        # Check bounds structure
-        for ep in endpoints:
-            assert ep.chunk_id is not None
-            assert len(ep.bounds.start) == 2
-            assert len(ep.bounds.stop) == 2
-
-        CacheManager.reset()
-
-    def test_get_chunk_endpoints_arbitrary_bounds(self):
-        """Non-aligned chunk positions appear in endpoints with exact bounds."""
-        CacheManager.reset()
-        config = CacheConfig(backend="memory", memory_max_entries=10)
-        CacheManager.initialize(config)
-
-        adapter = CachedSourceAdapter(
-            source_id="test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        # Write chunk at non-aligned position with specific bounds
-        data = np.ones((30, 40), dtype=np.uint8)
-        adapter.write_chunk(ChunkBounds(start=[10, 20], stop=[40, 60]), data)
-
-        endpoints = list(adapter.get_raw_chunk_endpoints())
-
-        # Should have 1 endpoint at the arbitrary position
-        assert len(endpoints) == 1
-        assert list(endpoints[0].bounds.start) == [10, 20]
-        # Should have exact bounds, not approximated from chunk_shape
-        assert list(endpoints[0].bounds.stop) == [40, 60]  # Exact, not [60, 70]
-
-        CacheManager.reset()
-
-    def test_get_chunk_array_raises(self):
-        """get_chunk_array raises FlightServerError for missing chunks."""
-        adapter = CachedSourceAdapter(
-            source_id="test",
-            shape=[100, 100],
-            dtype="uint8",
-            chunk_shape=[50, 50],
-        )
-
-        chunk_id = encode_chunk_id("test", b"0/0")
-
-        with pytest.raises(flight.FlightServerError, match="Chunk not found or evicted"):
-            adapter.get_chunk_array(chunk_id)
-
+    
     def test_write_chunk(self):
         """write_chunk stores data in cache."""
         CacheManager.reset()
@@ -208,8 +123,7 @@ class TestCachedSourceAdapter:
         adapter.write_chunk(bounds, data)
 
         # Verify chunk is in cache
-        chunk_key = "0/0"
-        chunk_id = encode_chunk_id("test", chunk_key.encode('utf-8'))
+        chunk_id = encode_chunk_id("test", bounds)
 
         entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
         assert entry.state.name == "READY"
@@ -241,8 +155,7 @@ class TestCachedSourceAdapter:
         adapter.write_chunk(bounds, data)
 
         # Verify chunk is stored
-        chunk_key = "10/20"
-        chunk_id = encode_chunk_id("test", chunk_key.encode('utf-8'))
+        chunk_id = encode_chunk_id("test", bounds)
 
         entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
         assert entry.state.name == "READY"
@@ -256,20 +169,22 @@ class TestChunkEncoding:
 
     def test_encode_chunk_id_cache(self):
         """Chunk ID encoding for cache sources."""
-        chunk_id = encode_chunk_id("cache_abc123", b"0/0/0")
+        bounds = ChunkBounds(start=[0, 0, 0], stop=[32, 32, 32])
+        chunk_id = encode_chunk_id("cache_abc123", bounds)
 
         # Should contain source_id
         assert chunk_id is not None
         assert len(chunk_id) > 0
 
-    def test_chunk_key_format(self):
-        """Chunk key uses bounds start coords."""
-        chunk_key = b"10/20/30"
-        chunk_id = encode_chunk_id("test", chunk_key)
+    def test_bounds_in_chunk_id(self):
+        """Bounds are encoded directly in chunk_id."""
+        bounds = ChunkBounds(start=[10, 20, 30], stop=[40, 50, 60])
+        chunk_id = encode_chunk_id("test", bounds)
 
         # Decode and verify
-        backend_data = get_backend_data(chunk_id)
-        assert backend_data == chunk_key
+        decoded_bounds = get_bounds_from_chunk_id(chunk_id)
+        assert list(decoded_bounds.start) == [10, 20, 30]
+        assert list(decoded_bounds.stop) == [40, 50, 60]
 
 
 class TestServerDoPutHandler:

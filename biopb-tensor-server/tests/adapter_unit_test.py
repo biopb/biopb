@@ -14,6 +14,7 @@ from biopb.tensor import (
     TensorDescriptor,
     TensorReadOptions,
 )
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server import (
     OmeZarrAdapter,
@@ -55,71 +56,7 @@ class TestZarrAdapter:
             assert desc.dtype == '<u2'
             assert list(desc.dim_labels) == ['y', 'x']
 
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_chunk_endpoints(self):
-        """Test chunk endpoint generation."""
-        import zarr
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, 'test.zarr')
-            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-
-            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
-            endpoints = adapter.get_chunk_endpoints()
-
-            # 2x2 chunks
-            assert len(endpoints) == 4
-
-            # Check first chunk bounds
-            assert list(endpoints[0].bounds.start) == [0, 0]
-            assert list(endpoints[0].bounds.stop) == [50, 50]
-
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_chunk_endpoints_with_slice_hint(self):
-        """Test slice hint filtering."""
-        import zarr
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, 'test.zarr')
-            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-
-            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
-
-            # Request only top-right quadrant
-            slice_hint = SliceHint(start=[0, 50], stop=[50, 100])
-            endpoints = adapter.get_chunk_endpoints(slice_hint)
-
-            # Should only return chunks that intersect [0:50, 50:100]
-            # Only (0,1) fully intersects
-            assert len(endpoints) == 1
-            assert list(endpoints[0].bounds.start) == [0, 50]
-
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_chunk_array(self):
-        """Test chunk array retrieval."""
-        import zarr
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zarr_path = os.path.join(tmpdir, 'test.zarr')
-            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
-
-            # Set known values
-            arr[:50, :50] = 1
-            arr[:50, 50:] = 2
-
-            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
-            endpoints = adapter.get_chunk_endpoints()
-
-            # Get first chunk array
-            data = adapter.get_chunk_array(endpoints[0].chunk_id)
-            assert data.shape == (50, 50)
-            assert data.mean() == 1.0
-
-            # Get second chunk array
-            data = adapter.get_chunk_array(endpoints[1].chunk_id)
-            assert data.shape == (50, 50)
-            assert data.mean() == 2.0
-
+    
 
 class TestTensorConfig:
     """Tests for tensor server config parsing."""
@@ -513,3 +450,100 @@ class TestSliceConversion:
 
             assert list(level_slice.start) == [2, 10]  # 10//4=2, 20//2=10
             assert list(level_slice.stop) == [12, 30]  # 50//4=12, 60//2=30
+
+
+class TestGetData:
+    """Tests for get_data method across adapters."""
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_get_data_aligned(self):
+        """Test ZarrAdapter get_data with aligned bounds."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr[:] = np.arange(100 * 100, dtype=np.uint8).reshape(100, 100)
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
+
+            # Aligned bounds
+            bounds = ChunkBounds(start=[0, 0], stop=[50, 50])
+            data = adapter.get_data(bounds)
+
+            assert data.shape == (50, 50)
+            assert data.dtype == np.uint8
+            # Verify by slicing the full array directly
+            full_arr = zarr.open_array(zarr_path, mode='r')
+            expected = full_arr[0:50, 0:50]
+            np.testing.assert_array_equal(data, expected)
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_get_data_non_aligned(self):
+        """Test ZarrAdapter get_data with non-aligned bounds."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+            arr[:] = np.arange(100 * 100, dtype=np.uint8).reshape(100, 100)
+
+            adapter = ZarrAdapter(zarr.open_array(zarr_path, mode='r'), 'test', ['y', 'x'])
+
+            # Non-aligned bounds
+            bounds = ChunkBounds(start=[10, 20], stop=[30, 40])
+            data = adapter.get_data(bounds)
+
+            assert data.shape == (20, 20)
+            # Verify by slicing the full array
+            full_arr = zarr.open_array(zarr_path, mode='r')
+            expected = full_arr[10:30, 20:40]
+            np.testing.assert_array_equal(data, expected)
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_get_data_out_of_bounds(self):
+        """Test ZarrAdapter get_data raises on out-of-bounds."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+
+            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
+
+            # Out of bounds
+            bounds = ChunkBounds(start=[0, 0], stop=[150, 100])
+            with pytest.raises(ValueError, match="exceeds shape"):
+                adapter.get_data(bounds)
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_get_data_negative_start(self):
+        """Test ZarrAdapter get_data raises on negative start."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+
+            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
+
+            # Negative start
+            bounds = ChunkBounds(start=[-10, 0], stop=[50, 50])
+            with pytest.raises(ValueError, match="is negative"):
+                adapter.get_data(bounds)
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_get_data_dimensionality_mismatch(self):
+        """Test ZarrAdapter get_data raises on wrong dimensionality."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, 'test.zarr')
+            arr = zarr.open_array(zarr_path, mode='w', shape=(100, 100), chunks=(50, 50), dtype='uint8')
+
+            adapter = ZarrAdapter(arr, 'test', ['y', 'x'])
+
+            # Wrong dimensionality
+            bounds = ChunkBounds(start=[0], stop=[50])
+            with pytest.raises(ValueError, match="dimensionality mismatch"):
+                adapter.get_data(bounds)

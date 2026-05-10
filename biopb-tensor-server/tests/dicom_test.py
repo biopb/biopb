@@ -11,10 +11,6 @@ import pytest
 from biopb_tensor_server.adapters.dicom import (
     DicomAdapter,
     DicomSeriesAdapter,
-    _decode_dicom_frame,
-    _decode_dicom_slice,
-    _encode_dicom_frame,
-    _encode_dicom_slice,
     _derive_orientation_from_iop,
 )
 from biopb_tensor_server.discovery import SourceClaim
@@ -142,19 +138,7 @@ def create_synthetic_dicom(
 
 
 class TestDicomEncoding:
-    """Tests for DICOM chunk encoding/decoding."""
-
-    def test_encode_decode_frame(self):
-        frame_idx = 42
-        encoded = _encode_dicom_frame(frame_idx)
-        decoded = _decode_dicom_frame(encoded)
-        assert decoded == frame_idx
-
-    def test_encode_decode_slice(self):
-        slice_idx = 123
-        encoded = _encode_dicom_slice(slice_idx)
-        decoded = _decode_dicom_slice(encoded)
-        assert decoded == slice_idx
+    """Tests for DICOM orientation derivation."""
 
     def test_derive_orientation_axial(self):
         iop = [1, 0, 0, 0, 1, 0]
@@ -287,53 +271,7 @@ class TestDicomAdapter:
             assert len(desc.shape) == 2
             assert desc.dtype == 'uint16'
 
-    def test_get_chunk_endpoints_single_frame(self):
-        import pydicom
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
-            create_synthetic_dicom(dcm_path)
-
-            ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
-
-            endpoints = list(adapter.get_raw_chunk_endpoints())
-            assert len(endpoints) == 1  # Single chunk for 2D image
-
-    def test_get_chunk_endpoints_multiframe(self):
-        import pydicom
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'multiframe.dcm'
-            num_frames = 5
-            create_synthetic_dicom(dcm_path, multi_frame=num_frames)
-
-            ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
-
-            endpoints = list(adapter.get_raw_chunk_endpoints())
-            assert len(endpoints) == num_frames
-
-    def test_get_chunk_array(self):
-        import pydicom
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
-            rows, cols = 32, 32
-            pixel_data = np.arange(rows * cols, dtype='uint16').reshape(rows, cols)
-            create_synthetic_dicom(dcm_path, rows=rows, cols=cols, pixel_data=pixel_data)
-
-            ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
-
-            endpoints = list(adapter.get_raw_chunk_endpoints())
-            chunk_id = endpoints[0].chunk_id
-
-            arr = adapter.get_chunk_array(chunk_id)
-            assert arr.shape == (rows, cols)
-            # Verify data matches
-            np.testing.assert_array_equal(arr, pixel_data)
-
+    
     def test_get_metadata(self):
         import pydicom
 
@@ -525,58 +463,7 @@ class TestDicomSeriesAdapter:
             assert desc.shape == [num_slices, rows, cols]
             assert desc.chunk_shape == [1, rows, cols]
 
-    def test_get_chunk_endpoints(self):
-        import pydicom
-        from pydicom.uid import generate_uid
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            series_uid = generate_uid()
-            num_slices = 8
-
-            for i in range(num_slices):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
-                create_synthetic_dicom(dcm_path, series_uid=series_uid)
-
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
-
-            endpoints = list(adapter.get_raw_chunk_endpoints())
-            assert len(endpoints) == num_slices
-
-            # Each endpoint should be one slice
-            for ep in endpoints:
-                assert ep.bounds.start[0] + 1 == ep.bounds.stop[0]  # 1 slice thick
-
-    def test_get_chunk_array(self):
-        import pydicom
-        from pydicom.uid import generate_uid
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            series_uid = generate_uid()
-            rows, cols = 16, 16
-
-            # Create slices with distinct pixel data
-            for i in range(3):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
-                pixel_data = np.full((rows, cols), i * 100, dtype='uint16')
-                create_synthetic_dicom(
-                    dcm_path,
-                    rows=rows,
-                    cols=cols,
-                    series_uid=series_uid,
-                    instance_number=i,
-                    pixel_data=pixel_data,
-                )
-
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
-
-            endpoints = list(adapter.get_raw_chunk_endpoints())
-
-            # Read slice 1
-            arr = adapter.get_chunk_array(endpoints[1].chunk_id)
-            assert arr.shape == (rows, cols)
-            # All pixels should be 100 (slice index 1 * 100)
-            assert np.all(arr == 100)
-
+    
     def test_get_metadata(self):
         import pydicom
         from pydicom.uid import generate_uid

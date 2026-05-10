@@ -85,12 +85,7 @@ class MockMultifieldAdapter(BackendAdapter):
             metadata_json="",  # Not populated; returned via GetFlightInfo instead
         )
 
-    def get_raw_chunk_endpoints(self):
-        return iter([])
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        return np.zeros((1, 1), dtype='uint8')
-
+    
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
 
@@ -129,21 +124,11 @@ class MockSingleTensorAdapter(BackendAdapter):
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self):
-        # Single chunk covering entire tensor
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-
-        from biopb_tensor_server.base import encode_chunk_id
-
-        chunk_id = encode_chunk_id(self.array_id, b"0")
-        yield ChunkEndpoint(
-            chunk_id=chunk_id,
-            bounds=ChunkBounds(start=[0] * len(self.shape), stop=list(self.shape)),
-        )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Return mock chunk data as numpy array."""
-        return np.full(self.shape, self.value, dtype=self.dtype)
+    def get_data(self, bounds) -> np.ndarray:
+        """Return mock data within bounds."""
+        super().get_data(bounds)
+        shape = tuple(int(stop - start) for start, stop in zip(bounds.start, bounds.stop))
+        return np.full(shape, self.value, dtype=self.dtype)
 
 
 class TestMultifieldSourceLevel:

@@ -3,21 +3,16 @@
 Handles .nii and .nii.gz files using nibabel.
 """
 
-import struct
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim
 
 if TYPE_CHECKING:
@@ -111,43 +106,16 @@ class NiftiAdapter(BackendAdapter):
         else:
             self._shape = tuple(nifti_img.shape)
 
-        # Get dtype from header
-        dtype_code = self.header.get('datatype', None)
-        if dtype_code is not None:
-            # nibabel header values are numpy scalars
-            dtype_code = int(dtype_code.item() if hasattr(dtype_code, 'item') else dtype_code)
-        self._dtype = self._nifti_dtype_to_str(dtype_code)
+        # NIfTI uses slope/intercept scaling to represent physical values.
+        # Scaled data is always float64, so we report float64 as the dtype
+        # and return scaled float64 values via nibabel's lazy slicing.
+        self._dtype = 'float64'
 
         # Dimension labels
         if dim_labels:
             self.dim_labels = dim_labels
         else:
             self.dim_labels = self._derive_dim_labels()
-
-    def _nifti_dtype_to_str(self, dtype_code: Optional[int]) -> str:
-        """Convert NIfTI datatype code to numpy dtype string."""
-        # NIfTI datatype codes (DT_* constants)
-        dtype_map = {
-            0: 'uint8',     # DT_UNKNOWN (treat as uint8)
-            1: 'int8',      # DT_BINARY (1-bit, treat as int8)
-            2: 'uint8',     # DT_UINT8
-            4: 'int16',     # DT_INT16
-            8: 'int32',     # DT_INT32
-            16: 'float32',  # DT_FLOAT32
-            32: 'float64',  # DT_FLOAT64 (complex float32)
-            64: 'float64',  # DT_FLOAT64
-            128: 'float32', # DT_RGB24 (treat as float32)
-            256: 'int8',    # DT_INT8
-            512: 'uint16',  # DT_UINT16
-            768: 'uint32',  # DT_UINT32
-            1024: 'int64',  # DT_INT64
-            1280: 'uint64', # DT_UINT64
-            1536: 'float64', # DT_FLOAT128 (treat as float64)
-        }
-        if dtype_code is None:
-            # Fallback: get from dataobj
-            return str(np.dtype(self.nifti_img.dataobj.dtype))
-        return dtype_map.get(dtype_code, 'float32')
 
     def _derive_dim_labels(self) -> List[str]:
         """Derive dimension labels from NIfTI header."""
@@ -203,40 +171,29 @@ class NiftiAdapter(BackendAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield single chunk endpoint for entire NIfTI array."""
-        shape = self._shape
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from NIfTI file.
 
-        yield ChunkEndpoint(
-            chunk_id=encode_chunk_id(self.array_id, b'W'),
-            bounds=ChunkBounds(start=[0] * len(shape), stop=list(shape)),
-        )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read the entire NIfTI array.
+        Returns scaled float64 data (applying slope/intercept if present).
 
         Args:
-            chunk_id: Backend-specific chunk identifier
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
         Returns:
-            Numpy array with the full NIfTI data
+            Numpy array with scaled float64 data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
         """
-        backend_data = get_backend_data(chunk_id)
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-        # We use single chunk, so backend_data should be 'W'
-        if backend_data != b'W':
-            raise ValueError(f"Unexpected chunk key: {backend_data}")
-
-        # nibabel dataobj can be sliced directly for lazy loading
-        # Serialize IO for thread safety
-        with self._io_lock:
-            # Get the full array
-            dataobj = self.nifti_img.dataobj
-            if hasattr(dataobj, 'get'):
-                # Use nibabel's get() for ArrayProxy objects
-                return np.asanyarray(dataobj.get())
-            else:
-                return np.asanyarray(dataobj)
+        # nibabel dataobj lazy slicing applies slope/intercept scaling.
+        # nibabel handles thread safety internally, so no io_lock needed.
+        dataobj = self.nifti_img.dataobj
+        result = dataobj[slices]
+        # Cast to float64 defensively (in case no scaling is applied)
+        return np.asanyarray(result, dtype=np.float64)
 
     def get_metadata(self) -> dict:
         """Extract NIfTI header metadata.

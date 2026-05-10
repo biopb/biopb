@@ -3,23 +3,17 @@
 Relies on OS page cache for raw data caching.
 """
 
-import struct
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
-import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim, get_file_identity
 
 if TYPE_CHECKING:
@@ -27,58 +21,8 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# OME-TIFF encoding/decoding helpers
+# OME-XML metadata helpers
 # =============================================================================
-
-def _encode_ome_tile(ifd_index: int, tile_indices: Tuple[int, ...]) -> bytes:
-    """Encode IFD index and tile indices to bytes (for OME-TIFF)."""
-    parts = [
-        struct.pack('>H', ifd_index),
-        struct.pack('>H', len(tile_indices))
-    ]
-    for idx in tile_indices:
-        parts.append(struct.pack('>q', idx))
-    return b''.join(parts)
-
-
-def _decode_ome_tile(data: bytes) -> Tuple[int, Tuple[int, ...]]:
-    """Decode IFD index and tile indices from bytes (for OME-TIFF)."""
-    ifd_index = struct.unpack('>H', data[:2])[0]
-    ndim = struct.unpack('>H', data[2:4])[0]
-    indices = []
-    offset = 4
-    for _ in range(ndim):
-        idx = struct.unpack('>q', data[offset:offset+8])[0]
-        indices.append(idx)
-        offset += 8
-    return ifd_index, tuple(indices)
-
-
-def _encode_ome_multifile_tile(file_index: int, ifd_index: int, tile_indices: Tuple[int, ...]) -> bytes:
-    """Encode file index, IFD index and tile indices for multi-file OME-TIFF."""
-    parts = [
-        struct.pack('>H', file_index),
-        struct.pack('>H', ifd_index),
-        struct.pack('>H', len(tile_indices))
-    ]
-    for idx in tile_indices:
-        parts.append(struct.pack('>q', idx))
-    return b''.join(parts)
-
-
-def _decode_ome_multifile_tile(data: bytes) -> Tuple[int, int, Tuple[int, ...]]:
-    """Decode file index, IFD index and tile indices for multi-file OME-TIFF."""
-    file_index = struct.unpack('>H', data[:2])[0]
-    ifd_index = struct.unpack('>H', data[2:4])[0]
-    ndim = struct.unpack('>H', data[4:6])[0]
-    indices = []
-    offset = 6
-    for _ in range(ndim):
-        idx = struct.unpack('>q', data[offset:offset+8])[0]
-        indices.append(idx)
-        offset += 8
-    return file_index, ifd_index, tuple(indices)
-
 
 def _elementtree_to_dict(element) -> dict:
     """Convert ElementTree element to JSON-serializable dict.
@@ -247,68 +191,28 @@ class OmeTiffAdapter(BackendAdapter):
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this OME-TIFF file."""
-        n_pages = len(self.tiff_file.pages)
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from OME-TIFF.
 
-        for ifd_index in range(n_pages):
-            plane_offset = ifd_index
+        Uses tifffile's memory-mapped array for efficient slicing.
 
-            for tile_row in range(self.tiles_per_col):
-                for tile_col in range(self.tiles_per_row):
-                    y_start = tile_row * self.tile_length
-                    y_stop = min((tile_row + 1) * self.tile_length, self.series_shape[-2])
-                    x_start = tile_col * self.tile_width
-                    x_stop = min((tile_col + 1) * self.tile_width, self.series_shape[-1])
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
-                    n_dims = len(self.full_shape)
-                    chunk_start = [0] * n_dims
-                    chunk_stop = list(self.full_shape)
+        Returns:
+            Numpy array with data within the requested bounds
 
-                    chunk_start[0] = plane_offset
-                    chunk_stop[0] = plane_offset + 1
-                    chunk_start[-2] = y_start
-                    chunk_stop[-2] = y_stop
-                    chunk_start[-1] = x_start
-                    chunk_stop[-1] = x_stop
+        Raises:
+            ValueError: If bounds exceed array shape
+        """
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-                    chunk_id = encode_chunk_id(self.array_id, _encode_ome_tile(ifd_index, (tile_row, tile_col)))
-
-                    yield ChunkEndpoint(
-                        chunk_id=chunk_id,
-                        bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-                    )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Decode a tile from the TIFF file as numpy array (no caching - relies on OS page cache)."""
-        backend_data = get_backend_data(chunk_id)
-        ifd_index, tile_indices = _decode_ome_tile(backend_data)
-        tile_row, tile_col = tile_indices
-
-        # tifffile TiffFile/page access is not safe under concurrent reads.
-        # Serialize IO to avoid corrupted page/tag parsing in parallel fetches.
+        # Serialize IO for thread safety - tifffile parsing not thread-safe
         with self._io_lock:
-            page = self.tiff_file.pages[ifd_index]
-
-            # Compute tile index
-            tile_idx = tile_row * self.tiles_per_row + tile_col
-
-            if not self.is_tiled:
-                return page.asarray()
-
-            # Read tile using tifffile's low-level API
-            offset = page.dataoffsets[tile_idx]
-            bytecount = page.databytecounts[tile_idx]
-
-            fh = self.tiff_file.filehandle
-            fh.seek(offset)
-            raw_data = fh.read(bytecount)
-
-            # Decode the tile
-            decoded = page.decode(raw_data, tile_idx)
-            data = decoded[0]
-
-            return data
+            # Use memory-mapped array for lazy slicing
+            arr = self.tiff_file.asarray(out='memmap')
+            return arr[slices]
 
     def get_metadata(self) -> dict:
         """Return OME metadata from TIFF file as JSON-serializable dict.
@@ -825,87 +729,39 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this multi-file OME-TIFF dataset."""
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from multi-file OME-TIFF dataset.
+
+        For multi-file datasets, this reads data from multiple files if bounds
+        span across files.
+
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
+
+        Returns:
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
+        """
         import tifffile
 
-        for global_ifd_index in range(self._total_ifds):
-            file_index, local_ifd_index = self._ifd_to_file[global_ifd_index]
-            file_path = self._tiff_files[file_index]
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-            with tifffile.TiffFile(str(file_path)) as tf:
-                page = tf.pages[local_ifd_index]
-
-                tiles_per_row = self.tiles_per_row
-                tiles_per_col = self.tiles_per_col
-
-                for tile_row in range(tiles_per_col):
-                    for tile_col in range(tiles_per_row):
-                        y_start = tile_row * self.tile_length
-                        y_stop = min((tile_row + 1) * self.tile_length, page.shape[0])
-                        x_start = tile_col * self.tile_width
-                        x_stop = min((tile_col + 1) * self.tile_width, page.shape[1])
-
-                        n_dims = len(self.full_shape)
-                        chunk_start = [0] * n_dims
-                        chunk_stop = list(self.full_shape)
-
-                        chunk_start[0] = file_index
-                        chunk_stop[0] = file_index + 1
-
-                        if n_dims > 3:
-                            chunk_start[1] = local_ifd_index
-                            chunk_stop[1] = local_ifd_index + 1
-
-                        chunk_start[-2] = y_start
-                        chunk_stop[-2] = y_stop
-                        chunk_start[-1] = x_start
-                        chunk_stop[-1] = x_stop
-
-                        chunk_id = encode_chunk_id(
-                            self.array_id,
-                            _encode_ome_multifile_tile(file_index, local_ifd_index, (tile_row, tile_col))
-                        )
-
-                        yield ChunkEndpoint(
-                            chunk_id=chunk_id,
-                            bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-                        )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Decode a tile from the multi-file dataset as numpy array (no caching)."""
-        import tifffile
-
-        backend_data = get_backend_data(chunk_id)
-        file_index, local_ifd_index, tile_indices = _decode_ome_multifile_tile(backend_data)
-        tile_row, tile_col = tile_indices
-
-        file_path = self._tiff_files[file_index]
-
-        # Serialize IO and decoding to avoid issues with non-thread-safe codecs
-        # (libjpeg-turbo, openjpeg, etc. may have global state)
+        # Serialize IO for thread safety
         with self._io_lock:
-            with tifffile.TiffFile(str(file_path)) as tf:
-                page = tf.pages[local_ifd_index]
-
-                if self.is_tiled:
-                    tiles_per_row = (page.shape[1] + self.tile_width - 1) // self.tile_width
-                    tile_idx = tile_row * tiles_per_row + tile_col
-
-                    offset = page.dataoffsets[tile_idx]
-                    bytecount = page.databytecounts[tile_idx]
-
-                    fh = tf.filehandle
-                    fh.seek(offset)
-                    raw_data = fh.read(bytecount)
-
-                    decoded = page.decode(raw_data, tile_idx)
-                    data = decoded[0]
-                else:
-                    # Non-tiled: read entire page as single "tile"
-                    data = page.asarray()
-
-                return data
+            # Use TiffSequence for multi-file lazy access
+            if self._tiff_sequence is not None:
+                arr = self._tiff_sequence.asarray(out='memmap')
+                return arr[slices]
+            else:
+                # Single file or OME-TIFF with embedded structure
+                # Open the first file and use its series
+                file_path = self._tiff_files[0]
+                with tifffile.TiffFile(str(file_path)) as tf:
+                    arr = tf.series[0].asarray(out='memmap')
+                    return arr[slices]
 
     def get_metadata(self) -> dict:
         """Return OME metadata from multi-file dataset."""

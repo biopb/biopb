@@ -29,10 +29,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint, encode_chunk_id
 from biopb_tensor_server.cache import CacheManager
 
 if TYPE_CHECKING:
@@ -122,35 +119,26 @@ class CachedSourceAdapter(BackendAdapter):
         """Return OME metadata."""
         return self._ome_metadata
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Enumerate actually-written chunk positions.
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds.
 
-        For cache-backed sources, only chunks that have been uploaded
-        are enumerated, with their exact bounds. This differs from
-        uniform-chunk sources which enumerate all theoretical grid positions.
-        """
-        for chunk_id, bounds in self._written_chunks.items():
-            yield ChunkEndpoint(
-                chunk_id=chunk_id,
-                bounds=bounds,
-            )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read chunk data from cache.
-
-        For cache-backed sources, this is called by resolve_chunk_data's compute_fn
-        only when the chunk is NOT in cache (missing or evicted). In that case,
-        we raise an error since cache-backed sources have no fallback backend.
+        Cache-backed sources have no backend data source - data is only
+        available in cache and must be accessed via chunk_id.
 
         Args:
-            chunk_id: Encoded chunk identifier
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
         Raises:
-            FlightServerError: Chunk not found or evicted
+            FlightServerError: Cannot read data from cache-backed source
         """
+        # Validate bounds first (base class validation)
+        desc = self.get_tensor_descriptor()
+        shape = tuple(desc.shape)
+        self._validate_bounds(bounds, shape)
+
         raise flight.FlightServerError(
-            f"Chunk not found or evicted for source {self.source_id}. "
-            f"Source no longer available."
+            f"Cannot read data from cache-backed source {self.source_id}. "
+            f"Cache-backed sources have no backend data - use chunk_id access."
         )
 
     def write_chunk(self, bounds: ChunkBounds, data: np.ndarray) -> None:
@@ -166,9 +154,8 @@ class CachedSourceAdapter(BackendAdapter):
         if cache_manager is None:
             raise RuntimeError("Cache not initialized")
 
-        # Encode chunk_id from bounds start coords
-        chunk_key = "/".join(str(s) for s in bounds.start)
-        chunk_id = encode_chunk_id(self.source_id, chunk_key.encode('utf-8'))
+        # Encode chunk_id directly with bounds
+        chunk_id = encode_chunk_id(self.source_id, bounds)
 
         # Flatten data and create Arrow RecordBatch
         flat_data = data.ravel()
@@ -187,4 +174,4 @@ class CachedSourceAdapter(BackendAdapter):
         # Track the written chunk with its full bounds
         self._written_chunks[chunk_id] = bounds
 
-        logger.debug(f"write_chunk: stored {size_bytes} bytes at {chunk_key}")
+        logger.debug(f"write_chunk: stored {size_bytes} bytes at bounds {list(bounds.start)} to {list(bounds.stop)}")

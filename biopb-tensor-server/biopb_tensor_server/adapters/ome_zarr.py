@@ -296,21 +296,34 @@ class OmeZarrAdapter(ZarrAdapter):
         level_path: str,
         level_slice: Optional[SliceHint],
     ) -> TensorReadPlan:
-        """Create read plan from precomputed level."""
+        """Create read plan from precomputed level.
+
+        Delegates to base class get_read_plan() with no scale_hint.
+        """
         level_adapter = self.get_level_adapter(level_path)
-        endpoints = level_adapter.get_chunk_endpoints(level_slice)
 
+        # Create request descriptor with slice_hint but NO read_options
         level_desc = level_adapter.get_tensor_descriptor()
-
-        logical_desc = TensorDescriptor(
-            array_id=self.array_id,
-            dim_labels=self.dim_labels,
+        request_desc = TensorDescriptor(
+            array_id=self.array_id,  # Use original array_id, not level's
+            dim_labels=level_desc.dim_labels,
             shape=list(level_desc.shape),
             chunk_shape=list(level_desc.chunk_shape),
             dtype=level_desc.dtype,
         )
 
-        return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=endpoints)
+        # Set slice_hint if provided
+        if level_slice is not None:
+            request_desc.slice_hint.start[:] = level_slice.start
+            request_desc.slice_hint.stop[:] = level_slice.stop
+
+        # Delegate to base class get_read_plan (no scale_hint means no downsampling)
+        read_plan = level_adapter.get_read_plan(request_desc)
+
+        # Override array_id in the returned descriptor to match original request
+        read_plan.descriptor.array_id = self.array_id
+
+        return read_plan
 
     def get_level_adapter(self, path: str) -> ZarrAdapter:
         """Get adapter for a specific precomputed level.

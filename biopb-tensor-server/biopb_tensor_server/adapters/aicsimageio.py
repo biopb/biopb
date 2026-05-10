@@ -9,9 +9,7 @@ Supports:
 - OME-XML metadata conversion
 
 Chunk ID format:
-- 4 bytes: array_id length (uint32, big-endian)
-- N bytes: array_id (UTF-8)
-- M bytes: chunk key (UTF-8, e.g., "0/1/2" for dask chunk indices)
+- array_id + bounds encoding (start, stop coordinates)
 
 Relies on OS page cache for raw data caching.
 """
@@ -19,19 +17,14 @@ Relies on OS page cache for raw data caching.
 import importlib
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set
+from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
-import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim
 
 if TYPE_CHECKING:
@@ -192,32 +185,25 @@ class AicsImageIoAdapter(BackendAdapter):
             self.dim_labels = dim_labels  # Used as default for all scenes
             self._cached_descriptors = None  # Cached on first list_tensor_descriptors call
 
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from the aicsimageio dask array as numpy array (no caching).
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from aicsimageio dask array.
 
-        Only valid for scene-level adapters.
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
+
+        Returns:
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape or called on source-level adapter
         """
         if self._dask_data is None:
-            raise ValueError("Cannot get chunk data from source-level adapter")
-        backend_data = get_backend_data(chunk_id)
-        chunk_key = backend_data.decode('utf-8')
-        chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
+            raise ValueError("Cannot get data from source-level adapter")
 
-        # Get chunk sizes from dask array
-        chunks = self._dask_data.chunks
-
-        # Compute slice for this chunk
-        slices = []
-        for d, idx in enumerate(chunk_idx):
-            chunk_sizes = chunks[d]
-            start = sum(chunk_sizes[:idx])
-            stop = start + chunk_sizes[idx]
-            slices.append(slice(start, stop))
-
-        # Serialize IO to avoid corrupted reads in parallel fetches.
-        # aicsimageio backends may not be thread-safe for concurrent reads.
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
         with self._io_lock:
-            return self._dask_data[tuple(slices)].compute()
+            return self._dask_data[slices].compute()
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter.
@@ -334,43 +320,6 @@ class AicsImageIoAdapter(BackendAdapter):
         self._tensor_adapters[tensor_id] = adapter
 
         return adapter
-
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this dask array.
-
-        Only valid for scene-level adapters.
-        """
-        if self._dask_data is None:
-            raise ValueError("Cannot get chunks from source-level adapter")
-        shape = self._dask_data.shape
-        chunks = self._dask_data.chunks
-        ndim = len(shape)
-
-        def iter_chunk_indices(dim: int = 0, prefix: tuple = ()):
-            if dim == ndim:
-                yield prefix
-            else:
-                n_chunks = len(chunks[dim])
-                for i in range(n_chunks):
-                    yield from iter_chunk_indices(dim + 1, prefix + (i,))
-
-        for chunk_idx in iter_chunk_indices():
-            chunk_start = []
-            chunk_stop = []
-            for d, idx in enumerate(chunk_idx):
-                chunk_sizes = chunks[d]
-                start = sum(chunk_sizes[:idx])
-                stop = start + chunk_sizes[idx]
-                chunk_start.append(start)
-                chunk_stop.append(min(stop, shape[d]))
-
-            chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
-
-            yield ChunkEndpoint(
-                chunk_id=chunk_id,
-                bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            )
 
     def get_metadata(self) -> dict:
         """Return OME metadata from the aicsimageio file.

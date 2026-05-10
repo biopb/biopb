@@ -3,7 +3,6 @@
 Handles single DICOM files and multi-file DICOM series using pydicom.
 """
 
-import struct
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
@@ -13,11 +12,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim, get_file_identity
 
 if TYPE_CHECKING:
@@ -25,27 +20,8 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# DICOM encoding/decoding helpers
+# DICOM metadata helpers
 # =============================================================================
-
-def _encode_dicom_frame(frame_index: int) -> bytes:
-    """Encode frame index for multi-frame DICOM."""
-    return struct.pack('>I', frame_index)
-
-
-def _decode_dicom_frame(data: bytes) -> int:
-    """Decode frame index from bytes."""
-    return struct.unpack('>I', data)[0]
-
-
-def _encode_dicom_slice(slice_index: int) -> bytes:
-    """Encode slice index for DICOM series."""
-    return struct.pack('>I', slice_index)
-
-
-def _decode_dicom_slice(data: bytes) -> int:
-    """Decode slice index from bytes."""
-    return struct.unpack('>I', data)[0]
 
 
 def _dicom_value_to_json(value) -> any:
@@ -236,50 +212,25 @@ class DicomAdapter(BackendAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield chunk endpoints for DICOM pixel data."""
-        shape = self._shape
-
-        if self._is_multiframe:
-            # One chunk per frame
-            for frame_idx in range(shape[0]):
-                yield ChunkEndpoint(
-                    chunk_id=encode_chunk_id(self.array_id, _encode_dicom_frame(frame_idx)),
-                    bounds=ChunkBounds(
-                        start=[frame_idx, 0, 0],
-                        stop=[frame_idx + 1, shape[1], shape[2]],
-                    ),
-                )
-        else:
-            # Single chunk for 2D image
-            yield ChunkEndpoint(
-                chunk_id=encode_chunk_id(self.array_id, b'W'),
-                bounds=ChunkBounds(start=[0, 0], stop=list(shape)),
-            )
-
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read DICOM pixel data.
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from DICOM pixel data.
 
         Args:
-            chunk_id: Backend-specific chunk identifier
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
         Returns:
-            Numpy array with pixel data
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
         """
-        backend_data = get_backend_data(chunk_id)
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
         # Serialize IO for thread safety
         with self._io_lock:
-            if self._is_multiframe:
-                frame_idx = _decode_dicom_frame(backend_data)
-                # pydicom's pixel_array returns all frames, then we slice
-                pixel_data = self.ds.pixel_array
-                return pixel_data[frame_idx]
-            else:
-                # Single frame
-                if backend_data != b'W':
-                    raise ValueError(f"Unexpected chunk key: {backend_data}")
-                return self.ds.pixel_array
+            pixel_data = self.ds.pixel_array
+            return pixel_data[slices]
 
     def get_metadata(self) -> dict:
         """Extract DICOM metadata.
@@ -570,39 +521,50 @@ class DicomSeriesAdapter(BackendAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield chunk endpoints for each slice in the series."""
-        for slice_idx in range(self._num_slices):
-            yield ChunkEndpoint(
-                chunk_id=encode_chunk_id(self.array_id, _encode_dicom_slice(slice_idx)),
-                bounds=ChunkBounds(
-                    start=[slice_idx, 0, 0],
-                    stop=[slice_idx + 1, self._rows, self._cols],
-                ),
-            )
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from DICOM series.
 
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read a single slice from the DICOM series.
+        Reads multiple slices if needed and stacks them into a contiguous array.
 
         Args:
-            chunk_id: Backend-specific chunk identifier
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
         Returns:
-            Numpy array with the slice data (2D: [H, W])
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
         """
         import pydicom
 
-        backend_data = get_backend_data(chunk_id)
-        slice_idx = _decode_dicom_slice(backend_data)
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+        slice_start = int(bounds.start[0])
+        slice_stop = int(bounds.stop[0])
 
-        if slice_idx < 0 or slice_idx >= self._num_slices:
-            raise ValueError(f"Slice index out of range: {slice_idx}")
+        # Determine output shape
+        out_shape = tuple(int(e - s) for s, e in zip(bounds.start, bounds.stop))
+        dtype = np.dtype(self._dtype)
 
         # Serialize IO for thread safety
         with self._io_lock:
-            dcm_file = self.dicom_files[slice_idx]
-            ds = pydicom.dcmread(str(dcm_file))
-            return ds.pixel_array
+            if slice_stop - slice_start == 1:
+                # Single slice - read directly
+                dcm_file = self.dicom_files[slice_start]
+                ds = pydicom.dcmread(str(dcm_file))
+                pixel_data = ds.pixel_array
+                # Apply spatial slices
+                return pixel_data[slices[1:]]
+            else:
+                # Multiple slices - read each and stack
+                result = np.zeros(out_shape, dtype=dtype)
+                for i, slice_idx in enumerate(range(slice_start, slice_stop)):
+                    dcm_file = self.dicom_files[slice_idx]
+                    ds = pydicom.dcmread(str(dcm_file))
+                    pixel_data = ds.pixel_array
+                    # Apply spatial slices and assign to result
+                    result[i] = pixel_data[slices[1:]]
+                return result
 
     def get_metadata(self) -> dict:
         """Extract DICOM series metadata.

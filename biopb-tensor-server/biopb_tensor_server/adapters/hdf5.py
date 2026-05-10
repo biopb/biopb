@@ -3,54 +3,27 @@
 Relies on OS page cache for raw data caching.
 """
 
-import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
-import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
 
 
-def _encode_backend_coords(chunk_idx: Tuple[int, ...]) -> bytes:
-    """Encode chunk coordinates to bytes (for HDF5)."""
-    parts = [struct.pack('>H', len(chunk_idx))]
-    for idx in chunk_idx:
-        parts.append(struct.pack('>q', idx))  # int64
-    return b''.join(parts)
-
-
-def _decode_backend_coords(data: bytes) -> Tuple[int, ...]:
-    """Decode chunk coordinates from bytes (for HDF5)."""
-    ndim = struct.unpack('>H', data[:2])[0]
-    indices = []
-    offset = 2
-    for _ in range(ndim):
-        idx = struct.unpack('>q', data[offset:offset+8])[0]
-        indices.append(idx)
-        offset += 8
-    return tuple(indices)
-
-
 class Hdf5Adapter(BackendAdapter):
     """Adapter for HDF5 chunked datasets.
 
     Chunk ID format:
-    - array_id prefix (via _encode_chunk_id)
-    - uint16 ndim
-    - int64[ndim] chunk indices
+    - array_id prefix
+    - bounds encoding (start, stop coordinates)
 
     Relies on OS page cache for raw data caching.
     """
@@ -131,17 +104,20 @@ class Hdf5Adapter(BackendAdapter):
         self._source_url = h5_dataset.file.filename if hasattr(h5_dataset, 'file') else ""
         self._source_type = "hdf5"
 
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from HDF5 as numpy array (no caching - relies on OS page cache)."""
-        backend_data = get_backend_data(chunk_id)
-        chunk_idx = _decode_backend_coords(backend_data)
-        chunks = self.h5_dataset.chunks
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from HDF5 dataset.
 
-        slices = tuple(
-            slice(idx * chunks[d], min((idx + 1) * chunks[d], self.h5_dataset.shape[d]))
-            for d, idx in enumerate(chunk_idx)
-        )
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
+        Returns:
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
+        """
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
         return self.h5_dataset[slices]
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
@@ -155,31 +131,3 @@ class Hdf5Adapter(BackendAdapter):
 
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
-
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this HDF5 dataset."""
-        shape = self.h5_dataset.shape
-        chunks = self.h5_dataset.chunks
-        ndim = len(shape)
-
-        def iter_chunk_indices(dim: int = 0, prefix: Tuple[int, ...] = ()):
-            if dim == ndim:
-                yield prefix
-            else:
-                n_chunks = (shape[dim] + chunks[dim] - 1) // chunks[dim]
-                for i in range(n_chunks):
-                    yield from iter_chunk_indices(dim + 1, prefix + (i,))
-
-        for chunk_idx in iter_chunk_indices():
-            chunk_start = [idx * chunks[d] for d, idx in enumerate(chunk_idx)]
-            chunk_stop = [
-                min((idx + 1) * chunks[d], shape[d])
-                for d, idx in enumerate(chunk_idx)
-            ]
-
-            chunk_id = encode_chunk_id(self.array_id, _encode_backend_coords(chunk_idx))
-
-            yield ChunkEndpoint(
-                chunk_id=chunk_id,
-                bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            )

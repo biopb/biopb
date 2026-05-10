@@ -12,11 +12,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
-from biopb_tensor_server.chunk import (
-    ChunkEndpoint,
-    encode_chunk_id,
-    get_backend_data,
-)
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import SourceClaim
 
 if TYPE_CHECKING:
@@ -129,19 +125,21 @@ class ZarrAdapter(BackendAdapter):
         self._source_url = str(zarr_array.store.path if hasattr(zarr_array.store, 'path') else str(zarr_array.store))
         self._source_type = "zarr"
 
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read a chunk from zarr as numpy array (no caching - relies on OS page cache)."""
-        backend_data = get_backend_data(chunk_id)
-        chunk_key = backend_data.decode('utf-8')
-        chunk_idx = tuple(int(i) for i in chunk_key.split('/'))
-        chunks = self.zarr_array.chunks
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from zarr array.
 
-        # Compute slice for this chunk
-        slices = tuple(
-            slice(idx * chunks[d], (idx + 1) * chunks[d])
-            for d, idx in enumerate(chunk_idx)
-        )
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
 
+        Returns:
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
+        """
+        super().get_data(bounds)
+        desc = self.get_tensor_descriptor()
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
         return self.zarr_array[slices]
 
     def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
@@ -178,32 +176,3 @@ class ZarrAdapter(BackendAdapter):
 
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
-
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Yield all chunk endpoints for this zarr array."""
-        shape = self.zarr_array.shape
-        chunks = self.zarr_array.chunks
-        ndim = len(shape)
-
-        def iter_chunk_indices(dim: int = 0, prefix: tuple = ()):
-            if dim == ndim:
-                yield prefix
-            else:
-                n_chunks = (shape[dim] + chunks[dim] - 1) // chunks[dim]
-                for i in range(n_chunks):
-                    yield from iter_chunk_indices(dim + 1, prefix + (i,))
-
-        for chunk_idx in iter_chunk_indices():
-            chunk_start = [idx * chunks[d] for d, idx in enumerate(chunk_idx)]
-            chunk_stop = [
-                min((idx + 1) * chunks[d], shape[d])
-                for d, idx in enumerate(chunk_idx)
-            ]
-
-            chunk_key = "/".join(str(i) for i in chunk_idx)
-            chunk_id = encode_chunk_id(self.array_id, chunk_key.encode('utf-8'))
-
-            yield ChunkEndpoint(
-                chunk_id=chunk_id,
-                bounds=ChunkBounds(start=chunk_start, stop=chunk_stop),
-            )

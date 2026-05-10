@@ -308,31 +308,7 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         image_key = '{http://www.openmicroscopy.org/Schemas/OME/2016-06}Image'
         assert image_key in metadata or 'Image' in metadata
 
-    def test_get_chunk_endpoints(self, tiled_ome_tiff):
-        """Test chunk endpoint generation for tiled OME-TIFF."""
-        tf, path = tiled_ome_tiff
-
-        adapter = OmeTiffAdapter(tf, 'test-embedded')
-
-        endpoints = adapter.get_chunk_endpoints()
-        # Should have 3 planes * 4 tiles per plane (128x128 / 32x32)
-        assert len(endpoints) == 3 * 4 * 4  # 48 tiles total
-
-    def test_get_chunk_array(self, tiled_ome_tiff):
-        """Test reading chunk array from tiled OME-TIFF."""
-        tf, path = tiled_ome_tiff
-
-        adapter = OmeTiffAdapter(tf, 'test-embedded')
-
-        endpoints = adapter.get_chunk_endpoints()
-        if endpoints:
-            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
-            assert chunk_arr is not None
-
-            # Raw decoded shape from tifffile is (1, tile_h, tile_w, 1)
-            # Defensive reshape in resolve_chunk_data handles matching to chunk bounds
-            assert chunk_arr.size == 32 * 32
-
+    
     def test_non_tiled_raises_error(self):
         """Test that non-tiled TIFF raises ValueError."""
         import tempfile
@@ -355,21 +331,6 @@ class TestOmeTiffAdapterEmbeddedMetadata:
         finally:
             tf.close()
             os.unlink(path)
-
-    def test_slice_hint_filters_chunks(self, tiled_ome_tiff):
-        """Test that slice_hint correctly filters chunk endpoints."""
-        tf, path = tiled_ome_tiff
-
-        from biopb.tensor.descriptor_pb2 import SliceHint
-
-        adapter = OmeTiffAdapter(tf, 'test-embedded')
-
-        # Request only channel 0, top-left quadrant (y: 0-64, x: 0-64)
-        slice_hint = SliceHint(start=[0, 0, 0], stop=[1, 64, 64])
-        endpoints = adapter.get_chunk_endpoints(slice_hint)
-
-        # Should have only tiles in that region: 1 plane * 2 tiles_y * 2 tiles_x = 4
-        assert len(endpoints) == 4
 
 
 class TestMultiFileOmeTiffAdapter:
@@ -394,49 +355,6 @@ class TestMultiFileOmeTiffAdapter:
         assert len(desc.shape) > 0
         assert desc.dtype is not None
         print(f"Descriptor: shape={desc.shape}, dtype={desc.dtype}")
-
-    def test_get_chunk_endpoints(self, multifile_ome_dataset):
-        """Test chunk endpoint generation."""
-        dir_path, file_list, metadata = multifile_ome_dataset
-
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        assert len(endpoints) > 0
-        assert all(hasattr(ep, 'chunk_id') for ep in endpoints)
-        assert all(hasattr(ep, 'bounds') for ep in endpoints)
-        print(f"Generated {len(endpoints)} chunk endpoints")
-
-    def test_get_chunk_array(self, multifile_ome_dataset):
-        """Test chunk array retrieval."""
-        dir_path, file_list, metadata = multifile_ome_dataset
-
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        if endpoints:
-            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
-            assert chunk_arr is not None
-            print(f"First chunk: shape {chunk_arr.shape}")
-
-    def test_cache_reuse(self, multifile_ome_dataset):
-        """Test that repeated reads return same data."""
-        dir_path, file_list, metadata = multifile_ome_dataset
-
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        if endpoints:
-            chunk_id = endpoints[0].chunk_id
-
-            # First call
-            arr1 = adapter.get_chunk_array(chunk_id)
-
-            # Second call
-            arr2 = adapter.get_chunk_array(chunk_id)
-
-            # Should return same data
-            np.testing.assert_array_equal(arr1, arr2)
 
     def test_get_metadata(self, multifile_ome_dataset):
         """Test metadata extraction from companion file."""
@@ -494,22 +412,6 @@ class TestMultiFileOmeTiffAdapter:
 
         assert desc.dim_labels[0] == 'c'
         assert desc.dim_labels[-2:] == ['y', 'x']
-
-    def test_data_values_per_channel(self, multifile_mm_dataset):
-        """Test that different channels have distinguishable values."""
-        dir_path, file_list, metadata = multifile_mm_dataset
-
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-values-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        # Get first chunk from first and second channels
-        if len(endpoints) >= 2:
-            arr0 = adapter.get_chunk_array(endpoints[0].chunk_id)
-            arr1 = adapter.get_chunk_array(endpoints[1].chunk_id)
-
-            # Values should differ (channel 0 = 100, channel 1 = 101)
-            # Data values should be different
-            assert arr0.mean() != arr1.mean()
 
 
 class TestOmeZarrAdapter:
@@ -597,73 +499,7 @@ class TestOmeZarrAdapter:
         assert len(multiscales) > 0
         print(f"Multiscales datasets: {multiscales[0].get('datasets', [])}")
 
-    @pytest.mark.skipif(
-        not _zarr_available(),
-        reason="zarr not available or incompatible numcodecs"
-    )
-    def test_get_chunk_endpoints(self, multires_ome_zarr):
-        """Test chunk endpoint generation."""
-        import zarr
-
-        zarr_path, level_paths, zattrs = multires_ome_zarr
-
-        root = zarr.open_group(zarr_path, mode='r')
-        arr = root['0']
-
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        assert len(endpoints) > 0
-        print(f"Generated {len(endpoints)} chunk endpoints")
-
-    @pytest.mark.skipif(
-        not _zarr_available(),
-        reason="zarr not available or incompatible numcodecs"
-    )
-    def test_get_chunk_array(self, multires_ome_zarr):
-        """Test chunk array retrieval."""
-        import zarr
-
-        zarr_path, level_paths, zattrs = multires_ome_zarr
-
-        root = zarr.open_group(zarr_path, mode='r')
-        arr = root['0']
-
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        if endpoints:
-            chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
-            assert chunk_arr is not None
-
-    @pytest.mark.skipif(
-        not _zarr_available(),
-        reason="zarr not available or incompatible numcodecs"
-    )
-    def test_cache_reuse(self, multires_ome_zarr):
-        """Test that repeated reads return same data."""
-        import zarr
-
-        zarr_path, level_paths, zattrs = multires_ome_zarr
-
-        root = zarr.open_group(zarr_path, mode='r')
-        arr = root['0']
-
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-test')
-        endpoints = adapter.get_chunk_endpoints()
-
-        if endpoints:
-            chunk_id = endpoints[0].chunk_id
-
-            # First call
-            arr1 = adapter.get_chunk_array(chunk_id)
-
-            # Second call
-            arr2 = adapter.get_chunk_array(chunk_id)
-
-            # Should return same data
-            np.testing.assert_array_equal(arr1, arr2)
-
+    
     @pytest.mark.skipif(
         not _zarr_available(),
         reason="zarr not available or incompatible numcodecs"
@@ -728,49 +564,4 @@ class TestHdf5Adapter:
             assert tuple(desc.shape) == shape
             assert tuple(desc.chunk_shape) == chunks
 
-    @pytest.mark.skipif(
-        not _h5py_available(),
-        reason="h5py not available"
-    )
-    def test_get_chunk_endpoints(self, hdf5_dataset):
-        """Test chunk endpoint generation."""
-        import h5py
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        with h5py.File(h5_path, 'r') as f:
-            dataset = f['data']
-
-            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-            adapter = Hdf5Adapter(dataset, 'hdf5-test')
-
-            endpoints = adapter.get_chunk_endpoints()
-
-            # Should have (100/50) * (100/50) = 4 chunks
-            expected_chunks = (shape[0] // chunks[0]) * (shape[1] // chunks[1])
-            assert len(endpoints) == expected_chunks
-
-    @pytest.mark.skipif(
-        not _h5py_available(),
-        reason="h5py not available"
-    )
-    def test_get_chunk_array(self, hdf5_dataset):
-        """Test chunk array retrieval."""
-        import h5py
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        with h5py.File(h5_path, 'r') as f:
-            dataset = f['data']
-
-            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-            adapter = Hdf5Adapter(dataset, 'hdf5-test')
-
-            endpoints = adapter.get_chunk_endpoints()
-
-            if endpoints:
-                chunk_arr = adapter.get_chunk_array(endpoints[0].chunk_id)
-                assert chunk_arr is not None
-
-                # Chunk should be chunks[0] x chunks[1]
-                assert chunk_arr.shape == (chunks[0], chunks[1])
+    

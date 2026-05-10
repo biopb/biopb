@@ -36,25 +36,17 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.chunk import (
     ChunkEndpoint,
-    _VIRTUAL_CHUNK_MAGIC,
-    chunks_intersect,
-    compute_virtual_chunk,
     decode_chunk_id,
-    decode_virtual_chunk_payload,
     encode_chunk_id,
-    encode_virtual_chunk_payload,
-    get_backend_data,
-    get_chunk_bounds_from_backend_key,
-    logical_chunk_shape,
+    encode_chunk_id_with_scale,
+    is_scaled_chunk,
+    decode_scale_info,
     needs_splitting,
     normalized_scale_hint,
     normalized_slice_bounds,
-    slice_array,
-    split_endpoint,
 )
 from biopb_tensor_server.downsample import (
     _ceil_div,
-    _logical_shape_for_scale,
     _normalize_reduction_method,
     _output_dtype,
 )
@@ -94,12 +86,11 @@ class BackendAdapterMeta(ABCMeta):
         'get_tensor_adapter': MethodContext.SOURCE,
         # Tensor methods (called after get_tensor_adapter())
         'get_tensor_descriptor': MethodContext.TENSOR,
-        'get_chunk_endpoints': MethodContext.TENSOR,
-        'get_raw_chunk_endpoints': MethodContext.TENSOR,
-        'get_chunk_array': MethodContext.TENSOR,
         'get_read_plan': MethodContext.TENSOR,
         'resolve_chunk_data': MethodContext.TENSOR,
         'get_arrow_schema': MethodContext.TENSOR,
+        'get_chunk_size': MethodContext.TENSOR,
+        'get_data': MethodContext.TENSOR,
     }
 
     def __new__(mcs, name, bases, namespace):
@@ -326,37 +317,29 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
 
     # === tensor methods ===
 
-    @abstractmethod
-    def get_raw_chunk_endpoints(self) -> Iterator[ChunkEndpoint]:
-        """Get raw chunk endpoints from the backend (before filtering/splitting).
-
-        Subclasses implement this to return their native chunk layout.
-        The base class get_chunk_endpoints() handles filtering and splitting.
-
-        Returns:
-            Iterator of ChunkEndpoint objects with chunk_id and bounds.
-            Adapters enumerate ALL chunks; filtering is done by base class.
-        """
-        pass
-
-
-    @abstractmethod
-    def get_chunk_array(self, chunk_id: bytes) -> np.ndarray:
-        """Read raw chunk data from backend as numpy array.
-
-        [TENSOR method] Must be called after get_tensor_adapter().
+    def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
+        """Validate that bounds are within array shape.
 
         Args:
-            chunk_id: Backend-specific chunk identifier (decoded from Flight ticket)
+            bounds: Chunk bounds (start, stop coordinates)
+            shape: Array shape
 
-        Returns:
-            Numpy array with the chunk's data in its native shape.
-            The chunk shape is provided via ChunkBounds in app_metadata.
-
-        Note: This method reads raw backend chunks, not split or virtual chunks.
-        Split/virtual chunk resolution is handled by resolve_chunk_data().
+        Raises:
+            ValueError: If bounds are out-of-bounds or invalid
         """
-        pass
+        ndim = len(shape)
+        if len(bounds.start) != ndim or len(bounds.stop) != ndim:
+            raise ValueError(
+                f"Bounds dimensionality mismatch: expected {ndim}, "
+                f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
+            )
+        for ax, (s, e, dim) in enumerate(zip(bounds.start, bounds.stop, shape)):
+            if s < 0:
+                raise ValueError(f"Bounds start[{ax}]={s} is negative")
+            if e > dim:
+                raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
+            if s >= e:
+                raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
 
 
     @abstractmethod
@@ -381,40 +364,39 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         pass
 
 
-    def get_chunk_endpoints(
-        self,
-        slice_hint: Optional[SliceHint] = None
-    ) -> List[ChunkEndpoint]:
-        """Get unscaled chunk endpoints, filtering by slice_hint.
+    def get_chunk_size(self) -> Tuple[int, ...]:
+        """Return the chunk size for this tensor adapter.
 
-        This method wraps the adapter-specific chunk discovery logic with
-        filtering by slice_hint (only chunks intersecting the slice).
-
-        Note: Chunk splitting is handled in get_read_plan() for oversized chunks.
-
-        Args:
-            slice_hint: Optional slice range. If provided, return only chunks
-                       that intersect this range. If None, return all chunks.
+        [TENSOR method] Must be called after get_tensor_adapter().
 
         Returns:
-            List of ChunkEndpoint objects with chunk_id and bounds.
+            Tuple of chunk dimensions (e.g., (64, 64, 64) for 3D chunks)
         """
-        raw_endpoints = self.get_raw_chunk_endpoints()
+        desc = self.get_tensor_descriptor()
+        return tuple(int(dim) for dim in desc.chunk_shape)
 
-        # Filter by slice_hint if provided
-        if slice_hint is not None:
-            slice_start = list(slice_hint.start)
-            slice_stop = list(slice_hint.stop)
-            filtered_endpoints = [
-                ep for ep in raw_endpoints
-                if chunks_intersect(
-                    list(ep.bounds.start), list(ep.bounds.stop),
-                    slice_start, slice_stop
-                )
-            ]
-            return filtered_endpoints
 
-        return list(raw_endpoints)
+    @abstractmethod
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from the backend.
+
+        [TENSOR method] Must be called after get_tensor_adapter().
+
+        Subclasses should call super().get_data(bounds) to validate bounds,
+        then read data from their backend.
+
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
+
+        Returns:
+            Numpy array with data within the requested bounds
+
+        Raises:
+            ValueError: If bounds exceed array shape
+        """
+        desc = self.get_tensor_descriptor()
+        shape = tuple(int(dim) for dim in desc.shape)
+        self._validate_bounds(bounds, shape)
 
 
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
@@ -447,14 +429,69 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)
 
 
+    def _compute_safe_chunk_size(
+        self,
+        chunk_size: Tuple[int, ...],
+        dtype: str,
+        dim_labels: Optional[List[str]],
+    ) -> Tuple[int, ...]:
+        """Compute a chunk size that fits within Arrow batch limit.
+
+        Splits along semantic axis (same logic as old split_endpoint).
+        Returns chunk size that is guaranteed to not need splitting.
+        """
+        from biopb_tensor_server.chunk import MAX_ARROW_BATCH_BYTES, _choose_split_axis
+
+        item_size = np.dtype(dtype).itemsize
+        chunk_bytes = int(np.prod(chunk_size)) * item_size
+
+        if chunk_bytes <= MAX_ARROW_BATCH_BYTES:
+            return chunk_size
+
+        n_splits = int(np.ceil(chunk_bytes / MAX_ARROW_BATCH_BYTES))
+
+        # Choose split axis using semantic priority
+        split_axis = _choose_split_axis(chunk_size, dim_labels, n_splits)
+
+        # Compute safe size on split axis
+        safe_axis_size = chunk_size[split_axis] // n_splits
+
+        safe_size = list(chunk_size)
+        safe_size[split_axis] = safe_axis_size
+
+        return tuple(safe_size)
+
+    def _crop_and_downsample(
+        self,
+        arr: np.ndarray,
+        scale_hint: Tuple[int, ...],
+        reduction_method: str,
+    ) -> np.ndarray:
+        """Downsample array by scale_hint.
+
+        Note: No padding needed because logical bounds are computed via floor_div //,
+        meaning input is always properly aligned to scale_hint multiples.
+        """
+        from biopb_tensor_server.downsample import _downsample_block
+
+        # Input shape is guaranteed to be multiple of scale_hint due to floor_div
+        # Just downsample directly
+        return _downsample_block(arr, scale_hint, reduction_method)
+
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
-        """Plan a logical tensor read by delegating to adapter.
+        """Plan a logical tensor read using uniform chunk grid.
+
+        Key ordering: Check splitting FIRST, then compute virtual_chunk_size
+        from the split-safe chunk_size. This ensures scaled chunks never need
+        re-checking for splitting.
         """
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
-        chunk_shape = tuple(int(dim) for dim in base_desc.chunk_shape)
+        chunk_size = self.get_chunk_size()
         slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
         read_options = request_desc.read_options if request_desc.HasField('read_options') else None
+
+        # Normalize inputs
         source_start, source_stop = normalized_slice_bounds(base_shape, slice_hint)
         scale_hint = normalized_scale_hint(base_shape, read_options)
         reduction_method = _normalize_reduction_method(
@@ -462,161 +499,106 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
         )
         ndim = len(base_shape)
 
-        # Validate chunk_shape dimensionality
-        if len(chunk_shape) != ndim:
-            logger.error(
-                f"chunk_shape dimensionality mismatch: tensor {base_desc.array_id} has "
-                f"shape={base_shape} ({ndim}D) but chunk_shape={chunk_shape} ({len(chunk_shape)}D)"
+        # STEP 1: Check if base chunk_size needs splitting FIRST
+        if needs_splitting(chunk_size, base_desc.dtype):
+            # Split chunk_size to safe_sub_chunk_size
+            safe_chunk_size = self._compute_safe_chunk_size(
+                chunk_size, base_desc.dtype, base_desc.dim_labels
             )
-            raise ValueError(
-                f"chunk_shape dimensionality mismatch: expected {ndim}, got {len(chunk_shape)}"
-            )
+        else:
+            safe_chunk_size = chunk_size
 
-        # find intersecting real chunks (slice_hint is in source coordinates)
-        real_endpoints = self.get_chunk_endpoints(
-            SliceHint(start=list(source_start), stop=list(source_stop))
-            if slice_hint is not None else None
-        )
+        # STEP 2: Now compute virtual_chunk_size from safe_chunk_size
+        # (guaranteed to not need splitting since base is already safe)
+        if scale_hint is None:
+            virtual_chunk_size = safe_chunk_size
+            logical_chunk_size = safe_chunk_size
+            output_dtype = base_desc.dtype
+        else:
+            virtual_chunk_size = tuple(lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim))
+            logical_chunk_size = tuple(virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim))
+            output_dtype = _output_dtype(base_desc.dtype, reduction_method)
+
+        # Snap bounds to virtual_chunk_size grid
         realized_start = tuple(
-            min(int(ep.bounds.start[ax]) for ep in real_endpoints) for ax in range(ndim)
+            (source_start[ax] // virtual_chunk_size[ax]) * virtual_chunk_size[ax]
+            for ax in range(ndim)
         )
         realized_stop = tuple(
-            max(int(ep.bounds.stop[ax]) for ep in real_endpoints) for ax in range(ndim)
+            min(_ceil_div(source_stop[ax], virtual_chunk_size[ax]) * virtual_chunk_size[ax], base_shape[ax])
+            for ax in range(ndim)
         )
         realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
 
-        if scale_hint is None:
-            # Real branch: check for oversized chunks and split if needed
-            logical_endpoints: List[ChunkEndpoint] = []
-            for endpoint in real_endpoints:
-                chunk_shape = tuple(int(stop - start) for start, stop in zip(endpoint.bounds.start, endpoint.bounds.stop))
-                if needs_splitting(chunk_shape, base_desc.dtype):
-                    shifted_bounds = ChunkBounds(
-                        start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
-                        stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
-                    )
-                    shifted_endpoint = ChunkEndpoint(chunk_id=endpoint.chunk_id, bounds=shifted_bounds)
-                    sub_endpoints = split_endpoint(base_desc.array_id, shifted_endpoint, base_desc.dtype)
-                    logical_endpoints.extend(sub_endpoints)
-                else:
-                    logical_endpoints.append(ChunkEndpoint(
-                        chunk_id=endpoint.chunk_id,
-                        bounds=ChunkBounds(
-                            start=[int(endpoint.bounds.start[ax] - realized_start[ax]) for ax in range(ndim)],
-                            stop=[int(endpoint.bounds.stop[ax] - realized_start[ax]) for ax in range(ndim)],
-                        ),
-                    ))
-            logical_desc = TensorDescriptor(
-                array_id=base_desc.array_id,
-                dim_labels=base_desc.dim_labels,
-                shape=list(realized_shape),
-                chunk_shape=list(chunk_shape),
-                dtype=base_desc.dtype,
-            )
-
-            # Always set slice_hint when user requested a slice, so client can crop correctly
-            # This is needed even when realized bounds equal full bounds (single-chunk arrays)
-            if slice_hint is not None:
-                logical_desc.slice_hint.start[:] = list(realized_start)
-                logical_desc.slice_hint.stop[:] = list(realized_stop)
-            elif realized_start != tuple(0 for _ in range(ndim)) or realized_stop != base_shape:
-                logical_desc.slice_hint.start[:] = list(realized_start)
-                logical_desc.slice_hint.stop[:] = list(realized_stop)
-
+        # Compute logical shape (for scale_hint case)
+        if scale_hint is not None:
+            logical_shape = tuple(_ceil_div(realized_shape[ax], scale_hint[ax]) for ax in range(ndim))
         else:
-            lcm_per_axis = tuple(lcm(chunk_shape[ax], scale_hint[ax]) for ax in range(ndim))
+            logical_shape = realized_shape
 
-            snapped_start = tuple(
-                (realized_start[ax] // lcm_per_axis[ax]) * lcm_per_axis[ax]
+        # Generate chunk endpoints by iterating grid using np.ndindex
+        # NO NEED to check splitting here - safe_chunk_size ensures it's always safe
+        logical_endpoints: List[ChunkEndpoint] = []
+
+        # Compute number of chunks along each axis
+        n_chunks_per_axis = tuple(
+            _ceil_div(realized_stop[ax] - realized_start[ax], virtual_chunk_size[ax])
+            for ax in range(ndim)
+        )
+
+        # Iterate over chunk grid
+        for chunk_idx in np.ndindex(*n_chunks_per_axis):
+            virtual_start = tuple(
+                realized_start[ax] + chunk_idx[ax] * virtual_chunk_size[ax]
                 for ax in range(ndim)
             )
-            snapped_stop = tuple(
-                min(_ceil_div(realized_stop[ax], lcm_per_axis[ax]) * lcm_per_axis[ax], base_shape[ax])
+            virtual_stop = tuple(
+                min(virtual_start[ax] + virtual_chunk_size[ax], base_shape[ax])
                 for ax in range(ndim)
             )
-            snapped_shape = tuple(snapped_stop[ax] - snapped_start[ax] for ax in range(ndim))
 
-            logical_shape = _logical_shape_for_scale(snapped_shape, scale_hint)
-            logical_chunk_shape_val = logical_chunk_shape(chunk_shape, scale_hint, logical_shape)
-            output_dtype = _output_dtype(base_desc.dtype, reduction_method)
-
-            logical_endpoints: List[ChunkEndpoint] = []
-
-            def iter_virtual_chunks(dim: int = 0, logical_offset: Tuple[int, ...] = ()):
-                if dim == ndim:
-                    yield logical_offset
-                    return
-                axis_chunk = logical_chunk_shape_val[dim]
-                axis_extent = logical_shape[dim]
-                for axis_start in range(0, axis_extent, axis_chunk):
-                    yield from iter_virtual_chunks(dim + 1, logical_offset + (axis_start,))
-
-            for logical_start in iter_virtual_chunks():
+            # Compute logical bounds for this chunk
+            if scale_hint is not None:
+                logical_start = tuple(
+                    (virtual_start[ax] - realized_start[ax]) // scale_hint[ax]
+                    for ax in range(ndim)
+                )
                 logical_stop = tuple(
-                    min(logical_start[ax] + logical_chunk_shape_val[ax], logical_shape[ax])
+                    _ceil_div(virtual_stop[ax] - realized_start[ax], scale_hint[ax])
                     for ax in range(ndim)
                 )
-                source_chunk_start = tuple(
-                    snapped_start[ax] + logical_start[ax] * scale_hint[ax]
-                    for ax in range(ndim)
-                )
-                source_chunk_stop = tuple(
-                    snapped_start[ax] + logical_stop[ax] * scale_hint[ax]
-                    for ax in range(ndim)
-                )
-                # Clip to array boundary; edge virtual chunks may extend past valid data
-                valid_chunk_stop = tuple(
-                    min(source_chunk_stop[ax], base_shape[ax])
-                    for ax in range(ndim)
-                )
+            else:
+                logical_start = tuple(virtual_start[ax] - realized_start[ax] for ax in range(ndim))
+                logical_stop = tuple(virtual_stop[ax] - realized_start[ax] for ax in range(ndim))
 
-                # Check if virtual chunk needs splitting
-                virtual_chunk_shape = tuple(logical_stop[ax] - logical_start[ax] for ax in range(ndim))
-                if needs_splitting(virtual_chunk_shape, output_dtype):
-                    # Create virtual chunk payload (without split info first)
-                    base_payload = encode_virtual_chunk_payload(
-                        source_start=source_chunk_start,
-                        source_stop=source_chunk_stop,
-                        valid_stop=valid_chunk_stop,
-                        scale_hint=scale_hint,
-                        reduction_method=reduction_method,
-                    )
-                    # Create endpoint with bounds, then split
-                    virtual_ep = ChunkEndpoint(
-                        chunk_id=encode_chunk_id(base_desc.array_id, base_payload),
-                        bounds=ChunkBounds(start=list(logical_start), stop=list(logical_stop)),
-                    )
-                    sub_endpoints = split_endpoint(base_desc.array_id, virtual_ep, output_dtype)
-                    logical_endpoints.extend(sub_endpoints)
-                else:
-                    payload = encode_virtual_chunk_payload(
-                        source_start=source_chunk_start,
-                        source_stop=source_chunk_stop,
-                        valid_stop=valid_chunk_stop,
-                        scale_hint=scale_hint,
-                        reduction_method=reduction_method,
-                    )
-                    logical_endpoints.append(ChunkEndpoint(
-                        chunk_id=encode_chunk_id(base_desc.array_id, payload),
-                        bounds=ChunkBounds(start=list(logical_start), stop=list(logical_stop)),
-                    ))
+            virtual_bounds = ChunkBounds(start=list(virtual_start), stop=list(virtual_stop))
+            logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
 
-            logical_desc = TensorDescriptor(
-                array_id=base_desc.array_id,
-                dim_labels=base_desc.dim_labels,
-                shape=list(logical_shape),
-                chunk_shape=list(logical_chunk_shape_val),
-                dtype=_output_dtype(base_desc.dtype, reduction_method),
-            )
+            # NO splitting check needed - safe_chunk_size guarantees it fits
 
-            # Always set slice_hint when user requested a slice, so client can crop correctly
-            # This is needed even when snapped bounds equal full bounds (single-chunk arrays)
-            if slice_hint is not None:
-                logical_desc.slice_hint.start[:] = list(snapped_start)
-                logical_desc.slice_hint.stop[:] = list(snapped_stop)
-            elif snapped_start != tuple(0 for _ in range(ndim)) or snapped_stop != base_shape:
-                logical_desc.slice_hint.start[:] = list(snapped_start)
-                logical_desc.slice_hint.stop[:] = list(snapped_stop)
+            # Encode: array_id + virtual_bounds + optional scale_hint
+            if scale_hint is not None:
+                chunk_id = encode_chunk_id_with_scale(
+                    base_desc.array_id, virtual_bounds, scale_hint, reduction_method
+                )
+            else:
+                chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
+
+            logical_endpoints.append(ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds))
+
+        # Build descriptor
+        logical_desc = TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=list(logical_shape),
+            chunk_shape=list(logical_chunk_size),
+            dtype=output_dtype,
+        )
+
+        # Set slice_hint for client cropping
+        if slice_hint is not None or realized_start != tuple(0 for _ in range(ndim)):
+            logical_desc.slice_hint.start[:] = list(realized_start)
+            logical_desc.slice_hint.stop[:] = list(realized_stop)
 
         if read_options is not None:
             logical_desc.read_options.CopyFrom(read_options)
@@ -625,106 +607,57 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
 
 
     def resolve_chunk_data(
-        self, chunk_id: bytes,  cache_manager: Optional[CacheManager] = None,
+        self, chunk_id: bytes,
+        cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
-        """Resolve chunk data, handling split and virtual chunks.
+        """Resolve chunk data, handling scaled chunks.
 
-        [TENSOR method] Must be called after get_tensor_adapter().
-
-        This is the main entry point for DoGet. It handles:
-        1. Raw backend chunks: delegates to get_chunk_array()
-        2. Split chunks: reads parent chunk and slices
-        3. Virtual chunks: computes downscaled data
-
-        Args:
-            chunk_id: Encoded chunk identifier (may contain split info or virtual payload)
-            cache_manager: Optional cache for virtual/split chunks
-
-        Returns:
-            Arrow RecordBatch with chunk data
+        Uses get_data() directly for all reads instead of complex chunk_array logic.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 
-        array_id, backend_data, split_index, split_max = decode_chunk_id(chunk_id)
+        array_id, bounds = decode_chunk_id(chunk_id)
 
-        is_virtual = backend_data.startswith(_VIRTUAL_CHUNK_MAGIC)
-        is_file_backend = cache_manager is not None and isinstance(cache_manager.backend, ArrowFileBackend)
+        # Check if scaled chunk (has extra bytes after bounds encoding)
+        is_scaled_chunk_flag = is_scaled_chunk(chunk_id)
 
-        should_cache = cache_manager is not None and (is_virtual or is_file_backend)
-
-        logger.debug(
-            f"resolve_chunk_data: array_id={array_id}, virtual={is_virtual}, "
-            f"split={split_index}/{split_max}, cache={should_cache}"
+        should_cache = cache_manager is not None and (
+            is_scaled_chunk_flag or isinstance(cache_manager.backend, ArrowFileBackend)
         )
 
-        # Use chunk_id directly as stable cache key (for both virtual and regular chunks)
-        key_bytes = chunk_id
+        logger.debug(
+            f"resolve_chunk_data: array_id={array_id}, scaled={is_scaled_chunk_flag}, "
+            f"bounds_start={list(bounds.start)}, bounds_stop={list(bounds.stop)}, cache={should_cache}"
+        )
 
         def compute_fn():
-            if is_virtual:
-                source_start, _, valid_stop, _, _ = decode_virtual_chunk_payload(backend_data)
-                parent_bounds = ChunkBounds(
-                    start=list(source_start),
-                    stop=list(valid_stop),
+            # Read data directly using get_data()
+            result_arr = self.get_data(bounds)
+
+            if is_scaled_chunk_flag:
+                scale_hint, reduction_method = decode_scale_info(chunk_id)
+                # Crop and downsample (no padding needed - bounds aligned via floor_div)
+                result_arr = self._crop_and_downsample(
+                    result_arr, scale_hint, reduction_method
                 )
 
-                # compute_virtual_chunk now returns numpy array directly
-                # The result is already downscaled, so result_arr.shape is the logical shape
-                result_arr = compute_virtual_chunk(self, backend_data)
-
-                if split_max > 1:
-                    # Slice the numpy array directly
-                    result_arr = slice_array(result_arr, parent_bounds, split_index, split_max)
-
-                # For virtual chunks, use result_arr.shape (already downscaled)
-                logical_shape = list(result_arr.shape)
-            else:
-                # For real chunks, get the numpy array directly
-                result_arr = self.get_chunk_array(chunk_id)
-
-                # Defensive reshape: backends may squeeze singleton dimensions
-                # Get expected bounds from backend_data
-                parent_bounds = get_chunk_bounds_from_backend_key(self, backend_data)
-                expected_shape = tuple(
-                    int(stop - start) for start, stop in zip(parent_bounds.start, parent_bounds.stop)
-                )
-                if result_arr.shape != expected_shape:
-                    if result_arr.size == int(np.prod(expected_shape)):
-                        result_arr = result_arr.reshape(expected_shape)
-                    else:
-                        raise ValueError(
-                            f"Chunk data size mismatch: got {result_arr.size} elements "
-                            f"but expected {int(np.prod(expected_shape))} for shape {expected_shape}"
-                        )
-
-                if split_max > 1:
-                    result_arr = slice_array(result_arr, parent_bounds, split_index, split_max)
-
-                # For real chunks, use logical shape from bounds (may differ from raw array shape)
-                logical_shape = [int(stop - start) for start, stop in zip(parent_bounds.start, parent_bounds.stop)]
-
-            # Convert to RecordBatch with 1 row per chunk
-            # data: list<dtype> - flattened tensor elements
-            # shape: list<int64> - LOGICAL chunk shape (from bounds for real chunks, from result for virtual)
-            # dtype: string - numpy dtype string
+            logical_shape = list(result_arr.shape)
             dtype_str = str(result_arr.dtype)
+
             result = pa.RecordBatch.from_arrays(
                 [
-                    pa.array([result_arr.ravel()]),  # list of flattened elements
-                    pa.array([logical_shape]),       # logical shape
-                    pa.array([dtype_str]),           # numpy dtype string
+                    pa.array([result_arr.ravel()]),
+                    pa.array([logical_shape]),
+                    pa.array([dtype_str]),
                 ],
                 ["data", "shape", "dtype"]
             )
-            size_bytes = result_arr.nbytes
-            logger.debug(f"resolve_chunk_data: computed {size_bytes} bytes")
-            return result, size_bytes
+            return result, result_arr.nbytes
 
         if should_cache:
-            entry = cache_manager.get_or_acquire(key_bytes, compute_fn, metadata={'array_id': array_id})
+            entry = cache_manager.get_or_acquire(chunk_id, compute_fn, metadata={'array_id': array_id})
             data = entry.data
-            cache_manager.release(key_bytes)
-
+            cache_manager.release(chunk_id)
         else:
             data, _ = compute_fn()
 
