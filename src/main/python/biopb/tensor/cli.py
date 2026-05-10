@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import json
 import time
 
+from pathlib import Path
 import dask
 import typer
 from rich.console import Console
@@ -218,7 +219,7 @@ def metadata(
 
 
 @app.command()
-def stats(
+def read(
     source_id: str = typer.Argument(..., help="Source identifier"),
     tensor_id: str = typer.Argument(..., help="Tensor identifier"),
     server: str = typer.Option(
@@ -233,21 +234,27 @@ def stats(
         "-S",
         help="Slice specification, e.g. '0:100,0:200'",
     ),
+    save: Optional[Path] = typer.Option(
+        None,
+        "--save",
+        "-o",
+        help="Path to pickle the tensor compute graph",
+    ),
     cache_bytes: int = typer.Option(
         100_000_000,
         "--cache-bytes",
         help="Maximum bytes for client-side chunk cache",
     ),
 ):
-    """Compute statistics (min, max, mean) for a tensor.
+    """Read a tensor and display its contents.
 
     The slice option restricts the region examined. If not specified,
-    statistics are computed for the entire tensor.
+    the entire tensor is read.
 
     Example:
-        biopb-diagnose stats my-source pos_0
-        biopb-diagnose stats my-source pos_0 --slice 0:100,0:100
-        biopb-diagnose stats my-source pos_0 -S 0:512 -s grpc://myhost:9000
+        biopb-diagnose read my-source pos_0
+        biopb-diagnose read my-source pos_0 --slice 0:100,0:100
+        biopb-diagnose read my-source pos_0 -S 0:512 -s grpc://myhost:9000
     """
     start_time = time.time()
     client = _create_flight_client(server, cache_bytes)
@@ -260,6 +267,14 @@ def stats(
         )
 
         arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+
+        if save is not None:
+            import pickle
+
+            with open(save, "wb") as f:
+                pickle.dump(arr, f)
+            console.print(f"[green]Tensor compute graph saved to:[/green] {save}")
+            _log_timing(start_time)
 
         # Compute all statistics in a single graph execution
         min_val, max_val, mean_val = dask.compute(arr.min(), arr.max(), arr.mean())
