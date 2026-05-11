@@ -95,7 +95,7 @@ class OmeZarrAdapter(ZarrAdapter):
         store = zarr.DirectoryStore(zarr_path)
 
         try:
-            with open(str(source.url / ".zattrs")) as f:
+            with open(str(Path(zarr_path) / ".zattrs")) as f:
                 zattrs = json.load(f)
 
             resolution_path = "0"

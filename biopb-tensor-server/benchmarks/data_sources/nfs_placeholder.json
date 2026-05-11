@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "id": "nfs-microscopy",
+      "path_env": "NFS_TEST_DATA_DIR",
+      "type": "auto",
+      "description": "NFS-mounted microscopy data (requires env var)"
+    }
+  ]
+}

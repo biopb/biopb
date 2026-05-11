@@ -1,0 +1,32 @@
+{
+  "sources": [
+    {
+      "id": "synthetic-zarr-512",
+      "type": "zarr",
+      "generator": "generate_synthetic_zarr",
+      "params": {"shape": [512, 512], "chunks": [256, 256], "dtype": "uint16"},
+      "description": "Basic zarr for latency tests"
+    },
+    {
+      "id": "synthetic-zarr-2048",
+      "type": "zarr",
+      "generator": "generate_synthetic_zarr",
+      "params": {"shape": [2048, 2048], "chunks": [512, 512], "dtype": "uint16"},
+      "description": "Large zarr for throughput tests"
+    },
+    {
+      "id": "synthetic-tiff",
+      "type": "ome_tiff",
+      "generator": "generate_synthetic_tiff",
+      "params": {"shape": [256, 256], "tile": [128, 128], "dtype": "uint16"},
+      "description": "OME-TIFF for adapter diversity tests"
+    },
+    {
+      "id": "synthetic-hdf5",
+      "type": "hdf5",
+      "generator": "generate_synthetic_hdf5",
+      "params": {"shape": [256, 256], "chunks": [128, 128], "dtype": "uint16"},
+      "description": "HDF5 for adapter diversity tests"
+    }
+  ]
+}

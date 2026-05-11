@@ -1,0 +1,53 @@
+{
+  "sources": [
+    {
+      "id": "allen-ome-tiff-tiny",
+      "url": "s3://allencell/aics/data_handoff_4dn/crop_seg/27a34691_segmentation.ome.tif",
+      "type": "ome_tiff",
+      "description": "Allen 4DN segmentation mask - tiny test file",
+      "expected_tensors": ["0"],
+      "size_mb": 0.38,
+      "size_category": "tiny"
+    },
+    {
+      "id": "allen-ome-tiff-medium",
+      "url": "s3://allencell/aics/data_handoff_4dn/crop_raw/c217c356_raw.ome.tif",
+      "type": "ome_tiff",
+      "description": "Allen 4DN chromatin imaging - medium size",
+      "expected_tensors": ["0"],
+      "size_mb": 100.18,
+      "size_category": "medium"
+    },
+    {
+      "id": "allen-ome-tiff-large",
+      "url": "s3://allencell/aics/data_handoff_4dn/crop_raw/447101df_raw.ome.tif",
+      "type": "ome_tiff",
+      "description": "Allen 4DN chromatin imaging - large size",
+      "expected_tensors": ["0"],
+      "size_mb": 248.70,
+      "size_category": "large"
+    },
+    {
+      "id": "allen-cardio-tiff",
+      "url": "s3://allencell/aics/cardio-classifier-brightfield/5500000101_63x_20190610_Capture1-Capture1-B4[144]Montage-5_brf.tif",
+      "type": "tiff",
+      "description": "Allen cardiomyocyte brightfield - large",
+      "expected_tensors": ["0"],
+      "size_mb": 308.32,
+      "size_category": "large"
+    }
+  ],
+  "metadata": {
+    "access_note": "S3 URLs use standard AWS public bucket access (s3fs.S3FileSystem(anon=True))",
+    "size_categories": {
+      "tiny": "<1MB - unit tests, fast benchmarks",
+      "small": "1-50MB - latency benchmarks",
+      "medium": "50-200MB - throughput benchmarks",
+      "large": "200-500MB - stress tests, cache efficiency"
+    },
+    "format_coverage": {
+      "ome_tiff": "OME-TIFF with embedded metadata",
+      "tiff": "Plain TIFF files"
+    }
+  }
+}
