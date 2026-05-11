@@ -18,6 +18,16 @@ This document describes how to deploy the BioPB Tensor Server as a Docker/Singul
 - Python 3.11+ with pip
 - pnpm installed
 
+### Dependency Version Notes
+
+**numpy < 2.0 required**: The tensor server requires `numpy < 2.0` due to compatibility issues with `tifffile` and `aicsimageio`. numpy 2.0+ removed `ndarray.newbyteorder()` which older tifffile versions rely on. This constraint is enforced in `pyproject.toml` and `benchmarks/biopb-bench.def`.
+
+If you encounter `AttributeError: 'numpy.ndarray' object has no attribute 'newbyteorder'` when reading TIFF files, ensure numpy is pinned to < 2.0:
+
+```bash
+pip install "numpy<2.0"
+```
+
 ### Step 1: Build biopb Wheel Locally
 
 The biopb package must be built locally because buf's remote plugins have network issues inside Docker:

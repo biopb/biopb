@@ -23,6 +23,7 @@ From: python:3.12-slim
         dask[array]>=2024.0.0 \
         cachey>=0.1.0 \
         tifffile>=2021.8.30 \
+        numpy<2.0 \
         h5py \
         numpy \
         pytest>=7.0.0 \
