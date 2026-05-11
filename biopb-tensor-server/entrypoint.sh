@@ -68,6 +68,11 @@ nginx -c "$BIOPB_TMP/nginx.conf"
 COMMAND="${1:-launch}"
 shift 2>/dev/null || true
 
+# Enable debug logging if dev bypass mode is active
+if [ "${BIOPB_WEB_DEV_BYPASS}" = "true" ] || [ "${BIOPB_WEB_DEV_BYPASS}" = "1" ]; then
+    export BIOPB_LOG_LEVEL="${BIOPB_LOG_LEVEL:-DEBUG}"
+fi
+
 exec biopb-tensor "$COMMAND" \
     --config "$CONFIG_FILE" \
     --web-host 127.0.0.1 \
