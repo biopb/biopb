@@ -6,7 +6,7 @@ Relies on OS page cache for raw data caching.
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -14,10 +14,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, get_file_identity
+from biopb_tensor_server.discovery import SourceClaim, get_file_identity, is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import RemoteStore
 
 
 # =============================================================================
@@ -73,6 +74,9 @@ def _elementtree_to_dict(element) -> dict:
 class OmeTiffAdapter(BackendAdapter):
     """Adapter for OME-TIFF files using tifffile.
 
+    Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
+    tifffile supports fsspec directly via its file-like object support.
+
     Chunk ID format:
     - array_id prefix (via _encode_chunk_id)
     - uint16 ifd_index (page index)
@@ -109,6 +113,34 @@ class OmeTiffAdapter(BackendAdapter):
         return None
 
     @classmethod
+    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim remote OME-TIFF files.
+
+        Args:
+            store: RemoteStore for remote access
+            path: Path within remote store
+            visited_identities: Set of already-visited identities
+
+        Returns:
+            SourceClaim if this is a remote OME-TIFF file, None otherwise
+        """
+        # Check for OME-TIFF extension
+        path_lower = path.lower()
+        if not (path_lower.endswith('.ome.tiff') or path_lower.endswith('.ome.tif')):
+            return None
+
+        # Check if it's a file
+        if not store.isfile(path):
+            return None
+
+        return SourceClaim(
+            source_type="ome-tiff",
+            primary_path=store._join(path),
+            claimed_paths={store._join(path)},
+            is_remote=True,
+        )
+
+    @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'OmeTiffAdapter':
         """Create adapter instance from SourceConfig.
 
@@ -120,7 +152,56 @@ class OmeTiffAdapter(BackendAdapter):
         """
         import tifffile
 
-        tiff = tifffile.TiffFile(str(source.url))
+        if source.is_remote:
+            # Remote storage: use fsspec file-like object
+            from fsspec.core import url_to_fs
+
+            storage_options = {}
+            if source.credentials_profile:
+                pass  # fsspec handles via environment variables
+
+            fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
+            # tifffile supports fsspec file-like objects
+            tiff = tifffile.TiffFile(fs.open(fs_path, mode='rb'))
+        else:
+            # Local filesystem
+            tiff = tifffile.TiffFile(str(source.url))
+
+        return cls(tiff, source.source_id, source.dim_labels)
+
+    @classmethod
+    def create_from_config_with_credentials(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'OmeTiffAdapter':
+        """Create adapter with explicit credentials config.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+            credentials_config: CredentialsConfig for authentication
+
+        Returns:
+            OmeTiffAdapter instance
+        """
+        import tifffile
+        from fsspec.core import url_to_fs
+        from biopb_tensor_server.remote import CredentialsConfig
+
+        if not source.is_remote:
+            return cls.create_from_config(source)
+
+        # Build storage_options from credentials_config
+        storage_options = {}
+        if credentials_config:
+            profile = credentials_config.get_profile(source.credentials_profile)
+            if profile:
+                storage_options = profile.to_storage_options()
+
+        # Create fsspec filesystem with credentials
+        fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
+        tiff = tifffile.TiffFile(fs.open(fs_path, mode='rb'))
+
         return cls(tiff, source.source_id, source.dim_labels)
 
     def __init__(

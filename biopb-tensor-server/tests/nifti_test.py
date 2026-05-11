@@ -79,7 +79,7 @@ class TestNiftiAdapterClaim:
 
             assert claim is not None
             assert claim.source_type == "nifti"
-            assert claim.primary_path == nii_path
+            assert claim.primary_path == str(nii_path)
 
     def test_claim_nii_gz_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

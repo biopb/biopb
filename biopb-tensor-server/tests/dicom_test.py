@@ -171,8 +171,8 @@ class TestDicomAdapterClaim:
 
             assert claim is not None
             assert claim.source_type == "dicom"
-            assert claim.primary_path == dcm_path
-            assert dcm_path in claim.claimed_paths
+            assert claim.primary_path == str(dcm_path)
+            assert str(dcm_path) in claim.claimed_paths
 
     def test_claim_non_dicom_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -343,7 +343,7 @@ class TestDicomSeriesAdapterClaim:
 
             assert claim is not None
             assert claim.source_type == "dicom-series"
-            assert claim.primary_path == Path(tmpdir)
+            assert claim.primary_path == str(Path(tmpdir))
             # Should claim directory + all DICOM files
             assert len(claim.claimed_paths) >= 6  # dir + 5 files
 

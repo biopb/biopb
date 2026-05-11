@@ -29,6 +29,7 @@ from biopb_tensor_server.config import (
     load_config,
     resolve_all_sources,
 )
+from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.server import TensorFlightServer
@@ -180,6 +181,7 @@ def _setup_flight_server(
         watcher=watcher,
         monitored_sources=monitored_sources,
         static_sources=static_sources,
+        credentials_config=server_config.credentials,
     )
 
     if source_manager is None:

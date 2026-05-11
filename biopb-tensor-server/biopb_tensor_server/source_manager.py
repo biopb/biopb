@@ -18,6 +18,11 @@ Move Handling:
 - Moves WITHIN monitored directory: preserve source_id, update path
 - Moves OUT OF monitored directory: treat as delete
 - Moves INTO monitored directory: treat as create with new source_id
+
+Remote Sources:
+- Remote sources (s3://, gs://, etc.) are NOT monitored
+- Remote sources are registered during initial discovery only
+- No filesystem events for remote URLs (static after discovery)
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
@@ -35,6 +40,7 @@ from biopb_tensor_server.discovery import (
     SourceClaim,
     discover_sources,
     get_file_identity,
+    is_remote_url,
 )
 from biopb_tensor_server.watcher import (
     DirectoryWatcher,
@@ -60,11 +66,17 @@ class SourceManager:
     The manager runs an event processing loop in a background thread,
     receiving debounced events from the watcher and updating the catalog.
 
+    Remote Sources:
+    - Remote sources are registered during discovery but NOT monitored
+    - is_path_claimed() checks string paths (works for remote URLs)
+    - _on_source_added() uses credentials_config for remote adapters
+
     Args:
         server: TensorFlightServer instance for source registration
         registry: AdapterRegistry for adapter creation
         discovery_state: DiscoveryState for claim tracking
         watcher: DirectoryWatcher for filesystem events
+        credentials_config: CredentialsConfig for remote storage authentication
 
     Example:
         manager = SourceManager(server, registry, state, watcher)
@@ -81,6 +93,7 @@ class SourceManager:
         watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
         dim_labels: Optional[List[str]] = None,
+        credentials_config: Optional[Any] = None,
     ):
         self._server = server
         self._registry = registry
@@ -88,6 +101,7 @@ class SourceManager:
         self._watcher = watcher
         self._monitored_dirs = monitored_dirs
         self._dim_labels = dim_labels
+        self._credentials_config = credentials_config
 
         # Thread management
         self._thread: Optional[threading.Thread] = None
@@ -95,12 +109,12 @@ class SourceManager:
         self._lock = threading.Lock()
 
         # Path tracking for move handling
-        # Maps resolved path -> source_id
-        self._path_to_source_id: Dict[Path, str] = {}
+        # Maps resolved path -> source_id (str keys for URL support)
+        self._path_to_source_id: Dict[str, str] = {}
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
-            self._path_to_source_id[claim.primary_path.resolve()] = source_id
+            self._path_to_source_id[claim.primary_path] = source_id
 
         # Set up discovery callbacks
         self._state.on_source_added = self._on_source_added
@@ -187,9 +201,10 @@ class SourceManager:
             is_directory: True if path is a directory
         """
         resolved_path = path.resolve()
+        path_str = str(resolved_path)
 
         # Skip if already claimed
-        if self._state.is_path_claimed(resolved_path):
+        if self._state.is_path_claimed(path_str):
             return
 
         # Skip hidden paths
@@ -371,6 +386,7 @@ class SourceManager:
         """Callback when source is added to DiscoveryState.
 
         Creates adapter and registers with Flight server.
+        Uses credentials_config for remote sources.
 
         Args:
             claim: SourceClaim that was added
@@ -391,13 +407,19 @@ class SourceManager:
                 logger.error(f"No adapter for type: {claim.source_type}")
                 return
 
-            adapter = adapter_cls.create_from_config(source_config)
+            # Create adapter - use credentials for remote sources
+            if claim.is_remote and hasattr(adapter_cls, 'create_from_config_with_credentials'):
+                adapter = adapter_cls.create_from_config_with_credentials(
+                    source_config, self._credentials_config
+                )
+            else:
+                adapter = adapter_cls.create_from_config(source_config)
 
             # Register with server
             self._server.register_source(claim.source_id, adapter)
 
-            # Update path tracking for move handling
-            self._path_to_source_id[claim.primary_path.resolve()] = claim.source_id
+            # Update path tracking for move handling (use str path)
+            self._path_to_source_id[claim.primary_path] = claim.source_id
 
             logger.info(f"Registered source with server: {claim.source_id}")
 
@@ -440,6 +462,7 @@ def create_source_manager(
     watcher: Optional[DirectoryWatcher],
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
+    credentials_config: Optional[Any] = None,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
 
@@ -447,12 +470,18 @@ def create_source_manager(
     monitored sources (filesystem-discovered, kept live via watcher).
     Both paths use the same DiscoveryState/callback machinery.
 
+    Remote sources:
+    - Are NOT monitored (no filesystem events)
+    - Are registered during initial discovery only
+    - Use credentials_config for authentication
+
     Args:
         server: TensorFlightServer instance
         registry: AdapterRegistry for adapter creation
         watcher: DirectoryWatcher for filesystem events (None for static-only)
         monitored_sources: SourceConfig entries with monitor=True
         static_sources: Explicit SourceConfig entries (monitor=False)
+        credentials_config: CredentialsConfig for remote storage authentication
 
     Returns:
         SourceManager if there are any sources, None otherwise
@@ -463,11 +492,11 @@ def create_source_manager(
     if not monitored_sources and not static_sources:
         return None
 
-    # Extract monitored directories
+    # Extract monitored directories (skip remote URLs)
     monitored_dirs: Set[Path] = set()
     for source in monitored_sources:
         if source.is_remote:
-            logger.warning(f"Cannot monitor remote URL: {source.url}")
+            logger.info(f"Remote URL will not be monitored: {source.url}")
             continue
 
         local_path = source.local_path
@@ -496,6 +525,7 @@ def create_source_manager(
         watcher=watcher,
         monitored_dirs=monitored_dirs,
         dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
+        credentials_config=credentials_config,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
@@ -503,8 +533,8 @@ def create_source_manager(
     for source in static_sources:
         claim = SourceClaim(
             source_type=source.type,
-            primary_path=Path(source.url),
-            claimed_paths={Path(source.url)},
+            primary_path=source.url,  # str for URL support
+            claimed_paths={source.url},
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             extra_config={'dataset': source.dataset} if source.dataset else {},
@@ -514,6 +544,7 @@ def create_source_manager(
     # Filesystem discovery for monitored sources (callbacks fire here too)
     for source in monitored_sources:
         if source.is_remote:
+            # Remote sources are handled above as static claims
             continue
 
         local_path = source.local_path

@@ -6,18 +6,19 @@ Extends ZarrAdapter with OME multiscales metadata support.
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.base import TensorReadPlan
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import SourceClaim, is_remote_url
 from biopb_tensor_server.downsample import _normalize_reduction_method
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import RemoteStore
 
 
 class OmeZarrAdapter(ZarrAdapter):
@@ -28,6 +29,8 @@ class OmeZarrAdapter(ZarrAdapter):
     - axes: Dimension labels with types (channel, space, time)
     - coordinate_transformations: Physical scales
     - omero: Channel colors, names
+
+    Supports both local and remote storage (S3, GCS, etc.) via fsspec.
 
     Chunk ID format: Same as ZarrAdapter
     - array_id prefix
@@ -78,6 +81,46 @@ class OmeZarrAdapter(ZarrAdapter):
         )
 
     @classmethod
+    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim remote OME-Zarr directories.
+
+        Args:
+            store: RemoteStore for remote access
+            path: Path within remote store
+            visited_identities: Set of already-visited identities
+
+        Returns:
+            SourceClaim if this is a remote OME-Zarr dataset, None otherwise
+        """
+        # Check for .zarr suffix
+        if not path.endswith('.zarr'):
+            return None
+
+        # Check if it's a directory
+        if not store.isdir(path):
+            return None
+
+        # Check for .zattrs with multiscales
+        zattrs_path = path.rstrip('/') + '/.zattrs'
+        if not store.exists(zattrs_path):
+            return None
+
+        try:
+            zattrs_content = store.read_text(zattrs_path)
+            zattrs = json.loads(zattrs_content)
+            if 'multiscales' not in zattrs:
+                return None
+        except (json.JSONDecodeError, Exception):
+            return None
+
+        return SourceClaim(
+            source_type="ome-zarr",
+            primary_path=store._join(path),
+            claimed_paths={store._join(path)},
+            is_remote=True,
+        )
+
+    @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'OmeZarrAdapter':
         """Create adapter instance from SourceConfig.
 
@@ -88,15 +131,23 @@ class OmeZarrAdapter(ZarrAdapter):
             OmeZarrAdapter instance
         """
         import json
-
         import zarr
+        from fsspec.core import url_to_fs
 
         zarr_path = str(source.url)
-        store = zarr.DirectoryStore(zarr_path)
 
-        try:
-            with open(str(Path(zarr_path) / ".zattrs")) as f:
-                zattrs = json.load(f)
+        if source.is_remote:
+            # Remote storage: use fsspec FSStore
+            storage_options = {}
+            if source.credentials_profile:
+                pass  # fsspec handles via environment variables
+
+            fs, fs_path = url_to_fs(zarr_path, storage_options=storage_options)
+            store = zarr.FSStore(fs, fs_path)
+
+            # Read zattrs to find the first resolution level
+            zattrs_bytes = fs.cat_file(fs_path.rstrip('/') + '/.zattrs')
+            zattrs = json.loads(zattrs_bytes)
 
             resolution_path = "0"
             if 'multiscales' in zattrs and zattrs['multiscales']:
@@ -104,13 +155,33 @@ class OmeZarrAdapter(ZarrAdapter):
                 if datasets:
                     resolution_path = datasets[0].get('path', '0')
 
-            root = zarr.open_group(zarr_path, mode='r')
+            # Open the group and then the resolution array
+            root = zarr.open_group(store, mode='r')
             if resolution_path in root:
                 arr = root[resolution_path]
             else:
                 arr = zarr.open_array(store, mode='r')
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
-            arr = zarr.open_array(zarr_path, mode='r')
+        else:
+            # Local filesystem
+            store = zarr.DirectoryStore(zarr_path)
+
+            try:
+                with open(str(Path(zarr_path) / ".zattrs")) as f:
+                    zattrs = json.load(f)
+
+                resolution_path = "0"
+                if 'multiscales' in zattrs and zattrs['multiscales']:
+                    datasets = zattrs['multiscales'][0].get('datasets', [])
+                    if datasets:
+                        resolution_path = datasets[0].get('path', '0')
+
+                root = zarr.open_group(zarr_path, mode='r')
+                if resolution_path in root:
+                    arr = root[resolution_path]
+                else:
+                    arr = zarr.open_array(store, mode='r')
+            except (json.JSONDecodeError, KeyError, FileNotFoundError):
+                arr = zarr.open_array(zarr_path, mode='r')
 
         return cls(arr, source.source_id, source.dim_labels)
 

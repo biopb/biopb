@@ -3,6 +3,7 @@
 Supports TOML config files with:
 - Server settings (host, port)
 - Data source definitions (explicit files or directory auto-discovery)
+- Credential profiles for remote storage (S3, GCS, etc.)
 
 Example config (explicit):
 ```toml
@@ -37,6 +38,28 @@ type = "hdf5"
 url = "/data/sample.h5"
 dataset = "/images"
 ```
+
+Example config (remote storage):
+```toml
+[server]
+host = "0.0.0.0"
+port = 8815
+
+[credentials]
+default_profile = "aws-prod"
+
+[[credentials.profiles]]
+name = "aws-prod"
+storage_type = "s3"
+key = "AKIAIOSFODNN7EXAMPLE"
+secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+region = "us-east-1"
+
+[[sources]]
+type = "ome-zarr"
+url = "s3://bucket/experiment.ome.zarr"
+credentials_profile = "aws-prod"
+```
 """
 
 from __future__ import annotations
@@ -54,6 +77,11 @@ from biopb_tensor_server.discovery import (
     generate_source_id,
     get_file_identity,
     is_remote_url,
+)
+from biopb_tensor_server.remote import (
+    CredentialProfile,
+    CredentialsConfig,
+    is_remote_url as is_remote_url_v2,
 )
 
 # Alias for backward compatibility with internal usage
@@ -83,6 +111,8 @@ class SourceConfig:
         monitor: Enable live filesystem monitoring for this source (local directories only)
                  When True, the server will watch for file add/delete events and update
                  the catalog automatically.
+        credentials_profile: Name of credential profile for remote URLs (overrides global default)
+        is_remote: Flag indicating if this is a remote source (set during discovery)
     """
     url: str
     type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "aics"]] = None
@@ -90,15 +120,28 @@ class SourceConfig:
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
     monitor: bool = False  # Enable live filesystem monitoring
+    credentials_profile: Optional[str] = None  # Override global credential profile
+    _is_remote: Optional[bool] = field(default=None, init=False)  # Internal field, computed from URL
+
+    @property
+    def is_remote(self) -> bool:
+        """Check if this source is a remote URL."""
+        if self._is_remote is None:
+            # Compute lazily
+            object.__setattr__(self, '_is_remote', _is_remote_url(self.url))
+        return self._is_remote
 
     def __post_init__(self):
         if self.url is None or self.url == "":
             raise ValueError("SourceConfig requires a valid 'url'")
 
+        # Compute is_remote from URL
+        object.__setattr__(self, '_is_remote', _is_remote_url(self.url))
+
         # Generate source_id from URL hash if not provided
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
-            self.source_id = generate_source_id(self.url, detected_type)
+            object.__setattr__(self, 'source_id', generate_source_id(self.url, detected_type))
 
     @property
     def local_path(self) -> Optional[Path]:
@@ -158,6 +201,7 @@ class ServerConfig:
         writable: Enable write mode for source creation and data upload
         write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
+        credentials: Credentials configuration for remote storage
         sources: List of data sources (each may contain multiple tensors)
     """
     host: str = "0.0.0.0"
@@ -174,6 +218,7 @@ class ServerConfig:
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
+    credentials: CredentialsConfig = field(default_factory=CredentialsConfig)  # NEW
     sources: List[SourceConfig] = field(default_factory=list)
 
 
@@ -255,6 +300,30 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         file_max_total_bytes=file_max_total_bytes,
     )
 
+    # Parse credentials settings (NEW)
+    credentials_data = data.get("credentials", {})
+    credentials_default_profile = credentials_data.get("default_profile", None)
+    credentials_profiles_data = credentials_data.get("profiles", [])
+
+    credentials_profiles = []
+    for profile_data in credentials_profiles_data:
+        profile = CredentialProfile(
+            name=profile_data.get("name", ""),
+            storage_type=profile_data.get("storage_type", "s3"),
+            key=profile_data.get("key", None),
+            secret=profile_data.get("secret", None),
+            region=profile_data.get("region", None),
+            token=profile_data.get("token", None),
+            endpoint_url=profile_data.get("endpoint_url", None),
+        )
+        if profile.name:
+            credentials_profiles.append(profile)
+
+    credentials_config = CredentialsConfig(
+        default_profile=credentials_default_profile,
+        profiles=credentials_profiles,
+    )
+
     # Parse sources
     sources_data = data.get("sources", [])
     sources: List[SourceConfig] = []
@@ -272,6 +341,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
             dim_labels=src_data.get("dim_labels"),
             dataset=src_data.get("dataset"),
             monitor=src_data.get("monitor", False),  # Optional - default False
+            credentials_profile=src_data.get("credentials_profile", None),  # NEW
         )
         sources.append(source)
 
@@ -290,6 +360,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         writable=writable,
         write_dir=write_dir,
         cache=cache_config,
+        credentials=credentials_config,  # NEW
         sources=sources,
     )
 
@@ -638,7 +709,7 @@ def _claim_to_source_config(claim: SourceClaim, original_source: SourceConfig) -
 
     Args:
         claim: SourceClaim from discovery
-        original_source: Original SourceConfig for dim_labels inheritance
+        original_source: Original SourceConfig for dim_labels and credentials_profile inheritance
 
     Returns:
         SourceConfig with claim information
@@ -660,6 +731,7 @@ def _claim_to_source_config(claim: SourceClaim, original_source: SourceConfig) -
         source_id=source_id,
         dim_labels=claim.dim_labels or original_source.dim_labels,
         dataset=dataset,
+        credentials_profile=original_source.credentials_profile,  # preserve credentials_profile
     )
 
 

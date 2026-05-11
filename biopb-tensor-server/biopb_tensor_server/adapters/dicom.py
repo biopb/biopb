@@ -5,7 +5,7 @@ Handles single DICOM files and multi-file DICOM series using pydicom.
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -13,10 +13,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, get_file_identity
+from biopb_tensor_server.discovery import SourceClaim, get_file_identity, is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import RemoteStore
 
 
 # =============================================================================
@@ -80,6 +81,7 @@ class DicomAdapter(BackendAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
+    Supports remote storage via fsspec (pydicom's dcmread accepts file-like objects).
 
     Chunk strategy:
     - Single frame: Single chunk for entire 2D image
@@ -128,6 +130,42 @@ class DicomAdapter(BackendAdapter):
             return None
 
     @classmethod
+    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim remote DICOM files.
+
+        Args:
+            store: RemoteStore for remote access
+            path: Path within remote store
+            visited_identities: Set of already-visited identities
+
+        Returns:
+            SourceClaim if this is a remote DICOM file, None otherwise
+        """
+        # Check for DICOM extension
+        path_lower = path.lower()
+        if not (path_lower.endswith('.dcm') or path_lower.endswith('.dicom')):
+            return None
+
+        if not store.isfile(path):
+            return None
+
+        # Try to read DICOM metadata
+        try:
+            import pydicom
+            with store.open(path, mode='rb') as fobj:
+                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
+                if not (hasattr(ds, 'Rows') and hasattr(ds, 'Columns')):
+                    return None
+            return SourceClaim(
+                source_type="dicom",
+                primary_path=store._join(path),
+                claimed_paths={store._join(path)},
+                is_remote=True,
+            )
+        except Exception:
+            return None
+
+    @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'DicomAdapter':
         """Create adapter instance from SourceConfig.
 
@@ -139,7 +177,57 @@ class DicomAdapter(BackendAdapter):
         """
         import pydicom
 
-        ds = pydicom.dcmread(str(source.url))
+        if source.is_remote:
+            # Remote storage: use fsspec file-like object
+            from fsspec.core import url_to_fs
+
+            storage_options = {}
+            if source.credentials_profile:
+                pass  # fsspec handles via environment variables
+
+            fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
+            with fs.open(fs_path, mode='rb') as fobj:
+                ds = pydicom.dcmread(fobj)
+        else:
+            # Local filesystem
+            ds = pydicom.dcmread(str(source.url))
+
+        return cls(ds, source.source_id, source.dim_labels)
+
+    @classmethod
+    def create_from_config_with_credentials(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'DicomAdapter':
+        """Create adapter with explicit credentials config.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+            credentials_config: CredentialsConfig for authentication
+
+        Returns:
+            DicomAdapter instance
+        """
+        import pydicom
+        from fsspec.core import url_to_fs
+        from biopb_tensor_server.remote import CredentialsConfig
+
+        if not source.is_remote:
+            return cls.create_from_config(source)
+
+        # Build storage_options from credentials_config
+        storage_options = {}
+        if credentials_config:
+            profile = credentials_config.get_profile(source.credentials_profile)
+            if profile:
+                storage_options = profile.to_storage_options()
+
+        # Create fsspec filesystem with credentials
+        fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
+        with fs.open(fs_path, mode='rb') as fobj:
+            ds = pydicom.dcmread(fobj)
+
         return cls(ds, source.source_id, source.dim_labels)
 
     def __init__(

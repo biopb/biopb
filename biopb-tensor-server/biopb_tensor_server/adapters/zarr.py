@@ -4,7 +4,7 @@ Relies on OS page cache for raw data caching.
 """
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -13,14 +13,18 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import SourceClaim, is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import RemoteStore
 
 
 class ZarrAdapter(BackendAdapter):
     """Adapter for Zarr/N5 chunked arrays.
+
+    Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
+    For remote storage, uses zarr.FSStore with fsspec filesystem.
 
     Chunk ID format:
     - 4 bytes: array_id length (uint32, big-endian)
@@ -89,6 +93,57 @@ class ZarrAdapter(BackendAdapter):
         return None
 
     @classmethod
+    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim remote .zarr directories.
+
+        Args:
+            store: RemoteStore for remote access
+            path: Path within remote store
+            visited_identities: Set of already-visited identities
+
+        Returns:
+            SourceClaim if this is a remote zarr array, None otherwise
+        """
+        # Check for .zarr suffix
+        if not path.endswith('.zarr'):
+            return None
+
+        # Check if it's a directory
+        if not store.isdir(path):
+            return None
+
+        # Check for zarr structure
+        has_zarray = store.exists(path + '/.zarray')
+        has_zarr_json = store.exists(path + '/zarr.json')
+        has_zattrs = store.exists(path + '/.zattrs')
+
+        if has_zarray or has_zarr_json:
+            return SourceClaim(
+                source_type="zarr",
+                primary_path=store._join(path),
+                claimed_paths={store._join(path)},
+                is_remote=True,
+            )
+
+        # If only .zattrs exists, check if it's NOT OME-Zarr
+        if has_zattrs:
+            try:
+                zattrs_content = store.read_text(path + '/.zattrs')
+                import json
+                zattrs = json.loads(zattrs_content)
+                if 'multiscales' not in zattrs:
+                    return SourceClaim(
+                        source_type="zarr",
+                        primary_path=store._join(path),
+                        claimed_paths={store._join(path)},
+                        is_remote=True,
+                    )
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        return None
+
+    @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'ZarrAdapter':
         """Create adapter instance from SourceConfig.
 
@@ -99,9 +154,52 @@ class ZarrAdapter(BackendAdapter):
             ZarrAdapter instance
         """
         import zarr
+        from zarr.storage import FSStore
+        from biopb_tensor_server.remote import RemoteStore
 
-        path = Path(source.url)
-        arr = zarr.open_array(str(path), mode='r')
+        if source.is_remote:
+            # Remote storage: use RemoteStore for filesystem creation
+            store = RemoteStore(source.url)
+            zarr_store = FSStore(store.path, fs=store.fs)
+            arr = zarr.open_array(zarr_store, mode='r')
+        else:
+            # Local filesystem
+            path = Path(source.url)
+            arr = zarr.open_array(str(path), mode='r')
+
+        return cls(arr, source.source_id, source.dim_labels)
+
+    @classmethod
+    def create_from_config_with_credentials(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'ZarrAdapter':
+        """Create adapter with explicit credentials config.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+            credentials_config: CredentialsConfig for authentication
+
+        Returns:
+            ZarrAdapter instance
+        """
+        import zarr
+        from zarr.storage import FSStore
+        from biopb_tensor_server.remote import RemoteStore, CredentialsConfig
+
+        if not source.is_remote:
+            return cls.create_from_config(source)
+
+        # Use RemoteStore for filesystem creation with credentials
+        store = RemoteStore.from_config(
+            source.url,
+            credentials_config=credentials_config,
+            profile_name=source.credentials_profile,
+        )
+        zarr_store = FSStore(store.path, fs=store.fs)
+        arr = zarr.open_array(zarr_store, mode='r')
+
         return cls(arr, source.source_id, source.dim_labels)
 
     def __init__(

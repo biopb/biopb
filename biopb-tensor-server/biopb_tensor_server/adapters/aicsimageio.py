@@ -7,6 +7,7 @@ Supports:
 - Multi-scene files (each scene becomes a separate tensor)
 - Lazy loading via dask arrays
 - OME-XML metadata conversion
+- Remote storage (S3, GCS, etc.) via fsspec (passing fs_kwargs)
 
 Chunk ID format:
 - array_id + bounds encoding (start, stop coordinates)
@@ -17,7 +18,7 @@ Relies on OS page cache for raw data caching.
 import importlib
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -25,12 +26,13 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import BackendAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import SourceClaim, is_remote_url
 
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
 
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import RemoteStore
 
 
 def _get_available_extensions() -> List[str]:
@@ -76,6 +78,7 @@ class AicsImageIoAdapter(BackendAdapter):
     Use get_tensor_adapter(scene_id) to access specific scenes.
 
     Supports lazy loading via dask arrays.
+    Supports remote storage via fsspec (passes fs_kwargs to AICSImage).
 
     Chunk ID format:
     - array_id prefix (via _encode_chunk_id)
@@ -112,6 +115,31 @@ class AicsImageIoAdapter(BackendAdapter):
         return None
 
     @classmethod
+    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
+        """Claim remote aicsimageio-supported files.
+
+        Args:
+            store: RemoteStore for remote access
+            path: Path within remote store
+            visited_identities: Set of already-visited identities
+
+        Returns:
+            SourceClaim if this is a supported remote file, None otherwise
+        """
+        # Check for supported extensions
+        path_lower = path.lower()
+        for ext in AICS_EXTENSIONS:
+            if path_lower.endswith(ext):
+                if store.isfile(path):
+                    return SourceClaim(
+                        source_type="aics",
+                        primary_path=store._join(path),
+                        claimed_paths={store._join(path)},
+                        is_remote=True,
+                    )
+        return None
+
+    @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'AicsImageIoAdapter':
         """Create source-level adapter instance from SourceConfig.
 
@@ -123,10 +151,67 @@ class AicsImageIoAdapter(BackendAdapter):
         """
         from aicsimageio import AICSImage
 
-        img = AICSImage(str(source.url))
+        if source.is_remote:
+            # Remote storage: pass fs_kwargs for fsspec authentication
+            from fsspec.core import url_to_fs
+            from biopb_tensor_server.remote import _get_env_credentials, _detect_storage_type
+
+            storage_options = {}
+            if source.credentials_profile:
+                pass  # fsspec handles via environment variables
+
+            # Get storage options from environment and URL
+            storage_type = _detect_storage_type(source.url)
+            storage_options = _get_env_credentials(storage_type)
+
+            # Note: aicsimageio's OmeZarrReader has a gap where fs_kwargs
+            # are not passed to ome-zarr-py. For OME-Zarr, use OmeZarrAdapter instead.
+            img = AICSImage(source.url, fs_kwargs=storage_options)
+        else:
+            # Local filesystem
+            img = AICSImage(str(source.url))
+
         return cls(
             img,
             scene_index=None,  # Source-level adapter
+            source_id=source.source_id,
+            dim_labels=source.dim_labels,
+            source_url=str(source.url),
+        )
+
+    @classmethod
+    def create_from_config_with_credentials(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'AicsImageIoAdapter':
+        """Create adapter with explicit credentials config.
+
+        Args:
+            source: SourceConfig with url, source_id, dim_labels
+            credentials_config: CredentialsConfig for authentication
+
+        Returns:
+            AicsImageIoAdapter instance
+        """
+        from aicsimageio import AICSImage
+        from biopb_tensor_server.remote import CredentialsConfig
+
+        if not source.is_remote:
+            return cls.create_from_config(source)
+
+        # Build storage_options from credentials_config
+        storage_options = {}
+        if credentials_config:
+            profile = credentials_config.get_profile(source.credentials_profile)
+            if profile:
+                storage_options = profile.to_storage_options()
+
+        img = AICSImage(source.url, fs_kwargs=storage_options)
+
+        return cls(
+            img,
+            scene_index=None,
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             source_url=str(source.url),

@@ -6,12 +6,14 @@ Provides a claim-based discovery architecture where each adapter can
 1. Extensible format detection - new adapters register and participate
 2. Cross-platform file identity tracking (symlink/hardlink safe)
 3. Future filesystem monitoring compatibility (DiscoveryState)
+4. Remote storage discovery via fsspec (S3, GCS, HTTP)
 
 Key components:
-- SourceClaim: Represents a claimed data source
-- AdapterRegistry: Registry of all adapter backends
+- SourceClaim: Represents a claimed data source (str paths for URL support)
+- AdapterRegistry: Registry of all adapter backends with remote claim support
 - DiscoveryState: Persistent state for incremental discovery
-- discover_sources(): Main discovery function
+- discover_sources(): Main discovery function (local + remote)
+- discover_sources_async(): Background discovery with progress logging
 """
 
 from __future__ import annotations
@@ -19,11 +21,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional, Set, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
+    from biopb_tensor_server.remote import RemoteStore
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +116,12 @@ class SourceClaim:
 
     Attributes:
         source_type: Type identifier ("zarr", "ome-tiff", "hdf5", etc.)
-        primary_path: Main entry point for the source
-        claimed_paths: All paths consumed by this claim (multi-node claims)
+        primary_path: Main entry point for the source (str to support URLs)
+        claimed_paths: All paths consumed by this claim (Set[str] for URLs)
         source_id: Unique identifier (auto-generated if None)
         dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
+        is_remote: Flag indicating if this is a remote source
     """
 
     __slots__ = (
@@ -126,29 +131,36 @@ class SourceClaim:
         'source_id',
         'dim_labels',
         'extra_config',
+        'is_remote',
     )
 
     def __init__(
         self,
         source_type: str,
-        primary_path: Path,
-        claimed_paths: Set[Path],
+        primary_path: Path | str,
+        claimed_paths: Set[Path] | Set[str],
         source_id: Optional[str] = None,
         dim_labels: Optional[List[str]] = None,
         extra_config: Optional[dict] = None,
+        is_remote: bool = False,
     ):
         self.source_type = source_type
-        self.primary_path = primary_path
-        self.claimed_paths = claimed_paths
+        # Convert Path to str to support both local and remote URLs
+        self.primary_path = str(primary_path) if isinstance(primary_path, Path) else primary_path
+        self.claimed_paths = {
+            str(p) if isinstance(p, Path) else p for p in claimed_paths
+        }
         self.source_id = source_id
         self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
+        self.is_remote = is_remote
 
     def __repr__(self) -> str:
         return (
             f"SourceClaim(source_type={self.source_type!r}, "
             f"primary_path={self.primary_path!r}, "
-            f"source_id={self.source_id!r})"
+            f"source_id={self.source_id!r}, "
+            f"is_remote={self.is_remote!r})"
         )
 
 
@@ -158,11 +170,16 @@ class AdapterRegistry:
     Adapters register themselves and participate in discovery by
     implementing the claim() classmethod.
 
+    Supports both local and remote discovery:
+    - Local: claim() for filesystem paths
+    - Remote: claim_remote() for fsspec-based remote URLs
+
     Usage:
         registry = AdapterRegistry()
         registry.register(ZarrAdapter)
         registry.register(OmeZarrAdapter)
         claims = registry.get_claims_for_path(path, visited)
+        remote_claims = registry.get_claims_for_remote(store, path, visited)
     """
 
     def __init__(self):
@@ -192,7 +209,7 @@ class AdapterRegistry:
         self._type_to_adapter[source_type] = cls
 
     def get_claims_for_path(self, path: Path, visited_identities: Set[str]) -> List[SourceClaim]:
-        """Ask all adapters to claim this path.
+        """Ask all adapters to claim this local path.
 
         Each adapter's claim() method is called in registration order.
         First adapter to return a non-None claim wins.
@@ -219,6 +236,43 @@ class AdapterRegistry:
                 continue
         return claims
 
+    def get_claims_for_remote(
+        self,
+        store: "RemoteStore",
+        path: str,
+        visited_identities: Set[str],
+    ) -> List[SourceClaim]:
+        """Ask all adapters to claim this remote path.
+
+        Each adapter's claim_remote() method is called in registration order.
+        First adapter to return a non-None claim wins.
+
+        Args:
+            store: RemoteStore instance for remote storage access
+            path: Path within the remote store (relative path string)
+            visited_identities: Set of already-visited file identities
+
+        Returns:
+            List of SourceClaim objects (may be empty if no adapter claims)
+        """
+        claims = []
+        for adapter_cls in self._adapters:
+            # Check if adapter has claim_remote method
+            if not hasattr(adapter_cls, 'claim_remote'):
+                continue
+            try:
+                claim = adapter_cls.claim_remote(store, path, visited_identities)
+                if claim is not None:
+                    claims.append(claim)
+                    logger.debug(f"Adapter {adapter_cls.__name__} claimed remote {path} as {claim.source_type}")
+                    # Update type mapping for factory use
+                    self._type_to_adapter[claim.source_type] = adapter_cls
+            except Exception as e:
+                # Adapter claim_remote() should not raise, but handle gracefully
+                logger.debug(f"Adapter {adapter_cls.__name__} claim_remote() raised exception: {e}")
+                continue
+        return claims
+
     def get_adapter_for_type(self, source_type: str) -> Optional[Type[BackendAdapter]]:
         """Get adapter class for a source type.
 
@@ -240,15 +294,15 @@ class DiscoveryState:
     Attributes:
         claims: Forward mapping (source_id → SourceClaim)
         path_to_source: Reverse mapping (primary_path → source_id)
-        consumed_paths: All paths consumed by any source
+        consumed_paths: All paths consumed by any source (Set[str] for URLs)
         visited_identities: File identities already visited
         on_source_added: Callback for source addition events
         on_source_removed: Callback for source removal events
     """
 
     claims: Dict[str, SourceClaim]
-    path_to_source: Dict[Path, str]
-    consumed_paths: Set[Path]
+    path_to_source: Dict[str, str]  # Changed from Dict[Path, str]
+    consumed_paths: Set[str]  # Changed from Set[Path]
     visited_identities: Set[str]
     on_source_added: Optional[Callable[[SourceClaim], None]]
     on_source_removed: Optional[Callable[[str], None]]
@@ -296,11 +350,11 @@ class DiscoveryState:
 
         return True
 
-    def remove_claim(self, path: Path) -> Optional[str]:
+    def remove_claim(self, path: str) -> Optional[str]:
         """Remove claim by path (for file deletion events).
 
         Args:
-            path: Primary path of the claim to remove
+            path: Primary path of the claim to remove (str to support URLs)
 
         Returns:
             source_id if removed, None if not found
@@ -319,11 +373,11 @@ class DiscoveryState:
 
         return source_id
 
-    def is_path_claimed(self, path: Path) -> bool:
+    def is_path_claimed(self, path: str) -> bool:
         """Check if a path is already part of a claim."""
         return path in self.consumed_paths
 
-    def get_source_for_path(self, path: Path) -> Optional[str]:
+    def get_source_for_path(self, path: str) -> Optional[str]:
         """Get source_id that owns this path (reverse lookup)."""
         return self.path_to_source.get(path)
 
@@ -402,7 +456,8 @@ def discover_sources(
     paths_scanned = 0
     for path in walk_with_identity_tracking(root, state.visited_identities):
         paths_scanned += 1
-        if state.is_path_claimed(path):
+        path_str = str(path)
+        if state.is_path_claimed(path_str):
             continue
 
         claims = registry.get_claims_for_path(path, state.visited_identities)
@@ -411,8 +466,9 @@ def discover_sources(
             if claim.dim_labels is None and dim_labels is not None:
                 claim.dim_labels = dim_labels
             # Add identities for claimed paths to visited set
-            for claimed_path in claim.claimed_paths:
+            for claimed_path_str in claim.claimed_paths:
                 try:
+                    claimed_path = Path(claimed_path_str)
                     identity = get_file_identity(claimed_path)
                     state.visited_identities.add(identity)
                 except OSError:
@@ -421,6 +477,203 @@ def discover_sources(
 
     logger.debug(f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources")
     return state
+
+
+def discover_remote_source(
+    url: str,
+    registry: AdapterRegistry,
+    credentials_config: Optional[Any] = None,
+    profile_name: Optional[str] = None,
+    state: Optional[DiscoveryState] = None,
+    dim_labels: Optional[List[str]] = None,
+) -> DiscoveryState:
+    """Discover a single remote source using fsspec.
+
+    For remote URLs, we check if the URL itself is a data source.
+    Unlike local discovery, we don't recursively scan remote directories
+    by default (too slow on large buckets).
+
+    Args:
+        url: Remote URL (s3://..., gs://..., etc.)
+        registry: Adapter registry for claims
+        credentials_config: CredentialsConfig for authentication
+        profile_name: Credential profile name to use
+        state: Existing DiscoveryState to update (creates new if None)
+        dim_labels: Optional dimension labels
+
+    Returns:
+        DiscoveryState with discovered remote source
+    """
+    from biopb_tensor_server.remote import RemoteStore
+
+    if state is None:
+        state = DiscoveryState()
+
+    logger.debug(f"discover_remote_source: checking {url}")
+
+    # Create RemoteStore for this URL
+    store = RemoteStore.from_config(
+        url=url,
+        credentials_config=credentials_config,
+        profile_name=profile_name,
+    )
+
+    # Get identity for remote path
+    try:
+        identity = store.get_identity("")
+        if identity in state.visited_identities:
+            logger.debug(f"discover_remote_source: {url} already visited")
+            return state
+        state.visited_identities.add(identity)
+    except Exception as e:
+        logger.debug(f"discover_remote_source: cannot get identity for {url}: {e}")
+
+    # Check if root URL is a data source
+    claims = registry.get_claims_for_remote(store, "", state.visited_identities)
+    if claims:
+        claim = claims[0]
+        if claim.dim_labels is None and dim_labels is not None:
+            claim.dim_labels = dim_labels
+        # Add identities for claimed paths
+        for claimed_path in claim.claimed_paths:
+            try:
+                claimed_identity = store.get_identity(claimed_path)
+                state.visited_identities.add(claimed_identity)
+            except Exception:
+                pass
+        state.add_claim(claim)
+        logger.info(f"discover_remote_source: {url} claimed as {claim.source_type}")
+
+    return state
+
+
+def discover_sources_async(
+    sources: List[Any],
+    registry: AdapterRegistry,
+    server: Any,
+    credentials_config: Optional[Any] = None,
+    console: Optional[Any] = None,
+    on_source_registered: Optional[Callable[[str, str], None]] = None,
+) -> None:
+    """Background discovery with progress logging.
+
+    Runs in a daemon thread:
+    1. For each source in sources:
+       2. Discover sources (local or remote)
+       3. Log progress: "Found X sources from Y..."
+       4. Register each discovered source with server
+
+    Args:
+        sources: List of SourceConfig objects
+        registry: Adapter registry for claims
+        server: TensorFlightServer instance for registration
+        credentials_config: CredentialsConfig for authentication
+        console: Rich Console for progress output (None for no output)
+        on_source_registered: Optional callback(source_id, source_type) after registration
+
+    Example output:
+        Server started at grpc://0.0.0.0:8815
+        Discovering sources from /data/local (1/3)
+          ✓ plate-001 (ome-zarr)
+          ✓ plate-002 (ome-zarr)
+          Found 2 sources
+        Discovering sources from s3://bucket/experiments (2/3)
+          ✓ experiment-a (ome-zarr)
+          Found 1 source
+    """
+    from biopb_tensor_server.config import SourceConfig
+
+    total_sources = len(sources)
+    state = DiscoveryState()
+
+    for i, source in enumerate(sources):
+        # Handle both SourceConfig and dict-like objects
+        if isinstance(source, SourceConfig):
+            url = source.url
+            dim_labels = source.dim_labels
+            is_remote = source.is_remote
+            profile_name = source.credentials_profile
+        else:
+            url = source.get("url", "")
+            dim_labels = source.get("dim_labels")
+            is_remote = is_remote_url(url)
+            profile_name = source.get("credentials_profile")
+
+        if console:
+            console.print(f"[dim]Discovering sources from {url} ({i+1}/{total_sources})[/dim]")
+
+        discovered_count = 0
+
+        if is_remote:
+            # Remote discovery
+            state = discover_remote_source(
+                url=url,
+                registry=registry,
+                credentials_config=credentials_config,
+                profile_name=profile_name,
+                state=state,
+                dim_labels=dim_labels,
+            )
+        else:
+            # Local discovery
+            local_path = Path(url).resolve() if Path(url).exists() else None
+            if local_path:
+                state = discover_sources(
+                    root=local_path,
+                    registry=registry,
+                    state=state,
+                    dim_labels=dim_labels,
+                )
+
+        # Register discovered sources with server
+        for claim in state.get_all_claims():
+            if claim.source_id:
+                # Create adapter for this source
+                adapter_cls = registry.get_adapter_for_type(claim.source_type)
+                if adapter_cls is None:
+                    logger.error(f"No adapter for type: {claim.source_type}")
+                    continue
+
+                try:
+                    # Build SourceConfig from claim
+                    source_config = SourceConfig(
+                        type=claim.source_type,
+                        url=claim.primary_path,
+                        source_id=claim.source_id,
+                        dim_labels=claim.dim_labels,
+                        credentials_profile=profile_name,
+                        is_remote=claim.is_remote,
+                    )
+
+                    # Create adapter (may need credentials_config for remote)
+                    if hasattr(adapter_cls, 'create_from_config_with_credentials'):
+                        adapter = adapter_cls.create_from_config_with_credentials(
+                            source_config, credentials_config
+                        )
+                    else:
+                        adapter = adapter_cls.create_from_config(source_config)
+
+                    # Register with server
+                    server.register_source(claim.source_id, adapter)
+                    discovered_count += 1
+
+                    if console:
+                        console.print(f"[green]  ✓ {claim.source_id}[/green] ({claim.source_type})")
+
+                    if on_source_registered:
+                        on_source_registered(claim.source_id, claim.source_type)
+
+                except Exception as e:
+                    logger.error(f"Failed to create adapter for {claim.source_id}: {e}")
+                    if console:
+                        console.print(f"[red]  ✗ {claim.source_id}[/red] ({e})")
+
+        if console:
+            console.print(f"[dim]  Found {discovered_count} sources[/dim]")
+
+    if console:
+        total_registered = len(state.claims)
+        console.print(f"[green]Discovery complete: {total_registered} sources registered[/green]")
 
 
 def is_remote_url(url: str) -> bool:
@@ -432,5 +685,5 @@ def is_remote_url(url: str) -> bool:
     Returns:
         True if URL is remote (s3://, http://, etc.), False if local path
     """
-    remote_prefixes = ('s3://', 'gs://', 'http://', 'https://', 'ftp://', 'file://')
+    remote_prefixes = ('s3://', 'gs://', 'gcs://', 'http://', 'https://', 'ftp://', 'az://', 'azure://')
     return url.lower().startswith(remote_prefixes)
