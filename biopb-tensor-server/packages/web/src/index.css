@@ -78,6 +78,16 @@ html, body {
 .tree-item:hover { background: #1e2435; color: #e2e8f0; }
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
+.tree-folder {
+  color: #e2e8f0;
+  font-weight: 500;
+}
+.tree-folder:hover { color: #60a5fa; }
+
+.tensor-item { color: #64748b; }
+.tensor-item:hover { color: #94a3b8; }
+.tensor-item.active { color: #60a5fa; }
+
 .tensor-pill {
   font-size: 10px;
   background: #2d3748;
