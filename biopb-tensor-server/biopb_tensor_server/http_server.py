@@ -8,6 +8,7 @@ Endpoints:
   GET  /healthz                      — alias for /readyz (no auth)
   GET  /api/diagnostics              — runtime diagnostics (token required)
   GET  /api/sources                  — list DataSourceDescriptors (token required)
+  POST /api/sources/query            — SQL query against source metadata (token required)
   GET  /api/sources/{source_id}      — single DataSourceDescriptor (token required)
   GET  /api/sources/{source_id}/metadata — parsed metadata_json (token required)
   POST /api/slice                    — fetch array slice as binary (token required)
@@ -234,6 +235,10 @@ class SliceRequest(BaseModel):
     pixel_budget: Optional[int] = None  # informational, stored in diagnostics
 
 
+class QuerySourcesRequest(BaseModel):
+    sql: str
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -388,6 +393,52 @@ def create_app(
         except Exception as exc:
             diag.mark_error("LIST_SOURCES_FAILED", str(exc))
             logger.error(f"list_sources failed: {exc}")
+            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+
+    @app.post("/api/sources/query")
+    async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
+        """Execute SQL query against source metadata database.
+
+        Request body: {"sql": "SELECT source_id, source_type FROM sources WHERE ..."}
+        Response headers:
+          X-Total-Sources    — total matching (before truncation)
+          X-Returned-Sources — actual rows returned
+          X-Truncated        — "true" if truncated
+        Response body: JSON array of query results
+        """
+        _check_token(request)
+        t0 = time.monotonic()
+
+        try:
+            client = _get_client()
+            arrow_table = client.query_sources(req.sql)
+
+            # Convert Arrow Table to JSON
+            result = arrow_table.to_pylist()
+
+            # Truncation info from schema metadata
+            total = int(arrow_table.schema.metadata.get(b'total_sources', len(result)))
+            returned = int(arrow_table.schema.metadata.get(b'returned_sources', len(result)))
+            truncated = total > returned
+
+            elapsed = (time.monotonic() - t0) * 1000
+            diag.latency.record(elapsed)
+            logger.debug(f"query_sources: returned {returned}/{total} rows in {elapsed:.1f}ms")
+
+            headers = {
+                "X-Total-Sources": str(total),
+                "X-Returned-Sources": str(returned),
+                "X-Truncated": str(truncated).lower(),
+            }
+
+            return JSONResponse(result, headers=headers)
+
+        except ValueError as exc:
+            # SQL validation error (forbidden keyword, disallowed table)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            diag.mark_error("QUERY_SOURCES_FAILED", str(exc))
+            logger.error(f"query_sources failed: {exc}")
             raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
 
     # NOTE: the /metadata and /ticket routes must be registered before the greedy

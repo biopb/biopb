@@ -8,6 +8,7 @@ The server supports:
 - GetFlightInfo: Get tensor metadata and chunk endpoints
 - DoGet: Fetch individual chunk data
 - DoPut: Upload data (when writable mode enabled)
+- Metadata queries: SQL queries against source catalog (via DuckDB)
 """
 
 import hashlib
@@ -26,6 +27,7 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import BackendAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.metadata_db import MetadataDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,8 @@ class TensorFlightServer(flight.FlightServerBase):
         token: Optional[str] = None,
         writable: bool = False,
         write_dir: Optional[Path] = None,
+        metadata_db: Optional[MetadataDatabase] = None,
+        max_list_flights_results: int = 100000,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -101,6 +105,8 @@ class TensorFlightServer(flight.FlightServerBase):
             token: Bearer token required on every call.  ``None`` disables auth.
             writable: Enable write mode for source creation and data upload
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
+            metadata_db: MetadataDatabase instance for source filtering queries (optional)
+            max_list_flights_results: Safety cap on list_flights() returned sources
             **kwargs: Additional arguments passed to FlightServerBase
         """
         middleware = kwargs.pop("middleware", {})
@@ -109,6 +115,8 @@ class TensorFlightServer(flight.FlightServerBase):
         self._sources: Dict[str, BackendAdapter] = {}
         self._writable = writable
         self._write_dir = write_dir
+        self._metadata_db: Optional[MetadataDatabase] = metadata_db
+        self._max_list_flights_results = max_list_flights_results
 
     def register_source(self, source_id: str, adapter: BackendAdapter) -> None:
         """Register a data source with the server.
@@ -206,19 +214,43 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Each flight represents a data source (which may contain multiple tensors).
 
+        Results are capped at `max_list_flights_results` for safety. Truncation
+        is signaled via schema metadata on all returned FlightInfos.
+
         Args:
             context: Server call context
             criteria: Unused criteria bytes
 
         Yields:
-            FlightInfo for each registered data source, with DataSourceDescriptor
+            FlightInfo for each registered data source (up to max_list_flights_results)
         """
+        total_sources = len(self._sources)
+        max_sources = self._max_list_flights_results
+        returned_count = min(total_sources, max_sources)
+        truncated = total_sources > max_sources
+
+        if truncated:
+            logger.warning(
+                f"list_flights truncated: returning {max_sources} of {total_sources} sources"
+            )
+
+        # Build base schema metadata for truncation signaling
+        base_metadata = {
+            b'total_sources': str(total_sources).encode(),
+            b'max_sources': str(max_sources).encode(),
+            b'returned_sources': str(returned_count).encode(),
+            b'truncated': str(truncated).encode(),
+        }
+
+        count = 0
         for source_id, adapter in self._sources.items():
+            if count >= max_sources:
+                break
+
             source_desc = adapter.get_source_descriptor()
-            # Use empty schema for source listing - actual tensor schemas
-            # come from get_flight_info(tensor_selection). The flight
-            # descriptor contains DataSourceDescriptor with tensor metadata.
-            schema = pa.schema([])
+
+            # Build schema with truncation metadata
+            schema = pa.schema([], metadata=base_metadata)
 
             # Create a FlightDescriptor for this source
             flight_descriptor = flight.FlightDescriptor.for_command(
@@ -238,6 +270,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 total_records=-1,
                 total_bytes=-1,
             )
+            count += 1
 
     def get_flight_info(
         self,
@@ -256,6 +289,16 @@ class TensorFlightServer(flight.FlightServerBase):
         import json
 
         selection = TensorSelection.FromString(descriptor.command)
+
+        # Check for metadata query first
+        if selection.metadata_query:
+            logger.debug(f"get_flight_info: metadata_query={selection.metadata_query[:100]}...")
+            if self._metadata_db is None:
+                raise flight.FlightServerError(
+                    "Metadata database not enabled. Set metadata_db config to enable SQL queries."
+                )
+            return self._metadata_db.handle_query(selection.metadata_query)
+
         logger.debug(
             f"get_flight_info: source_id={selection.source_id}, tensor_id={selection.tensor_id}"
         )
@@ -314,15 +357,28 @@ class TensorFlightServer(flight.FlightServerBase):
         context: flight.ServerCallContext,
         ticket: flight.Ticket
     ) -> flight.FlightDataStream:
-        """Fetch a chunk's data.
+        """Fetch a chunk's data or metadata query result.
 
         Args:
             context: Server call context
-            ticket: Flight ticket with TensorTicket
+            ticket: Flight ticket with TensorTicket or metadata query ID
 
         Returns:
-            FlightDataStream with the chunk data
+            FlightDataStream with the chunk data or query result
         """
+        # Check for metadata query result by checking the ticket prefix
+        ticket_bytes = ticket.ticket
+        metadata_prefix = b"metadata-query-"
+        if ticket_bytes.startswith(metadata_prefix):
+            ticket_id = ticket_bytes.decode()
+            logger.debug(f"do_get: metadata query result ticket={ticket_id}")
+            if self._metadata_db is None:
+                raise flight.FlightServerError("Metadata database not enabled")
+            result = self._metadata_db.get_pending_result(ticket_id)
+            if result is None:
+                raise flight.FlightServerError(f"Metadata query result not found: {ticket_id}")
+            return flight.RecordBatchStream(result)
+
         tensor_ticket = self._parse_ticket(ticket)
         logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 

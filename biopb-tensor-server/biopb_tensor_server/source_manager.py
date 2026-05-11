@@ -418,6 +418,10 @@ class SourceManager:
             # Register with server
             self._server.register_source(claim.source_id, adapter)
 
+            # Sync to metadata database
+            if hasattr(self._server, '_metadata_db') and self._server._metadata_db is not None:
+                self._server._metadata_db.sync_source_added(claim.source_id, adapter)
+
             # Update path tracking for move handling (use str path)
             self._path_to_source_id[claim.primary_path] = claim.source_id
 
@@ -439,6 +443,10 @@ class SourceManager:
         """
         try:
             self._server.unregister_source(source_id)
+
+            # Sync to metadata database
+            if hasattr(self._server, '_metadata_db') and self._server._metadata_db is not None:
+                self._server._metadata_db.sync_source_removed(source_id)
 
             # Remove path tracking
             paths_to_remove = [

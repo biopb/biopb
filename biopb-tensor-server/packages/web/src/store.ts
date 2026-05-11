@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { type ColorValue, guessDefaultColor, extractChannelNames } from "./utils/colorUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
@@ -47,6 +47,7 @@ export interface AppState {
   // Actions
   initClient: (apiBase: string, token: string | null, devMode: boolean) => void;
   loadSources: () => Promise<void>;
+  querySources: (sql: string) => Promise<QuerySourcesResult>;
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setShowAdvancedOptions: (value: boolean) => void;
@@ -140,6 +141,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         connectionError: err instanceof Error ? err.message : String(err),
       });
     }
+  },
+
+  async querySources(sql: string): Promise<QuerySourcesResult> {
+    const { client } = get();
+    if (!client) {
+      return { rows: [], totalSources: 0, returnedSources: 0, truncated: false };
+    }
+    return client.http.querySources(sql);
   },
 
   selectSource(sourceId, tensorId) {

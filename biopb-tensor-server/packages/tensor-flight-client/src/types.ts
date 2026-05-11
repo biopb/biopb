@@ -77,3 +77,10 @@ export interface ReadyzSnapshot {
   service: string;
   version: string;
 }
+
+export interface QuerySourcesResult {
+  rows: Record<string, unknown>[];
+  totalSources: number;
+  returnedSources: number;
+  truncated: boolean;
+}

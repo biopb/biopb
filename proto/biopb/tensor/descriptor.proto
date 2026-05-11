@@ -113,4 +113,9 @@ message TensorSelection {
 
   // Optional scale/reduction options
   TensorReadOptions read_options = 4;
+
+  // If set, server interprets as metadata query instead of tensor selection.
+  // SQL query against sources table (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+  // Returns Arrow Table with query results via DoGet.
+  string metadata_query = 5;
 }

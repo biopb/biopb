@@ -1,6 +1,7 @@
 package biopb.tensor;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -214,10 +215,16 @@ public class TensorFlightClient implements AutoCloseable {
      * where tensors have different shapes). The returned DataSourceDescriptor
      * contains full tensor metadata (shape, dtype, chunk_shape) for all tensors.
      *
+     * Results may be truncated if server has max_list_flights_results configured.
+     * Check returned map size vs total_sources in schema metadata for truncation info.
+     *
      * @return Map of source_id to DataSourceDescriptor
      */
     public Map<String, DataSourceDescriptor> listSources() throws IOException {
         Map<String, DataSourceDescriptor> result = new HashMap<>();
+        boolean truncated = false;
+        long totalSources = 0;
+
         for (FlightInfo info : client.listFlights(Criteria.ALL, authOption)) {
             DataSourceDescriptor sourceDesc = DataSourceDescriptor.parseFrom(
                 info.getDescriptor().getCommand());
@@ -226,10 +233,104 @@ public class TensorFlightClient implements AutoCloseable {
             for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
                 descriptors.put(tensorDesc.getArrayId(), tensorDesc);
             }
+
+            // Check schema metadata for truncation info
+            java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
+            if (schemaOpt.isPresent()) {
+                Map<String, String> metadata = schemaOpt.get().getCustomMetadata();
+                if (metadata != null) {
+                    String truncatedStr = metadata.get("truncated");
+                    if (truncatedStr != null) {
+                        truncated = Boolean.parseBoolean(truncatedStr);
+                    }
+                    String totalStr = metadata.get("total_sources");
+                    if (totalStr != null) {
+                        totalSources = Long.parseLong(totalStr);
+                    }
+                }
+            }
         }
         sources.putAll(result);
-        LOGGER.info("listSources: returned " + result.size() + " sources");
+
+        if (truncated && totalSources > result.size()) {
+            LOGGER.warning("listSources: returned " + result.size() + " of " + totalSources + " sources (truncated)");
+        } else {
+            LOGGER.info("listSources: returned " + result.size() + " sources");
+        }
+
         return result;
+    }
+
+    /**
+     * Execute SQL query against server's source metadata database.
+     *
+     * Returns Arrow VectorSchemaRoot with query results. Schema metadata may contain
+     * "total_sources" key if result was truncated.
+     *
+     * Requires server to have metadata_db.enabled=true in config.
+     *
+     * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_url LIKE '%plate%'")
+     * @return VectorSchemaRoot with query results (caller must close)
+     * @throws IOException If query fails or server does not have metadata database enabled
+     *
+     * Example:
+     * <pre>
+     * VectorSchemaRoot result = client.querySources("SELECT source_id, source_type FROM sources");
+     * System.out.println("Found " + result.getRowCount() + " sources");
+     * result.close();
+     * </pre>
+     */
+    public VectorSchemaRoot querySources(String sql) throws IOException {
+        TensorSelection selection = TensorSelection.newBuilder()
+            .setMetadataQuery(sql)
+            .build();
+
+        FlightInfo info = client.getInfo(
+            FlightDescriptor.command(selection.toByteArray()), authOption);
+
+        // Check schema metadata for truncation
+        java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
+        if (schemaOpt.isPresent()) {
+            Map<String, String> metadata = schemaOpt.get().getCustomMetadata();
+            if (metadata != null && metadata.containsKey("total_sources")) {
+                long total = Long.parseLong(metadata.get("total_sources"));
+                String returnedStr = metadata.get("returned_sources");
+                long returned = returnedStr != null ? Long.parseLong(returnedStr) : info.getEndpoints().size();
+                if (returned < total) {
+                    LOGGER.info("querySources: result truncated, returned " + returned + " of " + total + " sources");
+                } else {
+                    LOGGER.info("querySources: returned " + returned + " sources");
+                }
+            }
+        }
+
+        // Fetch results via doGet
+        if (info.getEndpoints().isEmpty()) {
+            // Empty result - return empty table
+            Schema schema = info.getSchema();
+            VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+            root.setRowCount(0);
+            return root;
+        }
+
+        FlightStream stream = client.getStream(
+            info.getEndpoints().get(0).getTicket(), authOption);
+
+        // Materialize all batches into one table
+        List<VectorSchemaRoot> batches = new ArrayList<>();
+        while (stream.next()) {
+            batches.add(stream.getRoot().clone());
+        }
+
+        if (batches.isEmpty()) {
+            Schema schema = info.getSchema();
+            VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+            root.setRowCount(0);
+            return root;
+        }
+
+        // Concatenate all batches
+        return VectorSchemaRoot.concatenate(batches);
     }
 
     /**

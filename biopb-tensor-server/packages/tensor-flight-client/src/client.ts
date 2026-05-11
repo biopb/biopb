@@ -14,6 +14,7 @@
 import type {
   DataSourceDescriptor,
   DiagnosticsSnapshot,
+  QuerySourcesResult,
   ReadyzSnapshot,
   SliceRequest,
   TypedNdArray,
@@ -134,6 +135,40 @@ export class TensorHttpClient {
     }
   }
 
+  private async fetchJsonWithHeaders<T>(
+    path: string,
+    body: unknown,
+    timeoutMs?: number,
+  ): Promise<{ data: T; headers: Headers }> {
+    const url = `${this.base}${path}`;
+    const controller = new AbortController();
+    const timeoutId = timeoutMs != null
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        let detail: unknown;
+        try { detail = await res.json(); } catch { /* ignore */ }
+        throw new TensorApiError(res.status, res.statusText, detail);
+      }
+      const data = await res.json() as T;
+      return { data, headers: res.headers };
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new TensorApiError(408, `Timeout after ${timeoutMs}ms (${path})`);
+      }
+      throw e;
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Health (no auth required)
   // -------------------------------------------------------------------------
@@ -178,6 +213,27 @@ export class TensorHttpClient {
       undefined,
       this.metadataTimeoutMs,
     );
+  }
+
+  /**
+   * Execute SQL query against server's source metadata database.
+   *
+   * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+   * @returns Query result with rows and truncation metadata
+   * @throws {TensorApiError} on validation error or timeout
+   */
+  async querySources(sql: string): Promise<QuerySourcesResult> {
+    const { data, headers } = await this.fetchJsonWithHeaders<Record<string, unknown>[]>(
+      "/api/sources/query",
+      { sql },
+      this.metadataTimeoutMs,
+    );
+
+    const totalSources = parseInt(headers.get("X-Total-Sources") ?? "0", 10);
+    const returnedSources = parseInt(headers.get("X-Returned-Sources") ?? String(data.length), 10);
+    const truncated = headers.get("X-Truncated") === "true";
+
+    return { rows: data, totalSources, returnedSources, truncated };
   }
 
   // -------------------------------------------------------------------------

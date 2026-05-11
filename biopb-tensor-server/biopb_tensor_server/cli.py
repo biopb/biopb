@@ -24,6 +24,7 @@ from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (
     CacheConfig,
+    MetadataDbConfig,
     ServerConfig,
     SourceConfig,
     load_config,
@@ -32,6 +33,7 @@ from biopb_tensor_server.config import (
 from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
+from biopb_tensor_server.metadata_db import MetadataDatabase
 from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.source_manager import create_source_manager
 from biopb_tensor_server.watcher import get_watcher
@@ -149,10 +151,32 @@ def _setup_flight_server(
     # Create registry for adapters
     registry = get_default_registry()
 
+    # Create metadata database if enabled
+    metadata_db: Optional[MetadataDatabase] = None
+    if server_config.metadata_db.enabled:
+        metadata_db = MetadataDatabase(
+            enabled=True,
+            max_query_results=server_config.metadata_db.max_query_results,
+            query_timeout_ms=server_config.metadata_db.query_timeout_ms,
+        )
+        console.print(
+            "[green]Metadata database initialized:[/green] "
+            f"max_query_results={server_config.metadata_db.max_query_results}, "
+            f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
+            f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
+        )
+
     # Create and start server
     location = f"grpc://{host}:{port}"
     flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
-    server = TensorFlightServer(location, token=flight_token, writable=effective_writable, write_dir=write_dir)
+    server = TensorFlightServer(
+        location,
+        token=flight_token,
+        writable=effective_writable,
+        write_dir=write_dir,
+        metadata_db=metadata_db,
+        max_list_flights_results=server_config.metadata_db.max_list_flights_results,
+    )
 
     # Set up watcher for monitored sources (None for static-only configs)
     watcher = None

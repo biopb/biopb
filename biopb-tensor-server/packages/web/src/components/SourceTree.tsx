@@ -1,7 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAppStore } from "../store";
+
+// Threshold for switching to server-side SQL query
+const SERVER_QUERY_THRESHOLD = 1000;
 
 function getPathParts(url: string): string[] {
   if (!url) return [];
@@ -90,17 +93,65 @@ export function SourceTree() {
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
   const selectSource = useAppStore((s) => s.selectSource);
+  const querySources = useAppStore((s) => s.querySources);
 
   const [query, setQuery] = useState("");
+  const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
+  const [serverQueryLoading, setServerQueryLoading] = useState(false);
+
+  // Determine if we should use server-side queries
+  const useServerQuery = sources.length > SERVER_QUERY_THRESHOLD;
+
+  // Debounce server queries to avoid rapid requests
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // Use debounced query for server-side filtering
+  useEffect(() => {
+    if (!useServerQuery || !debouncedQuery.trim()) {
+      setServerFilteredIds(null);
+      return;
+    }
+
+    const q = debouncedQuery.trim().toLowerCase();
+    const escaped = q.replace(/'/g, "''").replace(/%/g, "\\%").replace(/_/g, "\\_");
+    const sql = `SELECT source_id FROM sources WHERE
+      LOWER(source_id) LIKE '%${escaped}%' OR
+      LOWER(source_url) LIKE '%${escaped}%' OR
+      LOWER(source_type) LIKE '%${escaped}%'`;
+
+    setServerQueryLoading(true);
+    querySources(sql)
+      .then((result) => {
+        const ids = new Set(result.rows.map((r) => r.source_id as string));
+        setServerFilteredIds(ids);
+        setServerQueryLoading(false);
+      })
+      .catch((err) => {
+        console.warn("Server query failed:", err);
+        setServerFilteredIds(null);
+        setServerQueryLoading(false);
+      });
+  }, [debouncedQuery, useServerQuery, querySources]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sources;
+
+    // Use server-side results if available
+    if (serverFilteredIds) {
+      return sources.filter((s) => serverFilteredIds.has(s.source_id));
+    }
+
+    // Client-side filter for small catalogs
     return sources.filter((s) => {
       const hay = `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase();
       return hay.includes(q);
     });
-  }, [query, sources]);
+  }, [query, sources, serverFilteredIds]);
 
   const displayNames = useMemo(() => computeDisplayNames(filtered), [filtered]);
 
@@ -180,15 +231,22 @@ export function SourceTree() {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search sources"
+          placeholder={useServerQuery ? "Search (SQL filter)" : "Search sources"}
           aria-label="Search sources"
           style={{ width: "100%" }}
         />
+        {useServerQuery && (
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+            {sources.length.toLocaleString()} sources • Server-side filter
+          </div>
+        )}
       </div>
 
       <div style={{ overflow: "auto" }}>
-        {sourcesLoading ? (
-          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>Loading sources...</div>
+        {sourcesLoading || serverQueryLoading ? (
+          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
+            {serverQueryLoading ? "Searching..." : "Loading sources..."}
+          </div>
         ) : filtered.length === 0 ? (
           <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>No sources</div>
         ) : (

@@ -255,17 +255,95 @@ class TensorFlightClient:
             Dictionary mapping source_id to DataSourceDescriptor.
             Each DataSourceDescriptor.tensors contains TensorDescriptor info
             with shape/dtype for all tensors in that source.
+
+        Note:
+            Results may be truncated if server has max_list_flights_results configured.
+            Check schema metadata for truncation info (truncated=True indicates
+            more sources exist on server than were returned).
         """
         source_descriptors = {}
+        truncated = False
+        total_sources = None
+
         for info in self._client.list_flights(options=self._call_options):
             source_desc = DataSourceDescriptor.FromString(info.descriptor.command)
             source_descriptors[source_desc.source_id] = source_desc
             # Cache tensor descriptors
             for tensor_desc in source_desc.tensors:
                 self._descriptors[tensor_desc.array_id] = tensor_desc
+
+            # Check schema metadata for truncation info
+            if info.schema.metadata:
+                truncated_bytes = info.schema.metadata.get(b'truncated')
+                if truncated_bytes:
+                    truncated = truncated_bytes.decode() == 'True'
+                total_sources_bytes = info.schema.metadata.get(b'total_sources')
+                if total_sources_bytes:
+                    total_sources = int(total_sources_bytes.decode())
+
         self._sources = source_descriptors
-        logger.info(f"list_sources: returned {len(source_descriptors)} sources")
+
+        if truncated and total_sources:
+            logger.warning(
+                f"list_sources: returned {len(source_descriptors)} of {total_sources} sources (truncated)"
+            )
+        else:
+            logger.info(f"list_sources: returned {len(source_descriptors)} sources")
+
         return source_descriptors
+
+    def query_sources(self, sql: str) -> pa.Table:
+        """Execute SQL query against server's source metadata database.
+
+        Returns Arrow Table with query results. Schema metadata may contain
+        'total_sources' and 'returned_sources' keys if result was truncated.
+
+        Requires server to have metadata_db.enabled=True in config.
+
+        Args:
+            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
+
+        Returns:
+            pyarrow.Table with query results
+
+        Raises:
+            FlightServerError: If server does not have metadata database enabled
+            ValueError: If query contains forbidden keywords or references disallowed tables
+
+        Example:
+            >>> client = TensorFlightClient('grpc://localhost:8815')
+            >>> table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+            >>> print(table.to_pandas())
+        """
+        selection = TensorSelection(metadata_query=sql)
+        descriptor = flight.FlightDescriptor.for_command(selection.SerializeToString())
+        info = self._client.get_flight_info(descriptor, options=self._call_options)
+
+        # Check schema metadata for truncation info
+        if info.schema.metadata:
+            total_sources = info.schema.metadata.get(b'total_sources')
+            if total_sources:
+                total = int(total_sources.decode())
+                returned = info.schema.metadata.get(b'returned_sources')
+                if returned:
+                    returned_count = int(returned.decode())
+                    if returned_count < total:
+                        logger.info(
+                            f"query_sources: returned {returned_count} of {total} sources (truncated)"
+                        )
+                    else:
+                        logger.info(f"query_sources: returned {returned_count} sources")
+
+        # Fetch results via DoGet
+        if info.endpoints:
+            reader = self._client.do_get(
+                info.endpoints[0].ticket,
+                options=self._call_options
+            )
+            return reader.read_all()
+        else:
+            # Empty result
+            return info.schema.empty_table()
 
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata.

@@ -675,3 +675,87 @@ class TestIntegration:
         with self._make_tc() as tc:
             r = tc.get("/livez")
         assert r.status_code == 200
+
+
+# ===========================================================================
+# Unit tests — query_sources endpoint
+# ===========================================================================
+
+
+class TestQuerySourcesEndpoint:
+    def test_query_sources_requires_token(self, auth_client):
+        tc, _ = auth_client
+        r = tc.post("/api/sources/query", json={"sql": "SELECT * FROM sources"})
+        assert r.status_code == 401
+
+    def test_query_sources_valid_request(self, auth_client):
+        tc, mock_fc = auth_client
+
+        # Mock query_sources to return an Arrow table
+        import pyarrow as pa
+        mock_table = pa.table({
+            "source_id": ["src0", "src1"],
+            "source_type": ["zarr", "zarr"],
+        })
+        mock_table = mock_table.replace_schema_metadata({
+            b"total_sources": "2",
+            b"returned_sources": "2",
+        })
+        mock_fc.query_sources.return_value = mock_table
+
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT source_id, source_type FROM sources"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body, list)
+        assert len(body) == 2
+        assert body[0]["source_id"] == "src0"
+
+    def test_query_sources_truncation_headers(self, auth_client):
+        tc, mock_fc = auth_client
+
+        import pyarrow as pa
+        mock_table = pa.table({
+            "source_id": ["src0", "src1"],
+        })
+        mock_table = mock_table.replace_schema_metadata({
+            b"total_sources": "100",
+            b"returned_sources": "2",
+        })
+        mock_fc.query_sources.return_value = mock_table
+
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT source_id FROM sources"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        assert r.headers["X-Total-Sources"] == "100"
+        assert r.headers["X-Returned-Sources"] == "2"
+        assert r.headers["X-Truncated"] == "true"
+
+    def test_query_sources_validation_error(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.query_sources.side_effect = ValueError("forbidden keyword: INSERT")
+
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "INSERT INTO sources VALUES ('evil')"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 400
+        assert "forbidden keyword" in r.json()["detail"]
+
+    def test_query_sources_flight_error(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.query_sources.side_effect = RuntimeError("Flight connection lost")
+
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT * FROM sources"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 502

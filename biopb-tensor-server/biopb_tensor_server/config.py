@@ -185,6 +185,25 @@ class CacheConfig:
 
 
 @dataclass
+class MetadataDbConfig:
+    """Configuration for DuckDB metadata database and source catalog safety limits.
+
+    Enables efficient SQL filtering for large source catalogs (>100k sources).
+    Replaces O(n) in-memory scans with indexed DuckDB queries.
+
+    Attributes:
+        enabled: Enable metadata database for source filtering queries
+        max_query_results: Safety cap on SQL query returned rows (truncation signaled via schema metadata)
+        max_list_flights_results: Safety cap on list_flights() returned sources (truncation signaled via schema metadata)
+        query_timeout_ms: Query execution timeout in milliseconds
+    """
+    enabled: bool = True
+    max_query_results: int = 100000
+    max_list_flights_results: int = 100000
+    query_timeout_ms: int = 30000
+
+
+@dataclass
 class ServerConfig:
     """Server configuration.
 
@@ -202,6 +221,7 @@ class ServerConfig:
         write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
         credentials: Credentials configuration for remote storage
+        metadata_db: DuckDB metadata database configuration for source filtering
         sources: List of data sources (each may contain multiple tensors)
     """
     host: str = "0.0.0.0"
@@ -218,7 +238,8 @@ class ServerConfig:
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
-    credentials: CredentialsConfig = field(default_factory=CredentialsConfig)  # NEW
+    credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
+    metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
 
@@ -324,6 +345,20 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         profiles=credentials_profiles,
     )
 
+    # Parse metadata_db settings
+    metadata_db_data = data.get("metadata_db", {})
+    metadata_db_enabled = metadata_db_data.get("enabled", False)
+    metadata_db_max_query_results = metadata_db_data.get("max_query_results", 100000)
+    metadata_db_max_list_flights_results = metadata_db_data.get("max_list_flights_results", 100000)
+    metadata_db_query_timeout_ms = metadata_db_data.get("query_timeout_ms", 30000)
+
+    metadata_db_config = MetadataDbConfig(
+        enabled=metadata_db_enabled,
+        max_query_results=metadata_db_max_query_results,
+        max_list_flights_results=metadata_db_max_list_flights_results,
+        query_timeout_ms=metadata_db_query_timeout_ms,
+    )
+
     # Parse sources
     sources_data = data.get("sources", [])
     sources: List[SourceConfig] = []
@@ -360,7 +395,8 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         writable=writable,
         write_dir=write_dir,
         cache=cache_config,
-        credentials=credentials_config,  # NEW
+        credentials=credentials_config,
+        metadata_db=metadata_db_config,
         sources=sources,
     )
 
