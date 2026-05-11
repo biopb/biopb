@@ -813,8 +813,8 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from multi-file OME-TIFF dataset.
 
-        For multi-file datasets, this reads data from multiple files if bounds
-        span across files.
+        Only reads the specific files and pages needed for the slice bounds,
+        avoiding the expensive TiffSequence.asarray() call that reads all data.
 
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
@@ -832,13 +832,68 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
 
         # Serialize IO for thread safety
         with self._io_lock:
-            # Use TiffSequence for multi-file lazy access
             if self._tiff_sequence is not None:
-                arr = self._tiff_sequence.asarray(out='memmap')
-                return arr[slices]
+                # Multi-file dataset: read only needed files/pages
+                # Step 1: Normalize slice request to 4D (n_files, n_pages, H, W)
+                pages_per_file = self._file_ifd_map[0][1] if self._file_ifd_map else 1
+                original_ndim = len(slices)
+
+                # Build 4D slice tuple: (file_slice, page_slice, y_slice, x_slice)
+                if original_ndim == 4:
+                    file_slice, page_slice, y_slice, x_slice = slices
+                elif original_ndim == 3:
+                    # 3D array: (n_files, Y, X) - insert singleton page dim
+                    file_slice, y_slice, x_slice = slices
+                    page_slice = slice(0, 1)  # Single page per file
+                else:
+                    # Fallback for other cases
+                    file_slice = slices[0]
+                    page_slice = slice(0, pages_per_file)
+                    y_slice = slices[1] if len(slices) > 1 else slice(None)
+                    x_slice = slices[2] if len(slices) > 2 else slice(None)
+
+                # Determine which files and pages we need
+                file_indices = range(file_slice.start, min(file_slice.stop, len(self._file_ifd_map)))
+                page_indices = range(page_slice.start, min(page_slice.stop, pages_per_file))
+                n_files = file_slice.stop - file_slice.start
+                n_pages = page_slice.stop - page_slice.start
+
+                # Step 2: Lazy read -> build 4D array (n_files, n_pages, H, W)
+                result_pages = []
+                for file_idx in file_indices:
+                    file_path, n_pages_in_file = self._file_ifd_map[file_idx]
+                    with tifffile.TiffFile(str(file_path)) as tf:
+                        for page_idx in page_indices:
+                            if page_idx < n_pages_in_file:
+                                page_data = tf.pages[page_idx].asarray()
+                                # Apply spatial slicing (y_slice, x_slice)
+                                if y_slice != slice(None) or x_slice != slice(None):
+                                    page_data = page_data[y_slice, x_slice]
+                                result_pages.append(page_data)
+
+                # Stack into 4D: pages are ordered file0_page0, file0_page1, ..., file1_page0, ...
+                if result_pages:
+                    result_4d = np.stack(result_pages, axis=0)
+                    # Reshape to (n_files, n_pages, H, W)
+                    h, w = result_4d.shape[-2:]
+                    result_4d = result_4d.reshape(n_files, n_pages, h, w)
+                else:
+                    result_4d = np.array([])
+
+                # Step 3: Renormalize to original ndim
+                # Remove singleton dimensions that weren't in original request
+                if original_ndim == 3:
+                    # Remove the page dimension (axis 1)
+                    result = result_4d.squeeze(axis=1)
+                elif original_ndim == 4:
+                    result = result_4d
+                else:
+                    # Keep as-is or squeeze unused dims
+                    result = result_4d
+
+                return result
             else:
                 # Single file or OME-TIFF with embedded structure
-                # Open the first file and use its series
                 file_path = self._tiff_files[0]
                 with tifffile.TiffFile(str(file_path)) as tf:
                     arr = tf.series[0].asarray(out='memmap')
