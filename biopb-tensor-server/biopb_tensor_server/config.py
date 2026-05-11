@@ -103,7 +103,7 @@ class SourceConfig:
 
     Attributes:
         url: URL or path to the data source (supports local paths and remote URLs)
-        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", or "aics".
+        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs", or "aics".
               Optional - auto-detected if None (only for local files).
         source_id: Unique identifier for the data source (auto-generated from URL if None)
         dim_labels: Dimension labels (optional, applies to all tensors in source)
@@ -115,7 +115,7 @@ class SourceConfig:
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
     url: str
-    type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "aics"]] = None
+    type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs", "aics"]] = None
     source_id: Optional[str] = None
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
@@ -368,7 +368,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 def detect_source_type(url: str) -> Optional[str]:
     """Detect source type from URL characteristics.
 
-    Returns one of: "zarr", "ome-zarr", "ome-tiff", "ome-tiff-multifile", "aics"
+    Returns one of: "zarr", "ome-zarr", "ome-zarr-hcs", "ome-tiff", "ome-tiff-multifile", "aics"
     or None if type cannot be determined.
 
     Note: HDF5 is NOT auto-detected because it requires explicit dataset path.
@@ -420,6 +420,11 @@ def detect_source_type(url: str) -> Optional[str]:
                 try:
                     with open(zattrs_path) as f:
                         zattrs = json.load(f)
+
+                    # Check for HCS plate metadata first (highest priority)
+                    if 'plate' in zattrs:
+                        return 'ome-zarr-hcs'
+
                     if 'multiscales' in zattrs:
                         return 'ome-zarr'
                 except (json.JSONDecodeError, KeyError, IOError):

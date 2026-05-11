@@ -6,7 +6,7 @@ Extends ZarrAdapter with OME multiscales metadata support.
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
@@ -32,23 +32,41 @@ class OmeZarrAdapter(ZarrAdapter):
 
     Supports both local and remote storage (S3, GCS, etc.) via fsspec.
 
+    For HCS (High-Content Screening) plates:
+    - Plate as source, wells/fields as tensors
+    - array_id = '{source_id}/{well_name}/{field_index}'
+    - _single_tensor_source = False (multi-tensor)
+
     Chunk ID format: Same as ZarrAdapter
     - array_id prefix
     - chunk key (UTF-8, e.g., "0/1/2")
 
-    Note: This adapter can be used in two ways:
-    1. Source-level: Manages multiple resolution levels, get_level_adapter() returns
+    Note: This adapter can be used in multiple ways:
+    1. Source-level (HCS plate): Manages wells/fields, get_tensor_adapter() returns
+       ZarrAdapter instances for specific fields
+    2. Source-level (single image): Manages resolution levels, get_level_adapter() returns
        ZarrAdapter instances for specific levels
-    2. Level-specific: Created with a specific level array, acts as single-tensor
+    3. Level-specific: Created with a specific level array, acts as single-tensor
     """
 
     # Default: single-tensor (level-specific usage)
-    # get_level_adapter() returns ZarrAdapter instances which are also single-tensor
+    # Set to False for HCS plates in __init__
     _single_tensor_source = True
+
+    # HCS-specific state (populated if _is_hcs_plate is True)
+    _is_hcs_plate: bool = False
+    _plate_root_path: Optional[str] = None  # Path to plate root directory
+    _hcs_well_paths: dict = {}  # well_name -> zarr path (e.g., 'A01' -> 'A01')
+    _hcs_field_count: int = 0
+    _hcs_well_metadata: dict = {}  # well_name -> well .zattrs
+    _field_adapters: dict = {}  # field_key -> cached adapter
 
     @classmethod
     def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
         """Claim .zarr directories with OME multiscales metadata.
+
+        Detects both regular OME-Zarr multiscale images and HCS plate datasets.
+        HCS plates are detected by 'plate' key in .zattrs (checked before multiscales).
 
         Args:
             path: Path to check (file or directory)
@@ -68,6 +86,15 @@ class OmeZarrAdapter(ZarrAdapter):
         try:
             with open(zattrs_path) as f:
                 zattrs = json.load(f)
+
+            # Check for HCS plate metadata first (higher priority)
+            if 'plate' in zattrs:
+                return SourceClaim(
+                    source_type="ome-zarr-hcs",
+                    primary_path=path,
+                    claimed_paths={path},
+                )
+
             # Check for OME multiscales key
             if 'multiscales' not in zattrs:
                 return None
@@ -83,6 +110,9 @@ class OmeZarrAdapter(ZarrAdapter):
     @classmethod
     def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
         """Claim remote OME-Zarr directories.
+
+        Detects both regular OME-Zarr multiscale images and HCS plate datasets.
+        HCS plates are detected by 'plate' key in .zattrs (checked before multiscales).
 
         Args:
             store: RemoteStore for remote access
@@ -108,6 +138,16 @@ class OmeZarrAdapter(ZarrAdapter):
         try:
             zattrs_content = store.read_text(zattrs_path)
             zattrs = json.loads(zattrs_content)
+
+            # Check for HCS plate metadata first (higher priority)
+            if 'plate' in zattrs:
+                return SourceClaim(
+                    source_type="ome-zarr-hcs",
+                    primary_path=store._join(path),
+                    claimed_paths={store._join(path)},
+                    is_remote=True,
+                )
+
             if 'multiscales' not in zattrs:
                 return None
         except (json.JSONDecodeError, Exception):
@@ -123,6 +163,9 @@ class OmeZarrAdapter(ZarrAdapter):
     @classmethod
     def create_from_config(cls, source: 'SourceConfig') -> 'OmeZarrAdapter':
         """Create adapter instance from SourceConfig.
+
+        Handles both regular OME-Zarr multiscale images and HCS plate datasets.
+        For HCS plates, opens the plate root group.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
@@ -145,22 +188,68 @@ class OmeZarrAdapter(ZarrAdapter):
             fs, fs_path = url_to_fs(zarr_path, storage_options=storage_options)
             store = zarr.FSStore(fs, fs_path)
 
-            # Read zattrs to find the first resolution level
+            # Read zattrs to determine type (HCS plate or multiscale)
             zattrs_bytes = fs.cat_file(fs_path.rstrip('/') + '/.zattrs')
             zattrs = json.loads(zattrs_bytes)
 
-            resolution_path = "0"
-            if 'multiscales' in zattrs and zattrs['multiscales']:
-                datasets = zattrs['multiscales'][0].get('datasets', [])
-                if datasets:
-                    resolution_path = datasets[0].get('path', '0')
+            # Check for HCS plate metadata
+            if 'plate' in zattrs:
+                # HCS plate: open group and first field for array reference
+                root = zarr.open_group(store, mode='r')
 
-            # Open the group and then the resolution array
-            root = zarr.open_group(store, mode='r')
-            if resolution_path in root:
-                arr = root[resolution_path]
+                # Find first well and field for initial array
+                plate_meta = zattrs.get('plate', {})
+                wells = plate_meta.get('wells', [])
+                if wells:
+                    first_well_path = wells[0].get('path', '0')
+
+                    # Read well .zattrs
+                    well_zattrs_bytes = fs.cat_file(
+                        fs_path.rstrip('/') + '/' + first_well_path.rstrip('/') + '/.zattrs'
+                    )
+                    well_zattrs = json.loads(well_zattrs_bytes)
+                    well_info = well_zattrs.get('well', {})
+                    images = well_info.get('images', [])
+                    if images:
+                        first_field_path = images[0].get('path', '0')
+
+                        # Read field .zattrs
+                        field_zattrs_bytes = fs.cat_file(
+                            fs_path.rstrip('/') + '/' + first_well_path.rstrip('/') +
+                            '/' + first_field_path.rstrip('/') + '/.zattrs'
+                        )
+                        field_zattrs = json.loads(field_zattrs_bytes)
+
+                        # Get first resolution level
+                        multiscales = field_zattrs.get('multiscales', [])
+                        if multiscales:
+                            datasets = multiscales[0].get('datasets', [])
+                            if datasets:
+                                resolution_path = datasets[0].get('path', '0')
+                                arr_path = first_well_path.rstrip('/') + '/' + first_field_path.rstrip('/') + '/' + resolution_path
+                                arr = zarr.open_array(store, path=arr_path, mode='r')
+                            else:
+                                arr = zarr.open_array(store, mode='r')
+                        else:
+                            arr = zarr.open_array(store, mode='r')
+                    else:
+                        arr = zarr.open_array(store, mode='r')
+                else:
+                    arr = zarr.open_array(store, mode='r')
             else:
-                arr = zarr.open_array(store, mode='r')
+                # Regular multiscale image
+                resolution_path = "0"
+                if 'multiscales' in zattrs and zattrs['multiscales']:
+                    datasets = zattrs['multiscales'][0].get('datasets', [])
+                    if datasets:
+                        resolution_path = datasets[0].get('path', '0')
+
+                # Open the group and then the resolution array
+                root = zarr.open_group(store, mode='r')
+                if resolution_path in root:
+                    arr = root[resolution_path]
+                else:
+                    arr = zarr.open_array(store, mode='r')
         else:
             # Local filesystem
             store = zarr.DirectoryStore(zarr_path)
@@ -169,17 +258,66 @@ class OmeZarrAdapter(ZarrAdapter):
                 with open(str(Path(zarr_path) / ".zattrs")) as f:
                     zattrs = json.load(f)
 
-                resolution_path = "0"
-                if 'multiscales' in zattrs and zattrs['multiscales']:
-                    datasets = zattrs['multiscales'][0].get('datasets', [])
-                    if datasets:
-                        resolution_path = datasets[0].get('path', '0')
+                # Check for HCS plate metadata
+                if 'plate' in zattrs:
+                    # HCS plate: open group and first field for array reference
+                    root = zarr.open_group(zarr_path, mode='r')
 
-                root = zarr.open_group(zarr_path, mode='r')
-                if resolution_path in root:
-                    arr = root[resolution_path]
+                    # Find first well and field for initial array
+                    plate_meta = zattrs.get('plate', {})
+                    wells = plate_meta.get('wells', [])
+                    if wells:
+                        first_well_path = wells[0].get('path', '0')
+
+                        # Read well .zattrs
+                        well_zattrs_path = str(Path(zarr_path) / first_well_path.rstrip('/') / '.zattrs')
+                        if Path(well_zattrs_path).exists():
+                            with open(well_zattrs_path) as wf:
+                                well_zattrs = json.load(wf)
+                                well_info = well_zattrs.get('well', {})
+                                images = well_info.get('images', [])
+                                if images:
+                                    first_field_path = images[0].get('path', '0')
+
+                                    # Read field .zattrs
+                                    field_zattrs_path = str(Path(zarr_path) / first_well_path.rstrip('/') / first_field_path.rstrip('/') / '.zattrs')
+                                    if Path(field_zattrs_path).exists():
+                                        with open(field_zattrs_path) as ff:
+                                            field_zattrs = json.load(ff)
+
+                                            # Get first resolution level
+                                            multiscales = field_zattrs.get('multiscales', [])
+                                            if multiscales:
+                                                datasets = multiscales[0].get('datasets', [])
+                                                if datasets:
+                                                    resolution_path = datasets[0].get('path', '0')
+                                                    arr_path = str(Path(zarr_path) / first_well_path.rstrip('/') / first_field_path.rstrip('/') / resolution_path)
+                                                    arr = zarr.open_array(arr_path, mode='r')
+                                                else:
+                                                    arr = zarr.open_array(zarr_path, mode='r')
+                                            else:
+                                                arr = zarr.open_array(zarr_path, mode='r')
+                                    else:
+                                        arr = zarr.open_array(zarr_path, mode='r')
+                                else:
+                                    arr = zarr.open_array(zarr_path, mode='r')
+                        else:
+                            arr = zarr.open_array(zarr_path, mode='r')
+                    else:
+                        arr = zarr.open_array(zarr_path, mode='r')
                 else:
-                    arr = zarr.open_array(store, mode='r')
+                    # Regular multiscale image
+                    resolution_path = "0"
+                    if 'multiscales' in zattrs and zattrs['multiscales']:
+                        datasets = zattrs['multiscales'][0].get('datasets', [])
+                        if datasets:
+                            resolution_path = datasets[0].get('path', '0')
+
+                    root = zarr.open_group(zarr_path, mode='r')
+                    if resolution_path in root:
+                        arr = root[resolution_path]
+                    else:
+                        arr = zarr.open_array(store, mode='r')
             except (json.JSONDecodeError, KeyError, FileNotFoundError):
                 arr = zarr.open_array(zarr_path, mode='r')
 
@@ -205,46 +343,77 @@ class OmeZarrAdapter(ZarrAdapter):
         super().__init__(zarr_array, source_id, dim_labels)
 
         self.resolution_level = resolution_level
-        # Override source type to ome-zarr
-        self._source_type = "ome-zarr"
 
         # Try to read OME metadata from .zattrs
         self.ome_metadata = {}
         self.axes = []
         self.channel_names = []
 
-        # Read .zattrs from the zarr group root
-        try:
-            store = zarr_array.store
-            store_str = str(store)
-            if store_str.startswith('file://'):
-                store_path = str(urlparse(store_str).path)
-            elif hasattr(store, 'path'):
-                # DirectoryStore has 'path' attribute
-                store_path = str(store.path)
-            elif hasattr(store, 'root'):
-                store_path = str(store.root)
-            else:
-                store_path = store_str
+        # Determine store path for reading .zattrs
+        store = zarr_array.store
+        store_str = str(store)
+        if store_str.startswith('file://'):
+            store_path = str(urlparse(store_str).path)
+        elif hasattr(store, 'path'):
+            # DirectoryStore has 'path' attribute
+            store_path = str(store.path)
+        elif hasattr(store, 'root'):
+            store_path = str(store.root)
+        else:
+            store_path = store_str
 
-            # .zattrs is at the group root level
-            zattrs_path = os.path.join(store_path, '.zattrs')
-            if not os.path.exists(zattrs_path):
-                # Check parent directory (group root)
-                parent_path = os.path.dirname(store_path.rstrip('/'))
-                zattrs_path = os.path.join(parent_path, '.zattrs')
+        # Navigate to find the plate root .zattrs (might be multiple levels up for HCS)
+        # For HCS plates, array is at plate.zarr/A01/0/0, but plate .zattrs is at plate.zarr/
+        # We need to find .zattrs with 'plate' key, not just any .zattrs
+        plate_root_path = None
+        zattrs_path = None
+        zattrs = None
 
-            if os.path.exists(zattrs_path):
-                with open(zattrs_path) as f:
-                    zattrs = json.load(f)
-                    self.ome_metadata = zattrs
-                    if 'multiscales' in zattrs:
-                        self.axes = zattrs['multiscales'][0].get('axes', [])
-                        if 'omero' in zattrs:
-                            channels = zattrs['omero'].get('channels', [])
-                            self.channel_names = [ch.get('label', f'ch{i}') for i, ch in enumerate(channels)]
-        except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError):
-            pass
+        # Navigate up to find .zattrs with plate metadata (HCS) or multiscales (single image)
+        current_path = store_path.rstrip('/')
+        while current_path and current_path != '/':
+            candidate_zattrs_path = os.path.join(current_path, '.zattrs')
+            if os.path.exists(candidate_zattrs_path):
+                try:
+                    with open(candidate_zattrs_path) as f:
+                        candidate_zattrs = json.load(f)
+
+                    # Check for HCS plate metadata first (highest priority)
+                    if 'plate' in candidate_zattrs:
+                        plate_root_path = current_path
+                        zattrs_path = candidate_zattrs_path
+                        zattrs = candidate_zattrs
+                        break  # Found plate root, stop searching
+
+                    # If we found multiscales without plate, this might be a single image
+                    # But continue searching up to see if there's a plate above
+                    if 'multiscales' in candidate_zattrs and zattrs is None:
+                        # Save this as fallback (single image case)
+                        plate_root_path = current_path
+                        zattrs_path = candidate_zattrs_path
+                        zattrs = candidate_zattrs
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+            # Move up one level
+            current_path = os.path.dirname(current_path)
+
+        if zattrs is not None:
+            self.ome_metadata = zattrs
+
+            # Check for HCS plate metadata first
+            if 'plate' in zattrs:
+                self._is_hcs_plate = True
+                self._single_tensor_source = False  # Multi-tensor!
+                self._source_type = "ome-zarr-hcs"
+                self._plate_root_path = plate_root_path  # Save for field adapters
+                self._parse_hcs_plate_structure(plate_root_path)
+            elif 'multiscales' in zattrs:
+                self._source_type = "ome-zarr"
+                self.axes = zattrs['multiscales'][0].get('axes', [])
+                if 'omero' in zattrs:
+                    channels = zattrs['omero'].get('channels', [])
+                    self.channel_names = [ch.get('label', f'ch{i}') for i, ch in enumerate(channels)]
 
         # Override dimension labels from OME metadata if not explicitly provided
         if dim_labels is None and self.axes:
@@ -255,6 +424,171 @@ class OmeZarrAdapter(ZarrAdapter):
 
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
+
+    def _parse_hcs_plate_structure(self, store_path: str) -> None:
+        """Parse HCS plate metadata from plate.zattrs and well .zattrs files.
+
+        Populates:
+        - _hcs_well_paths: dict mapping well_name -> well path
+        - _hcs_field_count: number of fields per well
+        - _hcs_well_metadata: dict mapping well_name -> well .zattrs
+
+        Args:
+            store_path: Path to the plate root directory
+        """
+        plate_meta = self.ome_metadata.get('plate', {})
+        wells = plate_meta.get('wells', [])
+
+        # Parse well paths from plate metadata
+        # wells is a list of dicts with 'path' and optionally 'row_index', 'column_index'
+        well_paths = {}
+        for well_info in wells:
+            well_path = well_info.get('path', '')
+            if well_path:
+                # Extract well name from path (e.g., 'A01' from 'A01' or '0' from '0')
+                well_name = well_path.rstrip('/').split('/')[-1]
+                well_paths[well_name] = well_path
+
+        self._hcs_well_paths = well_paths
+
+        # Read well metadata for each well to get field count
+        field_count = 0
+        well_metadata = {}
+        for well_name, well_path in well_paths.items():
+            well_zattrs_path = os.path.join(store_path, well_path.rstrip('/'), '.zattrs')
+            if os.path.exists(well_zattrs_path):
+                try:
+                    with open(well_zattrs_path) as f:
+                        well_zattrs = json.load(f)
+                        well_metadata[well_name] = well_zattrs
+
+                        # Get field count from well metadata
+                        # well metadata has 'well' key with 'images' list
+                        well_info = well_zattrs.get('well', {})
+                        images = well_info.get('images', [])
+                        if len(images) > field_count:
+                            field_count = len(images)
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+        self._hcs_field_count = field_count
+        self._hcs_well_metadata = well_metadata
+
+        # Get axes/dim_labels from first field's multiscales metadata
+        if well_metadata:
+            first_well = list(well_metadata.values())[0]
+            well_info = first_well.get('well', {})
+            images = well_info.get('images', [])
+            if images:
+                # Path to first field
+                first_field_path = images[0].get('path', '0')
+                # Try to read field .zattrs for axes
+                first_well_name = list(well_metadata.keys())[0]
+                field_zattrs_path = os.path.join(
+                    store_path,
+                    self._hcs_well_paths[first_well_name].rstrip('/'),
+                    first_field_path.rstrip('/'),
+                    '.zattrs'
+                )
+                if os.path.exists(field_zattrs_path):
+                    try:
+                        with open(field_zattrs_path) as f:
+                            field_zattrs = json.load(f)
+                            if 'multiscales' in field_zattrs:
+                                self.axes = field_zattrs['multiscales'][0].get('axes', [])
+                                if 'omero' in field_zattrs:
+                                    channels = field_zattrs['omero'].get('channels', [])
+                                    self.channel_names = [ch.get('label', f'ch{i}') for i, ch in enumerate(channels)]
+                    except (json.JSONDecodeError, IOError):
+                        pass
+
+    def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
+        """Enumerate all fields in HCS plate as flattened tensor list.
+
+        Returns TensorDescriptors with:
+        - array_id = '{well_name}/{field_index}'
+        - shape from multiscales metadata
+        - chunk_shape from multiscales metadata
+        - dtype from field array
+
+        Returns:
+            List of TensorDescriptor for all fields in the plate
+        """
+        import zarr
+
+        descriptors = []
+
+        # Use plate root path for navigation
+        store_path = self._plate_root_path
+
+        for well_name, well_path in self._hcs_well_paths.items():
+            well_meta = self._hcs_well_metadata.get(well_name, {})
+            well_info = well_meta.get('well', {})
+            images = well_info.get('images', [])
+
+            for field_idx, image_info in enumerate(images):
+                field_path = image_info.get('path', str(field_idx))
+                field_key = f"{well_name}/{field_idx}"
+
+                # Try to read field .zattrs for shape/dtype
+                field_zattrs_path = os.path.join(
+                    store_path,
+                    well_path.rstrip('/'),
+                    field_path.rstrip('/'),
+                    '.zattrs'
+                )
+
+                shape = []
+                chunk_shape = []
+                dtype = ""
+                dim_labels = self.dim_labels
+
+                if os.path.exists(field_zattrs_path):
+                    try:
+                        with open(field_zattrs_path) as f:
+                            field_zattrs = json.load(f)
+                            multiscales = field_zattrs.get('multiscales', [])
+                            if multiscales:
+                                datasets = multiscales[0].get('datasets', [])
+                                if datasets:
+                                    # Get shape/chunks from first resolution level
+                                    first_level_path = datasets[0].get('path', '0')
+
+                                    # Open the array to get actual shape/chunks/dtype
+                                    arr_path = os.path.join(
+                                        store_path,
+                                        well_path.rstrip('/'),
+                                        field_path.rstrip('/'),
+                                        first_level_path
+                                    )
+                                    try:
+                                        arr = zarr.open_array(arr_path, mode='r')
+                                        shape = list(arr.shape)
+                                        chunk_shape = list(arr.chunks)
+                                        dtype = arr.dtype.str
+                                    except Exception:
+                                        # Fallback: estimate from multiscales metadata
+                                        pass
+
+                                # Get axes from multiscales
+                                axes = multiscales[0].get('axes', [])
+                                if axes:
+                                    dim_labels = [
+                                        ax.get('name', f'dim{i}') if isinstance(ax, dict) else str(ax)
+                                        for i, ax in enumerate(axes)
+                                    ]
+                    except (json.JSONDecodeError, IOError):
+                        pass
+
+                descriptors.append(TensorDescriptor(
+                    array_id=field_key,  # '{well_name}/{field_index}'
+                    dim_labels=dim_labels,
+                    shape=shape,
+                    chunk_shape=chunk_shape,
+                    dtype=dtype,
+                ))
+
+        return descriptors
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""
@@ -279,6 +613,159 @@ class OmeZarrAdapter(ZarrAdapter):
     def get_metadata(self) -> dict:
         """Return OME-Zarr .zattrs content directly."""
         return self.ome_metadata
+
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """List all tensors available in this source.
+
+        For HCS plates: Returns flattened list of field tensors.
+        For single images: Returns the single tensor descriptor.
+
+        Returns:
+            List of TensorDescriptor for all tensors in this source.
+        """
+        if self._is_hcs_plate:
+            return self._enumerate_hcs_fields()
+        else:
+            # Single multiscale image
+            return [self.get_tensor_descriptor()]
+
+    def get_tensor_adapter(self, tensor_id: str) -> 'BackendAdapter':
+        """Get adapter for a specific tensor.
+
+        For HCS plates: Returns ZarrAdapter for the specific field.
+        For single images: Returns self with tensor context set.
+
+        Args:
+            tensor_id: For HCS: 'well_name/field_index', for single image: optional
+
+        Returns:
+            BackendAdapter for the specific tensor with tensor context set
+        """
+        if not self._is_hcs_plate:
+            # Single image: use base class behavior
+            return super().get_tensor_adapter(tensor_id)
+
+        # HCS plate: create field-level adapter
+        # Parse tensor_id as 'well_name/field_index'
+        parts = tensor_id.split('/')
+        if len(parts) != 2:
+            raise ValueError(f"HCS tensor_id must be 'well_name/field_index', got: {tensor_id}")
+
+        well_name, field_idx_str = parts
+        try:
+            field_idx = int(field_idx_str)
+        except ValueError:
+            raise ValueError(f"HCS field_index must be an integer, got: {field_idx_str}")
+
+        # Check if well exists
+        if well_name not in self._hcs_well_paths:
+            raise ValueError(f"Unknown well: {well_name}")
+
+        field_key = f"{well_name}/{field_idx}"
+
+        # Cache field adapters for reuse
+        if not hasattr(self, '_field_adapters'):
+            self._field_adapters = {}
+
+        if field_key in self._field_adapters:
+            return self._field_adapters[field_key]
+
+        # Create ZarrAdapter for the field's resolution array
+        field_adapter = self._create_field_adapter(well_name, field_idx)
+
+        # Set tensor context directly on the field adapter
+        field_adapter._tensor_context = True
+        field_adapter._tensor_name = f"{well_name}/{field_idx}"
+
+        self._field_adapters[field_key] = field_adapter
+        return field_adapter
+
+    def _create_field_adapter(self, well_name: str, field_idx: int) -> ZarrAdapter:
+        """Create ZarrAdapter for a specific field.
+
+        Opens the field's resolution array (level 0 by default).
+
+        Args:
+            well_name: Well identifier (e.g., 'A01')
+            field_idx: Field index within the well
+
+        Returns:
+            ZarrAdapter for the field array
+        """
+        import zarr
+
+        well_path = self._hcs_well_paths[well_name]
+        well_meta = self._hcs_well_metadata.get(well_name, {})
+        well_info = well_meta.get('well', {})
+        images = well_info.get('images', [])
+
+        if field_idx >= len(images):
+            raise ValueError(f"Field index {field_idx} out of range for well {well_name} (has {len(images)} fields)")
+
+        field_path = images[field_idx].get('path', str(field_idx))
+
+        # Use plate root path for navigation
+        store_path = self._plate_root_path
+
+        # Read field .zattrs to get resolution path
+        field_zattrs_path = os.path.join(
+            store_path,
+            well_path.rstrip('/'),
+            field_path.rstrip('/'),
+            '.zattrs'
+        )
+
+        resolution_path = "0"
+        if os.path.exists(field_zattrs_path):
+            try:
+                with open(field_zattrs_path) as f:
+                    field_zattrs = json.load(f)
+                    multiscales = field_zattrs.get('multiscales', [])
+                    if multiscales:
+                        datasets = multiscales[0].get('datasets', [])
+                        if datasets:
+                            resolution_path = datasets[0].get('path', '0')
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        # Open the field's resolution array
+        arr_path = os.path.join(
+            store_path,
+            well_path.rstrip('/'),
+            field_path.rstrip('/'),
+            resolution_path
+        )
+
+        arr = zarr.open_array(arr_path, mode='r')
+
+        # Get dim_labels from field multiscales
+        dim_labels = None
+        if os.path.exists(field_zattrs_path):
+            try:
+                with open(field_zattrs_path) as f:
+                    field_zattrs = json.load(f)
+                    multiscales = field_zattrs.get('multiscales', [])
+                    if multiscales:
+                        axes = multiscales[0].get('axes', [])
+                        if axes:
+                            dim_labels = [
+                                ax.get('name', f'dim{i}') if isinstance(ax, dict) else str(ax)
+                                for i, ax in enumerate(axes)
+                            ]
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        # Create adapter for this field
+        field_adapter = ZarrAdapter(
+            arr,
+            source_id=self.source_id,
+            dim_labels=dim_labels or self.dim_labels,
+        )
+
+        # Set tensor name for array_id computation
+        field_adapter._tensor_name = f"{well_name}/{field_idx}"
+
+        return field_adapter
 
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
         """Return read plan for requested scale.

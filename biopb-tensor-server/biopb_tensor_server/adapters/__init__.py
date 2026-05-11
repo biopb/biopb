@@ -56,7 +56,7 @@ def get_default_registry() -> AdapterRegistry:
 
     Adapter registration order (by priority/specificity, highest first):
     1. AicsImageIoAdapter - Primary handler (well-maintained, supports CZI, LIF, ND2, DV, LSM, OIF, OIB, XML)
-    2. OmeZarrAdapter - OME-Zarr specific (more specific than generic Zarr)
+    2. OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
     3. ZarrAdapter - Generic Zarr fallback
     4. MultiFileOmeTiffAdapter - Multi-file OME-TIFF/MicroManager datasets
     5. OmeTiffAdapter - Single-file OME-TIFF only (.ome.tiff/.ome.tif extensions)
@@ -75,6 +75,7 @@ def get_default_registry() -> AdapterRegistry:
         registry.register_with_type("aics", AicsImageIoAdapter)
 
     registry.register_with_type("ome-zarr", OmeZarrAdapter)
+    registry.register_with_type("ome-zarr-hcs", OmeZarrAdapter)  # HCS plates use same adapter
     registry.register_with_type("zarr", ZarrAdapter)
     registry.register_with_type("ome-tiff-multifile", MultiFileOmeTiffAdapter)
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
