@@ -196,7 +196,6 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
     # === Claim Protocol ===
 
     @classmethod
-    @abstractmethod
     def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
         """Claim a filesystem path as a data source.
 
@@ -225,7 +224,7 @@ class BackendAdapter(ABC, metaclass=BackendAdapterMeta):
                 - Check if path is a directory with multi-file structure
                 - Return multi-node claim (directory + all TIFF files)
         """
-        pass
+        return None  # Default implementation claims nothing, override in subclasses
 
     # === Utility methods ===
 

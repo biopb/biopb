@@ -605,15 +605,8 @@ def discover_sources_async(
         discovered_count = 0
 
         if is_remote:
-            # Remote discovery
-            state = discover_remote_source(
-                url=url,
-                registry=registry,
-                credentials_config=credentials_config,
-                profile_name=profile_name,
-                state=state,
-                dim_labels=dim_labels,
-            )
+            # Remote discovery is disabled for now
+            logger.warning(f"Remote source {url} is ignored - remote discovery is not yet enabled")
         else:
             # Local discovery
             local_path = Path(url).resolve() if Path(url).exists() else None
