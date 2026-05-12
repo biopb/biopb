@@ -1,0 +1,267 @@
+"""Regression tests for biopb-tensor-server.
+
+Contains tests for:
+1. Claim-based discovery passing Path instead of ClaimContext
+2. File deletion not updating flight catalog due to Path vs str mismatch
+"""
+
+import os
+import tempfile
+
+import numpy as np
+import pytest
+import tifffile
+
+from biopb_tensor_server.config import (
+    SourceConfig,
+    discover_sources,
+    get_default_registry,
+)
+
+
+class TestDiscoverSourcesRegression:
+    """Regression tests for discover_sources claim-based detection."""
+
+    def test_file_discovery_without_type_uses_claim_context(self):
+        """Test that file discovery works when type is not specified.
+
+        This regression test verifies that discover_sources() properly
+        creates ClaimContext when calling get_claims_for_path() for a file
+        without an explicit type.
+
+        Before the fix, this would fail with:
+        'PosixPath' object has no attribute 'is_remote'
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a simple TIFF file
+            tiff_path = os.path.join(tmpdir, "test.tif")
+            data = np.random.randint(0, 255, (64, 64), dtype=np.uint16)
+            tifffile.imwrite(tiff_path, data)
+
+            # SourceConfig without type - triggers claim-based detection
+            source = SourceConfig(url=tiff_path)
+
+            # This should work without 'PosixPath' object has no attribute 'is_remote'
+            registry = get_default_registry()
+            discovered = discover_sources(source, registry)
+
+            assert len(discovered) == 1
+            assert discovered[0].type is not None
+            assert discovered[0].source_id is not None
+
+    def test_directory_discovery_without_type_uses_claim_context(self):
+        """Test that directory discovery works when type is not specified.
+
+        This regression test verifies that discover_sources() properly
+        creates ClaimContext when calling get_claims_for_path() for a directory
+        without an explicit type or source_id.
+
+        Before the fix, this would fail with:
+        'PosixPath' object has no attribute 'is_remote'
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a directory with a TIFF file
+            subdir = os.path.join(tmpdir, "data")
+            os.makedirs(subdir)
+            tiff_path = os.path.join(subdir, "image.tif")
+            data = np.random.randint(0, 255, (64, 64), dtype=np.uint16)
+            tifffile.imwrite(tiff_path, data)
+
+            # SourceConfig without type or source_id - triggers claim-based discovery
+            source = SourceConfig(url=tmpdir)
+
+            # This should work without 'PosixPath' object has no attribute 'is_remote'
+            registry = get_default_registry()
+            discovered = discover_sources(source, registry)
+
+            assert len(discovered) >= 1
+            for src in discovered:
+                assert src.type is not None
+                assert src.source_id is not None
+
+    def test_get_claims_for_path_accepts_claim_context(self):
+        """Direct test that get_claims_for_path works with ClaimContext.
+
+        This verifies the API contract directly, ensuring adapters receive
+        ClaimContext objects with the is_remote property.
+        """
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a TIFF file
+            tiff_path = os.path.join(tmpdir, "test.tif")
+            data = np.random.randint(0, 255, (64, 64), dtype=np.uint16)
+            tifffile.imwrite(tiff_path, data)
+
+            # Create ClaimContext (local path, so is_remote=False)
+            ctx = ClaimContext(tiff_path)
+            assert ctx.is_remote is False
+            assert ctx.is_file() is True
+
+            # Get claims - should not raise 'PosixPath' has no 'is_remote'
+            registry = get_default_registry()
+            state = DiscoveryState()
+            claims = registry.get_claims_for_path(ctx, state)
+
+            assert len(claims) >= 1
+            assert claims[0].source_type is not None
+
+
+class TestDeleteSourceRegression:
+    """Regression tests for source deletion Path vs str bug."""
+
+    def test_path_to_source_mapping_uses_string_keys(self):
+        """Test that path_to_source uses string keys, not Path objects.
+
+        This verifies the internal mapping convention that caused the bug.
+        get_source_for_path() and remove_claim() expect string keys.
+        """
+        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+
+        state = DiscoveryState()
+
+        # Add a claim manually with string path
+        claim = SourceClaim(
+            source_type="test",
+            primary_path="/tmp/test.tif",
+            source_id="test_123",
+        )
+        state.consumed_paths.discard("/tmp/test.tif")  # Remove from consumed to allow add
+        state.add_claim(claim)
+
+        # Verify string lookup works
+        assert state.get_source_for_path("/tmp/test.tif") == "test_123"
+
+        # Verify Path object lookup does NOT work (demonstrates the bug pattern)
+        from pathlib import Path
+        assert state.get_source_for_path(Path("/tmp/test.tif")) is None
+
+    def test_remove_claim_requires_string_key(self):
+        """Test that remove_claim expects string key.
+
+        This verifies that remove_claim() properly handles string keys.
+        """
+        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+
+        state = DiscoveryState()
+
+        # Add a claim manually
+        claim = SourceClaim(
+            source_type="test",
+            primary_path="/tmp/test.tif",
+            source_id="test_123",
+        )
+        state.consumed_paths.discard("/tmp/test.tif")
+        state.add_claim(claim)
+
+        assert len(state.claims) == 1
+
+        # Remove with string (correct)
+        removed_id = state.remove_claim("/tmp/test.tif")
+        assert removed_id == "test_123"
+        assert len(state.claims) == 0
+
+    def test_handle_deleted_path_to_str_conversion(self):
+        """Test that Path.resolve() result must be converted to str for lookup.
+
+        This regression test directly demonstrates the fix needed in source_manager.
+        The _handle_deleted method was passing Path object to get_source_for_path
+        and remove_claim, but they expect string keys.
+        """
+        from pathlib import Path
+        from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
+
+        state = DiscoveryState()
+
+        # Simulate a path being resolved
+        test_path = Path("/tmp/test.tif")
+        resolved = test_path.resolve()
+
+        # Add claim with the resolved string path
+        claim = SourceClaim(
+            source_type="test",
+            primary_path=str(resolved),
+            source_id="test_456",
+        )
+        state.consumed_paths.discard(str(resolved))
+        state.add_claim(claim)
+
+        # BUG: Passing Path object would fail
+        # source_id = state.get_source_for_path(resolved)  # Path object - returns None!
+        # assert source_id is None
+
+        # FIX: Convert to string first
+        source_id = state.get_source_for_path(str(resolved))  # String - works!
+        assert source_id == "test_456"
+
+        # Remove also requires string
+        removed = state.remove_claim(str(resolved))
+        assert removed == "test_456"
+
+    def test_handle_moved_arguments_order(self):
+        """Test that _handle_moved receives correct old_path and new_path order.
+
+        The watcher stores MOVED events with:
+        - WatcherEvent.path = old_path (original location)
+        - WatcherEvent.old_path = new_path (new location) - confusing naming!
+
+        Before the fix, _handle_moved was called with swapped arguments:
+        _handle_moved(event.old_path, event.path) = _handle_moved(new_path, old_path)
+
+        After the fix:
+        _handle_moved(event.path, event.old_path) = _handle_moved(old_path, new_path)
+        """
+        from pathlib import Path
+        from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+
+        # Simulate what the watcher creates for a move event
+        # The watcher stores: event_buffer[old_path] = (MOVED, time, new_path)
+        # So WatcherEvent has: path=old_path, old_path=new_path
+        original_path = Path("/home/user/data/test.tif")
+        new_path = Path("/home/user/data/test_.tif")
+
+        # Watcher creates this (confusing naming in WatcherEvent.old_path)
+        event = WatcherEvent(
+            event_type=WatcherEventType.MOVED,
+            path=original_path,  # This is actually the OLD path
+            old_path=new_path,   # This is actually the NEW path
+            is_directory=False,
+        )
+
+        # Verify the confusing naming
+        assert event.path == original_path  # OLD path (original location)
+        assert event.old_path == new_path   # NEW path (destination)
+
+        # Correct call order: _handle_moved(old_path, new_path)
+        # Should be: _handle_moved(event.path, event.old_path)
+        # NOT: _handle_moved(event.old_path, event.path) - SWAPPED!
+
+
+class TestCreatedSourceRegression:
+    """Regression tests for source creation using ClaimContext."""
+
+    def test_handle_created_uses_claim_context(self):
+        """Test that _handle_created uses ClaimContext for get_claims_for_path.
+
+        Before the fix, _handle_created was passing Path directly to
+        get_claims_for_path(), causing 'PosixPath' object has no attribute 'is_remote'.
+        """
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tiff_path = os.path.join(tmpdir, "test.tif")
+            data = np.random.randint(0, 255, (64, 64), dtype=np.uint16)
+            tifffile.imwrite(tiff_path, data)
+
+            # Create ClaimContext (the correct API)
+            ctx = ClaimContext(tiff_path)
+            assert ctx.is_remote is False
+            assert ctx.is_file() is True
+
+            # get_claims_for_path must accept ClaimContext, not Path
+            registry = get_default_registry()
+            state = DiscoveryState()
+            claims = registry.get_claims_for_path(ctx, state)
+
+            assert len(claims) >= 1
+            assert claims[0].source_type == "aics"

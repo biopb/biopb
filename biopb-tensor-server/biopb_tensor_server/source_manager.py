@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
+    ClaimContext,
     DiscoveryState,
     SourceClaim,
     discover_sources,
@@ -186,7 +187,7 @@ class SourceManager:
             elif event.event_type == WatcherEventType.DELETED:
                 self._handle_deleted(event.path, event.is_directory)
             elif event.event_type == WatcherEventType.MOVED:
-                self._handle_moved(event.old_path, event.path, event.is_directory)
+                self._handle_moved(event.path, event.old_path, event.is_directory)
         except Exception as e:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
@@ -221,10 +222,8 @@ class SourceManager:
             return
 
         # Try to claim
-        claims = self._registry.get_claims_for_path(
-            resolved_path,
-            self._state.visited_identities,
-        )
+        ctx = ClaimContext(resolved_path)
+        claims = self._registry.get_claims_for_path(ctx, self._state)
 
         if claims:
             claim = claims[0]
@@ -246,11 +245,11 @@ class SourceManager:
             path: Path to deleted file/directory
             is_directory: True if path is a directory
         """
-        resolved_path = path.resolve()
+        resolved_path = str(path.resolve())
 
         if is_directory:
             # Cascade deletion - remove all sources inside this directory
-            self._handle_directory_deleted(resolved_path)
+            self._handle_directory_deleted(Path(path.resolve()))
         else:
             # Single file deletion
             source_id = self._state.get_source_for_path(resolved_path)
@@ -339,7 +338,7 @@ class SourceManager:
             new_path: New resolved path
             is_directory: True if path is a directory
         """
-        source_id = self._state.get_source_for_path(old_path)
+        source_id = self._state.get_source_for_path(str(old_path))
 
         if source_id:
             claim = self._state.claims.get(source_id)

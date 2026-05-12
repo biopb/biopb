@@ -72,6 +72,8 @@ from typing import Any, Dict, List, Literal, Optional
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
+    ClaimContext,
+    DiscoveryState,
     SourceClaim,
     discover_sources as claim_based_discover,
     generate_source_id,
@@ -695,14 +697,15 @@ def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] =
     # Case 2: File with no type - try claim-based detection
     if local_path.is_file():
         # Try claim-based detection first
-        visited_identities = set()
+        ctx = ClaimContext(local_path)
+        state = DiscoveryState()
         try:
             identity = get_file_identity(local_path)
-            visited_identities.add(identity)
+            state.visited_identities.add(identity)
         except OSError:
             pass
 
-        claims = registry.get_claims_for_path(local_path, visited_identities)
+        claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]
             return [_claim_to_source_config(claim, source)]
@@ -728,14 +731,15 @@ def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] =
 
     # Case 4: Directory with no type and no source_id - use claim-based discovery
     # First check if the directory itself is a data source
-    visited_identities = set()
+    ctx = ClaimContext(local_path)
+    state = DiscoveryState()
     try:
         identity = get_file_identity(local_path)
-        visited_identities.add(identity)
+        state.visited_identities.add(identity)
     except OSError:
         pass
 
-    claims = registry.get_claims_for_path(local_path, visited_identities)
+    claims = registry.get_claims_for_path(ctx, state)
     if claims:
         claim = claims[0]
         return [_claim_to_source_config(claim, source)]
