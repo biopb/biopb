@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAppStore } from "./store";
 
 export function ClientBootstrap() {
@@ -9,10 +9,20 @@ export function ClientBootstrap() {
   const stopCatalogPolling = useAppStore((s) => s.stopCatalogPolling);
   const initialised = useRef(false);
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   useEffect(() => {
     if (initialised.current) return;
     initialised.current = true;
+
+    // Check for token in URL first (bypass unlock page)
+    const urlToken = searchParams.get("token");
+    if (urlToken) {
+      sessionStorage.setItem("biopb_token", urlToken.trim());
+      // Clean URL to remove token parameter (prevent leaking in history)
+      searchParams.delete("token");
+      setSearchParams(searchParams, { replace: true });
+    }
 
     const apiBase =
       import.meta.env.VITE_TENSOR_API ?? "http://localhost:8816";
@@ -49,7 +59,7 @@ export function ClientBootstrap() {
         });
       }
     })();
-  }, [initClient, loadSources, startCatalogPolling, navigate]);
+  }, [initClient, loadSources, startCatalogPolling, navigate, searchParams, setSearchParams]);
 
   // Stop polling on unmount
   useEffect(() => {
