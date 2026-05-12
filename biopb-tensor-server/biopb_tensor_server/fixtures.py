@@ -82,6 +82,93 @@ def create_multifile_micromanager_dataset(
     return str(dir_path), file_list, metadata
 
 
+def create_5d_6d_micromanager_dataset(
+    tmpdir: str,
+    n_positions: int = 2,
+    n_times: int = 3,
+    n_channels: int = 2,
+    n_z: int = 4,
+    image_shape: Tuple[int, int] = (32, 32),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, List[str], Dict]:
+    """Create full 5D/6D MicroManager dataset with position, time, channel, and z dimensions.
+
+    Creates a directory with:
+    - metadata.txt (Micro-Manager JSON format with IntendedDimensions, AxisOrder, and Coords)
+    - img_pos0_time0_channel0_slice0.tif, etc.
+
+    Args:
+        tmpdir: Temporary directory to create dataset in
+        n_positions: Number of positions
+        n_times: Number of time points
+        n_channels: Number of channels
+        n_z: Number of z slices
+        image_shape: Shape of each image (height, width)
+        dtype: Data type for images
+
+    Returns:
+        Tuple of (directory_path, file_list, metadata_dict)
+    """
+    import tifffile
+
+    dir_path = Path(tmpdir)
+    file_list = []
+
+    # Build metadata with full 5D/6D structure
+    metadata = {
+        "Summary": {
+            "AxisOrder": ["position", "time", "channel", "z"],
+            "IntendedDimensions": {
+                "position": n_positions,
+                "time": n_times,
+                "channel": n_channels,
+                "z": n_z,
+            },
+            "Channels": n_channels,
+            "Slices": n_z,
+            "Frames": n_times,
+            "Positions": n_positions,
+        }
+    }
+
+    # Generate files for all combinations
+    for pos_idx in range(n_positions):
+        for time_idx in range(n_times):
+            for chan_idx in range(n_channels):
+                for z_idx in range(n_z):
+                    # Micro-Manager naming convention for 5D/6D
+                    filename = f"img_pos{pos_idx}_time{time_idx}_channel{chan_idx}_slice{z_idx}.tif"
+
+                    # Add coords
+                    coord_key = f"Coords-Default/{filename}"
+                    metadata[coord_key] = {
+                        "PositionIndex": pos_idx,
+                        "TimeIndex": time_idx,
+                        "ChannelIndex": chan_idx,
+                        "SliceIndex": z_idx,
+                    }
+                    meta_key = f"Metadata-Default/{filename}"
+                    metadata[meta_key] = {
+                        "UUID": f"uuid-{pos_idx}-{time_idx}-{chan_idx}-{z_idx}",
+                        "Width": image_shape[1],
+                        "Height": image_shape[0],
+                    }
+
+                    # Create file with unique data for verification
+                    filepath = dir_path / filename
+                    # Encode position, time, channel, z in the data for verification
+                    value = pos_idx * 1000 + time_idx * 100 + chan_idx * 10 + z_idx
+                    data = np.full(image_shape, value, dtype=dtype)
+                    tifffile.imwrite(str(filepath), data, photometric="minisblack")
+                    file_list.append(filename)
+
+    # Write metadata file
+    metadata_path = dir_path / "metadata.txt"
+    metadata_path.write_text(json.dumps(metadata))
+
+    return str(dir_path), file_list, metadata
+
+
 def create_multifile_ome_dataset(
     tmpdir: str,
     complete: bool = True,
@@ -284,6 +371,135 @@ def create_tiled_ome_tiff(
     }
 
     return str(tiff_path), shape, tile_info
+
+
+def create_multi_series_ome_tiff(
+    tmpdir: str,
+    n_series: int = 3,
+    series_shape: Tuple[int, int, int] = (2, 64, 64),
+    tile_size: Tuple[int, int] = (32, 32),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, List[str], Dict]:
+    """Create OME-TIFF with multiple series (multi-field/multi-position).
+
+    Creates a tiled OME-TIFF file with multiple series, each representing
+    a different field/position. Each series has distinguishable data.
+
+    Args:
+        tmpdir: Temporary directory to create file in
+        n_series: Number of series (fields)
+        series_shape: Shape of each series (n_planes, height, width)
+        tile_size: Tile size (tile_height, tile_width)
+        dtype: Data type
+
+    Returns:
+        Tuple of (tiff_path, series_names, series_info)
+    """
+    import tifffile
+
+    tiff_path = Path(tmpdir) / "multiseries.ome.tif"
+
+    # Create data for each series with distinguishable values
+    series_names = []
+    series_info = {'n_series': n_series, 'shapes': []}
+
+    # Write multi-series TIFF using tifffile's metadata support
+    data_stack = []
+    for series_idx in range(n_series):
+        series_name = f"Field_{series_idx}"
+        series_names.append(series_name)
+
+        # Create data for this series - each series has unique values
+        series_data = np.zeros(series_shape, dtype=dtype)
+        for plane_idx in range(series_shape[0]):
+            # Each series-plane has unique value: series_idx * 100 + plane_idx + 1
+            series_data[plane_idx] = series_idx * 100 + plane_idx + 1
+
+        data_stack.append(series_data)
+        series_info['shapes'].append(series_shape)
+
+    # Write as OME-TIFF with multiple images (series)
+    # tifffile handles this via metadata
+    with tifffile.TiffWriter(str(tiff_path), bigtiff=True) as tif:
+        for series_idx, series_data in enumerate(data_stack):
+            # Write each series as a separate image
+            tif.write(
+                series_data,
+                photometric="minisblack",
+                tile=tile_size,
+                metadata={
+                    'axes': 'CYX',
+                    'Name': f"Field_{series_idx}",
+                },
+            )
+
+    return str(tiff_path), series_names, series_info
+
+
+def create_companion_ome_dataset(
+    tmpdir: str,
+    n_files: int = 3,
+    image_shape: Tuple[int, int] = (64, 64),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, List[str], Dict]:
+    """Create companion OME dataset with .companion.ome file.
+
+    Creates a directory with:
+    - sample.companion.ome (OME-XML companion file referencing TIFF files)
+    - data_001.tif, data_002.tif, etc. (plain TIFFs referenced by companion)
+
+    Args:
+        tmpdir: Temporary directory to create dataset in
+        n_files: Number of TIFF files to create
+        image_shape: Shape of each image (height, width)
+        dtype: Data type
+
+    Returns:
+        Tuple of (companion_path, tiff_files, metadata_info)
+    """
+    import tifffile
+
+    dir_path = Path(tmpdir)
+
+    # Create TIFF files with unique values
+    tiff_files = []
+    for i in range(n_files):
+        filename = f"data_{i+1:03d}.tif"
+        filepath = dir_path / filename
+        data = np.full(image_shape, i + 1, dtype=dtype)
+        tifffile.imwrite(str(filepath), data)
+        tiff_files.append(str(filepath))
+
+    # Create companion.ome file with OME-XML referencing TIFFs
+    ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0" Name="companion_test">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" SizeX="{width}" SizeY="{height}" SizeZ="{n_files}" SizeC="1" SizeT="1" Type="uint16">
+""".format(width=image_shape[1], height=image_shape[0], n_files=n_files)
+
+    for i in range(n_files):
+        filename = f"data_{i+1:03d}.tif"
+        uuid = f"urn:uuid:data-{i+1}"
+        ome_xml += f"""      <TiffData FirstZ="{i}" FirstC="0" FirstT="0" IFD="0">
+        <UUID FileName="{filename}">{uuid}</UUID>
+      </TiffData>
+"""
+
+    ome_xml += """    </Pixels>
+  </Image>
+</OME>"""
+
+    # Write companion file
+    companion_path = dir_path / "sample.companion.ome"
+    companion_path.write_text(ome_xml)
+
+    metadata_info = {
+        'n_files': n_files,
+        'image_shape': image_shape,
+        'companion_path': str(companion_path),
+    }
+
+    return str(companion_path), tiff_files, metadata_info
 
 
 def create_hdf5_dataset(

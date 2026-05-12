@@ -15,10 +15,14 @@ Note: This package is not distributed via PyPI. Install locally with:
 
 from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
+from biopb_tensor_server.adapters.tiff import (
+    OmeTiffAdapter,
+    TiffSequenceAdapter,
+    MicroManagerLegacyAdapter,
+)
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.downsample import ComputeBackendOptions, configure_compute_backend, get_compute_backend_options
-from biopb_tensor_server.base import BackendAdapter, TensorReadPlan
+from biopb_tensor_server.base import BackendAdapter, SourceAdapter, TensorAdapter, TensorReadPlan
 from biopb_tensor_server.chunk import ChunkEndpoint
 
 from biopb_tensor_server.cache import (
@@ -50,7 +54,9 @@ except Exception:
 __all__ = [
     'TensorFlightServer',
     'serve',
-    'BackendAdapter',
+    'SourceAdapter',
+    'TensorAdapter',
+    "BackendAdapter",
     'ChunkEndpoint',
     'TensorReadPlan',
     'ComputeBackendOptions',
@@ -59,7 +65,8 @@ __all__ = [
     'ZarrAdapter',
     'Hdf5Adapter',
     'OmeTiffAdapter',
-    'MultiFileOmeTiffAdapter',
+    'TiffSequenceAdapter',
+    'MicroManagerLegacyAdapter',
     'OmeZarrAdapter',
     'CacheManager',
     'CacheBackend',

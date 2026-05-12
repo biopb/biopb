@@ -1,29 +1,112 @@
 """OME-TIFF adapters for tensor storage.
 
-Relies on OS page cache for raw data caching.
+We could just use aiscimageio backend. But a separate module makes the claim protcol cleaner.
 """
 
+import json
+import os
+import re
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
+import tifffile
+import zarr
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, get_file_identity, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim, get_file_identity, is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
 
 
 # =============================================================================
 # OME-XML metadata helpers
 # =============================================================================
+
+def _get_namespace(root) -> dict:
+    """Extract namespace from root element tag.
+
+    Args:
+        root: ElementTree root element
+
+    Returns:
+        Dictionary with namespace mapping for OME schema
+    """
+    tag = root.tag
+    if tag.startswith('{'):
+        namespace = tag.split('}')[0].strip('{')
+        return {'ome': namespace}
+    # Fall back to common OME namespace if no namespace found
+    return {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+
+
+def _extract_files_from_ome_xml(
+    ome_metadata: str,
+    source_dir: Path | str,
+    store: Optional["RemoteStore"] = None,
+) -> Optional[List[Path] | List[str]]:
+    """Extract ordered file list from OME-XML TiffData elements.
+
+    Parses OME-XML to find all referenced TIFF files via TiffData/UUID elements.
+    Files are returned in order with the first TiffData's file as master.
+
+    Args:
+        ome_metadata: OME-XML string (raw XML)
+        source_dir: Directory containing the source file (for resolving relative paths)
+        store: Optional RemoteStore for remote access. If None, uses local Path operations.
+
+    Returns:
+        Ordered list of Path objects (local) or str paths (remote), or None if parsing fails
+    """
+    try:
+        root = ET.fromstring(ome_metadata)
+        namespace = _get_namespace(root)
+
+        files = []
+        seen_files = set()
+
+        # Find all TiffData elements - order matters (first is master)
+        for tiff_data in root.findall('.//ome:TiffData', namespace):
+            # UUID element contains FileName attribute
+            uuid_elem = tiff_data.find('ome:UUID', namespace)
+            if uuid_elem is None:
+                # Try without namespace prefix (some OME-XML variants)
+                for child in tiff_data:
+                    if child.tag.endswith('UUID') or child.tag == 'UUID':
+                        uuid_elem = child
+                        break
+
+            if uuid_elem is not None:
+                filename = uuid_elem.get('FileName')
+                if filename and filename not in seen_files:
+                    if store is not None:
+                        # Remote: use RemoteStore methods
+                        if source_dir:
+                            file_path = store._join(str(source_dir) + '/' + filename)
+                        else:
+                            file_path = store._join(filename)
+                        exists = store.isfile(file_path)
+                    else:
+                        # Local: use Path operations
+                        file_path = Path(source_dir) / filename
+                        exists = file_path.exists()
+
+                    if exists:
+                        files.append(file_path)
+                        seen_files.add(filename)
+
+        return files if files else None
+    except ET.ParseError:
+        return None
+
 
 def _elementtree_to_dict(element) -> dict:
     """Convert ElementTree element to JSON-serializable dict.
@@ -66,327 +149,297 @@ def _elementtree_to_dict(element) -> dict:
 
     return result if result else ""
 
-
 # =============================================================================
-# OmeTiffAdapter - Single file OME-TIFF
+# OmeTiffAdapter - Multi-series OME-TIFF (handles single/multi-file + companion)
 # =============================================================================
 
-class OmeTiffAdapter(BackendAdapter):
-    """Adapter for OME-TIFF files using tifffile.
+class OmeTiffAdapter(SourceAdapter, TensorAdapter):
+    """Adapter for OME-TIFF files using tifffile with multi-series support.
 
-    Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
-    tifffile supports fsspec directly via its file-like object support.
+    Handles all OME-TIFF variants:
+    - Case 1: OME-TIFF with embedded OME-XML (.ome.tif/.ome.tiff)
+    - Case 2: Companion OME files (.companion.ome)
 
-    Chunk ID format:
-    - array_id prefix (via _encode_chunk_id)
-    - uint16 ifd_index (page index)
-    - uint16 ndim
-    - int64[ndim] tile indices
+    This is a multi-tensor source (_single_tensor_source = False) where each
+    series (field/position) is a separate tensor. Use get_tensor_adapter(series_id)
+    to access a specific series.
 
-    Relies on OS page cache for raw data caching.
+    Uses tifffile.aszarr() for tile-level lazy loading via OmeTiffSeriesAdapter.
     """
 
+    # Multi-tensor source - each series is a separate tensor
+    _single_tensor_source = False
+
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim single OME-TIFF files.
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim OME-TIFF files (single/multi-file) or companion.ome files.
+
+        Handles:
+        - Case 1: OME-TIFF files (.ome.tif/.ome.tiff) - discover related files via embedded OME-XML
+        - Case 2: Companion OME files (.companion.ome) - parse XML to find TIFF files
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            SourceClaim if this is an OME-TIFF file, None otherwise
+            SourceClaim if this is an OME-TIFF file or companion, None otherwise
         """
-        if not path.is_file():
+        if not ctx.is_file():
             return None
 
-        name = path.name.lower()
-        # Only claim actual OME-TIFF files (with .ome.tiff or .ome.tif extension)
-        # Plain TIFF files are handled by AicsImageIoAdapter (higher priority)
-        if name.endswith('.ome.tiff') or name.endswith('.ome.tif'):
-            return SourceClaim(
-                source_type="ome-tiff",
-                primary_path=path,
-                claimed_paths={path},
-            )
+        name = ctx.name.lower()
+
+        if name.endswith('.companion.ome'):
+            ome_metadata = ctx.read_text()
+            related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
+            if related_files:
+                primary_path = related_files[0]
+                for f in related_files:
+                    state.try_claim_path(f)
+                return SourceClaim(
+                    source_type="ome-tiff",
+                    primary_path=primary_path,
+                    is_remote=ctx.is_remote,
+                )
+
+        elif name.endswith('.tif') or name.endswith('.tiff'):
+            ome_metadata = cls._get_ome_metadata(ctx)
+            if ome_metadata:
+                related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
+                if related_files:
+                    primary_path = related_files[0]
+                    for f in related_files:
+                        state.try_claim_path(f)
+                    return SourceClaim(
+                        source_type="ome-tiff",
+                        primary_path=primary_path,
+                        is_remote=ctx.is_remote,
+                    )
 
         return None
 
     @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote OME-TIFF files.
+    def _get_ome_metadata(cls, ctx: ClaimContext) -> Optional[str]:
+        """Extract OME-XML metadata from TIFF file if present.
 
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a remote OME-TIFF file, None otherwise
+        For remote files, this returns None since parsing embedded XML
+        requires downloading the file.
         """
-        # Check for OME-TIFF extension
-        path_lower = path.lower()
-        if not (path_lower.endswith('.ome.tiff') or path_lower.endswith('.ome.tif')):
+        if ctx.is_remote:
+            return None  # Remote OME-TIFF requires companion.ome
+        try:
+            with tifffile.TiffFile(ctx.path_str) as tf:
+                return tf.ome_metadata
+        except Exception:
             return None
 
-        # Check if it's a file
-        if not store.isfile(path):
-            return None
-
-        return SourceClaim(
-            source_type="ome-tiff",
-            primary_path=store._join(path),
-            claimed_paths={store._join(path)},
-            is_remote=True,
-        )
-
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'OmeTiffAdapter':
-        """Create adapter instance from SourceConfig.
-
-        Args:
-            source: SourceConfig with url, source_id, dim_labels
-
-        Returns:
-            OmeTiffAdapter instance
-        """
-        import tifffile
-
-        if source.is_remote:
-            # Remote storage: use fsspec file-like object
-            from fsspec.core import url_to_fs
-
-            storage_options = {}
-            if source.credentials_profile:
-                pass  # fsspec handles via environment variables
-
-            fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
-            # tifffile supports fsspec file-like objects
-            tiff = tifffile.TiffFile(fs.open(fs_path, mode='rb'))
-        else:
-            # Local filesystem
-            tiff = tifffile.TiffFile(str(source.url))
-
-        return cls(tiff, source.source_id, source.dim_labels)
-
-    @classmethod
-    def create_from_config_with_credentials(
+    def create_from_config(
         cls,
         source: 'SourceConfig',
         credentials_config: Optional[Any] = None,
     ) -> 'OmeTiffAdapter':
-        """Create adapter with explicit credentials config.
+        """Create adapter instance from SourceConfig.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
-            credentials_config: CredentialsConfig for authentication
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             OmeTiffAdapter instance
         """
-        import tifffile
-        from fsspec.core import url_to_fs
-        from biopb_tensor_server.remote import CredentialsConfig
-
-        if not source.is_remote:
-            return cls.create_from_config(source)
-
-        # Build storage_options from credentials_config
-        storage_options = {}
-        if credentials_config:
-            profile = credentials_config.get_profile(source.credentials_profile)
-            if profile:
-                storage_options = profile.to_storage_options()
-
-        # Create fsspec filesystem with credentials
-        fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
-        tiff = tifffile.TiffFile(fs.open(fs_path, mode='rb'))
-
-        return cls(tiff, source.source_id, source.dim_labels)
+        # For remote sources, credentials would be handled by fsspec
+        source_url = str(source.url)
+        return cls(source_url, source.source_id, source.dim_labels)
 
     def __init__(
         self,
-        tiff_file,
+        source_path: os.PathLike,
         source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
         """Initialize OME-TIFF adapter.
 
+        Handles all OME-TIFF types:
+        - Single-file OME-TIFF
+        - Multi-file OME-TIFF (discovered via embedded OME-XML)
+        - Companion OME file
+
         Args:
-            tiff_file: tifffile.TiffFile object
+            source_path_or_tiff: Path to OME-TIFF file/companion.ome, or
+                tifffile.TiffFile object (for backward compatibility - caller
+                manages the file handle and must keep it open)
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
+            dim_labels: Optional dimension labels (applied to all series)
         """
-        self.tiff_file = tiff_file
         self.source_id = source_id
         self._io_lock = threading.Lock()
-
-        # Source-level metadata for DataSourceDescriptor
-        self._source_url = tiff_file.filename if hasattr(tiff_file, 'filename') else ""
         self._source_type = "ome-tiff"
+        self._source_url = str(source_path)
+        self._dim_labels_override = dim_labels
+        self._series_adapters: Dict[str, str] = {}
 
-        # Get series info
-        self.series = tiff_file.series[0]
-        self.series_shape = self.series.shape
-        self.series_dims = self.series.dims
+        # Extract and cache OME metadata string
+        with tifffile.TiffFile(source_path) as tf:
+            self._ome_meta = tf.ome_metadata
+            self._dtype = str(tf.pages[0].dtype)
+            self._series_names = [series.name for series in tf.series]
+            self._series_shapes = [series.shape for series in tf.series]
+            self._series_dim_labels = [self._dim_labels_override or list(series.axes) for series in tf.series]
 
-        # Get tile info from first page
-        first_page = tiff_file.pages[0]
-        if not first_page.is_tiled:
-            raise ValueError("OME-TIFF pages must be tiled")
+        if len(self._series_names) == 0:
+            raise ValueError("No series found in OME-TIFF file")
+        elif len(self._series_names) == 1:
+            self._series_idx = 0
 
-        self.is_tiled = True
-        self.tile_width = first_page.tilewidth
-        self.tile_length = first_page.tilelength
-        self.tiles_per_row = (first_page.shape[1] + self.tile_width - 1) // self.tile_width
-        self.tiles_per_col = (first_page.shape[0] + self.tile_length - 1) // self.tile_length
-        # Derive chunk shape (tile_y, tile_x) for each plane
-        self.chunk_shape = [self.tile_length, self.tile_width]
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        """List all series as tensors.
 
-        # Dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
+        Returns lightweight descriptors for all series in this TIFF file.
+        For backward compatibility with single-series TIFFs, the array_id is
+        just source_id when there's exactly one series.
+        """
+        descriptors = []
+
+        for idx in range(len(self._series_names)):
+            series_shape = self._series_shapes[idx]
+            series_dim_label = self._series_dim_labels[idx]
+
+            # Create descriptor with basic info
+            desc = TensorDescriptor(
+                array_id=self.array_id,
+                dim_labels=series_dim_label,
+                shape=list(series_shape),
+                dtype=self._dtype,
+            )
+
+            descriptors.append(desc)
+
+        return descriptors
+
+    def get_tensor_adapter(self, tensor_id: str) -> TensorAdapter:
+        """Get adapter for specific series.
+
+        - For single-series TIFFs: tensor_id can be source_id (backward compat)
+        - For multi-series TIFFs: tensor_id should be series_name or source_id/series_name
+
+        Args:
+            tensor_id: Series name, or 'source_id' for single-series backward compat
+
+        Returns:
+            OmeTiffSeriesAdapter for the specified series
+        """
+        if len(self._series_names) == 1:
+            return self
+    
+        if tensor_id in self._series_names:
+            self._series_idx = self._series_names.index(tensor_id)
+            self._tensor_name = tensor_id
         else:
-            # Infer from series dims
-            self.dim_labels = [d if isinstance(d, str) else str(d) for d in self.series_dims]
+            raise ValueError(f"Series '{tensor_id}' not found in OME-TIFF")
 
-        # Full shape includes all planes
-        # series_shape is (n_planes, height, width) or similar
-        self.full_shape = list(self.series_shape)
-
-        # Adjust chunk_shape to match full_shape dimensions
-        # Non-spatial dimensions (like channel/time) have chunk size = 1
-        self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
+        return self
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        first_page = self.tiff_file.pages[0]
-        dtype = first_page.dtype
-        return TensorDescriptor(
-            array_id=self.array_id,
-            dim_labels=self.dim_labels,
-            shape=self.full_shape,
-            chunk_shape=self.chunk_shape,
-            dtype=str(dtype),
-        )
+        """Return descriptor for first series (backward compatibility)."""
+        descriptors = self.list_tensor_descriptors()
+        if descriptors:
+            return descriptors[self._series_idx]
+        raise ValueError("No series found in OME-TIFF")
 
-    def list_tensor_descriptors(self):
-        return [self.get_tensor_descriptor()]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds from OME-TIFF.
+        """Read data within bounds from zarr array.
 
-        Uses tifffile's memory-mapped array for efficient slicing.
+        Uses zarr array slicing for tile-level lazy loading. IO is serialized
+        because tifffile codecs may not be thread-safe.
 
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
 
         Returns:
             Numpy array with data within the requested bounds
-
-        Raises:
-            ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
         slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-        # Serialize IO for thread safety - tifffile parsing not thread-safe
         with self._io_lock:
-            # Use memory-mapped array for lazy slicing
-            arr = self.tiff_file.asarray(out='memmap')
-            return arr[slices]
+            with tifffile.TiffFile(self._source_url) as tf:
+                series = tf.series[self._series_idx]
+                zarr_array = zarr.open(series.aszarr())
+                return zarr_array[slices]
 
     def get_metadata(self) -> dict:
         """Return OME metadata from TIFF file as JSON-serializable dict.
 
-        Uses tifffile's ome_metadata attribute which contains parsed OME-XML.
+        Uses cached OME-XML string extracted during initialization.
 
         Returns:
             OME-XML as JSON-serializable dict, or empty dict if no metadata.
         """
-        if hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None:
-            ome_meta = self.tiff_file.ome_metadata
-            # tifffile may return string (raw XML) or ElementTree
-            if isinstance(ome_meta, str):
-                try:
-                    root = ET.fromstring(ome_meta)
-                    return _elementtree_to_dict(root)
-                except ET.ParseError:
-                    return {}
-            else:
-                return _elementtree_to_dict(ome_meta)
-        return {}
+        if self._ome_meta is None:
+            return {}
+
+        # Convert OME-XML string to dict
+        if isinstance(self._ome_meta, str):
+            try:
+                root = ET.fromstring(self._ome_meta)
+                return _elementtree_to_dict(root)
+            except ET.ParseError:
+                return {"raw_xml": self._ome_meta}
+
+        return self._ome_meta
 
 
 # =============================================================================
-# MultiFileOmeTiffAdapter - Multi-file OME-TIFF
+# TiffSequenceAdapter - Plain TIFF sequences (no metadata)
 # =============================================================================
 
-class MultiFileOmeTiffAdapter(BackendAdapter):
-    """Adapter for multi-file OME-TIFF datasets (e.g., Micro-Manager format).
+class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
+    """Adapter for plain TIFF file sequences in a directory (no metadata).
 
     Handles datasets where multiple TIFF files form a single logical image:
-    - sample/img_0.ome.tiff (channel 0)
-    - sample/img_1.ome.tiff (channel 1)
-    - sample/_metadata.txt (OME-XML metadata)
+    - ND000_aligned.tiff, ND001_aligned.tiff, ND002_aligned.tiff, ...
 
-    Chunk ID format:
-    - array_id prefix (via _encode_chunk_id)
-    - uint16 file_index (which file in the series)
-    - uint16 ifd_index (page index within file)
-    - uint16 ndim
-    - int64[ndim] tile indices
+    This is a single-tensor source that tracks file list and index mapping.
+    Uses TiffFile().aszarr() for true tile-level lazy reading.
 
-    Relies on OS page cache for raw data caching.
+    Unlike MultiFileOmeTiffAdapter, this does NOT:
+    - Parse OME-XML or MicroManager metadata
+    - Handle 5D/6D coordinate mapping
+    - Discover related files via companion files
+
+    Simple axis inference:
+    - (num_files, Y, X) for single-page files -> 't' or 'z'
+    - (num_files, pages, Y, X) for multi-page files -> 't', 'z' or 'c'
     """
 
-    @staticmethod
-    def _find_metadata_file(path: Path) -> Optional[Path]:
-        """Find metadata file in directory.
+    _single_tensor_source = True
 
-        Checks for metadata files in priority order:
-        1. _metadata.txt (standard OME-XML format)
-        2. metadata.txt (MicroManager v1 JSON format)
-        3. DisplaySettings.json (MicroManager v2 format)
-
-        Args:
-            path: Directory to search
-
-        Returns:
-            Path to metadata file, or None if not found
-        """
-        # Check exact filenames first (most common cases)
-        for filename in ['_metadata.txt', 'metadata.txt', 'DisplaySettings.json']:
-            candidate = path / filename
-            if candidate.exists():
-                return candidate
-
-        # Check for wildcard patterns
-        for pattern in ['*_metadata.txt']:
-            matches = list(path.glob(pattern))
-            if matches:
-                return matches[0]
-
-        return None
-
-    @staticmethod
-    def _detect_tiff_sequence(path: Path) -> Optional[List[Path]]:
-        """Detect plain TIFF file sequences (e.g., ND000_aligned.tiff, ND001_aligned.tiff, ...).
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim directories containing plain TIFF file sequences.
 
         A sequence is detected if:
-        1. Directory has 3+ TIFF files
+        1. Directory has 3+ TIFF files (excluding OME/MicroManager patterns)
         2. Filenames contain sequential numbers
         3. All files have the same file size (fastest validation)
 
         Args:
-            path: Directory to check
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            Sorted list of TIFF file paths if sequence detected, None otherwise
+            SourceClaim with directory if sequence detected
         """
-        import re
+        # Only support local directories for now (remote glob/stat is expensive)
+        if ctx.is_remote or not ctx.is_dir():
+            return None
 
-        # Gather all TIFF files (excluding those matching OME/MicroManager patterns)
-        all_tiffs = list(path.glob('*.tif')) + list(path.glob('*.tiff'))
+        # Gather all TIFF files (excluding OME/MicroManager patterns)
+        all_tiffs = list(ctx.glob('*.tif')) + list(ctx.glob('*.tiff'))
+        tiff_files = [t._path for t in all_tiffs]  # Extract underlying Path objects
 
         # Filter out known OME and MicroManager patterns
         exclude_patterns = {
@@ -395,31 +448,33 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
             'img_channel*.tif', 'img_channel*.tiff',
         }
 
-        tiff_files = []
-        for f in all_tiffs:
-            # Check if file matches any exclude pattern
+        filtered_files = []
+        for f in tiff_files:
             excluded = False
             for pattern in exclude_patterns:
                 if f.match(pattern):
                     excluded = True
                     break
             if not excluded:
-                tiff_files.append(f)
+                filtered_files.append(f)
 
         # Need at least 3 files to consider it a sequence
-        if len(tiff_files) < 3:
+        if len(filtered_files) < 3:
             return None
 
-        # Extract numbers from filenames
+        # Check for metadata files - if present, don't claim (let other adapters handle)
+        metadata_patterns = ['metadata.txt', '_metadata.txt', 'DisplaySettings.json', '*.companion.ome']
+        for pattern in metadata_patterns:
+            if list(ctx._path.glob(pattern)):
+                return None
+
+        # Extract numbers from filenames to verify sequence
         numbers = []
-        for f in tiff_files:
-            # Find all numbers in the filename
+        for f in filtered_files:
             nums = re.findall(r'\d+', f.name)
             if nums:
-                # Use the last number as the sequence index (most common pattern)
                 numbers.append((int(nums[-1]), f))
             else:
-                # No numbers found, can't confirm it's a sequence
                 return None
 
         if not numbers:
@@ -429,118 +484,28 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         numbers.sort(key=lambda x: x[0])
         sorted_files = [f for _, f in numbers]
 
-        # Validate: all files should have the same size
-        # (proxy for same dimensions, fastest check)
+        # Validate: all files should have the same size (proxy for same dimensions)
         try:
             file_sizes = [f.stat().st_size for f in sorted_files]
             if len(set(file_sizes)) > 1:
-                # File sizes differ - not a consistent sequence
                 return None
         except OSError:
-            # Can't stat files
             return None
 
-        return sorted_files
-
-    @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim directories with multi-file OME-TIFF structure or MicroManager format.
-
-        This is a multi-node claim that claims the directory + all TIFF files
-        + metadata file.
-
-        Supports:
-        - Standard OME-TIFF multi-file with _metadata.txt
-        - MicroManager v1 (JSON Coords/Metadata keys) with metadata.txt
-        - MicroManager v2 with DisplaySettings.json
-
-        Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
-
-        Returns:
-            SourceClaim with multi-node paths if valid structure, None otherwise
-        """
-        if not path.is_dir():
-            return None
-
-        # Check for metadata file (any format)
-        metadata_file = cls._find_metadata_file(path)
-
-        # Check for TIFF files in common patterns
-        tiff_patterns = [
-            'img_*.ome.tiff', 'img_*.ome.tif',  # OME-TIFF pattern
-            'img_*.tif', 'img_*.tiff',          # MicroManager standard pattern
-            'img_channel*.tif', 'img_channel*.tiff',  # MicroManager channel pattern
-            '*.ome.tiff', '*.ome.tif',          # Generic OME-TIFF
-        ]
-        tiff_files = []
-        for pattern in tiff_patterns:
-            tiff_files.extend(path.glob(pattern))
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_files = []
-        for f in tiff_files:
-            if f not in seen:
-                seen.add(f)
-                unique_files.append(f)
-        tiff_files = unique_files
-
-        # Determine if we have a valid multi-file structure
-        has_metadata = metadata_file is not None
-        tiff_count = len(tiff_files)
-
-        # Check for metadata + TIFF files OR 2+ OME/MicroManager TIFFs
-        if has_metadata and tiff_count >= 1:
-            # Has metadata (OME/MicroManager)
-            pass  # Proceed with claim
-        elif tiff_count >= 2:
-            # Multiple OME/MicroManager pattern TIFFs
-            pass  # Proceed with claim
-        else:
-            # Try detecting plain TIFF sequences as fallback
-            sequence_files = cls._detect_tiff_sequence(path)
-            if not sequence_files:
-                # No valid multi-file structure detected
-                return None
-            # Use detected sequence files
-            tiff_files = sequence_files
-
-        # Multi-node claim: claim the directory + all TIFF files + metadata
-        claimed = {path}
-
-        # Add all detected TIFF files
-        for img_file in tiff_files:
-            try:
-                identity = get_file_identity(img_file)
-                if identity not in visited_identities:
-                    claimed.add(img_file)
-            except OSError:
-                # Skip files we can't get identity for
-                pass
-
-        # Add metadata file if found
-        if metadata_file:
-            claimed.add(metadata_file)
+        # Claim directory + all TIFF files
+        state.try_claim_path(ctx.path_str)
+        for img_file in sorted_files:
+            state.try_claim_path(img_file)
 
         return SourceClaim(
-            source_type="ome-tiff-multifile",
-            primary_path=path,
-            claimed_paths=claimed,
+            source_type="tiff-sequence",
+            primary_path=ctx.path_str,
         )
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'MultiFileOmeTiffAdapter':
-        """Create adapter instance from SourceConfig.
-
-        Args:
-            source: SourceConfig with url (directory), source_id, dim_labels
-
-        Returns:
-            MultiFileOmeTiffAdapter instance
-        """
-        return cls(str(source.url), source.source_id, source.dim_labels)
+    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'TiffSequenceAdapter':
+        """Create adapter instance from SourceConfig."""
+        return cls(str(source.url), source.source_id or '', source.dim_labels)
 
     def __init__(
         self,
@@ -548,498 +513,662 @@ class MultiFileOmeTiffAdapter(BackendAdapter):
         source_id: str,
         dim_labels: Optional[List[str]] = None,
     ):
-        """Initialize multi-file OME-TIFF adapter.
+        """Initialize TIFF sequence adapter.
 
         Args:
-            directory: Path to directory containing multi-file dataset
+            directory: Path to directory containing TIFF sequence
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
+            dim_labels: Optional dimension labels (if None, inferred from file count)
         """
-        from pathlib import Path
-
+        import re
         import tifffile
 
         self.directory = Path(directory)
         self.source_id = source_id
-
-        # Source-level metadata for DataSourceDescriptor
         self._source_url = str(directory)
-        self._source_type = "ome-tiff-multifile"
-
-        # Thread lock for serializing IO operations
-        # Needed because underlying codecs (libjpeg, openjpeg, etc.) may not be thread-safe
+        self._source_type = "tiff-sequence"
         self._io_lock = threading.Lock()
 
-        # Try to get explicit file list from _metadata.txt OME-XML
-        expected_files = self._parse_file_list_from_metadata()
-        self._missing_files = []
+        # Discover TIFF files (excluding OME/MicroManager patterns)
+        all_tiffs = list(self.directory.glob('*.tif')) + list(self.directory.glob('*.tiff'))
 
-        if expected_files:
-            # Use explicit file list from metadata
-            tiff_files = []
-            for fname in expected_files:
-                fpath = self.directory / fname
-                if fpath.exists():
-                    tiff_files.append(fpath)
-                else:
-                    self._missing_files.append(fname)
+        exclude_patterns = {
+            '*.ome.tif', '*.ome.tiff',
+            'img_*.tif', 'img_*.tiff',
+            'img_channel*.tif', 'img_channel*.tiff',
+        }
 
-            if self._missing_files:
-                import warnings
-                warnings.warn(
-                    f"Multi-file OME-TIFF dataset has missing files: {self._missing_files}. "
-                    f"Proceeding with {len(tiff_files)} available files."
-                )
+        tiff_files = []
+        for f in all_tiffs:
+            excluded = False
+            for pattern in exclude_patterns:
+                if f.match(pattern):
+                    excluded = True
+                    break
+            if not excluded:
+                tiff_files.append(f)
 
-            if not tiff_files:
-                raise ValueError(
-                    f"No OME-TIFF files found in {directory}. "
-                    f"Expected files: {expected_files}, missing: {self._missing_files}"
-                )
-        else:
-            # Fall back to glob discovery (legacy behavior)
-            patterns = [
-                "img_*.ome.tiff", "img_*.ome.tif",
-                "*.ome.tiff", "*.ome.tif",
-                "img_channel*.tif", "img_*.tif",  # Micro-Manager standard format
-                "*.tiff", "*.tif",  # Plain TIFF sequences
-            ]
-            tiff_files = []
-            seen = set()
-            for pattern in patterns:
-                for f in sorted(self.directory.glob(pattern)):
-                    if f not in seen:
-                        seen.add(f)
-                        tiff_files.append(f)
+        # Sort by numeric part of filename
+        numbers = []
+        for f in tiff_files:
+            nums = re.findall(r'\d+', f.name)
+            if nums:
+                numbers.append((int(nums[-1]), f))
+        numbers.sort(key=lambda x: x[0])
+        self._tiff_files = [f for _, f in numbers]
 
-            if not tiff_files:
-                raise ValueError(f"No TIFF files found in {directory}")
+        if not self._tiff_files:
+            raise ValueError(f"No TIFF sequence files found in {directory}")
 
-        # Open first file to check for OME metadata and get tile info
-        self.tiff_file = tifffile.TiffFile(str(tiff_files[0]))
-        self._tiff_sequence = None
+        # Open first file to get shape and tile info
+        with tifffile.TiffFile(str(self._tiff_files[0])) as tf:
+            first_page = tf.pages[0]
+            self._dtype = str(first_page.dtype)
 
-        # Check if this is an OME-TIFF with auto-discovery
-        has_ome_metadata = hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None
+            # Tile info
+            if first_page.is_tiled:
+                self.is_tiled = True
+                self.tile_width = first_page.tilewidth
+                self.tile_length = first_page.tilelength
+                self._spatial_chunk = [self.tile_length, self.tile_width]
+            else:
+                self.is_tiled = False
+                self._spatial_chunk = [first_page.shape[0], first_page.shape[1]]
 
-        # For non-OME multi-file datasets, use TiffSequence to get proper multi-file shape
-        if not has_ome_metadata and len(tiff_files) > 1:
-            self._tiff_sequence = tifffile.TiffSequence([str(f) for f in tiff_files])
-            seq_shape = self._tiff_sequence.shape
-            if len(seq_shape) == 1:
-                # TiffSequence returned just (num_files,), need to get full shape from series
-                if len(self.tiff_file.series) > 0:
-                    # Use the full series shape and prepend the sequence length
-                    file_shape = self.tiff_file.series[0].shape
-                    seq_shape = (len(tiff_files),) + file_shape
-                    # Map 'other' dimension to 'z' for multi-page files
-                    file_dims = list(self.tiff_file.series[0].dims)
-                    if file_dims and file_dims[0] == 'other':
-                        file_dims[0] = 'z'
-                    self.series_dims = tuple(['t'] + file_dims)
-                else:
-                    # Fallback: just use first page shape
-                    first_page = self.tiff_file.pages[0]
-                    seq_shape = (len(tiff_files),) + first_page.shape
-                    self.series_dims = tuple(['t'] + ['y', 'x'][-len(first_page.shape):])
-            self.series_shape = seq_shape
-        else:
-            if len(self.tiff_file.series) == 0:
-                raise ValueError("No series found in OME-TIFF dataset")
-            self.series = self.tiff_file.series[0]
-            self.series_shape = self.series.shape
-            self.series_dims = self.series.dims
+            # Pages per file
+            n_pages_per_file = len(tf.pages)
 
-        # Get tile info from first page of first file
-        first_page = self.tiff_file.pages[0]
-
-        if first_page.is_tiled:
-            self.is_tiled = True
-            self.tile_width = first_page.tilewidth
-            self.tile_length = first_page.tilelength
-            self.tiles_per_row = (first_page.shape[1] + self.tile_width - 1) // self.tile_width
-            self.tiles_per_col = (first_page.shape[0] + self.tile_length - 1) // self.tile_length
-            self.chunk_shape = [self.tile_length, self.tile_width]
-        else:
-            self.is_tiled = False
-            self.tile_width = first_page.shape[1]
-            self.tile_length = first_page.shape[0]
-            self.tiles_per_row = 1
-            self.tiles_per_col = 1
-            self.chunk_shape = [first_page.shape[0], first_page.shape[1]]
-
-        # Dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
-        else:
-            self.dim_labels = [d if isinstance(d, str) else str(d) for d in self.series_dims]
-            # Micro-Manager metadata carries non-spatial axis semantics (channel/z/time).
-            # For multi-file datasets, tifffile often reports the leading axis as generic
-            # "plane" even when it is actually channel. Prefer metadata when available.
-            self._apply_metadata_axis_labels()
-
-        # Build file index for IFD access
+        # Build file index map: (file_path, n_pages)
         self._file_ifd_map = []
-        self._ifd_to_file = []
-
-        global_ifd_index = 0
-        for file_path in tiff_files:
+        for file_path in self._tiff_files:
             with tifffile.TiffFile(str(file_path)) as tf:
                 n_pages = len(tf.pages)
                 self._file_ifd_map.append((file_path, n_pages))
-                for local_idx in range(n_pages):
-                    self._ifd_to_file.append((len(self._file_ifd_map) - 1, local_idx))
-                global_ifd_index += n_pages
 
-        self._total_ifds = global_ifd_index
-        self._tiff_files = tiff_files
+        # Determine shape and dim labels
+        # Shape: (num_files, pages_per_file, Y, X) or (num_files, Y, X)
+        n_files = len(self._tiff_files)
 
-        # Full shape (adjust for partial datasets)
-        self.full_shape = list(self.series_shape)
-        if self._missing_files and len(self.full_shape) >= 2:
-            if self._total_ifds < self.full_shape[0]:
-                self.full_shape[0] = self._total_ifds
+        # Get spatial shape from first page (not series, which may include page dimension)
+        spatial_shape = [first_page.shape[0], first_page.shape[1]]
 
-        self.chunk_shape = [1] * (len(self.full_shape) - 2) + self.chunk_shape
+        if n_pages_per_file > 1:
+            # Multi-page files: (num_files, pages, Y, X)
+            self.full_shape = [n_files, n_pages_per_file] + spatial_shape
+            self.chunk_shape = [1, 1] + self._spatial_chunk
+            if dim_labels:
+                self.dim_labels = dim_labels
+            else:
+                self.dim_labels = ['t', 'z', 'y', 'x']
+        else:
+            # Single-page files: (num_files, Y, X)
+            self.full_shape = [n_files] + spatial_shape
+            self.chunk_shape = [1] + self._spatial_chunk
+            if dim_labels:
+                self.dim_labels = dim_labels
+            else:
+                self.dim_labels = ['t', 'y', 'x']
 
-    def _apply_metadata_axis_labels(self) -> None:
-        """Refine inferred dim labels using Micro-Manager Summary metadata.
-
-        The first non-spatial axis in multi-file datasets can be reported as
-        a generic plane index by tifffile. When metadata exposes axis order
-        and intended dimensions, map that leading axis to c/z/t/p accordingly.
-        """
-        if not self.dim_labels:
-            return
-
-        lead = str(self.dim_labels[0]).lower()
-        if lead not in ("plane", "p", "i", "q", "t"):
-            return
-
-        metadata = self.get_metadata()
-        if not isinstance(metadata, dict):
-            return
-
-        summary = metadata.get("Summary")
-        if not isinstance(summary, dict):
-            return
-
-        intended = summary.get("IntendedDimensions")
-        if not isinstance(intended, dict):
-            intended = {}
-
-        def _count(name: str, fallback_key: Optional[str] = None) -> int:
-            v = intended.get(name)
-            if v is None and fallback_key is not None:
-                v = summary.get(fallback_key)
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return 0
-
-        axis_counts = {
-            "channel": _count("channel", "Channels"),
-            "z": _count("z", "Slices"),
-            "time": _count("time", "Frames"),
-            "position": _count("position", "Positions"),
-        }
-
-        axis_alias = {
-            "channel": "c",
-            "c": "c",
-            "z": "z",
-            "slice": "z",
-            "time": "t",
-            "t": "t",
-            "frame": "t",
-            "position": "p",
-            "pos": "p",
-            "p": "p",
-        }
-
-        leading_label: Optional[str] = None
-
-        axis_order = summary.get("AxisOrder")
-        ordered_axes: List[str] = []
-        if isinstance(axis_order, list):
-            ordered_axes = [str(a).strip().lower() for a in axis_order]
-        elif isinstance(axis_order, str):
-            ordered_axes = [a.strip().lower() for a in axis_order.split(",")]
-
-        # Prefer the first axis in declared order that has multiplicity > 1.
-        for axis_name in ordered_axes:
-            n = axis_counts.get(axis_name, 0)
-            if n > 1:
-                leading_label = axis_alias.get(axis_name)
-                if leading_label:
-                    break
-
-        # Fallback by common Micro-Manager precedence.
-        if leading_label is None:
-            if axis_counts["channel"] > 1:
-                leading_label = "c"
-            elif axis_counts["z"] > 1:
-                leading_label = "z"
-            elif axis_counts["time"] > 1:
-                leading_label = "t"
-            elif axis_counts["position"] > 1:
-                leading_label = "p"
-
-        if leading_label is not None:
-            self.dim_labels[0] = leading_label
-
-        # Normalize common spatial label variants for downstream axis mapping.
-        for idx, label in enumerate(self.dim_labels):
-            label_lower = str(label).lower()
-            if label_lower in ("y", "height"):
-                self.dim_labels[idx] = "y"
-            elif label_lower in ("x", "width"):
-                self.dim_labels[idx] = "x"
+        # Total IFDs for coordinate mapping
+        self._total_ifds = sum(n for _, n in self._file_ifd_map)
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        first_page = self.tiff_file.pages[0]
-        dtype = first_page.dtype
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
             shape=self.full_shape,
             chunk_shape=self.chunk_shape,
-            dtype=str(dtype),
+            dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self):
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds from multi-file OME-TIFF dataset.
+        """Read data within bounds using tile-level lazy access.
 
-        Only reads the specific files and pages needed for the slice bounds,
-        avoiding the expensive TiffSequence.asarray() call that reads all data.
+        Uses TiffFile().aszarr() for true tile-level lazy reading.
 
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
 
         Returns:
             Numpy array with data within the requested bounds
-
-        Raises:
-            ValueError: If bounds exceed array shape
         """
         import tifffile
+        import zarr
 
         super().get_data(bounds)
         slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-        # Serialize IO for thread safety
         with self._io_lock:
-            if self._tiff_sequence is not None:
-                # Multi-file dataset: read only needed files/pages
-                # Step 1: Normalize slice request to 4D (n_files, n_pages, H, W)
-                pages_per_file = self._file_ifd_map[0][1] if self._file_ifd_map else 1
-                original_ndim = len(slices)
+            pages_per_file = self._file_ifd_map[0][1] if self._file_ifd_map else 1
+            original_ndim = len(slices)
 
-                # Build 4D slice tuple: (file_slice, page_slice, y_slice, x_slice)
-                if original_ndim == 4:
-                    file_slice, page_slice, y_slice, x_slice = slices
-                elif original_ndim == 3:
-                    # 3D array: (n_files, Y, X) - insert singleton page dim
-                    file_slice, y_slice, x_slice = slices
-                    page_slice = slice(0, 1)  # Single page per file
-                else:
-                    # Fallback for other cases
-                    file_slice = slices[0]
-                    page_slice = slice(0, pages_per_file)
-                    y_slice = slices[1] if len(slices) > 1 else slice(None)
-                    x_slice = slices[2] if len(slices) > 2 else slice(None)
-
-                # Determine which files and pages we need
-                file_indices = range(file_slice.start, min(file_slice.stop, len(self._file_ifd_map)))
-                page_indices = range(page_slice.start, min(page_slice.stop, pages_per_file))
-                n_files = file_slice.stop - file_slice.start
-                n_pages = page_slice.stop - page_slice.start
-
-                # Step 2: Lazy read -> build 4D array (n_files, n_pages, H, W)
-                result_pages = []
-                for file_idx in file_indices:
-                    file_path, n_pages_in_file = self._file_ifd_map[file_idx]
-                    with tifffile.TiffFile(str(file_path)) as tf:
-                        for page_idx in page_indices:
-                            if page_idx < n_pages_in_file:
-                                page_data = tf.pages[page_idx].asarray()
-                                # Apply spatial slicing (y_slice, x_slice)
-                                if y_slice != slice(None) or x_slice != slice(None):
-                                    page_data = page_data[y_slice, x_slice]
-                                result_pages.append(page_data)
-
-                # Stack into 4D: pages are ordered file0_page0, file0_page1, ..., file1_page0, ...
-                if result_pages:
-                    result_4d = np.stack(result_pages, axis=0)
-                    # Reshape to (n_files, n_pages, H, W)
-                    h, w = result_4d.shape[-2:]
-                    result_4d = result_4d.reshape(n_files, n_pages, h, w)
-                else:
-                    result_4d = np.array([])
-
-                # Step 3: Renormalize to original ndim
-                # Remove singleton dimensions that weren't in original request
-                if original_ndim == 3:
-                    # Remove the page dimension (axis 1)
-                    result = result_4d.squeeze(axis=1)
-                elif original_ndim == 4:
-                    result = result_4d
-                else:
-                    # Keep as-is or squeeze unused dims
-                    result = result_4d
-
-                return result
+            # Build slice tuple: (file_slice, [page_slice], y_slice, x_slice)
+            if original_ndim == 4:
+                file_slice, page_slice, y_slice, x_slice = slices
+            elif original_ndim == 3:
+                file_slice, y_slice, x_slice = slices
+                page_slice = slice(0, pages_per_file) if pages_per_file > 1 else slice(0, 1)
             else:
-                # Single file or OME-TIFF with embedded structure
-                file_path = self._tiff_files[0]
+                # Handle other dimensionalities
+                file_slice = slices[0]
+                page_slice = slice(0, pages_per_file) if len(slices) > 3 else slice(0, 1)
+                y_slice = slices[-2] if len(slices) >= 2 else slice(None)
+                x_slice = slices[-1] if len(slices) >= 1 else slice(None)
+
+            # Determine which files and pages to read
+            file_indices = range(
+                file_slice.start or 0,
+                min(file_slice.stop or len(self._file_ifd_map), len(self._file_ifd_map))
+            )
+            page_indices = range(
+                page_slice.start or 0,
+                min(page_slice.stop or pages_per_file, pages_per_file)
+            )
+
+            n_files = (file_slice.stop or len(self._file_ifd_map)) - (file_slice.start or 0)
+            n_pages = (page_slice.stop or pages_per_file) - (page_slice.start or 0)
+
+            # Read data via aszarr() for tile-level access
+            result_pages = []
+            for file_idx in file_indices:
+                file_path, n_pages_in_file = self._file_ifd_map[file_idx]
                 with tifffile.TiffFile(str(file_path)) as tf:
-                    arr = tf.series[0].asarray(out='memmap')
-                    return arr[slices]
+                    zarr_arr = zarr.open_array(tf.series[0].aszarr(), mode='r')
+                    zarr_ndim = len(zarr_arr.shape)
+                    for page_idx in page_indices:
+                        if page_idx < n_pages_in_file:
+                            if zarr_ndim == 2:
+                                # 2D array (Y, X) - single page
+                                page_data = zarr_arr[y_slice, x_slice]
+                            else:
+                                # 3D+ array (pages, Y, X)
+                                page_data = zarr_arr[page_idx, y_slice, x_slice]
+                            result_pages.append(page_data)
+
+            # Stack into result array
+            if result_pages:
+                result_4d = np.stack(result_pages, axis=0)
+                h, w = result_4d.shape[-2:]
+                result_4d = result_4d.reshape(n_files, n_pages, h, w)
+            else:
+                result_4d = np.array([])
+
+            # Reshape to match original ndim
+            if original_ndim == 3:
+                if pages_per_file > 1:
+                    result = result_4d.reshape(n_files * n_pages, h, w)
+                else:
+                    result = result_4d.squeeze(axis=1)
+            elif original_ndim == 4:
+                result = result_4d
+            else:
+                result = result_4d
+
+            return result
 
     def get_metadata(self) -> dict:
-        """Return OME metadata from multi-file dataset."""
-        import xml.etree.ElementTree as ET
-
-        # Check for companion metadata.txt or _metadata.txt file
-        metadata_patterns = ["metadata.txt", "_metadata.txt", "*_metadata.txt"]
-        for pattern in metadata_patterns:
-            metadata_files = list(self.directory.glob(pattern))
-            if metadata_files:
-                try:
-                    return self._parse_metadata_txt(metadata_files[0])
-                except Exception:
-                    pass
-
-        # Fall back to embedded OME-XML from first TIFF file
-        if hasattr(self.tiff_file, 'ome_metadata') and self.tiff_file.ome_metadata is not None:
-            ome_meta = self.tiff_file.ome_metadata
-            if isinstance(ome_meta, str):
-                try:
-                    root = ET.fromstring(ome_meta)
-                    return _elementtree_to_dict(root)
-                except ET.ParseError:
-                    return {}
-            else:
-                return _elementtree_to_dict(ome_meta)
-
+        """Return empty dict (no metadata for plain TIFF sequences)."""
         return {}
 
-    def _parse_metadata_txt(self, metadata_path) -> dict:
-        """Parse metadata file in various formats.
 
-        Supports:
-        - OME-XML format
-        - JSON with embedded OME-XML
-        - MicroManager v1 JSON (Coords/Metadata keys)
-        - MicroManager v2 DisplaySettings.json (returns empty dict)
-        """
-        import json
+# =============================================================================
+# MicroManagerLegacyAdapter - Legacy MicroManager datasets with JSON metadata
+# =============================================================================
 
-        # Handle DisplaySettings.json (MicroManager v2) - return empty dict
-        # File list will be determined by glob patterns in __init__
-        if metadata_path.name == 'DisplaySettings.json':
-            return {}
+class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
+    """Adapter for legacy MicroManager datasets with JSON metadata.
 
-        content = metadata_path.read_text()
+    Handles MicroManager v1 v2 datasets with metadata.txt containing:
+    - Summary: IntendedDimensions, AxisOrder, Channels, Slices, Frames, Positions
+    - Coords-Default/<filename>: PositionIndex, TimeIndex, ChannelIndex, SliceIndex
+    - Metadata-Default/<filename>: UUID, Width, Height
 
-        try:
-            root = ET.fromstring(content)
-            return _elementtree_to_dict(root)
-        except ET.ParseError:
-            pass
+    This adapter supports full 5D/6D datasets: (position, time, channel, z, y, x).
 
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict):
-                if "OME" in data and isinstance(data["OME"], str):
-                    root = ET.fromstring(data["OME"])
-                    return _elementtree_to_dict(root)
-                return data
-        except json.JSONDecodeError:
-            pass
+    Uses TiffFile().aszarr() for true tile-level lazy reading.
+    """
 
-        return {}
+    _single_tensor_source = True
 
-    def _parse_file_list_from_metadata(self) -> Optional[List[str]]:
-        """Extract ordered file list from metadata file.
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim directories with MicroManager metadata files.
 
-        Supports:
-        - OME-XML format (_metadata.txt or metadata.txt)
-        - MicroManager v1 JSON (metadata.txt with Coords/Metadata keys)
-        - MicroManager v2 DisplaySettings.json (returns None to use glob patterns)
+        Handles both:
+        - MicroManager v1: metadata.txt directly in directory
+        - MicroManager v2: DisplaySettings.json at root, metadata.txt in subdirectory
+
+        Args:
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            List of filenames if metadata file can be parsed to extract file list,
-            None if no file list found or DisplaySettings.json (use glob fallback)
+            SourceClaim with directory if MicroManager format
         """
-        import json
-
-        metadata_patterns = ["metadata.txt", "_metadata.txt", "DisplaySettings.json", "*_metadata.txt"]
-        metadata_files = []
-        for pattern in metadata_patterns:
-            metadata_files.extend(self.directory.glob(pattern))
-
-        if not metadata_files:
+        # Only support local directories for now
+        if ctx.is_remote or not ctx.is_dir():
             return None
 
-        metadata_file = metadata_files[0]
+        # Check for v1 metadata.txt directly in this directory
+        v1_metadata = None
+        if ctx.join('metadata.txt').exists():
+            v1_metadata = ctx.join('metadata.txt')._path
 
-        # DisplaySettings.json (MicroManager v2): return None to use glob patterns
-        if metadata_file.name == 'DisplaySettings.json':
+        # Check for v2 DisplaySettings.json (need to find subdirectory with metadata.txt)
+        v2_data_dir = None
+        if v1_metadata is None and ctx.join('DisplaySettings.json').exists():
+            # Look for subdirectories containing metadata.txt
+            for subdir in ctx._path.iterdir():
+                if subdir.is_dir() and not subdir.name.startswith('.'):
+                    candidate_metadata = subdir / 'metadata.txt'
+                    if candidate_metadata.exists():
+                        v2_data_dir = subdir
+                        v1_metadata = candidate_metadata
+                        break
+
+        if v1_metadata is None:
             return None
 
-        content = metadata_file.read_text()
-
-        # Try OME-XML format
+        # Parse metadata to confirm it's MicroManager v1 format
         try:
-            root = ET.fromstring(content)
-            files = []
-            for tiff_data in root.iter():
-                if tiff_data.tag.endswith('TiffData') or tiff_data.tag == 'TiffData':
-                    for uuid_elem in tiff_data:
-                        if uuid_elem.tag.endswith('UUID') or uuid_elem.tag == 'UUID':
-                            filename = uuid_elem.get('FileName')
-                            if filename:
-                                files.append(filename)
-            return files if files else None
-        except ET.ParseError:
-            pass
-
-        # Try JSON with embedded OME-XML
-        try:
+            content = v1_metadata.read_text()
             data = json.loads(content)
-            if isinstance(data, dict) and "OME" in data and isinstance(data["OME"], str):
-                root = ET.fromstring(data["OME"])
-                files = []
-                for tiff_data in root.iter():
-                    if tiff_data.tag.endswith('TiffData') or tiff_data.tag == 'TiffData':
-                        for uuid_elem in tiff_data:
-                            if uuid_elem.tag.endswith('UUID') or uuid_elem.tag == 'UUID':
-                                filename = uuid_elem.get('FileName')
-                                if filename:
-                                    files.append(filename)
-                return files if files else None
-        except (json.JSONDecodeError, ET.ParseError):
-            pass
 
-        # Try MicroManager v1 JSON format (Coords/Metadata keys)
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict):
-                files_set = set()
-                for key in data.keys():
-                    if key.startswith('Coords-') or key.startswith('Metadata-'):
-                        if '/' in key:
-                            filename = key.split('/', 1)[1]
-                            if filename.endswith('.tif') or filename.endswith('.tiff'):
-                                files_set.add(filename)
-                if files_set:
-                    files = sorted(files_set)
-                    return files
-        except json.JSONDecodeError:
-            pass
+            # Check for MicroManager v1 format markers
+            has_coords = any(k.startswith('Coords-') for k in data.keys())
+            has_summary = 'Summary' in data
+
+            if not (has_coords or has_summary):
+                return None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        # Discover TIFF files (in current dir or v2 data subdirectory)
+        search_dir = v2_data_dir if v2_data_dir else ctx._path
+        tiff_patterns = [
+            'img_channel*.tif', 'img_channel*.tiff',
+            'img_pos*_channel*.tif', 'img_pos*_channel*.tiff',
+            'img_*.tif', 'img_*.tiff',
+        ]
+        tiff_files = []
+        seen = set()
+        for pattern in tiff_patterns:
+            for f in search_dir.glob(pattern):
+                if f not in seen:
+                    seen.add(f)
+                    tiff_files.append(f)
+
+        if not tiff_files:
+            return None
+
+        # Claim root directory + metadata + TIFF files
+        state.try_claim_path(ctx.path_str)
+        state.try_claim_path(str(v1_metadata))
+        if v2_data_dir:
+            state.try_claim_path(str(v2_data_dir))
+        for img_file in tiff_files:
+            state.try_claim_path(img_file)
+
+        return SourceClaim(
+            source_type="micromanager-legacy",
+            primary_path=ctx.path_str,
+        )
+
+    @staticmethod
+    def _find_metadata_file(directory: Path) -> Optional[Path]:
+        """Find MicroManager metadata file in directory.
+
+        Handles both v1 (metadata.txt directly) and v2 (DisplaySettings.json at root,
+        metadata.txt in subdirectory) formats.
+
+        Args:
+            directory: Path to directory to search
+
+        Returns:
+            Path to metadata.txt if found, None otherwise
+        """
+        # Check for v1 format: metadata.txt directly in directory
+        v1_metadata = directory / 'metadata.txt'
+        if v1_metadata.exists():
+            return v1_metadata
+
+        # Check for v2 format: DisplaySettings.json at root, metadata.txt in subdirectory
+        display_settings = directory / 'DisplaySettings.json'
+        if display_settings.exists():
+            for subdir in directory.iterdir():
+                if subdir.is_dir() and not subdir.name.startswith('.'):
+                    candidate_metadata = subdir / 'metadata.txt'
+                    if candidate_metadata.exists():
+                        return candidate_metadata
 
         return None
+
+    @classmethod
+    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'MicroManagerLegacyAdapter':
+        """Create adapter instance from SourceConfig."""
+        return cls(str(source.url), source.source_id or '', source.dim_labels)
+
+    def __init__(
+        self,
+        directory: str,
+        source_id: str,
+        dim_labels: Optional[List[str]] = None,
+    ):
+        """Initialize MicroManager legacy adapter.
+
+        Args:
+            directory: Path to directory containing MicroManager dataset
+            source_id: Unique identifier for this data source
+            dim_labels: Optional dimension labels (if None, inferred from metadata)
+        """
+        import json
+        import tifffile
+
+        self.directory = Path(directory)
+        self.source_id = source_id
+        self._source_url = str(directory)
+        self._source_type = "micromanager-legacy"
+        self._io_lock = threading.Lock()
+
+        # Find and parse metadata file
+        metadata_file = self._find_metadata_file(self.directory)
+        if metadata_file is None:
+            raise ValueError(f"No MicroManager metadata file found in {directory}")
+
+        with open(metadata_file) as f:
+            self._raw_metadata = json.load(f)
+
+        # Parse Summary to get dimensions
+        summary = self._raw_metadata.get('Summary', {})
+        intended = summary.get('IntendedDimensions', {})
+
+        # Get dimension sizes
+        self._n_positions = intended.get('position', summary.get('Positions', 1))
+        self._n_times = intended.get('time', summary.get('Frames', 1))
+        self._n_channels = intended.get('channel', summary.get('Channels', 1))
+        self._n_z = intended.get('z', summary.get('Slices', 1))
+
+        # Build coordinate map: (p, t, c, z) -> filename
+        self._coord_map: Dict[Tuple[int, int, int, int], Path] = {}
+        self._file_list: List[Path] = []
+
+        for key in self._raw_metadata.keys():
+            if key.startswith('Coords-'):
+                coords = self._raw_metadata[key]
+                # Extract path from key (Coords-Default/<filename> or Coords-<filename>)
+                coords_prefix_len = len('Coords-')
+                filepath_in_key = key[coords_prefix_len:]
+
+                # Get indices
+                pos_idx = coords.get('PositionIndex', 0)
+                time_idx = coords.get('TimeIndex', 0)
+                chan_idx = coords.get('ChannelIndex', 0)
+                slice_idx = coords.get('SliceIndex', 0)
+
+                # Look for file relative to directory (may be in subdirectory for v2)
+                file_path = self.directory / filepath_in_key
+                if file_path.exists():
+                    self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = file_path
+                    self._file_list.append(file_path)
+
+        if not self._file_list:
+            raise ValueError(f"No MicroManager TIFF files found in {directory}")
+
+        # Sort file list for consistent ordering
+        self._file_list = sorted(set(self._file_list))
+
+        # Open first file to get shape and dtype
+        with tifffile.TiffFile(str(self._file_list[0])) as tf:
+            first_page = tf.pages[0]
+            self._dtype = str(first_page.dtype)
+            self._height = first_page.shape[0]
+            self._width = first_page.shape[1]
+
+            # Tile info
+            if first_page.is_tiled:
+                self.is_tiled = True
+                self.tile_width = first_page.tilewidth
+                self.tile_length = first_page.tilelength
+                self._spatial_chunk = [self.tile_length, self.tile_width]
+            else:
+                self.is_tiled = False
+                self._spatial_chunk = [self._height, self._width]
+
+        # Get axis order from metadata
+        axis_order = summary.get('AxisOrder', ['position', 'time', 'channel', 'z'])
+        if isinstance(axis_order, str):
+            axis_order = [a.strip() for a in axis_order.split(',')]
+        self._axis_order = axis_order
+
+        # Map axis names to their counts
+        axis_counts = {
+            'position': self._n_positions,
+            'time': self._n_times,
+            'channel': self._n_channels,
+            'z': self._n_z,
+        }
+
+        # Build shape following axis_order from metadata
+        shape_axes = [a.lower() for a in axis_order]
+        initial_shape = [axis_counts.get(a.lower(), 1) for a in axis_order] + [self._height, self._width]
+
+        # Remove singleton dimensions while preserving axis correspondence
+        # Only remove from non-spatial dimensions (keep y, x)
+        self.full_shape = []
+        self._shape_axes = []
+        for i, (size, axis) in enumerate(zip(initial_shape, shape_axes)):
+            if i < len(shape_axes):  # Non-spatial axis
+                if size > 1:  # Keep non-singleton dimensions
+                    self.full_shape.append(size)
+                    self._shape_axes.append(axis)
+            else:  # This shouldn't happen, shape_axes is shorter
+                pass
+
+        # Always append spatial dimensions
+        self.full_shape.extend([self._height, self._width])
+
+        # Chunk shape
+        self.chunk_shape = [1] * (len(self.full_shape) - 2) + self._spatial_chunk
+
+        # Dimension labels (from remaining axes after singleton removal)
+        if dim_labels:
+            self.dim_labels = dim_labels
+        else:
+            axis_alias = {
+                'position': 'p', 'pos': 'p',
+                'time': 't', 'frame': 't',
+                'channel': 'c',
+                'z': 'z', 'slice': 'z',
+            }
+            self.dim_labels = []
+            for axis in self._shape_axes:
+                label = axis_alias.get(axis.lower(), axis.lower()[0])
+                self.dim_labels.append(label)
+            self.dim_labels.extend(['y', 'x'])
+
+        # Build index for efficient lookups
+        self._build_file_index()
+
+    def _build_file_index(self) -> None:
+        """Build index mapping for efficient coordinate lookups."""
+        # Create reverse lookup: global_index -> file_path
+        # For single-position/time/z datasets, this simplifies access
+        self._index_to_file: Dict[int, Path] = {}
+
+        if len(self.full_shape) == 3:
+            # (channels, y, x) - single index is channel
+            for (pos, time, chan, z), file_path in self._coord_map.items():
+                if pos == 0 and time == 0 and z == 0:
+                    self._index_to_file[chan] = file_path
+        elif len(self.full_shape) == 4:
+            # (channels, z, y, x) or similar
+            for (pos, time, chan, z), file_path in self._coord_map.items():
+                if pos == 0 and time == 0:
+                    # Index = chan * n_z + z (assuming channel-z order)
+                    idx = chan * self._n_z + z
+                    self._index_to_file[idx] = file_path
+
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        return TensorDescriptor(
+            array_id=self.array_id,
+            dim_labels=self.dim_labels,
+            shape=self.full_shape,
+            chunk_shape=self.chunk_shape,
+            dtype=self._dtype,
+        )
+
+    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+        return [self.get_tensor_descriptor()]
+
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds using tile-level lazy access.
+
+        Uses TiffFile().aszarr() for true tile-level lazy reading.
+
+        Args:
+            bounds: Chunk bounds (start, stop coordinates per axis)
+
+        Returns:
+            Numpy array with data within the requested bounds
+        """
+        import tifffile
+        import zarr
+
+        super().get_data(bounds)
+        slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
+
+        with self._io_lock:
+            ndim = len(self.full_shape)
+            original_ndim = len(slices)
+
+            # Extract spatial slices (last 2 axes)
+            y_slice = slices[-2] if len(slices) >= 2 else slice(None)
+            x_slice = slices[-1] if len(slices) >= 1 else slice(None)
+
+            # Determine coordinate ranges based on shape
+            if ndim == 3:
+                # (channels, y, x)
+                chan_slice = slices[0]
+                pos_range = [0]
+                time_range = [0]
+                chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                z_range = [0]
+            elif ndim == 4:
+                # (channels, z, y, x) or (time, channels, y, x) depending on axis_order
+                if 'z' in self.dim_labels[:2]:
+                    # (channels, z, y, x) format
+                    chan_slice = slices[0]
+                    z_slice = slices[1]
+                    pos_range = [0]
+                    time_range = [0]
+                    chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+                else:
+                    # (time, channels, y, x) format
+                    time_slice = slices[0]
+                    chan_slice = slices[1]
+                    pos_range = [0]
+                    time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
+                    chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                    z_range = [0]
+            elif ndim == 5:
+                # (time, channels, z, y, x) or (position, channels, z, y, x)
+                if 'p' in self.dim_labels:
+                    pos_slice = slices[0]
+                    chan_slice = slices[1]
+                    z_slice = slices[2]
+                    pos_range = range(pos_slice.start or 0, pos_slice.stop or self._n_positions)
+                    time_range = [0]
+                    chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+                else:
+                    time_slice = slices[0]
+                    chan_slice = slices[1]
+                    z_slice = slices[2]
+                    pos_range = [0]
+                    time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
+                    chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                    z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+            elif ndim == 6:
+                # (position, time, channels, z, y, x)
+                pos_slice = slices[0]
+                time_slice = slices[1]
+                chan_slice = slices[2]
+                z_slice = slices[3]
+                pos_range = range(pos_slice.start or 0, pos_slice.stop or self._n_positions)
+                time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
+                chan_range = range(chan_slice.start or 0, chan_slice.stop or self._n_channels)
+                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
+            else:
+                # Fallback - assume all dimensions except last 2 are 1
+                pos_range = [0]
+                time_range = [0]
+                chan_range = [0]
+                z_range = [0]
+
+            # Collect data for each coordinate
+            result_pages = []
+            for pos_idx in pos_range:
+                for time_idx in time_range:
+                    for chan_idx in chan_range:
+                        for slice_idx in z_range:
+                            coord = (pos_idx, time_idx, chan_idx, slice_idx)
+                            file_path = self._coord_map.get(coord)
+
+                            if file_path is None:
+                                # Create empty array for missing data
+                                h = y_slice.stop - (y_slice.start or 0) if y_slice.stop else self._height
+                                w = x_slice.stop - (x_slice.start or 0) if x_slice.stop else self._width
+                                result_pages.append(np.zeros((h, w), dtype=self._dtype))
+                                continue
+
+                            with tifffile.TiffFile(str(file_path)) as tf:
+                                zarr_arr = zarr.open_array(tf.series[0].aszarr(), mode='r')
+                                zarr_ndim = len(zarr_arr.shape)
+                                if zarr_ndim == 2:
+                                    page_data = zarr_arr[y_slice, x_slice]
+                                else:
+                                    page_data = zarr_arr[0, y_slice, x_slice] if zarr_ndim >= 3 else zarr_arr[y_slice, x_slice]
+                                result_pages.append(page_data)
+
+            # Build output array with proper shape
+            if not result_pages:
+                return np.array([])
+
+            # Stack pages and reshape to match the expected shape
+            n_pos = len(pos_range)
+            n_time = len(time_range)
+            n_chan = len(chan_range)
+            n_z = len(z_range)
+
+            h = result_pages[0].shape[0] if result_pages else 0
+            w = result_pages[0].shape[1] if result_pages else 0
+
+            # Stack all pages and reshape
+            result = np.stack(result_pages, axis=0)
+
+            # Reshape to (pos, time, chan, z, h, w) based on actual ranges
+            if ndim == 3:
+                result = result.reshape(n_chan, h, w)
+            elif ndim == 4:
+                result = result.reshape(n_chan * n_z, h, w)
+                if 'z' in self.dim_labels[:2]:
+                    result = result.reshape(n_chan, n_z, h, w)
+                else:
+                    result = result.reshape(n_time, n_chan, h, w)
+            elif ndim == 5:
+                if 'p' in self.dim_labels:
+                    result = result.reshape(n_pos, n_chan, n_z, h, w)
+                else:
+                    result = result.reshape(n_time, n_chan, n_z, h, w)
+            elif ndim == 6:
+                result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
+
+            return result
+
+    def get_metadata(self) -> dict:
+        """Return parsed MicroManager metadata."""
+        return self._raw_metadata

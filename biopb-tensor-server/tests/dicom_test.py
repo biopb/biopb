@@ -13,7 +13,7 @@ from biopb_tensor_server.adapters.dicom import (
     DicomSeriesAdapter,
     _derive_orientation_from_iop,
 )
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 
 def create_synthetic_dicom(
@@ -166,13 +166,13 @@ class TestDicomAdapterClaim:
             dcm_path = Path(tmpdir) / 'test.dcm'
             create_synthetic_dicom(dcm_path)
 
-            visited = set()
-            claim = DicomAdapter.claim(dcm_path, visited)
+            ctx = ClaimContext(dcm_path)
+            state = DiscoveryState()
+            claim = DicomAdapter.claim(ctx, state)
 
             assert claim is not None
             assert claim.source_type == "dicom"
             assert claim.primary_path == str(dcm_path)
-            assert str(dcm_path) in claim.claimed_paths
 
     def test_claim_non_dicom_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -180,8 +180,9 @@ class TestDicomAdapterClaim:
             txt_path = Path(tmpdir) / 'test.txt'
             txt_path.write_text('not a dicom file')
 
-            visited = set()
-            claim = DicomAdapter.claim(txt_path, visited)
+            ctx = ClaimContext(txt_path)
+            state = DiscoveryState()
+            claim = DicomAdapter.claim(ctx, state)
 
             assert claim is None
 
@@ -207,8 +208,9 @@ class TestDicomAdapterClaim:
             # No Rows, Columns, or pixel data tags!
             ds.save_as(str(dcm_path))
 
-            visited = set()
-            claim = DicomAdapter.claim(dcm_path, visited)
+            ctx = ClaimContext(dcm_path)
+            state = DiscoveryState()
+            claim = DicomAdapter.claim(ctx, state)
 
             assert claim is None
 
@@ -216,8 +218,10 @@ class TestDicomAdapterClaim:
         """Directories should not be claimed by DicomAdapter."""
         with tempfile.TemporaryDirectory() as tmpdir:
             dir_path = Path(tmpdir)
-            visited = set()
-            claim = DicomAdapter.claim(dir_path, visited)
+
+            ctx = ClaimContext(dir_path)
+            state = DiscoveryState()
+            claim = DicomAdapter.claim(ctx, state)
 
             assert claim is None
 
@@ -338,14 +342,15 @@ class TestDicomSeriesAdapterClaim:
                     slice_location=float(i),
                 )
 
-            visited = set()
-            claim = DicomSeriesAdapter.claim(Path(tmpdir), visited)
+            ctx = ClaimContext(Path(tmpdir))
+            state = DiscoveryState()
+            claim = DicomSeriesAdapter.claim(ctx, state)
 
             assert claim is not None
             assert claim.source_type == "dicom-series"
             assert claim.primary_path == str(Path(tmpdir))
-            # Should claim directory + all DICOM files
-            assert len(claim.claimed_paths) >= 6  # dir + 5 files
+            # Should claim directory + all DICOM files (now tracked in state)
+            assert len(state.consumed_paths) >= 6  # dir + 5 files
 
     def test_claim_single_dicom_directory(self):
         """Directory with only one DICOM should not be claimed as series."""
@@ -353,8 +358,9 @@ class TestDicomSeriesAdapterClaim:
             dcm_path = Path(tmpdir) / 'single.dcm'
             create_synthetic_dicom(dcm_path)
 
-            visited = set()
-            claim = DicomSeriesAdapter.claim(Path(tmpdir), visited)
+            ctx = ClaimContext(Path(tmpdir))
+            state = DiscoveryState()
+            claim = DicomSeriesAdapter.claim(ctx, state)
 
             assert claim is None
 
@@ -376,8 +382,9 @@ class TestDicomSeriesAdapterClaim:
             dcm_path = Path(tmpdir) / 'series2_0.dcm'
             create_synthetic_dicom(dcm_path, series_uid=series_uid2)
 
-            visited = set()
-            claim = DicomSeriesAdapter.claim(Path(tmpdir), visited)
+            ctx = ClaimContext(Path(tmpdir))
+            state = DiscoveryState()
+            claim = DicomSeriesAdapter.claim(ctx, state)
 
             # Should still claim the first series with 2+ files
             assert claim is not None

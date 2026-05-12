@@ -11,16 +11,17 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
 
 
-class NiftiAdapter(BackendAdapter):
+class NiftiAdapter(SourceAdapter, TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
     Uses nibabel for lazy loading and header parsing.
@@ -34,62 +35,44 @@ class NiftiAdapter(BackendAdapter):
     """
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim NIfTI files (.nii or .nii.gz).
 
+        Works for both local and remote files.
+
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim if this is a NIfTI file, None otherwise
         """
-        if not path.is_file():
+        if not ctx.is_file():
             return None
 
-        name = path.name.lower()
+        name = ctx.name.lower()
         if not (name.endswith('.nii') or name.endswith('.nii.gz')):
             return None
 
-        return SourceClaim(
-            source_type="nifti",
-            primary_path=path,
-            claimed_paths={path},
-        )
-
-    @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote NIfTI files.
-
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a remote NIfTI file, None otherwise
-        """
-        # Check for NIfTI extension
-        path_lower = path.lower()
-        if not (path_lower.endswith('.nii') or path_lower.endswith('.nii.gz')):
-            return None
-
-        if not store.isfile(path):
-            return None
+        state.try_claim_path(ctx.path_str)
 
         return SourceClaim(
             source_type="nifti",
-            primary_path=store._join(path),
-            claimed_paths={store._join(path)},
-            is_remote=True,
+            primary_path=ctx.path_str,
+            is_remote=ctx.is_remote,
         )
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'NiftiAdapter':
+    def create_from_config(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'NiftiAdapter':
         """Create adapter instance from SourceConfig.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             NiftiAdapter instance
@@ -98,13 +81,16 @@ class NiftiAdapter(BackendAdapter):
 
         if source.is_remote:
             # Remote storage: download to temp file (nibabel doesn't support file-like objects)
-            from biopb_tensor_server.remote import RemoteStore
             from fsspec.core import url_to_fs
+            from biopb_tensor_server.remote import CredentialsConfig
             import tempfile
 
+            # Build storage_options from credentials_config if provided
             storage_options = {}
-            if source.credentials_profile:
-                pass  # fsspec handles via environment variables
+            if credentials_config:
+                profile = credentials_config.get_profile(source.credentials_profile)
+                if profile:
+                    storage_options = profile.to_storage_options()
 
             fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
 
@@ -128,53 +114,6 @@ class NiftiAdapter(BackendAdapter):
             # Local filesystem
             nifti_img = nib.load(str(source.url))
             return cls(nifti_img, source.source_id, source.dim_labels)
-
-    @classmethod
-    def create_from_config_with_credentials(
-        cls,
-        source: 'SourceConfig',
-        credentials_config: Optional[Any] = None,
-    ) -> 'NiftiAdapter':
-        """Create adapter with explicit credentials config.
-
-        Args:
-            source: SourceConfig with url, source_id, dim_labels
-            credentials_config: CredentialsConfig for authentication
-
-        Returns:
-            NiftiAdapter instance
-        """
-        import nibabel as nib
-        from fsspec.core import url_to_fs
-        from biopb_tensor_server.remote import CredentialsConfig
-        import tempfile
-
-        if not source.is_remote:
-            return cls.create_from_config(source)
-
-        # Build storage_options from credentials_config
-        storage_options = {}
-        if credentials_config:
-            profile = credentials_config.get_profile(source.credentials_profile)
-            if profile:
-                storage_options = profile.to_storage_options()
-
-        # Create fsspec filesystem with credentials
-        fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
-
-        # Determine suffix for temp file
-        suffix = '.nii.gz' if source.url.lower().endswith('.nii.gz') else '.nii'
-
-        # Download to temp file
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-
-        fs.get_file(fs_path, str(tmp_path))
-
-        # Load NIfTI from temp file
-        nifti_img = nib.load(str(tmp_path))
-
-        return cls(nifti_img, source.source_id, source.dim_labels, temp_file=tmp_path)
 
     def __init__(
         self,

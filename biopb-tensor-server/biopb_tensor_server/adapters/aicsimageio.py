@@ -8,6 +8,7 @@ Supports:
 - Lazy loading via dask arrays
 - OME-XML metadata conversion
 - Remote storage (S3, GCS, etc.) via fsspec (passing fs_kwargs)
+- OME-TIFF files (single/multi-file + companion.ome)
 
 Chunk ID format:
 - array_id + bounds encoding (start, stop coordinates)
@@ -17,6 +18,7 @@ Relies on OS page cache for raw data caching.
 
 import importlib
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
@@ -24,15 +26,109 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
 
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
+
+
+# =============================================================================
+# OME-XML metadata helpers (for OME-TIFF handling)
+# =============================================================================
+
+def _get_namespace(root) -> dict:
+    """Extract namespace from root element tag.
+
+    Args:
+        root: ElementTree root element
+
+    Returns:
+        Dictionary with namespace mapping for OME schema
+    """
+    tag = root.tag
+    if tag.startswith('{'):
+        namespace = tag.split('}')[0].strip('{')
+        return {'ome': namespace}
+    return {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+
+
+def _extract_files_from_ome_xml(
+    ome_metadata: str,
+    source_dir: Path | str,
+    store: Optional["RemoteStore"] = None,
+) -> Optional[List[Path] | List[str]]:
+    """Extract ordered file list from OME-XML TiffData elements.
+
+    Parses OME-XML to find all referenced TIFF files via TiffData/UUID elements.
+    Files are returned in order with the first TiffData's file as master.
+
+    Args:
+        ome_metadata: OME-XML string (raw XML)
+        source_dir: Directory containing the source file (for resolving relative paths)
+        store: Optional RemoteStore for remote access. If None, uses local Path operations.
+
+    Returns:
+        Ordered list of Path objects (local) or str paths (remote), or None if parsing fails
+    """
+    try:
+        root = ET.fromstring(ome_metadata)
+        namespace = _get_namespace(root)
+
+        files = []
+        seen_files = set()
+
+        for tiff_data in root.findall('.//ome:TiffData', namespace):
+            uuid_elem = tiff_data.find('ome:UUID', namespace)
+            if uuid_elem is None:
+                for child in tiff_data:
+                    if child.tag.endswith('UUID') or child.tag == 'UUID':
+                        uuid_elem = child
+                        break
+
+            if uuid_elem is not None:
+                filename = uuid_elem.get('FileName')
+                if filename and filename not in seen_files:
+                    if store is not None:
+                        if source_dir:
+                            file_path = store._join(str(source_dir) + '/' + filename)
+                        else:
+                            file_path = store._join(filename)
+                        exists = store.isfile(file_path)
+                    else:
+                        file_path = Path(source_dir) / filename
+                        exists = file_path.exists()
+
+                    if exists:
+                        files.append(file_path)
+                        seen_files.add(filename)
+
+        return files if files else None
+    except ET.ParseError:
+        return None
+
+
+def _get_ome_metadata_from_tiff(path: Path) -> Optional[str]:
+    """Extract OME-XML metadata from TIFF file if present.
+
+    Args:
+        path: Path to TIFF file
+
+    Returns:
+        OME-XML string if present, None otherwise
+    """
+    import tifffile
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            if hasattr(tf, 'ome_metadata') and tf.ome_metadata is not None:
+                return tf.ome_metadata
+    except Exception:
+        return None
 
 
 def _get_available_extensions() -> List[str]:
@@ -64,7 +160,7 @@ def _get_available_extensions() -> List[str]:
 AICS_EXTENSIONS = _get_available_extensions()
 
 
-class AicsImageIoAdapter(BackendAdapter):
+class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
     """Adapter for aicsimageio-supported vendor formats (CZI, LIF, ND2, DV, etc.).
 
     Dual-role adapter:
@@ -91,60 +187,114 @@ class AicsImageIoAdapter(BackendAdapter):
     _single_tensor_source = False
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim aicsimageio-supported vendor microscopy format files.
 
+        Handles:
+        - Companion OME files (.companion.ome) - parse XML to find all TIFF files
+        - OME-TIFF files (.tif/.tiff with embedded OME-XML) - discover related files
+        - Standard aicsimageio formats (CZI, LIF, ND2, DV, etc.)
+
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim if this is a supported vendor format file, None otherwise
         """
-        if not path.is_file():
+        if not ctx.is_file():
             return None
 
-        name = path.name.lower()
-        for ext in AICS_EXTENSIONS:
-            if name.endswith(ext):
-                return SourceClaim(
-                    source_type="aics",
-                    primary_path=path,
-                    claimed_paths={path},
-                )
-        return None
+        name = ctx.name.lower()
 
-    @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote aicsimageio-supported files.
+        # Case 1: Companion OME file - parse XML to find all TIFF files
+        # Requires bioformats_jar dependency
+        if name.endswith('.companion.ome'):
+            try:
+                import bioformats_jar
+            except ImportError:
+                return None
 
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a supported remote file, None otherwise
-        """
-        # Check for supported extensions
-        path_lower = path.lower()
-        for ext in AICS_EXTENSIONS:
-            if path_lower.endswith(ext):
-                if store.isfile(path):
+            ome_metadata = ctx.read_text()
+            if ome_metadata:
+                related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
+                if related_files:
+                    primary_path = related_files[0]
+                    state.try_claim_path(ctx.path_str)
+                    for f in related_files:
+                        state.try_claim_path(f)
                     return SourceClaim(
                         source_type="aics",
-                        primary_path=store._join(path),
-                        claimed_paths={store._join(path)},
-                        is_remote=True,
+                        primary_path=primary_path,
                     )
+            return None
+
+        # Case 2: TIFF file - check for embedded OME-XML
+        # Only works for local files (requires tifffile to extract embedded XML)
+        if not ctx.is_remote and (name.endswith('.tif') or name.endswith('.tiff')):
+            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
+
+            if ome_metadata:
+                related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
+                if related_files:
+                    primary_path = related_files[0]
+                    for f in related_files:
+                        state.try_claim_path(f)
+                    return SourceClaim(
+                        source_type="aics",
+                        primary_path=primary_path,
+                    )
+
+        # Case 3: Standard aicsimageio extension match (CZI, LIF, ND2, etc.)
+        for ext in AICS_EXTENSIONS:
+            if name.endswith(ext):
+                state.try_claim_path(ctx.path_str)
+                return SourceClaim(
+                    source_type="aics",
+                    primary_path=ctx.path_str,
+                )
+
         return None
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'AicsImageIoAdapter':
+    def create_from_url(cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None) -> 'AicsImageIoAdapter':
+        """Create source-level adapter instance from URL directly.
+
+        Convenience method for creating adapter without SourceConfig.
+
+        Args:
+            url: URL or path to the file
+            source_id: Unique identifier for this source
+            dim_labels: Optional dimension labels
+
+        Returns:
+            AicsImageIoAdapter instance (source-level, scene_index=None)
+        """
+        from aicsimageio import AICSImage
+
+        # Companion.ome files are handled directly by AICSImage when bioformats_jar is available
+        # No special handling needed - AICSImage will use BioformatsReader
+
+        img = AICSImage(url)
+        return cls(
+            img,
+            scene_index=None,
+            source_id=source_id,
+            dim_labels=dim_labels,
+            source_url=url,
+        )
+
+    @classmethod
+    def create_from_config(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'AicsImageIoAdapter':
         """Create source-level adapter instance from SourceConfig.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             AicsImageIoAdapter instance (source-level, scene_index=None)
@@ -152,17 +302,12 @@ class AicsImageIoAdapter(BackendAdapter):
         from aicsimageio import AICSImage
 
         if source.is_remote:
-            # Remote storage: pass fs_kwargs for fsspec authentication
-            from fsspec.core import url_to_fs
-            from biopb_tensor_server.remote import _get_env_credentials, _detect_storage_type
-
+            # Remote storage: resolve storage_options for fsspec authentication
             storage_options = {}
-            if source.credentials_profile:
-                pass  # fsspec handles via environment variables
-
-            # Get storage options from environment and URL
-            storage_type = _detect_storage_type(source.url)
-            storage_options = _get_env_credentials(storage_type)
+            if credentials_config:
+                profile = credentials_config.get_profile(source.credentials_profile)
+                if profile:
+                    storage_options = profile.to_storage_options()
 
             # Note: aicsimageio's OmeZarrReader has a gap where fs_kwargs
             # are not passed to ome-zarr-py. For OME-Zarr, use OmeZarrAdapter instead.
@@ -174,44 +319,6 @@ class AicsImageIoAdapter(BackendAdapter):
         return cls(
             img,
             scene_index=None,  # Source-level adapter
-            source_id=source.source_id,
-            dim_labels=source.dim_labels,
-            source_url=str(source.url),
-        )
-
-    @classmethod
-    def create_from_config_with_credentials(
-        cls,
-        source: 'SourceConfig',
-        credentials_config: Optional[Any] = None,
-    ) -> 'AicsImageIoAdapter':
-        """Create adapter with explicit credentials config.
-
-        Args:
-            source: SourceConfig with url, source_id, dim_labels
-            credentials_config: CredentialsConfig for authentication
-
-        Returns:
-            AicsImageIoAdapter instance
-        """
-        from aicsimageio import AICSImage
-        from biopb_tensor_server.remote import CredentialsConfig
-
-        if not source.is_remote:
-            return cls.create_from_config(source)
-
-        # Build storage_options from credentials_config
-        storage_options = {}
-        if credentials_config:
-            profile = credentials_config.get_profile(source.credentials_profile)
-            if profile:
-                storage_options = profile.to_storage_options()
-
-        img = AICSImage(source.url, fs_kwargs=storage_options)
-
-        return cls(
-            img,
-            scene_index=None,
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             source_url=str(source.url),
@@ -401,7 +508,8 @@ class AicsImageIoAdapter(BackendAdapter):
             source_url=self._source_url,
             io_lock=self._io_lock,
         )
-        _ = super(AicsImageIoAdapter, adapter).get_tensor_adapter(tensor_id)  # Set tensor context in base class
+        # Set tensor context in the adapter
+        adapter._tensor_name = tensor_id
         self._tensor_adapters[tensor_id] = adapter
 
         return adapter

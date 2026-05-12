@@ -4,21 +4,22 @@ Relies on OS page cache for raw data caching.
 """
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
 
 
-class Hdf5Adapter(BackendAdapter):
+class Hdf5Adapter(SourceAdapter, TensorAdapter):
     """Adapter for HDF5 chunked datasets.
 
     Chunk ID format:
@@ -29,7 +30,7 @@ class Hdf5Adapter(BackendAdapter):
     """
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim HDF5 files (requires explicit dataset path in config).
 
         HDF5 files are detected but NOT auto-expanded to tensors because
@@ -37,30 +38,31 @@ class Hdf5Adapter(BackendAdapter):
         signals this via extra_config['needs_dataset'] = True.
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim with needs_dataset flag, None if not HDF5 file
         """
-        if not path.is_file():
+        if not ctx.is_file():
             return None
 
-        name = path.name.lower()
+        name = ctx.name.lower()
         if not (name.endswith('.h5') or name.endswith('.hdf5')):
             return None
+
+        state.try_claim_path(ctx.path_str)
 
         # HDF5 files are claimed but marked as needing explicit dataset config
         # The discovery system will warn about these
         return SourceClaim(
             source_type="hdf5",
-            primary_path=path,
-            claimed_paths={path},
+            primary_path=ctx.path_str,
             extra_config={'needs_dataset': True},
         )
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'Hdf5Adapter':
+    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'Hdf5Adapter':
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -131,3 +133,15 @@ class Hdf5Adapter(BackendAdapter):
 
     def list_tensor_descriptors(self):
         return [self.get_tensor_descriptor()]
+
+    def get_metadata(self) -> dict:
+        """Return HDF5 metadata as dict.
+
+        Returns:
+            Dict with dataset info (shape, dtype, chunks)
+        """
+        return {
+            "shape": list(self.h5_dataset.shape),
+            "dtype": str(self.h5_dataset.dtype),
+            "chunks": list(self.h5_dataset.chunks) if self.h5_dataset.chunks else None,
+        }

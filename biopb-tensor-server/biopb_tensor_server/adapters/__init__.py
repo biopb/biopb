@@ -9,12 +9,15 @@ Usage:
     claims = registry.get_claims_for_path(path, visited)
 """
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import BackendAdapter, SourceAdapter, TensorAdapter
 from biopb_tensor_server.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
 from .ome_zarr import OmeZarrAdapter
-from .tiff import MultiFileOmeTiffAdapter, OmeTiffAdapter
+from .tiff import (
+    TiffSequenceAdapter,
+    MicroManagerLegacyAdapter,
+)
 from .zarr import ZarrAdapter
 
 # Optional aicsimageio adapter
@@ -39,10 +42,12 @@ __all__ = [
     'get_default_registry',
     'AdapterRegistry',
     'BackendAdapter',
+    'SourceAdapter',
+    'TensorAdapter',
     'ZarrAdapter',
     'Hdf5Adapter',
-    'OmeTiffAdapter',
-    'MultiFileOmeTiffAdapter',
+    'TiffSequenceAdapter',
+    'MicroManagerLegacyAdapter',
     'OmeZarrAdapter',
     'AicsImageIoAdapter',
     'DicomAdapter',
@@ -55,15 +60,15 @@ def get_default_registry() -> AdapterRegistry:
     """Get the default adapter registry with all built-in adapters.
 
     Adapter registration order (by priority/specificity, highest first):
-    1. AicsImageIoAdapter - Primary handler (well-maintained, supports CZI, LIF, ND2, DV, LSM, OIF, OIB, XML)
-    2. OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
-    3. ZarrAdapter - Generic Zarr fallback
-    4. MultiFileOmeTiffAdapter - Multi-file OME-TIFF/MicroManager datasets
-    5. OmeTiffAdapter - Single-file OME-TIFF only (.ome.tiff/.ome.tif extensions)
-    6. DicomSeriesAdapter - Multi-file DICOM series (directories with same SeriesInstanceUID)
-    7. DicomAdapter - Single DICOM files (.dcm)
-    8. NiftiAdapter - NIfTI files (.nii, .nii.gz)
-    9. Hdf5Adapter - HDF5 files (requires explicit type in config)
+    - AicsImageIoAdapter - Primary handler (well-maintained, supports CZI, LIF, ND2, DV, LSM, OIF, OIB, XML, OME-TIFF)
+    - OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
+    - ZarrAdapter - Generic Zarr fallback
+    - MicroManagerLegacyAdapter - Legacy MicroManager datasets with JSON metadata (metadata.txt)
+    - TiffSequenceAdapter - Plain TIFF sequences (no metadata)
+    - DicomSeriesAdapter - Multi-file DICOM series (directories with same SeriesInstanceUID)
+    - DicomAdapter - Single DICOM files (.dcm)
+    - NiftiAdapter - NIfTI files (.nii, .nii.gz)
+    - Hdf5Adapter - HDF5 files (requires explicit type in config)
 
     Returns:
         AdapterRegistry with all built-in adapters registered
@@ -76,9 +81,9 @@ def get_default_registry() -> AdapterRegistry:
 
     registry.register_with_type("ome-zarr", OmeZarrAdapter)
     registry.register_with_type("ome-zarr-hcs", OmeZarrAdapter)  # HCS plates use same adapter
-    registry.register_with_type("zarr", ZarrAdapter)
-    registry.register_with_type("ome-tiff-multifile", MultiFileOmeTiffAdapter)
-    registry.register_with_type("ome-tiff", OmeTiffAdapter)
+    # registry.register_with_type("zarr", ZarrAdapter) # disabled for now - too niche
+    registry.register_with_type("micromanager-legacy", MicroManagerLegacyAdapter)
+    registry.register_with_type("tiff-sequence", TiffSequenceAdapter)
 
     # Medical imaging adapters
     if DicomSeriesAdapter is not None:

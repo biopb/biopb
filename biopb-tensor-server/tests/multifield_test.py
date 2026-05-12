@@ -23,6 +23,11 @@ class MockMultifieldAdapter(BackendAdapter):
         """Mock adapter does not participate in discovery."""
         return None
 
+    @classmethod
+    def create_from_config(cls, source, credentials_config=None):
+        """Mock adapter is not created from config."""
+        raise NotImplementedError("MockMultifieldAdapter is for testing only")
+
     def __init__(self, source_id: str, tensor_specs):
         """Initialize with multiple tensors.
 
@@ -89,6 +94,10 @@ class MockMultifieldAdapter(BackendAdapter):
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
 
+    def get_data(self, bounds):
+        """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
+        raise NotImplementedError("MockMultifieldAdapter.get_data() should not be called directly")
+
 
 class MockSingleTensorAdapter(BackendAdapter):
     """Mock adapter for a single tensor within a multifield source."""
@@ -97,6 +106,11 @@ class MockSingleTensorAdapter(BackendAdapter):
     def claim(cls, path, visited_identities):
         """Mock adapter does not participate in discovery."""
         return None
+
+    @classmethod
+    def create_from_config(cls, source, credentials_config=None):
+        """Mock adapter is not created from config."""
+        raise NotImplementedError("MockSingleTensorAdapter is for testing only")
 
     def __init__(self, array_id: str, shape: tuple, dtype: str, value: int = 0):
         # Parse array_id to get source_id and tensor_name
@@ -129,6 +143,10 @@ class MockSingleTensorAdapter(BackendAdapter):
         super().get_data(bounds)
         shape = tuple(int(stop - start) for start, stop in zip(bounds.start, bounds.stop))
         return np.full(shape, self.value, dtype=self.dtype)
+
+    def get_metadata(self) -> dict:
+        """Return mock metadata."""
+        return {"mock_tensor": True, "value": self.value}
 
 
 class TestMultifieldSourceLevel:

@@ -11,12 +11,13 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, get_file_identity, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
 
 
@@ -77,7 +78,7 @@ def _derive_orientation_from_iop(iop: List[float]) -> str:
 # DicomAdapter - Single file
 # =============================================================================
 
-class DicomAdapter(BackendAdapter):
+class DicomAdapter(SourceAdapter, TensorAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
@@ -91,86 +92,62 @@ class DicomAdapter(BackendAdapter):
     """
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim single DICOM files.
 
+        Works for both local and remote files.
+
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim if this is a valid DICOM file with pixel data capability, None otherwise
         """
-        if not path.is_file():
+        if not ctx.is_file():
             return None
 
         # Check extension
-        name = path.name.lower()
+        name = ctx.name.lower()
         if not (name.endswith('.dcm') or name.endswith('.dicom')):
-            # Could also check for DICOM prefix "DICM" at byte 128
-            # But extension check is sufficient for most cases
             return None
 
         try:
             import pydicom
-            # Quick check: read metadata only (no pixel data)
-            ds = pydicom.dcmread(str(path), stop_before_pixels=True)
+
+            if ctx.is_remote:
+                # Remote: read via file-like object
+                with ctx.store.open(ctx._remote_path, mode='rb') as fobj:
+                    ds = pydicom.dcmread(fobj, stop_before_pixels=True)
+            else:
+                # Local: read metadata only (no pixel data)
+                ds = pydicom.dcmread(ctx.path_str, stop_before_pixels=True)
 
             # Check for image-related tags (indicating pixel data capability)
-            # PixelData isn't loaded with stop_before_pixels=True, so we check Rows/Columns
             if not (hasattr(ds, 'Rows') and hasattr(ds, 'Columns')):
                 return None
 
+            state.try_claim_path(ctx.path_str)
+
             return SourceClaim(
                 source_type="dicom",
-                primary_path=path,
-                claimed_paths={path},
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
             )
         except Exception:
             return None
 
     @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote DICOM files.
-
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a remote DICOM file, None otherwise
-        """
-        # Check for DICOM extension
-        path_lower = path.lower()
-        if not (path_lower.endswith('.dcm') or path_lower.endswith('.dicom')):
-            return None
-
-        if not store.isfile(path):
-            return None
-
-        # Try to read DICOM metadata
-        try:
-            import pydicom
-            with store.open(path, mode='rb') as fobj:
-                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
-                if not (hasattr(ds, 'Rows') and hasattr(ds, 'Columns')):
-                    return None
-            return SourceClaim(
-                source_type="dicom",
-                primary_path=store._join(path),
-                claimed_paths={store._join(path)},
-                is_remote=True,
-            )
-        except Exception:
-            return None
-
-    @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'DicomAdapter':
+    def create_from_config(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'DicomAdapter':
         """Create adapter instance from SourceConfig.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             DicomAdapter instance
@@ -181,9 +158,12 @@ class DicomAdapter(BackendAdapter):
             # Remote storage: use fsspec file-like object
             from fsspec.core import url_to_fs
 
+            # Build storage_options from credentials_config if provided
             storage_options = {}
-            if source.credentials_profile:
-                pass  # fsspec handles via environment variables
+            if credentials_config:
+                profile = credentials_config.get_profile(source.credentials_profile)
+                if profile:
+                    storage_options = profile.to_storage_options()
 
             fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
             with fs.open(fs_path, mode='rb') as fobj:
@@ -191,42 +171,6 @@ class DicomAdapter(BackendAdapter):
         else:
             # Local filesystem
             ds = pydicom.dcmread(str(source.url))
-
-        return cls(ds, source.source_id, source.dim_labels)
-
-    @classmethod
-    def create_from_config_with_credentials(
-        cls,
-        source: 'SourceConfig',
-        credentials_config: Optional[Any] = None,
-    ) -> 'DicomAdapter':
-        """Create adapter with explicit credentials config.
-
-        Args:
-            source: SourceConfig with url, source_id, dim_labels
-            credentials_config: CredentialsConfig for authentication
-
-        Returns:
-            DicomAdapter instance
-        """
-        import pydicom
-        from fsspec.core import url_to_fs
-        from biopb_tensor_server.remote import CredentialsConfig
-
-        if not source.is_remote:
-            return cls.create_from_config(source)
-
-        # Build storage_options from credentials_config
-        storage_options = {}
-        if credentials_config:
-            profile = credentials_config.get_profile(source.credentials_profile)
-            if profile:
-                storage_options = profile.to_storage_options()
-
-        # Create fsspec filesystem with credentials
-        fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
-        with fs.open(fs_path, mode='rb') as fobj:
-            ds = pydicom.dcmread(fobj)
 
         return cls(ds, source.source_id, source.dim_labels)
 
@@ -407,7 +351,7 @@ class DicomAdapter(BackendAdapter):
 # DicomSeriesAdapter - Multi-file series
 # =============================================================================
 
-class DicomSeriesAdapter(BackendAdapter):
+class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
     Handles directories where multiple DICOM files share the same SeriesInstanceUID.
@@ -419,23 +363,24 @@ class DicomSeriesAdapter(BackendAdapter):
     """
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories containing DICOM series.
 
         Detects multiple DICOM files sharing the same SeriesInstanceUID.
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            SourceClaim (multi-node) if valid DICOM series directory, None otherwise
+            SourceClaim if valid DICOM series directory, None otherwise
         """
-        if not path.is_dir():
+        # Only support local directories for now
+        if ctx.is_remote or not ctx.is_dir():
             return None
 
         # Find DICOM files
-        dcm_files = list(path.glob('*.dcm')) + list(path.glob('*.DICOM')) + list(path.glob('*.dicom'))
+        dcm_files = list(ctx._path.glob('*.dcm')) + list(ctx._path.glob('*.DICOM')) + list(ctx._path.glob('*.dicom'))
 
         # Need at least 2 files for a series
         if len(dcm_files) < 2:
@@ -467,20 +412,14 @@ class DicomSeriesAdapter(BackendAdapter):
             if len(series_files) < 2:
                 return None
 
-            # Multi-node claim: directory + all series files
-            claimed = {path}
+            # Claim directory + all series files
+            state.try_claim_path(ctx.path_str)
             for f in series_files:
-                try:
-                    identity = get_file_identity(f)
-                    if identity not in visited_identities:
-                        claimed.add(f)
-                except OSError:
-                    pass
+                state.try_claim_path(f)
 
             return SourceClaim(
                 source_type="dicom-series",
-                primary_path=path,
-                claimed_paths=claimed,
+                primary_path=ctx.path_str,
                 extra_config={'num_slices': len(series_files), 'series_uid': str(series_uid)},
             )
 
@@ -488,7 +427,7 @@ class DicomSeriesAdapter(BackendAdapter):
             return None
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'DicomSeriesAdapter':
+    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'DicomSeriesAdapter':
         """Create adapter instance from SourceConfig.
 
         Args:

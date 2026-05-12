@@ -231,14 +231,7 @@ class SourceManager:
             if self._dim_labels and claim.dim_labels is None:
                 claim.dim_labels = self._dim_labels
 
-            # Add claimed paths to visited identities
-            for claimed_path in claim.claimed_paths:
-                try:
-                    claimed_identity = get_file_identity(claimed_path)
-                    self._state.visited_identities.add(claimed_identity)
-                except OSError:
-                    pass
-
+            # Paths are already tracked in state via try_claim_path() during claim()
             # Add to discovery state (callback will register with server)
             self._state.add_claim(claim)
             logger.info(f"Added source: {claim.source_id} at {claim.primary_path}")
@@ -275,16 +268,18 @@ class SourceManager:
         removed_ids = []
         with self._lock:
             for source_id, claim in list(self._state.claims.items()):
-                for claimed_path in claim.claimed_paths:
-                    try:
-                        if claimed_path.resolve().is_relative_to(directory):
-                            # This claim is inside the deleted directory
-                            self._state.remove_claim(claim.primary_path)
-                            removed_ids.append(source_id)
-                            break
-                    except OSError:
-                        # Path no longer exists
-                        pass
+                # Check if primary_path is inside the deleted directory
+                try:
+                    claim_path = Path(claim.primary_path)
+                    if claim_path.is_relative_to(directory):
+                        # This claim is inside the deleted directory
+                        self._state.remove_claim(claim.primary_path)
+                        removed_ids.append(source_id)
+                except OSError:
+                    # Path no longer exists - check by string comparison
+                    if str(directory) in claim.primary_path:
+                        self._state.remove_claim(claim.primary_path)
+                        removed_ids.append(source_id)
 
         if removed_ids:
             logger.info(f"Removed {len(removed_ids)} sources from deleted directory: {directory}")
@@ -349,32 +344,20 @@ class SourceManager:
         if source_id:
             claim = self._state.claims.get(source_id)
             if claim:
-                # Update claim paths
-                new_claimed_paths = set()
-                for claimed_path in claim.claimed_paths:
-                    try:
-                        if claimed_path.resolve().is_relative_to(old_path):
-                            # This path moved with the source
-                            relative = claimed_path.relative_to(old_path)
-                            new_claimed_path = new_path / relative
-                            new_claimed_paths.add(new_claimed_path)
-                        else:
-                            new_claimed_paths.add(claimed_path)
-                    except OSError:
-                        pass
-
-                # Update claim
+                # Update claim with new primary path
                 new_claim = SourceClaim(
                     source_type=claim.source_type,
                     primary_path=new_path,
-                    claimed_paths=new_claimed_paths,
                     source_id=source_id,  # Preserve source_id
                     dim_labels=claim.dim_labels,
                     extra_config=claim.extra_config,
                 )
 
                 # Remove old claim, add new claim (callbacks handle server update)
-                self._state.remove_claim(old_path)
+                self._state.remove_claim(str(old_path))
+                # Update consumed_paths to reflect the move
+                if str(old_path) in self._state.consumed_paths:
+                    self._state.consumed_paths.remove(str(old_path))
                 self._state.add_claim(new_claim)
 
                 logger.info(f"Moved source {source_id}: {old_path} -> {new_path}")
@@ -407,13 +390,10 @@ class SourceManager:
                 logger.error(f"No adapter for type: {claim.source_type}")
                 return
 
-            # Create adapter - use credentials for remote sources
-            if claim.is_remote and hasattr(adapter_cls, 'create_from_config_with_credentials'):
-                adapter = adapter_cls.create_from_config_with_credentials(
-                    source_config, self._credentials_config
-                )
-            else:
-                adapter = adapter_cls.create_from_config(source_config)
+            # Create adapter - unified create_from_config with optional credentials
+            adapter = adapter_cls.create_from_config(
+                source_config, self._credentials_config
+            )
 
             # Register with server
             self._server.register_source(claim.source_id, adapter)
@@ -542,7 +522,6 @@ def create_source_manager(
         claim = SourceClaim(
             source_type=source.type,
             primary_path=source.url,  # str for URL support
-            claimed_paths={source.url},
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             extra_config={'dataset': source.dataset} if source.dataset else {},

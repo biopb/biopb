@@ -404,3 +404,33 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     method = chunk_id[method_offset + 2:method_offset + 2 + method_len].decode('utf-8')
 
     return tuple(scale_hint), method
+
+
+def compute_safe_chunk_size(
+    chunk_size: Tuple[int, ...],
+    dtype: str,
+    dim_labels: Optional[List[str]],
+) -> Tuple[int, ...]:
+    """Compute a chunk size that fits within Arrow batch limit.
+
+    Splits along semantic axis (same logic as old split_endpoint).
+    Returns chunk size that is guaranteed to not need splitting.
+    """
+    item_size = np.dtype(dtype).itemsize
+    chunk_bytes = int(np.prod(chunk_size)) * item_size
+
+    if chunk_bytes <= MAX_ARROW_BATCH_BYTES:
+        return chunk_size
+
+    n_splits = int(np.ceil(chunk_bytes / MAX_ARROW_BATCH_BYTES))
+
+    # Choose split axis using semantic priority
+    split_axis = _choose_split_axis(chunk_size, dim_labels, n_splits)
+
+    # Compute safe size on split axis
+    safe_axis_size = chunk_size[split_axis] // n_splits
+
+    safe_size = list(chunk_size)
+    safe_size[split_axis] = safe_axis_size
+
+    return tuple(safe_size)

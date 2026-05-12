@@ -65,6 +65,95 @@ def _hash_path(path: Path) -> str:
     return hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]
 
 
+class ClaimContext:
+    """Unified path access for claim protocol.
+
+    Wraps local Path or RemoteStore operations with identical interface,
+    allowing claim() to work with both filesystem types uniformly.
+    """
+
+    def __init__(self, path: Path | str, store: Optional["RemoteStore"] = None):
+        self._path = Path(path) if store is None else None
+        self._store = store
+        self._remote_path = str(path) if store is not None else None
+
+    def is_dir(self) -> bool:
+        """Check if path is directory."""
+        if self._store:
+            return self._store.isdir(self._remote_path)
+        return self._path.is_dir()
+
+    def is_file(self) -> bool:
+        """Check if path is file."""
+        if self._store:
+            return self._store.isfile(self._remote_path)
+        return self._path.is_file()
+
+    def exists(self) -> bool:
+        """Check if path exists."""
+        if self._store:
+            return self._store.exists(self._remote_path)
+        return self._path.exists()
+
+    def read_text(self, subpath: str = "") -> str:
+        """Read file contents as text.
+
+        Args:
+            subpath: Relative path within this context (empty for current path)
+        """
+        if self._store:
+            target = (self._remote_path + '/' + subpath).lstrip('/') if subpath else self._remote_path
+            return self._store.read_text(target)
+        target = self._path / subpath if subpath else self._path
+        return target.read_text()
+
+    def join(self, subpath: str) -> "ClaimContext":
+        """Create context for subpath."""
+        if self._store:
+            new_path = self._remote_path.rstrip('/') + '/' + subpath if self._remote_path else subpath
+            return ClaimContext(new_path, self._store)
+        return ClaimContext(self._path / subpath)
+
+    def glob(self, pattern: str) -> List["ClaimContext"]:
+        """Find files matching pattern."""
+        if self._store:
+            matches = self._store.find(pattern, maxdepth=1)
+            return [ClaimContext(m, self._store) for m in matches]
+        return [ClaimContext(p) for p in self._path.glob(pattern)]
+
+    @property
+    def path_str(self) -> str:
+        """Get path as string (for SourceClaim)."""
+        if self._store:
+            return self._store._join(self._remote_path)
+        return str(self._path)
+
+    @property
+    def name(self) -> str:
+        """Get filename/directory name."""
+        if self._store:
+            return self._remote_path.rstrip('/').split('/')[-1]
+        return self._path.name
+
+    @property
+    def parent(self) -> "ClaimContext":
+        """Get parent directory context."""
+        if self._store:
+            parent_path = self._remote_path.rsplit('/', 1)[0] if '/' in self._remote_path else ''
+            return ClaimContext(parent_path, self._store)
+        return ClaimContext(self._path.parent)
+
+    @property
+    def is_remote(self) -> bool:
+        """Check if this is a remote context."""
+        return self._store is not None
+
+    @property
+    def store(self) -> Optional["RemoteStore"]:
+        """Get underlying RemoteStore if remote."""
+        return self._store
+
+
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str]
@@ -117,7 +206,6 @@ class SourceClaim:
     Attributes:
         source_type: Type identifier ("zarr", "ome-tiff", "hdf5", etc.)
         primary_path: Main entry point for the source (str to support URLs)
-        claimed_paths: All paths consumed by this claim (Set[str] for URLs)
         source_id: Unique identifier (auto-generated if None)
         dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
@@ -127,7 +215,6 @@ class SourceClaim:
     __slots__ = (
         'source_type',
         'primary_path',
-        'claimed_paths',
         'source_id',
         'dim_labels',
         'extra_config',
@@ -138,18 +225,13 @@ class SourceClaim:
         self,
         source_type: str,
         primary_path: Path | str,
-        claimed_paths: Set[Path] | Set[str],
         source_id: Optional[str] = None,
         dim_labels: Optional[List[str]] = None,
         extra_config: Optional[dict] = None,
         is_remote: bool = False,
     ):
         self.source_type = source_type
-        # Convert Path to str to support both local and remote URLs
         self.primary_path = str(primary_path) if isinstance(primary_path, Path) else primary_path
-        self.claimed_paths = {
-            str(p) if isinstance(p, Path) else p for p in claimed_paths
-        }
         self.source_id = source_id
         self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
@@ -168,18 +250,14 @@ class AdapterRegistry:
     """Registry of all adapter backends.
 
     Adapters register themselves and participate in discovery by
-    implementing the claim() classmethod.
-
-    Supports both local and remote discovery:
-    - Local: claim() for filesystem paths
-    - Remote: claim_remote() for fsspec-based remote URLs
+    implementing the claim() classmethod with ClaimContext and DiscoveryState.
 
     Usage:
         registry = AdapterRegistry()
         registry.register(ZarrAdapter)
         registry.register(OmeZarrAdapter)
-        claims = registry.get_claims_for_path(path, visited)
-        remote_claims = registry.get_claims_for_remote(store, path, visited)
+        ctx = ClaimContext(path)  # or ClaimContext("", store) for remote
+        claims = registry.get_claims_for_path(ctx, state)
     """
 
     def __init__(self):
@@ -190,13 +268,9 @@ class AdapterRegistry:
         """Register an adapter class.
 
         Args:
-            cls: BackendAdapter subclass with claim() method
+            cls: BackendAdapter subclass with claim(ctx, state) method
         """
         self._adapters.append(cls)
-        # Map source_type to adapter class (derived from claim returns)
-        # We infer the type by checking a sample claim
-        # This is done lazily when get_claims_for_path is called
-        # For factory use, we can also set it explicitly via register_with_type
 
     def register_with_type(self, source_type: str, cls: Type[BackendAdapter]) -> None:
         """Register an adapter class with explicit source type mapping.
@@ -208,15 +282,15 @@ class AdapterRegistry:
         self._adapters.append(cls)
         self._type_to_adapter[source_type] = cls
 
-    def get_claims_for_path(self, path: Path, visited_identities: Set[str]) -> List[SourceClaim]:
-        """Ask all adapters to claim this local path.
+    def get_claims_for_path(self, ctx: ClaimContext, state: DiscoveryState) -> List[SourceClaim]:
+        """Ask all adapters to claim this path.
 
-        Each adapter's claim() method is called in registration order.
+        Each adapter's claim(ctx, state) method is called in registration order.
         First adapter to return a non-None claim wins.
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             List of SourceClaim objects (may be empty if no adapter claims)
@@ -224,52 +298,13 @@ class AdapterRegistry:
         claims = []
         for adapter_cls in self._adapters:
             try:
-                claim = adapter_cls.claim(path, visited_identities)
+                claim = adapter_cls.claim(ctx, state)
                 if claim is not None:
                     claims.append(claim)
-                    logger.debug(f"Adapter {adapter_cls.__name__} claimed {path} as {claim.source_type}")
-                    # Update type mapping for factory use
+                    logger.debug(f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}")
                     self._type_to_adapter[claim.source_type] = adapter_cls
             except Exception as e:
-                # Adapter claim() should not raise, but handle gracefully
                 logger.debug(f"Adapter {adapter_cls.__name__} claim() raised exception: {e}")
-                continue
-        return claims
-
-    def get_claims_for_remote(
-        self,
-        store: "RemoteStore",
-        path: str,
-        visited_identities: Set[str],
-    ) -> List[SourceClaim]:
-        """Ask all adapters to claim this remote path.
-
-        Each adapter's claim_remote() method is called in registration order.
-        First adapter to return a non-None claim wins.
-
-        Args:
-            store: RemoteStore instance for remote storage access
-            path: Path within the remote store (relative path string)
-            visited_identities: Set of already-visited file identities
-
-        Returns:
-            List of SourceClaim objects (may be empty if no adapter claims)
-        """
-        claims = []
-        for adapter_cls in self._adapters:
-            # Check if adapter has claim_remote method
-            if not hasattr(adapter_cls, 'claim_remote'):
-                continue
-            try:
-                claim = adapter_cls.claim_remote(store, path, visited_identities)
-                if claim is not None:
-                    claims.append(claim)
-                    logger.debug(f"Adapter {adapter_cls.__name__} claimed remote {path} as {claim.source_type}")
-                    # Update type mapping for factory use
-                    self._type_to_adapter[claim.source_type] = adapter_cls
-            except Exception as e:
-                # Adapter claim_remote() should not raise, but handle gracefully
-                logger.debug(f"Adapter {adapter_cls.__name__} claim_remote() raised exception: {e}")
                 continue
         return claims
 
@@ -319,8 +354,41 @@ class DiscoveryState:
         self.on_source_added = on_source_added
         self.on_source_removed = on_source_removed
 
+    def try_claim_path(self, path: str | Path, identity: Optional[str] = None) -> bool:
+        """Check if path can be claimed and mark it as consumed.
+
+        This is the callback for multi-file source discovery. Adapters call
+        this for each path they want to claim. The method handles identity
+        tracking and path consumption atomically.
+
+        Args:
+            path: Path to claim (local Path or remote URL string)
+            identity: Optional pre-computed identity (computed if None)
+
+        Returns:
+            True if path is available and now claimed, False if already claimed/visited
+        """
+        path_str = str(path)
+        if path_str in self.consumed_paths:
+            return False
+
+        if identity is None:
+            try:
+                identity = get_file_identity(Path(path_str))
+            except OSError:
+                identity = hashlib.sha256(path_str.encode('utf-8')).hexdigest()[:16]
+
+        if identity in self.visited_identities:
+            return False
+
+        self.visited_identities.add(identity)
+        self.consumed_paths.add(path_str)
+        return True
+
     def add_claim(self, claim: SourceClaim) -> bool:
         """Add a claim with callback notification.
+
+        Paths should already be consumed via try_claim_path() during discovery.
 
         Args:
             claim: SourceClaim to add
@@ -342,7 +410,8 @@ class DiscoveryState:
         # Store claim
         self.claims[source_id] = claim
         self.path_to_source[claim.primary_path] = source_id
-        self.consumed_paths.update(claim.claimed_paths)
+        # Mark primary_path as consumed (may already be via try_claim_path)
+        self.consumed_paths.add(claim.primary_path)
 
         # Callback
         if self.on_source_added:
@@ -365,7 +434,7 @@ class DiscoveryState:
 
         claim = self.claims.pop(source_id)
         self.path_to_source.pop(path)
-        self.consumed_paths.difference_update(claim.claimed_paths)
+        self.consumed_paths.discard(path)
 
         # Callback
         if self.on_source_removed:
@@ -443,7 +512,8 @@ def discover_sources(
         return state
 
     # Check if root itself is a data source (e.g., a .zarr directory)
-    claims = registry.get_claims_for_path(root, state.visited_identities)
+    ctx = ClaimContext(root)
+    claims = registry.get_claims_for_path(ctx, state)
     if claims:
         claim = claims[0]
         if claim.dim_labels is None and dim_labels is not None:
@@ -460,19 +530,12 @@ def discover_sources(
         if state.is_path_claimed(path_str):
             continue
 
-        claims = registry.get_claims_for_path(path, state.visited_identities)
+        ctx = ClaimContext(path)
+        claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]
             if claim.dim_labels is None and dim_labels is not None:
                 claim.dim_labels = dim_labels
-            # Add identities for claimed paths to visited set
-            for claimed_path_str in claim.claimed_paths:
-                try:
-                    claimed_path = Path(claimed_path_str)
-                    identity = get_file_identity(claimed_path)
-                    state.visited_identities.add(identity)
-                except OSError:
-                    pass
             state.add_claim(claim)
 
     logger.debug(f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources")
@@ -529,18 +592,12 @@ def discover_remote_source(
         logger.debug(f"discover_remote_source: cannot get identity for {url}: {e}")
 
     # Check if root URL is a data source
-    claims = registry.get_claims_for_remote(store, "", state.visited_identities)
+    ctx = ClaimContext("", store)
+    claims = registry.get_claims_for_path(ctx, state)
     if claims:
         claim = claims[0]
         if claim.dim_labels is None and dim_labels is not None:
             claim.dim_labels = dim_labels
-        # Add identities for claimed paths
-        for claimed_path in claim.claimed_paths:
-            try:
-                claimed_identity = store.get_identity(claimed_path)
-                state.visited_identities.add(claimed_identity)
-            except Exception:
-                pass
         state.add_claim(claim)
         logger.info(f"discover_remote_source: {url} claimed as {claim.source_type}")
 
@@ -638,13 +695,10 @@ def discover_sources_async(
                         is_remote=claim.is_remote,
                     )
 
-                    # Create adapter (may need credentials_config for remote)
-                    if hasattr(adapter_cls, 'create_from_config_with_credentials'):
-                        adapter = adapter_cls.create_from_config_with_credentials(
-                            source_config, credentials_config
-                        )
-                    else:
-                        adapter = adapter_cls.create_from_config(source_config)
+                    # Create adapter (unified create_from_config with optional credentials)
+                    adapter = adapter_cls.create_from_config(
+                        source_config, credentials_config
+                    )
 
                     # Register with server
                     server.register_source(claim.source_id, adapter)

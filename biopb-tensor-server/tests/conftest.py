@@ -8,9 +8,12 @@ import tempfile
 import pytest
 
 from biopb_tensor_server.fixtures import (
+    create_companion_ome_dataset,
+    create_5d_6d_micromanager_dataset,
     create_hdf5_dataset,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
+    create_multi_series_ome_tiff,
     create_multiresolution_ome_zarr,
     create_tiled_ome_tiff,
     create_zarr_array,
@@ -40,6 +43,18 @@ def multifile_mm_dataset_incomplete(temp_dir):
 
 
 @pytest.fixture
+def multifile_5d_6d_mm_dataset(temp_dir):
+    """Full 5D/6D MicroManager dataset with position, time, channel, and z dimensions."""
+    return create_5d_6d_micromanager_dataset(
+        temp_dir,
+        n_positions=2,
+        n_times=3,
+        n_channels=2,
+        n_z=4,
+    )
+
+
+@pytest.fixture
 def multifile_ome_dataset(temp_dir):
     """Complete multi-file OME-TIFF dataset with OME-XML metadata."""
     return create_multifile_ome_dataset(temp_dir)
@@ -61,6 +76,18 @@ def multires_ome_zarr(temp_dir):
 def tiled_ome_tiff(temp_dir):
     """Tiled OME-TIFF file."""
     return create_tiled_ome_tiff(temp_dir)
+
+
+@pytest.fixture
+def multi_series_ome_tiff(temp_dir):
+    """Multi-series OME-TIFF file (multiple fields/positions)."""
+    return create_multi_series_ome_tiff(temp_dir)
+
+
+@pytest.fixture
+def companion_ome_dataset(temp_dir):
+    """Companion OME dataset with .companion.ome file."""
+    return create_companion_ome_dataset(temp_dir)
 
 
 @pytest.fixture

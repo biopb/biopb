@@ -88,7 +88,7 @@ def get_compute_backend_options() -> ComputeBackendOptions:
     return ComputeBackendOptions(**_COMPUTE_BACKEND_OPTIONS.__dict__)
 
 
-def _normalize_reduction_method(method: str) -> str:
+def normalize_reduction_method(method: str) -> str:
     normalized = (method or _DEFAULT_REDUCTION_METHOD).strip().lower()
     normalized = _METHOD_ALIASES.get(normalized, normalized)
     if normalized not in _SUPPORTED_REDUCTION_METHODS:
@@ -99,7 +99,7 @@ def _normalize_reduction_method(method: str) -> str:
     return normalized
 
 
-def _ceil_div(value: int, divisor: int) -> int:
+def ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
@@ -107,14 +107,14 @@ def _logical_shape_for_scale(
     source_shape: Tuple[int, ...],
     scale_hint: Tuple[int, ...],
 ) -> Tuple[int, ...]:
-    return tuple(_ceil_div(extent, scale) for extent, scale in zip(source_shape, scale_hint))
+    return tuple(ceil_div(extent, scale) for extent, scale in zip(source_shape, scale_hint))
 
 
 def _pad_shape_to_scale_multiple(
     shape: Tuple[int, ...],
     scale_hint: Tuple[int, ...],
 ) -> Tuple[int, ...]:
-    return tuple(_ceil_div(extent, scale) * scale for extent, scale in zip(shape, scale_hint))
+    return tuple(ceil_div(extent, scale) * scale for extent, scale in zip(shape, scale_hint))
 
 
 def _pad_array_edge(
@@ -173,21 +173,8 @@ def _area_reduce(arr, scale_hint: Tuple[int, ...]):
     return reduced
 
 
-def _output_dtype(base_dtype: str, reduction_method: str) -> str:
+def get_output_dtype(base_dtype: str, reduction_method: str) -> str:
     return np.dtype(base_dtype).str
-
-
-def _cast_reduced_array(data: np.ndarray, target_dtype: np.dtype) -> np.ndarray:
-    if np.issubdtype(target_dtype, np.integer):
-        info = np.iinfo(target_dtype)
-        data = np.rint(data)
-        data = np.clip(data, info.min, info.max)
-        return data.astype(target_dtype)
-
-    if np.issubdtype(target_dtype, np.floating):
-        return data.astype(target_dtype)
-
-    return data.astype(target_dtype)
 
 
 def _get_backend_override() -> str:
@@ -218,7 +205,7 @@ def _select_compute_backend(
     scale_hint: Tuple[int, ...],
     merged_chunk_count: int,
 ) -> str:
-    reduction_method = _normalize_reduction_method(reduction_method)
+    reduction_method = normalize_reduction_method(reduction_method)
     override = _get_backend_override()
 
     if override == 'cpu':
@@ -280,14 +267,14 @@ def _select_compute_backend(
     return 'gpu'
 
 
-def _downsample_block(
+def downsample_block(
     data: np.ndarray,
     scale_hint: Tuple[int, ...],
     reduction_method: str,
     backend: Optional[str] = None,
     merged_chunk_count: int = 1,
 ) -> np.ndarray:
-    reduction_method = _normalize_reduction_method(reduction_method)
+    reduction_method = normalize_reduction_method(reduction_method)
     selected_backend = backend or _select_compute_backend(
         source_shape=tuple(int(dim) for dim in data.shape),
         dtype=np.dtype(data.dtype),

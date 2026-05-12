@@ -3,6 +3,7 @@
 Relies on OS page cache for raw data caching.
 """
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
@@ -11,144 +12,91 @@ import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import SourceClaim, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim, is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
 
 
-class ZarrAdapter(BackendAdapter):
+class ZarrAdapter(SourceAdapter, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
-    Chunk ID format:
-    - 4 bytes: array_id length (uint32, big-endian)
-    - N bytes: array_id (UTF-8)
-    - M bytes: chunk key (UTF-8, e.g., "0/1/2")
-
-    Relies on OS page cache for raw data caching.
     """
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim .zarr directories with .zarray or .zattrs.
 
         Supports both zarr v2 (.zarray/.zattrs) and zarr v3 (zarr.json).
+        Works for both local filesystem and remote storage.
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim if this is a plain zarr array, None otherwise
         """
         # Must be a directory ending in .zarr
-        if not path.is_dir() or not path.name.endswith('.zarr'):
+        if not ctx.is_dir() or not ctx.name.endswith('.zarr'):
             return None
 
         # Check for zarr structure files
-        zarray_path = path / '.zarray'
-        zattrs_path = path / '.zattrs'
-        zarr_json_path = path / 'zarr.json'
+        has_zarray = ctx.join('.zarray').exists()
+        has_zarr_json = ctx.join('zarr.json').exists()
+        has_zattrs = ctx.join('.zattrs').exists()
 
         # Zarr v2: has .zarray (array metadata)
-        if zarray_path.exists():
+        if has_zarray or has_zarr_json:
+            state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type="zarr",
-                primary_path=path,
-                claimed_paths={path},
-            )
-
-        # Zarr v3: has zarr.json
-        if zarr_json_path.exists():
-            return SourceClaim(
-                source_type="zarr",
-                primary_path=path,
-                claimed_paths={path},
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
             )
 
         # If only .zattrs exists, check if it's NOT an OME-Zarr
-        if zattrs_path.exists():
-            import json
-            try:
-                with open(zattrs_path) as f:
-                    zattrs = json.load(f)
-                # If no multiscales, it might be a plain zarr group or array
-                if 'multiscales' not in zattrs:
-                    # Could be a zarr group - check for array inside
-                    # For simplicity, claim it as zarr (will need to open to determine)
-                    return SourceClaim(
-                        source_type="zarr",
-                        primary_path=path,
-                        claimed_paths={path},
-                    )
-            except (json.JSONDecodeError, IOError):
-                pass
-
-        return None
-
-    @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote .zarr directories.
-
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a remote zarr array, None otherwise
-        """
-        # Check for .zarr suffix
-        if not path.endswith('.zarr'):
-            return None
-
-        # Check if it's a directory
-        if not store.isdir(path):
-            return None
-
-        # Check for zarr structure
-        has_zarray = store.exists(path + '/.zarray')
-        has_zarr_json = store.exists(path + '/zarr.json')
-        has_zattrs = store.exists(path + '/.zattrs')
-
-        if has_zarray or has_zarr_json:
-            return SourceClaim(
-                source_type="zarr",
-                primary_path=store._join(path),
-                claimed_paths={store._join(path)},
-                is_remote=True,
-            )
-
-        # If only .zattrs exists, check if it's NOT OME-Zarr
         if has_zattrs:
             try:
-                zattrs_content = store.read_text(path + '/.zattrs')
-                import json
-                zattrs = json.loads(zattrs_content)
+                zattrs = json.loads(ctx.read_text('.zattrs'))
+                # If no multiscales, it might be a plain zarr group or array
                 if 'multiscales' not in zattrs:
+                    state.try_claim_path(ctx.path_str)
                     return SourceClaim(
                         source_type="zarr",
-                        primary_path=store._join(path),
-                        claimed_paths={store._join(path)},
-                        is_remote=True,
+                        primary_path=ctx.path_str,
+                        is_remote=ctx.is_remote,
                     )
             except (json.JSONDecodeError, Exception):
                 pass
 
         return None
+    
+
+    def get_metadata(self):
+        return {}
+    
+    def get_tensor_adapter(self, tensor_id):
+        return self
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'ZarrAdapter':
+    def create_from_config(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'ZarrAdapter':
         """Create adapter instance from SourceConfig.
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             ZarrAdapter instance
@@ -159,46 +107,17 @@ class ZarrAdapter(BackendAdapter):
 
         if source.is_remote:
             # Remote storage: use RemoteStore for filesystem creation
-            store = RemoteStore(source.url)
+            store = RemoteStore.from_config(
+                source.url,
+                credentials_config=credentials_config,
+                profile_name=source.credentials_profile,
+            )
             zarr_store = FSStore(store.path, fs=store.fs)
             arr = zarr.open_array(zarr_store, mode='r')
         else:
             # Local filesystem
             path = Path(source.url)
             arr = zarr.open_array(str(path), mode='r')
-
-        return cls(arr, source.source_id, source.dim_labels)
-
-    @classmethod
-    def create_from_config_with_credentials(
-        cls,
-        source: 'SourceConfig',
-        credentials_config: Optional[Any] = None,
-    ) -> 'ZarrAdapter':
-        """Create adapter with explicit credentials config.
-
-        Args:
-            source: SourceConfig with url, source_id, dim_labels
-            credentials_config: CredentialsConfig for authentication
-
-        Returns:
-            ZarrAdapter instance
-        """
-        import zarr
-        from zarr.storage import FSStore
-        from biopb_tensor_server.remote import RemoteStore, CredentialsConfig
-
-        if not source.is_remote:
-            return cls.create_from_config(source)
-
-        # Use RemoteStore for filesystem creation with credentials
-        store = RemoteStore.from_config(
-            source.url,
-            credentials_config=credentials_config,
-            profile_name=source.credentials_profile,
-        )
-        zarr_store = FSStore(store.path, fs=store.fs)
-        arr = zarr.open_array(zarr_store, mode='r')
 
         return cls(arr, source.source_id, source.dim_labels)
 

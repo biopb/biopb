@@ -13,11 +13,12 @@ from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.base import TensorReadPlan
-from biopb_tensor_server.discovery import SourceClaim, is_remote_url
-from biopb_tensor_server.downsample import _normalize_reduction_method
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.downsample import normalize_reduction_method
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
 
 
@@ -62,106 +63,58 @@ class OmeZarrAdapter(ZarrAdapter):
     _field_adapters: dict = {}  # field_key -> cached adapter
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim .zarr directories with OME multiscales metadata.
 
         Detects both regular OME-Zarr multiscale images and HCS plate datasets.
         HCS plates are detected by 'plate' key in .zattrs (checked before multiscales).
 
         Args:
-            path: Path to check (file or directory)
-            visited_identities: Set of already-visited file identities
+            ctx: ClaimContext for unified filesystem access
+            state: DiscoveryState with try_claim_path() callback
 
         Returns:
             SourceClaim if this is an OME-Zarr dataset, None otherwise
         """
         # Must be a directory ending in .zarr
-        if not path.is_dir() or not path.name.endswith('.zarr'):
+        if not ctx.is_dir() or not ctx.name.endswith('.zarr'):
             return None
 
-        zattrs_path = path / '.zattrs'
-        if not zattrs_path.exists():
+        zattrs_ctx = ctx.join('.zattrs')
+        if not zattrs_ctx.exists():
             return None
 
         try:
-            with open(zattrs_path) as f:
-                zattrs = json.load(f)
+            zattrs = json.loads(ctx.read_text('.zattrs'))
 
             # Check for HCS plate metadata first (higher priority)
             if 'plate' in zattrs:
+                state.try_claim_path(ctx.path_str)
                 return SourceClaim(
                     source_type="ome-zarr-hcs",
-                    primary_path=path,
-                    claimed_paths={path},
+                    primary_path=ctx.path_str,
+                    is_remote=ctx.is_remote,
                 )
 
             # Check for OME multiscales key
             if 'multiscales' not in zattrs:
                 return None
-        except (json.JSONDecodeError, KeyError, IOError):
+        except (json.JSONDecodeError, KeyError, Exception):
             return None
 
+        state.try_claim_path(ctx.path_str)
         return SourceClaim(
             source_type="ome-zarr",
-            primary_path=path,
-            claimed_paths={path},
+            primary_path=ctx.path_str,
+            is_remote=ctx.is_remote,
         )
 
     @classmethod
-    def claim_remote(cls, store: "RemoteStore", path: str, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Claim remote OME-Zarr directories.
-
-        Detects both regular OME-Zarr multiscale images and HCS plate datasets.
-        HCS plates are detected by 'plate' key in .zattrs (checked before multiscales).
-
-        Args:
-            store: RemoteStore for remote access
-            path: Path within remote store
-            visited_identities: Set of already-visited identities
-
-        Returns:
-            SourceClaim if this is a remote OME-Zarr dataset, None otherwise
-        """
-        # Check for .zarr suffix
-        if not path.endswith('.zarr'):
-            return None
-
-        # Check if it's a directory
-        if not store.isdir(path):
-            return None
-
-        # Check for .zattrs with multiscales
-        zattrs_path = path.rstrip('/') + '/.zattrs'
-        if not store.exists(zattrs_path):
-            return None
-
-        try:
-            zattrs_content = store.read_text(zattrs_path)
-            zattrs = json.loads(zattrs_content)
-
-            # Check for HCS plate metadata first (higher priority)
-            if 'plate' in zattrs:
-                return SourceClaim(
-                    source_type="ome-zarr-hcs",
-                    primary_path=store._join(path),
-                    claimed_paths={store._join(path)},
-                    is_remote=True,
-                )
-
-            if 'multiscales' not in zattrs:
-                return None
-        except (json.JSONDecodeError, Exception):
-            return None
-
-        return SourceClaim(
-            source_type="ome-zarr",
-            primary_path=store._join(path),
-            claimed_paths={store._join(path)},
-            is_remote=True,
-        )
-
-    @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'OmeZarrAdapter':
+    def create_from_config(
+        cls,
+        source: 'SourceConfig',
+        credentials_config: Optional[Any] = None,
+    ) -> 'OmeZarrAdapter':
         """Create adapter instance from SourceConfig.
 
         Handles both regular OME-Zarr multiscale images and HCS plate datasets.
@@ -169,6 +122,7 @@ class OmeZarrAdapter(ZarrAdapter):
 
         Args:
             source: SourceConfig with url, source_id, dim_labels
+            credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
             OmeZarrAdapter instance
@@ -181,9 +135,12 @@ class OmeZarrAdapter(ZarrAdapter):
 
         if source.is_remote:
             # Remote storage: use fsspec FSStore
+            # Build storage_options from credentials_config if provided
             storage_options = {}
-            if source.credentials_profile:
-                pass  # fsspec handles via environment variables
+            if credentials_config:
+                profile = credentials_config.get_profile(source.credentials_profile)
+                if profile:
+                    storage_options = profile.to_storage_options()
 
             fs, fs_path = url_to_fs(zarr_path, storage_options=storage_options)
             store = zarr.FSStore(fs, fs_path)
@@ -783,7 +740,7 @@ class OmeZarrAdapter(ZarrAdapter):
         from biopb_tensor_server.chunk import normalized_scale_hint
         scale_hint = normalized_scale_hint(base_shape, read_options)
 
-        reduction_method = _normalize_reduction_method(
+        reduction_method = normalize_reduction_method(
             read_options.reduction_method if read_options else None
         )
 

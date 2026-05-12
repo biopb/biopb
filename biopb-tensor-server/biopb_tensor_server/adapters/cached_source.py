@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -28,18 +28,18 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import BackendAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint, encode_chunk_id
 from biopb_tensor_server.cache import CacheManager
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import SourceClaim
+    from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 logger = logging.getLogger(__name__)
 
 
-class CachedSourceAdapter(BackendAdapter):
+class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     """Adapter for cache-backed uploaded sources.
 
     One instance per source, registered in server._sources dict.
@@ -53,15 +53,7 @@ class CachedSourceAdapter(BackendAdapter):
     _single_tensor_source = True
 
     @classmethod
-    def claim(cls, path: Path, visited_identities: Set[str]) -> Optional[SourceClaim]:
-        """Cache-backed sources are not discovered from filesystem.
-
-        Returns None - these sources are created via DoPut, not discovery.
-        """
-        return None
-
-    @classmethod
-    def create_from_config(cls, source: 'SourceConfig') -> 'CachedSourceAdapter':
+    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'CachedSourceAdapter':
         """Cache-backed sources are not created from config.
 
         Raises NotImplementedError - use direct instantiation via DoPut.

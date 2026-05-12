@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from biopb_tensor_server.adapters.nifti import NiftiAdapter
-from biopb_tensor_server.discovery import SourceClaim
+from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 
 def create_synthetic_nifti(
@@ -74,8 +74,9 @@ class TestNiftiAdapterClaim:
             nii_path = Path(tmpdir) / 'test.nii'
             create_synthetic_nifti(nii_path)
 
-            visited = set()
-            claim = NiftiAdapter.claim(nii_path, visited)
+            ctx = ClaimContext(nii_path)
+            state = DiscoveryState()
+            claim = NiftiAdapter.claim(ctx, state)
 
             assert claim is not None
             assert claim.source_type == "nifti"
@@ -86,8 +87,9 @@ class TestNiftiAdapterClaim:
             nii_path = Path(tmpdir) / 'test.nii.gz'
             create_synthetic_nifti(nii_path)
 
-            visited = set()
-            claim = NiftiAdapter.claim(nii_path, visited)
+            ctx = ClaimContext(nii_path)
+            state = DiscoveryState()
+            claim = NiftiAdapter.claim(ctx, state)
 
             assert claim is not None
             assert claim.source_type == "nifti"
@@ -97,8 +99,9 @@ class TestNiftiAdapterClaim:
             txt_path = Path(tmpdir) / 'test.txt'
             txt_path.write_text('not a nifti file')
 
-            visited = set()
-            claim = NiftiAdapter.claim(txt_path, visited)
+            ctx = ClaimContext(txt_path)
+            state = DiscoveryState()
+            claim = NiftiAdapter.claim(ctx, state)
 
             assert claim is None
 
@@ -106,8 +109,10 @@ class TestNiftiAdapterClaim:
         """Directories should not be claimed."""
         with tempfile.TemporaryDirectory() as tmpdir:
             dir_path = Path(tmpdir)
-            visited = set()
-            claim = NiftiAdapter.claim(dir_path, visited)
+
+            ctx = ClaimContext(dir_path)
+            state = DiscoveryState()
+            claim = NiftiAdapter.claim(ctx, state)
 
             assert claim is None
 

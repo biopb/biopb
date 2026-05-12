@@ -228,16 +228,18 @@ Lightweight claim object using `__slots__` for memory efficiency when scanning l
 
 ```python
 class SourceClaim:
-    __slots__ = ('source_type', 'primary_path', 'claimed_paths', 
-                 'source_id', 'dim_labels', 'extra_config')
+    __slots__ = ('source_type', 'primary_path', 
+                 'source_id', 'dim_labels', 'extra_config', 'is_remote')
     
     source_type: str      # "zarr", "ome-tiff", "hdf5", etc.
-    primary_path: Path    # Main entry point
-    claimed_paths: Set[Path]  # All consumed paths (multi-node claims)
+    primary_path: str     # Main entry point (str for URL support)
     source_id: str        # Auto-generated from URL hash
     dim_labels: List[str] # Optional dimension labels
     extra_config: dict    # Adapter-specific config (e.g., HDF5 dataset)
+    is_remote: bool       # Flag for remote sources
 ```
+
+Multi-file claims: Paths are tracked in `DiscoveryState.consumed_paths` via `try_claim_path()` callback during claim().
 
 #### AdapterRegistry
 

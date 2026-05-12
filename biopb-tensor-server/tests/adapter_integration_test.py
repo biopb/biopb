@@ -33,6 +33,15 @@ def _h5py_available() -> bool:
     return importlib.util.find_spec("h5py") is not None
 
 
+def _bioformats_available() -> bool:
+    """Check if bioformats_jar is available for companion.ome support."""
+    try:
+        import bioformats_jar
+        return True
+    except ImportError:
+        return False
+
+
 class TestZarrIntegration:
     """Integration tests for ZarrAdapter with server/client."""
 
@@ -204,18 +213,19 @@ class TestOmeZarrIntegration:
 
 
 class TestOmeTiffIntegration:
-    """Integration tests for OmeTiffAdapter with server/client."""
+    """Integration tests for OME-TIFF files (now handled by AicsImageIoAdapter)."""
 
     def test_tiled_tiff_read(self, tiled_ome_tiff):
         """Test reading from tiled OME-TIFF through server."""
-        import tifffile
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
+        tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        tiff_path, shape, tile_info = tiled_ome_tiff
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'ome-tiff-integration')
 
-        tf = tifffile.TiffFile(tiff_path)
-        adapter = OmeTiffAdapter(tf, 'ome-tiff-integration')
+        # Get scene_id for tensor access
+        descriptors = adapter.list_tensor_descriptors()
+        scene_id = descriptors[0].array_id
 
         server = TensorFlightServer('grpc://localhost:8895')
         server.register_source('ome-tiff-integration', adapter)
@@ -227,32 +237,38 @@ class TestOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8895', cache_bytes=10_000_000)
 
-            darr = client.get_tensor('ome-tiff-integration', 'ome-tiff-integration')
-            assert darr.shape == shape
+            # tensor_id is the scene_id (e.g., 'Image:0')
+            darr = client.get_tensor('ome-tiff-integration', scene_id)
+
+            # AICSImage uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
+            # Original fixture creates (C, Y, X) = (3, 128, 128) with CYX axes
+            # aicsimageio interprets this as T=1, C=3, Z=1, Y=128, X=128
+            expected_shape = (1, 3, 1, 128, 128)
+            assert darr.shape == expected_shape
             assert darr.dtype == np.uint16
 
-            # Read specific region
-            data = darr[:1, :32, :32].compute()
-            assert data.shape == (1, 32, 32)
+            # Read specific region (slice across C dimension)
+            data = darr[:1, :1, :1, :32, :32].compute()
+            assert data.shape == (1, 1, 1, 32, 32)
 
-            # Value should be 1 (plane 0 = value 1 set by fixture)
-            assert data.mean() == 1
+            # Channel 0 should have value 1 (plane 0 = value 1 set by fixture)
+            assert data[0, 0, 0].mean() == 1
 
             client.close()
         finally:
             server.shutdown()
-            tf.close()
 
     def test_channel_access(self, tiled_ome_tiff):
         """Test accessing different channels through server."""
-        import tifffile
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
-        from biopb_tensor_server.adapters.tiff import OmeTiffAdapter
+        tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        tiff_path, shape, tile_info = tiled_ome_tiff
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'ome-tiff-channels')
 
-        tf = tifffile.TiffFile(tiff_path)
-        adapter = OmeTiffAdapter(tf, 'ome-tiff-channels')
+        # Get scene_id for tensor access
+        descriptors = adapter.list_tensor_descriptors()
+        scene_id = descriptors[0].array_id
 
         server = TensorFlightServer('grpc://localhost:8894')
         server.register_source('ome-tiff-channels', adapter)
@@ -264,94 +280,182 @@ class TestOmeTiffIntegration:
         try:
             client = TensorFlightClient('grpc://localhost:8894', cache_bytes=10_000_000)
 
-            darr = client.get_tensor('ome-tiff-channels', 'ome-tiff-channels')
+            # tensor_id is the scene_id (e.g., 'Image:0')
+            darr = client.get_tensor('ome-tiff-channels', scene_id)
 
-            # Read channel 0 (value = 1)
-            data0 = darr[0:1].compute()
-            assert data0.mean() == 1
+            # Read channel 0 (value = 1) - C axis is index 1 in TCZYX
+            data0 = darr[0:1, 0:1].compute()
+            assert data0[0, 0].mean() == 1
 
             # Read channel 1 (value = 2)
-            data1 = darr[1:2].compute()
-            assert data1.mean() == 2
+            data1 = darr[0:1, 1:2].compute()
+            assert data1[0, 0].mean() == 2
 
             # Read channel 2 (value = 3)
-            data2 = darr[2:3].compute()
-            assert data2.mean() == 3
+            data2 = darr[0:1, 2:3].compute()
+            assert data2[0, 0].mean() == 3
 
             client.close()
         finally:
             server.shutdown()
-            tf.close()
 
 
-class TestMultiFileOmeTiffIntegration:
-    """Integration tests for MultiFileOmeTiffAdapter with server/client."""
+class TestMultiSeriesOmeTiffIntegration:
+    """Integration tests for multi-series OME-TIFF with server/client (now handled by AicsImageIoAdapter)."""
 
-    def test_multifile_read(self, multifile_ome_dataset):
-        """Test reading from multi-file OME-TIFF through server."""
-        from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter
+    def test_multi_series_list_tensors(self, multi_series_ome_tiff):
+        """Test listing all series as tensors in multi-series OME-TIFF."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
-        dir_path, file_list, metadata = multifile_ome_dataset
+        tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'multifile-integration')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-test')
 
-        server = TensorFlightServer('grpc://localhost:8893')
-        server.register_source('multifile-integration', adapter)
+        # List all tensors (series)
+        descriptors = adapter.list_tensor_descriptors()
+        assert len(descriptors) == series_info['n_series']
+
+        # Each descriptor should have a unique array_id
+        array_ids = [d.array_id for d in descriptors]
+        assert len(set(array_ids)) == len(array_ids)
+
+    def test_multi_series_tensor_access(self, multi_series_ome_tiff):
+        """Test accessing specific series via get_tensor_adapter."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+
+        tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
+
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-access')
+
+        # Get actual scene IDs from adapter
+        descriptors = adapter.list_tensor_descriptors()
+        scene_ids = [d.array_id for d in descriptors]
+
+        # Access each series and verify data
+        for scene_id in scene_ids:
+            series_adapter = adapter.get_tensor_adapter(scene_id)
+            desc = series_adapter.get_tensor_descriptor()
+
+            # Verify shape matches expected (aicsimageio uses TCZYX order)
+            assert len(desc.shape) == 5  # T, C, Z, Y, X
+            assert desc.shape[3] == 64  # height
+            assert desc.shape[4] == 64  # width
+
+    def test_multi_series_server_client(self, multi_series_ome_tiff):
+        """Test reading from multi-series OME-TIFF through server."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+
+        tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
+
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-server')
+
+        server = TensorFlightServer('grpc://localhost:8877')
+        server.register_source('multi-series-server', adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8893', cache_bytes=10_000_000)
+            client = TensorFlightClient('grpc://localhost:8877', cache_bytes=10_000_000)
 
-            darr = client.get_tensor('multifile-integration', 'multifile-integration')
+            # List sources
+            sources = client.list_sources()
+            assert 'multi-series-server' in sources
 
-            # Verify shape - should have n_files planes
-            n_files = len(file_list)
-            assert darr.shape[0] == n_files
+            # Get actual scene IDs
+            descriptors = adapter.list_tensor_descriptors()
+            first_scene_id = descriptors[0].array_id
 
-            # Read first plane (use full slice to match chunk boundaries)
+            # Get first series tensor - tensor_id is the scene_id (e.g., 'Image:0')
+            darr = client.get_tensor('multi-series-server', first_scene_id)
+
+            # Read data
             data = darr.compute()
-            assert data.shape[0] == n_files
+            # aicsimageio uses TCZYX order: (T, C, Z, Y, X)
+            # Fixture uses CYX axes, so C=2, Z=1
+            assert data.shape[1] == 2  # C planes per series (from CYX first axis)
 
-            # First plane should have value 1 (set by fixture)
-            assert data[0].mean() == 1
+            # First C plane of first series should have value 1
+            assert data[0, 0, 0].mean() == 1
 
             client.close()
         finally:
             server.shutdown()
 
-    def test_micromanager_multifile_read(self, multifile_mm_dataset):
-        """Test reading from Micro-Manager multi-file dataset."""
-        from biopb_tensor_server.adapters.tiff import MultiFileOmeTiffAdapter
+    def test_lazy_tile_loading(self, multi_series_ome_tiff):
+        """Test that aicsimageio provides tile-level lazy loading."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb.tensor.ticket_pb2 import ChunkBounds
 
-        dir_path, file_list, metadata = multifile_mm_dataset
+        tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = MultiFileOmeTiffAdapter(dir_path, 'mm-integration')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'lazy-tile-test')
 
-        server = TensorFlightServer('grpc://localhost:8892')
-        server.register_source('mm-integration', adapter)
+        # Get actual scene IDs
+        descriptors = adapter.list_tensor_descriptors()
+        first_scene_id = descriptors[0].array_id
 
-        server_thread = threading.Thread(target=server.serve, daemon=True)
-        server_thread.start()
-        time.sleep(1)
+        # Get first series adapter
+        series_adapter = adapter.get_tensor_adapter(first_scene_id)
 
-        try:
-            client = TensorFlightClient('grpc://localhost:8892', cache_bytes=10_000_000)
+        # Read a small tile region (TCZYX order)
+        bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 32, 32])
+        data = series_adapter.get_data(bounds)
 
-            darr = client.get_tensor('mm-integration', 'mm-integration')
+        assert data.shape == (1, 1, 1, 32, 32)
+        assert data[0, 0, 0].mean() == 1  # First plane has value 1
 
-            # Should have 3 channels (set by fixture)
-            assert darr.shape[0] == 3
 
-            # Read all channels
-            data = darr.compute()
-            assert data.shape[0] == 3
+class TestCompanionOmeIntegration:
+    """Integration tests for companion OME files (now handled by AicsImageIoAdapter)."""
 
-            client.close()
-        finally:
-            server.shutdown()
+    @pytest.mark.skipif(not _bioformats_available(), reason="bioformats_jar not available")
+    def test_companion_claim(self, companion_ome_dataset):
+        """Test claiming companion.ome file."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from pathlib import Path
+
+        companion_path, tiff_files, metadata_info = companion_ome_dataset
+
+        # Test claim method
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        ctx = ClaimContext(Path(companion_path))
+        state = DiscoveryState()
+        claim = AicsImageIoAdapter.claim(ctx, state)
+        assert claim is not None
+        assert claim.source_type == "aics"
+        # Primary path is the companion file itself for companion.ome claims
+        assert str(claim.primary_path) == companion_path
+        # All TIFF files should be in consumed paths (tracked via try_claim_path)
+        for tiff_file in tiff_files:
+            assert tiff_file in state.consumed_paths
+
+    @pytest.mark.skipif(not _bioformats_available(), reason="bioformats_jar not available")
+    def test_companion_data_access(self, companion_ome_dataset):
+        """Test reading data from companion OME dataset."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        companion_path, tiff_files, metadata_info = companion_ome_dataset
+
+        # Create adapter from companion file
+        adapter = AicsImageIoAdapter.create_from_url(companion_path, 'companion-test')
+
+        # Get first series
+        descriptors = adapter.list_tensor_descriptors()
+        assert len(descriptors) > 0
+
+        # Read data
+        desc = descriptors[0]
+        series_adapter = adapter.get_tensor_adapter(desc.array_id)
+
+        bounds = ChunkBounds(start=[0, 0, 0], stop=[metadata_info['n_files'], 64, 64])
+        data = series_adapter.get_data(bounds)
+
+        assert data.shape[0] == metadata_info['n_files']
+        # First file has value 1
+        assert data[0].mean() == 1
 
 
 class TestHdf5Integration:

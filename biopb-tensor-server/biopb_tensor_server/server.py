@@ -25,7 +25,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.base import BackendAdapter, decode_chunk_id
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.metadata_db import MetadataDatabase
 
@@ -112,18 +112,18 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)
-        self._sources: Dict[str, BackendAdapter] = {}
+        self._sources: Dict[str, SourceAdapter] = {}
         self._writable = writable
         self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._max_list_flights_results = max_list_flights_results
 
-    def register_source(self, source_id: str, adapter: BackendAdapter) -> None:
+    def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
 
         Args:
             source_id: Unique identifier for the data source
-            adapter: Backend adapter for the data source
+            adapter: Source adapter for the data source
         """
         self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
@@ -164,7 +164,7 @@ class TensorFlightServer(flight.FlightServerBase):
         self,
         source_id: str,
         tensor_id: str
-    ) -> Optional[BackendAdapter]:
+    ) -> Optional[TensorAdapter]:
         """Get adapter for a specific tensor within a source.
 
         Args:
@@ -172,7 +172,7 @@ class TensorFlightServer(flight.FlightServerBase):
             tensor_id: The tensor identifier within the source
 
         Returns:
-            BackendAdapter for the specified tensor, or None if not found
+            TensorAdapter for the specified tensor, or None if not found
         """
         source_adapter = self._sources.get(source_id)
         if source_adapter is None:
@@ -181,14 +181,14 @@ class TensorFlightServer(flight.FlightServerBase):
         return source_adapter.get_tensor_adapter(tensor_id)
 
 
-    def _get_adapter_for_chunk(self, chunk_id: bytes) -> Optional[BackendAdapter]:
+    def _get_adapter_for_chunk(self, chunk_id: bytes) -> Optional[TensorAdapter]:
         """Get adapter for a specific chunk based on its chunk_id.
 
         Args:
             chunk_id: The chunk identifier bytes
 
         Returns:
-            BackendAdapter responsible for the chunk, or None if not found
+            TensorAdapter responsible for the chunk, or None if not found
         """ 
         array_id, *_ = decode_chunk_id(chunk_id)
         source_id, *rest = array_id.split('/')
@@ -614,14 +614,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
 
 def serve(
-    adapters: Dict[str, BackendAdapter],
+    adapters: Dict[str, SourceAdapter],
     location: str = 'grpc://0.0.0.0:8815',
     **kwargs
 ) -> None:
     """Start a Flight server with the given adapters.
 
     Args:
-        adapters: Dictionary mapping source_id to BackendAdapter
+        adapters: Dictionary mapping source_id to SourceAdapter
         location: Server location
         **kwargs: Additional arguments passed to FlightServerBase
     """
