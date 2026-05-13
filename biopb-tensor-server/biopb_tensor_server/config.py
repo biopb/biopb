@@ -116,21 +116,34 @@ class SourceConfig:
         credentials_profile: Name of credential profile for remote URLs (overrides global default)
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
+
     url: str
-    type: Optional[Literal["zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs", "aics"]] = None
+    type: Optional[
+        Literal[
+            "zarr",
+            "hdf5",
+            "ome-tiff",
+            "ome-tiff-multifile",
+            "ome-zarr",
+            "ome-zarr-hcs",
+            "aics",
+        ]
+    ] = None
     source_id: Optional[str] = None
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
     monitor: bool = False  # Enable live filesystem monitoring
     credentials_profile: Optional[str] = None  # Override global credential profile
-    _is_remote: Optional[bool] = field(default=None, init=False)  # Internal field, computed from URL
+    _is_remote: Optional[bool] = field(
+        default=None, init=False
+    )  # Internal field, computed from URL
 
     @property
     def is_remote(self) -> bool:
         """Check if this source is a remote URL."""
         if self._is_remote is None:
             # Compute lazily
-            object.__setattr__(self, '_is_remote', _is_remote_url(self.url))
+            object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
         return self._is_remote
 
     def __post_init__(self):
@@ -138,12 +151,14 @@ class SourceConfig:
             raise ValueError("SourceConfig requires a valid 'url'")
 
         # Compute is_remote from URL
-        object.__setattr__(self, '_is_remote', _is_remote_url(self.url))
+        object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
         # Generate source_id from URL hash if not provided
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
-            object.__setattr__(self, 'source_id', generate_source_id(self.url, detected_type))
+            object.__setattr__(
+                self, "source_id", generate_source_id(self.url, detected_type)
+            )
 
     @property
     def local_path(self) -> Optional[Path]:
@@ -174,6 +189,7 @@ class CacheConfig:
         file_max_segment_bytes: Maximum bytes per segment file (file backend, default 64 MB)
         file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
     """
+
     backend: str = "memory"
     memory_max_entries: int = 1024
     memory_max_bytes: int = 512 * 1024 * 1024  # 512 MB
@@ -199,6 +215,7 @@ class MetadataDbConfig:
         max_list_flights_results: Safety cap on list_flights() returned sources (truncation signaled via schema metadata)
         query_timeout_ms: Query execution timeout in milliseconds
     """
+
     enabled: bool = True
     max_query_results: int = 100000
     max_list_flights_results: int = 100000
@@ -226,6 +243,7 @@ class ServerConfig:
         metadata_db: DuckDB metadata database configuration for source filtering
         sources: List of data sources (each may contain multiple tensors)
     """
+
     host: str = "0.0.0.0"
     port: int = 8815
     log_level: str = "INFO"
@@ -349,9 +367,11 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
     # Parse metadata_db settings
     metadata_db_data = data.get("metadata_db", {})
-    metadata_db_enabled = metadata_db_data.get("enabled", False)
+    metadata_db_enabled = metadata_db_data.get("enabled", True)
     metadata_db_max_query_results = metadata_db_data.get("max_query_results", 100000)
-    metadata_db_max_list_flights_results = metadata_db_data.get("max_list_flights_results", 100000)
+    metadata_db_max_list_flights_results = metadata_db_data.get(
+        "max_list_flights_results", 100000
+    )
     metadata_db_query_timeout_ms = metadata_db_data.get("query_timeout_ms", 30000)
 
     metadata_db_config = MetadataDbConfig(
@@ -424,23 +444,32 @@ def detect_source_type(url: str) -> Optional[str]:
         name = path.name.lower()
 
         # aicsimageio-supported vendor formats
-        aics_extensions = ['.czi', '.lif', '.nd2', '.dv', '.lsm', '.oif', '.oib', '.xml']
+        aics_extensions = [
+            ".czi",
+            ".lif",
+            ".nd2",
+            ".dv",
+            ".lsm",
+            ".oif",
+            ".oib",
+            ".xml",
+        ]
         for ext in aics_extensions:
             if name.endswith(ext):
-                return 'aics'
+                return "aics"
 
         # OME-TIFF files
-        if name.endswith('.ome.tiff') or name.endswith('.ome.tif'):
-            return 'ome-tiff'
+        if name.endswith(".ome.tiff") or name.endswith(".ome.tif"):
+            return "ome-tiff"
 
         # Plain TIFF files - skip for now (could check for OME-XML in header)
-        if name.endswith('.tiff') or name.endswith('.tif'):
+        if name.endswith(".tiff") or name.endswith(".tif"):
             # Could implement OME-XML header detection here
             # For now, treat as ome-tiff (tifffile can handle plain TIFF)
-            return 'ome-tiff'
+            return "ome-tiff"
 
         # HDF5 files - return None (requires explicit config with dataset path)
-        if name.endswith('.h5') or name.endswith('.hdf5'):
+        if name.endswith(".h5") or name.endswith(".hdf5"):
             return None
 
         return None
@@ -449,9 +478,9 @@ def detect_source_type(url: str) -> Optional[str]:
         name = path.name.lower()
 
         # Zarr directories (must have .zarray or .zattrs)
-        if name.endswith('.zarr'):
-            zattrs_path = path / '.zattrs'
-            zarray_path = path / '.zarray'
+        if name.endswith(".zarr"):
+            zattrs_path = path / ".zattrs"
+            zarray_path = path / ".zarray"
 
             # Check for OME-Zarr first (more specific)
             if zattrs_path.exists():
@@ -460,26 +489,26 @@ def detect_source_type(url: str) -> Optional[str]:
                         zattrs = json.load(f)
 
                     # Check for HCS plate metadata first (highest priority)
-                    if 'plate' in zattrs:
-                        return 'ome-zarr-hcs'
+                    if "plate" in zattrs:
+                        return "ome-zarr-hcs"
 
-                    if 'multiscales' in zattrs:
-                        return 'ome-zarr'
+                    if "multiscales" in zattrs:
+                        return "ome-zarr"
                 except (json.JSONDecodeError, KeyError, IOError):
                     pass
 
             # Plain Zarr (has .zarray or .zattrs without multiscales)
             if zarray_path.exists() or zattrs_path.exists():
-                return 'zarr'
+                return "zarr"
 
             return None
 
         # Check for multi-file OME-TIFF dataset
-        metadata_file = path / '_metadata.txt'
-        img_files = list(path.glob('img_*.ome.tiff')) + list(path.glob('img_*.ome.tif'))
+        metadata_file = path / "_metadata.txt"
+        img_files = list(path.glob("img_*.ome.tiff")) + list(path.glob("img_*.ome.tif"))
 
         if metadata_file.exists() or len(img_files) > 1:
-            return 'ome-tiff-multifile'
+            return "ome-tiff-multifile"
 
         return None
 
@@ -512,19 +541,23 @@ def scan_directory_for_sources(
 
     for item in directory.iterdir():
         # Skip hidden files/directories
-        if item.name.startswith('.'):
+        if item.name.startswith("."):
             continue
 
         if item.is_file():
             detected_type = detect_source_type(str(item))
             if detected_type:
                 # source_id auto-generated from url hash in __post_init__
-                discovered.append(SourceConfig(
-                    type=detected_type,
-                    url=str(item),
-                    dim_labels=dim_labels,
-                ))
-            elif item.name.lower().endswith('.h5') or item.name.lower().endswith('.hdf5'):
+                discovered.append(
+                    SourceConfig(
+                        type=detected_type,
+                        url=str(item),
+                        dim_labels=dim_labels,
+                    )
+                )
+            elif item.name.lower().endswith(".h5") or item.name.lower().endswith(
+                ".hdf5"
+            ):
                 skipped_hdf5.append(item)
             else:
                 skipped_unknown.append(item)
@@ -534,18 +567,24 @@ def scan_directory_for_sources(
             detected_type = detect_source_type(str(item))
             if detected_type:
                 # source_id auto-generated from url hash in __post_init__
-                discovered.append(SourceConfig(
-                    type=detected_type,
-                    url=str(item),
-                    dim_labels=dim_labels,
-                ))
+                discovered.append(
+                    SourceConfig(
+                        type=detected_type,
+                        url=str(item),
+                        dim_labels=dim_labels,
+                    )
+                )
             elif recursive:
                 # Not a data source itself, but might contain them - recurse
-                discovered.extend(scan_directory_for_sources(item, dim_labels, recursive))
+                discovered.extend(
+                    scan_directory_for_sources(item, dim_labels, recursive)
+                )
 
     # Print warnings for skipped files (only at top level to avoid spam)
     if skipped_hdf5 and directory == directory:
-        print("Warning: Skipped HDF5 files (require explicit 'type' and 'dataset' in config):")
+        print(
+            "Warning: Skipped HDF5 files (require explicit 'type' and 'dataset' in config):"
+        )
         for h5_path in skipped_hdf5[:5]:  # Limit to 5 to avoid spam
             print(f"  - {h5_path}")
         if len(skipped_hdf5) > 5:
@@ -578,11 +617,13 @@ def _discover_by_type(
     if source_type == "zarr":
         for zarr_path in sorted(path.glob("*.zarr")):
             if zarr_path.is_dir():
-                discovered.append(SourceConfig(
-                    type="zarr",
-                    url=str(zarr_path),
-                    dim_labels=dim_labels,
-                ))
+                discovered.append(
+                    SourceConfig(
+                        type="zarr",
+                        url=str(zarr_path),
+                        dim_labels=dim_labels,
+                    )
+                )
 
     elif source_type == "ome-zarr":
         for zarr_path in sorted(path.glob("*.zarr")):
@@ -592,12 +633,14 @@ def _discover_by_type(
                     try:
                         with open(zattrs_path) as f:
                             zattrs = json.load(f)
-                        if 'multiscales' in zattrs:
-                            discovered.append(SourceConfig(
-                                type="ome-zarr",
-                                url=str(zarr_path),
-                                dim_labels=dim_labels,
-                            ))
+                        if "multiscales" in zattrs:
+                            discovered.append(
+                                SourceConfig(
+                                    type="ome-zarr",
+                                    url=str(zarr_path),
+                                    dim_labels=dim_labels,
+                                )
+                            )
                     except (json.JSONDecodeError, KeyError, IOError):
                         pass
 
@@ -605,32 +648,38 @@ def _discover_by_type(
         for pattern in ["*.h5", "*.hdf5"]:
             for h5_path in sorted(path.glob(pattern)):
                 if h5_path.is_file():
-                    discovered.append(SourceConfig(
-                        type="hdf5",
-                        url=str(h5_path),
-                        dim_labels=dim_labels,
-                        dataset=dataset,
-                    ))
+                    discovered.append(
+                        SourceConfig(
+                            type="hdf5",
+                            url=str(h5_path),
+                            dim_labels=dim_labels,
+                            dataset=dataset,
+                        )
+                    )
 
     elif source_type == "ome-tiff":
         metadata_file = path / "_metadata.txt"
         img_files = list(path.glob("img_*.ome.tiff")) + list(path.glob("img_*.ome.tif"))
 
         if metadata_file.exists() or len(img_files) > 1:
-            discovered.append(SourceConfig(
-                type="ome-tiff-multifile",
-                url=str(path),
-                dim_labels=dim_labels,
-            ))
+            discovered.append(
+                SourceConfig(
+                    type="ome-tiff-multifile",
+                    url=str(path),
+                    dim_labels=dim_labels,
+                )
+            )
         else:
             for pattern in ["*.ome.tiff", "*.ome.tif", "*.tif", "*.tiff"]:
                 for tiff_path in sorted(path.glob(pattern)):
                     if tiff_path.is_file():
-                        discovered.append(SourceConfig(
-                            type="ome-tiff",
-                            url=str(tiff_path),
-                            dim_labels=dim_labels,
-                        ))
+                        discovered.append(
+                            SourceConfig(
+                                type="ome-tiff",
+                                url=str(tiff_path),
+                                dim_labels=dim_labels,
+                            )
+                        )
 
     elif source_type == "aics":
         # Discover aicsimageio-supported files (one source per file)
@@ -638,16 +687,20 @@ def _discover_by_type(
         for pattern in aics_extensions:
             for file_path in sorted(path.glob(pattern)):
                 if file_path.is_file():
-                    discovered.append(SourceConfig(
-                        type="aics",
-                        url=str(file_path),
-                        dim_labels=dim_labels,
-                    ))
+                    discovered.append(
+                        SourceConfig(
+                            type="aics",
+                            url=str(file_path),
+                            dim_labels=dim_labels,
+                        )
+                    )
 
     return discovered
 
 
-def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] = None) -> List[SourceConfig]:
+def discover_sources(
+    source: SourceConfig, registry: Optional[AdapterRegistry] = None
+) -> List[SourceConfig]:
     """Expand a source config to actual data sources.
 
     Uses claim-based discovery for directory scanning, while maintaining
@@ -713,13 +766,15 @@ def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] =
         # Fallback to legacy detection
         detected_type = detect_source_type(source.url)
         if detected_type:
-            return [SourceConfig(
-                type=detected_type,
-                url=source.url,
-                source_id=source.source_id,
-                dim_labels=source.dim_labels,
-                dataset=source.dataset,
-            )]
+            return [
+                SourceConfig(
+                    type=detected_type,
+                    url=source.url,
+                    source_id=source.source_id,
+                    dim_labels=source.dim_labels,
+                    dataset=source.dataset,
+                )
+            ]
         raise ValueError(
             f"Could not detect type for file: {local_path}. "
             f"Please specify 'type' explicitly in config."
@@ -727,7 +782,9 @@ def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] =
 
     # Case 3: Directory with type but no source_id - discover by type (backward compatible)
     if source.type and not source.source_id:
-        return _discover_by_type(local_path, source.type, source.dim_labels, source.dataset)
+        return _discover_by_type(
+            local_path, source.type, source.dim_labels, source.dataset
+        )
 
     # Case 4: Directory with no type and no source_id - use claim-based discovery
     # First check if the directory itself is a data source
@@ -749,7 +806,9 @@ def discover_sources(source: SourceConfig, registry: Optional[AdapterRegistry] =
     return [_claim_to_source_config(claim, source) for claim in state.get_all_claims()]
 
 
-def _claim_to_source_config(claim: SourceClaim, original_source: SourceConfig) -> SourceConfig:
+def _claim_to_source_config(
+    claim: SourceClaim, original_source: SourceConfig
+) -> SourceConfig:
     """Convert a SourceClaim to SourceConfig.
 
     Args:
@@ -759,13 +818,15 @@ def _claim_to_source_config(claim: SourceClaim, original_source: SourceConfig) -
     Returns:
         SourceConfig with claim information
     """
-    source_id = claim.source_id or generate_source_id(str(claim.primary_path), claim.source_type)
+    source_id = claim.source_id or generate_source_id(
+        str(claim.primary_path), claim.source_type
+    )
 
     # Handle HDF5 special case - needs dataset path
     dataset = None
     if claim.source_type == "hdf5":
         # HDF5 claims have needs_dataset flag in extra_config
-        if claim.extra_config.get('needs_dataset'):
+        if claim.extra_config.get("needs_dataset"):
             # This will fail at adapter creation unless dataset is provided
             # For backward compatibility, we pass through any original dataset
             dataset = original_source.dataset
@@ -780,7 +841,9 @@ def _claim_to_source_config(claim: SourceClaim, original_source: SourceConfig) -
     )
 
 
-def resolve_all_sources(config: ServerConfig, registry: Optional[AdapterRegistry] = None) -> List[SourceConfig]:
+def resolve_all_sources(
+    config: ServerConfig, registry: Optional[AdapterRegistry] = None
+) -> List[SourceConfig]:
     """Resolve all sources in config, expanding directories.
 
     Uses claim-based discovery for automatic source detection.

@@ -82,10 +82,28 @@ def _setup_flight_server(
 
     configure_compute_backend(
         force_backend=compute_backend or server_config.compute_backend,
-        gpu_min_input_bytes=int((gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb) * 1024 * 1024),
-        gpu_min_linear_input_bytes=int((gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb) * 1024 * 1024),
-        gpu_memory_safety_factor=gpu_memory_safety_factor or server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks or server_config.gpu_min_merged_chunks,
+        gpu_min_input_bytes=int(
+            (
+                gpu_min_input_mb
+                if gpu_min_input_mb is not None
+                else server_config.gpu_min_input_mb
+            )
+            * 1024
+            * 1024
+        ),
+        gpu_min_linear_input_bytes=int(
+            (
+                gpu_min_linear_input_mb
+                if gpu_min_linear_input_mb is not None
+                else server_config.gpu_min_linear_input_mb
+            )
+            * 1024
+            * 1024
+        ),
+        gpu_memory_safety_factor=gpu_memory_safety_factor
+        or server_config.gpu_memory_safety_factor,
+        gpu_min_merged_chunks=gpu_min_merged_chunks
+        or server_config.gpu_min_merged_chunks,
     )
 
     # Initialize cache manager for virtual chunks
@@ -96,7 +114,7 @@ def _setup_flight_server(
             "[green]Virtual chunk cache initialized:[/green] "
             f"backend=memory, "
             f"max_entries={cache_config.memory_max_entries}, "
-            f"max_bytes={cache_config.memory_max_bytes // (1024*1024)}MB"
+            f"max_bytes={cache_config.memory_max_bytes // (1024 * 1024)}MB"
         )
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     elif cache_config.backend == "file":
@@ -105,8 +123,8 @@ def _setup_flight_server(
             "[green]Virtual chunk cache initialized:[/green] "
             f"backend=file, "
             f"cache_dir={cache_config.file_cache_dir}, "
-            f"max_segment_mb={cache_config.file_max_segment_bytes // (1024*1024)}, "
-            f"max_total_gb={cache_config.file_max_total_bytes // (1024*1024*1024)}"
+            f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
+            f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
         )
         # Check for recovery status
         if isinstance(manager.backend, ArrowFileBackend):
@@ -115,7 +133,7 @@ def _setup_flight_server(
                 console.print(
                     "[yellow]Cache recovery completed:[/yellow] "
                     f"recovered={recovery_status.recovered_entries} entries "
-                    f"({recovery_status.recovered_bytes // (1024*1024)}MB), "
+                    f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
                     f"lost={recovery_status.lost_entries} entries"
                 )
                 if recovery_status.errors:
@@ -123,7 +141,9 @@ def _setup_flight_server(
                         console.print(f"[red]  Error: {err}[/red]")
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     else:
-        console.print(f"[yellow]Warning: Unknown cache backend '{cache_config.backend}', using memory[/yellow]")
+        console.print(
+            f"[yellow]Warning: Unknown cache backend '{cache_config.backend}', using memory[/yellow]"
+        )
         CacheManager.initialize(CacheConfig())
 
     # Resolve and separate sources
@@ -135,9 +155,13 @@ def _setup_flight_server(
         console.print("[yellow]Warning: No data sources configured[/yellow]")
         raise typer.Exit(1)
 
-    console.print(f"[green]Loading {len(static_sources)} static data source(s)...[/green]")
+    console.print(
+        f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
+    )
     if monitored_sources:
-        console.print(f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]")
+        console.print(
+            f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
+        )
 
     console.print(
         "[green]Compute backend policy:[/green] "
@@ -212,6 +236,10 @@ def _setup_flight_server(
         console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
+    # Initial sync of metadata database (batch insert all discovered sources)
+    if metadata_db is not None:
+        metadata_db.initial_sync(server._sources)
+
     if watcher and source_manager:
         try:
             watcher.start(monitored_dirs)
@@ -257,13 +285,15 @@ def _create_source_adapter(source: SourceConfig, registry=None):
 def serve(
     config: Path = typer.Option(
         ...,
-        "--config", "-c",
+        "--config",
+        "-c",
         exists=True,
         help="Path to TOML config file",
     ),
     log_level: Optional[str] = typer.Option(
         None,
-        "--log-level", "-l",
+        "--log-level",
+        "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
     log_scope_biopb: bool = typer.Option(
@@ -273,12 +303,14 @@ def serve(
     ),
     host: Optional[str] = typer.Option(
         None,
-        "--host", "-h",
+        "--host",
+        "-h",
         help="Server host (overrides config)",
     ),
     port: Optional[int] = typer.Option(
         None,
-        "--port", "-p",
+        "--port",
+        "-p",
         help="Server port (overrides config)",
     ),
     compute_backend: Optional[str] = typer.Option(
@@ -322,7 +354,9 @@ def serve(
     server_config = load_config(config)
 
     # Setup logging with priority: CLI > env > config > default
-    effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
+    effective_log_level = (
+        log_level or get_log_level_from_env() or server_config.log_level
+    )
     setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
 
     server, source_manager, watcher = _setup_flight_server(
@@ -379,20 +413,17 @@ def validate(
             f"gpu_memory_safety_factor={server_config.gpu_memory_safety_factor}, "
             f"gpu_min_merged_chunks={server_config.gpu_min_merged_chunks}"
         )
-        console.print(
-            "  Cache: "
-            f"backend={server_config.cache.backend}, "
-        )
+        console.print(f"  Cache: backend={server_config.cache.backend}, ")
         if server_config.cache.backend == "memory":
             console.print(
                 f"    max_entries={server_config.cache.memory_max_entries}, "
-                f"max_bytes={server_config.cache.memory_max_bytes // (1024*1024)}MB"
+                f"max_bytes={server_config.cache.memory_max_bytes // (1024 * 1024)}MB"
             )
         elif server_config.cache.backend == "file":
             console.print(
                 f"    cache_dir={server_config.cache.file_cache_dir}, "
-                f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024*1024)}, "
-                f"max_total_gb={server_config.cache.file_max_total_bytes // (1024*1024*1024)}"
+                f"max_segment_mb={server_config.cache.file_max_segment_bytes // (1024 * 1024)}, "
+                f"max_total_gb={server_config.cache.file_max_total_bytes // (1024 * 1024 * 1024)}"
             )
         console.print(f"  Sources: {len(sources)} data source(s)")
 
@@ -482,17 +513,20 @@ def version():
     console.print(f"biopb-tensor-server: {tensor_version}")
     console.print(f"biopb: {biopb_version}")
 
+
 @app.command()
 def launch(
     config: Path = typer.Option(
         ...,
-        "--config", "-c",
+        "--config",
+        "-c",
         exists=True,
         help="Path to TOML config file",
     ),
     log_level: Optional[str] = typer.Option(
         None,
-        "--log-level", "-l",
+        "--log-level",
+        "-l",
         help="Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (overrides config and env)",
     ),
     log_scope_biopb: bool = typer.Option(
@@ -557,7 +591,9 @@ def launch(
     server_config = load_config(config)
 
     # Setup logging with priority: CLI > env > config > default
-    effective_log_level = log_level or get_log_level_from_env() or server_config.log_level
+    effective_log_level = (
+        log_level or get_log_level_from_env() or server_config.log_level
+    )
     setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
 
     # --- Determine dev mode ---
@@ -580,7 +616,9 @@ def launch(
 
     if effective_dev_mode:
         effective_token = None
-        console.print("[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]")
+        console.print(
+            "[yellow]DEV MODE: Website token bypass is active (localhost only).[/yellow]"
+        )
     else:
         env_token = os.environ.get("BIOPB_TENSOR_TOKEN", "")
         if token and _valid_token(token):
@@ -635,15 +673,16 @@ def launch(
     else:
         # Derive from web_url: add both host variants
         from urllib.parse import urlparse as _urlparse
+
         parsed = _urlparse(web_url)
         base = f"{parsed.scheme}://{parsed.hostname}"
         p = parsed.port
-        effective_cors = (
-            [f"{base}:{p}"] if p else [base]
-        )
+        effective_cors = [f"{base}:{p}"] if p else [base]
 
     # --- Start HTTP sidecar (blocks) ---
-    console.print(f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]")
+    console.print(
+        f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
+    )
     console.print("Press Ctrl+C to stop\n")
     try:
         run_http_server(
@@ -664,6 +703,7 @@ def launch(
 
     try:
         from biopb_tensor_server import __version__
+
         console.print(f"TensorFlight server (using biopb-tensor-server {__version__})")
     except ImportError:
         console.print("TensorFlight server")

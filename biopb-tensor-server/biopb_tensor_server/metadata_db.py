@@ -59,21 +59,32 @@ class MetadataDatabase:
 
     # Forbidden SQL keywords (write operations, table manipulation)
     FORBIDDEN_KEYWORDS: Set[str] = {
-        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE',
-        'ALTER', 'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE',
-        'COPY', 'EXPORT', 'IMPORT', 'LOAD',
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "DROP",
+        "CREATE",
+        "ALTER",
+        "TRUNCATE",
+        "EXECUTE",
+        "GRANT",
+        "REVOKE",
+        "COPY",
+        "EXPORT",
+        "IMPORT",
+        "LOAD",
     }
 
     # Only these tables can be referenced in queries
-    ALLOWED_TABLES: Set[str] = {'sources'}
+    ALLOWED_TABLES: Set[str] = {"sources"}
 
     # Pattern for detecting table references in SQL
     TABLE_REFERENCE_PATTERN = re.compile(
-        r'\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)'
-        r'|\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)'
-        r'|\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)'
-        r'|\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)',
-        re.IGNORECASE
+        r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+        r"|\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+        r"|\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+        r"|\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
     )
 
     def __init__(
@@ -90,6 +101,13 @@ class MetadataDatabase:
         self._write_lock = threading.Lock()  # Lock for write operations only
         self._initialized = False
 
+        if self._enabled:
+            logger.info(
+                "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
+            )
+        else:
+            logger.info("MetadataDatabase disabled")
+
         # Pending query results for DoGet (stored by ticket)
         self._pending_results: Dict[str, pa.Table] = {}
         self._pending_results_lock = threading.Lock()
@@ -103,7 +121,7 @@ class MetadataDatabase:
         if self._conn is None:
             with self._write_lock:
                 if self._conn is None:
-                    self._conn = duckdb.connect(':memory:')
+                    self._conn = duckdb.connect(":memory:")
                     self._create_schema()
                     self._initialized = True
                     logger.info("MetadataDatabase initialized with in-memory DuckDB")
@@ -173,7 +191,7 @@ class MetadataDatabase:
         # Check for subqueries that might reference external resources
         # (DuckDB can't actually access external resources without explicit config,
         # but we validate anyway for clarity)
-        if 'SELECT' in normalized and '(' in normalized:
+        if "SELECT" in normalized and "(" in normalized:
             # Has subquery - ensure it only references sources
             # This is a simplified check; DuckDB's SQL parser would be more thorough
             pass  # DuckDB won't allow external table references without explicit config
@@ -237,9 +255,11 @@ class MetadataDatabase:
         # Build schema metadata for truncation signaling
         schema = arrow_table.schema
         metadata = {
-            b'total_sources': str(total_sources).encode(),
-            b'returned_sources': str(min(returned_rows, self._max_query_results)).encode(),
-            b'query_elapsed_ms': str(int(elapsed_ms)).encode(),
+            b"total_sources": str(total_sources).encode(),
+            b"returned_sources": str(
+                min(returned_rows, self._max_query_results)
+            ).encode(),
+            b"query_elapsed_ms": str(int(elapsed_ms)).encode(),
         }
         schema = schema.with_metadata(metadata)
 
@@ -308,12 +328,22 @@ class MetadataDatabase:
 
             # Insert or replace (upsert) - serialize writes with lock
             with self._write_lock:
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT OR REPLACE INTO sources
                     (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, [source_id, source_desc.source_url, source_desc.source_type,
-                      dtype, indexed_at, metadata_json, shape_summary])
+                """,
+                    [
+                        source_id,
+                        source_desc.source_url,
+                        source_desc.source_type,
+                        dtype,
+                        indexed_at,
+                        metadata_json,
+                        shape_summary,
+                    ],
+                )
 
             logger.debug(f"Synced source to metadata database: {source_id}")
 
@@ -340,10 +370,7 @@ class MetadataDatabase:
         except Exception as e:
             logger.error(f"Failed to remove source {source_id}: {e}", exc_info=True)
 
-    def initial_sync(
-        self,
-        server_sources: Dict[str, BackendAdapter]
-    ) -> None:
+    def initial_sync(self, server_sources: Dict[str, BackendAdapter]) -> None:
         """Batch insert all existing sources on startup.
 
         Called once after SourceManager is created to sync sources
@@ -374,25 +401,32 @@ class MetadataDatabase:
                 shape_summary = json.dumps(list(first_tensor.shape))
                 dtype = first_tensor.dtype
 
-            batch.append([
-                source_id,
-                source_desc.source_url,
-                source_desc.source_type,
-                dtype,
-                datetime.now(),
-                json.dumps(metadata) if metadata else None,
-                shape_summary,
-            ])
+            batch.append(
+                [
+                    source_id,
+                    source_desc.source_url,
+                    source_desc.source_type,
+                    dtype,
+                    datetime.now(),
+                    json.dumps(metadata) if metadata else None,
+                    shape_summary,
+                ]
+            )
 
         # Batch insert - serialize writes with lock
         with self._write_lock:
-            conn.executemany("""
+            conn.executemany(
+                """
                 INSERT OR REPLACE INTO sources
                 (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, batch)
+            """,
+                batch,
+            )
 
-        logger.info(f"Initial sync: inserted {len(batch)} sources into metadata database")
+        logger.info(
+            f"Initial sync: inserted {len(batch)} sources into metadata database"
+        )
 
     def close(self) -> None:
         """Close the DuckDB connection."""
