@@ -54,8 +54,10 @@ This creates `biopb-tensor-server/packages/web/dist/`.
 ### Step 3: Build Docker Image
 
 ```bash
-docker build -t biopb-tensor-server:latest -f biopb-tensor-server/Dockerfile .
+docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb-tensor-server/Dockerfile .
 ```
+
+**Note:** The `--memory` and `--memory-swap` flags are recommended because the build extracts a large Python site-packages layer (~1.5GB) during the COPY step from the builder stage. Without sufficient memory, the build may hang or fail with exit code 137 (OOM killed). If your system has limited memory, try building with `--no-cache` first.
 
 **Image size:** ~1.24GB
 

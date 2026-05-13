@@ -80,8 +80,6 @@ fi
 
 exec biopb-tensor "$COMMAND" \
     --config "$CONFIG_FILE" \
-    --host 127.0.0.1 \
-    --port 8817 \
     --web-host 127.0.0.1 \
     --web-port ${WEB_PORT:-8816} \
     --web-url http://localhost:${NGINX_HTTP_PORT} \
