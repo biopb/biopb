@@ -54,6 +54,11 @@ COPY biopb-tensor-server/default-config.toml /app/config/
 
 # Set default config file (can be overridden at runtime)
 ENV CONFIG_FILE=/app/config/default-config.toml
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+
+# Configure scyjava to use system JDK instead of downloading via cjdk
+RUN echo 'import scyjava.config; scyjava.config.set_java_constraints(fetch="never")' \
+    > /usr/local/lib/python3.11/site-packages/sitecustomize.py
 
 # Create data directory and set permissions
 RUN mkdir -p /data \
