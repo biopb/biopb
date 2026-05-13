@@ -27,9 +27,13 @@ Only add/delete events are tracked; modification events are ignored.
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import signal
+import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from multiprocessing import Event, Process, Queue
@@ -42,11 +46,114 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _ignore_sigint_during_cleanup():
+    """Prevent repeated Ctrl+C from interrupting subprocess cleanup."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _join_process(process: _Process, timeout: float) -> bool:
+    """Wait up to timeout seconds for the child process to exit."""
+    deadline = time.monotonic() + timeout
+    while process.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # multiprocessing.Process.join(timeout>0) still blocks in waitpid() on
+        # fork-based start methods, so poll with timeout=0 and sleep ourselves.
+        process.join(timeout=0)
+        if process.is_alive():
+            time.sleep(min(0.05, remaining))
+    return not process.is_alive()
+
+
+def _detach_process(process: _Process) -> None:
+    """Remove a subprocess from multiprocessing's child tracking.
+
+    This is a last resort for shutdown paths where the child failed to die even
+    after escalation. Without this, multiprocessing's atexit handler will block
+    on joining the same process again.
+    """
+    try:
+        from multiprocessing.process import _children  # type: ignore[attr-defined]
+    except ImportError:
+        return
+
+    _children.discard(process)
+
+
+def _get_linux_process_state(pid: int) -> Optional[str]:
+    """Return the Linux process state code for pid when available."""
+    try:
+        stat_fields = Path(f"/proc/{pid}/stat").read_text().split()
+    except OSError:
+        return None
+
+    if len(stat_fields) < 3:
+        return None
+    return stat_fields[2]
+
+
+def _stop_subprocess(process: Optional[_Process], label: str) -> None:
+    """Stop a watcher subprocess without leaving cleanup to multiprocessing atexit."""
+    if process is None:
+        return
+
+    with _ignore_sigint_during_cleanup():
+        if _join_process(process, timeout=5):
+            process.close()
+            return
+
+        logger.warning(
+            "%s process %s did not terminate gracefully, terminating",
+            label,
+            process.pid,
+        )
+        process.terminate()
+        if _join_process(process, timeout=2):
+            process.close()
+            return
+
+        logger.warning(
+            "%s process %s did not terminate after SIGTERM, killing", label, process.pid
+        )
+        process.kill()
+        if _join_process(process, timeout=2):
+            process.close()
+            return
+
+        state = _get_linux_process_state(process.pid)
+        if state == "Z":
+            logger.warning(
+                "%s process %s became a zombie after SIGKILL; detaching it from multiprocessing cleanup",
+                label,
+                process.pid,
+            )
+        else:
+            logger.warning(
+                "%s process %s is still alive after SIGKILL; detaching it from multiprocessing cleanup",
+                label,
+                process.pid,
+            )
+        _detach_process(process)
+
+
 class WatcherEventType(Enum):
     """Types of filesystem events."""
+
     CREATED = "created"
     DELETED = "deleted"
     MOVED = "moved"
+    CLOSED = "closed"  # File closed after write (close_write in inotify)
 
 
 @dataclass
@@ -59,6 +166,7 @@ class WatcherEvent:
         old_path: For moved events, the original path before move
         is_directory: True if the affected path is a directory
     """
+
     event_type: WatcherEventType
     path: Path
     old_path: Optional[Path] = None
@@ -167,10 +275,17 @@ class WatchdogWatcher(DirectoryWatcher):
         # Resolve directories to absolute paths
         resolved_dirs = {d.resolve() for d in directories}
 
-        logger.info(f"Starting watchdog watcher for: {resolved_dirs}, debounce_window={self._debounce_window}s")
+        logger.info(
+            f"Starting watchdog watcher for: {resolved_dirs}, debounce_window={self._debounce_window}s"
+        )
         self._process = Process(
             target=_run_watchdog_subprocess,
-            args=(self._queue, self._shutdown_event, resolved_dirs, self._debounce_window),
+            args=(
+                self._queue,
+                self._shutdown_event,
+                resolved_dirs,
+                self._debounce_window,
+            ),
             daemon=True,
         )
         self._process.start()
@@ -186,17 +301,7 @@ class WatchdogWatcher(DirectoryWatcher):
         # Signal shutdown via Event (clean, no queue contention)
         self._shutdown_event.set()
 
-        # Wait for graceful shutdown
-        self._process.join(timeout=5)
-
-        if self._process.is_alive():
-            logger.warning(f"Watcher process {self._process.pid} did not terminate gracefully, killing")
-            self._process.terminate()
-            self._process.join(timeout=2)
-
-            if self._process.is_alive():
-                self._process.kill()
-                self._process.join(timeout=1)
+        _stop_subprocess(self._process, "Watcher")
 
         self._process = None
         logger.debug("Watcher subprocess stopped")
@@ -260,9 +365,14 @@ def _run_watchdog_subprocess(
             else:
                 path = Path(event.src_path)
                 # Skip hidden files
-                if path.name.startswith('.'):
+                if path.name.startswith("."):
                     return
-                event_buffer[path] = (WatcherEventType.CREATED, time.time(), None, False)
+                event_buffer[path] = (
+                    WatcherEventType.CREATED,
+                    time.time(),
+                    None,
+                    False,
+                )
 
         def on_deleted(self, event):
             if event.is_directory:
@@ -271,9 +381,14 @@ def _run_watchdog_subprocess(
             else:
                 path = Path(event.src_path)
                 # Skip hidden files
-                if path.name.startswith('.'):
+                if path.name.startswith("."):
                     return
-                event_buffer[path] = (WatcherEventType.DELETED, time.time(), None, False)
+                event_buffer[path] = (
+                    WatcherEventType.DELETED,
+                    time.time(),
+                    None,
+                    False,
+                )
 
         def on_moved(self, event):
             old_path = Path(event.src_path)
@@ -281,16 +396,45 @@ def _run_watchdog_subprocess(
             is_dir = event.is_directory
 
             # Skip hidden files
-            if new_path.name.startswith('.'):
+            if new_path.name.startswith("."):
                 # Move to hidden = deletion
-                event_buffer[old_path] = (WatcherEventType.DELETED, time.time(), None, is_dir)
+                event_buffer[old_path] = (
+                    WatcherEventType.DELETED,
+                    time.time(),
+                    None,
+                    is_dir,
+                )
                 return
-            if old_path.name.startswith('.'):
+            if old_path.name.startswith("."):
                 # Move from hidden = creation
-                event_buffer[new_path] = (WatcherEventType.CREATED, time.time(), None, is_dir)
+                event_buffer[new_path] = (
+                    WatcherEventType.CREATED,
+                    time.time(),
+                    None,
+                    is_dir,
+                )
                 return
 
-            event_buffer[old_path] = (WatcherEventType.MOVED, time.time(), new_path, is_dir)
+            event_buffer[old_path] = (
+                WatcherEventType.MOVED,
+                time.time(),
+                new_path,
+                is_dir,
+            )
+
+        def on_closed(self, event):
+            """Handle file close event (close_write in inotify).
+
+            This event fires when a file descriptor is closed after writing.
+            It indicates the file is ready for processing (write completed).
+            """
+            if not event.is_directory:
+                path = Path(event.src_path)
+                # Skip hidden files
+                if path.name.startswith("."):
+                    return
+                # CLOSED event indicates file write completed
+                event_buffer[path] = (WatcherEventType.CLOSED, time.time(), None, False)
 
     # Set up observer
     observer = Observer()
@@ -301,11 +445,13 @@ def _run_watchdog_subprocess(
             observer.schedule(handler, str(directory), recursive=True)
         except Exception:
             # Log to queue as error (main process will handle)
-            queue.put(WatcherEvent(
-                event_type=WatcherEventType.DELETED,  # Use as error signal
-                path=directory,
-                is_directory=True,
-            ))
+            queue.put(
+                WatcherEvent(
+                    event_type=WatcherEventType.DELETED,  # Use as error signal
+                    path=directory,
+                    is_directory=True,
+                )
+            )
 
     observer.start()
 
@@ -325,8 +471,30 @@ def _run_watchdog_subprocess(
         # Also caught on SIGTERM (from terminate())
         pass
     finally:
+        logger.debug(
+            "Watchdog subprocess %s entering shutdown; observer_alive=%s emitters=%s",
+            os.getpid(),
+            observer.is_alive(),
+            len(getattr(observer, "emitters", [])),
+        )
         observer.stop()
+        logger.debug(
+            "Watchdog subprocess %s called observer.stop(); observer_alive=%s",
+            os.getpid(),
+            observer.is_alive(),
+        )
         observer.join(timeout=2)
+        emitter_states = [
+            (type(emitter).__name__, emitter.is_alive())
+            for emitter in getattr(observer, "emitters", [])
+        ]
+        logger.debug(
+            "Watchdog subprocess %s finished observer.join(); observer_alive=%s emitters=%s threads=%s",
+            os.getpid(),
+            observer.is_alive(),
+            emitter_states,
+            [(thread.name, thread.is_alive()) for thread in threading.enumerate()],
+        )
 
 
 def _emit_debounced_events(
@@ -357,12 +525,14 @@ def _emit_debounced_events(
         if len(events) == 1:
             # Single event - emit directly
             event_type, _, extra, is_dir = events[0]
-            queue.put(WatcherEvent(
-                event_type=event_type,
-                path=path,
-                old_path=extra if event_type == WatcherEventType.MOVED else None,
-                is_directory=is_dir,
-            ))
+            queue.put(
+                WatcherEvent(
+                    event_type=event_type,
+                    path=path,
+                    old_path=extra if event_type == WatcherEventType.MOVED else None,
+                    is_directory=is_dir,
+                )
+            )
         else:
             # Multiple events - collapse to final state
             # Sort by timestamp
@@ -371,19 +541,28 @@ def _emit_debounced_events(
             # Check for create+delete collapse (transient file)
             has_create = any(e[0] == WatcherEventType.CREATED for e in events)
             has_delete = any(e[0] == WatcherEventType.DELETED for e in events)
+            has_closed = any(e[0] == WatcherEventType.CLOSED for e in events)
 
             if has_create and has_delete:
                 # Transient file - skip
                 continue
 
+            if has_create and has_closed:
+                # File created and closed - emit CLOSED (file ready)
+                # The "keep last event" logic below handles this correctly since
+                # CLOSED fires after CREATED
+                pass
+
             # Keep last event
             event_type, _, extra, is_dir = events[-1]
-            queue.put(WatcherEvent(
-                event_type=event_type,
-                path=path,
-                old_path=extra if event_type == WatcherEventType.MOVED else None,
-                is_directory=is_dir,
-            ))
+            queue.put(
+                WatcherEvent(
+                    event_type=event_type,
+                    path=path,
+                    old_path=extra if event_type == WatcherEventType.MOVED else None,
+                    is_directory=is_dir,
+                )
+            )
 
     # Send sentinel to signal batch end
     queue.put(None)
@@ -417,9 +596,11 @@ class PollVFSWatcher(DirectoryWatcher):
         self,
         poll_interval: float = 30.0,
         debounce_window: float = 1.5,
+        stability_window: float = 2.0,
     ):
         self._poll_interval = poll_interval
         self._debounce_window = debounce_window
+        self._stability_window = stability_window
         self._queue: Queue = Queue()
         self._shutdown_event: Event = Event()
         self._process: Optional[_Process] = None
@@ -428,7 +609,9 @@ class PollVFSWatcher(DirectoryWatcher):
     def start(self, directories: Set[Path]) -> None:
         """Start watcher subprocess."""
         if self._process is not None and self._process.is_alive():
-            logger.warning("PollVFS watcher already running, stopping previous instance")
+            logger.warning(
+                "PollVFS watcher already running, stopping previous instance"
+            )
             self.stop()
 
         self._directories = directories
@@ -442,10 +625,19 @@ class PollVFSWatcher(DirectoryWatcher):
         # Resolve directories to absolute paths
         resolved_dirs = {d.resolve() for d in directories}
 
-        logger.info(f"Starting PollVFS watcher for: {resolved_dirs}, poll_interval={self._poll_interval}s")
+        logger.info(
+            f"Starting PollVFS watcher for: {resolved_dirs}, poll_interval={self._poll_interval}s, stability_window={self._stability_window}s"
+        )
         self._process = Process(
             target=_run_pollvfs_subprocess,
-            args=(self._queue, self._shutdown_event, resolved_dirs, self._poll_interval, self._debounce_window),
+            args=(
+                self._queue,
+                self._shutdown_event,
+                resolved_dirs,
+                self._poll_interval,
+                self._debounce_window,
+                self._stability_window,
+            ),
             daemon=True,
         )
         self._process.start()
@@ -461,17 +653,7 @@ class PollVFSWatcher(DirectoryWatcher):
         # Signal shutdown via Event
         self._shutdown_event.set()
 
-        # Wait for graceful shutdown
-        self._process.join(timeout=5)
-
-        if self._process.is_alive():
-            logger.warning(f"PollVFS process {self._process.pid} did not terminate gracefully, killing")
-            self._process.terminate()
-            self._process.join(timeout=2)
-
-            if self._process.is_alive():
-                self._process.kill()
-                self._process.join(timeout=1)
+        _stop_subprocess(self._process, "PollVFS")
 
         self._process = None
         logger.debug("PollVFS subprocess stopped")
@@ -503,6 +685,7 @@ def _run_pollvfs_subprocess(
     directories: Set[Path],
     poll_interval: float,
     debounce_window: float,
+    stability_window: float = 2.0,
 ) -> None:
     """Subprocess entry point - runs polling loop with snapshot comparison.
 
@@ -511,7 +694,8 @@ def _run_pollvfs_subprocess(
     2. Polls periodically, comparing snapshots
     3. Emits CREATED/DELETED events for changes
     4. Uses debouncing to collapse rapid changes
-    5. Exits cleanly when shutdown_event is set
+    5. Only emits CREATED for stable files (mtime >= stability_window)
+    6. Exits cleanly when shutdown_event is set
 
     Args:
         queue: Queue for sending events to parent (ONLY subprocess writes)
@@ -519,10 +703,13 @@ def _run_pollvfs_subprocess(
         directories: Set of directory paths to monitor
         poll_interval: Time between scans (seconds)
         debounce_window: Time window for debouncing events
+        stability_window: Minimum mtime age for files to be considered stable
     """
     # Snapshot: {path: mtime}
     # Nested by monitored directory for efficient updates
+    # Pending files: {path: first_seen_mtime} - files not yet stable
     snapshots: Dict[Path, Dict[Path, float]] = {}
+    pending_files: Dict[Path, float] = {}  # Files waiting to become stable
 
     # Event buffer for debouncing: path -> (event_type, timestamp, extra, is_dir)
     event_buffer: dict = {}
@@ -532,9 +719,9 @@ def _run_pollvfs_subprocess(
         """Recursively scan directory, return {path: mtime}."""
         result = {}
         try:
-            for path in root.rglob('*'):
+            for path in root.rglob("*"):
                 # Skip hidden files/directories
-                if path.name.startswith('.'):
+                if path.name.startswith("."):
                     continue
                 try:
                     result[path] = path.stat().st_mtime
@@ -545,6 +732,26 @@ def _run_pollvfs_subprocess(
             # Permission issue reading directory
             pass
         return result
+
+    def check_file_handle_released(path: Path) -> bool:
+        """Check if file handle is released by trying to open in append mode.
+
+        This catches NFS 'glitch' writes where file appears stable
+        but is still held by a writing process.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            True if file can be opened (handle released), False if locked
+        """
+        try:
+            with open(path, "a"):
+                pass  # Open/close succeeds = handle released
+            return True
+        except (IOError, OSError):
+            # File may be locked or still being written
+            return False
 
     # Take initial snapshot
     for directory in directories:
@@ -567,21 +774,82 @@ def _run_pollvfs_subprocess(
                 previous = snapshots.get(directory, {})
 
                 # Detect created: in current but not previous
+                # For files, check stability (mtime age + handle release) before emitting
+                current_time = time.time()
                 for path in current:
-                    if path not in previous:
+                    if path not in previous and path not in pending_files:
                         is_dir = path.is_dir()
-                        event_buffer[path] = (WatcherEventType.CREATED, time.time(), None, is_dir)
+                        mtime = current[path]
+
+                        if is_dir:
+                            # Directories are always stable - emit immediately
+                            event_buffer[path] = (
+                                WatcherEventType.CREATED,
+                                time.time(),
+                                None,
+                                True,
+                            )
+                        else:
+                            # Check file stability (mtime age >= stability_window AND handle released)
+                            age = current_time - mtime
+                            if age >= stability_window and check_file_handle_released(
+                                path
+                            ):
+                                # File is stable - emit CREATED
+                                event_buffer[path] = (
+                                    WatcherEventType.CREATED,
+                                    time.time(),
+                                    None,
+                                    False,
+                                )
+                            else:
+                                # File not yet stable - add to pending
+                                pending_files[path] = mtime
+
+                # Check pending files for stability
+                stable_paths = []
+                for path, first_mtime in list(pending_files.items()):
+                    if path not in current:
+                        # File disappeared - remove from pending
+                        pending_files.pop(path, None)
+                        continue
+                    current_mtime = current[path]
+                    # Check if mtime is stable (unchanged or old enough) AND handle released
+                    if (
+                        current_mtime == first_mtime
+                        and current_time - current_mtime >= stability_window
+                    ):
+                        if check_file_handle_released(path):
+                            # File is now stable and handle released
+                            stable_paths.append(path)
+                            pending_files.pop(path, None)
+
+                # Emit CREATED for stable pending files
+                for path in stable_paths:
+                    event_buffer[path] = (
+                        WatcherEventType.CREATED,
+                        time.time(),
+                        None,
+                        False,
+                    )
 
                 # Detect deleted: in previous but not current
                 for path in previous:
                     if path not in current:
+                        # Also remove from pending if present
+                        pending_files.pop(path, None)
                         # We don't know if it was a dir or file now
                         # Check if it had children in previous snapshot
-                        was_dir = any(
-                            p.is_relative_to(path) and p != path
-                            for p in previous
-                        ) or path in directories  # monitored dirs are dirs
-                        event_buffer[path] = (WatcherEventType.DELETED, time.time(), None, was_dir)
+                        was_dir = (
+                            any(p.is_relative_to(path) and p != path for p in previous)
+                            or path in directories
+                        )  # monitored dirs are dirs
+                        event_buffer[path] = (
+                            WatcherEventType.DELETED,
+                            time.time(),
+                            None,
+                            was_dir,
+                        )
 
                 # Update snapshot
                 snapshots[directory] = current
@@ -605,14 +873,14 @@ def detect_nfs_mount(path: Path) -> bool:
     """
     try:
         resolved = path.resolve()
-        with open('/proc/mounts', 'r') as f:
+        with open("/proc/mounts", "r") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 3:
                     mount_point = parts[1]
                     fs_type = parts[2]
                     # Check if resolved path is under this NFS mount
-                    if fs_type in ('nfs', 'nfs4'):
+                    if fs_type in ("nfs", "nfs4"):
                         try:
                             mount_path = Path(mount_point)
                             if resolved.is_relative_to(mount_path):
@@ -653,11 +921,15 @@ def get_watcher(
         # Auto-detect based on mount type
         if directories and any(detect_nfs_mount(d) for d in directories):
             logger.info("Auto-detected NFS mount, using PollVFS watcher")
-            return PollVFSWatcher(poll_interval=poll_interval, debounce_window=debounce_window)
+            return PollVFSWatcher(
+                poll_interval=poll_interval, debounce_window=debounce_window
+            )
         return WatchdogWatcher(debounce_window=debounce_window)
     elif watcher_type == "watchdog":
         return WatchdogWatcher(debounce_window=debounce_window)
     elif watcher_type == "pollvfs":
-        return PollVFSWatcher(poll_interval=poll_interval, debounce_window=debounce_window)
+        return PollVFSWatcher(
+            poll_interval=poll_interval, debounce_window=debounce_window
+        )
     else:
         raise ValueError(f"Unknown watcher type: {watcher_type}")

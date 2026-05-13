@@ -109,6 +109,11 @@ class SourceManager:
         self._running = False
         self._lock = threading.Lock()
 
+        # Pending file tracking for write completion
+        # Maps path -> (path, first_seen_timestamp, is_directory)
+        self._pending_creates: Dict[str, Tuple[Path, float, bool]] = {}
+        self._closed_timeout: float = 60.0  # Max wait for CLOSED after CREATED
+
         # Path tracking for move handling
         # Maps resolved path -> source_id (str keys for URL support)
         self._path_to_source_id: Dict[str, str] = {}
@@ -168,6 +173,9 @@ class SourceManager:
                         for event in events:
                             self._process_event(event)
 
+                # Cleanup expired pending files
+                self._cleanup_expired_pending()
+
             except Exception as e:
                 logger.error(f"Error processing events: {e}", exc_info=True)
 
@@ -182,7 +190,10 @@ class SourceManager:
         """
         try:
             logger.debug(f"Processing event: {event.event_type.value} {event.path}")
-            if event.event_type == WatcherEventType.CREATED:
+            if event.event_type == WatcherEventType.CLOSED:
+                # File closed after write - ready for registration
+                self._handle_closed(event.path)
+            elif event.event_type == WatcherEventType.CREATED:
                 self._handle_created(event.path, event.is_directory)
             elif event.event_type == WatcherEventType.DELETED:
                 self._handle_deleted(event.path, event.is_directory)
@@ -194,8 +205,8 @@ class SourceManager:
     def _handle_created(self, path: Path, is_directory: bool) -> None:
         """Handle file/directory creation.
 
-        For files: Try to claim as new source.
-        For directories: Check if it's a data source, otherwise monitor children.
+        For files: Queue pending CLOSED event (file write completion).
+        For directories: Process immediately (directories don't have close events).
 
         Args:
             path: Path to created file/directory
@@ -209,7 +220,60 @@ class SourceManager:
             return
 
         # Skip hidden paths
-        if resolved_path.name.startswith('.'):
+        if resolved_path.name.startswith("."):
+            return
+
+        # For directories, process immediately (no close event)
+        if is_directory:
+            self._handle_created_stable(path, is_directory)
+            return
+
+        # For files, queue pending CLOSED event
+        # CLOSED event indicates write completion (close_write in inotify)
+        self._pending_creates[path_str] = (resolved_path, time.time(), False)
+        logger.debug(f"File created, waiting for closed event: {path}")
+
+    def _handle_closed(self, path: Path) -> None:
+        """Handle file close event (write completed).
+
+        Process files that were queued waiting for CLOSED event.
+
+        Args:
+            path: Path to closed file
+        """
+        resolved_path = path.resolve()
+        path_str = str(resolved_path)
+
+        # Check if this was a pending create
+        if path_str in self._pending_creates:
+            self._pending_creates.pop(path_str)
+            logger.debug(f"File closed after write: {path}")
+            self._handle_created_stable(path, False)
+        else:
+            # CLOSED without pending CREATED - might be a reopened existing file
+            # Try to claim if not already claimed
+            if not self._state.is_path_claimed(path_str):
+                logger.debug(f"Closed event for non-pending file: {path}")
+                self._handle_created_stable(path, False)
+
+    def _handle_created_stable(self, path: Path, is_directory: bool) -> None:
+        """Process a file/directory that is confirmed stable/ready.
+
+        This is the actual claiming logic, called after write completion is confirmed.
+
+        Args:
+            path: Path to process (already resolved)
+            is_directory: True if path is a directory
+        """
+        resolved_path = path if isinstance(path, Path) else Path(path)
+        path_str = str(resolved_path)
+
+        # Skip if already claimed
+        if self._state.is_path_claimed(path_str):
+            return
+
+        # Skip hidden paths
+        if resolved_path.name.startswith("."):
             return
 
         # Get identity for deduplication
@@ -230,10 +294,79 @@ class SourceManager:
             if self._dim_labels and claim.dim_labels is None:
                 claim.dim_labels = self._dim_labels
 
-            # Paths are already tracked in state via try_claim_path() during claim()
             # Add to discovery state (callback will register with server)
             self._state.add_claim(claim)
             logger.info(f"Added source: {claim.source_id} at {claim.primary_path}")
+
+    def _cleanup_expired_pending(self) -> None:
+        """Remove pending creates that timed out (no CLOSED event).
+
+        For timed-out files, fallback to stability check and process if stable.
+        This handles cases where CLOSED event was not emitted (e.g., PollVFSWatcher).
+        """
+        current_time = time.time()
+        expired = []
+        stable = []
+
+        for path_str, (path, timestamp, is_dir) in list(self._pending_creates.items()):
+            if current_time - timestamp > self._closed_timeout:
+                expired.append((path_str, path, is_dir))
+                logger.warning(f"Pending create timed out (no closed event): {path}")
+                continue
+
+            # Fallback stability check for files that might be ready
+            # (for PollVFSWatcher or if CLOSED event was missed)
+            if not is_dir and self._check_file_stable(path):
+                stable.append((path_str, path, is_dir))
+
+        # Process stable files
+        for path_str, path, is_dir in stable:
+            self._pending_creates.pop(path_str, None)
+            logger.debug(f"Pending file now stable: {path}")
+            try:
+                self._handle_created_stable(path, is_dir)
+            except Exception as e:
+                logger.error(f"Failed to process stable pending file {path}: {e}")
+
+        # Remove expired (without processing - file may have been deleted)
+        for path_str, path, is_dir in expired:
+            self._pending_creates.pop(path_str, None)
+
+    def _check_file_stable(self, path: Path, stability_window: float = 2.0) -> bool:
+        """Check if file is stable (not being actively written).
+
+        Fallback for platforms/filesystems that don't emit CLOSED events.
+        Uses mtime age + open check to ensure file handle is released (NFS safety).
+
+        Args:
+            path: Path to check
+            stability_window: Seconds for mtime age check
+
+        Returns:
+            True if file appears stable and handle is released
+        """
+        try:
+            stat1 = path.stat()
+            # Check if file is old enough to likely be stable
+            age = time.time() - stat1.st_mtime
+            if age < stability_window:
+                return False
+
+            # Try to open file in append mode to ensure handle is released
+            # This catches NFS "glitch" writes where file appears stable
+            # but is still held by a writing process
+            try:
+                with open(path, "a"):
+                    pass  # Open/close succeeds = handle released
+            except (IOError, OSError) as e:
+                # File may be locked or still being written
+                logger.debug(f"File handle not released: {path} ({e})")
+                return False
+
+            return True
+        except OSError:
+            # File disappeared or permission issue
+            return False
 
     def _handle_deleted(self, path: Path, is_directory: bool) -> None:
         """Handle file/directory deletion.
@@ -281,7 +414,9 @@ class SourceManager:
                         removed_ids.append(source_id)
 
         if removed_ids:
-            logger.info(f"Removed {len(removed_ids)} sources from deleted directory: {directory}")
+            logger.info(
+                f"Removed {len(removed_ids)} sources from deleted directory: {directory}"
+            )
 
     def _handle_moved(
         self,
@@ -380,7 +515,7 @@ class SourceManager:
                 url=str(claim.primary_path),
                 source_id=claim.source_id,
                 dim_labels=claim.dim_labels,
-                dataset=claim.extra_config.get('dataset'),
+                dataset=claim.extra_config.get("dataset"),
             )
 
             # Get adapter class and create instance
@@ -398,7 +533,10 @@ class SourceManager:
             self._server.register_source(claim.source_id, adapter)
 
             # Sync to metadata database
-            if hasattr(self._server, '_metadata_db') and self._server._metadata_db is not None:
+            if (
+                hasattr(self._server, "_metadata_db")
+                and self._server._metadata_db is not None
+            ):
                 self._server._metadata_db.sync_source_added(claim.source_id, adapter)
 
             # Update path tracking for move handling (use str path)
@@ -424,12 +562,16 @@ class SourceManager:
             self._server.unregister_source(source_id)
 
             # Sync to metadata database
-            if hasattr(self._server, '_metadata_db') and self._server._metadata_db is not None:
+            if (
+                hasattr(self._server, "_metadata_db")
+                and self._server._metadata_db is not None
+            ):
                 self._server._metadata_db.sync_source_removed(source_id)
 
             # Remove path tracking
             paths_to_remove = [
-                path for path, sid in self._path_to_source_id.items()
+                path
+                for path, sid in self._path_to_source_id.items()
                 if sid == source_id
             ]
             for path in paths_to_remove:
@@ -523,7 +665,7 @@ def create_source_manager(
             primary_path=source.url,  # str for URL support
             source_id=source.source_id,
             dim_labels=source.dim_labels,
-            extra_config={'dataset': source.dataset} if source.dataset else {},
+            extra_config={"dataset": source.dataset} if source.dataset else {},
         )
         discovery_state.add_claim(claim)  # fires _on_source_added callback
 
