@@ -314,6 +314,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const sliceRef = useRef(slice);  // Keep current slice for event handlers
   const colorRef = useRef<ColorValue>("auto");  // Keep current color for rendering
   const channelNameRef = useRef<string | undefined>(undefined);  // Keep current channel name for rendering
+  const percentileLoRef = useRef(percentileLo);  // Keep current percentile for rendering
+  const percentileHiRef = useRef(percentileHi);  // Keep current percentile for rendering
   const pressedKeysRef = useRef<Set<string>>(new Set());  // Track held keys for slice navigation
   const sliceWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Debounce for scroll c/t/z
 
@@ -331,6 +333,10 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
 
   // Update channelNameRef whenever channel name changes
   channelNameRef.current = currentChannelName;
+
+  // Update percentile refs whenever they change
+  percentileLoRef.current = percentileLo;
+  percentileHiRef.current = percentileHi;
 
   // Track current source/tensor to reset when switching
   const prevSourceIdRef = useRef<string>(sourceId);
@@ -627,8 +633,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
           arr.buffer,
           colorRef.current,
           channelNameRef.current,
-          percentileLo,
-          percentileHi,
+          percentileLoRef.current,
+          percentileHiRef.current,
         );
 
         const canvas = document.createElement("canvas");
