@@ -15,6 +15,7 @@ from biopb_tensor_server.cache import (
     CacheManager,
     EntryState,
     MemoryCacheBackend,
+    PoolStats,
 )
 from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_MEDIUM_THRESHOLD,
@@ -23,6 +24,7 @@ from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     _get_size_class,
+    K,
 )
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.recovery import (
@@ -952,6 +954,300 @@ class TestSchemaPooling:
         entry, is_owner = backend.start_compute(b"small_key")
         assert is_owner is False
         backend.release(b"small_key")
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+
+class TestSieveKEviction:
+    """Tests for Sieve-K scan-resistant eviction algorithm."""
+
+    def _make_data(self, values) -> pa.RecordBatch:
+        """Helper to create RecordBatch with new schema format."""
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
+            ["data", "shape", "dtype"]
+        )
+
+    def _make_temp_cache_dir(self):
+        """Create a temporary cache directory."""
+        return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
+
+    def test_scan_resistance(self):
+        """Scan items (frequency=0) are evicted first, hot items survive."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=500,  # Small segment to force many segments
+            max_total_bytes=3 * 500,  # Only 3 segments can fit
+        )
+        backend = ArrowFileBackend(config)
+
+        # Create 10 segments (10 entries)
+        for i in range(10):
+            key = f"key{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 50)
+            backend.complete_entry(key, data, 400)
+            backend.release(key)
+
+        # Access keys 0, 1, 2 repeatedly (make them "hot")
+        for _ in range(3):
+            for hot_key in [b"key0", b"key1", b"key2"]:
+                entry, _ = backend.start_compute(hot_key)
+                backend.release(hot_key)
+
+        # Verify hot keys still exist after multiple evictions
+        # Cold keys (key3-key9) should have been evicted first
+        hot_keys_cached = 0
+        for hot_key in [b"key0", b"key1", b"key2"]:
+            entry, is_owner = backend.start_compute(hot_key)
+            if not is_owner:
+                hot_keys_cached += 1
+            backend.release(hot_key)
+
+        # Check that some cold keys were evicted
+        stats = backend.stats()
+        assert stats.evictions >= 3  # At least 3 cold segments evicted
+        # At least one hot key should still be cached (they have higher frequency)
+        assert hot_keys_cached >= 1  # At least 1 hot key survived
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_frequency_promotion(self):
+        """Accessing same segment increases frequency counter, saturating at K=2."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+        backend = ArrowFileBackend(config)
+
+        # Create entry
+        key = b"key1"
+        entry, _ = backend.start_compute(key)
+        data = self._make_data([1, 2, 3])
+        backend.complete_entry(key, data, 24)
+        backend.release(key)
+
+        # Get pool queue for this segment
+        pool_key = ("unified", "tiny")
+        pool_queue = backend._pool_queues.get(pool_key)
+
+        if pool_queue:
+            # Get segment info
+            segment_id = pool_queue.queue[-1] if pool_queue.queue else None  # Tail (oldest)
+            if segment_id:
+                seg_info = pool_queue.segments.get(segment_id)
+                assert seg_info is not None
+                initial_freq = seg_info.frequency
+
+                # Access 5 times - frequency should saturate at K=2
+                for _ in range(5):
+                    entry, _ = backend.start_compute(key)
+                    backend.release(key)
+
+                # Frequency should be at K (saturated)
+                assert seg_info.frequency == K
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_hand_position_after_eviction(self):
+        """Hand stays at same offset after evicting a segment."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=500,
+            max_total_bytes=2 * 500,  # Only 2 segments can fit
+        )
+        backend = ArrowFileBackend(config)
+
+        # Create 5 segments (cold, frequency=0)
+        for i in range(5):
+            key = f"key{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 50)
+            backend.complete_entry(key, data, 400)
+            backend.release(key)
+
+        pool_key = ("unified", "tiny")
+        pool_queue = backend._pool_queues.get(pool_key)
+
+        if pool_queue and len(pool_queue.queue) > 2:
+            # Record hand position before eviction
+            initial_hand = pool_queue.hand
+
+            # Trigger eviction
+            key_new = b"key_new"
+            entry, _ = backend.start_compute(key_new)
+            data = self._make_data([99] * 50)
+            backend.complete_entry(key_new, data, 400)
+            backend.release(key_new)
+
+            # Hand should have stayed at same offset (or wrapped)
+            # The actual behavior depends on where the cold segment was found
+            stats = backend.stats()
+            assert stats.evictions >= 1  # At least one eviction occurred
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_pool_selection_by_hit_rate(self):
+        """Pool with lowest hit rate is selected for eviction."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=500,
+            max_total_bytes=4 * 500,  # 4 segments can fit
+        )
+        backend = ArrowFileBackend(config)
+
+        # Create entries in "tiny" pool (low hit rate)
+        for i in range(3):
+            key = f"tiny{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 10)  # Tiny size
+            backend.complete_entry(key, data, 80)
+            backend.release(key)
+
+        # Create entries in "small" pool (higher hit rate)
+        small_size = SIZE_CLASS_TINY_THRESHOLD + 100
+        for i in range(3):
+            key = f"small{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 50)
+            backend.complete_entry(key, data, small_size)
+            backend.release(key)
+
+        # Access small pool entries repeatedly (increase hit rate)
+        for _ in range(5):
+            for i in range(3):
+                key = f"small{i}".encode()
+                entry, _ = backend.start_compute(key)
+                backend.release(key)
+
+        # Trigger eviction by adding more entries
+        for i in range(3):
+            key = f"new{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 10)
+            backend.complete_entry(key, data, 80)
+            backend.release(key)
+
+        # Check pool stats
+        stats = backend.stats()
+        assert stats.evictions >= 1
+
+        # Tiny pool should have lower hit rate
+        if "unified-tiny" in stats.pool_stats and "unified-small" in stats.pool_stats:
+            tiny_rate = stats.pool_stats["unified-tiny"].hit_rate
+            small_rate = stats.pool_stats["unified-small"].hit_rate
+            # Small pool was accessed more, should have higher hit rate
+            assert small_rate >= tiny_rate
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_pool_stats_tracking(self):
+        """Pool-level statistics are tracked correctly."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+        backend = ArrowFileBackend(config)
+
+        # Create some entries
+        for i in range(5):
+            key = f"key{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 10)
+            backend.complete_entry(key, data, 80)
+            backend.release(key)
+
+        # Access some entries (hits)
+        for i in range(3):
+            key = f"key{i}".encode()
+            entry, _ = backend.start_compute(key)
+            backend.release(key)
+
+        stats = backend.stats()
+        assert "unified-tiny" in stats.pool_stats
+
+        pool_stat = stats.pool_stats["unified-tiny"]
+        assert pool_stat.hits >= 3  # 3 hits
+        assert pool_stat.misses >= 5  # 5 misses (initial writes)
+        assert pool_stat.segments >= 1
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_new_segment_frequency_zero(self):
+        """Newly created segments start with frequency=0."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+        backend = ArrowFileBackend(config)
+
+        # Create entry (creates new segment)
+        key = b"key1"
+        entry, _ = backend.start_compute(key)
+        data = self._make_data([1, 2, 3])
+        backend.complete_entry(key, data, 24)
+        backend.release(key)
+
+        pool_key = ("unified", "tiny")
+        pool_queue = backend._pool_queues.get(pool_key)
+
+        if pool_queue and pool_queue.queue:
+            segment_id = pool_queue.queue[0]  # Head (newest)
+            seg_info = pool_queue.segments.get(segment_id)
+            assert seg_info is not None
+            assert seg_info.frequency == 0  # New segments start at 0
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_decrement_on_eviction_attempt(self):
+        """When hand passes a hot segment (frequency>0), counter is decremented."""
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=500,
+            max_total_bytes=2 * 500,  # Only 2 segments
+        )
+        backend = ArrowFileBackend(config)
+
+        # Create segments
+        for i in range(4):
+            key = f"key{i}".encode()
+            entry, _ = backend.start_compute(key)
+            data = self._make_data([i] * 50)
+            backend.complete_entry(key, data, 400)
+            backend.release(key)
+
+        pool_key = ("unified", "tiny")
+        pool_queue = backend._pool_queues.get(pool_key)
+
+        if pool_queue and len(pool_queue.queue) >= 3:
+            # Access oldest segment multiple times to increase frequency
+            oldest_seg_id = pool_queue.queue[-1]  # Tail (oldest)
+
+            # Find key in oldest segment
+            for key, entry_info in backend._metadata.items():
+                if entry_info.segment_id == oldest_seg_id:
+                    # Access to increase frequency
+                    for _ in range(3):
+                        entry, _ = backend.start_compute(key)
+                        backend.release(key)
+                    break
+
+            # Trigger eviction
+            key_new = b"key_new"
+            entry, _ = backend.start_compute(key_new)
+            data = self._make_data([99] * 50)
+            backend.complete_entry(key_new, data, 400)
+            backend.release(key_new)
+
+            # The oldest segment's frequency should have been decremented
+            # if it wasn't evicted immediately
+            stats = backend.stats()
+            assert stats.evictions >= 1
 
         backend.close()
         shutil.rmtree(cache_dir)

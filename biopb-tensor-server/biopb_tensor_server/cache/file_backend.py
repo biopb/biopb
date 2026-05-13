@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Literal, Optional, Tuple
@@ -26,16 +26,26 @@ from biopb_tensor_server.cache.base import (
     CacheEntry,
     CacheStats,
     EntryState,
+    PoolStats,
 )
 from biopb_tensor_server.cache.recovery import (
     ProcessLock,
     RecoveryStatus,
     SegmentEntryInfo,
     SegmentInfo,
+    SieveKSegmentInfo,
+    PoolQueueInfo,
     WriteAheadLog,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Sieve-K constants
+K = 2  # Counter saturates at K (levels: 0, 1, 2)
+COLD_THRESHOLD_SECONDS = 300  # 5 minutes without access
+COLD_FREQUENCY_THRESHOLD = 0  # frequency == 0
+MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 
 # Size class thresholds derived from Arrow batch limit (~2GB)
@@ -198,8 +208,13 @@ class ArrowFileBackend(CacheBackend):
         # Metadata index: key -> SegmentEntryInfo (location in segment)
         self._metadata: Dict[bytes, SegmentEntryInfo] = {}
 
-        # Segment tracking: segment_id -> SegmentInfo
-        self._segments: OrderedDict[int, SegmentInfo] = OrderedDict()
+        # Sieve-K: Per-pool queues with frequency counters
+        # Replaces old `_segments: OrderedDict[int, SegmentInfo]`
+        self._pool_queues: Dict[Tuple[str, SizeClass], PoolQueueInfo] = {}
+
+        # Legacy segment tracking for backward compatibility during migration
+        # Maps segment_id -> SegmentInfo for segments not yet in pool queues
+        self._segments_legacy: Dict[int, SegmentInfo] = {}
 
         # Mmap handles for fast reads
         self._segment_mmaps: Dict[int, pa.MemoryMappedFile] = {}
@@ -213,6 +228,9 @@ class ArrowFileBackend(CacheBackend):
         # Pool tracking: (schema_key, size_class) -> segment_id for open segments
         self._open_pools: Dict[Tuple[str, SizeClass], int] = {}
 
+        # Double-buffered rotation: pre-created next segment for each pool
+        self._next_segment_map: Dict[Tuple[str, SizeClass], int] = {}
+
         # Statistics
         self._hits: int = 0
         self._misses: int = 0
@@ -220,6 +238,9 @@ class ArrowFileBackend(CacheBackend):
         self._pending_waits: int = 0
         self._ref_held_skips: int = 0
         self._oversized_skips: int = 0
+
+        # Access counter for periodic mmap cleanup
+        self._access_counter: int = 0
 
         # WAL and process lock
         self._wal: Optional[WriteAheadLog] = None
@@ -260,7 +281,11 @@ class ArrowFileBackend(CacheBackend):
         self._rebuild_index_from_segments()
 
         # Find next segment ID (segments are created lazily when first write happens)
-        self._next_segment_id = max(self._segments.keys(), default=0) + 1
+        all_segment_ids = set()
+        for pool in self._pool_queues.values():
+            all_segment_ids.update(pool.queue)
+        all_segment_ids.update(self._segments_legacy.keys())
+        self._next_segment_id = max(all_segment_ids, default=0) + 1
 
     def _recover(self) -> RecoveryStatus:
         """Recover from crash: clean up incomplete writes."""
@@ -302,7 +327,7 @@ class ArrowFileBackend(CacheBackend):
         )
 
     def _rebuild_index_from_segments(self) -> None:
-        """Scan all segment files to rebuild metadata index."""
+        """Scan all segment files to rebuild metadata index and pool queues."""
         segments_dir = self._config.cache_dir / "segments"
 
         for seg_file in sorted(segments_dir.glob("seg_*.arrow")):
@@ -322,6 +347,9 @@ class ArrowFileBackend(CacheBackend):
                 segment_created = seg_file.stat().st_mtime
 
                 reader = pa.RecordBatchStreamReader(mmap)
+                pool_key: Optional[Tuple[str, SizeClass]] = None
+                schema_key = "unified"  # Default for unified schema
+
                 for batch in reader:
                     # Extract cache key from schema metadata
                     schema_meta = batch.schema.metadata or {}
@@ -329,6 +357,10 @@ class ArrowFileBackend(CacheBackend):
                     if key_hex:
                         key = bytes.fromhex(key_hex.decode('utf-8'))
                         batch_size = sum(col.nbytes for col in batch.columns)
+
+                        # Determine pool key for this entry
+                        size_class = _get_size_class(batch_size)
+                        pool_key = (schema_key, size_class)
 
                         # Update offset for next batch
                         # Note: Arrow IPC stream format doesn't expose exact offsets easily
@@ -344,13 +376,32 @@ class ArrowFileBackend(CacheBackend):
                         self._metadata[key] = entry_info
                         entry_count += 1
 
-                # Track segment info
-                self._segments[segment_id] = SegmentInfo(
-                    size_bytes=segment_size,
-                    created_at=segment_created,
-                    last_access_time=segment_created,
-                    entry_count=entry_count,
-                )
+                # Initialize pool queue for this segment if we have entries
+                if pool_key is not None and entry_count > 0:
+                    pool_queue = self._pool_queues.get(pool_key)
+                    if pool_queue is None:
+                        pool_queue = PoolQueueInfo(pool_key=pool_key)
+                        self._pool_queues[pool_key] = pool_queue
+
+                    # Add segment to pool queue (at tail since it's oldest)
+                    pool_queue.queue.append(segment_id)
+                    pool_queue.segments[segment_id] = SieveKSegmentInfo(
+                        segment_id=segment_id,
+                        size_bytes=segment_size,
+                        created_at=segment_created,
+                        last_access_time=segment_created,
+                        entry_count=entry_count,
+                        frequency=0,  # Start with counter=0
+                        mmap_released=False,
+                    )
+                else:
+                    # Legacy tracking for segments without pool info
+                    self._segments_legacy[segment_id] = SegmentInfo(
+                        size_bytes=segment_size,
+                        created_at=segment_created,
+                        last_access_time=segment_created,
+                        entry_count=entry_count,
+                    )
 
             except Exception as e:
                 logger.error(f"Error rebuilding index from {seg_file}: {e}")
@@ -382,12 +433,22 @@ class ArrowFileBackend(CacheBackend):
         sink = pa.OSFile(str(segment_path), 'wb')
         writer = pa.RecordBatchStreamWriter(sink, schema)
 
-        # Track segment
-        self._segments[segment_id] = SegmentInfo(
+        # Get or create pool queue
+        pool_queue = self._pool_queues.get(pool_key)
+        if pool_queue is None:
+            pool_queue = PoolQueueInfo(pool_key=pool_key)
+            self._pool_queues[pool_key] = pool_queue
+
+        # Track segment in pool queue (at head since newest)
+        pool_queue.queue.appendleft(segment_id)
+        pool_queue.segments[segment_id] = SieveKSegmentInfo(
+            segment_id=segment_id,
             size_bytes=0,
             created_at=time.time(),
             last_access_time=time.time(),
             entry_count=0,
+            frequency=0,  # New segments start with counter=0
+            mmap_released=False,
         )
 
         # Register in pool tracking
@@ -420,77 +481,223 @@ class ArrowFileBackend(CacheBackend):
 
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
-        return sum(seg.size_bytes for seg in self._segments.values())
+        total = 0
+        # Pool queues
+        for pool in self._pool_queues.values():
+            for seg_info in pool.segments.values():
+                total += seg_info.size_bytes
+        # Legacy segments
+        for seg_info in self._segments_legacy.values():
+            total += seg_info.size_bytes
+        return total
 
-    def _evict_least_recently_used_segment(self) -> bool:
-        """Evict the segment with oldest last_access_time.
+    def _get_total_segment_count(self) -> int:
+        """Count total segments across all pools."""
+        total = 0
+        for pool in self._pool_queues.values():
+            total += len(pool.queue)
+        total += len(self._segments_legacy)
+        return total
 
-        Returns True if evicted, False if nothing evictable.
-        """
-        if not self._segments:
-            return False
+    def _get_pool_key_for_segment(self, segment_id: int) -> Optional[Tuple[str, SizeClass]]:
+        """Get the pool key for a given segment ID."""
+        for pool_key, pool in self._pool_queues.items():
+            if segment_id in pool.segments:
+                return pool_key
+        return None
 
-        # Find segments with no entries holding references
-        evictable_segments = []
-        for seg_id, seg_info in self._segments.items():
-            # Check if any entries in this segment have ref_count > 0
-            has_refs = False
-            for key, entry_info in self._metadata.items():
-                if entry_info.segment_id == seg_id:
-                    entry = self._entries.get(key)
-                    if entry and entry.ref_count > 0:
-                        has_refs = True
-                        break
+    def _segment_is_evictable(self, segment_id: int) -> bool:
+        """Check if segment has no entries holding references."""
+        for key, entry_info in self._metadata.items():
+            if entry_info.segment_id == segment_id:
+                entry = self._entries.get(key)
+                if entry and entry.ref_count > 0:
+                    return False
+        return True
 
-            if not has_refs:
-                evictable_segments.append((seg_id, seg_info.last_access_time, seg_info.size_bytes))
-
-        if not evictable_segments:
-            self._ref_held_skips += 1
-            return False
-
-        # Evict oldest segment
-        oldest_seg = min(evictable_segments, key=lambda x: x[1])
-        seg_id = oldest_seg[0]
-
+    def _do_evict_segment(self, segment_id: int) -> None:
+        """Actually evict a segment: remove files, metadata, and mmap."""
         # Remove all entries in this segment from metadata
-        keys_to_remove = [k for k, e in self._metadata.items() if e.segment_id == seg_id]
+        keys_to_remove = [k for k, e in self._metadata.items() if e.segment_id == segment_id]
         for key in keys_to_remove:
             self._metadata.pop(key, None)
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
 
         # Close any open writer for this segment
-        writer = self._pool_writers.pop(seg_id, None)
+        writer = self._pool_writers.pop(segment_id, None)
         if writer:
             writer.close()
-        self._pool_paths.pop(seg_id, None)
-        self._pool_schemas.pop(seg_id, None)
-        self._open_pools = {k: v for k, v in self._open_pools.items() if v != seg_id}
+        self._pool_paths.pop(segment_id, None)
+        self._pool_schemas.pop(segment_id, None)
+        self._open_pools = {k: v for k, v in self._open_pools.items() if v != segment_id}
 
         # Close and remove mmap
-        mmap = self._segment_mmaps.pop(seg_id, None)
+        mmap = self._segment_mmaps.pop(segment_id, None)
         if mmap:
             mmap.close()
 
         # Delete segment file
         segments_dir = self._config.cache_dir / "segments"
-        seg_file = segments_dir / f"seg_{seg_id:04d}.arrow"
+        seg_file = segments_dir / f"seg_{segment_id:04d}.arrow"
         if seg_file.exists():
             seg_file.unlink()
 
-        # Remove from segments tracking
-        self._segments.pop(seg_id, None)
+        # Remove from legacy tracking if present
+        self._segments_legacy.pop(segment_id, None)
+
         self._evictions += 1
 
-        logger.debug(f"Evicted segment {seg_id}, {oldest_seg[2]} bytes")
-        return True
+    def _select_pool_for_eviction(self) -> Optional[Tuple[str, SizeClass]]:
+        """Select pool with lowest aggregate hit rate."""
+        if not self._pool_queues:
+            return None
+
+        # Calculate hit rates
+        pool_rates = []
+        for pool_key, pool in self._pool_queues.items():
+            total = pool.hits + pool.misses
+            if total > 0:
+                hit_rate = pool.hits / total
+            else:
+                hit_rate = 0.0
+            pool_rates.append((pool_key, hit_rate, pool.queue))
+
+        # Select lowest hit rate pool with segments
+        pool_rates.sort(key=lambda x: (x[1], -len(x[2])))  # Lowest rate, then most segments
+        for pool_key, rate, queue in pool_rates:
+            if queue:
+                return pool_key
+        return None
+
+    def _evict_segment_sieve_k(self) -> bool:
+        """Per-pool Sieve-K sweep following reference algorithm.
+
+        Returns True if evicted, False if nothing evictable.
+        """
+        # Try pool queues first (Sieve-K)
+        target_pool = self._select_pool_for_eviction()
+        if target_pool is not None:
+            pool_queue = self._pool_queues[target_pool]
+
+            # Sieve-K eviction loop
+            max_iterations = len(pool_queue.queue) * 2  # Safety limit
+            iterations = 0
+            while iterations < max_iterations:
+                iterations += 1
+
+                # Wrap hand if it exceeds queue length
+                if pool_queue.hand >= len(pool_queue.queue):
+                    pool_queue.hand = 0
+
+                if len(pool_queue.queue) == 0:
+                    return False
+
+                # Get segment at hand offset from tail
+                # deque: newest at left (index 0), oldest at right (index -1 is tail)
+                # -1 - hand: tail is index -1, hand=0 → -1, hand=1 → -2, etc.
+                idx = -1 - pool_queue.hand
+
+                if idx < -len(pool_queue.queue):
+                    # Wrapped around, all segments have counter > 0
+                    return False
+
+                seg_id = pool_queue.queue[idx]
+                seg_info = pool_queue.segments.get(seg_id)
+
+                if seg_info is None:
+                    # Segment info missing, skip
+                    pool_queue.hand += 1
+                    continue
+
+                # Check if segment is evictable (no ref_count entries)
+                if not self._segment_is_evictable(seg_id):
+                    pool_queue.hand += 1
+                    continue
+
+                # Sieve-K logic
+                if seg_info.frequency > 0:
+                    # Hot segment: decrement counter, advance hand
+                    seg_info.frequency -= 1
+                    pool_queue.hand += 1
+                else:
+                    # Cold segment (frequency == 0): evict
+                    self._do_evict_segment(seg_id)
+                    pool_queue.segments.pop(seg_id, None)
+                    # O(n) deletion from deque, acceptable for <1000 segments
+                    del pool_queue.queue[idx]
+                    # Hand stays at this position for next eviction
+                    return True
+
+        # Fall back to legacy segments (simple LRU)
+        if self._segments_legacy:
+            # Find oldest evictable legacy segment
+            evictable_legacy = []
+            for seg_id, seg_info in self._segments_legacy.items():
+                if self._segment_is_evictable(seg_id):
+                    evictable_legacy.append((seg_id, seg_info.last_access_time))
+
+            if evictable_legacy:
+                oldest_seg = min(evictable_legacy, key=lambda x: x[1])
+                seg_id = oldest_seg[0]
+                self._do_evict_segment(seg_id)
+                return True
+
+        # Nothing to evict
+        self._ref_held_skips += 1
+        return False
+
+    def _reopen_segment_mmap(self, segment_id: int, seg_info: SieveKSegmentInfo) -> None:
+        """Reopen mmap for cold segment that was accessed."""
+        path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        if path.exists():
+            mmap = pa.memory_map(str(path), 'r')
+            self._segment_mmaps[segment_id] = mmap
+            seg_info.mmap_released = False
+            # On access: increment counter
+            seg_info.frequency = min(K, seg_info.frequency + 1)
+
+    def _maybe_release_cold_mmaps(self) -> None:
+        """Release mmap handles for cold segments.
+
+        Only runs if total segments exceed MMAP_LIFECYCLE_THRESHOLD.
+        """
+        if self._get_total_segment_count() <= MMAP_LIFECYCLE_THRESHOLD:
+            return  # Skip for small caches
+
+        now = time.time()
+        for pool_key, pool in self._pool_queues.items():
+            for seg_id, seg_info in pool.segments.items():
+                age = now - seg_info.last_access_time
+                if seg_info.frequency <= COLD_FREQUENCY_THRESHOLD and age > COLD_THRESHOLD_SECONDS:
+                    mmap = self._segment_mmaps.pop(seg_id, None)
+                    if mmap:
+                        mmap.close()
+                    seg_info.mmap_released = True
 
     def _read_batch_from_segment(self, key: bytes) -> Optional[pa.RecordBatch]:
         """Read a batch from segment file using mmap and cast back to typed schema."""
         entry_info = self._metadata.get(key)
         if entry_info is None:
             return None
+
+        # Get pool info for this segment
+        pool_key = self._get_pool_key_for_segment(entry_info.segment_id)
+
+        # Track pool hit if we have pool info
+        if pool_key:
+            pool_queue = self._pool_queues.get(pool_key)
+            if pool_queue:
+                seg_info = pool_queue.segments.get(entry_info.segment_id)
+                if seg_info:
+                    # Reopen mmap if cold segment was released
+                    if seg_info.mmap_released:
+                        self._reopen_segment_mmap(entry_info.segment_id, seg_info)
+
+                    # Sieve-K: increment counter on hit, saturating at K=2
+                    seg_info.frequency = min(K, seg_info.frequency + 1)
+                    seg_info.last_access_time = time.time()
+                    pool_queue.hits += 1
 
         mmap = self._segment_mmaps.get(entry_info.segment_id)
         if mmap is None:
@@ -499,18 +706,16 @@ class ArrowFileBackend(CacheBackend):
         # Seek back to beginning since reader exhausts the mmap
         mmap.seek(0)
 
+        # Periodic mmap cleanup check
+        self._access_counter += 1
+        if self._access_counter % 100 == 0:
+            self._maybe_release_cold_mmaps()
+
         # Read all batches and find the right one by index
         # (Arrow IPC stream doesn't support direct offset access easily)
         reader = pa.RecordBatchStreamReader(mmap)
         for i, batch in enumerate(reader):
             if i == entry_info.offset:
-                # Update last_access_time for segment
-                seg_info = self._segments.get(entry_info.segment_id)
-                if seg_info:
-                    seg_info.last_access_time = time.time()
-                    # Move to end of OrderedDict (most recently used)
-                    self._segments.move_to_end(entry_info.segment_id)
-
                 # Cast from unified binary schema back to typed schema
                 typed_batch = _cast_from_unified_schema(batch)
                 return typed_batch
@@ -533,6 +738,10 @@ class ArrowFileBackend(CacheBackend):
                     # Ready entry - acquire and return
                     entry.acquire()
                     self._hits += 1
+                    # Update segment frequency if entry is from a segment
+                    entry_info = self._metadata.get(key)
+                    if entry_info:
+                        self._update_segment_frequency(entry_info.segment_id)
                     return entry
 
                 if entry.state == EntryState.PENDING:
@@ -587,6 +796,19 @@ class ArrowFileBackend(CacheBackend):
             entry.acquire()
             return entry
 
+    def _update_segment_frequency(self, segment_id: int) -> None:
+        """Update frequency counter for a segment when accessed."""
+        pool_key = self._get_pool_key_for_segment(segment_id)
+        if pool_key:
+            pool_queue = self._pool_queues.get(pool_key)
+            if pool_queue:
+                seg_info = pool_queue.segments.get(segment_id)
+                if seg_info:
+                    # Sieve-K: increment counter on hit, saturating at K=2
+                    seg_info.frequency = min(K, seg_info.frequency + 1)
+                    seg_info.last_access_time = time.time()
+                    pool_queue.hits += 1
+
     def start_compute(
         self,
         key: bytes,
@@ -600,6 +822,10 @@ class ArrowFileBackend(CacheBackend):
                 if entry.state == EntryState.READY:
                     entry.acquire()
                     self._hits += 1
+                    # Update segment frequency if entry is from a segment
+                    entry_info = self._metadata.get(key)
+                    if entry_info:
+                        self._update_segment_frequency(entry_info.segment_id)
                     return entry, False
 
                 if entry.state == EntryState.PENDING:
@@ -674,7 +900,7 @@ class ArrowFileBackend(CacheBackend):
 
             # Evict if needed before storing
             while self._get_total_size() + size_bytes > self._config.max_total_bytes:
-                if not self._evict_least_recently_used_segment():
+                if not self._evict_segment_sieve_k():
                     break
 
             # Log pending write to WAL
@@ -693,6 +919,15 @@ class ArrowFileBackend(CacheBackend):
             # Use unified schema for pool_key (all dtypes now share same pool per size_class)
             schema_key = "unified"
             pool_key = (schema_key, size_class)
+
+            # Get or create pool queue
+            pool_queue = self._pool_queues.get(pool_key)
+            if pool_queue is None:
+                pool_queue = PoolQueueInfo(pool_key=pool_key)
+                self._pool_queues[pool_key] = pool_queue
+
+            # Track miss for pool (new entry)
+            pool_queue.misses += 1
 
             # Find or create segment for this pool
             segment_id = self._open_pools.get(pool_key)
@@ -720,8 +955,8 @@ class ArrowFileBackend(CacheBackend):
             # Write batch (in unified schema)
             writer.write_batch(batch_with_key)
 
-            # Update segment info
-            seg_info = self._segments.get(segment_id)
+            # Update segment info in pool queue
+            seg_info = pool_queue.segments.get(segment_id)
             if seg_info:
                 seg_info.size_bytes += size_bytes
                 seg_info.entry_count += 1
@@ -792,6 +1027,7 @@ class ArrowFileBackend(CacheBackend):
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
+            self._next_segment_map.clear()
 
             # Close all mmaps
             for mmap in self._segment_mmaps.values():
@@ -804,7 +1040,8 @@ class ArrowFileBackend(CacheBackend):
                 seg_file.unlink()
 
             # Clear tracking
-            self._segments.clear()
+            self._pool_queues.clear()
+            self._segments_legacy.clear()
             self._metadata.clear()
             self._entries.clear()
 
@@ -814,11 +1051,27 @@ class ArrowFileBackend(CacheBackend):
 
             # Reset segment ID counter
             self._next_segment_id = 1
+            self._access_counter = 0
 
     def stats(self) -> CacheStats:
         """Return cache statistics."""
         total_entries = len(self._metadata)
         total_bytes = self._get_total_size()
+
+        # Build pool-level statistics
+        pool_stats = {}
+        for pool_key, pool in self._pool_queues.items():
+            pool_name = f"{pool_key[0]}-{pool_key[1]}"
+            total = pool.hits + pool.misses
+            hit_rate = pool.hits / total if total > 0 else 0.0
+            pool_stats[pool_name] = PoolStats(
+                pool_key=pool_name,
+                hits=pool.hits,
+                misses=pool.misses,
+                segments=len(pool.queue),
+                bytes=sum(s.size_bytes for s in pool.segments.values()),
+                hit_rate=hit_rate,
+            )
 
         return CacheStats(
             total_entries=total_entries,
@@ -831,6 +1084,7 @@ class ArrowFileBackend(CacheBackend):
             pending_waits=self._pending_waits,
             ref_held_evictions_skipped=self._ref_held_skips,
             oversized_skips=self._oversized_skips,
+            pool_stats=pool_stats,
         )
 
     def get_recovery_status(self) -> Optional[RecoveryStatus]:
@@ -851,6 +1105,7 @@ class ArrowFileBackend(CacheBackend):
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
+            self._next_segment_map.clear()
 
             # Close all mmap handles
             for mmap in self._segment_mmaps.values():
@@ -868,4 +1123,5 @@ class ArrowFileBackend(CacheBackend):
             # Clear in-memory tracking (data persists in files)
             self._entries.clear()
             self._metadata.clear()
-            self._segments.clear()
+            self._pool_queues.clear()
+            self._segments_legacy.clear()
