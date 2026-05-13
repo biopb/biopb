@@ -87,6 +87,14 @@ export class TensorHttpClient {
         signal: controller.signal,
       });
       if (!res.ok) {
+        // Check if response is HTML (nginx error page during startup)
+        const contentType = res.headers.get("content-type") ?? "";
+        if (contentType.includes("text/html")) {
+          throw new TensorApiError(
+            res.status,
+            "Server unavailable - may be starting up. Please wait and retry.",
+          );
+        }
         let detail: unknown;
         try { detail = await res.json(); } catch { /* ignore */ }
         throw new TensorApiError(res.status, res.statusText, detail);
@@ -120,6 +128,14 @@ export class TensorHttpClient {
         signal: controller.signal,
       });
       if (!res.ok) {
+        // Check if response is HTML (nginx error page during startup)
+        const contentType = res.headers.get("content-type") ?? "";
+        if (contentType.includes("text/html")) {
+          throw new TensorApiError(
+            res.status,
+            "Server unavailable - may be starting up. Please wait and retry.",
+          );
+        }
         let detail: unknown;
         try { detail = await res.json(); } catch { /* ignore */ }
         throw new TensorApiError(res.status, res.statusText, detail);
@@ -153,6 +169,14 @@ export class TensorHttpClient {
         signal: controller.signal,
       });
       if (!res.ok) {
+        // Check if response is HTML (nginx error page during startup)
+        const contentType = res.headers.get("content-type") ?? "";
+        if (contentType.includes("text/html")) {
+          throw new TensorApiError(
+            res.status,
+            "Server unavailable - may be starting up. Please wait and retry.",
+          );
+        }
         let detail: unknown;
         try { detail = await res.json(); } catch { /* ignore */ }
         throw new TensorApiError(res.status, res.statusText, detail);
