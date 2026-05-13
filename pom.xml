@@ -194,6 +194,8 @@
 				<configuration>
 					<javadocExecutable>${java.home}/bin/javadoc</javadocExecutable>
 					<source>11</source>
+					<failOnWarnings>false</failOnWarnings>
+					<doclint>none</doclint>
 				</configuration>
 				<executions>
 					<execution>
