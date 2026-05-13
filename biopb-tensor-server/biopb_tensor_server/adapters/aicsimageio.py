@@ -1,14 +1,22 @@
-"""AICSImageIO adapter for vendor microscopy formats (CZI, LIF, ND2, DV, etc.).
+"""AICSImageIO adapters for vendor microscopy formats.
 
-This adapter wraps aicsimageio's AICSImage class to provide unified access to
-various vendor microscopy formats through the BackendAdapter interface.
+This module provides a base class and format-specific subclasses for reading
+various microscopy formats through aicsimageio's AICSImage class.
+
+Format-specific subclasses provide meaningful source_type values:
+- OmeTiffAdapter: "ome-tiff" (embedded OME-XML, companion.ome)
+- ZeissAdapter: "zeiss" (CZI, LSM)
+- LeicaAdapter: "leica" (LIF)
+- NikonAdapter: "nikon" (ND2)
+- DvAdapter: "dv" (DeltaVision)
+- OlympusAdapter: "olympus" (OIF, OIB)
+- AicsImageIoAdapter: "aics" (fallback for other formats)
 
 Supports:
 - Multi-scene files (each scene becomes a separate tensor)
 - Lazy loading via dask arrays
 - OME-XML metadata conversion
 - Remote storage (S3, GCS, etc.) via fsspec (passing fs_kwargs)
-- OME-TIFF files (single/multi-file + companion.ome)
 
 Chunk ID format:
 - array_id + bounds encoding (start, stop coordinates)
@@ -42,6 +50,7 @@ if TYPE_CHECKING:
 # OME-XML metadata helpers (for OME-TIFF handling)
 # =============================================================================
 
+
 def _get_namespace(root) -> dict:
     """Extract namespace from root element tag.
 
@@ -52,10 +61,10 @@ def _get_namespace(root) -> dict:
         Dictionary with namespace mapping for OME schema
     """
     tag = root.tag
-    if tag.startswith('{'):
-        namespace = tag.split('}')[0].strip('{')
-        return {'ome': namespace}
-    return {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+    if tag.startswith("{"):
+        namespace = tag.split("}")[0].strip("{")
+        return {"ome": namespace}
+    return {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
 
 
 def _extract_files_from_ome_xml(
@@ -83,20 +92,20 @@ def _extract_files_from_ome_xml(
         files = []
         seen_files = set()
 
-        for tiff_data in root.findall('.//ome:TiffData', namespace):
-            uuid_elem = tiff_data.find('ome:UUID', namespace)
+        for tiff_data in root.findall(".//ome:TiffData", namespace):
+            uuid_elem = tiff_data.find("ome:UUID", namespace)
             if uuid_elem is None:
                 for child in tiff_data:
-                    if child.tag.endswith('UUID') or child.tag == 'UUID':
+                    if child.tag.endswith("UUID") or child.tag == "UUID":
                         uuid_elem = child
                         break
 
             if uuid_elem is not None:
-                filename = uuid_elem.get('FileName')
+                filename = uuid_elem.get("FileName")
                 if filename and filename not in seen_files:
                     if store is not None:
                         if source_dir:
-                            file_path = store._join(str(source_dir) + '/' + filename)
+                            file_path = store._join(str(source_dir) + "/" + filename)
                         else:
                             file_path = store._join(filename)
                         exists = store.isfile(file_path)
@@ -123,9 +132,10 @@ def _get_ome_metadata_from_tiff(path: Path) -> Optional[str]:
         OME-XML string if present, None otherwise
     """
     import tifffile
+
     try:
         with tifffile.TiffFile(str(path)) as tf:
-            if hasattr(tf, 'ome_metadata') and tf.ome_metadata is not None:
+            if hasattr(tf, "ome_metadata") and tf.ome_metadata is not None:
                 return tf.ome_metadata
     except Exception:
         return None
@@ -146,10 +156,10 @@ def _get_available_extensions() -> List[str]:
     for ext, reader_paths in formats.FORMAT_IMPLEMENTATIONS.items():
         for reader_path in reader_paths:
             try:
-                module_path, cls_name = reader_path.rsplit('.', 1)
+                module_path, cls_name = reader_path.rsplit(".", 1)
                 module = importlib.import_module(module_path)
                 getattr(module, cls_name)
-                extensions.append(f'.{ext}')
+                extensions.append(f".{ext}")
                 break
             except (ImportError, AttributeError, ModuleNotFoundError):
                 continue
@@ -160,8 +170,12 @@ def _get_available_extensions() -> List[str]:
 AICS_EXTENSIONS = _get_available_extensions()
 
 
-class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
-    """Adapter for aicsimageio-supported vendor formats (CZI, LIF, ND2, DV, etc.).
+class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
+    """Base adapter for aicsimageio-supported vendor formats.
+
+    This base class provides full functionality for reading microscopy data
+    through aicsimageio's AICSImage class. Subclasses implement claim() with
+    format-specific detection and provide meaningful source_type values.
 
     Dual-role adapter:
     - Source-level (scene_index=None): manages metadata, lists all scenes
@@ -170,94 +184,20 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
     Multi-scene files expose each scene as a separate tensor within the source.
     Each scene is identified by its scene_id from img.scenes.
 
-    Multi-tensor source: Each scene is a separate tensor.
-    Use get_tensor_adapter(scene_id) to access specific scenes.
-
     Supports lazy loading via dask arrays.
     Supports remote storage via fsspec (passes fs_kwargs to AICSImage).
-
-    Chunk ID format:
-    - array_id prefix (via _encode_chunk_id)
-    - chunk key (UTF-8, e.g., "0/1/2" for dask chunk indices)
-
-    Relies on OS page cache for raw data caching.
     """
+
+    # Class-level source type (override in subclasses)
+    SOURCE_TYPE: str = "aics"
 
     # Multi-tensor source: has multiple scenes
     _single_tensor_source = False
 
     @classmethod
-    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim aicsimageio-supported vendor microscopy format files.
-
-        Handles:
-        - Companion OME files (.companion.ome) - parse XML to find all TIFF files
-        - OME-TIFF files (.tif/.tiff with embedded OME-XML) - discover related files
-        - Standard aicsimageio formats (CZI, LIF, ND2, DV, etc.)
-
-        Args:
-            ctx: ClaimContext for unified filesystem access
-            state: DiscoveryState with try_claim_path() callback
-
-        Returns:
-            SourceClaim if this is a supported vendor format file, None otherwise
-        """
-        if not ctx.is_file():
-            return None
-
-        name = ctx.name.lower()
-
-        # Case 1: Companion OME file - parse XML to find all TIFF files
-        # Requires bioformats_jar dependency
-        if name.endswith('.companion.ome'):
-            try:
-                import bioformats_jar
-            except ImportError:
-                return None
-
-            ome_metadata = ctx.read_text()
-            if ome_metadata:
-                related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
-                if related_files:
-                    primary_path = related_files[0]
-                    state.try_claim_path(ctx.path_str)
-                    for f in related_files:
-                        state.try_claim_path(f)
-                    return SourceClaim(
-                        source_type="aics",
-                        primary_path=primary_path,
-                    )
-            return None
-
-        # Case 2: TIFF file - check for embedded OME-XML
-        # Only works for local files (requires tifffile to extract embedded XML)
-        if not ctx.is_remote and (name.endswith('.tif') or name.endswith('.tiff')):
-            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
-
-            if ome_metadata:
-                related_files = _extract_files_from_ome_xml(ome_metadata, ctx.parent.path_str, ctx.store)
-                if related_files:
-                    primary_path = related_files[0]
-                    for f in related_files:
-                        state.try_claim_path(f)
-                    return SourceClaim(
-                        source_type="aics",
-                        primary_path=primary_path,
-                    )
-
-        # Case 3: Standard aicsimageio extension match (CZI, LIF, ND2, etc.)
-        for ext in AICS_EXTENSIONS:
-            if name.endswith(ext):
-                state.try_claim_path(ctx.path_str)
-                return SourceClaim(
-                    source_type="aics",
-                    primary_path=ctx.path_str,
-                )
-
-        return None
-
-    @classmethod
-    def create_from_url(cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None) -> 'AicsImageIoAdapter':
+    def create_from_url(
+        cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None
+    ) -> "_AicsImageIoAdapterBase":
         """Create source-level adapter instance from URL directly.
 
         Convenience method for creating adapter without SourceConfig.
@@ -268,7 +208,7 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
             dim_labels: Optional dimension labels
 
         Returns:
-            AicsImageIoAdapter instance (source-level, scene_index=None)
+            Adapter instance (source-level, scene_index=None)
         """
         from aicsimageio import AICSImage
 
@@ -287,9 +227,9 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
     @classmethod
     def create_from_config(
         cls,
-        source: 'SourceConfig',
+        source: "SourceConfig",
         credentials_config: Optional[Any] = None,
-    ) -> 'AicsImageIoAdapter':
+    ) -> "_AicsImageIoAdapterBase":
         """Create source-level adapter instance from SourceConfig.
 
         Args:
@@ -297,7 +237,7 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
-            AicsImageIoAdapter instance (source-level, scene_index=None)
+            Adapter instance (source-level, scene_index=None)
         """
         from aicsimageio import AICSImage
 
@@ -359,11 +299,11 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
         # Source-level metadata for DataSourceDescriptor
         if source_url:
             self._source_url = source_url
-        elif hasattr(aics_image, 'source') and hasattr(aics_image.source, 'path'):
+        elif hasattr(aics_image, "source") and hasattr(aics_image.source, "path"):
             self._source_url = str(aics_image.source.path)
         else:
             self._source_url = ""
-        self._source_type = "aics"
+        self._source_type = self.SOURCE_TYPE
 
         # Scene-level: cache dask_data after set_scene (thread-safe)
         if scene_index is not None:
@@ -375,7 +315,9 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
             # Source-level: no cached dask_data
             self._dask_data = None
             self.dim_labels = dim_labels  # Used as default for all scenes
-            self._cached_descriptors = None  # Cached on first list_tensor_descriptors call
+            self._cached_descriptors = (
+                None  # Cached on first list_tensor_descriptors call
+            )
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from aicsimageio dask array.
@@ -437,7 +379,11 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
         # Try OME metadata first (much faster - no scene switching)
         try:
             ome_meta = self._aics_image.ome_metadata
-            if ome_meta is not None and hasattr(ome_meta, 'images') and len(ome_meta.images) == len(scene_ids):
+            if (
+                ome_meta is not None
+                and hasattr(ome_meta, "images")
+                and len(ome_meta.images) == len(scene_ids)
+            ):
                 # Get dtype from first scene (assumed consistent)
                 self._aics_image.set_scene(scene_ids[0])
                 dtype = self._aics_image.dask_data.dtype.str
@@ -448,13 +394,19 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
                     px = im.pixels
                     shape = [px.size_t, px.size_c, px.size_z, px.size_y, px.size_x]
 
-                    descriptors.append(TensorDescriptor(
-                        array_id=scene_ids[i],  # Use img.scenes ID for get_tensor_adapter
-                        dim_labels=self.dim_labels if self.dim_labels else list(self._aics_image.dims.order),
-                        shape=shape,
-                        chunk_shape=[],  # Not populated - call get_flight_info for chunk info
-                        dtype=dtype,
-                    ))
+                    descriptors.append(
+                        TensorDescriptor(
+                            array_id=scene_ids[
+                                i
+                            ],  # Use img.scenes ID for get_tensor_adapter
+                            dim_labels=self.dim_labels
+                            if self.dim_labels
+                            else list(self._aics_image.dims.order),
+                            shape=shape,
+                            chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                            dtype=dtype,
+                        )
+                    )
         except NotImplementedError:
             # Some formats don't support ome_metadata - fall through to scene switching
             pass
@@ -465,26 +417,30 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
                 self._aics_image.set_scene(scene_id)
                 dask_data = self._aics_image.dask_data
 
-                descriptors.append(TensorDescriptor(
-                    array_id=scene_id,
-                    dim_labels=self.dim_labels if self.dim_labels else list(self._aics_image.dims.order),
-                    shape=list(dask_data.shape),
-                    chunk_shape=[],  # Not populated - call get_flight_info for chunk info
-                    dtype=dask_data.dtype.str,
-                ))
+                descriptors.append(
+                    TensorDescriptor(
+                        array_id=scene_id,
+                        dim_labels=self.dim_labels
+                        if self.dim_labels
+                        else list(self._aics_image.dims.order),
+                        shape=list(dask_data.shape),
+                        chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                        dtype=dask_data.dtype.str,
+                    )
+                )
 
         # Cache for future calls
         self._cached_descriptors = descriptors
         return descriptors
 
-    def get_tensor_adapter(self, tensor_id: str) -> 'BackendAdapter':
+    def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
         """Get BackendAdapter for a specific scene within this source.
 
         Args:
             tensor_id: Scene identifier (scene_id from img.scenes)
 
         Returns:
-            AicsImageIoAdapter for the specified scene, with tensor context set
+            Adapter for the specified scene, with tensor context set
         """
         # Source-level: lazy initialize tensor level adapters
         scene_ids = list(self._aics_image.scenes)
@@ -492,15 +448,15 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
             scene_idx = scene_ids.index(tensor_id)
         except ValueError:
             raise ValueError(f"Unknown scene: {tensor_id}")
-        
-        if hasattr(self, '_tensor_adapters'):
+
+        if hasattr(self, "_tensor_adapters"):
             # Check if adapter already exists for this scene
             if tensor_id in self._tensor_adapters:
                 return self._tensor_adapters[tensor_id]
         else:
             self._tensor_adapters = {}
 
-        adapter = AicsImageIoAdapter(
+        adapter = self.__class__(
             self._aics_image,
             scene_index=scene_idx,
             source_id=self.source_id,
@@ -533,16 +489,243 @@ class AicsImageIoAdapter(SourceAdapter, TensorAdapter):
             # or dict method (pydantic v1)
             # Use mode='json' to ensure Enum fields (UnitsElectricPotential, etc.)
             # are serialized to their string representations
-            if hasattr(ome_meta, 'model_dump'):
-                return ome_meta.model_dump(mode='json')
-            elif hasattr(ome_meta, 'dict'):
+            if hasattr(ome_meta, "model_dump"):
+                return ome_meta.model_dump(mode="json")
+            elif hasattr(ome_meta, "dict"):
                 return ome_meta.dict(by_alias=False, exclude_none=False)
-            elif hasattr(ome_meta, '__dict__'):
+            elif hasattr(ome_meta, "__dict__"):
                 # Fallback: try to extract serializable attributes
                 return {
-                    k: v for k, v in ome_meta.__dict__.items()
-                    if not k.startswith('_')
+                    k: v for k, v in ome_meta.__dict__.items() if not k.startswith("_")
                 }
             return {}
         except Exception:
             return {}
+
+
+# =============================================================================
+# Format-specific subclasses
+# =============================================================================
+
+
+class OmeTiffAdapter(_AicsImageIoAdapterBase):
+    """Adapter for OME-TIFF files (embedded OME-XML or companion.ome).
+
+    Handles:
+    - .tif/.tiff files with embedded OME-XML metadata
+    - .companion.ome files (multi-file OME-TIFF with Bioformats)
+    """
+
+    SOURCE_TYPE = "ome-tiff"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim OME-TIFF files with embedded or companion OME-XML."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+
+        # Case 1: Companion OME file - parse XML to find all TIFF files
+        # Requires bioformats_jar dependency
+        if name.endswith(".companion.ome"):
+            try:
+                import bioformats_jar
+            except ImportError:
+                return None
+
+            ome_metadata = ctx.read_text()
+            if ome_metadata:
+                related_files = _extract_files_from_ome_xml(
+                    ome_metadata, ctx.parent.path_str, ctx.store
+                )
+                if related_files:
+                    primary_path = related_files[0]
+                    state.try_claim_path(ctx.path_str)
+                    for f in related_files:
+                        state.try_claim_path(f)
+                    return SourceClaim(
+                        source_type=cls.SOURCE_TYPE,
+                        primary_path=primary_path,
+                    )
+            return None
+
+        # Case 2: TIFF file - check for embedded OME-XML
+        # Only works for local files (requires tifffile to extract embedded XML)
+        if (
+            not ctx.is_remote
+            and ctx._path is not None
+            and (name.endswith(".tif") or name.endswith(".tiff"))
+        ):
+            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
+
+            if ome_metadata:
+                related_files = _extract_files_from_ome_xml(
+                    ome_metadata, ctx.parent.path_str, ctx.store
+                )
+                if related_files:
+                    primary_path = related_files[0]
+                    for f in related_files:
+                        state.try_claim_path(f)
+                    return SourceClaim(
+                        source_type=cls.SOURCE_TYPE,
+                        primary_path=primary_path,
+                    )
+
+        return None
+
+
+class ZeissAdapter(_AicsImageIoAdapterBase):
+    """Adapter for Zeiss microscopy files (CZI and LSM)."""
+
+    SOURCE_TYPE = "zeiss"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim Zeiss CZI and LSM files."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if name.endswith(".czi") or name.endswith(".lsm"):
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type=cls.SOURCE_TYPE,
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+            )
+        return None
+
+
+class LeicaAdapter(_AicsImageIoAdapterBase):
+    """Adapter for Leica LIF files."""
+
+    SOURCE_TYPE = "leica"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim Leica LIF files."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if name.endswith(".lif"):
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type=cls.SOURCE_TYPE,
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+            )
+        return None
+
+
+class NikonAdapter(_AicsImageIoAdapterBase):
+    """Adapter for Nikon ND2 files."""
+
+    SOURCE_TYPE = "nikon"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim Nikon ND2 files."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if name.endswith(".nd2"):
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type=cls.SOURCE_TYPE,
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+            )
+        return None
+
+
+class DvAdapter(_AicsImageIoAdapterBase):
+    """Adapter for DeltaVision DV files."""
+
+    SOURCE_TYPE = "dv"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim DeltaVision DV files."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if name.endswith(".dv"):
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type=cls.SOURCE_TYPE,
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+            )
+        return None
+
+
+class OlympusAdapter(_AicsImageIoAdapterBase):
+    """Adapter for Olympus OIF and OIB files."""
+
+    SOURCE_TYPE = "olympus"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim Olympus OIF and OIB files."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if name.endswith(".oif") or name.endswith(".oib"):
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type=cls.SOURCE_TYPE,
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+            )
+        return None
+
+
+class AicsImageIoAdapter(_AicsImageIoAdapterBase):
+    """Fallback adapter for remaining aicsimageio-supported formats.
+
+    Claims any file with an extension supported by aicsimageio that isn't
+    handled by the format-specific subclasses above.
+    """
+
+    SOURCE_TYPE = "aics"
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim aicsimageio-supported files not handled by other adapters."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+
+        # Check against format-specific extensions to avoid double-claiming
+        # These are already handled by other subclasses
+        specific_extensions = (
+            ".companion.ome",
+            ".czi",
+            ".lsm",
+            ".lif",
+            ".nd2",
+            ".dv",
+            ".oif",
+            ".oib",
+        )
+        for ext in specific_extensions:
+            if name.endswith(ext):
+                return None  # Let the specific adapter handle this
+
+        # Check for remaining aicsimageio extensions
+        for ext in AICS_EXTENSIONS:
+            if name.endswith(ext):
+                state.try_claim_path(ctx.path_str)
+                return SourceClaim(
+                    source_type=cls.SOURCE_TYPE,
+                    primary_path=ctx.path_str,
+                    is_remote=ctx.is_remote,
+                )
+
+        return None
