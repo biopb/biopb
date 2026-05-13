@@ -26,7 +26,7 @@ COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
 WORKDIR /app/tensor-server
 RUN pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir ".[web,ome-zarr,aics,medical]" \
+    && pip install --no-cache-dir ".[web,ome-zarr,aics,medical,ndtiff]" \
     && pip install --no-cache-dir bioformats-jar
 
 # Stage 3: Runtime (nginx + python)

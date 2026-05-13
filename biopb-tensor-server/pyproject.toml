@@ -43,6 +43,9 @@ dependencies = [
     "aicsimageio[nd2]",
     "aicsimageio[dv]",
   ]
+  ndtiff = [
+    "ndtiff >= 3.0.0",
+  ]
   dicom = [
     "pydicom >= 2.4.0",
   ]

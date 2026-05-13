@@ -20,6 +20,12 @@ from .tiff import (
 )
 from .zarr import ZarrAdapter
 
+# Optional ndtiff adapter (Micro-Manager NDTiff storage format)
+try:
+    from .ndtiff import NdTiffAdapter
+except ImportError:
+    NdTiffAdapter = None  # type: ignore
+
 # Optional aicsimageio adapters (format-specific subclasses)
 try:
     from .aicsimageio import (
@@ -63,6 +69,7 @@ __all__ = [
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
     "OmeZarrAdapter",
+    "NdTiffAdapter",
     "OmeTiffAdapter",
     "ZeissAdapter",
     "LeicaAdapter",
@@ -89,6 +96,7 @@ def get_default_registry() -> AdapterRegistry:
     - AicsImageIoAdapter - Fallback for other aicsimageio-supported formats
     - OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
     - ZarrAdapter - Generic Zarr fallback
+    - NdTiffAdapter - Micro-Manager NDTiff storage (NDTiff.index + NDTiffStack_*.tif)
     - MicroManagerLegacyAdapter - Legacy MicroManager datasets with JSON metadata (metadata.txt)
     - TiffSequenceAdapter - Plain TIFF sequences (no metadata)
     - DicomSeriesAdapter - Multi-file DICOM series (directories with same SeriesInstanceUID)
@@ -123,7 +131,9 @@ def get_default_registry() -> AdapterRegistry:
         "ome-zarr-hcs", OmeZarrAdapter
     )  # HCS plates use same adapter
 
-    # TIFF/MicroManager
+    # TIFF/MicroManager - NDTiff before Legacy (newer format)
+    if NdTiffAdapter is not None:
+        registry.register_with_type("ndtiff", NdTiffAdapter)
     registry.register_with_type("micromanager-legacy", MicroManagerLegacyAdapter)
     registry.register_with_type("tiff-sequence", TiffSequenceAdapter)
 
