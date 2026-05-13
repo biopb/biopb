@@ -24,7 +24,6 @@ Chunk ID format:
 Relies on OS page cache for raw data caching.
 """
 
-import importlib
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -141,33 +140,56 @@ def _get_ome_metadata_from_tiff(path: Path) -> Optional[str]:
         return None
 
 
-def _get_available_extensions() -> List[str]:
-    """Detect file extensions with at least one importable aicsimageio reader.
+# Core microscopy/image extensions for AicsImageIoAdapter fallback
+# These are genuine image formats that are NOT handled by format-specific subclasses
+# Format-specific adapters handle: .czi, .lsm, .lif, .nd2, .dv, .oif, .oib, .companion.ome
+#
+# This curated set avoids claiming generic file types (txt, csv, cfg, htm, etc.)
+# that bioformats technically supports but are not microscopy images.
+CORE_IMAGE_EXTENSIONS = frozenset(
+    [
+        # Standard image formats
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        # Video formats
+        ".avi",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        # Microscopy-specific formats (not handled by specific adapters)
+        ".mrc",
+        ".mrcs",  # MRC electron microscopy
+        ".klb",  # Keller Lab Blockfile
+        ".ims",  # Imaris
+        ".liff",
+        ".lim",  # Other Leica variants
+        ".cif",
+        ".cxd",  # Cell imaging formats
+        ".flex",
+        ".fli",  # Flexible image transport
+        # Scientific image formats
+        ".fits",
+        ".fit",
+        ".fts",  # FITS astronomical/scientific
+        ".nrrd",
+        ".nhdr",  # NRRD medical imaging
+        ".mhd",
+        ".mha",
+        ".img",
+        ".hdr",  # Analyze/MetaImage format
+        ".ics",
+        ".ids",  # ICS/IDS format
+    ]
+)
 
-    Uses aicsimageio's FORMAT_IMPLEMENTATIONS to check which readers are
-    actually available (have their required dependencies installed).
-
-    Returns:
-        Sorted list of extensions (e.g., ['.czi', '.lif', '.tif', '.tiff'])
-    """
-    import aicsimageio.formats as formats
-
-    extensions = []
-    for ext, reader_paths in formats.FORMAT_IMPLEMENTATIONS.items():
-        for reader_path in reader_paths:
-            try:
-                module_path, cls_name = reader_path.rsplit(".", 1)
-                module = importlib.import_module(module_path)
-                getattr(module, cls_name)
-                extensions.append(f".{ext}")
-                break
-            except (ImportError, AttributeError, ModuleNotFoundError):
-                continue
-    return sorted(set(extensions))
-
-
-# Build extension list at module load time based on installed readers
-AICS_EXTENSIONS = _get_available_extensions()
+# Use core set for claim scope (not dynamic discovery which is too broad when bioformats is installed)
+AICS_EXTENSIONS = CORE_IMAGE_EXTENSIONS
 
 
 class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
@@ -688,8 +710,18 @@ class OlympusAdapter(_AicsImageIoAdapterBase):
 class AicsImageIoAdapter(_AicsImageIoAdapterBase):
     """Fallback adapter for remaining aicsimageio-supported formats.
 
-    Claims any file with an extension supported by aicsimageio that isn't
-    handled by the format-specific subclasses above.
+    Claims files with extensions in CORE_IMAGE_EXTENSIONS that are not handled
+    by format-specific subclasses. Uses a curated set of microscopy and
+    scientific image formats, excluding generic file types (txt, csv, cfg, etc.)
+    that bioformats technically supports.
+
+    Note: Some formats handled by specific adapters:
+    - .companion.ome → OmeTiffAdapter
+    - .czi, .lsm → ZeissAdapter
+    - .lif → LeicaAdapter
+    - .nd2 → NikonAdapter
+    - .dv → DvAdapter
+    - .oif, .oib → OlympusAdapter
     """
 
     SOURCE_TYPE = "aics"

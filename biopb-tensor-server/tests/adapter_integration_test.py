@@ -5,8 +5,11 @@ to dask compute for each adapter type.
 """
 
 import importlib.util
+import tempfile
 import threading
 import time
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,6 +25,7 @@ def _zarr_available() -> bool:
     """Check if zarr is available with working numcodecs."""
     try:
         import zarr
+
         zarr.open_array
         return True
     except ImportError:
@@ -37,6 +41,7 @@ def _bioformats_available() -> bool:
     """Check if bioformats_jar is available for companion.ome support."""
     try:
         import bioformats_jar
+
         return True
     except ImportError:
         return False
@@ -55,12 +60,12 @@ class TestZarrIntegration:
         zarr_path, shape, chunks = simple_zarr_array
 
         # Open array and create adapter
-        arr = zarr.open_array(zarr_path, mode='r')
-        adapter = ZarrAdapter(arr, 'zarr-integration', ['y', 'x'])
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = TensorFlightServer('grpc://localhost:8899')
-        server.register_source('zarr-integration', adapter)
+        server = TensorFlightServer("grpc://localhost:8899")
+        server.register_source("zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -68,14 +73,14 @@ class TestZarrIntegration:
 
         try:
             # Connect client and compute
-            client = TensorFlightClient('grpc://localhost:8899', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8899", cache_bytes=10_000_000)
 
             # List sources
             sources = client.list_sources()
-            assert 'zarr-integration' in sources
+            assert "zarr-integration" in sources
 
             # Get tensor (source_id matches tensor_id for single-tensor sources)
-            darr = client.get_tensor('zarr-integration', 'zarr-integration')
+            darr = client.get_tensor("zarr-integration", "zarr-integration")
             assert darr.shape == shape
             assert darr.dtype == np.uint8
 
@@ -96,21 +101,26 @@ class TestZarrIntegration:
 
         zarr_path, shape, chunks = simple_zarr_array
 
-        arr = zarr.open_array(zarr_path, mode='r')
-        adapter = ZarrAdapter(arr, 'zarr-scaled', ['y', 'x'])
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "zarr-scaled", ["y", "x"])
 
-        server = TensorFlightServer('grpc://localhost:8898')
-        server.register_source('zarr-scaled', adapter)
+        server = TensorFlightServer("grpc://localhost:8898")
+        server.register_source("zarr-scaled", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8898', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8898", cache_bytes=10_000_000)
 
             # Test stride downsampling
-            darr = client.get_tensor('zarr-scaled', 'zarr-scaled', scale_hint=[2, 2], reduction_method='stride')
+            darr = client.get_tensor(
+                "zarr-scaled",
+                "zarr-scaled",
+                scale_hint=[2, 2],
+                reduction_method="stride",
+            )
             expected_shape = (shape[0] // 2, shape[1] // 2)
             assert darr.shape == expected_shape
 
@@ -134,24 +144,28 @@ class TestOmeZarrIntegration:
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
 
-        root = zarr.open_group(zarr_path, mode='r')
-        arr = root['0']
+        root = zarr.open_group(zarr_path, mode="r")
+        arr = root["0"]
 
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-integration')
+        adapter = OmeZarrAdapter(arr, "ome-zarr-integration")
 
-        server = TensorFlightServer('grpc://localhost:8897')
-        server.register_source('ome-zarr-integration', adapter)
+        server = TensorFlightServer("grpc://localhost:8897")
+        server.register_source("ome-zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8897', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8897", cache_bytes=10_000_000)
 
             # Test precompute method for scale 2
-            darr = client.get_tensor('ome-zarr-integration', 'ome-zarr-integration',
-                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='precompute')
+            darr = client.get_tensor(
+                "ome-zarr-integration",
+                "ome-zarr-integration",
+                read_options=TensorReadOptions(
+                    scale_hint=[2, 2], reduction_method="precompute"
+                ),
             )
 
             # Level 1 shape should be base_shape / 2
@@ -178,29 +192,34 @@ class TestOmeZarrIntegration:
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
 
-        root = zarr.open_group(zarr_path, mode='r')
-        arr = root['0']
+        root = zarr.open_group(zarr_path, mode="r")
+        arr = root["0"]
 
-        adapter = OmeZarrAdapter(arr, 'ome-zarr-virtual')
+        adapter = OmeZarrAdapter(arr, "ome-zarr-virtual")
 
-        server = TensorFlightServer('grpc://localhost:8896')
-        server.register_source('ome-zarr-virtual', adapter)
+        server = TensorFlightServer("grpc://localhost:8896")
+        server.register_source("ome-zarr-virtual", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8896', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8896", cache_bytes=10_000_000)
 
             # Request scale 3 - no matching level, should use virtual scaling
-            darr = client.get_tensor('ome-zarr-virtual', 'ome-zarr-virtual', scale_hint=[3, 3], reduction_method='nearest')
+            darr = client.get_tensor(
+                "ome-zarr-virtual",
+                "ome-zarr-virtual",
+                scale_hint=[3, 3],
+                reduction_method="nearest",
+            )
 
             # Virtual scaling gives ceil(shape/3)
             base_shape = (256, 256)
             expected_shape = (
                 (base_shape[0] + 2) // 3,  # ceil division
-                (base_shape[1] + 2) // 3
+                (base_shape[1] + 2) // 3,
             )
             assert darr.shape == expected_shape
 
@@ -221,24 +240,24 @@ class TestOmeTiffIntegration:
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'ome-tiff-integration')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer('grpc://localhost:8895')
-        server.register_source('ome-tiff-integration', adapter)
+        server = TensorFlightServer("grpc://localhost:8895")
+        server.register_source("ome-tiff-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8895', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8895", cache_bytes=10_000_000)
 
             # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor('ome-tiff-integration', scene_id)
+            darr = client.get_tensor("ome-tiff-integration", scene_id)
 
             # AICSImage uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
             # Original fixture creates (C, Y, X) = (3, 128, 128) with CYX axes
@@ -264,24 +283,24 @@ class TestOmeTiffIntegration:
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'ome-tiff-channels')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer('grpc://localhost:8894')
-        server.register_source('ome-tiff-channels', adapter)
+        server = TensorFlightServer("grpc://localhost:8894")
+        server.register_source("ome-tiff-channels", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8894', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8894", cache_bytes=10_000_000)
 
             # tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor('ome-tiff-channels', scene_id)
+            darr = client.get_tensor("ome-tiff-channels", scene_id)
 
             # Read channel 0 (value = 1) - C axis is index 1 in TCZYX
             data0 = darr[0:1, 0:1].compute()
@@ -309,11 +328,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-test')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-test")
 
         # List all tensors (series)
         descriptors = adapter.list_tensor_descriptors()
-        assert len(descriptors) == series_info['n_series']
+        assert len(descriptors) == series_info["n_series"]
 
         # Each descriptor should have a unique array_id
         array_ids = [d.array_id for d in descriptors]
@@ -325,7 +344,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-access')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
         descriptors = adapter.list_tensor_descriptors()
@@ -347,28 +366,28 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'multi-series-server')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-server")
 
-        server = TensorFlightServer('grpc://localhost:8877')
-        server.register_source('multi-series-server', adapter)
+        server = TensorFlightServer("grpc://localhost:8877")
+        server.register_source("multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8877', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8877", cache_bytes=10_000_000)
 
             # List sources
             sources = client.list_sources()
-            assert 'multi-series-server' in sources
+            assert "multi-series-server" in sources
 
             # Get actual scene IDs
             descriptors = adapter.list_tensor_descriptors()
             first_scene_id = descriptors[0].array_id
 
             # Get first series tensor - tensor_id is the scene_id (e.g., 'Image:0')
-            darr = client.get_tensor('multi-series-server', first_scene_id)
+            darr = client.get_tensor("multi-series-server", first_scene_id)
 
             # Read data
             data = darr.compute()
@@ -390,7 +409,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, 'lazy-tile-test')
+        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
         descriptors = adapter.list_tensor_descriptors()
@@ -410,7 +429,9 @@ class TestMultiSeriesOmeTiffIntegration:
 class TestCompanionOmeIntegration:
     """Integration tests for companion OME files (now handled by AicsImageIoAdapter)."""
 
-    @pytest.mark.skipif(not _bioformats_available(), reason="bioformats_jar not available")
+    @pytest.mark.skipif(
+        not _bioformats_available(), reason="bioformats_jar not available"
+    )
     def test_companion_claim(self, companion_ome_dataset):
         """Test claiming companion.ome file."""
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
@@ -420,6 +441,7 @@ class TestCompanionOmeIntegration:
 
         # Test claim method
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
         ctx = ClaimContext(Path(companion_path))
         state = DiscoveryState()
         claim = AicsImageIoAdapter.claim(ctx, state)
@@ -431,7 +453,9 @@ class TestCompanionOmeIntegration:
         for tiff_file in tiff_files:
             assert tiff_file in state.consumed_paths
 
-    @pytest.mark.skipif(not _bioformats_available(), reason="bioformats_jar not available")
+    @pytest.mark.skipif(
+        not _bioformats_available(), reason="bioformats_jar not available"
+    )
     def test_companion_data_access(self, companion_ome_dataset):
         """Test reading data from companion OME dataset."""
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
@@ -440,7 +464,7 @@ class TestCompanionOmeIntegration:
         companion_path, tiff_files, metadata_info = companion_ome_dataset
 
         # Create adapter from companion file
-        adapter = AicsImageIoAdapter.create_from_url(companion_path, 'companion-test')
+        adapter = AicsImageIoAdapter.create_from_url(companion_path, "companion-test")
 
         # Get first series
         descriptors = adapter.list_tensor_descriptors()
@@ -450,10 +474,10 @@ class TestCompanionOmeIntegration:
         desc = descriptors[0]
         series_adapter = adapter.get_tensor_adapter(desc.array_id)
 
-        bounds = ChunkBounds(start=[0, 0, 0], stop=[metadata_info['n_files'], 64, 64])
+        bounds = ChunkBounds(start=[0, 0, 0], stop=[metadata_info["n_files"], 64, 64])
         data = series_adapter.get_data(bounds)
 
-        assert data.shape[0] == metadata_info['n_files']
+        assert data.shape[0] == metadata_info["n_files"]
         # First file has value 1
         assert data[0].mean() == 1
 
@@ -471,21 +495,23 @@ class TestHdf5Integration:
         h5_path, shape, chunks = hdf5_dataset
 
         # HDF5 adapter needs the dataset object, so we need to keep file open
-        with h5py.File(h5_path, 'r') as f:
-            dataset = f['data']
-            adapter = Hdf5Adapter(dataset, 'hdf5-integration')
+        with h5py.File(h5_path, "r") as f:
+            dataset = f["data"]
+            adapter = Hdf5Adapter(dataset, "hdf5-integration")
 
-            server = TensorFlightServer('grpc://localhost:8891')
-            server.register_source('hdf5-integration', adapter)
+            server = TensorFlightServer("grpc://localhost:8891")
+            server.register_source("hdf5-integration", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
             server_thread.start()
             time.sleep(1)
 
             try:
-                client = TensorFlightClient('grpc://localhost:8891', cache_bytes=10_000_000)
+                client = TensorFlightClient(
+                    "grpc://localhost:8891", cache_bytes=10_000_000
+                )
 
-                darr = client.get_tensor('hdf5-integration', 'hdf5-integration')
+                darr = client.get_tensor("hdf5-integration", "hdf5-integration")
                 assert darr.shape == shape
 
                 data = darr.compute()
@@ -508,30 +534,30 @@ class TestCacheIntegration:
 
         zarr_path, shape, chunks = simple_zarr_array
 
-        arr = zarr.open_array(zarr_path, mode='r')
-        adapter = ZarrAdapter(arr, 'cache-test', ['y', 'x'])
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "cache-test", ["y", "x"])
 
-        server = TensorFlightServer('grpc://localhost:8890')
-        server.register_source('cache-test', adapter)
+        server = TensorFlightServer("grpc://localhost:8890")
+        server.register_source("cache-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
 
-            darr = client.get_tensor('cache-test', 'cache-test')
+            darr = client.get_tensor("cache-test", "cache-test")
 
             # First read
-            data1 = darr[:chunks[0], :chunks[1]].compute()
+            data1 = darr[: chunks[0], : chunks[1]].compute()
 
             # Check cache state via cache_info()
             info1 = client.cache_info()
             initial_bytes = info1["size_bytes"]
 
             # Second read - same region
-            data2 = darr[:chunks[0], :chunks[1]].compute()
+            data2 = darr[: chunks[0], : chunks[1]].compute()
 
             # Cache should have same size (hit, no new data)
             info2 = client.cache_info()
@@ -553,27 +579,27 @@ class TestCacheIntegration:
 
         zarr_path, shape, chunks = simple_zarr_array
 
-        arr = zarr.open_array(zarr_path, mode='r')
-        adapter = ZarrAdapter(arr, 'cache-regions', ['y', 'x'])
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "cache-regions", ["y", "x"])
 
-        server = TensorFlightServer('grpc://localhost:8889')
-        server.register_source('cache-regions', adapter)
+        server = TensorFlightServer("grpc://localhost:8889")
+        server.register_source("cache-regions", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(1)
 
         try:
-            client = TensorFlightClient('grpc://localhost:8889', cache_bytes=10_000_000)
+            client = TensorFlightClient("grpc://localhost:8889", cache_bytes=10_000_000)
 
-            darr = client.get_tensor('cache-regions', 'cache-regions')
+            darr = client.get_tensor("cache-regions", "cache-regions")
 
             # Read first chunk
-            data1 = darr[:chunks[0], :chunks[1]].compute()
+            data1 = darr[: chunks[0], : chunks[1]].compute()
             nbytes1 = client.cache_info()["size_bytes"]
 
             # Read second chunk (different region)
-            data2 = darr[chunks[0]:chunks[0]*2, chunks[1]:chunks[1]*2].compute()
+            data2 = darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
             nbytes2 = client.cache_info()["size_bytes"]
 
             # Cache should have grown
@@ -598,11 +624,11 @@ class TestConcurrentAccess:
 
         zarr_path, shape, chunks = simple_zarr_array
 
-        arr = zarr.open_array(zarr_path, mode='r')
-        adapter = ZarrAdapter(arr, 'concurrent-test', ['y', 'x'])
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "concurrent-test", ["y", "x"])
 
-        server = TensorFlightServer('grpc://localhost:8888')
-        server.register_source('concurrent-test', adapter)
+        server = TensorFlightServer("grpc://localhost:8888")
+        server.register_source("concurrent-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -611,9 +637,9 @@ class TestConcurrentAccess:
         results = []
 
         def read_region(client_id):
-            client = TensorFlightClient('grpc://localhost:8888', cache_bytes=10_000_000)
-            darr = client.get_tensor('concurrent-test', 'concurrent-test')
-            data = darr[:chunks[0], :chunks[1]].compute()
+            client = TensorFlightClient("grpc://localhost:8888", cache_bytes=10_000_000)
+            darr = client.get_tensor("concurrent-test", "concurrent-test")
+            data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))
             client.close()
             return data
@@ -632,3 +658,42 @@ class TestConcurrentAccess:
         except Exception:
             server.shutdown()
             raise
+
+
+class TestAicsImageIoAdapterClaim:
+    """Tests for AicsImageIoAdapter.claim() scope limits."""
+
+    def test_claim_generic_files_rejected(self):
+        """Generic file types (txt, csv, cfg) should not be claimed."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Test various generic file types that bioformats supports
+            for ext in [".txt", ".csv", ".cfg", ".htm", ".html", ".db", ".dat", ".bin"]:
+                path = Path(tmpdir) / f"test{ext}"
+                path.write_text("not an image file")
+
+                ctx = ClaimContext(path)
+                state = DiscoveryState()
+                claim = AicsImageIoAdapter.claim(ctx, state)
+
+                assert claim is None, f"AicsImageIoAdapter should not claim {ext} files"
+
+    def test_claim_image_files_accepted(self):
+        """Standard image file types should be claimed."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Test standard image formats (extensions only, content doesn't matter for claim)
+            for ext in [".png", ".jpg", ".gif", ".bmp"]:
+                path = Path(tmpdir) / f"test{ext}"
+                path.write_bytes(b"\x00")  # Dummy content
+
+                ctx = ClaimContext(path)
+                state = DiscoveryState()
+                claim = AicsImageIoAdapter.claim(ctx, state)
+
+                assert claim is not None, f"AicsImageIoAdapter should claim {ext} files"
+                assert claim.source_type == "aics"
