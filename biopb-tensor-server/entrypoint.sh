@@ -6,18 +6,20 @@ set -e
 #                  Otherwise generates config from env vars below
 # DATA_DIR       - Directory to monitor (default: /data)
 # MONITOR        - Enable live fs monitoring (default: false, recommended for NFS/Lustre)
-# HOST           - gRPC server host (default: 0.0.0.0)
-# PORT           - gRPC server port (default: 8815)
+# HOST           - gRPC server host (default: 127.0.0.1 for nginx proxy)
+# PORT           - gRPC server port (default: 8817 for nginx proxy)
 # WEB_HOST       - HTTP sidecar host (default: 127.0.0.1 for nginx proxy)
 # WEB_PORT       - HTTP sidecar port (default: 8816)
-# NGINX_PORT     - nginx/webapp port (default: 80, use higher port on HPC)
+# NGINX_HTTP_PORT - nginx/webapp HTTP port (default: 8814)
+# NGINX_GRPC_PORT - nginx gRPC port (default: 8815)
 # COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Pre-set access token (skips prompt)
 # BIOPB_WEB_DEV_BYPASS - Set to "true" for dev mode
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
 #                  Uses USER env var or PID to avoid multi-user collisions
 
-NGINX_PORT="${NGINX_PORT:-80}"
+NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-8814}"
+NGINX_GRPC_PORT="${NGINX_GRPC_PORT:-8815}"
 
 # Create unique temp directory prefix to avoid multi-user collisions on shared /tmp
 # Use USER env var if available, else use PID as unique identifier
@@ -33,8 +35,8 @@ else
     MONITOR="${MONITOR:-true}"
     cat > "$BIOPB_TMP/runtime-config.toml" << EOF
 [server]
-host = "${HOST:-0.0.0.0}"
-port = ${PORT:-8815}
+host = "${HOST:-127.0.0.1}"
+port = ${PORT:-8817}
 
 [compute]
 backend = "${COMPUTE_BACKEND:-auto}"
@@ -52,9 +54,12 @@ cp /etc/nginx/nginx.conf "$BIOPB_TMP/nginx.conf"
 # Update all /tmp paths in nginx.conf to use our unique prefix
 sed -i "s|/tmp/biopb|${BIOPB_TMP}|g" "$BIOPB_TMP/nginx.conf"
 
-# Update nginx port if not default
-if [ "$NGINX_PORT" != "80" ]; then
-    sed -i "s/listen 80;/listen ${NGINX_PORT};/" "$BIOPB_TMP/nginx.conf"
+# Update nginx ports if not default
+if [ "$NGINX_HTTP_PORT" != "8814" ]; then
+    sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
+fi
+if [ "$NGINX_GRPC_PORT" != "8815" ]; then
+    sed -i "s/listen 8815 http2;/listen ${NGINX_GRPC_PORT} http2;/" "$BIOPB_TMP/nginx.conf"
 fi
 
 # Create nginx temp directories
@@ -75,7 +80,9 @@ fi
 
 exec biopb-tensor "$COMMAND" \
     --config "$CONFIG_FILE" \
+    --host 127.0.0.1 \
+    --port 8817 \
     --web-host 127.0.0.1 \
     --web-port ${WEB_PORT:-8816} \
-    --web-url http://localhost \
+    --web-url http://localhost:${NGINX_HTTP_PORT} \
     "$@"

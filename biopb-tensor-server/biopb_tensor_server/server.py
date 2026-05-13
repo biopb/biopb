@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
@@ -117,6 +118,7 @@ class TensorFlightServer(flight.FlightServerBase):
         self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._max_list_flights_results = max_list_flights_results
+        self._start_time: float = time.time()
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -203,7 +205,47 @@ class TensorFlightServer(flight.FlightServerBase):
             return source_adapter.get_level_adapter(rest)
 
         # Otherwise get tensor adapter (for virtual scaling or single-tensor sources)
-        return source_adapter.get_tensor_adapter(rest)            
+        return source_adapter.get_tensor_adapter(rest)
+
+    def list_actions(
+        self,
+        context: flight.ServerCallContext,
+    ) -> List[flight.ActionType]:
+        """List available actions on this server.
+
+        Returns:
+            List of ActionType objects describing available actions.
+        """
+        return [
+            flight.ActionType("health", "Health check - returns server status JSON"),
+        ]
+
+    def do_action(
+        self,
+        context: flight.ServerCallContext,
+        action: flight.Action,
+    ) -> Iterator[bytes]:
+        """Execute a custom action.
+
+        Args:
+            context: Server call context
+            action: Action to execute
+
+        Yields:
+            Result bytes (JSON-encoded for health action)
+        """
+        if action.type == "health":
+            uptime_seconds = int(time.time() - self._start_time)
+            health_status = {
+                "status": "SERVING",
+                "source_count": len(self._sources),
+                "metadata_db_enabled": self._metadata_db is not None,
+                "writable": self._writable,
+                "uptime_seconds": uptime_seconds,
+            }
+            yield json.dumps(health_status).encode('utf-8')
+        else:
+            raise flight.FlightServerError(f"Unknown action: {action.type}")
 
     def list_flights(
         self,

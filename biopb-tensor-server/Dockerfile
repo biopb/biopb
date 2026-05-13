@@ -59,8 +59,9 @@ ENV CONFIG_FILE=/app/config/default-config.toml
 RUN mkdir -p /data \
     && chmod +x /usr/local/bin/entrypoint.sh
 
-# Expose ports: nginx (80), gRPC (8815), sidecar (8816)
-EXPOSE 80 8815 8816
+# Expose ports: nginx HTTP (8814), nginx gRPC (8815)
+# Internal services (Flight 8817, sidecar 8816) bind to localhost only
+EXPOSE 8814 8815
 
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["launch"]

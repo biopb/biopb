@@ -132,11 +132,13 @@ class _DiagnosticsState:
     def mark_error(self, code: Optional[str], message: Optional[str]) -> None:
         with self._lock:
             self.connection_state = "error"
-            self._errors.append(_ErrorEvent(
-                timestamp=_now_rfc3339(),
-                code=code,
-                message=_redact(message),
-            ))
+            self._errors.append(
+                _ErrorEvent(
+                    timestamp=_now_rfc3339(),
+                    code=code,
+                    message=_redact(message),
+                )
+            )
 
     def mark_degraded(self) -> None:
         with self._lock:
@@ -265,9 +267,9 @@ def create_app(
     """
     if cors_origins is None:
         cors_origins = [
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://[::1]:5173",
+            "http://localhost:8814",
+            "http://127.0.0.1:8814",
+            "http://[::1]:8814",
         ]
 
     # Lazy-init Flight client (first request will connect)
@@ -319,7 +321,7 @@ def create_app(
             return  # bypass in dev mode
         bearer = request.headers.get("Authorization", "")
         if bearer.startswith("Bearer "):
-            provided = bearer[len("Bearer "):]
+            provided = bearer[len("Bearer ") :]
         else:
             provided = request.headers.get("X-Biopb-Token", "")
         if not secrets.compare_digest(provided.encode(), token.encode()):
@@ -335,15 +337,34 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
-        ready = diag.connection_state in ("connected", "disconnected")  # not "error"
-        return JSONResponse({
-            "status": "ok" if ready else "degraded",
-            "timestamp": _now_rfc3339(),
-            "ready": ready,
-            "dev_mode": dev_mode,
-            "service": _SERVICE,
-            "version": _VERSION,
-        })
+        backend_health = None
+        with _client_lock:
+            client = _client_holder["client"]
+
+        if client is not None:
+            try:
+                backend_health = client.health_check()
+            except Exception as e:
+                logger.warning(f"Backend health check failed: {e}")
+
+        ready = (
+            backend_health and backend_health.get("status") == "SERVING"
+        ) or diag.connection_state == "connected"
+
+        return JSONResponse(
+            {
+                "status": "ok" if ready else "degraded",
+                "timestamp": _now_rfc3339(),
+                "ready": ready,
+                "dev_mode": dev_mode,
+                "service": _SERVICE,
+                "version": _VERSION,
+                "backend_health": backend_health,
+                "source_count": backend_health.get("source_count", 0)
+                if backend_health
+                else 0,
+            }
+        )
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -357,8 +378,9 @@ def create_app(
     async def diagnostics(request: Request) -> JSONResponse:
         _check_token(request)
         # Soft rate limit per session (identify by token itself as session key)
-        session_id = request.headers.get("X-Biopb-Token", "") or \
-            request.headers.get("Authorization", "")
+        session_id = request.headers.get("X-Biopb-Token", "") or request.headers.get(
+            "Authorization", ""
+        )
         if not diag.check_rate_limit(session_id):
             raise HTTPException(status_code=429, detail="Rate limit exceeded (1 req/s)")
         # Sync cache stats from Flight client if available
@@ -386,14 +408,18 @@ def create_app(
                 result.append(_source_desc_to_dict(desc))
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
-            logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
+            logger.debug(
+                f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms"
+            )
             return JSONResponse(result)
         except HTTPException:
             raise
         except Exception as exc:
             diag.mark_error("LIST_SOURCES_FAILED", str(exc))
             logger.error(f"list_sources failed: {exc}")
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     @app.post("/api/sources/query")
     async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
@@ -417,13 +443,17 @@ def create_app(
             result = arrow_table.to_pylist()
 
             # Truncation info from schema metadata
-            total = int(arrow_table.schema.metadata.get(b'total_sources', len(result)))
-            returned = int(arrow_table.schema.metadata.get(b'returned_sources', len(result)))
+            total = int(arrow_table.schema.metadata.get(b"total_sources", len(result)))
+            returned = int(
+                arrow_table.schema.metadata.get(b"returned_sources", len(result))
+            )
             truncated = total > returned
 
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
-            logger.debug(f"query_sources: returned {returned}/{total} rows in {elapsed:.1f}ms")
+            logger.debug(
+                f"query_sources: returned {returned}/{total} rows in {elapsed:.1f}ms"
+            )
 
             headers = {
                 "X-Total-Sources": str(total),
@@ -439,7 +469,9 @@ def create_app(
         except Exception as exc:
             diag.mark_error("QUERY_SOURCES_FAILED", str(exc))
             logger.error(f"query_sources failed: {exc}")
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     # NOTE: the /metadata and /ticket routes must be registered before the greedy
     # {source_id:path} route, otherwise Starlette's first-match routing
@@ -459,7 +491,9 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc))
         except Exception as exc:
             diag.mark_error("GET_METADATA_FAILED", str(exc))
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     # -----------------------------------------------------------------------
     # Chunk (binary response via ticket)
@@ -516,14 +550,16 @@ def create_app(
 
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
-            logger.debug(f"get_chunk: returned shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms")
+            logger.debug(
+                f"get_chunk: returned shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms"
+            )
 
             # Build response headers
             headers = {
                 "X-Shape": ",".join(str(d) for d in arr.shape),
                 "X-Dtype": str(arr.dtype),
                 "X-Chunk-Start": "",  # Not available from do_get alone
-                "X-Chunk-Stop": "",   # Not available from do_get alone
+                "X-Chunk-Stop": "",  # Not available from do_get alone
             }
 
             return Response(
@@ -539,11 +575,15 @@ def create_app(
         except flight.FlightError as exc:
             diag.mark_error("CHUNK_FETCH_FAILED", str(exc))
             logger.error(f"get_chunk: Flight error: {exc}")
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
         except Exception as exc:
             diag.mark_error("CHUNK_FAILED", str(exc))
             logger.error(f"get_chunk: unexpected error: {exc}")
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     @app.get("/api/sources/{source_id:path}")
     async def get_source(source_id: str, request: Request) -> JSONResponse:
@@ -553,14 +593,18 @@ def create_app(
             client = _get_client()
             sources = client.list_sources()
             if source_id not in sources:
-                raise HTTPException(status_code=404, detail=f"Source not found: {source_id}")
+                raise HTTPException(
+                    status_code=404, detail=f"Source not found: {source_id}"
+                )
             diag.latency.record((time.monotonic() - t0) * 1000)
             return JSONResponse(_source_desc_to_dict(sources[source_id]))
         except HTTPException:
             raise
         except Exception as exc:
             diag.mark_error("GET_SOURCE_FAILED", str(exc))
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     # -----------------------------------------------------------------------
     # Slice (binary response)
@@ -629,7 +673,9 @@ def create_app(
 
             elapsed = (time.monotonic() - t0) * 1000
             diag.latency.record(elapsed)
-            logger.debug(f"slice: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms")
+            logger.debug(
+                f"slice: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B in {elapsed:.1f}ms"
+            )
 
             # Build response headers
             headers = {
@@ -662,7 +708,9 @@ def create_app(
         except Exception as exc:
             diag.mark_error("SLICE_FAILED", str(exc))
             logger.error(f"slice failed: {exc}")
-            raise HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=502, detail=f"Flight error: {type(exc).__name__}"
+            )
 
     return app
 

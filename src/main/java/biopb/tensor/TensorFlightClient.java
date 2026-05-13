@@ -513,6 +513,39 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Check server health status via Flight action.
+     *
+     * Returns a map with health status information including:
+     * - status: "SERVING" or other status string
+     * - source_count: number of registered sources
+     * - metadata_db_enabled: whether metadata database is enabled
+     * - writable: whether server accepts uploads
+     * - uptime_seconds: server uptime in seconds
+     *
+     * @return Map containing health status
+     * @throws IOException If action fails
+     */
+    public Map<String, Object> healthCheck() throws IOException {
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+            "health",
+            ByteString.EMPTY.toByteArray());
+
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        if (iter.hasNext()) {
+            org.apache.arrow.flight.Result result = iter.next();
+            byte[] body = result.getBody();
+            if (body != null && body.length > 0) {
+                return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
+                    new TypeToken<Map<String, Object>>() {}.getType());
+            }
+        }
+
+        Map<String, Object> unknown = new HashMap<>();
+        unknown.put("status", "UNKNOWN");
+        return unknown;
+    }
+
     // Note: Upload API (uploadCellImg) not yet implemented for Java client.
     // Use the Python client for upload functionality.
 

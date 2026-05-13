@@ -14,7 +14,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import threading
 
 import numpy as np
@@ -25,7 +25,13 @@ from dask.delayed import delayed
 from cachey import Cache
 
 from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, SliceHint, TensorReadOptions, TensorSelection, DataSourceDescriptor
+from biopb.tensor.descriptor_pb2 import (
+    TensorDescriptor,
+    SliceHint,
+    TensorReadOptions,
+    TensorSelection,
+    DataSourceDescriptor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +104,8 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
 
     return (
         _CONNECTION_POOL[key][1],  # client
-        _CACHE_POOL[key][1],       # cache
-        _CALL_OPTS_POOL[key],      # call_options
+        _CACHE_POOL[key][1],  # cache
+        _CALL_OPTS_POOL[key],  # call_options
     )
 
 
@@ -141,7 +147,9 @@ def _fetch_chunk_distributed(
 
     # Fetch from server
     ticket = TensorTicket(chunk_id=chunk_id)
-    reader = client.do_get(flight.Ticket(ticket.SerializeToString()), options=call_options)
+    reader = client.do_get(
+        flight.Ticket(ticket.SerializeToString()), options=call_options
+    )
     table = reader.read_all()
     arr = table.column("data").to_numpy()[0]  # First row's data list
 
@@ -158,8 +166,8 @@ def _fetch_chunk_distributed(
 def _parse_version(version_str: str) -> Tuple[int, int, int]:
     """Parse semantic version string to (major, minor, patch) tuple."""
     # Handle dev versions like "0.3.1.dev43+g..."
-    base = version_str.split('.dev')[0].split('+')[0]
-    parts = base.split('.')
+    base = version_str.split(".dev")[0].split("+")[0]
+    parts = base.split(".")
     major = int(parts[0]) if len(parts) > 0 else 0
     minor = int(parts[1]) if len(parts) > 1 else 0
     patch = int(parts[2]) if len(parts) > 2 else 0
@@ -171,13 +179,13 @@ def _check_schema_version(schema: pa.Schema) -> None:
     if schema.metadata is None:
         return
 
-    server_version_bytes = schema.metadata.get(b'tensor_schema_version')
+    server_version_bytes = schema.metadata.get(b"tensor_schema_version")
     if server_version_bytes is None:
         return
 
-    server_version = server_version_bytes.decode('utf-8')
+    server_version = server_version_bytes.decode("utf-8")
     try:
-        client_version = importlib.metadata.version('biopb')
+        client_version = importlib.metadata.version("biopb")
     except importlib.metadata.PackageNotFoundError:
         return
 
@@ -221,7 +229,7 @@ class TensorFlightClient:
 
     def __init__(
         self,
-        location: str = 'grpc://localhost:8815',
+        location: str = "grpc://localhost:8815",
         cache_bytes: int = 1_000_000_000,  # 1GB default
         token: Optional[str] = None,
     ):
@@ -232,7 +240,9 @@ class TensorFlightClient:
             cache_bytes: Maximum bytes for chunk cache (default 1GB)
             token: Bearer token for server authentication.  ``None`` disables auth.
         """
-        logger.info(f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}")
+        logger.info(
+            f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
+        )
         # Store pickle-safe connection parameters
         self._location = location
         self._token = token
@@ -240,7 +250,9 @@ class TensorFlightClient:
         # Create FlightClient for direct API calls (list_flights, get_flight_info, uploads)
         self._client = flight.FlightClient(location)
         self._call_options = (
-            flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
+            flight.FlightCallOptions(
+                headers=[(b"authorization", f"Bearer {token}".encode())]
+            )
             if token
             else flight.FlightCallOptions()
         )
@@ -274,10 +286,10 @@ class TensorFlightClient:
 
             # Check schema metadata for truncation info
             if info.schema.metadata:
-                truncated_bytes = info.schema.metadata.get(b'truncated')
+                truncated_bytes = info.schema.metadata.get(b"truncated")
                 if truncated_bytes:
-                    truncated = truncated_bytes.decode() == 'True'
-                total_sources_bytes = info.schema.metadata.get(b'total_sources')
+                    truncated = truncated_bytes.decode() == "True"
+                total_sources_bytes = info.schema.metadata.get(b"total_sources")
                 if total_sources_bytes:
                     total_sources = int(total_sources_bytes.decode())
 
@@ -321,10 +333,10 @@ class TensorFlightClient:
 
         # Check schema metadata for truncation info
         if info.schema.metadata:
-            total_sources = info.schema.metadata.get(b'total_sources')
+            total_sources = info.schema.metadata.get(b"total_sources")
             if total_sources:
                 total = int(total_sources.decode())
-                returned = info.schema.metadata.get(b'returned_sources')
+                returned = info.schema.metadata.get(b"returned_sources")
                 if returned:
                     returned_count = int(returned.decode())
                     if returned_count < total:
@@ -337,8 +349,7 @@ class TensorFlightClient:
         # Fetch results via DoGet
         if info.endpoints:
             reader = self._client.do_get(
-                info.endpoints[0].ticket,
-                options=self._call_options
+                info.endpoints[0].ticket, options=self._call_options
             )
             return reader.read_all()
         else:
@@ -433,16 +444,24 @@ class TensorFlightClient:
             stops = []
             for s in slice_hint:
                 starts.append(s.start if s.start is not None else 0)
-                stops.append(s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1])
+                stops.append(
+                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
+                )
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
-        if read_options is not None and (scale_hint is not None or reduction_method is not None):
-            raise ValueError("Pass either read_options or scale_hint/reduction_method, not both")
+        if read_options is not None and (
+            scale_hint is not None or reduction_method is not None
+        ):
+            raise ValueError(
+                "Pass either read_options or scale_hint/reduction_method, not both"
+            )
 
-        if read_options is None and (scale_hint is not None or reduction_method is not None):
+        if read_options is None and (
+            scale_hint is not None or reduction_method is not None
+        ):
             read_options = TensorReadOptions(
                 scale_hint=list(scale_hint or []),
-                reduction_method=reduction_method or '',
+                reduction_method=reduction_method or "",
             )
 
         # Build TensorSelection for the request
@@ -491,10 +510,14 @@ class TensorFlightClient:
         # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         # the returned descriptor.shape may be larger than what was requested.
         # We crop the dask array back to the exact requested region here.
-        if slice_hint_proto is not None and response_desc.HasField('slice_hint'):
+        if slice_hint_proto is not None and response_desc.HasField("slice_hint"):
             realized = response_desc.slice_hint
             ndim = len(response_desc.shape)
-            scale = list(read_options.scale_hint) if read_options and len(read_options.scale_hint) > 0 else None
+            scale = (
+                list(read_options.scale_hint)
+                if read_options and len(read_options.scale_hint) > 0
+                else None
+            )
             crop = []
             for ax in range(ndim):
                 req_start = int(slice_hint_proto.start[ax])
@@ -533,15 +556,17 @@ class TensorFlightClient:
 
         # Create a mapping from chunk index to chunk_id and bounds
         chunk_map = {}
-        axis_starts = [sorted({int(bounds.start[axis]) for bounds in chunk_bounds}) for axis in range(len(shape))]
+        axis_starts = [
+            sorted({int(bounds.start[axis]) for bounds in chunk_bounds})
+            for axis in range(len(shape))
+        ]
         axis_index_maps = [
             {start: index for index, start in enumerate(starts)}
             for starts in axis_starts
         ]
         for chunk_id, bounds in zip(chunks, chunk_bounds):
             chunk_idx = tuple(
-                axis_index_maps[d][int(bounds.start[d])]
-                for d in range(len(shape))
+                axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
             )
             chunk_map[chunk_idx] = (chunk_id, bounds)
 
@@ -563,7 +588,9 @@ class TensorFlightClient:
             logger.debug(f"fetch_chunk: fetching {cache_key[:16]} from server")
             # Fetch from server
             ticket = TensorTicket(chunk_id=chunk_id)
-            reader = self._client.do_get(flight.Ticket(ticket.SerializeToString()), options=self._call_options)
+            reader = self._client.do_get(
+                flight.Ticket(ticket.SerializeToString()), options=self._call_options
+            )
 
             # Read all data from the stream
             table = reader.read_all()
@@ -586,14 +613,15 @@ class TensorFlightClient:
         # Find the grid dimensions
         ndim = len(shape)
         grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map.keys())
-            for d in range(ndim)
+            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
         )
 
         # Create block array
         blocks = np.empty(grid_shape, dtype=object)
         for chunk_idx, (chunk_id, bounds) in chunk_map.items():
-            chunk_shape = tuple(stop - start for start, stop in zip(bounds.start, bounds.stop))
+            chunk_shape = tuple(
+                stop - start for start, stop in zip(bounds.start, bounds.stop)
+            )
             # Use pickle-safe module-level function with connection params
             delayed_arr = da.from_delayed(
                 delayed(_fetch_chunk_distributed)(
@@ -650,8 +678,7 @@ class TensorFlightClient:
 
             # Check if dask chunks are non-uniform
             needs_rechunk = not all(
-                len(set(arr.chunks[d])) == 1
-                for d in range(arr.ndim)
+                len(set(arr.chunks[d])) == 1 for d in range(arr.ndim)
             )
 
             if needs_rechunk:
@@ -684,8 +711,11 @@ class TensorFlightClient:
         ]
 
         from itertools import product
+
         for chunk_idx in product(*(range(n) for n in chunks_per_dim)):
-            chunk_start = [idx * chunk_shape_tuple[d] for d, idx in enumerate(chunk_idx)]
+            chunk_start = [
+                idx * chunk_shape_tuple[d] for d, idx in enumerate(chunk_idx)
+            ]
             chunk_stop = [
                 min((idx + 1) * chunk_shape_tuple[d], arr.shape[d])
                 for d, idx in enumerate(chunk_idx)
@@ -694,8 +724,7 @@ class TensorFlightClient:
             bounds = ChunkBounds(start=chunk_start, stop=chunk_stop)
 
             slices = tuple(
-                slice(chunk_start[d], chunk_stop[d])
-                for d in range(arr.ndim)
+                slice(chunk_start[d], chunk_stop[d]) for d in range(arr.ndim)
             )
             chunk_data = arr[slices].compute()
             self.upload_chunk(source_id, bounds, chunk_data)
@@ -728,20 +757,19 @@ class TensorFlightClient:
         """
         import zarr
 
-        arr = zarr.open_array(zarr_path, mode='r')
+        arr = zarr.open_array(zarr_path, mode="r")
 
         # Read metadata from local zarr if not provided
-        zattrs_path = Path(zarr_path) / '.zattrs'
+        zattrs_path = Path(zarr_path) / ".zattrs"
         if zattrs_path.exists():
             with open(zattrs_path) as f:
                 zattrs = json.load(f)
-            if ome_metadata is None and 'multiscales' in zattrs:
+            if ome_metadata is None and "multiscales" in zattrs:
                 ome_metadata = zattrs
-            if dim_labels is None and 'multiscales' in zattrs:
-                axes = zattrs['multiscales'][0].get('axes', [])
+            if dim_labels is None and "multiscales" in zattrs:
+                axes = zattrs["multiscales"][0].get("axes", [])
                 dim_labels = [
-                    ax.get('name') if isinstance(ax, dict) else str(ax)
-                    for ax in axes
+                    ax.get("name") if isinstance(ax, dict) else str(ax) for ax in axes
                 ]
 
         dask_arr = da.from_zarr(zarr_path)
@@ -788,7 +816,9 @@ class TensorFlightClient:
         )
 
         desc = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
-        writer, reader = self._client.do_put(desc, pa.schema([]), options=self._call_options)
+        writer, reader = self._client.do_put(
+            desc, pa.schema([]), options=self._call_options
+        )
         writer.close()
 
         metadata = reader.read()
@@ -828,6 +858,26 @@ class TensorFlightClient:
         """Close the Flight client."""
         logger.info("Closing Flight client")
         self._client.close()
+
+    def health_check(self) -> Dict[str, Any]:
+        """Check server health status via Flight action.
+
+        Returns:
+            Dictionary with health status information:
+            - status: "SERVING" or other status string
+            - source_count: Number of registered sources
+            - metadata_db_enabled: Whether metadata database is enabled
+            - writable: Whether server accepts uploads
+            - uptime_seconds: Server uptime in seconds
+
+        Raises:
+            FlightError: If server is unreachable or action fails
+        """
+        action = flight.Action("health", b"")
+        results = self._client.do_action(action, options=self._call_options)
+        for result in results:
+            return json.loads(result.body.to_pybytes())
+        return {"status": "UNKNOWN"}
 
     def cache_info(self) -> Dict:
         """Return cache statistics from the pooled cache for this connection.
