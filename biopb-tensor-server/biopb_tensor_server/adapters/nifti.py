@@ -109,17 +109,18 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             # Note: temp file is NOT deleted - nibabel caches data internally
             # The OS will clean up temp files eventually
 
-            return cls(nifti_img, source.source_id, source.dim_labels, temp_file=tmp_path)
+            return cls(nifti_img, source.source_id, source.dim_labels, source_url=str(source.url), temp_file=tmp_path)
         else:
             # Local filesystem
             nifti_img = nib.load(str(source.url))
-            return cls(nifti_img, source.source_id, source.dim_labels)
+            return cls(nifti_img, source.source_id, source.dim_labels, source_url=str(source.url))
 
     def __init__(
         self,
         nifti_img,
         source_id: str,
         dim_labels: Optional[List[str]] = None,
+        source_url: Optional[str] = None,
         temp_file: Optional[Path] = None,
     ):
         """Initialize NIfTI adapter.
@@ -128,6 +129,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             nifti_img: nibabel Nifti1Image or Nifti2Image object
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides header-derived labels)
+            source_url: Optional source URL (overrides file_map-derived path)
             temp_file: Optional path to temp file for remote sources (for cleanup tracking)
         """
         self.nifti_img = nifti_img
@@ -137,7 +139,9 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         self._temp_file = temp_file  # Track temp file for potential cleanup
 
         # Source-level metadata for DataSourceDescriptor
-        if hasattr(nifti_img, 'file_map'):
+        if source_url:
+            self._source_url = source_url
+        elif hasattr(nifti_img, 'file_map'):
             # Try to get file path from nibabel
             files = list(nifti_img.file_map.keys())
             self._source_url = files[0] if files else ""
@@ -178,6 +182,11 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         spatial_unit = units & 0x07  # 1=meter, 2=mm, 3=um
         time_unit = units - spatial_unit  # 8=sec, 16=ms, 24=us
 
+        pixdim = self.header.get('pixdim', [0] * 8)
+        # If pixdim[4] (time step) is present and > 0, we likely have a time dimension
+        if ndim > 4 and pixdim[4] > 0 and time_unit == 0:
+            time_unit = 8  # Treat as seconds for labeling purposes
+
         # NIfTI dimensions: typically (x, y, z) or (t, x, y, z) or (t, c, x, y, z)
         # Dimension order in nibabel is as stored in file
         labels = []
@@ -185,22 +194,21 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         if ndim == 1:
             labels = ['x']
         elif ndim == 2:
-            labels = ['y', 'x']
+            labels = ['x', 'y']
         elif ndim == 3:
             # Could be (x,y,z) or (t,x,y) - check intent and units
-            if time_unit >= 8 and self._shape[0] > 1:
-                labels = ['t', 'y', 'x']
+            if pixdim[1] == pixdim[2] != pixdim[3] or time_unit == 0:
+                labels = ['x', 'y', 'z']
             else:
-                labels = ['z', 'y', 'x']
+                labels = ['t', 'x', 'y']
         elif ndim == 4:
-            # Typically (t, z, y, x) or (c, z, y, x)
             if time_unit >= 8:
-                labels = ['t', 'z', 'y', 'x']
+                labels = ['t', 'x', 'y', 'z']
             else:
-                labels = ['c', 'z', 'y', 'x']
+                labels = ['c', 'x', 'y', 'z']
         elif ndim == 5:
             # Could be vector/tensor data
-            labels = ['v', 't', 'z', 'y', 'x']
+            labels = ['v', 't', 'x', 'y', 'z']
         else:
             # Generic labels for higher dimensions
             labels = [f'dim{i}' for i in range(ndim)]

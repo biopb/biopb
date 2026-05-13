@@ -258,6 +258,42 @@ class WatchdogWatcher(DirectoryWatcher):
         self._process: Optional[_Process] = None
         self._directories: Set[Path] = set()
 
+    def _launch_process(self, directories: Set[Path]) -> None:
+        """Launch the watchdog subprocess for the provided directories."""
+        self._process = Process(
+            target=_run_watchdog_subprocess,
+            args=(
+                self._queue,
+                self._shutdown_event,
+                directories,
+                self._debounce_window,
+            ),
+            daemon=True,
+        )
+        self._process.start()
+        logger.debug(f"Watcher subprocess started with PID {self._process.pid}")
+
+    def _restart_if_stopped(self) -> None:
+        """Restart the watcher when the child exited unexpectedly."""
+        process = self._process
+        if process is None or process.is_alive() or self._shutdown_event.is_set():
+            return
+
+        exit_code = process.exitcode
+        logger.warning(
+            "Watchdog watcher subprocess %s exited unexpectedly with code %s; restarting",
+            process.pid,
+            exit_code,
+        )
+        try:
+            process.close()
+        except ValueError:
+            pass
+
+        self._process = None
+        if self._directories:
+            self._launch_process({d.resolve() for d in self._directories})
+
     def start(self, directories: Set[Path]) -> None:
         """Start watcher subprocess."""
         if self._process is not None and self._process.is_alive():
@@ -278,18 +314,7 @@ class WatchdogWatcher(DirectoryWatcher):
         logger.info(
             f"Starting watchdog watcher for: {resolved_dirs}, debounce_window={self._debounce_window}s"
         )
-        self._process = Process(
-            target=_run_watchdog_subprocess,
-            args=(
-                self._queue,
-                self._shutdown_event,
-                resolved_dirs,
-                self._debounce_window,
-            ),
-            daemon=True,
-        )
-        self._process.start()
-        logger.debug(f"Watcher subprocess started with PID {self._process.pid}")
+        self._launch_process(resolved_dirs)
 
     def stop(self) -> None:
         """Stop watcher subprocess gracefully."""
@@ -308,6 +333,7 @@ class WatchdogWatcher(DirectoryWatcher):
 
     def get_events(self, timeout: float = 0.1) -> List[WatcherEvent]:
         """Poll for debounced events from subprocess."""
+        self._restart_if_stopped()
         events = []
         while True:
             try:
@@ -324,6 +350,7 @@ class WatchdogWatcher(DirectoryWatcher):
 
     def is_running(self) -> bool:
         """Check if watcher subprocess is alive."""
+        self._restart_if_stopped()
         return self._process is not None and self._process.is_alive()
 
 
@@ -458,6 +485,13 @@ def _run_watchdog_subprocess(
     try:
         while not shutdown_event.is_set():
             time.sleep(0.1)  # Polling interval
+
+            if not observer.is_alive():
+                logger.error(
+                    "Watchdog observer thread stopped unexpectedly in subprocess %s",
+                    os.getpid(),
+                )
+                break
 
             # Check if we should emit events
             current_time = time.time()
@@ -606,6 +640,44 @@ class PollVFSWatcher(DirectoryWatcher):
         self._process: Optional[_Process] = None
         self._directories: Set[Path] = set()
 
+    def _launch_process(self, directories: Set[Path]) -> None:
+        """Launch the PollVFS subprocess for the provided directories."""
+        self._process = Process(
+            target=_run_pollvfs_subprocess,
+            args=(
+                self._queue,
+                self._shutdown_event,
+                directories,
+                self._poll_interval,
+                self._debounce_window,
+                self._stability_window,
+            ),
+            daemon=True,
+        )
+        self._process.start()
+        logger.debug(f"PollVFS subprocess started with PID {self._process.pid}")
+
+    def _restart_if_stopped(self) -> None:
+        """Restart the watcher when the child exited unexpectedly."""
+        process = self._process
+        if process is None or process.is_alive() or self._shutdown_event.is_set():
+            return
+
+        exit_code = process.exitcode
+        logger.warning(
+            "PollVFS watcher subprocess %s exited unexpectedly with code %s; restarting",
+            process.pid,
+            exit_code,
+        )
+        try:
+            process.close()
+        except ValueError:
+            pass
+
+        self._process = None
+        if self._directories:
+            self._launch_process({d.resolve() for d in self._directories})
+
     def start(self, directories: Set[Path]) -> None:
         """Start watcher subprocess."""
         if self._process is not None and self._process.is_alive():
@@ -628,20 +700,7 @@ class PollVFSWatcher(DirectoryWatcher):
         logger.info(
             f"Starting PollVFS watcher for: {resolved_dirs}, poll_interval={self._poll_interval}s, stability_window={self._stability_window}s"
         )
-        self._process = Process(
-            target=_run_pollvfs_subprocess,
-            args=(
-                self._queue,
-                self._shutdown_event,
-                resolved_dirs,
-                self._poll_interval,
-                self._debounce_window,
-                self._stability_window,
-            ),
-            daemon=True,
-        )
-        self._process.start()
-        logger.debug(f"PollVFS subprocess started with PID {self._process.pid}")
+        self._launch_process(resolved_dirs)
 
     def stop(self) -> None:
         """Stop watcher subprocess gracefully."""
@@ -660,6 +719,7 @@ class PollVFSWatcher(DirectoryWatcher):
 
     def get_events(self, timeout: float = 0.1) -> List[WatcherEvent]:
         """Poll for debounced events from subprocess."""
+        self._restart_if_stopped()
         events = []
         while True:
             try:
@@ -676,6 +736,7 @@ class PollVFSWatcher(DirectoryWatcher):
 
     def is_running(self) -> bool:
         """Check if watcher subprocess is alive."""
+        self._restart_if_stopped()
         return self._process is not None and self._process.is_alive()
 
 

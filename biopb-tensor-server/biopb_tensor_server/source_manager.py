@@ -107,7 +107,9 @@ class SourceManager:
         # Thread management
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._lock = threading.Lock()
+        # The event loop already holds this lock while dispatching events.
+        # Directory delete handling re-enters helper paths that also need it.
+        self._lock = threading.RLock()
 
         # Pending file tracking for write completion
         # Maps path -> (path, first_seen_timestamp, is_directory)
@@ -169,9 +171,8 @@ class SourceManager:
                 events = self._watcher.get_events(timeout=0.5)
 
                 if events:
-                    with self._lock:
-                        for event in events:
-                            self._process_event(event)
+                    for event in events:
+                        self._process_event(event)
 
                 # Cleanup expired pending files
                 self._cleanup_expired_pending()
@@ -215,22 +216,28 @@ class SourceManager:
         resolved_path = path.resolve()
         path_str = str(resolved_path)
 
-        # Skip if already claimed
-        if self._state.is_path_claimed(path_str):
-            return
+        with self._lock:
+            # Skip if already claimed
+            if self._state.is_path_claimed(path_str):
+                return
 
-        # Skip hidden paths
-        if resolved_path.name.startswith("."):
-            return
+            # Skip hidden paths
+            if resolved_path.name.startswith("."):
+                return
 
-        # For directories, process immediately (no close event)
-        if is_directory:
+            # For directories, process immediately (no close event)
+            if is_directory:
+                should_process_stable = True
+            else:
+                # For files, queue pending CLOSED event
+                # CLOSED event indicates write completion (close_write in inotify)
+                self._pending_creates[path_str] = (resolved_path, time.time(), False)
+                should_process_stable = False
+
+        if should_process_stable:
             self._handle_created_stable(path, is_directory)
             return
 
-        # For files, queue pending CLOSED event
-        # CLOSED event indicates write completion (close_write in inotify)
-        self._pending_creates[path_str] = (resolved_path, time.time(), False)
         logger.debug(f"File created, waiting for closed event: {path}")
 
     def _handle_closed(self, path: Path) -> None:
@@ -244,17 +251,27 @@ class SourceManager:
         resolved_path = path.resolve()
         path_str = str(resolved_path)
 
-        # Check if this was a pending create
-        if path_str in self._pending_creates:
-            self._pending_creates.pop(path_str)
+        should_process_stable = False
+        log_closed = False
+        with self._lock:
+            # Check if this was a pending create
+            if path_str in self._pending_creates:
+                self._pending_creates.pop(path_str)
+                should_process_stable = True
+                log_closed = True
+            else:
+                # CLOSED without pending CREATED - might be a reopened existing file
+                # Try to claim if not already claimed
+                if not self._state.is_path_claimed(path_str):
+                    should_process_stable = True
+
+        if log_closed:
             logger.debug(f"File closed after write: {path}")
+        elif should_process_stable:
+            logger.debug(f"Closed event for non-pending file: {path}")
+
+        if should_process_stable:
             self._handle_created_stable(path, False)
-        else:
-            # CLOSED without pending CREATED - might be a reopened existing file
-            # Try to claim if not already claimed
-            if not self._state.is_path_claimed(path_str):
-                logger.debug(f"Closed event for non-pending file: {path}")
-                self._handle_created_stable(path, False)
 
     def _handle_created_stable(self, path: Path, is_directory: bool) -> None:
         """Process a file/directory that is confirmed stable/ready.
@@ -268,22 +285,24 @@ class SourceManager:
         resolved_path = path if isinstance(path, Path) else Path(path)
         path_str = str(resolved_path)
 
-        # Skip if already claimed
-        if self._state.is_path_claimed(path_str):
-            return
-
-        # Skip hidden paths
-        if resolved_path.name.startswith("."):
-            return
-
         # Get identity for deduplication
         try:
             identity = get_file_identity(resolved_path)
+        except OSError:
+            return
+
+        with self._lock:
+            # Skip if already claimed
+            if self._state.is_path_claimed(path_str):
+                return
+
+            # Skip hidden paths
+            if resolved_path.name.startswith("."):
+                return
+
             if identity in self._state.visited_identities:
                 return
             self._state.visited_identities.add(identity)
-        except OSError:
-            return
 
         # Try to claim
         ctx = ClaimContext(resolved_path)
@@ -294,8 +313,11 @@ class SourceManager:
             if self._dim_labels and claim.dim_labels is None:
                 claim.dim_labels = self._dim_labels
 
-            # Add to discovery state (callback will register with server)
-            self._state.add_claim(claim)
+            # Add to discovery state, then notify outside the manager lock.
+            with self._lock:
+                added = self._state.add_claim(claim, notify=False)
+            if added:
+                self._notify_source_added(claim)
             logger.info(f"Added source: {claim.source_id} at {claim.primary_path}")
 
     def _cleanup_expired_pending(self) -> None:
@@ -308,7 +330,10 @@ class SourceManager:
         expired = []
         stable = []
 
-        for path_str, (path, timestamp, is_dir) in list(self._pending_creates.items()):
+        with self._lock:
+            pending_items = list(self._pending_creates.items())
+
+        for path_str, (path, timestamp, is_dir) in pending_items:
             if current_time - timestamp > self._closed_timeout:
                 expired.append((path_str, path, is_dir))
                 logger.warning(f"Pending create timed out (no closed event): {path}")
@@ -321,7 +346,8 @@ class SourceManager:
 
         # Process stable files
         for path_str, path, is_dir in stable:
-            self._pending_creates.pop(path_str, None)
+            with self._lock:
+                self._pending_creates.pop(path_str, None)
             logger.debug(f"Pending file now stable: {path}")
             try:
                 self._handle_created_stable(path, is_dir)
@@ -330,7 +356,8 @@ class SourceManager:
 
         # Remove expired (without processing - file may have been deleted)
         for path_str, path, is_dir in expired:
-            self._pending_creates.pop(path_str, None)
+            with self._lock:
+                self._pending_creates.pop(path_str, None)
 
     def _check_file_stable(self, path: Path, stability_window: float = 2.0) -> bool:
         """Check if file is stable (not being actively written).
@@ -385,9 +412,12 @@ class SourceManager:
             self._handle_directory_deleted(Path(path.resolve()))
         else:
             # Single file deletion
-            source_id = self._state.get_source_for_path(resolved_path)
+            with self._lock:
+                source_id = self._state.get_source_for_path(resolved_path)
+                if source_id:
+                    self._state.remove_claim(resolved_path, notify=False)
             if source_id:
-                self._state.remove_claim(resolved_path)
+                self._notify_source_removed(source_id)
                 logger.info(f"Removed source: {source_id} at {path}")
 
     def _handle_directory_deleted(self, directory: Path) -> None:
@@ -405,13 +435,16 @@ class SourceManager:
                     claim_path = Path(claim.primary_path)
                     if claim_path.is_relative_to(directory):
                         # This claim is inside the deleted directory
-                        self._state.remove_claim(claim.primary_path)
+                        self._state.remove_claim(claim.primary_path, notify=False)
                         removed_ids.append(source_id)
                 except OSError:
                     # Path no longer exists - check by string comparison
                     if str(directory) in claim.primary_path:
-                        self._state.remove_claim(claim.primary_path)
+                        self._state.remove_claim(claim.primary_path, notify=False)
                         removed_ids.append(source_id)
+
+        for source_id in removed_ids:
+            self._notify_source_removed(source_id)
 
         if removed_ids:
             logger.info(
@@ -473,10 +506,17 @@ class SourceManager:
             new_path: New resolved path
             is_directory: True if path is a directory
         """
-        source_id = self._state.get_source_for_path(str(old_path))
+        removed_source_id = None
+        added_claim = None
 
-        if source_id:
-            claim = self._state.claims.get(source_id)
+        with self._lock:
+            source_id = self._state.get_source_for_path(str(old_path))
+
+            if source_id:
+                claim = self._state.claims.get(source_id)
+            else:
+                claim = None
+
             if claim:
                 # Update claim with new primary path
                 new_claim = SourceClaim(
@@ -487,17 +527,36 @@ class SourceManager:
                     extra_config=claim.extra_config,
                 )
 
-                # Remove old claim, add new claim (callbacks handle server update)
-                self._state.remove_claim(str(old_path))
+                # Remove old claim, add new claim, then notify outside the lock.
+                removed_source_id = self._state.remove_claim(
+                    str(old_path), notify=False
+                )
                 # Update consumed_paths to reflect the move
-                if str(old_path) in self._state.consumed_paths:
-                    self._state.consumed_paths.remove(str(old_path))
-                self._state.add_claim(new_claim)
+                self._state.consumed_paths.discard(str(old_path))
+                if self._state.add_claim(new_claim, notify=False):
+                    added_claim = new_claim
 
-                logger.info(f"Moved source {source_id}: {old_path} -> {new_path}")
+        if removed_source_id:
+            self._notify_source_removed(removed_source_id)
+        if added_claim is not None:
+            self._notify_source_added(added_claim)
+
+            logger.info(f"Moved source {source_id}: {old_path} -> {new_path}")
         else:
             # No existing claim - treat as create at new location
             self._handle_created(new_path, is_directory)
+
+    def _notify_source_added(self, claim: SourceClaim) -> None:
+        """Invoke the current source-added callback without holding manager state locks."""
+        callback = self._state.on_source_added
+        if callback is not None:
+            callback(claim)
+
+    def _notify_source_removed(self, source_id: str) -> None:
+        """Invoke the current source-removed callback without holding manager state locks."""
+        callback = self._state.on_source_removed
+        if callback is not None:
+            callback(source_id)
 
     def _on_source_added(self, claim: SourceClaim) -> None:
         """Callback when source is added to DiscoveryState.

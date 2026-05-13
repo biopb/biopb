@@ -31,6 +31,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Optional, Set
 
 import duckdb
+import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
@@ -38,6 +39,27 @@ if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy scalar and array types, and bytes."""
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, bytes):
+            # Try to decode as UTF-8, otherwise use base64
+            try:
+                return obj.decode("utf-8")
+            except UnicodeDecodeError:
+                import base64
+                return base64.b64encode(obj).decode("ascii")
+        # Catch-all: indicate unserializable type
+        return f"Unserializable {type(obj).__qualname__}"
 
 
 class MetadataDatabase:
@@ -324,7 +346,7 @@ class MetadataDatabase:
 
             # Build row data
             indexed_at = datetime.now()
-            metadata_json = json.dumps(metadata) if metadata else None
+            metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
             # Insert or replace (upsert) - serialize writes with lock
             with self._write_lock:
@@ -388,41 +410,47 @@ class MetadataDatabase:
 
         conn = self._get_connection()
 
-        # Build batch of rows
+        # Build batch of rows (skip sources that fail to sync)
         batch = []
+        failed_count = 0
         for source_id, adapter in server_sources.items():
-            source_desc = adapter.get_source_descriptor()
-            metadata = adapter.get_metadata()
+            try:
+                source_desc = adapter.get_source_descriptor()
+                metadata = adapter.get_metadata()
 
-            shape_summary = None
-            dtype = None
-            if source_desc.tensors:
-                first_tensor = source_desc.tensors[0]
-                shape_summary = json.dumps(list(first_tensor.shape))
-                dtype = first_tensor.dtype
+                shape_summary = None
+                dtype = None
+                if source_desc.tensors:
+                    first_tensor = source_desc.tensors[0]
+                    shape_summary = json.dumps(list(first_tensor.shape))
+                    dtype = first_tensor.dtype
 
-            batch.append(
-                [
-                    source_id,
-                    source_desc.source_url,
-                    source_desc.source_type,
-                    dtype,
-                    datetime.now(),
-                    json.dumps(metadata) if metadata else None,
-                    shape_summary,
-                ]
-            )
+                batch.append(
+                    [
+                        source_id,
+                        source_desc.source_url,
+                        source_desc.source_type,
+                        dtype,
+                        datetime.now(),
+                        json.dumps(metadata, cls=NumpyEncoder) if metadata else None,
+                        shape_summary,
+                    ]
+                )
+            except Exception as e:
+                logger.error(f"Failed to sync source {source_id}: {e}", exc_info=True)
+                failed_count += 1
 
         # Batch insert - serialize writes with lock
-        with self._write_lock:
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                batch,
-            )
+        if batch:
+            with self._write_lock:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO sources
+                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                    batch,
+                )
 
         logger.info(
             f"Initial sync: inserted {len(batch)} sources into metadata database"

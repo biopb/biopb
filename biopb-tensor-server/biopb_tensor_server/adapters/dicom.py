@@ -172,13 +172,14 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
             # Local filesystem
             ds = pydicom.dcmread(str(source.url))
 
-        return cls(ds, source.source_id, source.dim_labels)
+        return cls(ds, source.source_id, source.dim_labels, source_url=str(source.url))
 
     def __init__(
         self,
         dicom_dataset,
         source_id: str,
         dim_labels: Optional[List[str]] = None,
+        source_url: Optional[str] = None,
     ):
         """Initialize DICOM adapter.
 
@@ -186,13 +187,16 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
             dicom_dataset: pydicom Dataset object
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
+            source_url: Optional source URL (overrides filename-derived path)
         """
         self.ds = dicom_dataset
         self.source_id = source_id
         self._io_lock = threading.Lock()
 
         # Source-level metadata
-        if hasattr(dicom_dataset, 'filename'):
+        if source_url:
+            self._source_url = source_url
+        elif hasattr(dicom_dataset, 'filename'):
             self._source_url = str(dicom_dataset.filename)
         else:
             self._source_url = ""

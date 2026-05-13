@@ -385,13 +385,14 @@ class DiscoveryState:
         self.consumed_paths.add(path_str)
         return True
 
-    def add_claim(self, claim: SourceClaim) -> bool:
+    def add_claim(self, claim: SourceClaim, notify: bool = True) -> bool:
         """Add a claim with callback notification.
 
         Paths should already be consumed via try_claim_path() during discovery.
 
         Args:
             claim: SourceClaim to add
+            notify: Whether to invoke on_source_added after storing the claim
 
         Returns:
             True if added, False if path already claimed
@@ -414,16 +415,17 @@ class DiscoveryState:
         self.consumed_paths.add(claim.primary_path)
 
         # Callback
-        if self.on_source_added:
+        if notify and self.on_source_added:
             self.on_source_added(claim)
 
         return True
 
-    def remove_claim(self, path: str) -> Optional[str]:
+    def remove_claim(self, path: str, notify: bool = True) -> Optional[str]:
         """Remove claim by path (for file deletion events).
 
         Args:
             path: Primary path of the claim to remove (str to support URLs)
+            notify: Whether to invoke on_source_removed after removing the claim
 
         Returns:
             source_id if removed, None if not found
@@ -437,7 +439,7 @@ class DiscoveryState:
         self.consumed_paths.discard(path)
 
         # Callback
-        if self.on_source_removed:
+        if notify and self.on_source_removed:
             self.on_source_removed(source_id)
 
         return source_id

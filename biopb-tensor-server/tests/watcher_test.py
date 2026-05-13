@@ -13,6 +13,7 @@ from biopb_tensor_server.watcher import (
     WatcherEventType,
     WatcherEvent,
     WatchdogWatcher,
+    PollVFSWatcher,
     _emit_debounced_events,
 )
 
@@ -189,8 +190,9 @@ class TestPendingQueue:
 
 
 class _FakeProcess:
-    def __init__(self, join_effects, alive_states, pid=1234):
+    def __init__(self, join_effects, alive_states, pid=1234, exitcode=0):
         self.pid = pid
+        self.exitcode = exitcode
         self._join_effects = list(join_effects)
         self._alive_states = list(alive_states)
         self.terminate_calls = 0
@@ -313,3 +315,57 @@ class TestWatcherShutdown:
         watcher.stop()
 
         assert "became a zombie after SIGKILL" in caplog.text
+
+
+class TestWatcherRecovery:
+    def test_watchdog_restarts_dead_subprocess_when_polled(self, monkeypatch, caplog):
+        watcher = WatchdogWatcher()
+        watcher._shutdown_event = SimpleNamespace(is_set=lambda: False)
+        watcher._directories = {Path("/tmp/watch")}
+        watcher._process = _FakeProcess(
+            join_effects=[],
+            alive_states=[False],
+            pid=4321,
+            exitcode=17,
+        )
+
+        launched = []
+        replacement = _FakeProcess(join_effects=[], alive_states=[True], pid=9876)
+
+        def fake_launch(directories):
+            launched.append(directories)
+            watcher._process = replacement
+
+        monkeypatch.setattr(watcher, "_launch_process", fake_launch)
+
+        events = watcher.get_events(timeout=0)
+
+        assert events == []
+        assert launched == [{Path("/tmp/watch")}]
+        assert watcher._process is replacement
+        assert "exited unexpectedly with code 17; restarting" in caplog.text
+
+    def test_pollvfs_restarts_dead_subprocess_when_checked(self, monkeypatch, caplog):
+        watcher = PollVFSWatcher()
+        watcher._shutdown_event = SimpleNamespace(is_set=lambda: False)
+        watcher._directories = {Path("/tmp/poll")}
+        watcher._process = _FakeProcess(
+            join_effects=[],
+            alive_states=[False],
+            pid=2468,
+            exitcode=9,
+        )
+
+        launched = []
+        replacement = _FakeProcess(join_effects=[], alive_states=[True], pid=1357)
+
+        def fake_launch(directories):
+            launched.append(directories)
+            watcher._process = replacement
+
+        monkeypatch.setattr(watcher, "_launch_process", fake_launch)
+
+        assert watcher.is_running() is True
+        assert launched == [{Path("/tmp/poll")}]
+        assert watcher._process is replacement
+        assert "exited unexpectedly with code 9; restarting" in caplog.text

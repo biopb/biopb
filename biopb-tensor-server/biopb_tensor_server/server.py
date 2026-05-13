@@ -28,7 +28,7 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.metadata_db import MetadataDatabase
+from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -372,7 +372,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Populate metadata_json in response descriptor
         metadata = tensor_adapter.get_metadata()
         if metadata:
-            read_plan.descriptor.metadata_json = json.dumps(metadata)
+            read_plan.descriptor.metadata_json = json.dumps(metadata, cls=NumpyEncoder)
 
         # Convert to FlightEndpoints
         endpoints = []

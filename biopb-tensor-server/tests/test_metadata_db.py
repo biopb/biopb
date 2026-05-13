@@ -28,6 +28,7 @@ class MockAdapter:
 
     def get_source_descriptor(self):
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
         return DataSourceDescriptor(
             source_id=self.source_id,
             source_url=self._source_url,
@@ -65,7 +66,9 @@ class TestMetadataDatabaseInit:
         assert db._conn is None
 
         # Trigger initialization via sync
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         assert db._conn is not None
@@ -73,13 +76,17 @@ class TestMetadataDatabaseInit:
     def test_schema_created(self):
         """Test that sources table is created with correct schema."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         conn = db._get_connection()
 
         # Check table exists
-        result = conn.execute("SELECT * FROM sources WHERE source_id='test-1'").fetchone()
+        result = conn.execute(
+            "SELECT * FROM sources WHERE source_id='test-1'"
+        ).fetchone()
         assert result is not None
         assert result[0] == "test-1"
 
@@ -90,12 +97,16 @@ class TestSourceSync:
     def test_sync_source_added(self):
         """Test adding a source to the database."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("plate-001", "/data/plate.ome.zarr", "ome-zarr", [512, 512, 64], "uint16")
+        adapter = MockAdapter(
+            "plate-001", "/data/plate.ome.zarr", "ome-zarr", [512, 512, 64], "uint16"
+        )
 
         db.sync_source_added("plate-001", adapter)
 
         conn = db._get_connection()
-        result = conn.execute("SELECT * FROM sources WHERE source_id='plate-001'").fetchone()
+        result = conn.execute(
+            "SELECT * FROM sources WHERE source_id='plate-001'"
+        ).fetchone()
 
         assert result is not None
         assert result[0] == "plate-001"
@@ -105,29 +116,75 @@ class TestSourceSync:
         assert result[5] is not None  # metadata_json
         assert result[6] == "[512, 512, 64]"  # shape_summary
 
+    def test_sync_numpy_types(self):
+        """Test that numpy scalar types are serialized correctly."""
+        import numpy as np
+
+        class NumpyMockAdapter(MockAdapter):
+            def get_metadata(self):
+                return {
+                    "int16": np.int16(42),
+                    "int32": np.int32(100),
+                    "float32": np.float32(3.14),
+                    "float64": np.float64(2.71),
+                    "array": np.array([1, 2, 3]),
+                    "bytes_utf8": b"hello",
+                    "bytes_binary": b"\xff\xfe",
+                }
+
+        db = MetadataDatabase(enabled=True)
+        adapter = NumpyMockAdapter(
+            "numpy-test", "/data/test.nii", "nifti", [64, 64, 64], "int16"
+        )
+
+        db.sync_source_added("numpy-test", adapter)
+
+        conn = db._get_connection()
+        result = conn.execute(
+            "SELECT metadata_json FROM sources WHERE source_id='numpy-test'"
+        ).fetchone()
+
+        assert result is not None
+        import json
+
+        metadata = json.loads(result[0])
+        assert metadata["int16"] == 42
+        assert metadata["int32"] == 100
+        assert abs(metadata["float32"] - 3.14) < 0.01
+        assert abs(metadata["float64"] - 2.71) < 0.01
+        assert metadata["array"] == [1, 2, 3]
+
     def test_sync_source_removed(self):
         """Test removing a source from the database."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
 
         db.sync_source_added("test-1", adapter)
 
         # Verify source exists
         conn = db._get_connection()
-        result = conn.execute("SELECT COUNT(*) FROM sources WHERE source_id='test-1'").fetchone()
+        result = conn.execute(
+            "SELECT COUNT(*) FROM sources WHERE source_id='test-1'"
+        ).fetchone()
         assert result[0] == 1
 
         # Remove source
         db.sync_source_removed("test-1")
 
         # Verify source removed
-        result = conn.execute("SELECT COUNT(*) FROM sources WHERE source_id='test-1'").fetchone()
+        result = conn.execute(
+            "SELECT COUNT(*) FROM sources WHERE source_id='test-1'"
+        ).fetchone()
         assert result[0] == 0
 
     def test_sync_disabled_noop(self):
         """Test that sync operations are no-ops when disabled."""
         db = MetadataDatabase(enabled=False)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
 
         # These should be no-ops
         db.sync_source_added("test-1", adapter)
@@ -141,9 +198,15 @@ class TestSourceSync:
         db = MetadataDatabase(enabled=True)
 
         sources = {
-            "plate-001": MockAdapter("plate-001", "/data/plate1.zarr", "ome-zarr", [256, 256], "uint8"),
-            "plate-002": MockAdapter("plate-002", "/data/plate2.zarr", "ome-zarr", [512, 512], "uint16"),
-            "plate-003": MockAdapter("plate-003", "/data/plate3.zarr", "ome-zarr", [1024, 1024], "float32"),
+            "plate-001": MockAdapter(
+                "plate-001", "/data/plate1.zarr", "ome-zarr", [256, 256], "uint8"
+            ),
+            "plate-002": MockAdapter(
+                "plate-002", "/data/plate2.zarr", "ome-zarr", [512, 512], "uint16"
+            ),
+            "plate-003": MockAdapter(
+                "plate-003", "/data/plate3.zarr", "ome-zarr", [1024, 1024], "float32"
+            ),
         }
 
         db.initial_sync(sources)
@@ -154,8 +217,60 @@ class TestSourceSync:
 
         # Check each source
         for source_id in sources:
-            row = conn.execute("SELECT source_id FROM sources WHERE source_id=?", [source_id]).fetchone()
+            row = conn.execute(
+                "SELECT source_id FROM sources WHERE source_id=?", [source_id]
+            ).fetchone()
             assert row is not None
+
+    def test_initial_sync_continues_on_error(self):
+        """Test that initial_sync continues even if one source fails."""
+        import numpy as np
+
+        class FailingAdapter(MockAdapter):
+            def get_source_descriptor(self):
+                raise RuntimeError("Simulated failure")
+
+        class NumpyAdapter(MockAdapter):
+            def get_metadata(self):
+                return {"value": np.int16(42)}
+
+        db = MetadataDatabase(enabled=True)
+
+        sources = {
+            "good-1": MockAdapter(
+                "good-1", "/data/g1.zarr", "ome-zarr", [100, 100], "uint8"
+            ),
+            "failing": FailingAdapter(
+                "failing", "/data/fail.zarr", "ome-zarr", [100, 100], "uint8"
+            ),
+            "numpy": NumpyAdapter(
+                "numpy", "/data/numpy.nii", "nifti", [64, 64], "int16"
+            ),
+        }
+
+        db.initial_sync(sources)
+
+        conn = db._get_connection()
+        # Only good-1 and numpy should be synced (failing adapter raises error)
+        result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
+        assert result[0] == 2
+
+        # Verify the good sources are present
+        row = conn.execute(
+            "SELECT source_id FROM sources WHERE source_id='good-1'"
+        ).fetchone()
+        assert row is not None
+
+        row = conn.execute(
+            "SELECT source_id FROM sources WHERE source_id='numpy'"
+        ).fetchone()
+        assert row is not None
+
+        # Verify failing source is not present
+        row = conn.execute(
+            "SELECT source_id FROM sources WHERE source_id='failing'"
+        ).fetchone()
+        assert row is None
 
 
 class TestQueryHandling:
@@ -164,7 +279,9 @@ class TestQueryHandling:
     def test_handle_query_simple(self):
         """Test simple SELECT query."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         info = db.handle_query("SELECT source_id, source_type FROM sources")
@@ -173,19 +290,30 @@ class TestQueryHandling:
 
         # Check schema metadata
         assert info.schema.metadata is not None
-        assert b'total_sources' in info.schema.metadata
-        assert int(info.schema.metadata[b'total_sources']) == 1
+        assert b"total_sources" in info.schema.metadata
+        assert int(info.schema.metadata[b"total_sources"]) == 1
 
     def test_handle_query_with_filter(self):
         """Test SELECT query with WHERE clause."""
         db = MetadataDatabase(enabled=True)
 
         # Add multiple sources
-        db.sync_source_added("zarr-1", MockAdapter("zarr-1", "/data/z1.zarr", "ome-zarr", [100, 100], "uint16"))
-        db.sync_source_added("zarr-2", MockAdapter("zarr-2", "/data/z2.zarr", "ome-zarr", [200, 200], "uint16"))
-        db.sync_source_added("tiff-1", MockAdapter("tiff-1", "/data/t1.tiff", "ome-tiff", [300, 300], "uint8"))
+        db.sync_source_added(
+            "zarr-1",
+            MockAdapter("zarr-1", "/data/z1.zarr", "ome-zarr", [100, 100], "uint16"),
+        )
+        db.sync_source_added(
+            "zarr-2",
+            MockAdapter("zarr-2", "/data/z2.zarr", "ome-zarr", [200, 200], "uint16"),
+        )
+        db.sync_source_added(
+            "tiff-1",
+            MockAdapter("tiff-1", "/data/t1.tiff", "ome-tiff", [300, 300], "uint8"),
+        )
 
-        info = db.handle_query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+        info = db.handle_query(
+            "SELECT source_id FROM sources WHERE source_type='ome-zarr'"
+        )
         assert info is not None
 
         # Retrieve result
@@ -196,7 +324,9 @@ class TestQueryHandling:
     def test_handle_query_json_field(self):
         """Test query using DuckDB JSON operators."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         # Query JSON field
@@ -215,14 +345,19 @@ class TestQueryHandling:
 
         # Add 5 sources
         for i in range(5):
-            db.sync_source_added(f"test-{i}", MockAdapter(f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"))
+            db.sync_source_added(
+                f"test-{i}",
+                MockAdapter(
+                    f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+                ),
+            )
 
         info = db.handle_query("SELECT source_id FROM sources")
         assert info is not None
 
         # Check truncation metadata
-        assert int(info.schema.metadata[b'total_sources']) == 5
-        assert int(info.schema.metadata[b'returned_sources']) == 2
+        assert int(info.schema.metadata[b"total_sources"]) == 5
+        assert int(info.schema.metadata[b"returned_sources"]) == 2
 
         # Result should be truncated
         result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
@@ -244,7 +379,9 @@ class TestSQLValidation:
         db = MetadataDatabase(enabled=True)
 
         db._validate_query("SELECT * FROM sources")
-        db._validate_query("SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
+        db._validate_query(
+            "SELECT source_id, source_type FROM sources WHERE dtype='uint16'"
+        )
 
     def test_validate_forbidden_insert(self):
         """Test that INSERT is blocked."""
@@ -258,7 +395,9 @@ class TestSQLValidation:
         db = MetadataDatabase(enabled=True)
 
         with pytest.raises(ValueError, match="forbidden keyword"):
-            db._validate_query("UPDATE sources SET source_id='new' WHERE source_id='old'")
+            db._validate_query(
+                "UPDATE sources SET source_id='new' WHERE source_id='old'"
+            )
 
     def test_validate_forbidden_delete(self):
         """Test that DELETE is blocked."""
@@ -299,7 +438,9 @@ class TestFlightInfo:
     def test_flight_info_schema(self):
         """Test that FlightInfo has correct schema."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         info = db.handle_query("SELECT source_id, source_type FROM sources")
@@ -312,19 +453,26 @@ class TestFlightInfo:
         db = MetadataDatabase(enabled=True)
 
         for i in range(3):
-            db.sync_source_added(f"test-{i}", MockAdapter(f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"))
+            db.sync_source_added(
+                f"test-{i}",
+                MockAdapter(
+                    f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+                ),
+            )
 
         info = db.handle_query("SELECT source_id FROM sources")
 
         assert info.schema.metadata is not None
-        assert b'total_sources' in info.schema.metadata
-        assert b'returned_sources' in info.schema.metadata
-        assert b'query_elapsed_ms' in info.schema.metadata
+        assert b"total_sources" in info.schema.metadata
+        assert b"returned_sources" in info.schema.metadata
+        assert b"query_elapsed_ms" in info.schema.metadata
 
     def test_get_pending_result(self):
         """Test retrieval of pending results."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         info = db.handle_query("SELECT source_id FROM sources")
@@ -353,7 +501,9 @@ class TestClose:
     def test_close(self):
         """Test that close() cleans up connection."""
         db = MetadataDatabase(enabled=True)
-        adapter = MockAdapter("test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16")
+        adapter = MockAdapter(
+            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
+        )
         db.sync_source_added("test-1", adapter)
 
         assert db._conn is not None
@@ -387,7 +537,9 @@ class TestListFlightsTruncation:
 
         # Register 3 sources (under limit)
         for i in range(3):
-            adapter = MockAdapter(f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16")
+            adapter = MockAdapter(
+                f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+            )
             server.register_source(f"test-{i}", adapter)
 
         # Call list_flights
@@ -398,9 +550,9 @@ class TestListFlightsTruncation:
         # Check schema metadata
         info = results[0]
         assert info.schema.metadata is not None
-        assert int(info.schema.metadata[b'total_sources']) == 3
-        assert int(info.schema.metadata[b'max_sources']) == 5
-        assert info.schema.metadata[b'truncated'].decode() == 'False'
+        assert int(info.schema.metadata[b"total_sources"]) == 3
+        assert int(info.schema.metadata[b"max_sources"]) == 5
+        assert info.schema.metadata[b"truncated"].decode() == "False"
 
     def test_list_flights_truncation(self):
         """Test that list_flights truncates and signals via metadata."""
@@ -416,7 +568,9 @@ class TestListFlightsTruncation:
 
         # Register 10 sources (over limit)
         for i in range(10):
-            adapter = MockAdapter(f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16")
+            adapter = MockAdapter(
+                f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
+            )
             server.register_source(f"test-{i}", adapter)
 
         # Call list_flights
@@ -428,6 +582,6 @@ class TestListFlightsTruncation:
         # Check schema metadata signals truncation
         info = results[0]
         assert info.schema.metadata is not None
-        assert int(info.schema.metadata[b'total_sources']) == 10
-        assert int(info.schema.metadata[b'max_sources']) == 3
-        assert info.schema.metadata[b'truncated'].decode() == 'True'
+        assert int(info.schema.metadata[b"total_sources"]) == 10
+        assert int(info.schema.metadata[b"max_sources"]) == 3
+        assert info.schema.metadata[b"truncated"].decode() == "True"
