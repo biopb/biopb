@@ -44,6 +44,9 @@ import org.apache.arrow.vector.UInt1Vector;
 import org.apache.arrow.vector.UInt2Vector;
 import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.VectorLoader;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.Types;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -316,21 +319,61 @@ public class TensorFlightClient implements AutoCloseable {
         FlightStream stream = client.getStream(
             info.getEndpoints().get(0).getTicket(), authOption);
 
-        // Materialize all batches into one table
-        List<VectorSchemaRoot> batches = new ArrayList<>();
+        // Materialize all batches using ArrowRecordBatch (Arrow 18 API)
+        List<ArrowRecordBatch> batches = new ArrayList<>();
+        Schema schema = info.getSchema();
         while (stream.next()) {
-            batches.add(stream.getRoot().clone());
+            VectorUnloader unloader = new VectorUnloader(stream.getRoot());
+            ArrowRecordBatch batch = unloader.getRecordBatch().cloneWithTransfer(allocator);
+            batches.add(batch);
         }
 
         if (batches.isEmpty()) {
-            Schema schema = info.getSchema();
             VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
             root.setRowCount(0);
             return root;
         }
 
-        // Concatenate all batches
-        return VectorSchemaRoot.concatenate(batches);
+        // Concatenate all batches into one VectorSchemaRoot
+        return concatenateBatches(schema, batches);
+    }
+
+    /**
+     * Concatenate ArrowRecordBatch objects into a single VectorSchemaRoot.
+     * Uses TransferPair to copy values from each batch into the result.
+     */
+    private VectorSchemaRoot concatenateBatches(Schema schema, List<ArrowRecordBatch> batches) {
+        // Calculate total row count
+        int totalRows = 0;
+        for (ArrowRecordBatch batch : batches) {
+            totalRows += batch.getLength();
+        }
+
+        // Create result root with enough capacity
+        VectorSchemaRoot result = VectorSchemaRoot.create(schema, allocator);
+        result.allocateNew();
+        VectorLoader loader = new VectorLoader(result);
+
+        // Load and copy each batch
+        int offset = 0;
+        for (ArrowRecordBatch batch : batches) {
+            loader.load(batch);
+            // Copy values from current position to offset position
+            for (int i = 0; i < result.getFieldVectors().size(); i++) {
+                org.apache.arrow.vector.ValueVector srcVec = result.getVector(i);
+                org.apache.arrow.vector.ValueVector dstVec = result.getVector(i);
+                // Use slice to get the loaded portion and copy to offset
+                // Since loader loads starting at 0, we need to shift values
+                for (int row = 0; row < batch.getLength(); row++) {
+                    dstVec.copyFromSafe(row, offset + row, srcVec);
+                }
+            }
+            offset += batch.getLength();
+            batch.close();
+        }
+
+        result.setRowCount(totalRows);
+        return result;
     }
 
     /**

@@ -4,9 +4,10 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
-- **HTTP Sidecar** (port 8816) - FastAPI proxy for browser access
-- **nginx** (port 80) - Serves React webapp and proxies API requests
+- **TensorFlightServer** (gRPC on port 8817, internal) - Arrow Flight server for tensor data
+- **HTTP Sidecar** (port 8816, internal) - FastAPI proxy for browser access
+- **nginx HTTP** (port 8814) - Serves React webapp and proxies API requests
+- **nginx gRPC** (port 8815) - Proxies gRPC requests to TensorFlightServer
 - **Webapp** - React-based image browser UI
 
 ## Build Instructions
@@ -65,7 +66,8 @@ docker build -t biopb-tensor-server:latest -f biopb-tensor-server/Dockerfile .
 ```bash
 docker run -d \
     --name biopb-tensor \
-    -p 80:80 \
+    -p 8814:8814 \
+    -p 8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     biopb-tensor-server:latest
@@ -78,10 +80,12 @@ docker run -d \
 | `CONFIG_FILE` | `/app/config/default-config.toml` | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
 | `DATA_DIR` | `/data` | Directory containing microscopy files (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (NFS/Lustre: set to false) |
-| `HOST` | `0.0.0.0` | gRPC server host |
-| `PORT` | `8815` | gRPC server port |
+| `HOST` | `127.0.0.1` | gRPC server host (internal, proxied through nginx) |
+| `PORT` | `8817` | gRPC server port (internal, proxied through nginx) |
+| `WEB_HOST` | `127.0.0.1` | HTTP sidecar host (internal) |
 | `WEB_PORT` | `8816` | HTTP sidecar port (internal) |
-| `NGINX_PORT` | `80` | nginx/webapp port (use higher port on HPC, e.g., 8080) |
+| `NGINX_HTTP_PORT` | `8814` | nginx/webapp HTTP port (external) |
+| `NGINX_GRPC_PORT` | `8815` | nginx gRPC port (external) |
 | `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
@@ -100,12 +104,12 @@ Docker sets `CONFIG_FILE=/app/config/default-config.toml` by default, so it uses
 
 ```bash
 # Basic run (uses baked-in default-config.toml)
-docker run -d -p 80:80 -v ~/data:/data \
+docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
 # With custom config file
-docker run -d -p 80:80 \
+docker run -d -p 8814:8814 -p 8815:8815 \
     -v ~/my-config.toml:/custom.toml \
     -v ~/data:/data \
     -e CONFIG_FILE=/custom.toml \
@@ -113,7 +117,7 @@ docker run -d -p 80:80 \
     biopb-tensor-server:latest
 
 # Generate config from env vars (unset CONFIG_FILE)
-docker run -d -p 80:80 -v ~/data:/data \
+docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
     -e CONFIG_FILE="" \
     -e DATA_DIR=/data \
     -e COMPUTE_BACKEND=cpu \
@@ -121,8 +125,13 @@ docker run -d -p 80:80 -v ~/data:/data \
     biopb-tensor-server:latest
 
 # Dev mode (localhost only, no token required)
-docker run -d -p 80:80 -v ~/data:/data \
+docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
     -e BIOPB_WEB_DEV_BYPASS=true \
+    biopb-tensor-server:latest
+
+# HTTP only (webapp access only, no external gRPC)
+docker run -d -p 8814:8814 -v ~/data:/data \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
 # gRPC only (no webapp)
@@ -134,16 +143,19 @@ docker run -d -p 8815:8815 -v ~/data:/data \
 ### Health Checks
 
 ```bash
-# Liveness
-curl http://localhost/livez
+# Liveness (HTTP)
+curl http://localhost:8814/livez
 
-# Readiness
-curl http://localhost/readyz
+# Readiness (HTTP)
+curl http://localhost:8814/readyz
+
+# gRPC health check (via nginx proxy on port 8815)
+grpcurl -plaintext localhost:8815 grpc.health.v1.Health/Check
 ```
 
 ### Access the Webapp
 
-1. Open `http://localhost/` in browser
+1. Open `http://localhost:8814/` in browser
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
 
@@ -175,7 +187,7 @@ By default, Singularity inherits the Docker image's `CONFIG_FILE` environment va
 singularity run --cleanenv \
     --bind ~/data:/data \
     --env DATA_DIR=/data \
-    --env NGINX_PORT=8080 \
+    --env NGINX_HTTP_PORT=8814 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 ```
@@ -195,9 +207,10 @@ singularity run \
 singularity run --cleanenv \
     --bind ~/data:/data \
     --env DATA_DIR=/data \
-    --env HOST=0.0.0.0 \
-    --env PORT=8815 \
-    --env NGINX_PORT=8080 \
+    --env HOST=127.0.0.1 \
+    --env PORT=8817 \
+    --env NGINX_HTTP_PORT=8814 \
+    --env NGINX_GRPC_PORT=8815 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 ```
@@ -215,24 +228,23 @@ singularity run \
 ### HPC Cluster Examples
 
 ```bash
-# SLURM interactive session with custom webapp port (port 80 requires root)
+# SLURM interactive session
 srun --pty singularity run \
     --bind /scratch/user/data:/data \
-    --env NGINX_PORT=8080 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# With custom gRPC port
+# With custom ports
 singularity run \
     --bind ~/data:/data \
-    --env PORT=9000 \
+    --env NGINX_HTTP_PORT=8888 \
+    --env NGINX_GRPC_PORT=8889 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# Dev mode for debugging (no token, custom port)
+# Dev mode for debugging (no token)
 singularity run \
     --bind ~/data:/data \
-    --env NGINX_PORT=8080 \
     --env BIOPB_WEB_DEV_BYPASS=true \
     biopb-tensor-server.sif
 ```
@@ -240,15 +252,22 @@ singularity run \
 ## Architecture
 
 ```
-Container (port 80 externally)
-├── nginx (80)                 → serves webapp, proxies /api/* to sidecar
+Container (external ports 8814, 8815)
+├── nginx HTTP (8814)          → serves webapp, proxies /api/* to sidecar
 │   ├── /                      → React SPA (static files)
-│   └── /api/*                 → proxy to 127.0.0.1:8816
+│   ├── /api/*                 → proxy to 127.0.0.1:8816
+│   ├── /livez, /readyz        → health endpoints
 │
-├── TensorFlightServer (8815)  → Arrow Flight gRPC (internal)
+├── nginx gRPC (8815)          → proxies gRPC to TensorFlightServer
+│   ├── /grpc.health.v1.Health/Check → health check proxy to sidecar
+│   ├── /*                     → grpc_pass to 127.0.0.1:8817
 │
-└── HTTP Sidecar (8816)        → FastAPI (localhost only, nginx proxies)
+├── TensorFlightServer (8817)  → Arrow Flight gRPC (internal, nginx proxy)
+│
+└── HTTP Sidecar (8816)        → FastAPI (internal, nginx proxy)
 ```
+
+All internal services bind to `127.0.0.1`. External access is through nginx proxies only.
 
 ## Supported File Formats
 
@@ -299,9 +318,9 @@ The image now includes `bioformats-jar` and `aicsimageio[nd2]` for ND2 support. 
 
 | Port | Service | External Access | Configurable via |
 |------|---------|-----------------|------------------|
-| 80 (default) | nginx | Yes (webapp + API) | `NGINX_PORT` env var |
-| 8815 | gRPC | Yes (if exposed) | `PORT` env var |
+| 8814 (default) | nginx HTTP | Yes (webapp + API + health) | `NGINX_HTTP_PORT` env var |
+| 8815 (default) | nginx gRPC | Yes (gRPC + health check) | `NGINX_GRPC_PORT` env var |
 | 8816 | FastAPI sidecar | No (internal only) | `WEB_PORT` env var |
+| 8817 | TensorFlightServer | No (internal, proxied via nginx gRPC) | `PORT` env var |
 
-On HPC systems, use `NGINX_PORT=8080` or similar since port 80 typically requires root privileges.
-Expose only the nginx port for webapp access. gRPC port 8815 is for programmatic access (Python clients).
+Expose nginx HTTP (8814) for webapp access and nginx gRPC (8815) for programmatic gRPC clients. Internal ports 8816 and 8817 are not exposed directly.

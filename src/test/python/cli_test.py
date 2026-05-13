@@ -201,24 +201,26 @@ class TestMetadataCommand:
             mock_client = _build_mock_client()
             mock_fc_class.return_value = mock_client
 
-            result = runner.invoke(app, ["metadata", "my-source", "--tensor", "nonexistent"])
+            result = runner.invoke(
+                app, ["metadata", "my-source", "--tensor", "nonexistent"]
+            )
 
             assert result.exit_code == 1
             assert "Tensor not found" in result.stdout
 
 
-class TestStatsCommand:
-    """Tests for the 'stats' command."""
+class TestReadCommand:
+    """Tests for the 'read' command."""
 
-    def test_stats_computes_values(self):
-        """Test that stats computes min, max, mean."""
+    def test_read_computes_values(self):
+        """Test that read computes min, max, mean."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             with patch("biopb.tensor.cli.dask.compute") as mock_compute:
                 mock_client = _build_mock_client()
                 mock_fc_class.return_value = mock_client
                 mock_compute.return_value = (10, 200, 100.5)
 
-                result = runner.invoke(app, ["stats", "my-source", "pos_0"])
+                result = runner.invoke(app, ["read", "my-source", "pos_0"])
 
                 assert result.exit_code == 0
                 assert "min" in result.stdout
@@ -229,15 +231,15 @@ class TestStatsCommand:
                 assert "100.5" in result.stdout
                 mock_client.close.assert_called_once()
 
-    def test_stats_with_slice(self):
-        """Test that stats respects --slice option."""
+    def test_read_with_slice(self):
+        """Test that read respects --slice option."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(
                 app,
-                ["stats", "my-source", "pos_0", "--slice", "0:100,0:100"],
+                ["read", "my-source", "pos_0", "--slice", "0:100,0:100"],
             )
 
             assert result.exit_code == 0
@@ -245,25 +247,25 @@ class TestStatsCommand:
             call_args = mock_client.get_tensor.call_args
             assert call_args[1]["slice_hint"] == (slice(0, 100), slice(0, 100))
 
-    def test_stats_missing_tensor(self):
-        """Test that stats handles missing tensor."""
+    def test_read_missing_tensor(self):
+        """Test that read handles missing tensor."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_client.get_tensor.side_effect = ValueError("Tensor not found")
             mock_fc_class.return_value = mock_client
 
-            result = runner.invoke(app, ["stats", "my-source", "nonexistent"])
+            result = runner.invoke(app, ["read", "my-source", "nonexistent"])
 
             assert result.exit_code == 1
             assert "Failed to compute statistics" in result.stdout
 
-    def test_stats_displays_shape_and_dtype(self):
-        """Test that stats shows tensor shape and dtype."""
+    def test_read_displays_shape_and_dtype(self):
+        """Test that read shows tensor shape and dtype."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_fc_class.return_value = mock_client
 
-            result = runner.invoke(app, ["stats", "my-source", "pos_0"])
+            result = runner.invoke(app, ["read", "my-source", "pos_0"])
 
             assert result.exit_code == 0
             assert "[512, 512]" in result.stdout
@@ -323,7 +325,7 @@ class TestCliIntegration:
         result = runner.invoke(app, ["metadata", "--help"])
         assert result.exit_code == 0
 
-        result = runner.invoke(app, ["stats", "--help"])
+        result = runner.invoke(app, ["read", "--help"])
         assert result.exit_code == 0
 
     def test_app_version(self):
