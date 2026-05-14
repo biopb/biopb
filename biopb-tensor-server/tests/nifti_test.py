@@ -134,7 +134,7 @@ class TestNiftiAdapter:
             assert adapter._shape == shape
             # NIfTI always reports float64 (scaled data with slope/intercept)
             assert adapter._dtype == 'float64'
-            assert adapter.dim_labels == ['z', 'y', 'x']
+            assert adapter.dim_labels == ['x', 'y', 'z']
 
     def test_init_and_shape_4d(self):
         import nibabel as nib
@@ -149,7 +149,7 @@ class TestNiftiAdapter:
 
             assert adapter._shape == shape
             # Should detect time series
-            assert adapter.dim_labels == ['t', 'z', 'y', 'x']
+            assert adapter.dim_labels == ['t', 'x', 'y', 'z']
 
     def test_get_tensor_descriptor(self):
         import nibabel as nib
@@ -278,7 +278,7 @@ class TestNiftiAdapterIntegration:
             adapter = NiftiAdapter(img, 'test_5d')
 
             assert len(adapter._shape) == 5
-            assert adapter.dim_labels == ['v', 't', 'z', 'y', 'x']
+            assert adapter.dim_labels == ['v', 't', 'x', 'y', 'z']
 
     def test_header_fields_preserved(self):
         import nibabel as nib
