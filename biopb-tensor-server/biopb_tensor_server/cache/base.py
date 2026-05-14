@@ -13,7 +13,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import pyarrow as pa
 
@@ -91,6 +91,17 @@ class CacheEntry:
 
 
 @dataclass
+class PoolStats:
+    """Per-pool cache statistics."""
+    pool_key: str  # e.g., "unified-tiny"
+    hits: int = 0
+    misses: int = 0
+    segments: int = 0
+    bytes: int = 0
+    hit_rate: float = 0.0
+
+
+@dataclass
 class CacheStats:
     """Cache statistics."""
     total_entries: int = 0
@@ -103,6 +114,7 @@ class CacheStats:
     pending_waits: int = 0  # Threads that waited on pending entries
     ref_held_evictions_skipped: int = 0  # Evictions skipped due to ref_count
     oversized_skips: int = 0  # Chunks skipped due to exceeding Arrow batch size limit
+    pool_stats: Dict[str, PoolStats] = field(default_factory=dict)
 
 
 class CacheBackend(ABC):

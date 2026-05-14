@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -36,6 +37,52 @@ class SegmentInfo:
     created_at: float
     last_access_time: float  # Updated on each read from segment
     entry_count: int
+
+
+@dataclass
+class SieveKSegmentInfo:
+    """Sieve-K metadata for a segment.
+
+    Attributes:
+        segment_id: Unique segment identifier
+        size_bytes: Total size of segment file
+        created_at: Creation timestamp
+        last_access_time: Last access timestamp
+        entry_count: Number of entries in this segment
+        frequency: Saturating counter (0 to K=2) for Sieve-K algorithm
+        mmap_released: True if mmap handle was released for cold segment
+    """
+    segment_id: int
+    size_bytes: int
+    created_at: float
+    last_access_time: float
+    entry_count: int
+    frequency: int = 0  # Saturating counter (0 to K=2)
+    mmap_released: bool = False  # True if mmap handle was released for cold segment
+
+
+@dataclass
+class PoolQueueInfo:
+    """Per-pool Sieve-K queue state.
+
+    Uses same pattern as reference implementation:
+    - queue: ordered segment_ids (newest at left/head, oldest at right/tail)
+    - segments: dict for metadata lookup (segment_id -> SieveKSegmentInfo)
+
+    Attributes:
+        pool_key: Tuple of (schema_key, size_class)
+        hand: Current hand offset from tail (0 = tail position)
+        queue: deque of segment_ids ordered (newest at left)
+        segments: dict mapping segment_id to SieveKSegmentInfo
+        hits: Number of cache hits in this pool
+        misses: Number of cache misses in this pool
+    """
+    pool_key: Tuple[str, str]  # (schema_key, size_class)
+    hand: int = 0  # Current hand offset from tail (0 = tail position)
+    queue: deque = field(default_factory=deque)  # segment_ids ordered (newest at left)
+    segments: Dict[int, SieveKSegmentInfo] = field(default_factory=dict)  # segment_id -> info
+    hits: int = 0
+    misses: int = 0
 
 
 @dataclass
