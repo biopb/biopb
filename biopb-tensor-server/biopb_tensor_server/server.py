@@ -348,7 +348,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError(
                     "Metadata database not enabled. Set metadata_db config to enable SQL queries."
                 )
-            return self._metadata_db.handle_query(selection.metadata_query)
+            try:
+                return self._metadata_db.handle_query(selection.metadata_query)
+            except ValueError as e:
+                # Query validation or execution failure
+                raise flight.FlightInternalError(f"Metadata query failed: {e}") from e
 
         logger.debug(
             f"get_flight_info: source_id={selection.source_id}, tensor_id={selection.tensor_id}"
@@ -367,29 +371,36 @@ class TensorFlightServer(flight.FlightServerBase):
             )
 
         # Build request descriptor for the specific tensor
-        base_desc = tensor_adapter.get_tensor_descriptor()
-        tensor_desc = TensorDescriptor(
-            array_id=selection.tensor_id,
-            dim_labels=base_desc.dim_labels,
-            shape=base_desc.shape,
-            chunk_shape=base_desc.chunk_shape,
-            dtype=base_desc.dtype,
-        )
-        if selection.HasField("slice_hint"):
-            tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
-            logger.debug(
-                f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}"
+        try:
+            base_desc = tensor_adapter.get_tensor_descriptor()
+            tensor_desc = TensorDescriptor(
+                array_id=selection.tensor_id,
+                dim_labels=base_desc.dim_labels,
+                shape=base_desc.shape,
+                chunk_shape=base_desc.chunk_shape,
+                dtype=base_desc.dtype,
             )
-        if selection.HasField("read_options"):
-            tensor_desc.read_options.CopyFrom(selection.read_options)
+            if selection.HasField("slice_hint"):
+                tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
+                logger.debug(
+                    f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}"
+                )
+            if selection.HasField("read_options"):
+                tensor_desc.read_options.CopyFrom(selection.read_options)
 
-        read_plan = tensor_adapter.get_read_plan(tensor_desc)
-        schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
+            read_plan = tensor_adapter.get_read_plan(tensor_desc)
+            schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
-        # Populate metadata_json in response descriptor
-        metadata = tensor_adapter.get_metadata()
-        if metadata:
-            read_plan.descriptor.metadata_json = json.dumps(metadata, cls=NumpyEncoder)
+            # Populate metadata_json in response descriptor
+            metadata = tensor_adapter.get_metadata()
+            if metadata:
+                read_plan.descriptor.metadata_json = json.dumps(
+                    metadata, cls=NumpyEncoder
+                )
+        except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
+            raise flight.FlightInternalError(
+                f"Metadata error for {selection.source_id}: {e}"
+            ) from e
 
         # Convert to FlightEndpoints
         endpoints = []
@@ -432,10 +443,11 @@ class TensorFlightServer(flight.FlightServerBase):
             ticket_id = ticket_bytes.decode()
             logger.debug(f"do_get: metadata query result ticket={ticket_id}")
             if self._metadata_db is None:
-                raise flight.FlightServerError("Metadata database not enabled")
+                raise flight.FlightInternalError("Metadata database not enabled")
             result = self._metadata_db.get_pending_result(ticket_id)
             if result is None:
-                raise flight.FlightServerError(
+                # Internal error: pending result should exist if ticket was valid
+                raise flight.FlightInternalError(
                     f"Metadata query result not found: {ticket_id}"
                 )
             return flight.RecordBatchStream(result)
@@ -453,7 +465,15 @@ class TensorFlightServer(flight.FlightServerBase):
         cache_manager = CacheManager.get_instance()
 
         # Read the chunk (with caching for virtual chunks)
-        record_batch = adapter.resolve_chunk_data(tensor_ticket.chunk_id, cache_manager)
+        try:
+            record_batch = adapter.resolve_chunk_data(
+                tensor_ticket.chunk_id, cache_manager
+            )
+        except (OSError, IOError, ValueError) as e:
+            # ValueError can be raised by bounds validation or parsing failures
+            raise flight.FlightInternalError(
+                f"I/O error reading chunk data: {e}"
+            ) from e
         batch_size = sum(col.nbytes for col in record_batch.columns)
         logger.debug(f"do_get: returning {batch_size} bytes")
         return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
