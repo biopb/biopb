@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -32,8 +33,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _FailureTracker:
+    attempts: int = 0
+    next_retry_at: float = 0.0
+    last_log_at: float = float("-inf")
+
+
 class SourceManager:
     """Manages periodic rescans and source lifecycle reconciliation."""
+
+    _retry_backoff_initial = 1.0
+    _retry_backoff_max = 60.0
+    _failure_log_interval = 30.0
 
     def __init__(
         self,
@@ -72,6 +84,8 @@ class SourceManager:
         self._entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
+        # source_id -> retry/logging state for repeatedly failing datasets.
+        self._failed_sources: Dict[str, _FailureTracker] = {}
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
@@ -302,6 +316,7 @@ class SourceManager:
         added_claims = [
             discovered_claims[source_id]
             for source_id in sorted((discovered_ids - current_ids) | changed_ids)
+            if self._should_retry_source(source_id)
         ]
 
         for source_id in removed_ids:
@@ -372,16 +387,19 @@ class SourceManager:
     def _commit_add_claim(self, claim: SourceClaim) -> bool:
         """Register a discovered source, then commit it into confirmed state."""
         if not self._register_source_claim(claim):
+            self._record_failed_source_attempt(claim.source_id)
             return False
 
         with self._lock:
             added = self._state.add_claim(claim, notify=False)
             if not added:
                 self._rollback_source_registration(claim.source_id)
+                self._record_failed_source_attempt(claim.source_id)
                 return False
             self._source_signatures[claim.source_id] = self._build_claim_signatures(
                 claim
             )
+            self._clear_failed_source_attempt(claim.source_id)
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:
@@ -397,7 +415,67 @@ class SourceManager:
         with self._lock:
             self._state.remove_claim(claim.primary_path, notify=False)
             self._source_signatures.pop(source_id, None)
+            self._clear_failed_source_attempt(source_id)
         return True
+
+    def _should_retry_source(self, source_id: str) -> bool:
+        """Return True when a failed source is eligible for another add attempt."""
+        tracker = self._failed_sources.get(source_id)
+        if tracker is None:
+            return True
+        return time.time() >= tracker.next_retry_at
+
+    def _record_failed_source_attempt(self, source_id: Optional[str]) -> None:
+        """Advance retry state for a failing source."""
+        if not source_id:
+            return
+
+        now = time.time()
+        tracker = self._failed_sources.get(source_id)
+        if tracker is None:
+            tracker = _FailureTracker()
+            self._failed_sources[source_id] = tracker
+
+        tracker.attempts += 1
+        delay = min(
+            self._retry_backoff_initial * (2 ** (tracker.attempts - 1)),
+            self._retry_backoff_max,
+        )
+        tracker.next_retry_at = now + delay
+
+    def _clear_failed_source_attempt(self, source_id: Optional[str]) -> None:
+        """Drop retry state after a source reaches a clean steady state."""
+        if not source_id:
+            return
+        self._failed_sources.pop(source_id, None)
+
+    def _log_source_failure(
+        self,
+        source_id: Optional[str],
+        message: str,
+        *args: Any,
+        exc_info: bool = False,
+    ) -> None:
+        """Log a source failure no more than once per rate-limit window."""
+        if not source_id:
+            logger.error(message, *args, exc_info=exc_info)
+            return
+
+        now = time.time()
+        tracker = self._failed_sources.get(source_id)
+        if tracker is None:
+            tracker = _FailureTracker()
+            self._failed_sources[source_id] = tracker
+
+        if now - tracker.last_log_at >= self._failure_log_interval:
+            logger.error(message, *args, exc_info=exc_info)
+            tracker.last_log_at = now
+            return
+
+        logger.debug(
+            "Suppressing repeated failure log for source %s until retry window expires",
+            source_id,
+        )
 
     def _register_source_claim(self, claim: SourceClaim) -> bool:
         """Create and register a source, rolling back on partial failure."""
@@ -412,14 +490,21 @@ class SourceManager:
 
             adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
             if adapter_cls is None:
-                logger.error(f"No adapter for type: {claim.source_type}")
+                self._log_source_failure(
+                    claim.source_id,
+                    "No adapter for type %s for source %s (%s)",
+                    claim.source_type,
+                    claim.source_id,
+                    claim.primary_path,
+                )
                 return False
 
             adapter = adapter_cls.create_from_config(
                 source_config, self._credentials_config
             )
         except Exception as e:
-            logger.error(
+            self._log_source_failure(
+                claim.source_id,
                 "Failed to create adapter for source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,
@@ -443,7 +528,8 @@ class SourceManager:
             logger.info(f"Registered source with server: {claim.source_id}")
             return True
         except Exception as e:
-            logger.error(
+            self._log_source_failure(
+                claim.source_id,
                 "Failed to register/sync source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,

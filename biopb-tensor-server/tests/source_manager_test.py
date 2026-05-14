@@ -100,7 +100,30 @@ class _RegistryWithFailingAdapter(_FakeRegistry):
         return None
 
 
+class _FlakyAdapter:
+    calls = 0
+
+    @classmethod
+    def claim(cls, ctx, state):
+        return _FakeAdapter.claim(ctx, state)
+
+    @classmethod
+    def create_from_config(cls, source_config, credentials_config=None):
+        cls.calls += 1
+        raise RuntimeError("transient adapter failure")
+
+
+class _RegistryWithFlakyAdapter(_FakeRegistry):
+    def get_adapter_for_type(self, source_type):
+        if source_type == "fake":
+            return _FlakyAdapter
+        return None
+
+
 class TestSourceManagerRegressions:
+    def setup_method(self):
+        _FlakyAdapter.calls = 0
+
     def test_process_event_ignores_legacy_event_types(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
@@ -499,3 +522,91 @@ class TestSourceManagerRegressions:
         manager._rollback_source_registration("source-1")
 
         assert manager._path_to_source_id == {}
+
+    def test_failed_dataset_retries_with_backoff(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        manager = SourceManager(
+            server=server,
+            registry=_RegistryWithFlakyAdapter(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        source_id = generate_source_id(str(data_path.resolve()), "fake")
+
+        assert _FlakyAdapter.calls == 1
+        assert manager._failed_sources[source_id].attempts == 1
+
+        clock["now"] = 100.5
+        manager._handle_rescan()
+
+        assert _FlakyAdapter.calls == 1
+        assert manager._failed_sources[source_id].attempts == 1
+
+        clock["now"] = 101.1
+        manager._handle_rescan()
+
+        assert _FlakyAdapter.calls == 2
+        assert manager._failed_sources[source_id].attempts == 2
+        assert manager._failed_sources[source_id].next_retry_at == pytest.approx(103.1)
+
+    def test_failed_dataset_logs_are_rate_limited(self, tmp_path, monkeypatch, caplog):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        manager = SourceManager(
+            server=server,
+            registry=_RegistryWithFlakyAdapter(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        caplog.set_level("ERROR")
+
+        manager._handle_rescan()
+        clock["now"] = 101.1
+        manager._handle_rescan()
+        clock["now"] = 104.0
+        manager._handle_rescan()
+
+        error_records = [
+            record
+            for record in caplog.records
+            if "Failed to create adapter for source" in record.message
+        ]
+        assert len(error_records) == 1
+
+        clock["now"] = 132.0
+        manager._handle_rescan()
+
+        error_records = [
+            record
+            for record in caplog.records
+            if "Failed to create adapter for source" in record.message
+        ]
+        assert len(error_records) == 2

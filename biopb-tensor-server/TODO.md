@@ -8,6 +8,10 @@
 | v0.2 | Complete | Multi-scale pyramid routing, virtual scaling, HTTP sidecar |
 | v0.3 | Planning | HCS plate support, metadata database, Sieve-K cache |
 
+## Investigation
+
+- Investigate whether runtime adapter chunk read failures in `TensorFlightServer.do_get()` should feed into `SourceManager` source failure tracking. Open questions: whether this should only share rate-limited logging/diagnostics, or also drive quarantine, unregister, or rediscovery behavior for repeatedly failing registered datasets.
+
 ---
 
 ## Remaining Feature: OME-Zarr HCS Plate Support
