@@ -213,12 +213,13 @@ def _setup_flight_server(
                 for ms in monitored_sources
                 if not ms.is_remote and ms.local_path
             }
-            watcher = get_watcher(
-                watcher_type=server_config.watcher_type,
-                directories=monitored_dirs,
-                poll_interval=server_config.poll_interval,
-                debounce_window=1.5,
-            )
+            if server_config.monitor_mode != "off":
+                watcher = get_watcher(
+                    watcher_type=server_config.monitor_mode,
+                    directories=monitored_dirs,
+                    poll_interval=server_config.rescan_interval,
+                    debounce_window=1.5,
+                )
         except Exception as e:
             console.print(f"[red]Failed to create watcher: {e}[/red]")
 
@@ -230,6 +231,8 @@ def _setup_flight_server(
         monitored_sources=monitored_sources,
         static_sources=static_sources,
         credentials_config=server_config.credentials,
+        stability_window=server_config.stability_window,
+        probe_open_files=server_config.probe_open_files,
     )
 
     if source_manager is None:

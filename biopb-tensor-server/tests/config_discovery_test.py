@@ -265,3 +265,49 @@ class TestCreatedSourceRegression:
 
             assert len(claims) >= 1
             assert claims[0].source_type == "aics"
+
+
+class _RaisingOnBadPathAdapter:
+    @classmethod
+    def claim(cls, ctx, state):
+        if ctx.name == "bad.dat":
+            raise RuntimeError("boom")
+        return None
+
+
+class _ClaimsGoodPathAdapter:
+    @classmethod
+    def claim(cls, ctx, state):
+        from biopb_tensor_server.discovery import SourceClaim
+
+        if ctx.is_file() and ctx.name == "good.dat":
+            if not state.try_claim_path(ctx.path_str):
+                return None
+            return SourceClaim(source_type="good", primary_path=ctx.path_str)
+        return None
+
+
+class TestDiscoveryFailureIsolation:
+    def test_discover_sources_continues_after_claim_exception_on_one_path(self):
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import (
+            AdapterRegistry,
+            discover_sources as discover_tree_sources,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "bad.dat").write_text("bad")
+            (root / "good.dat").write_text("good")
+
+            registry = AdapterRegistry()
+            registry.register(_RaisingOnBadPathAdapter)
+            registry.register(_ClaimsGoodPathAdapter)
+
+            state = discover_tree_sources(root, registry)
+
+            assert len(state.claims) == 1
+            claim = next(iter(state.claims.values()))
+            assert claim.primary_path == str(root / "good.dat")
+            assert str(root / "bad.dat") not in state.path_to_source

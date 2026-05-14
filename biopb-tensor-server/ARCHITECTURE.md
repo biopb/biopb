@@ -279,21 +279,25 @@ class DiscoveryState:
 
 **Modules:** `biopb_tensor_server.watcher`, `biopb_tensor_server.source_manager`
 
-Live filesystem monitoring for configured directories. When files are added or deleted, the tensor store catalog updates automatically.
+Periodic monitoring for configured directories. On each rescan interval, the catalog reconciles against a fresh stable snapshot of the monitored trees.
 
 #### Architecture
 
 ```
-Main Process                          Subprocess (isolated)
-┌─────────────────────┐              ┌─────────────────────┐
-│ TensorFlightServer  │              │ Watchdog Observer   │
-│ SourceManager       │              │ DebouncingHandler   │
-│         │           │              │                     │
-│         ▼           │   Queue      │   event_buffer      │
-│  get_events()       │◄─────────────│   (debounced)       │
-│         │           │   (events)   │                     │
-│         ▼           │              │                     │
-│  _process_event()   │   Event      │   loop checks       │
+Main Process
+┌─────────────────────┐
+│ TensorFlightServer  │
+│ SourceManager       │
+│ PeriodicRescanWatcher
+│         │
+│         ▼
+│  get_events()
+│         │
+│         ▼
+│  _process_event()
+│         │
+│         ▼
+│  _handle_rescan()
 │         │           │─────────────►│   shutdown_event    │
 │         ▼           │ (shutdown)   │                     │
 │  register_source()  │              │                     │
@@ -302,11 +306,10 @@ Main Process                          Subprocess (isolated)
 ```
 
 Key design decisions:
-- **Subprocess isolation**: Watchdog runs in separate process for stability
-- **Unidirectional queue**: Events flow subprocess → parent only
-- **Shutdown via Event**: Clean signaling without queue contention
-- **Thread-safe updates**: Server mutations serialized via lock in main process
-- **Abstract interface**: `DirectoryWatcher` supports future PollVFS for NFS
+- **Timer-driven monitoring**: The watcher emits periodic rescan requests only
+- **Separation of concerns**: The watcher handles cadence while `SourceManager` handles stability checks and diffs
+- **Thread-safe updates**: Server mutations are serialized via locks in the main process
+- **Stable snapshots**: Catalog reconciliation runs against a scan-local discovered snapshot, not per-file events
 
 #### Watcher Interface
 
@@ -319,24 +322,22 @@ class DirectoryWatcher(ABC):
 ```
 
 Implementations:
-- `WatchdogWatcher` — inode-based monitoring (local filesystems)
-- `PollVFSWatcher` — polling-based (placeholder for NFS/network mounts)
+- `PeriodicRescanWatcher` — emits `RESCAN` events at a fixed cadence for monitored directories
 
 #### Event Types
 
 ```python
 class WatcherEventType(Enum):
-    CREATED = "created"   # New file/directory
-    DELETED = "deleted"   # Removed file/directory  
-    MOVED = "moved"       # Renamed/moved (old_path + new_path)
+  RESCAN = "rescan"     # Trigger one reconciliation pass
 ```
 
-#### Debouncing
+#### Rescan Cadence
 
-Events are buffered for 1.5 seconds (configurable) to handle:
-- Rapid file operations (bulk data transfer, acquisition systems)
-- Partial detection of partially-written files
-- Transient files (create+delete pairs are collapsed and skipped)
+The watcher emits a `RESCAN` event on a fixed interval. `SourceManager` then:
+- refreshes cached directory and file signatures
+- skips unstable subtrees until they satisfy the stability window
+- performs discovery on stable paths only
+- diffs the discovered snapshot against the confirmed catalog state
 
 #### Move Handling
 

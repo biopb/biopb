@@ -23,7 +23,18 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
@@ -62,7 +73,7 @@ def get_file_identity(path: Path) -> str:
 
 def _hash_path(path: Path) -> str:
     """Hash path for identity when inode unavailable."""
-    return hashlib.sha256(str(path).encode('utf-8')).hexdigest()[:16]
+    return hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
 
 
 class ClaimContext:
@@ -102,7 +113,11 @@ class ClaimContext:
             subpath: Relative path within this context (empty for current path)
         """
         if self._store:
-            target = (self._remote_path + '/' + subpath).lstrip('/') if subpath else self._remote_path
+            target = (
+                (self._remote_path + "/" + subpath).lstrip("/")
+                if subpath
+                else self._remote_path
+            )
             return self._store.read_text(target)
         target = self._path / subpath if subpath else self._path
         return target.read_text()
@@ -110,7 +125,11 @@ class ClaimContext:
     def join(self, subpath: str) -> "ClaimContext":
         """Create context for subpath."""
         if self._store:
-            new_path = self._remote_path.rstrip('/') + '/' + subpath if self._remote_path else subpath
+            new_path = (
+                self._remote_path.rstrip("/") + "/" + subpath
+                if self._remote_path
+                else subpath
+            )
             return ClaimContext(new_path, self._store)
         return ClaimContext(self._path / subpath)
 
@@ -132,14 +151,16 @@ class ClaimContext:
     def name(self) -> str:
         """Get filename/directory name."""
         if self._store:
-            return self._remote_path.rstrip('/').split('/')[-1]
+            return self._remote_path.rstrip("/").split("/")[-1]
         return self._path.name
 
     @property
     def parent(self) -> "ClaimContext":
         """Get parent directory context."""
         if self._store:
-            parent_path = self._remote_path.rsplit('/', 1)[0] if '/' in self._remote_path else ''
+            parent_path = (
+                self._remote_path.rsplit("/", 1)[0] if "/" in self._remote_path else ""
+            )
             return ClaimContext(parent_path, self._store)
         return ClaimContext(self._path.parent)
 
@@ -156,7 +177,8 @@ class ClaimContext:
 
 def walk_with_identity_tracking(
     root: Path,
-    visited_identities: Set[str]
+    visited_identities: Set[str],
+    path_filter: Optional[Callable[[Path], bool]] = None,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
@@ -173,7 +195,10 @@ def walk_with_identity_tracking(
     try:
         for path in root.iterdir():
             # Skip hidden files/directories
-            if path.name.startswith('.'):
+            if path.name.startswith("."):
+                continue
+
+            if path_filter is not None and not path_filter(path):
                 continue
 
             try:
@@ -189,7 +214,11 @@ def walk_with_identity_tracking(
 
             # Recurse into real directories (not symlinks pointing to dirs)
             if path.is_dir() and not path.is_symlink():
-                yield from walk_with_identity_tracking(path, visited_identities)
+                yield from walk_with_identity_tracking(
+                    path,
+                    visited_identities,
+                    path_filter=path_filter,
+                )
     except OSError:
         # Permission issue reading directory
         pass
@@ -213,12 +242,13 @@ class SourceClaim:
     """
 
     __slots__ = (
-        'source_type',
-        'primary_path',
-        'source_id',
-        'dim_labels',
-        'extra_config',
-        'is_remote',
+        "source_type",
+        "primary_path",
+        "source_id",
+        "dim_labels",
+        "extra_config",
+        "is_remote",
+        "member_paths",
     )
 
     def __init__(
@@ -229,13 +259,20 @@ class SourceClaim:
         dim_labels: Optional[List[str]] = None,
         extra_config: Optional[dict] = None,
         is_remote: bool = False,
+        member_paths: Optional[Set[str] | List[str]] = None,
     ):
         self.source_type = source_type
-        self.primary_path = str(primary_path) if isinstance(primary_path, Path) else primary_path
+        self.primary_path = (
+            str(primary_path) if isinstance(primary_path, Path) else primary_path
+        )
         self.source_id = source_id
         self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
         self.is_remote = is_remote
+        normalized_member_paths = {self.primary_path}
+        if member_paths is not None:
+            normalized_member_paths.update(str(path) for path in member_paths)
+        self.member_paths = normalized_member_paths
 
     def __repr__(self) -> str:
         return (
@@ -282,7 +319,9 @@ class AdapterRegistry:
         self._adapters.append(cls)
         self._type_to_adapter[source_type] = cls
 
-    def get_claims_for_path(self, ctx: ClaimContext, state: DiscoveryState) -> List[SourceClaim]:
+    def get_claims_for_path(
+        self, ctx: ClaimContext, state: DiscoveryState
+    ) -> List[SourceClaim]:
         """Ask all adapters to claim this path.
 
         Each adapter's claim(ctx, state) method is called in registration order.
@@ -297,14 +336,22 @@ class AdapterRegistry:
         """
         claims = []
         for adapter_cls in self._adapters:
+            consumed_before = set(state.consumed_paths)
             try:
                 claim = adapter_cls.claim(ctx, state)
                 if claim is not None:
+                    member_paths = set(state.consumed_paths) - consumed_before
+                    member_paths.add(claim.primary_path)
+                    claim.member_paths.update(member_paths)
                     claims.append(claim)
-                    logger.debug(f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}")
+                    logger.debug(
+                        f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}"
+                    )
                     self._type_to_adapter[claim.source_type] = adapter_cls
             except Exception as e:
-                logger.debug(f"Adapter {adapter_cls.__name__} claim() raised exception: {e}")
+                logger.debug(
+                    f"Adapter {adapter_cls.__name__} claim() raised exception: {e}"
+                )
                 continue
         return claims
 
@@ -337,6 +384,7 @@ class DiscoveryState:
 
     claims: Dict[str, SourceClaim]
     path_to_source: Dict[str, str]  # Changed from Dict[Path, str]
+    source_to_paths: Dict[str, Set[str]]
     consumed_paths: Set[str]  # Changed from Set[Path]
     visited_identities: Set[str]
     on_source_added: Optional[Callable[[SourceClaim], None]]
@@ -349,6 +397,7 @@ class DiscoveryState:
     ):
         self.claims = {}
         self.path_to_source = {}
+        self.source_to_paths = {}
         self.consumed_paths = set()
         self.visited_identities = set()
         self.on_source_added = on_source_added
@@ -376,12 +425,11 @@ class DiscoveryState:
             try:
                 identity = get_file_identity(Path(path_str))
             except OSError:
-                identity = hashlib.sha256(path_str.encode('utf-8')).hexdigest()[:16]
+                identity = hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:16]
 
-        if identity in self.visited_identities:
-            return False
+        if identity not in self.visited_identities:
+            self.visited_identities.add(identity)
 
-        self.visited_identities.add(identity)
         self.consumed_paths.add(path_str)
         return True
 
@@ -397,22 +445,34 @@ class DiscoveryState:
         Returns:
             True if added, False if path already claimed
         """
-        if claim.primary_path in self.consumed_paths:
-            return False
-
         # Generate source_id if not provided
         source_id = claim.source_id or generate_source_id(
             str(claim.primary_path), claim.source_type
         )
 
+        member_paths = set(claim.member_paths)
+        member_paths.add(claim.primary_path)
+
+        existing_owner = None
+        for path in member_paths:
+            owner = self.path_to_source.get(path)
+            if owner is not None and owner != source_id:
+                existing_owner = owner
+                break
+
+        if existing_owner is not None:
+            return False
+
         # Update claim's source_id (important for callbacks)
         claim.source_id = source_id
+        claim.member_paths = member_paths
 
         # Store claim
         self.claims[source_id] = claim
-        self.path_to_source[claim.primary_path] = source_id
-        # Mark primary_path as consumed (may already be via try_claim_path)
-        self.consumed_paths.add(claim.primary_path)
+        self.source_to_paths[source_id] = member_paths
+        for path in member_paths:
+            self.path_to_source[path] = source_id
+            self.consumed_paths.add(path)
 
         # Callback
         if notify and self.on_source_added:
@@ -435,8 +495,10 @@ class DiscoveryState:
             return None
 
         claim = self.claims.pop(source_id)
-        self.path_to_source.pop(path)
-        self.consumed_paths.discard(path)
+        member_paths = self.source_to_paths.pop(source_id, set(claim.member_paths))
+        for member_path in member_paths:
+            self.path_to_source.pop(member_path, None)
+            self.consumed_paths.discard(member_path)
 
         # Callback
         if notify and self.on_source_removed:
@@ -455,6 +517,10 @@ class DiscoveryState:
     def get_all_claims(self) -> List[SourceClaim]:
         """Get all claims as a list."""
         return list(self.claims.values())
+
+    def get_paths_for_source(self, source_id: str) -> Set[str]:
+        """Get all claimed member paths for a source."""
+        return set(self.source_to_paths.get(source_id, set()))
 
 
 def generate_source_id(url: str, source_type: str) -> str:
@@ -485,6 +551,7 @@ def discover_sources(
     registry: AdapterRegistry,
     state: Optional[DiscoveryState] = None,
     dim_labels: Optional[List[str]] = None,
+    path_filter: Optional[Callable[[Path], bool]] = None,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -504,6 +571,10 @@ def discover_sources(
         state = DiscoveryState()
 
     logger.debug(f"discover_sources: scanning {root}")
+
+    if path_filter is not None and not path_filter(root):
+        logger.debug(f"discover_sources: skipping filtered root {root}")
+        return state
 
     # Get identity for root itself
     try:
@@ -526,7 +597,11 @@ def discover_sources(
 
     # Walk filesystem
     paths_scanned = 0
-    for path in walk_with_identity_tracking(root, state.visited_identities):
+    for path in walk_with_identity_tracking(
+        root,
+        state.visited_identities,
+        path_filter=path_filter,
+    ):
         paths_scanned += 1
         path_str = str(path)
         if state.is_path_claimed(path_str):
@@ -540,7 +615,9 @@ def discover_sources(
                 claim.dim_labels = dim_labels
             state.add_claim(claim)
 
-    logger.debug(f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources")
+    logger.debug(
+        f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources"
+    )
     return state
 
 
@@ -659,13 +736,17 @@ def discover_sources_async(
             profile_name = source.get("credentials_profile")
 
         if console:
-            console.print(f"[dim]Discovering sources from {url} ({i+1}/{total_sources})[/dim]")
+            console.print(
+                f"[dim]Discovering sources from {url} ({i + 1}/{total_sources})[/dim]"
+            )
 
         discovered_count = 0
 
         if is_remote:
             # Remote discovery is disabled for now
-            logger.warning(f"Remote source {url} is ignored - remote discovery is not yet enabled")
+            logger.warning(
+                f"Remote source {url} is ignored - remote discovery is not yet enabled"
+            )
         else:
             # Local discovery
             local_path = Path(url).resolve() if Path(url).exists() else None
@@ -707,7 +788,9 @@ def discover_sources_async(
                     discovered_count += 1
 
                     if console:
-                        console.print(f"[green]  ✓ {claim.source_id}[/green] ({claim.source_type})")
+                        console.print(
+                            f"[green]  ✓ {claim.source_id}[/green] ({claim.source_type})"
+                        )
 
                     if on_source_registered:
                         on_source_registered(claim.source_id, claim.source_type)
@@ -722,7 +805,9 @@ def discover_sources_async(
 
     if console:
         total_registered = len(state.claims)
-        console.print(f"[green]Discovery complete: {total_registered} sources registered[/green]")
+        console.print(
+            f"[green]Discovery complete: {total_registered} sources registered[/green]"
+        )
 
 
 def is_remote_url(url: str) -> bool:
@@ -734,5 +819,14 @@ def is_remote_url(url: str) -> bool:
     Returns:
         True if URL is remote (s3://, http://, etc.), False if local path
     """
-    remote_prefixes = ('s3://', 'gs://', 'gcs://', 'http://', 'https://', 'ftp://', 'az://', 'azure://')
+    remote_prefixes = (
+        "s3://",
+        "gs://",
+        "gcs://",
+        "http://",
+        "https://",
+        "ftp://",
+        "az://",
+        "azure://",
+    )
     return url.lower().startswith(remote_prefixes)

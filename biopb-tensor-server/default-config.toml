@@ -2,6 +2,10 @@
 host = "127.0.0.1"
 port = 8817
 log_level = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+monitor_mode = "periodic"  # periodic or off
+rescan_interval = 30.0
+stability_window = 30.0
+probe_open_files = true
 
 [compute]
 backend = "auto"

@@ -585,3 +585,46 @@ class TestListFlightsTruncation:
         assert int(info.schema.metadata[b"total_sources"]) == 10
         assert int(info.schema.metadata[b"max_sources"]) == 3
         assert info.schema.metadata[b"truncated"].decode() == "True"
+
+    def test_list_flights_uses_stable_snapshot_during_mutation(self):
+        """list_flights should not fail if sources mutate mid-iteration."""
+        from biopb_tensor_server.server import TensorFlightServer
+        import random
+
+        port = random.randint(8900, 8999)
+        server = TensorFlightServer(
+            f"grpc://localhost:{port}",
+            max_list_flights_results=10,
+        )
+
+        class MutatingAdapter(MockAdapter):
+            def __init__(self, *args, on_descriptor=None, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._on_descriptor = on_descriptor
+
+            def get_source_descriptor(self):
+                if self._on_descriptor is not None:
+                    self._on_descriptor()
+                    self._on_descriptor = None
+                return super().get_source_descriptor()
+
+        def mutate_sources():
+            server.unregister_source("test-2")
+
+        server.register_source(
+            "test-1",
+            MutatingAdapter(
+                "test-1", "/data/test1.zarr", "ome-zarr", [100, 100], "uint16",
+                on_descriptor=mutate_sources,
+            ),
+        )
+        server.register_source(
+            "test-2",
+            MockAdapter(
+                "test-2", "/data/test2.zarr", "ome-zarr", [100, 100], "uint16"
+            ),
+        )
+
+        results = list(server.list_flights(None, b""))
+
+        assert len(results) == 2

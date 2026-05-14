@@ -83,6 +83,36 @@ class TestTensorConfig:
         assert config.gpu_memory_safety_factor == 6
         assert config.gpu_min_merged_chunks == 5
 
+    def test_parse_periodic_monitor_settings(self):
+        config = parse_config({
+            'server': {
+                'monitor_mode': 'periodic',
+                'rescan_interval': 12,
+                'stability_window': 45,
+                'probe_open_files': False,
+            },
+            'sources': [],
+        })
+
+        assert config.monitor_mode == 'periodic'
+        assert config.rescan_interval == 12.0
+        assert config.stability_window == 45.0
+        assert config.probe_open_files is False
+
+    def test_parse_legacy_monitor_aliases(self):
+        config = parse_config({
+            'server': {
+                'watcher_type': 'off',
+                'poll_interval': 9,
+            },
+            'sources': [],
+        })
+
+        assert config.monitor_mode == 'off'
+        assert config.rescan_interval == 9.0
+        assert config.stability_window == 30.0
+        assert config.probe_open_files is True
+
 
 class TestComputeBackendSelection:
     """Tests for internal CPU/GPU backend heuristics."""

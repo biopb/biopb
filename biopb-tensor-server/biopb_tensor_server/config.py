@@ -232,10 +232,14 @@ class ServerConfig:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_scope_to_biopb: If True, logging level changes only affect biopb_tensor_server
                             packages, not external packages like grpc, numpy, etc.
-        watcher_type: Filesystem watcher type - "auto", "watchdog", or "pollvfs"
-            "auto": Auto-detect based on filesystem (NFS uses pollvfs, local uses watchdog)
-            "watchdog": Force inotify-based watcher (local filesystems only)
-            "pollvfs": Force polling-based watcher (for NFS/network mounts)
+        monitor_mode: Directory monitoring mode.
+            "periodic": Run periodic rescans for monitored local directories.
+            "off": Disable background rescans after initial discovery.
+        rescan_interval: Seconds between background rescan attempts.
+        stability_window: Minimum quiet period before a path/subtree is eligible
+            for discovery or removal checks.
+        probe_open_files: When True, verify candidate files can be opened for append
+            before considering them stable.
         writable: Enable write mode for source creation and data upload
         write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
@@ -253,8 +257,10 @@ class ServerConfig:
     gpu_min_linear_input_mb: float = 2.0
     gpu_memory_safety_factor: int = 4
     gpu_min_merged_chunks: int = 4
-    watcher_type: str = "auto"
-    poll_interval: float = 30.0  # Polling interval for pollvfs watcher (seconds)
+    monitor_mode: str = "periodic"
+    rescan_interval: float = 30.0
+    stability_window: float = 30.0
+    probe_open_files: bool = True
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -303,8 +309,17 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     port = server_data.get("port", 8815)
     log_level = server_data.get("log_level", "INFO")
     log_scope_to_biopb = server_data.get("log_scope_to_biopb", True)
-    watcher_type = server_data.get("watcher_type", "auto")
-    poll_interval = server_data.get("poll_interval", 30.0)
+    monitor_mode = server_data.get("monitor_mode")
+    if monitor_mode is None:
+        legacy_watcher_type = server_data.get("watcher_type", "auto")
+        monitor_mode = "off" if legacy_watcher_type == "off" else "periodic"
+
+    rescan_interval = server_data.get("rescan_interval")
+    if rescan_interval is None:
+        rescan_interval = server_data.get("poll_interval", 30.0)
+
+    stability_window = server_data.get("stability_window", 30.0)
+    probe_open_files = server_data.get("probe_open_files", True)
     writable = server_data.get("writable", False)
     write_dir_str = server_data.get("write_dir", None)
     write_dir = Path(write_dir_str) if write_dir_str else None
@@ -407,8 +422,10 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         port=port,
         log_level=log_level,
         log_scope_to_biopb=log_scope_to_biopb,
-        watcher_type=watcher_type,
-        poll_interval=float(poll_interval),
+        monitor_mode=monitor_mode,
+        rescan_interval=float(rescan_interval),
+        stability_window=float(stability_window),
+        probe_open_files=bool(probe_open_files),
         compute_backend=compute_backend,
         gpu_min_input_mb=float(gpu_min_input_mb),
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),

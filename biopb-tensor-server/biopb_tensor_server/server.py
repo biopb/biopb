@@ -17,8 +17,9 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
+import threading
 import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection
@@ -91,7 +92,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
     def __init__(
         self,
-        location: str = 'grpc://0.0.0.0:8815',
+        location: str = "grpc://0.0.0.0:8815",
         token: Optional[str] = None,
         writable: bool = False,
         write_dir: Optional[Path] = None,
@@ -114,6 +115,7 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)
         self._sources: Dict[str, SourceAdapter] = {}
+        self._sources_lock = threading.RLock()
         self._writable = writable
         self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
@@ -127,7 +129,8 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id: Unique identifier for the data source
             adapter: Source adapter for the data source
         """
-        self._sources[source_id] = adapter
+        with self._sources_lock:
+            self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
 
     def unregister_source(self, source_id: str) -> None:
@@ -136,8 +139,19 @@ class TensorFlightServer(flight.FlightServerBase):
         Args:
             source_id: Unique identifier for the data source
         """
-        self._sources.pop(source_id, None)
+        with self._sources_lock:
+            self._sources.pop(source_id, None)
         logger.debug(f"Unregistered source: {source_id}")
+
+    def _get_source_adapter(self, source_id: str) -> Optional[SourceAdapter]:
+        """Thread-safe source lookup."""
+        with self._sources_lock:
+            return self._sources.get(source_id)
+
+    def _get_sources_snapshot(self) -> List[Tuple[str, SourceAdapter]]:
+        """Return a stable snapshot of registered sources for iteration."""
+        with self._sources_lock:
+            return list(self._sources.items())
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
@@ -161,11 +175,8 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return bounds.SerializeToString()
 
-
     def _get_adapter_for_tensor(
-        self,
-        source_id: str,
-        tensor_id: str
+        self, source_id: str, tensor_id: str
     ) -> Optional[TensorAdapter]:
         """Get adapter for a specific tensor within a source.
 
@@ -176,12 +187,11 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self._sources.get(source_id)
+        source_adapter = self._get_source_adapter(source_id)
         if source_adapter is None:
             return None
 
         return source_adapter.get_tensor_adapter(tensor_id)
-
 
     def _get_adapter_for_chunk(self, chunk_id: bytes) -> Optional[TensorAdapter]:
         """Get adapter for a specific chunk based on its chunk_id.
@@ -191,17 +201,17 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Returns:
             TensorAdapter responsible for the chunk, or None if not found
-        """ 
+        """
         array_id, *_ = decode_chunk_id(chunk_id)
-        source_id, *rest = array_id.split('/')
-        rest = '/'.join(rest) if rest else None
+        source_id, *rest = array_id.split("/")
+        rest = "/".join(rest) if rest else None
 
-        source_adapter = self._sources.get(source_id)
+        source_adapter = self._get_source_adapter(source_id)
         if source_adapter is None:
             return None
 
         # Check for level adapter (OME-Zarr) only when there's an explicit level path
-        if rest is not None and hasattr(source_adapter, 'get_level_adapter'):
+        if rest is not None and hasattr(source_adapter, "get_level_adapter"):
             return source_adapter.get_level_adapter(rest)
 
         # Otherwise get tensor adapter (for virtual scaling or single-tensor sources)
@@ -238,19 +248,17 @@ class TensorFlightServer(flight.FlightServerBase):
             uptime_seconds = int(time.time() - self._start_time)
             health_status = {
                 "status": "SERVING",
-                "source_count": len(self._sources),
+                "source_count": len(self._get_sources_snapshot()),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
             }
-            yield json.dumps(health_status).encode('utf-8')
+            yield json.dumps(health_status).encode("utf-8")
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
     def list_flights(
-        self,
-        context: flight.ServerCallContext,
-        criteria: bytes
+        self, context: flight.ServerCallContext, criteria: bytes
     ) -> Iterator[flight.FlightInfo]:
         """List all available data sources.
 
@@ -266,7 +274,8 @@ class TensorFlightServer(flight.FlightServerBase):
         Yields:
             FlightInfo for each registered data source (up to max_list_flights_results)
         """
-        total_sources = len(self._sources)
+        source_items = self._get_sources_snapshot()
+        total_sources = len(source_items)
         max_sources = self._max_list_flights_results
         returned_count = min(total_sources, max_sources)
         truncated = total_sources > max_sources
@@ -278,14 +287,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Build base schema metadata for truncation signaling
         base_metadata = {
-            b'total_sources': str(total_sources).encode(),
-            b'max_sources': str(max_sources).encode(),
-            b'returned_sources': str(returned_count).encode(),
-            b'truncated': str(truncated).encode(),
+            b"total_sources": str(total_sources).encode(),
+            b"max_sources": str(max_sources).encode(),
+            b"returned_sources": str(returned_count).encode(),
+            b"truncated": str(truncated).encode(),
         }
 
         count = 0
-        for source_id, adapter in self._sources.items():
+        for source_id, adapter in source_items:
             if count >= max_sources:
                 break
 
@@ -301,7 +310,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Create a single endpoint for listing (no specific tensor selected)
             endpoint = flight.FlightEndpoint(
-                ticket=flight.Ticket(b''),  # Empty ticket for listing
+                ticket=flight.Ticket(b""),  # Empty ticket for listing
                 locations=[],
             )
 
@@ -315,9 +324,7 @@ class TensorFlightServer(flight.FlightServerBase):
             count += 1
 
     def get_flight_info(
-        self,
-        context: flight.ServerCallContext,
-        descriptor: flight.FlightDescriptor
+        self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
     ) -> flight.FlightInfo:
         """Get metadata and chunk endpoints for a tensor.
 
@@ -334,7 +341,9 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Check for metadata query first
         if selection.metadata_query:
-            logger.debug(f"get_flight_info: metadata_query={selection.metadata_query[:100]}...")
+            logger.debug(
+                f"get_flight_info: metadata_query={selection.metadata_query[:100]}..."
+            )
             if self._metadata_db is None:
                 raise flight.FlightServerError(
                     "Metadata database not enabled. Set metadata_db config to enable SQL queries."
@@ -346,10 +355,16 @@ class TensorFlightServer(flight.FlightServerBase):
         )
 
         # Get tensor adapter for the specified source and tensor
-        tensor_adapter = self._get_adapter_for_tensor(selection.source_id, selection.tensor_id)
+        tensor_adapter = self._get_adapter_for_tensor(
+            selection.source_id, selection.tensor_id
+        )
         if tensor_adapter is None:
-            logger.warning(f"Tensor not found: {selection.source_id}/{selection.tensor_id}")
-            raise flight.FlightServerError(f"Tensor not found: {selection.source_id}/{selection.tensor_id}")
+            logger.warning(
+                f"Tensor not found: {selection.source_id}/{selection.tensor_id}"
+            )
+            raise flight.FlightServerError(
+                f"Tensor not found: {selection.source_id}/{selection.tensor_id}"
+            )
 
         # Build request descriptor for the specific tensor
         base_desc = tensor_adapter.get_tensor_descriptor()
@@ -360,10 +375,12 @@ class TensorFlightServer(flight.FlightServerBase):
             chunk_shape=base_desc.chunk_shape,
             dtype=base_desc.dtype,
         )
-        if selection.HasField('slice_hint'):
+        if selection.HasField("slice_hint"):
             tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
-            logger.debug(f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}")
-        if selection.HasField('read_options'):
+            logger.debug(
+                f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}"
+            )
+        if selection.HasField("read_options"):
             tensor_desc.read_options.CopyFrom(selection.read_options)
 
         read_plan = tensor_adapter.get_read_plan(tensor_desc)
@@ -388,16 +405,16 @@ class TensorFlightServer(flight.FlightServerBase):
         logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
         return flight.FlightInfo(
             schema=schema,
-            descriptor=flight.FlightDescriptor.for_command(read_plan.descriptor.SerializeToString()),
+            descriptor=flight.FlightDescriptor.for_command(
+                read_plan.descriptor.SerializeToString()
+            ),
             endpoints=endpoints,
             total_records=-1,
             total_bytes=-1,
         )
 
     def do_get(
-        self,
-        context: flight.ServerCallContext,
-        ticket: flight.Ticket
+        self, context: flight.ServerCallContext, ticket: flight.Ticket
     ) -> flight.FlightDataStream:
         """Fetch a chunk's data or metadata query result.
 
@@ -418,7 +435,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError("Metadata database not enabled")
             result = self._metadata_db.get_pending_result(ticket_id)
             if result is None:
-                raise flight.FlightServerError(f"Metadata query result not found: {ticket_id}")
+                raise flight.FlightServerError(
+                    f"Metadata query result not found: {ticket_id}"
+                )
             return flight.RecordBatchStream(result)
 
         tensor_ticket = self._parse_ticket(ticket)
@@ -426,7 +445,9 @@ class TensorFlightServer(flight.FlightServerBase):
 
         adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
         if adapter is None:
-            raise flight.FlightServerError(f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}...")
+            raise flight.FlightServerError(
+                f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}..."
+            )
 
         # Get cache manager singleton (if initialized)
         cache_manager = CacheManager.get_instance()
@@ -479,9 +500,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(f"Invalid upload command: {e}")
 
     def _handle_create_source(
-        self,
-        req_desc: TensorDescriptor,
-        writer: flight.FlightMetadataWriter
+        self, req_desc: TensorDescriptor, writer: flight.FlightMetadataWriter
     ) -> None:
         """Create source from TensorDescriptor.
 
@@ -497,15 +516,19 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         array_id = req_desc.array_id
 
-        if array_id.startswith('cache:'):
+        if array_id.startswith("cache:"):
             # Cache-backed source
             provided_name = array_id[6:]  # After 'cache:'
             if provided_name:
-                source_id = f"cache_{hashlib.sha256(provided_name.encode()).hexdigest()[:12]}"
+                source_id = (
+                    f"cache_{hashlib.sha256(provided_name.encode()).hexdigest()[:12]}"
+                )
             else:
                 source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
 
-            ome_metadata = json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
+            ome_metadata = (
+                json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
+            )
 
             adapter = CachedSourceAdapter(
                 source_id=source_id,
@@ -519,15 +542,20 @@ class TensorFlightServer(flight.FlightServerBase):
 
             logger.info(f"Created cache-backed source: {source_id}")
 
-        elif array_id.startswith('ome_zarr:'):
+        elif array_id.startswith("ome_zarr:"):
             # Zarr-backed source
             import zarr
 
             provided_name = array_id[9:]  # After 'ome_zarr:'
-            zarr_name = provided_name or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+            zarr_name = (
+                provided_name
+                or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
+            )
 
             if self._write_dir is None:
-                raise flight.FlightServerError("write_dir not configured for zarr-backed sources")
+                raise flight.FlightServerError(
+                    "write_dir not configured for zarr-backed sources"
+                )
 
             zarr_path = self._write_dir / f"{zarr_name}.zarr"
             zarr_path.mkdir(parents=True, exist_ok=True)
@@ -546,19 +574,25 @@ class TensorFlightServer(flight.FlightServerBase):
             else:
                 zattrs = self._build_minimal_ome_metadata(req_desc)
 
-            with open(zarr_path / '.zattrs', 'w') as f:
+            with open(zarr_path / ".zattrs", "w") as f:
                 json.dump(zattrs, f)
 
             source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
 
-            adapter = OmeZarrAdapter(arr, source_id, list(req_desc.dim_labels) if req_desc.dim_labels else None)
+            adapter = OmeZarrAdapter(
+                arr,
+                source_id,
+                list(req_desc.dim_labels) if req_desc.dim_labels else None,
+            )
 
             self.register_source(source_id, adapter)
 
             logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
 
         else:
-            raise flight.FlightServerError(f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix")
+            raise flight.FlightServerError(
+                f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix"
+            )
 
         # Return TensorDescriptor with actual source_id via writer
         response_desc = TensorDescriptor(
@@ -571,9 +605,7 @@ class TensorFlightServer(flight.FlightServerBase):
         writer.write(response_desc.SerializeToString())
 
     def _handle_chunk_upload(
-        self,
-        upload: ChunkUpload,
-        reader: flight.MetadataRecordBatchReader
+        self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
     ) -> None:
         """Write chunk data.
 
@@ -590,7 +622,7 @@ class TensorFlightServer(flight.FlightServerBase):
         bounds = upload.bounds
 
         # Check chunk alignment for OmeZarr-backed sources
-        if hasattr(adapter, 'zarr_array'):
+        if hasattr(adapter, "zarr_array"):
             desc = adapter.get_tensor_descriptor()
             chunk_shape = list(desc.chunk_shape)
 
@@ -602,7 +634,9 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
 
             # Verify chunk size matches (or is edge chunk)
-            actual_size = [stop - start for start, stop in zip(bounds.start, bounds.stop)]
+            actual_size = [
+                stop - start for start, stop in zip(bounds.start, bounds.stop)
+            ]
             for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
                 if actual != expected and actual > expected:
                     raise flight.FlightServerError(
@@ -611,7 +645,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Convert bounds to chunk_idx for zarr
             chunk_idx = tuple(int(s // cs) for s, cs in zip(bounds.start, chunk_shape))
-            if hasattr(adapter, 'write_chunk'):
+            if hasattr(adapter, "write_chunk"):
                 adapter.write_chunk(chunk_idx, data)
             else:
                 raise flight.FlightServerError(f"Source does not support writes")
@@ -623,42 +657,49 @@ class TensorFlightServer(flight.FlightServerBase):
         else:
             raise flight.FlightServerError(f"Source type does not support writes")
 
-        logger.debug(f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}")
+        logger.debug(
+            f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
+        )
 
     def _build_minimal_ome_metadata(self, desc: TensorDescriptor) -> dict:
         """Build minimal OME-Zarr metadata from TensorDescriptor."""
-        dim_labels = list(desc.dim_labels) if desc.dim_labels else [f"dim{i}" for i in range(len(desc.shape))]
+        dim_labels = (
+            list(desc.dim_labels)
+            if desc.dim_labels
+            else [f"dim{i}" for i in range(len(desc.shape))]
+        )
 
         axes = []
         for i, label in enumerate(dim_labels):
-            if label.lower() in ('x', 'y', 'z'):
-                axes.append({'name': label, 'type': 'space'})
-            elif label.lower() in ('c', 'channel'):
-                axes.append({'name': label, 'type': 'channel'})
-            elif label.lower() in ('t', 'time'):
-                axes.append({'name': label, 'type': 'time'})
+            if label.lower() in ("x", "y", "z"):
+                axes.append({"name": label, "type": "space"})
+            elif label.lower() in ("c", "channel"):
+                axes.append({"name": label, "type": "channel"})
+            elif label.lower() in ("t", "time"):
+                axes.append({"name": label, "type": "time"})
             else:
-                axes.append({'name': label})
+                axes.append({"name": label})
 
         return {
-            'multiscales': [{
-                'version': '0.4',
-                'axes': axes,
-                'datasets': [{
-                    'path': '0',
-                    'coordinateTransformations': [{
-                        'type': 'scale',
-                        'scale': [1.0] * len(desc.shape)
-                    }]
-                }]
-            }]
+            "multiscales": [
+                {
+                    "version": "0.4",
+                    "axes": axes,
+                    "datasets": [
+                        {
+                            "path": "0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [1.0] * len(desc.shape)}
+                            ],
+                        }
+                    ],
+                }
+            ]
         }
 
 
 def serve(
-    adapters: Dict[str, SourceAdapter],
-    location: str = 'grpc://0.0.0.0:8815',
-    **kwargs
+    adapters: Dict[str, SourceAdapter], location: str = "grpc://0.0.0.0:8815", **kwargs
 ) -> None:
     """Start a Flight server with the given adapters.
 

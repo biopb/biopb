@@ -1,28 +1,7 @@
-"""Source lifecycle manager for tensor store catalog.
+"""Source lifecycle manager for the periodic catalog rescan runtime.
 
-Coordinates filesystem watcher, discovery protocol, and server catalog updates.
-Handles dynamic source registration/unregistration when files are added or
-deleted in monitored directories.
-
-Thread Safety:
-- All server updates (register/unregister) are serialized via a thread-safe queue
-- DiscoveryState mutations are protected by a lock
-- Callbacks are invoked from the event processing thread, not watcher subprocess
-
-Architecture:
-- SourceManager runs event loop in separate thread
-- Events arrive from watcher subprocess via multiprocessing.Queue
-- Server updates are batched and applied atomically
-
-Move Handling:
-- Moves WITHIN monitored directory: preserve source_id, update path
-- Moves OUT OF monitored directory: treat as delete
-- Moves INTO monitored directory: treat as create with new source_id
-
-Remote Sources:
-- Remote sources (s3://, gs://, etc.) are NOT monitored
-- Remote sources are registered during initial discovery only
-- No filesystem events for remote URLs (static after discovery)
+Coordinates the periodic rescan watcher, discovery state, server catalog updates,
+and metadata database synchronization for monitored local directories.
 """
 
 from __future__ import annotations
@@ -31,16 +10,14 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
-    ClaimContext,
     DiscoveryState,
     SourceClaim,
     discover_sources,
-    get_file_identity,
     is_remote_url,
 )
 from biopb_tensor_server.watcher import (
@@ -56,35 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class SourceManager:
-    """Manages dynamic source registration/unregistration.
-
-    Coordinates:
-    - Filesystem watcher (subprocess sending events)
-    - DiscoveryState (claim tracking with callbacks)
-    - TensorFlightServer (register/unregister sources)
-    - AdapterRegistry (create adapters for new sources)
-
-    The manager runs an event processing loop in a background thread,
-    receiving debounced events from the watcher and updating the catalog.
-
-    Remote Sources:
-    - Remote sources are registered during discovery but NOT monitored
-    - is_path_claimed() checks string paths (works for remote URLs)
-    - _on_source_added() uses credentials_config for remote adapters
-
-    Args:
-        server: TensorFlightServer instance for source registration
-        registry: AdapterRegistry for adapter creation
-        discovery_state: DiscoveryState for claim tracking
-        watcher: DirectoryWatcher for filesystem events
-        credentials_config: CredentialsConfig for remote storage authentication
-
-    Example:
-        manager = SourceManager(server, registry, state, watcher)
-        manager.start()
-        # ... server runs ...
-        manager.stop()
-    """
+    """Manages periodic rescans and source lifecycle reconciliation."""
 
     def __init__(
         self,
@@ -95,6 +44,8 @@ class SourceManager:
         monitored_dirs: Set[Path],
         dim_labels: Optional[List[str]] = None,
         credentials_config: Optional[Any] = None,
+        stability_window: float = 30.0,
+        probe_open_files: bool = True,
     ):
         self._server = server
         self._registry = registry
@@ -103,6 +54,8 @@ class SourceManager:
         self._monitored_dirs = monitored_dirs
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
+        self._stability_window = stability_window
+        self._probe_open_files = probe_open_files
 
         # Thread management
         self._thread: Optional[threading.Thread] = None
@@ -111,22 +64,21 @@ class SourceManager:
         # Directory delete handling re-enters helper paths that also need it.
         self._lock = threading.RLock()
 
-        # Pending file tracking for write completion
-        # Maps path -> (path, first_seen_timestamp, is_directory)
-        self._pending_creates: Dict[str, Tuple[Path, float, bool]] = {}
-        self._closed_timeout: float = 60.0  # Max wait for CLOSED after CREATED
-
         # Path tracking for move handling
         # Maps resolved path -> source_id (str keys for URL support)
         self._path_to_source_id: Dict[str, str] = {}
+        # Cached filesystem signatures for stability and change detection.
+        # path -> (is_directory, signature_tuple, last_changed_epoch)
+        self._entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        # source_id -> member path signature map used to detect in-place changes.
+        self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
             self._path_to_source_id[claim.primary_path] = source_id
 
-        # Set up discovery callbacks
-        self._state.on_source_added = self._on_source_added
-        self._state.on_source_removed = self._on_source_removed
+        self._state.on_source_added = None
+        self._state.on_source_removed = None
 
     def start(self) -> None:
         """Start the event processing loop."""
@@ -159,13 +111,7 @@ class SourceManager:
         return self._running and (self._thread is not None and self._thread.is_alive())
 
     def _event_loop(self) -> None:
-        """Process watcher events and update catalog.
-
-        This loop runs in a background thread:
-        1. Poll watcher for events (debounced by watcher)
-        2. Process each event (create/delete/move)
-        3. Update DiscoveryState and server catalog
-        """
+        """Process periodic rescan triggers from the watcher."""
         while self._running:
             try:
                 events = self._watcher.get_events(timeout=0.5)
@@ -174,9 +120,6 @@ class SourceManager:
                     for event in events:
                         self._process_event(event)
 
-                # Cleanup expired pending files
-                self._cleanup_expired_pending()
-
             except Exception as e:
                 logger.error(f"Error processing events: {e}", exc_info=True)
 
@@ -184,391 +127,281 @@ class SourceManager:
             time.sleep(0.1)
 
     def _process_event(self, event: WatcherEvent) -> None:
-        """Handle a filesystem event.
-
-        Args:
-            event: WatcherEvent from the watcher
-        """
+        """Handle a watcher event."""
         try:
             logger.debug(f"Processing event: {event.event_type.value} {event.path}")
-            if event.event_type == WatcherEventType.CLOSED:
-                # File closed after write - ready for registration
-                self._handle_closed(event.path)
-            elif event.event_type == WatcherEventType.CREATED:
-                self._handle_created(event.path, event.is_directory)
-            elif event.event_type == WatcherEventType.DELETED:
-                self._handle_deleted(event.path, event.is_directory)
-            elif event.event_type == WatcherEventType.MOVED:
-                self._handle_moved(event.path, event.old_path, event.is_directory)
+            if event.event_type == WatcherEventType.RESCAN:
+                self._handle_rescan()
+            else:
+                logger.debug(
+                    "Ignoring unsupported watcher event type: %s",
+                    event.event_type.value,
+                )
         except Exception as e:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
-    def _handle_created(self, path: Path, is_directory: bool) -> None:
-        """Handle file/directory creation.
-
-        For files: Queue pending CLOSED event (file write completion).
-        For directories: Process immediately (directories don't have close events).
-
-        Args:
-            path: Path to created file/directory
-            is_directory: True if path is a directory
-        """
-        resolved_path = path.resolve()
-        path_str = str(resolved_path)
-
-        with self._lock:
-            # Skip if already claimed
-            if self._state.is_path_claimed(path_str):
-                return
-
-            # Skip hidden paths
-            if resolved_path.name.startswith("."):
-                return
-
-            # For directories, process immediately (no close event)
-            if is_directory:
-                should_process_stable = True
-            else:
-                # For files, queue pending CLOSED event
-                # CLOSED event indicates write completion (close_write in inotify)
-                self._pending_creates[path_str] = (resolved_path, time.time(), False)
-                should_process_stable = False
-
-        if should_process_stable:
-            self._handle_created_stable(path, is_directory)
+    def _handle_rescan(self) -> None:
+        """Run one periodic rescan across monitored directories."""
+        if not self._monitored_dirs:
             return
 
-        logger.debug(f"File created, waiting for closed event: {path}")
-
-    def _handle_closed(self, path: Path) -> None:
-        """Handle file close event (write completed).
-
-        Process files that were queued waiting for CLOSED event.
-
-        Args:
-            path: Path to closed file
-        """
-        resolved_path = path.resolve()
-        path_str = str(resolved_path)
-
-        should_process_stable = False
-        log_closed = False
-        with self._lock:
-            # Check if this was a pending create
-            if path_str in self._pending_creates:
-                self._pending_creates.pop(path_str)
-                should_process_stable = True
-                log_closed = True
-            else:
-                # CLOSED without pending CREATED - might be a reopened existing file
-                # Try to claim if not already claimed
-                if not self._state.is_path_claimed(path_str):
-                    should_process_stable = True
-
-        if log_closed:
-            logger.debug(f"File closed after write: {path}")
-        elif should_process_stable:
-            logger.debug(f"Closed event for non-pending file: {path}")
-
-        if should_process_stable:
-            self._handle_created_stable(path, False)
-
-    def _handle_created_stable(self, path: Path, is_directory: bool) -> None:
-        """Process a file/directory that is confirmed stable/ready.
-
-        This is the actual claiming logic, called after write completion is confirmed.
-
-        Args:
-            path: Path to process (already resolved)
-            is_directory: True if path is a directory
-        """
-        resolved_path = path if isinstance(path, Path) else Path(path)
-        path_str = str(resolved_path)
-
-        # Get identity for deduplication
-        try:
-            identity = get_file_identity(resolved_path)
-        except OSError:
-            return
-
-        with self._lock:
-            # Skip if already claimed
-            if self._state.is_path_claimed(path_str):
-                return
-
-            # Skip hidden paths
-            if resolved_path.name.startswith("."):
-                return
-
-            if identity in self._state.visited_identities:
-                return
-            self._state.visited_identities.add(identity)
-
-        # Try to claim
-        ctx = ClaimContext(resolved_path)
-        claims = self._registry.get_claims_for_path(ctx, self._state)
-
-        if claims:
-            claim = claims[0]
-            if self._dim_labels and claim.dim_labels is None:
-                claim.dim_labels = self._dim_labels
-
-            # Add to discovery state, then notify outside the manager lock.
-            with self._lock:
-                added = self._state.add_claim(claim, notify=False)
-            if added:
-                self._notify_source_added(claim)
-            logger.info(f"Added source: {claim.source_id} at {claim.primary_path}")
-
-    def _cleanup_expired_pending(self) -> None:
-        """Remove pending creates that timed out (no CLOSED event).
-
-        For timed-out files, fallback to stability check and process if stable.
-        This handles cases where CLOSED event was not emitted (e.g., PollVFSWatcher).
-        """
-        current_time = time.time()
-        expired = []
-        stable = []
-
-        with self._lock:
-            pending_items = list(self._pending_creates.items())
-
-        for path_str, (path, timestamp, is_dir) in pending_items:
-            if current_time - timestamp > self._closed_timeout:
-                expired.append((path_str, path, is_dir))
-                logger.warning(f"Pending create timed out (no closed event): {path}")
-                continue
-
-            # Fallback stability check for files that might be ready
-            # (for PollVFSWatcher or if CLOSED event was missed)
-            if not is_dir and self._check_file_stable(path):
-                stable.append((path_str, path, is_dir))
-
-        # Process stable files
-        for path_str, path, is_dir in stable:
-            with self._lock:
-                self._pending_creates.pop(path_str, None)
-            logger.debug(f"Pending file now stable: {path}")
-            try:
-                self._handle_created_stable(path, is_dir)
-            except Exception as e:
-                logger.error(f"Failed to process stable pending file {path}: {e}")
-
-        # Remove expired (without processing - file may have been deleted)
-        for path_str, path, is_dir in expired:
-            with self._lock:
-                self._pending_creates.pop(path_str, None)
-
-    def _check_file_stable(self, path: Path, stability_window: float = 2.0) -> bool:
-        """Check if file is stable (not being actively written).
-
-        Fallback for platforms/filesystems that don't emit CLOSED events.
-        Uses mtime age + open check to ensure file handle is released (NFS safety).
-
-        Args:
-            path: Path to check
-            stability_window: Seconds for mtime age check
-
-        Returns:
-            True if file appears stable and handle is released
-        """
-        try:
-            stat1 = path.stat()
-            # Check if file is old enough to likely be stable
-            age = time.time() - stat1.st_mtime
-            if age < stability_window:
-                return False
-
-            # Try to open file in append mode to ensure handle is released
-            # This catches NFS "glitch" writes where file appears stable
-            # but is still held by a writing process
-            try:
-                with open(path, "a"):
-                    pass  # Open/close succeeds = handle released
-            except (IOError, OSError) as e:
-                # File may be locked or still being written
-                logger.debug(f"File handle not released: {path} ({e})")
-                return False
-
-            return True
-        except OSError:
-            # File disappeared or permission issue
-            return False
-
-    def _handle_deleted(self, path: Path, is_directory: bool) -> None:
-        """Handle file/directory deletion.
-
-        For files: Remove the source if path matches a claim.
-        For directories: Remove all sources inside the directory.
-
-        Args:
-            path: Path to deleted file/directory
-            is_directory: True if path is a directory
-        """
-        resolved_path = str(path.resolve())
-
-        if is_directory:
-            # Cascade deletion - remove all sources inside this directory
-            self._handle_directory_deleted(Path(path.resolve()))
-        else:
-            # Single file deletion
-            with self._lock:
-                source_id = self._state.get_source_for_path(resolved_path)
-                if source_id:
-                    self._state.remove_claim(resolved_path, notify=False)
-            if source_id:
-                self._notify_source_removed(source_id)
-                logger.info(f"Removed source: {source_id} at {path}")
-
-    def _handle_directory_deleted(self, directory: Path) -> None:
-        """Remove all sources inside a deleted directory.
-
-        Args:
-            directory: Path to deleted directory
-        """
-        # Find all claims with paths inside this directory
-        removed_ids = []
-        with self._lock:
-            for source_id, claim in list(self._state.claims.items()):
-                # Check if primary_path is inside the deleted directory
-                try:
-                    claim_path = Path(claim.primary_path)
-                    if claim_path.is_relative_to(directory):
-                        # This claim is inside the deleted directory
-                        self._state.remove_claim(claim.primary_path, notify=False)
-                        removed_ids.append(source_id)
-                except OSError:
-                    # Path no longer exists - check by string comparison
-                    if str(directory) in claim.primary_path:
-                        self._state.remove_claim(claim.primary_path, notify=False)
-                        removed_ids.append(source_id)
-
-        for source_id in removed_ids:
-            self._notify_source_removed(source_id)
-
-        if removed_ids:
-            logger.info(
-                f"Removed {len(removed_ids)} sources from deleted directory: {directory}"
+        self._refresh_entry_state()
+        discovered_state = DiscoveryState()
+        for monitored_dir in sorted(self._monitored_dirs):
+            discover_sources(
+                monitored_dir,
+                self._registry,
+                state=discovered_state,
+                dim_labels=self._dim_labels,
+                path_filter=self._should_scan_path,
             )
 
-    def _handle_moved(
+        unstable_paths = self._get_unstable_paths()
+        self._reconcile_discovered_state(discovered_state, unstable_paths)
+
+    def _refresh_entry_state(self) -> None:
+        """Refresh cached filesystem signatures for all monitored trees."""
+        now = time.time()
+        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        for monitored_dir in sorted(self._monitored_dirs):
+            self._scan_tree_state(monitored_dir.resolve(), now, next_state)
+        self._entry_state = next_state
+
+    def _scan_tree_state(
         self,
-        old_path: Path,
-        new_path: Path,
-        is_directory: bool,
+        path: Path,
+        now: float,
+        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
     ) -> None:
-        """Handle file/directory move.
+        """Capture the current filesystem signature state for one subtree."""
+        try:
+            resolved_path = path.resolve(strict=False)
+            if resolved_path.name.startswith("."):
+                return
 
-        Move semantics:
-        - Within monitored directory: preserve source_id, update paths
-        - Out of monitored directory: treat as delete
-        - Into monitored directory: treat as create
+            stat_result = resolved_path.stat()
+            is_directory = resolved_path.is_dir()
+        except OSError:
+            return
 
-        Args:
-            old_path: Original path before move
-            new_path: New path after move
-            is_directory: True if path is a directory
-        """
-        resolved_old = old_path.resolve()
-        resolved_new = new_path.resolve()
+        path_str = str(resolved_path)
+        signature = self._build_entry_signature(stat_result, is_directory)
+        previous_entry = self._entry_state.get(path_str)
+        last_changed = now
+        if previous_entry is not None and previous_entry[:2] == (
+            is_directory,
+            signature,
+        ):
+            last_changed = previous_entry[2]
+        next_state[path_str] = (is_directory, signature, last_changed)
 
-        # Check if move is within monitored directories
-        old_in_monitored = any(
-            resolved_old.is_relative_to(d) for d in self._monitored_dirs
-        )
-        new_in_monitored = any(
-            resolved_new.is_relative_to(d) for d in self._monitored_dirs
-        )
+        if not is_directory or resolved_path.is_symlink():
+            return
 
-        if old_in_monitored and new_in_monitored:
-            # Move within monitored area - preserve source_id
-            self._handle_move_within(resolved_old, resolved_new, is_directory)
-        elif old_in_monitored and not new_in_monitored:
-            # Move out of monitored area - treat as delete
-            self._handle_deleted(old_path, is_directory)
-        elif not old_in_monitored and new_in_monitored:
-            # Move into monitored area - treat as create
-            self._handle_created(new_path, is_directory)
-        else:
-            # Move between unmonitored areas - ignore
-            pass
+        try:
+            for child in resolved_path.iterdir():
+                self._scan_tree_state(child, now, next_state)
+        except OSError:
+            return
 
-    def _handle_move_within(
+    def _build_entry_signature(
         self,
-        old_path: Path,
-        new_path: Path,
+        stat_result: Any,
         is_directory: bool,
-    ) -> None:
-        """Handle move within monitored directory - preserve source_id.
+    ) -> Tuple[Any, ...]:
+        """Build a stable signature tuple for a file or directory."""
+        if is_directory:
+            return (
+                stat_result.st_dev,
+                stat_result.st_ino,
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+            )
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
 
-        Args:
-            old_path: Original resolved path
-            new_path: New resolved path
-            is_directory: True if path is a directory
-        """
-        removed_source_id = None
-        added_claim = None
+    def _should_scan_path(self, path: Path) -> bool:
+        """Return True when a path is stable enough to participate in discovery."""
+        try:
+            resolved_path = path.resolve(strict=False)
+        except OSError:
+            return False
+
+        if resolved_path.name.startswith("."):
+            return False
+
+        entry = self._entry_state.get(str(resolved_path))
+        if entry is None:
+            return False
+
+        age = time.time() - entry[2]
+        if age < self._stability_window:
+            return False
+
+        if not entry[0] and self._probe_open_files:
+            return self._can_open_for_append(resolved_path)
+
+        return True
+
+    def _can_open_for_append(self, path: Path) -> bool:
+        """Best-effort check that a file handle is no longer actively held."""
+        try:
+            with open(path, "a"):
+                return True
+        except OSError:
+            return False
+
+    def _get_unstable_paths(self) -> List[Path]:
+        """Return unstable files/directories observed in the latest refresh."""
+        now = time.time()
+        unstable = []
+        for path_str, (_, _, last_changed) in self._entry_state.items():
+            if now - last_changed < self._stability_window:
+                unstable.append(Path(path_str))
+        return unstable
+
+    def _reconcile_discovered_state(
+        self,
+        discovered_state: DiscoveryState,
+        unstable_paths: List[Path],
+    ) -> None:
+        """Apply add/remove/update diffs between the current and discovered states."""
+        with self._lock:
+            current_claims = {
+                source_id: claim
+                for source_id, claim in self._state.claims.items()
+                if self._is_monitored_claim(claim)
+            }
+
+        discovered_claims = discovered_state.claims
+        current_ids = set(current_claims)
+        discovered_ids = set(discovered_claims)
+
+        changed_ids: Set[str] = set()
+        for source_id in current_ids & discovered_ids:
+            new_signatures = self._build_claim_signatures(discovered_claims[source_id])
+            existing_signatures = self._source_signatures.get(source_id)
+            if existing_signatures is None:
+                self._source_signatures[source_id] = new_signatures
+                continue
+            if existing_signatures != new_signatures:
+                changed_ids.add(source_id)
+
+        removed_ids = [
+            source_id
+            for source_id in sorted(current_ids - discovered_ids | changed_ids)
+            if not self._claim_overlaps_unstable(
+                current_claims[source_id], unstable_paths
+            )
+        ]
+        added_claims = [
+            discovered_claims[source_id]
+            for source_id in sorted((discovered_ids - current_ids) | changed_ids)
+        ]
+
+        for source_id in removed_ids:
+            self._commit_remove_source(source_id)
+        for claim in added_claims:
+            self._commit_add_claim(claim)
+
+    def _is_monitored_claim(self, claim: SourceClaim) -> bool:
+        """Check if a claim belongs to one of the monitored local roots."""
+        if is_remote_url(claim.primary_path):
+            return False
+
+        try:
+            claim_path = Path(claim.primary_path).resolve(strict=False)
+        except OSError:
+            return False
+
+        return any(
+            claim_path.is_relative_to(monitored_dir)
+            for monitored_dir in self._monitored_dirs
+        )
+
+    def _claim_overlaps_unstable(
+        self,
+        claim: SourceClaim,
+        unstable_paths: List[Path],
+    ) -> bool:
+        """Check if any claimed member path falls in an unstable area."""
+        for member_path in claim.member_paths:
+            try:
+                resolved_member = Path(member_path).resolve(strict=False)
+            except OSError:
+                continue
+
+            for unstable_path in unstable_paths:
+                if resolved_member == unstable_path:
+                    return True
+                if unstable_path.is_dir() and resolved_member.is_relative_to(
+                    unstable_path
+                ):
+                    return True
+        return False
+
+    def _build_claim_signatures(
+        self,
+        claim: SourceClaim,
+    ) -> Dict[str, Tuple[Any, ...]]:
+        """Collect cached member-path signatures for a claim."""
+        signatures: Dict[str, Tuple[Any, ...]] = {}
+        for member_path in sorted(claim.member_paths):
+            entry = self._entry_state.get(member_path)
+            if entry is not None:
+                signatures[member_path] = entry[1]
+                continue
+
+            try:
+                resolved_path = Path(member_path).resolve(strict=False)
+                stat_result = resolved_path.stat()
+            except OSError:
+                continue
+
+            signatures[member_path] = self._build_entry_signature(
+                stat_result,
+                resolved_path.is_dir(),
+            )
+        return signatures
+
+    def _commit_add_claim(self, claim: SourceClaim) -> bool:
+        """Register a discovered source, then commit it into confirmed state."""
+        if not self._register_source_claim(claim):
+            return False
 
         with self._lock:
-            source_id = self._state.get_source_for_path(str(old_path))
+            added = self._state.add_claim(claim, notify=False)
+            if not added:
+                self._rollback_source_registration(claim.source_id)
+                return False
+            self._source_signatures[claim.source_id] = self._build_claim_signatures(
+                claim
+            )
+        return True
 
-            if source_id:
-                claim = self._state.claims.get(source_id)
-            else:
-                claim = None
+    def _commit_remove_source(self, source_id: str) -> bool:
+        """Unregister a confirmed source and then drop it from state."""
+        with self._lock:
+            claim = self._state.claims.get(source_id)
+        if claim is None:
+            return False
 
-            if claim:
-                # Update claim with new primary path
-                new_claim = SourceClaim(
-                    source_type=claim.source_type,
-                    primary_path=new_path,
-                    source_id=source_id,  # Preserve source_id
-                    dim_labels=claim.dim_labels,
-                    extra_config=claim.extra_config,
-                )
+        if not self._unregister_source_claim(source_id):
+            return False
 
-                # Remove old claim, add new claim, then notify outside the lock.
-                removed_source_id = self._state.remove_claim(
-                    str(old_path), notify=False
-                )
-                # Update consumed_paths to reflect the move
-                self._state.consumed_paths.discard(str(old_path))
-                if self._state.add_claim(new_claim, notify=False):
-                    added_claim = new_claim
+        with self._lock:
+            self._state.remove_claim(claim.primary_path, notify=False)
+            self._source_signatures.pop(source_id, None)
+        return True
 
-        if removed_source_id:
-            self._notify_source_removed(removed_source_id)
-        if added_claim is not None:
-            self._notify_source_added(added_claim)
-
-            logger.info(f"Moved source {source_id}: {old_path} -> {new_path}")
-        else:
-            # No existing claim - treat as create at new location
-            self._handle_created(new_path, is_directory)
-
-    def _notify_source_added(self, claim: SourceClaim) -> None:
-        """Invoke the current source-added callback without holding manager state locks."""
-        callback = self._state.on_source_added
-        if callback is not None:
-            callback(claim)
-
-    def _notify_source_removed(self, source_id: str) -> None:
-        """Invoke the current source-removed callback without holding manager state locks."""
-        callback = self._state.on_source_removed
-        if callback is not None:
-            callback(source_id)
-
-    def _on_source_added(self, claim: SourceClaim) -> None:
-        """Callback when source is added to DiscoveryState.
-
-        Creates adapter and registers with Flight server.
-        Uses credentials_config for remote sources.
-
-        Args:
-            claim: SourceClaim that was added
-        """
+    def _register_source_claim(self, claim: SourceClaim) -> bool:
+        """Create and register a source, rolling back on partial failure."""
         try:
-            # Create source config from claim
             source_config = SourceConfig(
                 type=claim.source_type,
                 url=str(claim.primary_path),
@@ -577,57 +410,88 @@ class SourceManager:
                 dataset=claim.extra_config.get("dataset"),
             )
 
-            # Get adapter class and create instance
             adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
             if adapter_cls is None:
                 logger.error(f"No adapter for type: {claim.source_type}")
-                return
+                return False
 
-            # Create adapter - unified create_from_config with optional credentials
             adapter = adapter_cls.create_from_config(
                 source_config, self._credentials_config
             )
+        except Exception as e:
+            logger.error(
+                "Failed to create adapter for source %s (%s): %s",
+                claim.source_id,
+                claim.primary_path,
+                e,
+                exc_info=True,
+            )
+            return False
 
-            # Register with server
+        registered = False
+        try:
             self._server.register_source(claim.source_id, adapter)
+            registered = True
 
-            # Sync to metadata database
             if (
                 hasattr(self._server, "_metadata_db")
                 and self._server._metadata_db is not None
             ):
                 self._server._metadata_db.sync_source_added(claim.source_id, adapter)
 
-            # Update path tracking for move handling (use str path)
             self._path_to_source_id[claim.primary_path] = claim.source_id
-
             logger.info(f"Registered source with server: {claim.source_id}")
-
+            return True
         except Exception as e:
             logger.error(
-                f"Failed to create/register source {claim.source_id}: {e}",
+                "Failed to register/sync source %s (%s): %s",
+                claim.source_id,
+                claim.primary_path,
+                e,
+                exc_info=True,
+            )
+            if registered:
+                self._rollback_source_registration(claim.source_id)
+            return False
+
+    def _rollback_source_registration(self, source_id: str) -> None:
+        """Best-effort rollback after a partial add failure."""
+        try:
+            self._server.unregister_source(source_id)
+        except Exception:
+            logger.error(
+                "Rollback failed to unregister source %s", source_id, exc_info=True
+            )
+
+        try:
+            if (
+                hasattr(self._server, "_metadata_db")
+                and self._server._metadata_db is not None
+            ):
+                self._server._metadata_db.sync_source_removed(source_id)
+        except Exception:
+            logger.error(
+                "Rollback failed to remove source %s from metadata DB",
+                source_id,
                 exc_info=True,
             )
 
-    def _on_source_removed(self, source_id: str) -> None:
-        """Callback when source is removed from DiscoveryState.
+        paths_to_remove = [
+            path for path, sid in self._path_to_source_id.items() if sid == source_id
+        ]
+        for path in paths_to_remove:
+            self._path_to_source_id.pop(path, None)
 
-        Unregisters from Flight server.
-
-        Args:
-            source_id: ID of removed source
-        """
+    def _unregister_source_claim(self, source_id: str) -> bool:
+        """Remove a source from the server and metadata DB."""
         try:
             self._server.unregister_source(source_id)
-
-            # Sync to metadata database
             if (
                 hasattr(self._server, "_metadata_db")
                 and self._server._metadata_db is not None
             ):
                 self._server._metadata_db.sync_source_removed(source_id)
 
-            # Remove path tracking
             paths_to_remove = [
                 path
                 for path, sid in self._path_to_source_id.items()
@@ -637,11 +501,15 @@ class SourceManager:
                 self._path_to_source_id.pop(path, None)
 
             logger.info(f"Unregistered source from server: {source_id}")
+            return True
         except Exception as e:
             logger.error(
-                f"Failed to unregister source {source_id}: {e}",
+                "Failed to unregister source %s: %s",
+                source_id,
+                e,
                 exc_info=True,
             )
+            return False
 
 
 def create_source_manager(
@@ -651,6 +519,8 @@ def create_source_manager(
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
     credentials_config: Optional[Any] = None,
+    stability_window: float = 30.0,
+    probe_open_files: bool = True,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
 
@@ -714,6 +584,8 @@ def create_source_manager(
         monitored_dirs=monitored_dirs,
         dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
         credentials_config=credentials_config,
+        stability_window=stability_window,
+        probe_open_files=probe_open_files,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
@@ -726,7 +598,7 @@ def create_source_manager(
             dim_labels=source.dim_labels,
             extra_config={"dataset": source.dataset} if source.dataset else {},
         )
-        discovery_state.add_claim(claim)  # fires _on_source_added callback
+        manager._commit_add_claim(claim)
 
     # Filesystem discovery for monitored sources (callbacks fire here too)
     for source in monitored_sources:
@@ -745,6 +617,6 @@ def create_source_manager(
         )
 
         for claim in state.get_all_claims():
-            discovery_state.add_claim(claim)
+            manager._commit_add_claim(claim)
 
     return manager
