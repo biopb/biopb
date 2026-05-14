@@ -9,99 +9,115 @@
 # BioPB Tensor Server Benchmark Suite
 # SLURM batch script for HPC deployment
 #
-# This script runs the benchmark suite on HPC infrastructure
-# using Singularity containers with NFS data mounts.
-#
 # Prerequisites:
-#   1. Build Singularity image: singularity build biopb-bench.sif benchmarks/biopb-bench.def
-#   2. Set NFS_TEST_DATA_DIR to your microscopy data path
-#   3. Ensure scratch filesystem is available for cache/results
+#   1. docker build -t jiyuuchc/biopb-tensor-server ../
+#   2. singularity build biopb-bench.sif benchmarks/biopb-bench.def
 #
-# Output:
-#   /scratch/$USER/results/*.json     - Raw benchmark data
-#   /scratch/$USER/results/*.svg      - Histogram plots
+# Usage:
+#   sbatch run_benchmarks.sh              # Ephemeral test servers
+#   ./run_benchmarks.sh --bench-only      # Existing production server
+#
+# Environment variables (forwarded to container):
+#   TEST_DATA_DIR=/path/to/data           # For placeholder.json sources
+#   BIOPB_CACHE_BACKEND=file|memory       # Cache backend mode
+#   BIOPB_SYNTHETIC_DATA_DIR=/scratch/bench-data  # Synthetic data location
+#
+# pytest -k keyword filters (matches test names):
+#   Client type:
+#     -k "flight"          # Flight server tests only
+#     -k "baseline"        # Baseline (direct library) tests only
+#     -k "not baseline"    # Skip baseline tests
+#
+#   Source type:
+#     -k "synthetic"       # Only synthetic sources (no network)
+#     -k "allen"           # Allen Institute S3 sources
+#     -k "zarr"            # All zarr sources
+#     -k "tiff"            # All TIFF sources
+#     -k "hdf5"            # HDF5 sources
+#
+#   Test class:
+#     -k "TestReadLatency"            # First/warm read latency
+#     -k "TestScaledColdRead"         # Cold cache scaled reads
+#     -k "TestScaledWarmRead"         # Warm cache scaled reads
+#     -k "TestScaledSequentialScan"   # Sequential scan tests
+#     -k "TestUnscaledRead"           # Unscaled reads (file backend)
+#
+#   Combinations:
+#     -k "flight and synthetic"       # No network required
+#     -k "baseline and allen"         # Baseline on S3 sources
+#     -k "TestScaledWarmRead and zarr" # Warm cache on zarr
+#
+# pytest -m markers (matches @pytest.mark.xxx):
+#     -m "s3"              # Only tests marked with @pytest.mark.s3
+#     -m "nfs"             # Only tests marked with @pytest.mark.nfs
 
 set -e
 
-# Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="biopb-bench.sif"
-RESULTS_DIR="/scratch/${USER}/biopb-results"
+RESULTS_DIR="/tmp/${USER}/biopb-results"
 
-# Test data paths (customize for your environment)
-NFS_DATA_DIR="${NFS_TEST_DATA_DIR:-/data/microscopy}"
-S3_DATA_URL="${S3_TEST_DATA_URL:-s3://idr-public/ngff/6001240.zarr}"
+# Build quoted PYTEST_ARGS preserving argument grouping
+PYTEST_ARGS=""
+for arg in "$@"; do
+    if [[ "$arg" == --bench-only ]]; then
+        BENCH_ONLY=1
+    else
+        # Quote args that contain spaces using single quotes for singularity
+        if [[ "$arg" =~ [[:space:]] ]]; then
+            PYTEST_ARGS="$PYTEST_ARGS '$arg'"
+        else
+            PYTEST_ARGS="$PYTEST_ARGS $arg"
+        fi
+    fi
+done
 
-# Create results directory
 mkdir -p "${RESULTS_DIR}"
 
 echo "=========================================="
 echo "BioPB Tensor Server Benchmark Suite"
 echo "=========================================="
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "CPUs: ${SLURM_CPUS_PER_TASK}"
-echo "Memory: ${SLURM_MEM_PER_NODE}MB"
-echo "Results dir: ${RESULTS_DIR}"
+echo "Job ID: ${SLURM_JOB_ID:-N/A}"
+echo "Results: ${RESULTS_DIR}"
+echo "Args: ${PYTEST_ARGS:-<default>}"
 echo "=========================================="
 
-# Check if Singularity image exists
+cd "${SCRIPT_DIR}"
+
 if [[ ! -f "${IMAGE_NAME}" ]]; then
-    echo "Building Singularity image..."
-    cd "${SCRIPT_DIR}"
+    echo "Building SIF from Docker image..."
     singularity build "${IMAGE_NAME}" biopb-bench.def
 fi
 
-# Run benchmarks with NFS mount
-echo "Running benchmarks..."
-
-singularity exec \
-    --bind "${NFS_DATA_DIR}:/data:ro" \
+singularity run \
     --bind "${RESULTS_DIR}:/scratch/results" \
-    --env S3_TEST_DATA_URL="${S3_DATA_URL}" \
-    --env NFS_TEST_DATA_DIR="/data" \
-    "${IMAGE_NAME}" \
-    python -m pytest benchmarks/ \
-        --benchmark-only \
-        --benchmark-autosave \
-        --benchmark-save-data \
-        --benchmark-histogram \
-        --benchmark-storage="/scratch/results" \
-        -v \
-        --tb=short
+    --env TEST_DATA_DIR="${TEST_DATA_DIR:-}" \
+    --env BIOPB_CACHE_BACKEND="${BIOPB_CACHE_BACKEND:-file}" \
+    --env BIOPB_SYNTHETIC_DATA_DIR="${BIOPB_SYNTHETIC_DATA_DIR:-}" \
+    --env PYTEST_ARGS="${PYTEST_ARGS}" \
+    --env BENCH_ONLY="${BENCH_ONLY:-0}" \
+    "${IMAGE_NAME}"
 
-# Copy results to permanent location
-echo "Copying results to ${RESULTS_DIR}..."
-
-# Summarize results
-echo "=========================================="
-echo "Benchmark Summary"
-echo "=========================================="
-
-if [[ -f "${RESULTS_DIR}/.benchmarks" ]]; then
+# Print latest results (pytest-benchmark stores in nested subdir)
+LATEST_JSON=$(ls -t "${RESULTS_DIR}"/*.json 2>/dev/null | head -1)
+if [[ -z "${LATEST_JSON}" ]]; then
+    # pytest-benchmark may store in nested platform subdir
+    LATEST_JSON=$(find "${RESULTS_DIR}" -name "*.json" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+fi
+if [[ -n "${LATEST_JSON}" ]]; then
+    echo ""
+    echo "=== Latest Results ==="
     python -c "
 import json
-import glob
-
-results_files = glob.glob('${RESULTS_DIR}/*.json')
-for f in results_files:
-    with open(f) as fp:
-        data = json.load(fp)
-    print(f'File: {f}')
-    for bench in data.get('benchmarks', []):
-        name = bench['name']
-        mean = bench['stats']['mean'] * 1000
-        stddev = bench['stats']['stddev'] * 1000
-        print(f'  {name}: {mean:.2f}ms (+/- {stddev:.2f}ms)')
+with open('${LATEST_JSON}') as fp:
+    data = json.load(fp)
+for bench in data.get('benchmarks', []):
+    name = bench['name']
+    mean = bench['stats']['mean'] * 1000
+    stddev = bench['stats']['stddev'] * 1000
+    print(f'{name}: {mean:.2f}ms (+/- {stddev:.2f}ms)')
 "
 fi
 
 echo "=========================================="
-echo "Results saved to: ${RESULTS_DIR}"
-echo "=========================================="
-
-# Clean up old results (keep last 10 runs)
-cd "${RESULTS_DIR}"
-ls -t *.json | tail -n +11 | xargs -r rm
-ls -t *.svg | tail -n +11 | xargs -r rm
-
-echo "Done!"
+echo "Done"

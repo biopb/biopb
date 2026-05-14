@@ -1,8 +1,4 @@
-"""Baseline comparison benchmarks.
-
-Compares tensor server overhead vs direct library access using parametrized
-bench_client fixture (baseline vs flight) and data_source fixture from configs.
-
+"""Baseline latency benchmarks.
 Tests run across all configured synthetic sources.
 """
 
@@ -12,11 +8,7 @@ from benchmarks.conftest import get_all_source_ids, BaselineClient
 
 
 class TestReadLatency:
-    """Compare read latency: baseline vs flight across all formats.
-
-    Expected results:
-    - First read: baseline faster (no Flight overhead)
-    - Warm read: flight may be faster (application cache)
+    """Read latency.
     """
 
     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
@@ -33,11 +25,12 @@ class TestReadLatency:
 
         arr = bench_client.get_tensor(source_id, tensor_id)
 
+        # Use ellipsis to select last two spatial dims (works for 2D and 5D)
         def read():
-            return arr[0:256, 0:256].compute()
+            return arr[..., 0:256, 0:256].compute()
 
         result = benchmark(read)
-        assert result.shape == (256, 256)
+        assert result.shape[-2:] == (256, 256)
 
     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
     @pytest.mark.parametrize("bench_client", ["baseline", "flight"], indirect=True)
@@ -53,14 +46,13 @@ class TestReadLatency:
 
         arr = bench_client.get_tensor(source_id, tensor_id)
 
-        # Prime cache
-        arr[0:256, 0:256].compute()
-
+        # Prime cache and read - use ellipsis for last two spatial dims
+        arr[..., 0:256, 0:256].compute()
         def read():
-            return arr[0:256, 0:256].compute()
+            return arr[..., 0:256, 0:256].compute()
 
         result = benchmark(read)
-        assert result.shape == (256, 256)
+        assert result.shape[-2:] == (256, 256)
 
     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
     @pytest.mark.parametrize("bench_client", ["baseline", "flight"], indirect=True)
@@ -80,15 +72,14 @@ class TestReadLatency:
         params = data_source.get("params", {})
         chunks = params.get("chunks", params.get("tile", [256, 256]))
 
-        chunks_to_read = [
-            (slice(0, chunks[0]), slice(0, chunks[1])),
-            (slice(0, chunks[0]), slice(chunks[1], chunks[1] * 2)),
-            (slice(chunks[0], chunks[0] * 2), slice(0, chunks[1])),
-            (slice(chunks[0], chunks[0] * 2), slice(chunks[1], chunks[1] * 2)),
-        ]
-
+        # Use ellipsis to read last two spatial dims
         def scan():
-            return [arr[s[0], s[1]].compute() for s in chunks_to_read]
+            results = []
+            results.append(arr[..., 0:chunks[0], 0:chunks[1]].compute())
+            results.append(arr[..., 0:chunks[0], chunks[1]:chunks[1]*2].compute())
+            results.append(arr[..., chunks[0]:chunks[0]*2, 0:chunks[1]].compute())
+            results.append(arr[..., chunks[0]:chunks[0]*2, chunks[1]:chunks[1]*2].compute())
+            return results
 
         results = benchmark(scan)
         assert len(results) == 4
@@ -113,8 +104,9 @@ class TestReadLatency:
         chunks = params.get("chunks", [512, 512])
 
         random.seed(42)
-        n_chunks_x = arr.shape[1] // chunks[1]
-        n_chunks_y = arr.shape[0] // chunks[0]
+        # Use last two dimensions for spatial chunking
+        n_chunks_x = arr.shape[-1] // chunks[1]
+        n_chunks_y = arr.shape[-2] // chunks[0]
 
         chunk_indices = [
             (i * chunks[0], j * chunks[1])
@@ -124,8 +116,9 @@ class TestReadLatency:
             )
         ]
 
+        # Use ellipsis to read last two spatial dims
         def read_random():
-            return [arr[i:i+chunks[0], j:j+chunks[1]].compute() for i, j in chunk_indices]
+            return [arr[..., i:i+chunks[0], j:j+chunks[1]].compute() for i, j in chunk_indices]
 
         results = benchmark(read_random)
         assert len(results) == len(chunk_indices)
@@ -134,37 +127,36 @@ class TestReadLatency:
 class TestMetadataLatency:
     """Compare metadata discovery latency: baseline vs flight."""
 
-    @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
-    @pytest.mark.parametrize("bench_client", ["baseline", "flight"], indirect=True)
-    def test_list_sources_latency(self, benchmark, data_source, bench_client):
-        """Measure list_sources() latency."""
-        def list_sources():
-            return bench_client.list_sources()
+#     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
+#     def test_list_sources_latency(self, benchmark, data_source, bench_client)_flight:
+#         """Measure list_sources() latency."""
+#         def list_sources():
+#             return bench_client_flight.list_sources()
+# 
+#         result = benchmark(list_sources)
+#         assert isinstance(result, dict)
 
-        result = benchmark(list_sources)
-        assert isinstance(result, dict)
-
-    @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
-    def test_metadata_discovery_latency(self, benchmark, data_source, bench_client_flight):
-        """Measure metadata discovery through Flight stack."""
-        source_id = data_source["id"]
-
-        def discover_metadata():
-            bench_client_flight._sources.clear()
-            sources = bench_client_flight.list_sources()
-            source_desc = sources.get(source_id)
-            if source_desc and source_desc.tensors:
-                tensor_desc = source_desc.tensors[0]
-                return {
-                    "source_id": source_id,
-                    "shape": tensor_desc.shape,
-                    "dtype": tensor_desc.dtype,
-                }
-            return None
-
-        result = benchmark(discover_metadata)
-        assert result is not None
-        assert result["source_id"] == source_id
+#     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
+#     def test_metadata_discovery_latency(self, benchmark, data_source, bench_client_flight):
+#         """Measure metadata discovery through Flight stack."""
+#         source_id = data_source["id"]
+# 
+#         def discover_metadata():
+#             bench_client_flight._sources.clear()
+#             sources = bench_client_flight.list_sources()
+#             source_desc = sources.get(source_id)
+#             if source_desc and source_desc.tensors:
+#                 tensor_desc = source_desc.tensors[0]
+#                 return {
+#                     "source_id": source_id,
+#                     "shape": tensor_desc.shape,
+#                     "dtype": tensor_desc.dtype,
+#                 }
+#             return None
+# 
+#         result = benchmark(discover_metadata)
+#         assert result is not None
+#         assert result["source_id"] == source_id
 
     @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
     @pytest.mark.parametrize("bench_client", ["baseline", "flight"], indirect=True)

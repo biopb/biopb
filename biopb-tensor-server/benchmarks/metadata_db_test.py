@@ -41,6 +41,7 @@ class MockAdapter:
             ],
         )
 
+
     def get_metadata(self):
         return {"plate_id": self.source_id.split("-")[0], "acquisition_date": "2024-01-01"}
 

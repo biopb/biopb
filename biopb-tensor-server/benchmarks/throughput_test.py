@@ -74,6 +74,7 @@ class TestMultiClientThroughput:
     def test_bench_two_concurrent_clients(self, benchmark, data_source, bench_server):
         """Throughput with 2 concurrent clients."""
         source_id = data_source["id"]
+        tensor_id = data_source.get("expected_tensors", [source_id])[0]
         port = getattr(bench_server, "_bench_port", 8815)
         params = data_source.get("params", {})
         chunks = params.get("chunks", params.get("tile", [256, 256]))
@@ -83,7 +84,7 @@ class TestMultiClientThroughput:
         def concurrent_read():
             def read_chunk(chunk_idx):
                 client = TensorFlightClient(f"grpc://localhost:{port}")
-                arr = client.get_tensor(source_id, source_id)
+                arr = client.get_tensor(source_id, tensor_id)
                 i, j = chunk_idx
                 result = arr[i:i+chunks[0], j:j+chunks[1]].compute()
                 client.close()
@@ -104,6 +105,7 @@ class TestMultiClientThroughput:
     def test_bench_four_concurrent_clients(self, benchmark, data_source, bench_server):
         """Throughput with 4 concurrent clients."""
         source_id = data_source["id"]
+        tensor_id = data_source.get("expected_tensors", [source_id])[0]
         port = getattr(bench_server, "_bench_port", 8815)
         params = data_source.get("params", {})
         chunks = params.get("chunks", params.get("tile", [256, 256]))
@@ -113,7 +115,7 @@ class TestMultiClientThroughput:
         def concurrent_read():
             def read_chunk(chunk_idx):
                 client = TensorFlightClient(f"grpc://localhost:{port}")
-                arr = client.get_tensor(source_id, source_id)
+                arr = client.get_tensor(source_id, tensor_id)
                 i, j = chunk_idx
                 result = arr[i:i+chunks[0], j:j+chunks[1]].compute()
                 client.close()
@@ -134,6 +136,7 @@ class TestMultiClientThroughput:
     def test_bench_eight_concurrent_clients(self, benchmark, data_source, bench_server):
         """Throughput with 8 concurrent clients."""
         source_id = data_source["id"]
+        tensor_id = data_source.get("expected_tensors", [source_id])[0]
         port = getattr(bench_server, "_bench_port", 8815)
         params = data_source.get("params", {})
         chunks = params.get("chunks", params.get("tile", [128, 128]))
@@ -143,7 +146,7 @@ class TestMultiClientThroughput:
         def concurrent_read():
             def read_chunk(chunk_idx):
                 client = TensorFlightClient(f"grpc://localhost:{port}")
-                arr = client.get_tensor(source_id, source_id)
+                arr = client.get_tensor(source_id, tensor_id)
                 i, j = chunk_idx
                 result = arr[i:i+chunks[0], j:j+chunks[1]].compute()
                 client.close()
@@ -168,10 +171,11 @@ class TestChunkCoalescing:
     def test_bench_adjacent_chunks_vs_separate(self, data_source, bench_client_flight):
         """Compare reading adjacent chunks together vs separately."""
         source_id = data_source["id"]
+        tensor_id = data_source.get("expected_tensors", [source_id])[0]
         params = data_source.get("params", {})
         chunks = params.get("chunks", params.get("tile", [256, 256]))
 
-        arr = bench_client_flight.get_tensor(source_id, source_id)
+        arr = bench_client_flight.get_tensor(source_id, tensor_id)
 
         def merged_read():
             return arr[0:chunks[0]*2, 0:chunks[1]].compute()
