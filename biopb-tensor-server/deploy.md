@@ -209,8 +209,6 @@ singularity run \
 singularity run --cleanenv \
     --bind ~/data:/data \
     --env DATA_DIR=/data \
-    --env HOST=127.0.0.1 \
-    --env PORT=8817 \
     --env NGINX_HTTP_PORT=8814 \
     --env NGINX_GRPC_PORT=8815 \
     --env BIOPB_TENSOR_TOKEN=mytoken \

@@ -59,7 +59,7 @@ if [ "$NGINX_HTTP_PORT" != "8814" ]; then
     sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
 fi
 if [ "$NGINX_GRPC_PORT" != "8815" ]; then
-    sed -i "s/listen 8815 http2;/listen ${NGINX_GRPC_PORT} http2;/" "$BIOPB_TMP/nginx.conf"
+    sed -i "s/listen 8815;/listen ${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
 fi
 
 # Create nginx temp directories
