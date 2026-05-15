@@ -30,6 +30,29 @@ from benchmarks.utils import (
     reset_cache,
 )
 
+# =============================================================================
+# pytest marker registration
+# =============================================================================
+
+
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers", "s3: tests requiring S3 network access"
+    )
+    config.addinivalue_line(
+        "markers", "nfs: tests requiring NFS/local filesystem access"
+    )
+    config.addinivalue_line(
+        "markers", "slow: tests that take longer to run (e.g., large file downloads)"
+    )
+    config.option.benchmark_sort = "name"
+    config.option.benchmark_time_unit = "ms"
+    if not getattr(config.option, "benchmark_json", None):
+        benchmark_output = Path(__file__).resolve().parent.parent / ".benchmarks" / "output.json"
+        benchmark_output.parent.mkdir(parents=True, exist_ok=True)
+        config.option.benchmark_json = benchmark_output.open("wb")
+
 
 # =============================================================================
 # Data source configuration loading
@@ -46,9 +69,35 @@ def load_all_source_configs() -> List[Dict]:
     return configs
 
 
-def get_all_source_ids() -> List[str]:
-    """Get IDs of all configured sources (synthetic, S3, NFS)."""
-    return [c["id"] for c in load_all_source_configs()]
+def get_all_source_ids() -> List:
+    """Get pytest.param objects for all sources with appropriate marks.
+
+    Use this for @pytest.mark.parametrize("data_source", get_all_source_ids(), indirect=True)
+
+    Synthetic sources: no mark (always run)
+    S3 sources: mark.s3 (run with -m s3 or when explicitly selected with -k)
+    NFS sources: mark.nfs (run with -m nfs or when explicitly selected)
+    """
+    params = []
+    for spec in load_all_source_configs():
+        source_id = spec["id"]
+        if "generator" in spec:
+            # Synthetic - always run
+            params.append(source_id)
+        elif spec.get("url", "").startswith("s3://"):
+            # S3 source - requires network
+            params.append(pytest.param(source_id, marks=pytest.mark.s3))
+        elif spec.get("path_env"):
+            # NFS source - requires local filesystem
+            params.append(pytest.param(source_id, marks=pytest.mark.nfs))
+        else:
+            params.append(source_id)
+    return params
+
+
+def get_synthetic_source_ids() -> List[str]:
+    """Get IDs of synthetic sources only (no network required)."""
+    return [c["id"] for c in load_all_source_configs() if "generator" in c]
 
 
 def is_synthetic_source(source_id: str) -> bool:
@@ -168,7 +217,10 @@ class BaselineClient:
         raise ValueError(f"Unknown generator: {generator}")
 
     def _open_reader(self, source_id: str) -> Any:
-        """Open direct reader based on source config."""
+        """Open direct reader based on source config.
+
+        Uses specialized libraries for known formats, aicsimageio as catch-all.
+        """
         import zarr
 
         spec = self._sources[source_id]
@@ -183,27 +235,32 @@ class BaselineClient:
         if source_id not in self._paths and "generator" in spec:
             self.generate_data(spec)
 
+        # Get path or URL - S3 sources have url, local sources have path
         path = self._paths.get(source_id)
+        url = spec.get("url")
 
+        # Specialized handlers for known formats
         if source_type == "zarr":
             return zarr.open_array(path, mode="r")
 
         elif source_type in ("ome_zarr", "ome_zarr_hcs"):
-            if spec.get("url"):  # S3
+            if url:  # S3
                 import s3fs
                 fs = s3fs.S3FileSystem(anon=True)
-                return zarr.open_group(s3fs.S3Map(fs, spec["url"]), mode="r")
+                return zarr.open_group(s3fs.S3Map(fs, url), mode="r")
             return zarr.open_group(path, mode="r")
-
-        elif source_type in ("ome_tiff", "tiff"):
-            import tifffile
-            return tifffile.TiffFile(path)
 
         elif source_type == "hdf5":
             import h5py
             return h5py.File(path, "r")
 
-        raise ValueError(f"Unknown source type: {source_type}")
+        # Catch-all: use aicsimageio for any unhandled format
+        # Supports: OME-TIFF, TIFF, CZI, ND2, LIF, DV, and many more
+        # aicsimageio can read from local path or S3 URL directly
+        import aicsimageio
+        target = url or path
+        fs_kwargs = {'anon': True} if target.startswith('s3://') else {}
+        return aicsimageio.AICSImage(target, fs_kwargs=fs_kwargs)
 
     def list_sources(self) -> Dict[str, Dict]:
         """List available data sources."""
@@ -243,20 +300,17 @@ class BaselineClient:
             arr = da.from_zarr(reader)
 
         elif source_type in ("ome_zarr", "ome_zarr_hcs"):
-            if tensor_id.isdigit():
-                arr = da.from_zarr(reader[str(int(tensor_id))])
+            # For single-tensor sources, tensor_id == source_id means use first level
+            if tensor_id == source_id or tensor_id.isdigit():
+                level_key = str(int(tensor_id) if tensor_id.isdigit() else 0)
+                arr = da.from_zarr(reader[level_key])
             else:
+                # Navigate to specific tensor path (e.g., well/field for HCS)
                 parts = tensor_id.split("/")
                 zarr_obj = reader
                 for part in parts:
                     zarr_obj = zarr_obj[part]
                 arr = da.from_zarr(zarr_obj)
-
-        elif source_type in ("ome_tiff", "tiff"):
-            page_idx = int(tensor_id) if tensor_id.isdigit() else 0
-            numpy_arr = reader.pages[page_idx].asarray()
-            chunks = spec.get("params", {}).get("tile", (256, 256))
-            arr = da.from_array(numpy_arr, chunks=chunks)
 
         elif source_type == "hdf5":
             dataset_name = tensor_id if tensor_id != source_id else "data"
@@ -264,7 +318,22 @@ class BaselineClient:
             arr = da.from_array(h5_ds, chunks=h5_ds.chunks)
 
         else:
-            raise ValueError(f"Unsupported source type: {source_type}")
+            # Catch-all via aicsimageio: use xarray_dask_data for lazy loading
+            # AICSImage handles OME-TIFF, TIFF, CZI, ND2, LIF, DV, etc.
+            # xarray_dask_data returns dask-backed DataArray with proper dims
+            import aicsimageio
+            if isinstance(reader, aicsimageio.AICSImage):
+                # Handle scene selection - tensor_id may be scene name like "Image:0"
+                if tensor_id in reader.scenes:
+                    reader.set_scene(tensor_id)
+                elif tensor_id.isdigit() and int(tensor_id) < len(reader.scenes):
+                    reader.set_scene(int(tensor_id))
+
+                # Get dask array from xarray DataArray
+                xarr = reader.xarray_dask_data
+                arr = xarr.data  # Extract dask array from xarray
+            else:
+                raise ValueError(f"Unexpected reader type: {type(reader)}")
 
         if slice_hint is not None:
             arr = arr[slice_hint]
@@ -298,11 +367,28 @@ class BaselineClient:
 # =============================================================================
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def temp_cache_dir() -> Generator[str, None, None]:
-    """Clean scratch directory for synthetic data."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+    """Clean scratch directory for synthetic data.
+
+    Function-scoped to ensure each test gets its own directory,
+    avoiding data conflicts between tests that overwrite files.
+
+    Location controlled by BIOPB_SYNTHETIC_DATA_DIR env var,
+    defaults to system temp directory if not set.
+    """
+    synthetic_dir = os.environ.get("BIOPB_SYNTHETIC_DATA_DIR")
+    if synthetic_dir:
+        # Create unique subdirectory in specified location
+        subdir = Path(synthetic_dir) / f"bench_{os.getpid()}_{int(time.time() * 1000)}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        yield str(subdir)
+        # Cleanup
+        import shutil
+        shutil.rmtree(subdir, ignore_errors=True)
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
 
 
 @pytest.fixture
@@ -310,8 +396,34 @@ def bench_server(
     temp_cache_dir: str,
     request: pytest.FixtureRequest,
 ) -> Generator[TensorFlightServer, None, None]:
-    """Start TensorFlightServer with configurable cache backend."""
-    backend = getattr(request, "param", "file")
+    """Start TensorFlightServer with configurable cache backend.
+
+    When BIOPB_BENCH_SERVER_URL is set, connects to existing production server
+    instead of creating a new one (for container-based benchmarking).
+
+    Cache backend controlled by:
+    - pytest parametrize (request.param) - for explicit comparison tests
+    - BIOPB_CACHE_BACKEND env var - default backend override
+    - defaults to "file" if neither specified
+    """
+    # Check for existing production server
+    existing_url = os.environ.get("BIOPB_BENCH_SERVER_URL")
+    if existing_url:
+        # Connect to existing server - no setup/teardown needed
+        # Return a mock object with the URL for client fixtures
+        server = TensorFlightServer(existing_url)
+        server._bench_port = int(existing_url.split(":")[-1])
+        server._bench_backend = "production"
+        server._bench_cache_dir = temp_cache_dir
+        server._production_mode = True  # Flag to skip shutdown
+        yield server
+        return
+
+    # Create ephemeral test server (default behavior)
+    # Priority: pytest param > env var > default "file"
+    backend = getattr(request, "param", None)
+    if backend is None:
+        backend = os.environ.get("BIOPB_CACHE_BACKEND", "file")
 
     if backend == "memory":
         config = CacheConfig(
@@ -337,6 +449,7 @@ def bench_server(
     server._bench_port = port
     server._bench_backend = backend
     server._bench_cache_dir = temp_cache_dir
+    server._production_mode = False
 
     server_thread = threading.Thread(target=server.serve, daemon=True)
     server_thread.start()
@@ -466,14 +579,16 @@ def data_source(
 ) -> Generator[Dict, None, None]:
     """Parametrized fixture over ALL data source configs.
 
-    Generates synthetic data and registers with server.
+    In development mode: generates synthetic data and registers with ephemeral server.
+    In production mode (BIOPB_BENCH_SERVER_URL set): assumes sources exist via file watcher.
+
     Skips S3/NFS sources if not available.
 
     Returns the source spec dict with keys:
     - id: source_id
     - type: source type (zarr, ome_zarr, etc.)
     - expected_tensors: list of tensor_ids to test
-    - path: generated data path (for synthetic)
+    - path: generated data path (for synthetic, development mode)
     """
     source_id = request.param
 
@@ -481,15 +596,82 @@ def data_source(
     configs = load_all_source_configs()
     spec = next(c for c in configs if c["id"] == source_id)
 
-    # Handle different source types
+    # Production mode: skip synthetic sources, assume real data exists
+    production_mode = getattr(bench_server, "_production_mode", False)
+    if production_mode:
+        if "generator" in spec:
+            pytest.skip(f"Synthetic source {source_id} skipped in production mode")
+        # For production mode, just return spec without registering
+        yield spec
+        return
+
+    # Development mode: handle different source types
+    # Check if test was selected via marker (s3/nfs) - don't skip if so
+    has_s3_marker = request.node.get_closest_marker("s3") is not None
+    has_nfs_marker = request.node.get_closest_marker("nfs") is not None
+
     if is_s3_source(source_id):
-        pytest.skip(f"S3 source {source_id} requires network (run with -m s3)")
+        if not has_s3_marker:
+            pytest.skip(f"S3 source {source_id} - run with -m s3 or select explicitly")
+
+        # S3 source - register URL-based adapter with server
+        url = spec.get("url")
+        source_type = spec.get("type")
+
+        # For public S3 buckets, use anonymous access
+        from biopb_tensor_server.remote import CredentialsConfig, CredentialProfile
+
+        # Create anon credentials profile (empty key/secret triggers anon=True)
+        anon_profile = CredentialProfile(
+            name="anon",
+            storage_type="s3",
+            key=None,
+            secret=None,
+        )
+        anon_credentials = CredentialsConfig(
+            default_profile="anon",
+            profiles=[anon_profile],
+        )
+
+        # Map benchmark config type to adapter class
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+
+        adapter_cls_map = {
+            "ome_tiff": OmeTiffAdapter,
+            "tiff": OmeTiffAdapter,
+            "ome_zarr": OmeZarrAdapter,
+        }
+        adapter_cls = adapter_cls_map.get(source_type)
+        if adapter_cls is None:
+            pytest.skip(f"No adapter for source type: {source_type}")
+
+        # Create SourceConfig for S3 with anon credentials profile
+        from biopb_tensor_server.config import SourceConfig
+        source_config = SourceConfig(
+            url=url,
+            type=adapter_cls.SOURCE_TYPE,
+            source_id=source_id,
+            credentials_profile="anon",
+        )
+
+        # Create adapter from config with anon credentials
+        adapter = adapter_cls.create_from_config(source_config, anon_credentials)
+        bench_server.register_source(source_id, adapter)
+
+        yield spec
+
+        bench_server.unregister_source(source_id)
 
     elif is_nfs_source(source_id):
+        if not has_nfs_marker:
+            pytest.skip(f"NFS source {source_id} - run with -m nfs or select explicitly")
+
         path_env = spec.get("path_env")
         nfs_path = os.environ.get(path_env)
         if not nfs_path or not Path(nfs_path).exists():
             pytest.skip(f"NFS source requires {path_env} env var")
+
         spec["path"] = nfs_path
         # NFS discovery would go here when implemented
         pytest.skip(f"NFS discovery not yet implemented for {source_id}")
@@ -513,10 +695,13 @@ def data_source(
 
 @pytest.fixture
 def bench_client_baseline(temp_cache_dir: str) -> BaselineClient:
-    """Baseline client for direct library access."""
+    """Baseline client for direct library access.
+
+    Includes all configured sources (synthetic, S3, NFS).
+    S3 sources are handled via aicsimageio catch-all.
+    """
     configs = load_all_source_configs()
-    synthetic_configs = [c for c in configs if "generator" in c]
-    return BaselineClient(synthetic_configs, cache_dir=temp_cache_dir)
+    return BaselineClient(configs, cache_dir=temp_cache_dir)
 
 
 @pytest.fixture
@@ -526,6 +711,19 @@ def bench_client_flight(bench_server: TensorFlightServer):
 
     port = getattr(bench_server, "_bench_port", 8815)
     client = TensorFlightClient(f"grpc://localhost:{port}")
+
+    yield client
+
+    client.close()
+
+
+@pytest.fixture
+def bench_client_flight_no_cache(bench_server: TensorFlightServer):
+    """Flight client with cache disabled for server cache benchmarks."""
+    from biopb.tensor import TensorFlightClient
+
+    port = getattr(bench_server, "_bench_port", 8815)
+    client = TensorFlightClient(f"grpc://localhost:{port}", cache_bytes=0)
 
     yield client
 
@@ -557,6 +755,15 @@ def bench_client(
 
 @pytest.fixture(autouse=True)
 def reset_cache_after_test():
-    """Automatically reset cache after each test."""
+    """Automatically reset cache after each test.
+
+    In production mode, skips cache reset to preserve server state.
+    """
     yield
+
+    # Skip reset in production mode (server managed externally)
+    # Check via env var to avoid fixture teardown ordering issues
+    if os.environ.get("BIOPB_BENCH_SERVER_URL"):
+        return
+
     reset_cache()

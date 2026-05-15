@@ -491,7 +491,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Get cache manager singleton (if initialized)
         cache_manager = CacheManager.get_instance()
 
-        # Read the chunk (with caching for virtual chunks)
+        # Read the chunk, using the configured cache backend when applicable.
         try:
             record_batch = adapter.resolve_chunk_data(
                 tensor_ticket.chunk_id, cache_manager
@@ -501,9 +501,13 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightInternalError(
                 f"I/O error reading chunk data: {e}"
             ) from e
+
         batch_size = sum(col.nbytes for col in record_batch.columns)
         logger.debug(f"do_get: returning {batch_size} bytes")
-        return flight.RecordBatchStream(pa.Table.from_batches([record_batch]))
+
+        # zoer copy wrapper - do _not_ convert to pa.Table!
+        reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
+        return flight.RecordBatchStream(reader)
 
     def do_put(
         self,

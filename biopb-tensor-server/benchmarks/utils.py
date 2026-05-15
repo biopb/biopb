@@ -45,11 +45,8 @@ def clear_os_page_cache() -> None:
         pass
 
 
-def get_cache_stats(server) -> Dict:
-    """Get cache statistics from server's CacheManager.
-
-    Args:
-        server: TensorFlightServer instance
+def get_cache_stats() -> Dict:
+    """Get cache statistics from CacheManager singleton.
 
     Returns:
         Dictionary with cache hit/miss/eviction statistics
@@ -62,10 +59,8 @@ def get_cache_stats(server) -> Dict:
 
     stats = manager.stats()
     return {
-        "total_entries": stats.total_entries,
-        "total_bytes": stats.total_bytes,
-        "max_entries": stats.max_entries,
-        "max_bytes": stats.max_bytes,
+        "entries": stats.total_entries,
+        "bytes": stats.total_bytes,
         "hits": stats.hits,
         "misses": stats.misses,
         "evictions": stats.evictions,
@@ -78,6 +73,19 @@ def reset_cache() -> None:
     from biopb_tensor_server.cache import CacheManager
 
     CacheManager.reset()
+
+
+def clear_cache_entries() -> None:
+    """Clear cache entries but keep CacheManager initialized.
+
+    For warm cache tests that need a fresh cache state without
+    destroying the singleton.
+    """
+    from biopb_tensor_server.cache import CacheManager
+
+    manager = CacheManager.get_instance()
+    if manager is not None:
+        manager.clear()
 
 
 # =============================================================================

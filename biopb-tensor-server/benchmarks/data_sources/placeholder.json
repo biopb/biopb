@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "id": "microscopy",
+      "path_env": "TEST_DATA_DIR",
+      "type": "auto",
+      "description": "microscopy data (requires env var)"
+    }
+  ]
+}

@@ -153,3 +153,5 @@ packages/*/coverage/
 
 # Generated TypeScript protobuf bindings
 packages/tensor-flight-client/src/gen/
+*.sif
+.benchmarks/

@@ -9,6 +9,7 @@ Features:
 - Numpy-compatible slicing and operations
 """
 
+import atexit
 import logging
 import importlib.metadata
 import json
@@ -41,22 +42,171 @@ logger = logging.getLogger(__name__)
 # Module-level pools for worker-local connection caching (pickle-safe)
 # ==============================================================================
 #
-# Each entry stores (pid, resource) to detect forked processes. When a process
-# forks after pool was populated, the child detects pid mismatch and creates
-# fresh connections (inherited gRPC sockets are broken).
+# FlightClient connections are stored per-thread for lock-free access.
+# Cache and CallOptions remain shared across threads for cross-thread cache hits.
 #
-_CONNECTION_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, flight.FlightClient]] = {}
+# Fork-safety: Each thread stores (pid, client) to detect forked processes.
+# When a process forks, child threads detect pid mismatch and create fresh
+# connections (inherited gRPC sockets are broken).
+#
+
+# Per-thread storage: thread gets its own FlightClient per (location, token)
+_THREAD_LOCAL = threading.local()
+
+# Global registry for cleanup: thread_id -> {(location, token): FlightClient}
+_CONNECTION_REGISTRY: Dict[int, Dict[Tuple[str, Optional[str]], flight.FlightClient]] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+# Shared pools for cache and call options (cross-thread cache hits enabled)
 _CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Cache]] = {}
 _CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
+
+
+@atexit.register
+def _cleanup_connection_pool():
+    """Clean up all pooled FlightClient connections on process exit."""
+    with _REGISTRY_LOCK:
+        for thread_id, clients in _CONNECTION_REGISTRY.items():
+            for key, client in clients.items():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        _CONNECTION_REGISTRY.clear()
+
+    with _POOL_LOCK:
+        _CACHE_POOL.clear()
+        _CALL_OPTS_POOL.clear()
+
+
+def _evict_dead_threads():
+    """Close connections from threads that have died."""
+    for thread_id, clients in list(_CONNECTION_REGISTRY.items()):
+        # Check if thread is alive using threading._active (tracks all live threads)
+        if thread_id not in threading._active:
+            # Thread died - close all its connections
+            for key, client in clients.items():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            del _CONNECTION_REGISTRY[thread_id]
+
+
+def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClient:
+    """Get thread-local FlightClient (no lock for read access).
+
+    Creates FlightClient lazily on first call per thread. Thread-safe via
+    thread-local storage. Fork-safe: stale connections from parent process
+    are detected and cleaned up before use.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+
+    Returns:
+        FlightClient for this thread and location
+    """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    # Fast path: thread already has client for this location (no lock)
+    local_pool = getattr(_THREAD_LOCAL, 'clients', None)
+    if local_pool is None:
+        local_pool = {}
+        _THREAD_LOCAL.clients = local_pool
+    elif key in local_pool:
+        pid_client = local_pool[key]
+        if isinstance(pid_client, tuple):
+            pid, client = pid_client
+            if pid == current_pid:
+                return client
+            # Forked child - inherited gRPC socket is broken, create new
+            try:
+                client.close()
+            except Exception:
+                pass
+            del local_pool[key]
+        else:
+            # Legacy format (shouldn't happen, but handle gracefully)
+            return pid_client
+
+    # Slow path: create new client, register for cleanup
+    client = flight.FlightClient(location)
+    local_pool[key] = (current_pid, client)
+
+    thread_id = threading.current_thread().ident
+    if thread_id is not None:
+        with _REGISTRY_LOCK:
+            # Eviction: clean up dead threads
+            _evict_dead_threads()
+            # Register this thread's connection
+            if thread_id not in _CONNECTION_REGISTRY:
+                _CONNECTION_REGISTRY[thread_id] = {}
+            _CONNECTION_REGISTRY[thread_id][key] = client
+
+    return client
+
+
+def _get_shared_cache(location: str, token: Optional[str], cache_bytes: int) -> Cache:
+    """Get shared Cache for cross-thread cache hits.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Cache size for worker-local cache
+
+    Returns:
+        Cache instance shared across threads
+    """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    with _POOL_LOCK:
+        # Fork-safety: detect and clean up inherited stale cache
+        if key in _CACHE_POOL:
+            pool_pid, cache = _CACHE_POOL[key]
+            if pool_pid != current_pid:
+                del _CACHE_POOL[key]
+
+        # Create fresh cache for current process if needed
+        if key not in _CACHE_POOL:
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=cache_bytes))
+
+    return _CACHE_POOL[key][1]
+
+
+def _get_shared_call_options(location: str, token: Optional[str]) -> flight.FlightCallOptions:
+    """Get shared FlightCallOptions.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+
+    Returns:
+        FlightCallOptions for this connection
+    """
+    key = (location, token)
+
+    with _POOL_LOCK:
+        if key not in _CALL_OPTS_POOL:
+            if token:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions(
+                    headers=[(b"authorization", f"Bearer {token}".encode())]
+                )
+            else:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions()
+
+    return _CALL_OPTS_POOL[key]
 
 
 def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int):
     """Get cached FlightClient, Cache, and CallOptions for a connection namespace.
 
     Creates resources lazily on first call per (location, token) key.
-    Thread-safe via lock. Fork-safe: stale entries from parent process
-    are detected and cleaned up before use.
+    FlightClient is per-thread for lock-free access. Cache and CallOptions
+    are shared across threads for cross-thread cache hits.
 
     Each worker process has its own pool after unpickle. If a process
     forks after pool was populated, the child detects pid mismatch and
@@ -70,44 +220,11 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
     Returns:
         Tuple of (FlightClient, Cache, FlightCallOptions)
     """
-    key = (location, token)
-    current_pid = os.getpid()
+    client = _get_thread_client(location, token)
+    cache = _get_shared_cache(location, token, cache_bytes)
+    call_options = _get_shared_call_options(location, token)
 
-    with _POOL_LOCK:
-        # Fork-safety: detect and clean up inherited stale connections
-        if key in _CONNECTION_POOL:
-            pool_pid, client = _CONNECTION_POOL[key]
-            if pool_pid != current_pid:
-                # Forked child - inherited gRPC socket is broken, close it
-                try:
-                    client.close()
-                except Exception:
-                    pass
-                del _CONNECTION_POOL[key]
-
-        if key in _CACHE_POOL:
-            pool_pid, cache = _CACHE_POOL[key]
-            if pool_pid != current_pid:
-                del _CACHE_POOL[key]
-
-        # Create fresh resources for current process
-        if key not in _CONNECTION_POOL:
-            _CONNECTION_POOL[key] = (current_pid, flight.FlightClient(location))
-        if key not in _CACHE_POOL:
-            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=cache_bytes))
-        if key not in _CALL_OPTS_POOL:
-            if token:
-                _CALL_OPTS_POOL[key] = flight.FlightCallOptions(
-                    headers=[(b"authorization", f"Bearer {token}".encode())]
-                )
-            else:
-                _CALL_OPTS_POOL[key] = flight.FlightCallOptions()
-
-    return (
-        _CONNECTION_POOL[key][1],  # client
-        _CACHE_POOL[key][1],  # cache
-        _CALL_OPTS_POOL[key],  # call_options
-    )
+    return (client, cache, call_options)
 
 
 def _fetch_chunk_distributed(
