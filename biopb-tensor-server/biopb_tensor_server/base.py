@@ -376,7 +376,7 @@ class TensorAdapter(ABC):
 
         Args:
             request_desc: TensorDescriptor from the client's read request, which may
-                          include slice_hint and read_options with scale_hint and reduction_method.
+                          include slice_hint and scale_hint/reduction_method directly.
         Returns:
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
         """        
@@ -392,19 +392,16 @@ class BackendAdapter(SourceAdapter, TensorAdapter):
 def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, chunk_size: Tuple[int, ...]) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
-    Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too 
-    large to read in one go (e.g., due to Arrow IPC limits). 
+    Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
+    large to read in one go (e.g., due to Arrow IPC limits).
     """
     base_shape = tuple(int(dim) for dim in base_desc.shape)
     slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
-    read_options = request_desc.read_options if request_desc.HasField('read_options') else None
 
-    # Normalize inputs
+    # Normalize inputs - use scale_hint/reduction_method directly from TensorDescriptor
     source_start, source_stop = normalized_slice_bounds(base_shape, slice_hint)
-    scale_hint = normalized_scale_hint(base_shape, read_options)
-    reduction_method = normalize_reduction_method(
-        read_options.reduction_method if read_options else None
-    )
+    scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
+    reduction_method = normalize_reduction_method(request_desc.reduction_method)
     ndim = len(base_shape)
 
     # STEP 1: Check if base chunk_size needs splitting FIRST
@@ -508,7 +505,10 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         logical_desc.slice_hint.start[:] = list(realized_start)
         logical_desc.slice_hint.stop[:] = list(realized_stop)
 
-    if read_options is not None:
-        logical_desc.read_options.CopyFrom(read_options)
+    # Copy scale_hint and reduction_method to logical descriptor
+    if scale_hint is not None:
+        logical_desc.scale_hint[:] = list(scale_hint)
+    if reduction_method:
+        logical_desc.reduction_method = reduction_method
 
     return TensorReadPlan(descriptor=logical_desc, chunk_endpoints=logical_endpoints)

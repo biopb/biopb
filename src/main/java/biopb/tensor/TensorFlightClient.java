@@ -11,10 +11,11 @@ import java.util.logging.Logger;
 import biopb.tensor.ChunkBounds;
 import biopb.tensor.ChunkUpload;
 import biopb.tensor.DataSourceDescriptor;
+import biopb.tensor.FlightCmd;
+import biopb.tensor.MetadataQueryOption;
 import biopb.tensor.SliceHint;
 import biopb.tensor.TensorDescriptor;
-import biopb.tensor.TensorReadOptions;
-import biopb.tensor.TensorSelection;
+import biopb.tensor.TensorReadOption;
 import biopb.tensor.TensorTicket;
 
 import com.google.gson.Gson;
@@ -284,12 +285,15 @@ public class TensorFlightClient implements AutoCloseable {
      * </pre>
      */
     public VectorSchemaRoot querySources(String sql) throws IOException {
-        TensorSelection selection = TensorSelection.newBuilder()
-            .setMetadataQuery(sql)
+        FlightCmd cmd = FlightCmd.newBuilder()
+            .setSourceId("__metadata_query__")
+            .setMetadataQuery(MetadataQueryOption.newBuilder()
+                .setSql(sql)
+                .build())
             .build();
 
         FlightInfo info = client.getInfo(
-            FlightDescriptor.command(selection.toByteArray()), authOption);
+            FlightDescriptor.command(cmd.toByteArray()), authOption);
 
         // Check schema metadata for truncation
         java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
@@ -381,6 +385,8 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * Fetches metadata via GetFlightInfo for the first tensor in the source,
      * since metadataJson is populated in the response TensorDescriptor.
+     * The server wraps metadata in {"type": ..., "dim_label": [...], "metadata": {...}},
+     * this method returns the inner "metadata" dict.
      *
      * @param sourceId Source identifier
      * @return Parsed metadata as Map, or empty map if no metadata
@@ -399,17 +405,26 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Get metadata from first tensor via GetFlightInfo
         TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
-        TensorSelection selection = TensorSelection.newBuilder()
+        FlightCmd cmd = FlightCmd.newBuilder()
                 .setSourceId(sourceId)
-                .setTensorId(firstTensor.getArrayId())
+                .setTensorRead(TensorReadOption.newBuilder()
+                        .setTensorId(firstTensor.getArrayId())
+                        .setWithMetadata(true)
+                        .build())
                 .build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()), authOption);
+        FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
         TensorDescriptor responseDesc = TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
 
         if (responseDesc.getMetadataJson().isEmpty()) {
             return new HashMap<>();
         }
-        return parseMetadataJson(responseDesc.getMetadataJson());
+        // Unwrap to return just the metadata dict
+        Map<String, Object> wrapped = parseMetadataJson(responseDesc.getMetadataJson());
+        Object metadataValue = wrapped.get("metadata");
+        if (metadataValue instanceof Map) {
+            return (Map<String, Object>) metadataValue;
+        }
+        return wrapped;
     }
 
     /**
@@ -424,33 +439,53 @@ public class TensorFlightClient implements AutoCloseable {
             String sourceId,
             String tensorId) {
 
-        return getTensor(sourceId, tensorId, null, (TensorReadOptions) null);
+        return getTensor(sourceId, tensorId, null, null, null);
     }
 
     /**
-     * Get a RandomAccessibleInterval for a tensor with read options.
+     * Get a RandomAccessibleInterval for a tensor with slice hint.
      *
      * @param sourceId Data source identifier
      * @param tensorId Tensor identifier within the source
-     * @param readOptions Optional request-scoped read options
+     * @param sliceHint Optional slice hint
      * @param <T> The pixel type
      * @return RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
             String sourceId,
             String tensorId,
-            TensorReadOptions readOptions) {
+            SliceHint sliceHint) {
 
-        return getTensor(sourceId, tensorId, null, readOptions);
+        return getTensor(sourceId, tensorId, sliceHint, null, null);
     }
 
     /**
-     * Get a RandomAccessibleInterval for a tensor with slice and read options.
+     * Get a RandomAccessibleInterval for a tensor with scaled read options.
+     *
+     * @param sourceId Data source identifier
+     * @param tensorId Tensor identifier within the source
+     * @param scaleHint Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @param <T> The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String sourceId,
+            String tensorId,
+            long[] scaleHint,
+            String reductionMethod) {
+
+        return getTensor(sourceId, tensorId, null, scaleHint, reductionMethod);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor with all options.
      *
      * @param sourceId Data source identifier
      * @param tensorId Tensor identifier within the source
      * @param sliceHint Optional slice hint
-     * @param readOptions Optional request-scoped read options
+     * @param scaleHint Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
      * @param <T> The pixel type
      * @return SerializableTensorImg containing the requested tensor (implements RandomAccessibleInterval)
      */
@@ -458,9 +493,10 @@ public class TensorFlightClient implements AutoCloseable {
             String sourceId,
             String tensorId,
             SliceHint sliceHint,
-            TensorReadOptions readOptions) {
+            long[] scaleHint,
+            String reductionMethod) {
 
-        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, readOptions);
+        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
         RandomAccessibleInterval<T> rai = createArray(context);
 
         // Crop to the originally requested region.
@@ -477,9 +513,9 @@ public class TensorFlightClient implements AutoCloseable {
                 long reqStop  = sliceHint.getStop(ax);
                 long retStart = realized.getStart(ax);
                 long scale = 1L;
-                if (context.descriptor.hasReadOptions()
-                        && context.descriptor.getReadOptions().getScaleHintCount() > ax) {
-                    scale = context.descriptor.getReadOptions().getScaleHint(ax);
+                // Use scale_hint directly from TensorDescriptor
+                if (context.descriptor.getScaleHintCount() > ax) {
+                    scale = context.descriptor.getScaleHint(ax);
                 }
                 if (scale > 1L) {
                     cropMin[ax] = (reqStart - retStart) / scale;
@@ -499,49 +535,7 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Return SerializableTensorImg wrapper for serialization support
         return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, tensorId,
-                sliceHint, readOptions, context.descriptor, rai);
-    }
-
-    /**
-     * Convenience overload for scaled reads.
-     *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
-     * @param scaleHint Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        TensorReadOptions readOptions = buildReadOptions(scaleHint, reductionMethod);
-        return getTensor(sourceId, tensorId, null, readOptions);
-    }
-
-    /**
-     * Convenience overload for sliced scaled reads.
-     *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
-     * @param sliceHint Optional slice hint
-     * @param scaleHint Per-dimension scale factors
-     * @param reductionMethod Requested reduction method
-     * @param <T> The pixel type
-     * @return RandomAccessibleInterval containing the requested tensor
-     */
-    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
-            String sourceId,
-            String tensorId,
-            SliceHint sliceHint,
-            long[] scaleHint,
-            String reductionMethod) {
-
-        TensorReadOptions readOptions = buildReadOptions(scaleHint, reductionMethod);
-        return getTensor(sourceId, tensorId, sliceHint, readOptions);
+                sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
     }
 
     @Override
@@ -596,7 +590,8 @@ public class TensorFlightClient implements AutoCloseable {
             String sourceId,
             String tensorId,
             SliceHint sliceHint,
-            TensorReadOptions readOptions) {
+            long[] scaleHint,
+            String reductionMethod) {
 
         LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
@@ -626,22 +621,47 @@ public class TensorFlightClient implements AutoCloseable {
             throw new IllegalArgumentException("Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
         }
 
-        TensorReadOptions normalizedReadOptions = normalizeReadOptions(baseDescriptor, readOptions);
+        // Validate scale hint dimensionality if provided
+        if (scaleHint != null && scaleHint.length > 0) {
+            int rank = baseDescriptor.getShapeCount();
+            if (scaleHint.length != rank) {
+                throw new IllegalArgumentException(
+                        "Scale hint dimensionality mismatch: expected " + rank
+                                + ", got " + scaleHint.length);
+            }
+            for (int axis = 0; axis < scaleHint.length; axis++) {
+                if (scaleHint[axis] <= 0) {
+                    throw new IllegalArgumentException(
+                            "Scale hint must be positive on axis " + axis + ": " + scaleHint[axis]);
+                }
+            }
+        }
 
-        // Build TensorSelection for the request
-        TensorSelection.Builder selectionBuilder = TensorSelection.newBuilder()
-            .setSourceId(sourceId)
-            .setTensorId(tensorId);
+        // Normalize reduction method
+        String normalizedReductionMethod = normalizeReductionMethod(reductionMethod);
+
+        // Build TensorReadOption with flattened fields
+        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
+            .setTensorId(tensorId)
+            .setWithMetadata(false);
 
         if (sliceHint != null) {
-            selectionBuilder.setSliceHint(sliceHint);
+            readBuilder.setSliceHint(sliceHint);
         }
-        if (normalizedReadOptions != null) {
-            selectionBuilder.setReadOptions(normalizedReadOptions);
+        if (scaleHint != null) {
+            for (long s : scaleHint) {
+                readBuilder.addScaleHint(s);
+            }
+        }
+        if (normalizedReductionMethod != null && !normalizedReductionMethod.isEmpty()) {
+            readBuilder.setReductionMethod(normalizedReductionMethod);
         }
 
-        TensorSelection selection = selectionBuilder.build();
-        FlightInfo info = client.getInfo(FlightDescriptor.command(selection.toByteArray()), authOption);
+        FlightCmd cmd = FlightCmd.newBuilder()
+            .setSourceId(sourceId)
+            .setTensorRead(readBuilder.build())
+            .build();
+        FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
         checkSchemaVersion(info);
         TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
 
@@ -649,57 +669,6 @@ public class TensorFlightClient implements AutoCloseable {
         descriptors.put(responseDescriptor.getArrayId(), responseDescriptor);
 
         return new RequestContext(responseDescriptor, info.getEndpoints());
-    }
-
-    private static TensorReadOptions buildReadOptions(long[] scaleHint, String reductionMethod) {
-        if ((scaleHint == null || scaleHint.length == 0)
-                && (reductionMethod == null || reductionMethod.isEmpty())) {
-            return null;
-        }
-
-        TensorReadOptions.Builder builder = TensorReadOptions.newBuilder();
-        if (scaleHint != null) {
-            for (long value : scaleHint) {
-                builder.addScaleHint(value);
-            }
-        }
-        if (reductionMethod != null && !reductionMethod.isEmpty()) {
-            builder.setReductionMethod(reductionMethod);
-        }
-        return builder.build();
-    }
-
-    private static TensorReadOptions normalizeReadOptions(
-            TensorDescriptor baseDescriptor,
-            TensorReadOptions readOptions) {
-
-        if (readOptions == null) {
-            return null;
-        }
-
-        int rank = baseDescriptor.getShapeCount();
-        if (readOptions.getScaleHintCount() == 0) {
-            return readOptions;
-        }
-
-        if (readOptions.getScaleHintCount() != rank) {
-            throw new IllegalArgumentException(
-                    "Scale hint dimensionality mismatch: expected " + rank
-                            + ", got " + readOptions.getScaleHintCount());
-        }
-
-        TensorReadOptions.Builder builder = TensorReadOptions.newBuilder();
-        for (int axis = 0; axis < readOptions.getScaleHintCount(); axis++) {
-            long scale = readOptions.getScaleHint(axis);
-            if (scale <= 0) {
-                throw new IllegalArgumentException(
-                        "Scale hint must be positive on axis " + axis + ": " + scale);
-            }
-            builder.addScaleHint(scale);
-        }
-
-        builder.setReductionMethod(normalizeReductionMethod(readOptions.getReductionMethod()));
-        return builder.build();
     }
 
     private static String normalizeReductionMethod(String reductionMethod) {

@@ -9,7 +9,6 @@ import numpy as np
 
 from biopb.tensor import (
     TensorFlightClient,
-    TensorReadOptions,
 )
 from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
@@ -168,7 +167,8 @@ class TestTensorFlightClient:
         darr = server_client.get_tensor(
             'test-tensor',
             'test-tensor',
-            read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='mean'),
+            scale_hint=[2, 2],
+            reduction_method='mean',
         )
 
         assert darr.shape == (64, 64)
@@ -186,7 +186,8 @@ class TestTensorFlightClient:
         darr = server_client.get_tensor(
             'test-tensor',
             'test-tensor',
-            read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='area'),
+            scale_hint=[2, 2],
+            reduction_method='area',
         )
 
         assert darr.shape == (64, 64)
@@ -227,7 +228,8 @@ class TestTensorFlightClient:
                     darr = client.get_tensor(
                         'mean-preserve',
                         'mean-preserve',
-                        read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='mean'),
+                        scale_hint=[2, 2],
+                        reduction_method='mean',
                     )
                     assert darr.dtype == np.uint8
                     np.testing.assert_array_equal(
@@ -266,7 +268,8 @@ class TestTensorFlightClient:
                     darr = client.get_tensor(
                         'linear',
                         'linear',
-                        read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='linear'),
+                        scale_hint=[2, 2],
+                        reduction_method='linear',
                     )
                     assert darr.dtype == np.uint8
                     np.testing.assert_array_equal(

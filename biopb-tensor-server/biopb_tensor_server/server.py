@@ -22,7 +22,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import threading
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorSelection
+from biopb.tensor.descriptor_pb2 import TensorDescriptor, FlightCmd, TensorReadOption, MetadataQueryOption
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
@@ -330,76 +330,103 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Args:
             context: Server call context
-            descriptor: Flight descriptor with TensorSelection
+            descriptor: Flight descriptor with FlightCmd
 
         Returns:
             FlightInfo with schema and chunk endpoints
         """
         import json
 
-        selection = TensorSelection.FromString(descriptor.command)
+        cmd = FlightCmd.FromString(descriptor.command)
 
-        # Check for metadata query first
-        if selection.metadata_query:
-            logger.debug(
-                f"get_flight_info: metadata_query={selection.metadata_query[:100]}..."
-            )
-            if self._metadata_db is None:
-                raise flight.FlightServerError(
-                    "Metadata database not enabled. Set metadata_db config to enable SQL queries."
+        # Dispatch based on source_id
+        if cmd.source_id == "__metadata_query__":
+            # Metadata SQL query branch
+            if cmd.HasField("metadata_query"):
+                sql = cmd.metadata_query.sql
+                logger.debug(
+                    f"get_flight_info: metadata_query sql={sql[:100]}..."
                 )
-            try:
-                return self._metadata_db.handle_query(selection.metadata_query)
-            except ValueError as e:
-                # Query validation or execution failure
-                raise flight.FlightInternalError(f"Metadata query failed: {e}") from e
+                if self._metadata_db is None:
+                    raise flight.FlightServerError(
+                        "Metadata database not enabled. Set metadata_db config to enable SQL queries."
+                    )
+                try:
+                    return self._metadata_db.handle_query(sql)
+                except ValueError as e:
+                    # Query validation or execution failure
+                    raise flight.FlightInternalError(f"Metadata query failed: {e}") from e
+            else:
+                raise flight.FlightServerError(
+                    "Metadata query source_id but no MetadataQueryOption"
+                )
+
+        # Tensor read branch
+        if not cmd.HasField("tensor_read"):
+            raise flight.FlightServerError(
+                f"Tensor read source_id '{cmd.source_id}' but no TensorReadOption"
+            )
+
+        read_opt = cmd.tensor_read
+        source_id = cmd.source_id
+        tensor_id = read_opt.tensor_id
 
         logger.debug(
-            f"get_flight_info: source_id={selection.source_id}, tensor_id={selection.tensor_id}"
+            f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}"
         )
 
         # Get tensor adapter for the specified source and tensor
         tensor_adapter = self._get_adapter_for_tensor(
-            selection.source_id, selection.tensor_id
+            source_id, tensor_id
         )
         if tensor_adapter is None:
             logger.warning(
-                f"Tensor not found: {selection.source_id}/{selection.tensor_id}"
+                f"Tensor not found: {source_id}/{tensor_id}"
             )
             raise flight.FlightServerError(
-                f"Tensor not found: {selection.source_id}/{selection.tensor_id}"
+                f"Tensor not found: {source_id}/{tensor_id}"
             )
 
         # Build request descriptor for the specific tensor
         try:
             base_desc = tensor_adapter.get_tensor_descriptor()
             tensor_desc = TensorDescriptor(
-                array_id=selection.tensor_id,
+                array_id=tensor_id,
                 dim_labels=base_desc.dim_labels,
                 shape=base_desc.shape,
                 chunk_shape=base_desc.chunk_shape,
                 dtype=base_desc.dtype,
             )
-            if selection.HasField("slice_hint"):
-                tensor_desc.slice_hint.CopyFrom(selection.slice_hint)
+            if read_opt.HasField("slice_hint"):
+                tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
                 logger.debug(
-                    f"get_flight_info: slice_hint={list(selection.slice_hint.start)}-{list(selection.slice_hint.stop)}"
+                    f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
                 )
-            if selection.HasField("read_options"):
-                tensor_desc.read_options.CopyFrom(selection.read_options)
+            # Apply scale_hint and reduction_method directly to TensorDescriptor
+            if read_opt.scale_hint:
+                tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
+            if read_opt.reduction_method:
+                tensor_desc.reduction_method = read_opt.reduction_method
 
             read_plan = tensor_adapter.get_read_plan(tensor_desc)
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
-            # Populate metadata_json in response descriptor
-            metadata = tensor_adapter.get_metadata()
-            if metadata:
-                read_plan.descriptor.metadata_json = json.dumps(
-                    metadata, cls=NumpyEncoder
-                )
+            # Populate metadata_json in response descriptor if requested
+            if read_opt.with_metadata:
+                source_adapter = self._get_source_adapter(source_id)
+                raw_metadata = tensor_adapter.get_metadata()
+                if raw_metadata and source_adapter is not None:
+                    wrapped_metadata = {
+                        "type": source_adapter._source_type,
+                        "dim_label": list(read_plan.descriptor.dim_labels),
+                        "metadata": raw_metadata,
+                    }
+                    read_plan.descriptor.metadata_json = json.dumps(
+                        wrapped_metadata, cls=NumpyEncoder
+                    )
         except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
-                f"Metadata error for {selection.source_id}: {e}"
+                f"Metadata error for {source_id}: {e}"
             ) from e
 
         # Convert to FlightEndpoints

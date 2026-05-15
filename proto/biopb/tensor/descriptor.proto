@@ -26,16 +26,20 @@ message TensorDescriptor {
   // covering this range. Leave unset/null to return all chunks.
   SliceHint slice_hint = 6;
 
-  // Optional read-time options for virtual/scaled reads.
-  // These do not change tensor identity, only how a specific read request
-  // should be planned and served.
-  TensorReadOptions read_options = 7;
+  // Per-dimension integer downsampling factors for virtual/scaled reads.
+  // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
+  // These do not change tensor identity, only how a specific read request is planned.
+  repeated int64 scale_hint = 7;
+
+  // Dynamic reduction/downsampling method for scaled reads: "nearest", "area", "linear".
+  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area".
+  string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
   // Contains: multiscales, axes, coordinateTransformations, channels, etc.
   // For precomputed pyramids: multiscales[].datasets[].path and scale info.
   // Empty string if no metadata available.
-  string metadata_json = 8;
+  string metadata_json = 9;
 }
 
 // Specifies a sub-region of the tensor for filtered endpoint discovery
@@ -52,30 +56,54 @@ message TensorCriteria {
   reserved 1 to 10; // Future: prefix, dtype_filter, shape_range, etc.
 }
 
-// Placeholder for future read options
-// Currently used for request-scoped virtual/scaled read planning.
-message TensorReadOptions {
-  // Per-dimension integer downsampling factors.
-  // Example: [1, 8, 8] means full resolution on the first axis and 8x reduced
-  // resolution on the remaining axes.
-  repeated int64 scale_hint = 1;
-
-  // Dynamic reduction/downsampling method selected by the client.
-  // Current implementation supports the visualization-oriented methods
-  // "nearest", "area", and "linear".
-  // Compatibility aliases are also accepted:
-  // - "stride" -> "nearest"
-  // - "decimate" -> "nearest"
-  // - "mean" -> "area"
-  string reduction_method = 2;
-
-  reserved 3 to 10; // Future: compression_hint, cache_policy, device_hint, etc.
-}
-
 // Placeholder for future write options
 // Currently empty - server uses defaults
 message TensorWriteOptions {
   reserved 1 to 10; // Future: transaction_id, atomic, overwrite_policy, etc.
+}
+
+// SQL query against server's metadata database.
+// Used in FlightCmd.metadata_query branch.
+message MetadataQueryOption {
+  // SQL query string (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+  string sql = 1;
+}
+
+// Tensor read request within a data source.
+// Flattened structure - no nested messages for read options.
+// Used in FlightCmd.tensor_read branch.
+message TensorReadOption {
+  // Which tensor within the source
+  string tensor_id = 1;
+
+  // Optional sub-region to read
+  SliceHint slice_hint = 2;
+
+  // Per-dimension integer downsampling factors.
+  // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
+  repeated int64 scale_hint = 3;
+
+  // Dynamic reduction/downsampling method: "nearest", "area", "linear".
+  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area".
+  string reduction_method = 4;
+
+  // If true, server populates metadata_json with wrapped metadata.
+  // Wrapped structure: {"type": source_type, "dim_label": [...], "metadata": {...}}
+  bool with_metadata = 5;
+}
+
+// Client command for GetFlightInfo requests.
+// Server dispatches based on source_id:
+// - "__metadata_query__" -> MetadataQueryOption branch (SQL query)
+// - Any other value -> TensorReadOption branch (tensor read)
+message FlightCmd {
+  // Which data source (flight identifier), or "__metadata_query__" for SQL queries
+  string source_id = 1;
+
+  oneof command {
+    TensorReadOption tensor_read = 2;
+    MetadataQueryOption metadata_query = 3;
+  }
 }
 
 // Describes a data source containing one or more tensors.
@@ -97,25 +125,4 @@ message DataSourceDescriptor {
 
   // Source-level OME/vendor metadata (JSON format)
   string metadata_json = 5;
-}
-
-// Client request to access a specific tensor within a data source.
-// Used in GetFlightInfo request to select tensor_id from a source.
-message TensorSelection {
-  // Which data source (flight identifier)
-  string source_id = 1;
-
-  // Which tensor within the source
-  string tensor_id = 2;
-
-  // Optional sub-region to read
-  SliceHint slice_hint = 3;
-
-  // Optional scale/reduction options
-  TensorReadOptions read_options = 4;
-
-  // If set, server interprets as metadata query instead of tensor selection.
-  // SQL query against sources table (e.g., "SELECT source_id FROM sources WHERE source_type='ome-zarr'")
-  // Returns Arrow Table with query results via DoGet.
-  string metadata_query = 5;
 }

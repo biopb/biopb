@@ -92,14 +92,11 @@ public class TensorFlightClientTest {
     public void testScaledReadUsesResponseDescriptor() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                TensorReadOptions readOptions = TensorReadOptions.newBuilder()
-                        .addScaleHint(2)
-                        .addScaleHint(2)
-                        .setReductionMethod("nearest")
-                        .build();
+                long[] scaleHint = new long[] {2, 2};
+                String reductionMethod = "nearest";
 
                 RandomAccessibleInterval<FloatType> scaled = client.getTensor(
-                        "test-source", "test-tensor", readOptions);
+                        "test-source", "test-tensor", scaleHint, reductionMethod);
                 Assert.assertEquals(0, server.getTotalChunkRequestCount());
 
                 Assert.assertEquals(2, scaled.dimension(0));
@@ -132,14 +129,11 @@ public class TensorFlightClientTest {
     public void testScaledReadAcceptsClippedEdgeChunks() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                TensorReadOptions readOptions = TensorReadOptions.newBuilder()
-                        .addScaleHint(2)
-                        .addScaleHint(2)
-                        .setReductionMethod("linear")
-                        .build();
+                long[] scaleHint = new long[] {2, 2};
+                String reductionMethod = "linear";
 
                 RandomAccessibleInterval<FloatType> scaled = client.getTensor(
-                        "test-source", "test-tensor", readOptions);
+                        "test-source", "test-tensor", scaleHint, reductionMethod);
                 Assert.assertEquals(0, server.getTotalChunkRequestCount());
 
                 Assert.assertEquals(3, scaled.dimension(0));
@@ -366,7 +360,7 @@ public class TensorFlightClientTest {
         private final org.apache.arrow.vector.types.pojo.Schema schema;
         private final Map<String, float[]> chunkData;
         private final Map<String, AtomicInteger> chunkRequests;
-        private volatile TensorSelection lastSelection;
+        private volatile FlightCmd lastCmd;
 
         TensorTestProducer(BufferAllocator allocator) {
             this.allocator = allocator;
@@ -423,10 +417,10 @@ public class TensorFlightClientTest {
         }
 
         String getLastReductionMethod() {
-            if (lastSelection == null || !lastSelection.hasReadOptions()) {
+            if (lastCmd == null || !lastCmd.hasTensorRead()) {
                 return null;
             }
-            return lastSelection.getReadOptions().getReductionMethod();
+            return lastCmd.getTensorRead().getReductionMethod();
         }
 
         @Override
@@ -447,26 +441,26 @@ public class TensorFlightClientTest {
 
         @Override
         public FlightInfo getFlightInfo(FlightProducer.CallContext context, FlightDescriptor descriptor) {
-            TensorSelection selection = parseSelection(descriptor.getCommand());
-            lastSelection = selection;
-            TensorReadOptions readOptions = selection.hasReadOptions()
-                    ? selection.getReadOptions()
+            FlightCmd cmd = parseCmd(descriptor.getCommand());
+            lastCmd = cmd;
+            TensorReadOption readOpt = cmd.hasTensorRead()
+                    ? cmd.getTensorRead()
                     : null;
 
             // Validate source and tensor
-            if (!selection.getSourceId().equals("test-source")) {
-                throw new IllegalArgumentException("Source not found: " + selection.getSourceId());
+            if (!cmd.getSourceId().equals("test-source")) {
+                throw new IllegalArgumentException("Source not found: " + cmd.getSourceId());
             }
-            if (!selection.getTensorId().equals("test-tensor")) {
-                throw new IllegalArgumentException("Tensor not found: " + selection.getTensorId());
+            if (readOpt == null || !readOpt.getTensorId().equals("test-tensor")) {
+                throw new IllegalArgumentException("Tensor not found: " + (readOpt != null ? readOpt.getTensorId() : "null"));
             }
 
             // Handle scaled reads
-            if (readOptions != null
-                    && readOptions.getScaleHintCount() == 2
-                    && readOptions.getScaleHint(0) == 2
-                    && readOptions.getScaleHint(1) == 2
-                    && "linear".equals(readOptions.getReductionMethod())) {
+            if (readOpt != null
+                    && readOpt.getScaleHintCount() == 2
+                    && readOpt.getScaleHint(0) == 2
+                    && readOpt.getScaleHint(1) == 2
+                    && "linear".equals(readOpt.getReductionMethod())) {
 
                 TensorDescriptor responseDescriptor = TensorDescriptor.newBuilder(baseDescriptor)
                         .clearShape()
@@ -475,7 +469,9 @@ public class TensorFlightClientTest {
                         .addShape(3)
                         .addChunkShape(2)
                         .addChunkShape(2)
-                        .setReadOptions(readOptions)
+                        .clearScaleHint()
+                        .addAllScaleHint(readOpt.getScaleHintList())
+                        .setReductionMethod(readOpt.getReductionMethod())
                         .build();
                 return new FlightInfo(
                         schema,
@@ -485,10 +481,10 @@ public class TensorFlightClientTest {
                         -1);
             }
 
-            if (readOptions != null
-                    && readOptions.getScaleHintCount() == 2
-                    && readOptions.getScaleHint(0) == 2
-                    && readOptions.getScaleHint(1) == 2) {
+            if (readOpt != null
+                    && readOpt.getScaleHintCount() == 2
+                    && readOpt.getScaleHint(0) == 2
+                    && readOpt.getScaleHint(1) == 2) {
 
                 TensorDescriptor responseDescriptor = TensorDescriptor.newBuilder(baseDescriptor)
                         .clearShape()
@@ -497,7 +493,9 @@ public class TensorFlightClientTest {
                         .addShape(2)
                         .addChunkShape(1)
                         .addChunkShape(1)
-                        .setReadOptions(readOptions)
+                        .clearScaleHint()
+                        .addAllScaleHint(readOpt.getScaleHintList())
+                        .setReductionMethod(readOpt.getReductionMethod())
                         .build();
                 return new FlightInfo(
                         schema,
@@ -602,11 +600,11 @@ public class TensorFlightClientTest {
             return new org.apache.arrow.vector.types.pojo.Schema(Collections.singletonList(listField));
         }
 
-        private static TensorSelection parseSelection(byte[] bytes) {
+        private static FlightCmd parseCmd(byte[] bytes) {
             try {
-                return TensorSelection.parseFrom(bytes);
+                return FlightCmd.parseFrom(bytes);
             } catch (IOException e) {
-                throw new IllegalStateException("Failed to parse TensorSelection", e);
+                throw new IllegalStateException("Failed to parse FlightCmd", e);
             }
         }
 

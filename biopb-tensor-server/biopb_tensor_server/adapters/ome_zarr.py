@@ -730,19 +730,16 @@ class OmeZarrAdapter(ZarrAdapter):
         Supports "precompute" method to use precomputed pyramid levels.
         Falls back to virtual scaling for other methods.
         """
-        # Extract parameters from request_desc
+        # Extract parameters from request_desc (scale_hint/reduction_method are now direct fields)
         slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
-        read_options = request_desc.read_options if request_desc.HasField('read_options') else None
 
-        # Compute scale_hint from read_options
+        # Compute scale_hint directly from TensorDescriptor
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
         from biopb_tensor_server.chunk import normalized_scale_hint
-        scale_hint = normalized_scale_hint(base_shape, read_options)
+        scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
 
-        reduction_method = normalize_reduction_method(
-            read_options.reduction_method if read_options else None
-        )
+        reduction_method = normalize_reduction_method(request_desc.reduction_method)
 
         # "precompute" method: use precomputed level if exact match
         if reduction_method == 'precompute' and scale_hint is not None:
@@ -817,7 +814,7 @@ class OmeZarrAdapter(ZarrAdapter):
         """
         level_adapter = self.get_level_adapter(level_path)
 
-        # Create request descriptor with slice_hint but NO read_options
+        # Create request descriptor with slice_hint but NO scale_hint (no downsampling)
         level_desc = level_adapter.get_tensor_descriptor()
         request_desc = TensorDescriptor(
             array_id=self.array_id,  # Use original array_id, not level's

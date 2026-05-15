@@ -14,7 +14,7 @@ from math import lcm
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
-from biopb.tensor.descriptor_pb2 import SliceHint, TensorReadOptions
+from biopb.tensor.descriptor_pb2 import SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 logger = logging.getLogger(__name__)
@@ -160,13 +160,13 @@ def normalized_slice_bounds(
 
 def normalized_scale_hint(
     shape: Tuple[int, ...],
-    read_options: Optional[TensorReadOptions],
+    scale_hint: Optional[Tuple[int, ...]],
 ) -> Optional[Tuple[int, ...]]:
-    """Normalize scale hint from read_options.
+    """Normalize scale hint from request.
 
     Args:
         shape: Tensor shape
-        read_options: Optional read options from request
+        scale_hint: Optional scale hint from request (repeated int64 field)
 
     Returns:
         Scale hint tuple if valid and non-trivial, None otherwise
@@ -174,23 +174,23 @@ def normalized_scale_hint(
     Raises:
         ValueError: If scale hint dimensionality mismatch or invalid values
     """
-    if read_options is None or len(read_options.scale_hint) == 0:
+    if scale_hint is None or len(scale_hint) == 0:
         return None
 
-    scale_hint = tuple(int(value) for value in read_options.scale_hint)
-    if len(scale_hint) != len(shape):
+    scale_hint_tuple = tuple(int(value) for value in scale_hint)
+    if len(scale_hint_tuple) != len(shape):
         raise ValueError(
-            f"Scale hint dimensionality mismatch: expected {len(shape)}, got {len(scale_hint)}"
+            f"Scale hint dimensionality mismatch: expected {len(shape)}, got {len(scale_hint_tuple)}"
         )
 
-    for axis, scale in enumerate(scale_hint):
+    for axis, scale in enumerate(scale_hint_tuple):
         if scale <= 0:
             raise ValueError(f"Scale hint must be positive on axis {axis}")
 
-    if all(scale == 1 for scale in scale_hint):
+    if all(scale == 1 for scale in scale_hint_tuple):
         return None
 
-    return scale_hint
+    return scale_hint_tuple
 
 
 def logical_chunk_shape(

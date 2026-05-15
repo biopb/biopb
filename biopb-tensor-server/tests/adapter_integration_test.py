@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 from biopb.tensor import (
     TensorFlightClient,
-    TensorReadOptions,
 )
 
 from biopb_tensor_server import TensorFlightServer
@@ -163,9 +162,8 @@ class TestOmeZarrIntegration:
             darr = client.get_tensor(
                 "ome-zarr-integration",
                 "ome-zarr-integration",
-                read_options=TensorReadOptions(
-                    scale_hint=[2, 2], reduction_method="precompute"
-                ),
+                scale_hint=[2, 2],
+                reduction_method="precompute",
             )
 
             # Level 1 shape should be base_shape / 2

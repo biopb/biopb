@@ -22,8 +22,10 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     SliceHint,
     TensorCriteria,
-    TensorReadOptions,
     TensorWriteOptions,
+    FlightCmd,
+    TensorReadOption,
+    MetadataQueryOption,
 )
 
 # Import client
@@ -36,8 +38,10 @@ __all__ = [
     'TensorDescriptor',
     'SliceHint',
     'TensorCriteria',
-    'TensorReadOptions',
     'TensorWriteOptions',
+    'FlightCmd',
+    'TensorReadOption',
+    'MetadataQueryOption',
     # Client
     'TensorFlightClient',
 ]

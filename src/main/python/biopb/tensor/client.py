@@ -28,8 +28,9 @@ from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     SliceHint,
-    TensorReadOptions,
-    TensorSelection,
+    FlightCmd,
+    TensorReadOption,
+    MetadataQueryOption,
     DataSourceDescriptor,
 )
 
@@ -327,8 +328,11 @@ class TensorFlightClient:
             >>> table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
             >>> print(table.to_pandas())
         """
-        selection = TensorSelection(metadata_query=sql)
-        descriptor = flight.FlightDescriptor.for_command(selection.SerializeToString())
+        cmd = FlightCmd(
+            source_id="__metadata_query__",
+            metadata_query=MetadataQueryOption(sql=sql),
+        )
+        descriptor = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         info = self._client.get_flight_info(descriptor, options=self._call_options)
 
         # Check schema metadata for truncation info
@@ -366,8 +370,9 @@ class TensorFlightClient:
             source_id: Source identifier
 
         Returns:
-            Parsed metadata_json from GetFlightInfo response
-            (multiscales, axes, omero, etc. per OME-NGFF schema),
+            Parsed metadata from GetFlightInfo response.
+            The server wraps metadata in {"type": ..., "dim_label": [...], "metadata": {...}},
+            this method returns the inner "metadata" dict,
             or empty dict if no metadata.
         """
         import json
@@ -384,16 +389,21 @@ class TensorFlightClient:
 
         # Get metadata from first tensor via GetFlightInfo
         first_tensor = source_desc.tensors[0]
-        selection = TensorSelection(
+        cmd = FlightCmd(
             source_id=source_id,
-            tensor_id=first_tensor.array_id,
+            tensor_read=TensorReadOption(
+                tensor_id=first_tensor.array_id,
+                with_metadata=True,
+            ),
         )
-        flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
+        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         info = self._client.get_flight_info(flight_desc, options=self._call_options)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         if response_desc.metadata_json:
-            return json.loads(response_desc.metadata_json)
+            wrapped = json.loads(response_desc.metadata_json)
+            # Unwrap to return just the metadata dict
+            return wrapped.get("metadata", {})
         return {}
 
     def get_tensor(
@@ -403,7 +413,6 @@ class TensorFlightClient:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        read_options: Optional[TensorReadOptions] = None,
     ) -> da.Array:
         """Get a lazy dask array for a tensor within a data source.
 
@@ -413,7 +422,6 @@ class TensorFlightClient:
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
-            read_options: Optional explicit read options proto
 
         Returns:
             dask.array with lazy chunk loading
@@ -449,33 +457,26 @@ class TensorFlightClient:
                 )
             slice_hint_proto = SliceHint(start=starts, stop=stops)
 
-        if read_options is not None and (
-            scale_hint is not None or reduction_method is not None
-        ):
-            raise ValueError(
-                "Pass either read_options or scale_hint/reduction_method, not both"
-            )
-
-        if read_options is None and (
-            scale_hint is not None or reduction_method is not None
-        ):
-            read_options = TensorReadOptions(
-                scale_hint=list(scale_hint or []),
-                reduction_method=reduction_method or "",
-            )
-
-        # Build TensorSelection for the request
-        selection = TensorSelection(
-            source_id=source_id,
+        # Build TensorReadOption with flattened fields
+        read_opt = TensorReadOption(
             tensor_id=tensor_id,
+            with_metadata=False,
         )
         if slice_hint_proto is not None:
-            selection.slice_hint.CopyFrom(slice_hint_proto)
-        if read_options is not None:
-            selection.read_options.CopyFrom(read_options)
+            read_opt.slice_hint.CopyFrom(slice_hint_proto)
+        if scale_hint is not None:
+            read_opt.scale_hint[:] = list(scale_hint)
+        if reduction_method is not None:
+            read_opt.reduction_method = reduction_method
+
+        # Build FlightCmd for the request
+        cmd = FlightCmd(
+            source_id=source_id,
+            tensor_read=read_opt,
+        )
 
         # Get flight info
-        flight_desc = flight.FlightDescriptor.for_command(selection.SerializeToString())
+        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         info = self._client.get_flight_info(flight_desc, options=self._call_options)
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
@@ -513,11 +514,8 @@ class TensorFlightClient:
         if slice_hint_proto is not None and response_desc.HasField("slice_hint"):
             realized = response_desc.slice_hint
             ndim = len(response_desc.shape)
-            scale = (
-                list(read_options.scale_hint)
-                if read_options and len(read_options.scale_hint) > 0
-                else None
-            )
+            # Use scale_hint from read_opt (flattened field)
+            scale = list(read_opt.scale_hint) if read_opt.scale_hint else None
             crop = []
             for ax in range(ndim):
                 req_start = int(slice_hint_proto.start[ax])

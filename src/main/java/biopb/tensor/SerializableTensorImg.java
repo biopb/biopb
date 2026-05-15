@@ -52,7 +52,8 @@ import net.imglib2.type.numeric.real.FloatType;
  * - Authentication token
  * - Cache size (bytes)
  * - Source and tensor identifiers
- * - SliceHint and TensorReadOptions (as protobuf bytes)
+ * - SliceHint (as protobuf bytes)
+ * - scale_hint and reduction_method (flattened, as serialized bytes)
  *
  * Deserialization reconstructs:
  * - Pooled FlightClient connection (shared across deserializations)
@@ -68,13 +69,14 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     private String sourceId;
     private String tensorId;
     private byte[] sliceHintBytes;
-    private byte[] readOptionsBytes;
+    private byte[] scaleHintBytes;  // Serialized long[] array
+    private String reductionMethod;
     private byte[] descriptorBytes;
 
     // Transient state - reconstructed after deserialization
     private transient RandomAccessibleInterval<T> delegate;
     private transient SliceHint sliceHint;
-    private transient TensorReadOptions readOptions;
+    private transient long[] scaleHint;
     private transient TensorDescriptor descriptor;
 
     // Required for Externalizable - no-arg constructor
@@ -85,7 +87,8 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         this.sourceId = null;
         this.tensorId = null;
         this.sliceHintBytes = null;
-        this.readOptionsBytes = null;
+        this.scaleHintBytes = null;
+        this.reductionMethod = null;
         this.descriptorBytes = null;
         this.delegate = null;
     }
@@ -99,7 +102,8 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
      * @param sourceId Data source identifier
      * @param tensorId Tensor identifier
      * @param sliceHint Slice hint (null if none)
-     * @param readOptions Read options (null if none)
+     * @param scaleHint Per-dimension scale factors (null if none)
+     * @param reductionMethod Reduction method string (null if none)
      * @param descriptor Response tensor descriptor (contains shape, chunk info)
      * @param delegate The actual RandomAccessibleInterval to wrap
      */
@@ -110,7 +114,8 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             String sourceId,
             String tensorId,
             SliceHint sliceHint,
-            TensorReadOptions readOptions,
+            long[] scaleHint,
+            String reductionMethod,
             TensorDescriptor descriptor,
             RandomAccessibleInterval<T> delegate) {
 
@@ -120,13 +125,14 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         this.sourceId = sourceId;
         this.tensorId = tensorId;
         this.sliceHint = sliceHint;
-        this.readOptions = readOptions;
+        this.scaleHint = scaleHint;
+        this.reductionMethod = reductionMethod;
         this.descriptor = descriptor;
         this.delegate = delegate;
 
-        // Serialize protobuf objects to bytes
+        // Serialize protobuf objects and arrays to bytes
         this.sliceHintBytes = sliceHint != null ? sliceHint.toByteArray() : null;
-        this.readOptionsBytes = readOptions != null ? readOptions.toByteArray() : null;
+        this.scaleHintBytes = scaleHint != null ? serializeLongArray(scaleHint) : null;
         this.descriptorBytes = descriptor != null ? descriptor.toByteArray() : null;
     }
 
@@ -140,7 +146,8 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         out.writeUTF(sourceId);
         out.writeUTF(tensorId);
         out.writeObject(sliceHintBytes);
-        out.writeObject(readOptionsBytes);
+        out.writeObject(scaleHintBytes);
+        out.writeObject(reductionMethod);
         out.writeObject(descriptorBytes);
     }
 
@@ -152,12 +159,13 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         sourceId = in.readUTF();
         tensorId = in.readUTF();
         sliceHintBytes = (byte[]) in.readObject();
-        readOptionsBytes = (byte[]) in.readObject();
+        scaleHintBytes = (byte[]) in.readObject();
+        reductionMethod = (String) in.readObject();
         descriptorBytes = (byte[]) in.readObject();
 
-        // Parse protobuf bytes
+        // Parse protobuf bytes and deserialize arrays
         sliceHint = sliceHintBytes != null ? SliceHint.parseFrom(sliceHintBytes) : null;
-        readOptions = readOptionsBytes != null ? TensorReadOptions.parseFrom(readOptionsBytes) : null;
+        scaleHint = scaleHintBytes != null ? deserializeLongArray(scaleHintBytes) : null;
         descriptor = descriptorBytes != null ? TensorDescriptor.parseFrom(descriptorBytes) : null;
 
         // Delegate is null - will be reconstructed lazily
@@ -184,23 +192,30 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         FlightClient client = conn.getClient();
         CredentialCallOption authOption = conn.getAuthOption();
 
-        // Build TensorSelection for the request
-        TensorSelection.Builder selectionBuilder = TensorSelection.newBuilder()
-            .setSourceId(sourceId)
+        // Build TensorReadOption with flattened fields
+        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
             .setTensorId(tensorId);
 
         if (sliceHint != null) {
-            selectionBuilder.setSliceHint(sliceHint);
+            readBuilder.setSliceHint(sliceHint);
         }
-        if (readOptions != null) {
-            selectionBuilder.setReadOptions(readOptions);
+        if (scaleHint != null) {
+            for (long s : scaleHint) {
+                readBuilder.addScaleHint(s);
+            }
+        }
+        if (reductionMethod != null && !reductionMethod.isEmpty()) {
+            readBuilder.setReductionMethod(reductionMethod);
         }
 
-        TensorSelection selection = selectionBuilder.build();
+        FlightCmd cmd = FlightCmd.newBuilder()
+            .setSourceId(sourceId)
+            .setTensorRead(readBuilder.build())
+            .build();
 
         try {
             FlightInfo info = client.getInfo(
-                org.apache.arrow.flight.FlightDescriptor.command(selection.toByteArray()),
+                org.apache.arrow.flight.FlightDescriptor.command(cmd.toByteArray()),
                 authOption);
 
             // Use stored descriptor if available, otherwise parse from response
@@ -244,9 +259,9 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                     long reqStop = sliceHint.getStop(ax);
                     long retStart = realized.getStart(ax);
                     long scale = 1L;
-                    if (responseDescriptor.hasReadOptions()
-                            && responseDescriptor.getReadOptions().getScaleHintCount() > ax) {
-                        scale = responseDescriptor.getReadOptions().getScaleHint(ax);
+                    // Use scale_hint directly from TensorDescriptor
+                    if (responseDescriptor.getScaleHintCount() > ax) {
+                        scale = responseDescriptor.getScaleHint(ax);
                     }
                     if (scale > 1L) {
                         cropMin[ax] = (reqStart - retStart) / scale;
@@ -269,6 +284,39 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         } catch (Exception e) {
             throw new IllegalStateException("Failed to reconstruct tensor after deserialization", e);
         }
+    }
+
+    // Helper methods for long[] serialization
+
+    private static byte[] serializeLongArray(long[] arr) {
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream dos = new java.io.DataOutputStream(baos);
+        try {
+            dos.writeInt(arr.length);
+            for (long val : arr) {
+                dos.writeLong(val);
+            }
+            dos.close();
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to serialize long array", e);
+        }
+        return baos.toByteArray();
+    }
+
+    private static long[] deserializeLongArray(byte[] bytes) {
+        java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(bytes);
+        java.io.DataInputStream dis = new java.io.DataInputStream(bais);
+        try {
+            int len = dis.readInt();
+            long[] arr = new long[len];
+            for (int i = 0; i < len; i++) {
+                arr[i] = dis.readLong();
+            }
+            dis.close();
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to deserialize long array", e);
+        }
+        return null; // unreachable
     }
 
     // Helper methods (adapted from TensorFlightClient)

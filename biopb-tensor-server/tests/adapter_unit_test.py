@@ -12,7 +12,6 @@ import pytest
 from biopb.tensor import (
     SliceHint,
     TensorDescriptor,
-    TensorReadOptions,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -221,7 +220,8 @@ class TestGetScaledReadPlan:
                 shape=[100, 100],
                 chunk_shape=[50, 50],
                 dtype='uint8',
-                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+                scale_hint=[2, 2],
+                reduction_method='nearest',
             )
             plan = adapter.get_read_plan(request_desc)
 
@@ -248,7 +248,8 @@ class TestGetScaledReadPlan:
                 chunk_shape=[50, 50],
                 dtype='uint8',
                 slice_hint=SliceHint(start=[10, 10], stop=[50, 50]),
-                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+                scale_hint=[2, 2],
+                reduction_method='nearest',
             )
             plan = adapter.get_read_plan(request_desc)
 
@@ -343,7 +344,8 @@ class TestOmeZarrPrecompute:
                 shape=[100, 100],
                 chunk_shape=[50, 50],
                 dtype='uint8',
-                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='precompute'),
+                scale_hint=[2, 2],
+                reduction_method='precompute',
             )
             plan = adapter.get_read_plan(request_desc)
 
@@ -388,7 +390,8 @@ class TestOmeZarrPrecompute:
                 shape=[100, 100],
                 chunk_shape=[50, 50],
                 dtype='uint8',
-                read_options=TensorReadOptions(scale_hint=[3, 3], reduction_method='precompute'),
+                scale_hint=[3, 3],
+                reduction_method='precompute',
             )
             with pytest.raises(ValueError, match="No precomputed level matching"):
                 adapter.get_read_plan(request_desc)
@@ -430,7 +433,8 @@ class TestOmeZarrPrecompute:
                 shape=[100, 100],
                 chunk_shape=[50, 50],
                 dtype='uint8',
-                read_options=TensorReadOptions(scale_hint=[2, 2], reduction_method='nearest'),
+                scale_hint=[2, 2],
+                reduction_method='nearest',
             )
             plan = adapter.get_read_plan(request_desc)
 
