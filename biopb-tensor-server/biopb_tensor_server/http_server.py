@@ -250,7 +250,7 @@ def create_app(
     flight_location: str = "grpc://localhost:8815",
     token: Optional[str] = None,
     dev_mode: bool = False,
-    cache_bytes: int = 1_000_000_000,
+    cache_bytes: int = 0,  # Disabled - sidecar runs on same machine as gRPC server
     cors_origins: Optional[List[str]] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
@@ -259,7 +259,8 @@ def create_app(
         flight_location: Arrow Flight server to connect to.
         token: Shared secret token. ``None`` disables auth (only in dev_mode).
         dev_mode: Whether the website token bypass is active.
-        cache_bytes: Bytes for the in-process chunk cache on the Python side.
+        cache_bytes: Bytes for the in-process chunk cache (default 0, disabled
+            since sidecar runs on same machine as gRPC server which already caches).
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
 
     Returns:
@@ -752,7 +753,7 @@ def run(
     dev_mode: bool = False,
     host: str = "127.0.0.1",
     port: int = 8816,
-    cache_bytes: int = 1_000_000_000,
+    cache_bytes: int = 0,  # Disabled - sidecar runs on same machine as gRPC server
     cors_origins: Optional[List[str]] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
