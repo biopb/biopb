@@ -8,56 +8,33 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
 
-import biopb.tensor.ChunkBounds;
-import biopb.tensor.ChunkUpload;
-import biopb.tensor.DataSourceDescriptor;
-import biopb.tensor.FlightCmd;
-import biopb.tensor.MetadataQueryOption;
-import biopb.tensor.SliceHint;
-import biopb.tensor.TensorDescriptor;
-import biopb.tensor.TensorReadOption;
-import biopb.tensor.TensorTicket;
+import org.apache.arrow.flight.Criteria;
+import org.apache.arrow.flight.FlightClient;
+import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightStream;
+import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.Ticket;
+import org.apache.arrow.flight.grpc.CredentialCallOption;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.VectorLoader;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
-import org.apache.arrow.flight.Criteria;
-import org.apache.arrow.flight.FlightClient;
-import org.apache.arrow.flight.FlightClient.ClientStreamListener;
-import org.apache.arrow.flight.FlightDescriptor;
-import org.apache.arrow.flight.FlightEndpoint;
-import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightStream;
-import org.apache.arrow.flight.Location;
-import org.apache.arrow.flight.PutResult;
-import org.apache.arrow.flight.Ticket;
-import org.apache.arrow.flight.CallHeaders;
-import org.apache.arrow.flight.AsyncPutListener;
-import org.apache.arrow.flight.grpc.CredentialCallOption;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.Float4Vector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.UInt1Vector;
-import org.apache.arrow.vector.UInt2Vector;
-import org.apache.arrow.vector.UInt4Vector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.vector.VectorLoader;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
-import org.apache.arrow.vector.types.Types;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.types.pojo.Schema;
-
 import net.imglib2.FinalInterval;
 import net.imglib2.Interval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.view.Views;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
 import net.imglib2.cache.img.SingleCellArrayImg;
@@ -72,11 +49,13 @@ import net.imglib2.type.numeric.integer.UnsignedIntType;
 import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.DoubleType;
 import net.imglib2.type.numeric.real.FloatType;
+import net.imglib2.view.Views;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
  *
- * This client uses Apache Arrow Flight to discover data sources, request logical
+ * This client uses Apache Arrow Flight to discover data sources, request
+ * logical
  * read plans, and fetch chunk payloads from a TensorFlightServer. It supports
  * multifield acquisitions where tensors within a source have different shapes.
  *
@@ -85,6 +64,7 @@ import net.imglib2.type.numeric.real.FloatType;
  * internal cell cache is the primary cache for repeated reads.
  *
  * Usage:
+ * 
  * <pre>
  * TensorFlightClient client = new TensorFlightClient("localhost:8815");
  *
@@ -93,7 +73,7 @@ import net.imglib2.type.numeric.real.FloatType;
  *
  * // Access a specific tensor within a source
  * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source", "tensor-0");
- * long[] pos = {10, 20, 30};
+ * long[] pos = { 10, 20, 30 };
  * UnsignedByteType pixel = arr.getAt(pos);
  * client.close();
  * </pre>
@@ -125,8 +105,8 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Create a new TensorFlightClient with custom cache size.
      *
-     * @param host Server host
-     * @param port Server port
+     * @param host       Server host
+     * @param port       Server port
      * @param cacheBytes Maximum cache size in bytes
      */
     public TensorFlightClient(String host, int port, long cacheBytes) {
@@ -136,10 +116,10 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Create a new TensorFlightClient with authentication token.
      *
-     * @param host Server host
-     * @param port Server port
+     * @param host       Server host
+     * @param port       Server port
      * @param cacheBytes Maximum cache size in bytes
-     * @param token Bearer token for authentication (null disables auth)
+     * @param token      Bearer token for authentication (null disables auth)
      */
     public TensorFlightClient(String host, int port, long cacheBytes, String token) {
         this(Location.forGrpcInsecure(host, port), cacheBytes, token);
@@ -157,7 +137,7 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Create a new TensorFlightClient for an Arrow Flight location.
      *
-     * @param location Flight server location
+     * @param location   Flight server location
      * @param cacheBytes Maximum cache size in bytes
      */
     public TensorFlightClient(Location location, long cacheBytes) {
@@ -165,21 +145,23 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Create a new TensorFlightClient for an Arrow Flight location with authentication.
+     * Create a new TensorFlightClient for an Arrow Flight location with
+     * authentication.
      *
-     * @param location Flight server location
+     * @param location   Flight server location
      * @param cacheBytes Maximum cache size in bytes
-     * @param token Bearer token for authentication (null disables auth)
+     * @param token      Bearer token for authentication (null disables auth)
      */
     public TensorFlightClient(Location location, long cacheBytes, String token) {
-        LOGGER.info("Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
+        LOGGER.info(
+                "Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
         this.location = location;
         this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.client = FlightClient.builder(this.allocator, location).build();
         this.token = token;
         this.authOption = (token != null && !token.isEmpty())
-            ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
-            : null;
+                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token))
+                : null;
         this.descriptors = new HashMap<>();
         this.sources = new HashMap<>();
         this.cacheBytes = cacheBytes;
@@ -220,7 +202,8 @@ public class TensorFlightClient implements AutoCloseable {
      * contains full tensor metadata (shape, dtype, chunk_shape) for all tensors.
      *
      * Results may be truncated if server has max_list_flights_results configured.
-     * Check returned map size vs total_sources in schema metadata for truncation info.
+     * Check returned map size vs total_sources in schema metadata for truncation
+     * info.
      *
      * @return Map of source_id to DataSourceDescriptor
      */
@@ -231,7 +214,7 @@ public class TensorFlightClient implements AutoCloseable {
 
         for (FlightInfo info : client.listFlights(Criteria.ALL, authOption)) {
             DataSourceDescriptor sourceDesc = DataSourceDescriptor.parseFrom(
-                info.getDescriptor().getCommand());
+                    info.getDescriptor().getCommand());
             result.put(sourceDesc.getSourceId(), sourceDesc);
             // Cache tensor descriptors for quick lookup
             for (TensorDescriptor tensorDesc : sourceDesc.getTensorsList()) {
@@ -268,32 +251,36 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Execute SQL query against server's source metadata database.
      *
-     * Returns Arrow VectorSchemaRoot with query results. Schema metadata may contain
+     * Returns Arrow VectorSchemaRoot with query results. Schema metadata may
+     * contain
      * "total_sources" key if result was truncated.
      *
      * Requires server to have metadata_db.enabled=true in config.
      *
-     * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_url LIKE '%plate%'")
+     * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_url
+     *            LIKE '%plate%'")
      * @return VectorSchemaRoot with query results (caller must close)
-     * @throws IOException If query fails or server does not have metadata database enabled
+     * @throws IOException If query fails or server does not have metadata database
+     *                     enabled
      *
-     * Example:
-     * <pre>
-     * VectorSchemaRoot result = client.querySources("SELECT source_id, source_type FROM sources");
-     * System.out.println("Found " + result.getRowCount() + " sources");
-     * result.close();
-     * </pre>
+     *                     Example:
+     * 
+     *                     <pre>
+     *                     VectorSchemaRoot result = client.querySources("SELECT source_id, source_type FROM sources");
+     *                     System.out.println("Found " + result.getRowCount() + " sources");
+     *                     result.close();
+     *                     </pre>
      */
     public VectorSchemaRoot querySources(String sql) throws IOException {
         FlightCmd cmd = FlightCmd.newBuilder()
-            .setSourceId("__metadata_query__")
-            .setMetadataQuery(MetadataQueryOption.newBuilder()
-                .setSql(sql)
-                .build())
-            .build();
+                .setSourceId("__metadata_query__")
+                .setMetadataQuery(MetadataQueryOption.newBuilder()
+                        .setSql(sql)
+                        .build())
+                .build();
 
         FlightInfo info = client.getInfo(
-            FlightDescriptor.command(cmd.toByteArray()), authOption);
+                FlightDescriptor.command(cmd.toByteArray()), authOption);
 
         // Check schema metadata for truncation
         java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
@@ -321,7 +308,7 @@ public class TensorFlightClient implements AutoCloseable {
         }
 
         FlightStream stream = client.getStream(
-            info.getEndpoints().get(0).getTicket(), authOption);
+                info.getEndpoints().get(0).getTicket(), authOption);
 
         // Materialize all batches using ArrowRecordBatch (Arrow 18 API)
         List<ArrowRecordBatch> batches = new ArrayList<>();
@@ -385,7 +372,8 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * Fetches metadata via GetFlightInfo for the first tensor in the source,
      * since metadataJson is populated in the response TensorDescriptor.
-     * The server wraps metadata in {"type": ..., "dim_label": [...], "metadata": {...}},
+     * The server wraps metadata in {"type": ..., "dim_label": [...], "metadata":
+     * {...}},
      * this method returns the inner "metadata" dict.
      *
      * @param sourceId Source identifier
@@ -432,7 +420,7 @@ public class TensorFlightClient implements AutoCloseable {
      *
      * @param sourceId Data source identifier
      * @param tensorId Tensor identifier within the source
-     * @param <T> The pixel type
+     * @param <T>      The pixel type
      * @return RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
@@ -445,10 +433,10 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get a RandomAccessibleInterval for a tensor with slice hint.
      *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
+     * @param sourceId  Data source identifier
+     * @param tensorId  Tensor identifier within the source
      * @param sliceHint Optional slice hint
-     * @param <T> The pixel type
+     * @param <T>       The pixel type
      * @return RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
@@ -462,11 +450,11 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get a RandomAccessibleInterval for a tensor with scaled read options.
      *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
-     * @param scaleHint Per-dimension scale factors
+     * @param sourceId        Data source identifier
+     * @param tensorId        Tensor identifier within the source
+     * @param scaleHint       Per-dimension scale factors
      * @param reductionMethod Requested reduction method
-     * @param <T> The pixel type
+     * @param <T>             The pixel type
      * @return RandomAccessibleInterval containing the requested tensor
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
@@ -481,13 +469,14 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Get a RandomAccessibleInterval for a tensor with all options.
      *
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier within the source
-     * @param sliceHint Optional slice hint
-     * @param scaleHint Per-dimension scale factors
+     * @param sourceId        Data source identifier
+     * @param tensorId        Tensor identifier within the source
+     * @param sliceHint       Optional slice hint
+     * @param scaleHint       Per-dimension scale factors
      * @param reductionMethod Requested reduction method
-     * @param <T> The pixel type
-     * @return SerializableTensorImg containing the requested tensor (implements RandomAccessibleInterval)
+     * @param <T>             The pixel type
+     * @return SerializableTensorImg containing the requested tensor (implements
+     *         RandomAccessibleInterval)
      */
     public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
             String sourceId,
@@ -510,7 +499,7 @@ public class TensorFlightClient implements AutoCloseable {
             boolean needsCrop = false;
             for (int ax = 0; ax < ndim; ax++) {
                 long reqStart = sliceHint.getStart(ax);
-                long reqStop  = sliceHint.getStop(ax);
+                long reqStop = sliceHint.getStop(ax);
                 long retStart = realized.getStart(ax);
                 long scale = 1L;
                 // Use scale_hint directly from TensorDescriptor
@@ -522,7 +511,7 @@ public class TensorFlightClient implements AutoCloseable {
                     cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
                 } else {
                     cropMin[ax] = reqStart - retStart;
-                    cropMax[ax] = reqStop  - retStart - 1L;
+                    cropMax[ax] = reqStop - retStart - 1L;
                 }
                 if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
                     needsCrop = true;
@@ -565,8 +554,8 @@ public class TensorFlightClient implements AutoCloseable {
      */
     public Map<String, Object> healthCheck() throws IOException {
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
-            "health",
-            ByteString.EMPTY.toByteArray());
+                "health",
+                ByteString.EMPTY.toByteArray());
 
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
         if (iter.hasNext()) {
@@ -574,7 +563,8 @@ public class TensorFlightClient implements AutoCloseable {
             byte[] body = result.getBody();
             if (body != null && body.length > 0) {
                 return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
-                    new TypeToken<Map<String, Object>>() {}.getType());
+                        new TypeToken<Map<String, Object>>() {
+                        }.getType());
             }
         }
 
@@ -642,8 +632,8 @@ public class TensorFlightClient implements AutoCloseable {
 
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-            .setTensorId(tensorId)
-            .setWithMetadata(false);
+                .setTensorId(tensorId)
+                .setWithMetadata(false);
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -658,9 +648,9 @@ public class TensorFlightClient implements AutoCloseable {
         }
 
         FlightCmd cmd = FlightCmd.newBuilder()
-            .setSourceId(sourceId)
-            .setTensorRead(readBuilder.build())
-            .build();
+                .setSourceId(sourceId)
+                .setTensorRead(readBuilder.build())
+                .build();
         FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
         checkSchemaVersion(info);
         TensorDescriptor responseDescriptor = parseDescriptorUnchecked(info.getDescriptor().getCommand());
@@ -941,7 +931,8 @@ public class TensorFlightClient implements AutoCloseable {
         int[] clientParsed = parseVersion(clientVersion);
         if (clientParsed[0] < serverParsed[0]
                 || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
-                || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1] && clientParsed[2] < serverParsed[2])) {
+                || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
+                        && clientParsed[2] < serverParsed[2])) {
             LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
                     + serverVersion + ". Consider upgrading biopb client for compatibility.");
         }
@@ -968,7 +959,7 @@ public class TensorFlightClient implements AutoCloseable {
         int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
         int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
         int patch = parts.length > 2 ? Integer.parseInt(parts[2]) : 0;
-        return new int[]{major, minor, patch};
+        return new int[] { major, minor, patch };
     }
 
     private static long[] toLongArray(List<Long> values) {
@@ -1096,7 +1087,8 @@ public class TensorFlightClient implements AutoCloseable {
             return new HashMap<>();
         }
         try {
-            return GSON.fromJson(json, new TypeToken<Map<String, Object>>() {}.getType());
+            return GSON.fromJson(json, new TypeToken<Map<String, Object>>() {
+            }.getType());
         } catch (Exception e) {
             Map<String, Object> result = new HashMap<>();
             result.put("raw", json);

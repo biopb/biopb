@@ -69,7 +69,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     private String sourceId;
     private String tensorId;
     private byte[] sliceHintBytes;
-    private byte[] scaleHintBytes;  // Serialized long[] array
+    private byte[] scaleHintBytes; // Serialized long[] array
     private String reductionMethod;
     private byte[] descriptorBytes;
 
@@ -96,16 +96,17 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     /**
      * Constructor for initial creation from TensorFlightClient.
      *
-     * @param location Flight server location
-     * @param token Authentication token (null if none)
-     * @param cacheBytes Cache size in bytes
-     * @param sourceId Data source identifier
-     * @param tensorId Tensor identifier
-     * @param sliceHint Slice hint (null if none)
-     * @param scaleHint Per-dimension scale factors (null if none)
+     * @param location        Flight server location
+     * @param token           Authentication token (null if none)
+     * @param cacheBytes      Cache size in bytes
+     * @param sourceId        Data source identifier
+     * @param tensorId        Tensor identifier
+     * @param sliceHint       Slice hint (null if none)
+     * @param scaleHint       Per-dimension scale factors (null if none)
      * @param reductionMethod Reduction method string (null if none)
-     * @param descriptor Response tensor descriptor (contains shape, chunk info)
-     * @param delegate The actual RandomAccessibleInterval to wrap
+     * @param descriptor      Response tensor descriptor (contains shape, chunk
+     *                        info)
+     * @param delegate        The actual RandomAccessibleInterval to wrap
      */
     public SerializableTensorImg(
             Location location,
@@ -194,7 +195,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
         // Build TensorReadOption with flattened fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
-            .setTensorId(tensorId);
+                .setTensorId(tensorId);
 
         if (sliceHint != null) {
             readBuilder.setSliceHint(sliceHint);
@@ -209,26 +210,27 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         }
 
         FlightCmd cmd = FlightCmd.newBuilder()
-            .setSourceId(sourceId)
-            .setTensorRead(readBuilder.build())
-            .build();
+                .setSourceId(sourceId)
+                .setTensorRead(readBuilder.build())
+                .build();
 
         try {
             FlightInfo info = client.getInfo(
-                org.apache.arrow.flight.FlightDescriptor.command(cmd.toByteArray()),
-                authOption);
+                    org.apache.arrow.flight.FlightDescriptor.command(cmd.toByteArray()),
+                    authOption);
 
             // Use stored descriptor if available, otherwise parse from response
             TensorDescriptor responseDescriptor = descriptor != null
-                ? descriptor
-                : TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
+                    ? descriptor
+                    : TensorDescriptor.parseFrom(info.getDescriptor().getCommand());
 
             // Create the array
             T type = (T) createType(responseDescriptor.getDtype());
             long[] dims = toLongArray(responseDescriptor.getShapeList());
             int[] cellDimensions = toIntArray(responseDescriptor.getChunkShapeList());
 
-            EndpointIndex endpointIndex = buildEndpointIndex(responseDescriptor, dims, cellDimensions, info.getEndpoints());
+            EndpointIndex endpointIndex = buildEndpointIndex(responseDescriptor, dims, cellDimensions,
+                    info.getEndpoints());
 
             if (endpointIndex == null) {
                 // Materialize all data into an ArrayImg
