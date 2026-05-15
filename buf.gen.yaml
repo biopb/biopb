@@ -35,13 +35,5 @@ plugins:
   # These are the Java RPC interfaces: ProcessImageGrpc, ObjectDetectionGrpc, etc.
   - remote: buf.build/grpc/java:v1.79.0
     out: target/generated-sources/protobuf/grpc
-
-  # Plugin 5: Generates TypeScript protobuf classes for browser/client packages.
-  # Output is consumed by packages/tensor-flight-client.
-  - local: protoc-gen-es
-    out: packages/tensor-flight-client/src/gen
-    include_imports: true
-    opt:
-      - target=ts
 inputs:
   - directory: proto
