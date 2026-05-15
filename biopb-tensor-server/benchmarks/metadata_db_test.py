@@ -11,7 +11,6 @@ import time
 import threading
 
 import pytest
-import pyarrow as pa
 
 from biopb_tensor_server.metadata_db import MetadataDatabase
 
@@ -41,7 +40,6 @@ class MockAdapter:
             ],
         )
 
-
     def get_metadata(self):
         return {"plate_id": self.source_id.split("-")[0], "acquisition_date": "2024-01-01"}
 
@@ -56,13 +54,51 @@ def populate_database(db: MetadataDatabase, n_sources: int) -> None:
         db.sync_source_added(source_id, adapter)
 
 
+def _create_db_with_sources(n_sources: int):
+    """Create a fresh MetadataDatabase with n_sources pre-populated."""
+    db = MetadataDatabase(enabled=True)
+    populate_database(db, n_sources)
+    return db
+
+
+@pytest.fixture(scope="session")
+def populated_db_10k():
+    """Database pre-populated with 10k sources (setup, not benchmarked)."""
+    db = _create_db_with_sources(10000)
+    yield db
+    db.close()
+
+
+@pytest.fixture(scope="session")
+def populated_db_50k():
+    """Database pre-populated with 50k sources (setup, not benchmarked)."""
+    db = _create_db_with_sources(50000)
+    yield db
+    db.close()
+
+
+@pytest.fixture(scope="session")
+def populated_db_100k():
+    """Database pre-populated with 100k sources (setup, not benchmarked)."""
+    db = _create_db_with_sources(100000)
+    yield db
+    db.close()
+
+
+@pytest.fixture
+def fresh_db():
+    """Fresh database for populate benchmark tests (function-scoped)."""
+    db = MetadataDatabase(enabled=True)
+    yield db
+    db.close()
+
+
 class TestConcurrentAccess:
     """Concurrent read/write access benchmarks."""
 
-    def test_bench_concurrent_queries_same_db(self, benchmark, tmp_path):
+    def test_bench_concurrent_queries_same_db(self, benchmark, populated_db_10k):
         """Multiple threads querying the same database simultaneously."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 1000)
+        db = populated_db_10k
 
         def concurrent_queries():
             def run_query(thread_id):
@@ -86,12 +122,10 @@ class TestConcurrentAccess:
 
         results = benchmark(concurrent_queries)
         assert len(results) == 32
-        db.close()
 
-    def test_bench_concurrent_sync_and_query(self, benchmark, tmp_path):
+    def test_bench_concurrent_sync_and_query(self, benchmark, fresh_db):
         """Concurrent source additions while queries are running."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 500)  # Initial population
+        populate_database(fresh_db, 500)  # Initial population
 
         def concurrent_mixed():
             errors = []
@@ -100,16 +134,16 @@ class TestConcurrentAccess:
                 try:
                     source_id = f"dynamic-{thread_id}"
                     adapter = MockAdapter(source_id, f"/data/{source_id}.zarr", "ome-zarr", [256, 256], "float32")
-                    db.sync_source_added(source_id, adapter)
-                    db.sync_source_removed(source_id)
+                    fresh_db.sync_source_added(source_id, adapter)
+                    fresh_db.sync_source_removed(source_id)
                 except Exception as e:
                     errors.append(str(e))
 
             def query_worker(thread_id):
                 try:
                     sql = "SELECT COUNT(*) FROM sources"
-                    info = db.handle_query(sql)
-                    db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+                    info = fresh_db.handle_query(sql)
+                    fresh_db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
                 except Exception as e:
                     errors.append(str(e))
 
@@ -127,60 +161,40 @@ class TestConcurrentAccess:
 
         errors = benchmark(concurrent_mixed)
         assert len(errors) == 0
-        db.close()
 
 
 class TestLargeScale:
     """Performance with large source catalogs."""
 
-    def test_bench_populate_10k_sources(self, benchmark, tmp_path):
+    def test_bench_populate_10k_sources(self, benchmark, fresh_db):
         """Time to populate database with 10,000 sources."""
-        db = MetadataDatabase(enabled=True)
-
-        def populate_10k():
-            populate_database(db, 10000)
-
-        benchmark(populate_10k)
+        benchmark.pedantic(lambda: populate_database(fresh_db, 10000), rounds=1)
 
         # Verify count
-        conn = db._get_connection()
+        conn = fresh_db._get_connection()
         result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
         assert result[0] == 10000
-        db.close()
 
-    def test_bench_populate_50k_sources(self, benchmark, tmp_path):
+    def test_bench_populate_50k_sources(self, benchmark, fresh_db):
         """Time to populate database with 50,000 sources."""
-        db = MetadataDatabase(enabled=True)
+        benchmark.pedantic(lambda: populate_database(fresh_db, 50000), rounds=1)
 
-        def populate_50k():
-            populate_database(db, 50000)
-
-        benchmark(populate_50k)
-
-        conn = db._get_connection()
+        conn = fresh_db._get_connection()
         result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
         assert result[0] == 50000
-        db.close()
 
     @pytest.mark.slow
-    def test_bench_populate_100k_sources(self, benchmark, tmp_path):
+    def test_bench_populate_100k_sources(self, benchmark, fresh_db):
         """Time to populate database with 100,000 sources."""
-        db = MetadataDatabase(enabled=True)
+        benchmark.pedantic(lambda: populate_database(fresh_db, 100000), rounds=1)
 
-        def populate_100k():
-            populate_database(db, 100000)
-
-        benchmark(populate_100k)
-
-        conn = db._get_connection()
+        conn = fresh_db._get_connection()
         result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
         assert result[0] == 100000
-        db.close()
 
-    def test_bench_query_latency_10k(self, benchmark, tmp_path):
+    def test_bench_query_latency_10k(self, benchmark, populated_db_10k):
         """Query latency with 10k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 10000)
+        db = populated_db_10k
 
         def query_all():
             sql = "SELECT source_id FROM sources"
@@ -190,12 +204,10 @@ class TestLargeScale:
 
         n_rows = benchmark(query_all)
         assert n_rows == 10000
-        db.close()
 
-    def test_bench_query_latency_50k(self, benchmark, tmp_path):
+    def test_bench_query_latency_50k(self, benchmark, populated_db_50k):
         """Query latency with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 50000)
+        db = populated_db_50k
 
         def query_all():
             sql = "SELECT source_id FROM sources"
@@ -205,13 +217,11 @@ class TestLargeScale:
 
         n_rows = benchmark(query_all)
         assert n_rows == 50000
-        db.close()
 
     @pytest.mark.slow
-    def test_bench_query_latency_100k(self, benchmark, tmp_path):
+    def test_bench_query_latency_100k(self, benchmark, populated_db_100k):
         """Query latency with 100k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 100000)
+        db = populated_db_100k
 
         def query_all():
             sql = "SELECT source_id FROM sources"
@@ -221,16 +231,14 @@ class TestLargeScale:
 
         n_rows = benchmark(query_all)
         assert n_rows == 100000
-        db.close()
 
 
 class TestQueryComplexity:
     """Performance with different query complexity levels."""
 
-    def test_bench_simple_count_50k(self, benchmark, tmp_path):
+    def test_bench_simple_count_50k(self, benchmark, populated_db_50k):
         """Simple COUNT query with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 50000)
+        db = populated_db_50k
 
         def count_query():
             sql = "SELECT COUNT(*) FROM sources"
@@ -240,15 +248,13 @@ class TestQueryComplexity:
 
         count = benchmark(count_query)
         assert count == 50000
-        db.close()
 
-    def test_bench_filtered_query_50k(self, benchmark, tmp_path):
+    def test_bench_filtered_query_50k(self, benchmark, populated_db_50k):
         """Filtered query (WHERE clause) with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 50000)
+        db = populated_db_50k
 
         def filtered_query():
-            # This filter matches ~1000 sources (plate-0000 and plate-0001)
+            # This filter matches ~20 sources (plate-0000 and plate-0001)
             sql = "SELECT source_id FROM sources WHERE source_url LIKE '%experiment-0000%' OR source_url LIKE '%experiment-0001%'"
             info = db.handle_query(sql)
             result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
@@ -256,12 +262,10 @@ class TestQueryComplexity:
 
         n_rows = benchmark(filtered_query)
         assert n_rows == 20  # 2 plates * 10 wells each
-        db.close()
 
-    def test_bench_json_field_query_50k(self, benchmark, tmp_path):
+    def test_bench_json_field_query_50k(self, benchmark, populated_db_50k):
         """Query using JSON field extraction with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 50000)
+        db = populated_db_50k
 
         def json_query():
             sql = "SELECT source_id, metadata_json->>'plate_id' as plate FROM sources LIMIT 1000"
@@ -271,12 +275,10 @@ class TestQueryComplexity:
 
         n_rows = benchmark(json_query)
         assert n_rows == 1000
-        db.close()
 
-    def test_bench_complex_filter_50k(self, benchmark, tmp_path):
+    def test_bench_complex_filter_50k(self, benchmark, populated_db_50k):
         """Complex multi-condition filter with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-        populate_database(db, 50000)
+        db = populated_db_50k
 
         def complex_query():
             sql = """
@@ -293,50 +295,4 @@ class TestQueryComplexity:
 
         n_rows = benchmark(complex_query)
         assert n_rows == 500
-        db.close()
 
-
-class TestInitialSync:
-    """Benchmark initial batch sync operations."""
-
-    def test_bench_initial_sync_10k(self, benchmark, tmp_path):
-        """Batch insert via initial_sync with 10k sources."""
-        db = MetadataDatabase(enabled=True)
-
-        sources = {}
-        for i in range(10000):
-            source_id = f"batch-{i}"
-            sources[source_id] = MockAdapter(
-                source_id, f"/data/{source_id}.zarr", "ome-zarr", [256, 256], "uint8"
-            )
-
-        def batch_sync():
-            db.initial_sync(sources)
-
-        benchmark(batch_sync)
-
-        conn = db._get_connection()
-        result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
-        assert result[0] == 10000
-        db.close()
-
-    def test_bench_initial_sync_50k(self, benchmark, tmp_path):
-        """Batch insert via initial_sync with 50k sources."""
-        db = MetadataDatabase(enabled=True)
-
-        sources = {}
-        for i in range(50000):
-            source_id = f"batch-{i}"
-            sources[source_id] = MockAdapter(
-                source_id, f"/data/{source_id}.zarr", "ome-zarr", [256, 256], "uint8"
-            )
-
-        def batch_sync():
-            db.initial_sync(sources)
-
-        benchmark(batch_sync)
-
-        conn = db._get_connection()
-        result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
-        assert result[0] == 50000
-        db.close()

@@ -11,8 +11,10 @@ The adapters integrate with Arrow Flight's GetFlightInfo/DoGet flow:
 1. GetFlightInfo returns FlightEndpoints with chunk_id tickets
 2. DoGet uses the chunk_id to fetch the actual data
 
-Raw data caching relies on OS page cache. Virtual chunk (scaled read) caching
-uses the CacheManager with future/promise pattern for thread safety.
+Caching behavior depends on the configured CacheManager backend:
+- memory cache stores computed virtual chunks (for example scaled reads)
+- file cache stores both virtual chunks and raw chunks as mmap-backed Arrow batches
+    keyed by chunk_id
 """
 
 from __future__ import annotations
@@ -317,9 +319,11 @@ class TensorAdapter(ABC):
         self, chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
-        """Resolve chunk data, handling scaled chunks.
+        """Resolve chunk data, handling scaled chunks and backend caching.
 
-        default implementation uses self.get_data() and handles caching.
+        The default implementation reads raw chunk data with ``self.get_data()``.
+        Scaled chunks are always cacheable when a CacheManager is available.
+        With the file-backed Arrow cache, raw chunks are also cached by chunk_id.
         """
         from biopb_tensor_server.cache import ArrowFileBackend
 

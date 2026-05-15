@@ -47,8 +47,11 @@ def pytest_configure(config):
         "markers", "slow: tests that take longer to run (e.g., large file downloads)"
     )
     config.option.benchmark_sort = "name"
-    config.option.benchmark_columns = ["mean", "stddev", "median", "ops"]
     config.option.benchmark_time_unit = "ms"
+    if not getattr(config.option, "benchmark_json", None):
+        benchmark_output = Path(__file__).resolve().parent.parent / ".benchmarks" / "output.json"
+        benchmark_output.parent.mkdir(parents=True, exist_ok=True)
+        config.option.benchmark_json = benchmark_output.open("wb")
 
 
 # =============================================================================
