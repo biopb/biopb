@@ -8,6 +8,7 @@ option java_multiple_files = true;
 
 import "biopb/image/roi.proto";
 import "biopb/image/bindata.proto";
+import "biopb/tensor/serialized.proto";
 
 // The Pixels element represent generic 5D pixel data. The time axis is
 // currently not being utilized, but is defined here for futire extensibility.
@@ -86,13 +87,20 @@ message ImageAnnotation {
 
 message ImageData {
 
-    // Encapsulated image data
-    Pixels pixels = 1;
+    // Legacy field - servers should check this for backward compatibility
+    Pixels pixels = 1 [deprecated = true];
 
     // Optional additional information regarding the image that will be utilized
     // by the RPC call. For example, some SegmentAnything type models may ask
     // the user to provide a tentative bounding box for the objects that the
     // users are interested in.
     ImageAnnotation image_annotation = 2;
+
+    oneof data {
+        // Inline pixel data (eager/lazy naming distinguishes from legacy pixels field)
+        Pixels eager_data = 3;
+        // Lazy tensor reference for larger-than-memory datasets
+        biopb.tensor.SerializedTensor lazy_data = 4;
+    }
 
 }

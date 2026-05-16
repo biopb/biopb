@@ -20,3 +20,11 @@ from biopb.image.bindata_pb2 import BinData
 from biopb.image.detection_settings_pb2 import DetectionSettings
 from biopb.image.image_data_pb2 import ImageData, Pixels, ImageAnnotation
 from biopb.image.roi_pb2 import ROI, Rectangle, Mask, Mesh, Polygon, Point
+
+# Utility functions for image data serialization/deserialization
+from biopb.image.utils import (
+    deserialize_to_numpy,
+    serialize_from_numpy,
+    deserialize_image_data,
+    serialize_from_numpy_to_image_data,
+)

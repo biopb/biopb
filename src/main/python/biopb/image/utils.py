@@ -1,7 +1,12 @@
 import warnings
 
 import numpy as np
-from . import Pixels, BinData, ROI, Rectangle, Point, Mask
+import dask.array as da
+from typing import Union
+
+from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData
+from biopb.tensor.client import TensorFlightClient
+from biopb.tensor.serialized_pb2 import SerializedTensor
 
 
 def _canonicalize_dtype(dtype_str: str) -> str:
@@ -371,5 +376,82 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
             endianness = 0 if bitorder == 'big' else 1,
         )),
     )
- 
+
     return roi
+
+
+def deserialize_image_data(
+    image_data: ImageData,
+    *,
+    singleton_t: bool = True,
+    np_index_order: str = "ZYXC",
+    cache_bytes: int = 1_000_000_000,
+) -> Union[np.ndarray, da.Array]:
+    '''Convert protobuf ImageData to a numpy array or dask array.
+
+    Handles both eager (inline) and lazy (Flight server) data representations.
+    Also handles legacy pixels field for backward compatibility.
+
+    Args:
+        image_data: protobuf ImageData message
+    Keyword Args:
+        singleton_t: DEPRECATED. Use np_index_order to control output dimensions.
+        np_index_order: Numpy index order string for eager_data deserialization.
+        cache_bytes: Cache size for lazy_data chunk cache (default 1GB).
+
+    Returns:
+        numpy array for eager_data, or dask array for lazy_data.
+    '''
+    # Check oneof field
+    data_type = image_data.WhichOneof('data')
+
+    if data_type == 'eager_data':
+        return deserialize_to_numpy(
+            image_data.eager_data,
+            singleton_t=singleton_t,
+            np_index_order=np_index_order,
+        )
+    elif data_type == 'lazy_data':
+        return TensorFlightClient.tensor_from_pb(
+            image_data.lazy_data,
+            cache_bytes=cache_bytes,
+        )
+    elif data_type is None:
+        # Legacy fallback: check deprecated pixels field
+        if image_data.HasField('pixels'):
+            return deserialize_to_numpy(
+                image_data.pixels,
+                singleton_t=singleton_t,
+                np_index_order=np_index_order,
+            )
+        else:
+            raise ValueError("ImageData has no data field set")
+
+    else:
+        raise ValueError(f"Unknown ImageData data type: {data_type}")
+
+
+def serialize_from_numpy_to_image_data(
+    np_img: np.ndarray,
+    dimension_order: str = "CXYZT",
+    np_index_order: str = None,
+    **kwargs
+) -> ImageData:
+    '''Convert numpy array to protobuf ImageData with eager_data.
+
+    Args:
+        np_img: image as numpy array (any memory order is accepted)
+        dimension_order: F-order string describing dimension order in output.
+        np_index_order: Numpy index order string (see serialize_from_numpy).
+        **kwargs: additional metadata (physical_size_x etc).
+
+    Returns:
+        protobuf ImageData with eager_data set.
+    '''
+    pixels = serialize_from_numpy(
+        np_img,
+        dimension_order=dimension_order,
+        np_index_order=np_index_order,
+        **kwargs,
+    )
+    return ImageData(eager_data=pixels)

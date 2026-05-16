@@ -6,21 +6,21 @@ import java.util.logging.Logger;
 
 import com.google.protobuf.ByteString;
 
-import net.imglib2.view.Views;
+import biopb.tensor.SerializableTensorImg;
+import biopb.tensor.SerializedTensor;
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.converter.Converter;
-import net.imglib2.converter.RealTypeConverters;
 import net.imglib2.img.array.ArrayImgFactory;
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.ByteType;
-import net.imglib2.type.numeric.integer.ShortType;
-import net.imglib2.type.numeric.integer.IntType;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
-import net.imglib2.type.numeric.real.FloatType;
+import net.imglib2.type.numeric.integer.ByteType;
+import net.imglib2.type.numeric.integer.IntType;
+import net.imglib2.type.numeric.integer.ShortType;
+import net.imglib2.type.numeric.integer.UnsignedByteType;
+import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.DoubleType;
+import net.imglib2.type.numeric.real.FloatType;
+import net.imglib2.view.Views;
 
 public final class Utils {
     private Utils() {
@@ -625,6 +625,134 @@ public final class Utils {
         }
 
         return result;
+    }
+
+    /**
+     * Deserialize an ImageData protobuf message to a RandomAccessibleInterval.
+     *
+     * Handles both eager_data (inline Pixels) and lazy_data (SerializedTensor).
+     * Also handles legacy pixels field for backward compatibility.
+     *
+     * @param imageData the protobuf message containing serialized image data
+     * @return a RandomAccessibleInterval (ArrayImg for eager_data, or
+     *         SerializableTensorImg for lazy_data)
+     * @throws IllegalArgumentException if no data field is set or dtype is unsupported
+     */
+    @SuppressWarnings("deprecation")  // Uses legacy pixels field for backward compatibility
+    public static RandomAccessibleInterval<?> deserializeImageData(ImageData imageData) {
+        ImageData.DataCase dataCase = imageData.getDataCase();
+
+        if (dataCase == ImageData.DataCase.EAGER_DATA) {
+            return DeserializeToInterval(imageData.getEagerData());
+        } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
+            return reconstructFromSerializedTensor(imageData.getLazyData());
+        } else if (dataCase == ImageData.DataCase.DATA_NOT_SET) {
+            // Legacy fallback: check deprecated pixels field
+            if (imageData.hasPixels()) {
+                return DeserializeToInterval(imageData.getPixels());
+            } else {
+                throw new IllegalArgumentException("ImageData has no data field set");
+            }
+        } else {
+            throw new IllegalArgumentException("Unknown ImageData data case: " + dataCase);
+        }
+    }
+
+    /**
+     * Reconstruct a SerializableTensorImg from SerializedTensor protobuf.
+     *
+     * The returned RandomAccessibleInterval is a lazy imglib2 CellImg that
+     * fetches chunks on-demand from the Flight server.
+     *
+     * @param serializedTensor the SerializedTensor protobuf
+     * @return a SerializableTensorImg wrapping the lazy tensor
+     */
+    private static RandomAccessibleInterval<?> reconstructFromSerializedTensor(SerializedTensor serializedTensor) {
+        // Use SerializableTensorImg's static reconstruction method
+        // We create a minimal wrapper that reconstructs on first access
+        return new SerializableTensorImg<>(
+                parseLocation(serializedTensor.getLocation()),
+                serializedTensor.getAuthToken().isEmpty() ? null : serializedTensor.getAuthToken(),
+                100_000_000L,  // Default cache size 100MB
+                serializedTensor.getTensorDescriptor().getArrayId(),
+                null,  // tensorId is embedded in descriptor
+                serializedTensor.hasOriginalSliceHint() ? serializedTensor.getOriginalSliceHint() : null,
+                serializedTensor.getTensorDescriptor().getScaleHintList().isEmpty() ? null
+                        : toLongArray(serializedTensor.getTensorDescriptor().getScaleHintList()),
+                serializedTensor.getTensorDescriptor().getReductionMethod().isEmpty() ? null
+                        : serializedTensor.getTensorDescriptor().getReductionMethod(),
+                serializedTensor.getTensorDescriptor(),
+                null  // delegate reconstructed lazily
+        );
+    }
+
+    private static org.apache.arrow.flight.Location parseLocation(String uri) {
+        try {
+            return new org.apache.arrow.flight.Location(java.net.URI.create(uri));
+        } catch (Exception e) {
+            java.net.URI parsed = java.net.URI.create(uri);
+            String scheme = parsed.getScheme();
+            if (scheme == null) {
+                return org.apache.arrow.flight.Location.forGrpcInsecure(parsed.getHost(), parsed.getPort());
+            }
+            return new org.apache.arrow.flight.Location(parsed);
+        }
+    }
+
+    private static long[] toLongArray(java.util.List<Long> values) {
+        long[] out = new long[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            out[i] = values.get(i);
+        }
+        return out;
+    }
+
+    /**
+     * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data.
+     *
+     * @param crop the input RandomAccessibleInterval to serialize
+     * @return an ImageData protobuf message with eager_data set
+     * @throws IllegalArgumentException if dimensions are invalid
+     */
+    public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
+            RandomAccessibleInterval<T> crop) {
+        Pixels pixels = SerializeFromInterval(crop);
+        return ImageData.newBuilder()
+                .setEagerData(pixels)
+                .build();
+    }
+
+    /**
+     * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data
+     * and specified dimension order.
+     *
+     * @param crop the input RandomAccessibleInterval to serialize
+     * @param dimensionOrder F-order string for output protobuf
+     * @return an ImageData protobuf message with eager_data set
+     */
+    public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
+            RandomAccessibleInterval<T> crop, String dimensionOrder) {
+        Pixels pixels = SerializeFromInterval(crop, dimensionOrder);
+        return ImageData.newBuilder()
+                .setEagerData(pixels)
+                .build();
+    }
+
+    /**
+     * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data
+     * and specified dimension orders.
+     *
+     * @param crop the input RandomAccessibleInterval to serialize
+     * @param dimensionOrder F-order string for output protobuf
+     * @param imglibIndexOrder String describing imglib2 dimension mapping
+     * @return an ImageData protobuf message with eager_data set
+     */
+    public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
+            RandomAccessibleInterval<T> crop, String dimensionOrder, String imglibIndexOrder) {
+        Pixels pixels = SerializeFromInterval(crop, dimensionOrder, imglibIndexOrder);
+        return ImageData.newBuilder()
+                .setEagerData(pixels)
+                .build();
     }
 
 }
