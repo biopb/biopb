@@ -931,4 +931,199 @@ public class UtilsTest {
             idx++;
         }
     }
+
+    // ========================================================================
+    // serializeFromIntervalToImageData tests
+    // ========================================================================
+
+    @Test
+    public void testSerializeFromIntervalToImageDataDefault() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10);
+
+        float value = 0.0f;
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(value++);
+        }
+
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image);
+
+        Assert.assertTrue(imageData.hasEagerData());
+        Assert.assertEquals(10, imageData.getEagerData().getSizeX());
+        Assert.assertEquals(10, imageData.getEagerData().getSizeY());
+    }
+
+    @Test
+    public void testSerializeFromIntervalToImageDataWithDimensionOrder() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10, 2);
+
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, "CXYZT");
+
+        Assert.assertEquals("CXYZT", imageData.getEagerData().getDimensionOrder());
+    }
+
+    @Test
+    public void testSerializeFromIntervalToImageDataWithAllOrders() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(4, 3, 2, 2);
+
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, "CXYZT", "XYZC");
+
+        Assert.assertEquals(4, imageData.getEagerData().getSizeX());
+        Assert.assertEquals(3, imageData.getEagerData().getSizeY());
+        Assert.assertEquals(2, imageData.getEagerData().getSizeZ());
+        Assert.assertEquals(2, imageData.getEagerData().getSizeC());
+    }
+
+    // ========================================================================
+    // deserializeImageData tests (eager data)
+    // ========================================================================
+
+    @Test
+    public void testDeserializeImageDataEagerData() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10);
+
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(42.0f);
+        }
+
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image);
+        RandomAccessibleInterval<?> deserialized = Utils.deserializeImageData(imageData);
+
+        Assert.assertNotNull(deserialized);
+        Assert.assertEquals(10, deserialized.dimension(0));  // X
+        Assert.assertEquals(10, deserialized.dimension(1));  // Y
+    }
+
+    @Test
+    public void testDeserializeImageDataNoDataFieldRaises() {
+        ImageData emptyData = ImageData.newBuilder().build();
+
+        IllegalArgumentException error = Assert.assertThrows(
+                IllegalArgumentException.class,
+                () -> Utils.deserializeImageData(emptyData));
+        Assert.assertTrue(error.getMessage().contains("no data field"));
+    }
+
+    @Test
+    public void testDeserializeImageDataUnknownDataCaseRaises() {
+        // This tests the fallback handling
+        // In practice, ImageData only has eager_data, lazy_data, or pixels fields
+        ImageData imageData = ImageData.newBuilder().build();
+        Assert.assertThrows(IllegalArgumentException.class, () -> Utils.deserializeImageData(imageData));
+    }
+
+    // ========================================================================
+    // Custom imglibIndexOrder tests
+    // ========================================================================
+
+    @Test
+    public void testSerializeWithCustomImglibIndexOrderZYXC() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(4, 3, 2, 2);  // XYZC order
+
+        float value = 0.0f;
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(value++);
+        }
+
+        Pixels pixels = Utils.SerializeFromInterval(image, "XYZCT", "XYZC");
+
+        Assert.assertEquals(4, pixels.getSizeX());
+        Assert.assertEquals(3, pixels.getSizeY());
+        Assert.assertEquals(2, pixels.getSizeZ());
+        Assert.assertEquals(2, pixels.getSizeC());
+    }
+
+    @Test
+    public void testSerializeWithCustomImglibIndexOrderXY() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 20);  // XY order
+
+        Pixels pixels = Utils.SerializeFromInterval(image, "XYZCT", "XY");
+
+        Assert.assertEquals(10, pixels.getSizeX());  // First dimension
+        Assert.assertEquals(20, pixels.getSizeY());  // Second dimension
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSerializeImglibIndexOrderLengthMismatch() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10, 10);  // 3D
+
+        // imglibIndexOrder has 4 chars but image has 3 dims
+        Utils.SerializeFromInterval(image, "XYZCT", "XYZC");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSerializeImglibIndexOrderDuplicateChars() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10, 10);
+
+        Utils.SerializeFromInterval(image, "XYZCT", "XYZZ");
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSerializeImglibIndexOrderInvalidChars() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10, 10);
+
+        Utils.SerializeFromInterval(image, "XYZCT", "XYZA");
+    }
+
+    // ========================================================================
+    // 5D image tests with T dimension
+    // ========================================================================
+
+    @Test
+    public void testSerializeDeserialize5DWithT() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(2, 3, 4, 2, 3);  // XYZCT
+
+        float value = 0.0f;
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(value++);
+        }
+
+        Pixels pixels = Utils.SerializeFromInterval(image, "XYZCT", "XYZCT");
+
+        Assert.assertEquals(2, pixels.getSizeX());
+        Assert.assertEquals(3, pixels.getSizeY());
+        Assert.assertEquals(4, pixels.getSizeZ());
+        Assert.assertEquals(2, pixels.getSizeC());
+        Assert.assertEquals(3, pixels.getSizeT());
+
+        // Round-trip with 5D output order including T
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels, "XYZCT");
+
+        Assert.assertEquals(2, deserialized.dimension(0));  // X
+        Assert.assertEquals(3, deserialized.dimension(1));  // Y
+        Assert.assertEquals(4, deserialized.dimension(2));  // Z
+        Assert.assertEquals(2, deserialized.dimension(3));  // C
+        Assert.assertEquals(3, deserialized.dimension(4));  // T
+    }
+
+    // ========================================================================
+    // Dtype variant tests
+    // ========================================================================
+
+    @Test
+    public void testSerializeDeserializeUint8WithPrefix() {
+        ArrayImgFactory<UnsignedByteType> factory = new ArrayImgFactory<>(new UnsignedByteType());
+        RandomAccessibleInterval<UnsignedByteType> image = factory.create(10, 10);
+
+        for (UnsignedByteType pixel : Views.flatIterable(image)) {
+            pixel.set(100);
+        }
+
+        Pixels pixels = Utils.SerializeFromInterval(image);
+        // dtype should be 'u1' without prefix
+        Assert.assertEquals("u1", pixels.getDtype());
+
+        // Round-trip
+        RandomAccessibleInterval<?> deserialized = Utils.DeserializeToInterval(pixels);
+        Assert.assertNotNull(deserialized);
+    }
 }

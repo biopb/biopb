@@ -1,9 +1,12 @@
 import pytest
 import numpy as np
 import warnings
+from unittest.mock import MagicMock, patch
 
-from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype
-from biopb.image import BinData
+import biopb.tensor.ticket_pb2
+
+from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype, deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import BinData, Pixels, ImageData
 
 
 def test_import():
@@ -378,4 +381,176 @@ def test_serialize_f_order_input():
     # Round-trip
     img_back = deserialize_to_numpy(pixels, np_index_order="ZYXC")
     np.testing.assert_array_equal(img_back, img)
+
+
+# ============================================================================
+# deserialize_image_data Tests
+# ============================================================================
+
+def test_deserialize_image_data_eager_data():
+    """Test deserialize_image_data with eager_data."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+    pixels = serialize_from_numpy(img)
+
+    image_data = ImageData(eager_data=pixels)
+    result = deserialize_image_data(image_data)
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (1, 32, 32, 3)
+
+
+def test_deserialize_image_data_lazy_data():
+    """Test deserialize_image_data with lazy_data (SerializedTensor)."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+    from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
+    from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
+    from unittest.mock import patch
+
+    # Create a mock SerializedTensor
+    descriptor = TensorDescriptor(
+        array_id="test-tensor",
+        shape=[64, 64],
+        dtype="uint8",
+        chunk_shape=[32, 32],
+    )
+
+    serialized_tensor = SerializedTensor(
+        tensor_descriptor=descriptor,
+        location="grpc://localhost:8815",
+        auth_token="",
+        endpoints=[
+            SerializedEndpoint(
+                ticket=TensorTicket(chunk_id=b"chunk-0"),
+                chunk_bounds=ChunkBounds(start=[0, 0], stop=[32, 32]),
+            ),
+        ],
+    )
+
+    image_data = ImageData(lazy_data=serialized_tensor)
+
+    # Mock TensorFlightClient.tensor_from_pb to avoid needing live server
+    mock_dask_arr = MagicMock()
+    mock_dask_arr.shape = (64, 64)
+    mock_dask_arr.dtype = np.uint8
+
+    with patch("biopb.image.utils.TensorFlightClient.tensor_from_pb", return_value=mock_dask_arr):
+        result = deserialize_image_data(image_data)
+
+        # Should return the mocked dask array
+        assert result.shape == (64, 64)
+
+
+def test_deserialize_image_data_legacy_pixels():
+    """Test deserialize_image_data with legacy pixels field."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+    pixels = serialize_from_numpy(img)
+
+    # Use deprecated pixels field directly
+    image_data = ImageData(pixels=pixels)
+    result = deserialize_image_data(image_data)
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (1, 32, 32, 3)
+
+
+def test_deserialize_image_data_no_data_raises():
+    """Test that deserialize_image_data raises when no data field is set."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+
+    # Create ImageData with no data fields set
+    image_data = ImageData()
+
+    with pytest.raises(ValueError, match="ImageData has no data field set"):
+        deserialize_image_data(image_data)
+
+
+def test_serialize_from_numpy_to_image_data():
+    """Test serialize_from_numpy_to_image_data."""
+    from biopb.image.utils import serialize_from_numpy_to_image_data
+    from biopb.image import ImageData
+
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+
+    image_data = serialize_from_numpy_to_image_data(img)
+
+    assert isinstance(image_data, ImageData)
+    assert image_data.HasField('eager_data')
+
+    # Verify dimensions
+    assert image_data.eager_data.size_y == 32
+    assert image_data.eager_data.size_x == 32
+    assert image_data.eager_data.size_c == 3
+
+
+def test_serialize_from_numpy_to_image_data_with_dimension_order():
+    """Test serialize_from_numpy_to_image_data with custom dimension_order."""
+    from biopb.image.utils import serialize_from_numpy_to_image_data
+
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+
+    image_data = serialize_from_numpy_to_image_data(img, dimension_order="CXYZT")
+
+    assert image_data.eager_data.dimension_order == "CXYZT"
+
+
+def test_deserialize_image_data_np_index_order():
+    """Test deserialize_image_data with np_index_order parameter."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+    pixels = serialize_from_numpy(img)
+
+    image_data = ImageData(eager_data=pixels)
+
+    # Test with different np_index_order
+    result_zyxc = deserialize_image_data(image_data, np_index_order="ZYXC")
+    assert result_zyxc.shape == (1, 32, 32, 3)
+
+    result_yxcz = deserialize_image_data(image_data, np_index_order="YXCZ")
+    assert result_yxcz.shape == (32, 32, 3, 1)
+
+
+def test_deserialize_image_data_cache_bytes_parameter():
+    """Test deserialize_image_data with cache_bytes parameter for lazy_data."""
+    from biopb.image.utils import deserialize_image_data
+    from biopb.image import ImageData
+    from biopb.tensor.serialized_pb2 import SerializedTensor
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
+    from unittest.mock import patch
+
+    descriptor = TensorDescriptor(
+        array_id="test-tensor",
+        shape=[64, 64],
+        dtype="uint8",
+    )
+
+    serialized_tensor = SerializedTensor(
+        tensor_descriptor=descriptor,
+        location="grpc://localhost:8815",
+    )
+
+    image_data = ImageData(lazy_data=serialized_tensor)
+
+    mock_dask_arr = MagicMock()
+
+    with patch("biopb.image.utils.TensorFlightClient.tensor_from_pb") as mock_tensor_from_pb:
+        mock_tensor_from_pb.return_value = mock_dask_arr
+
+        # Call with custom cache_bytes
+        deserialize_image_data(image_data, cache_bytes=500_000_000)
+
+        # Verify cache_bytes was passed
+        mock_tensor_from_pb.assert_called_once()
+        call_args = mock_tensor_from_pb.call_args
+        assert call_args[1]['cache_bytes'] == 500_000_000
 
