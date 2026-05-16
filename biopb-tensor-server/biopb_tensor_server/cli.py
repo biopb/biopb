@@ -39,7 +39,7 @@ from biopb_tensor_server.source_manager import create_source_manager
 from biopb_tensor_server.watcher import get_watcher
 
 app = typer.Typer(
-    name="biopb-tensor",
+    name="biopb-tensor-server",
     help="BioPB Tensor: Arrow Flight server for multi-dimensional arrays",
 )
 console = Console()
@@ -350,9 +350,9 @@ def serve(
     """Start the TensorFlight server.
 
     Example:
-        biopb-tensor serve --config biopb-tensor.toml
-        biopb-tensor serve -c config.toml --port 9000
-        biopb-tensor serve -c config.toml --log-level DEBUG
+        biopb-tensor-server serve --config biopb-tensor.toml
+        biopb-tensor-server serve -c config.toml --port 9000
+        biopb-tensor-server serve -c config.toml --log-level DEBUG
     """
     server_config = load_config(config)
 
@@ -400,7 +400,7 @@ def validate(
     """Validate a config file.
 
     Example:
-        biopb-tensor validate biopb-tensor.toml
+        biopb-tensor-server validate biopb-tensor.toml
     """
     try:
         server_config = load_config(config)
@@ -449,7 +449,7 @@ def list_tensors(
     """List data sources and tensors defined in a config file.
 
     Example:
-        biopb-tensor list biopb-tensor.toml
+        biopb-tensor-server list biopb-tensor.toml
     """
     try:
         server_config = load_config(config)
@@ -584,9 +584,9 @@ def launch(
     or point --web-url to a production deployment.
 
     Example:
-        biopb-tensor launch --config biopb-tensor.toml
-        biopb-tensor launch -c config.toml --web-port 9000 --dev
-        biopb-tensor launch -c config.toml --log-level DEBUG
+        biopb-tensor-server launch --config biopb-tensor.toml
+        biopb-tensor-server launch -c config.toml --web-port 9000 --dev
+        biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
     import re as _re
 

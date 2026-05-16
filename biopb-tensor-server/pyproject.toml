@@ -58,7 +58,7 @@ dependencies = [
   ]
 
 [project.scripts]
-  biopb-tensor = "biopb_tensor_server.cli:app"
+  biopb-tensor-server = "biopb_tensor_server.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["."]

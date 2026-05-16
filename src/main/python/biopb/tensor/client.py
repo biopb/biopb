@@ -593,7 +593,7 @@ class TensorFlightClient:
     def get_tensor(
         self,
         source_id: str,
-        tensor_id: str,
+        tensor_id: Optional[str] = None,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
@@ -602,13 +602,17 @@ class TensorFlightClient:
 
         Args:
             source_id: Data source identifier
-            tensor_id: Tensor identifier within the source
+            tensor_id: Tensor identifier within the source (optional if source has single tensor)
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
 
         Returns:
             dask.array with lazy chunk loading
+
+        Raises:
+            ValueError: If source not found, tensor not found, or tensor_id is None
+                for a multi-tensor source
         """
         logger.debug(f"get_tensor: source_id={source_id}, tensor_id={tensor_id}")
         # Get tensor descriptor from cached source info
@@ -618,6 +622,18 @@ class TensorFlightClient:
         source_desc = self._sources.get(source_id)
         if source_desc is None:
             raise ValueError(f"Source not found: {source_id}")
+
+        # Resolve tensor_id if not provided
+        if tensor_id is None:
+            if len(source_desc.tensors) == 1:
+                tensor_id = source_desc.tensors[0].array_id
+            elif len(source_desc.tensors) == 0:
+                raise ValueError(f"Source '{source_id}' has no tensors")
+            else:
+                raise ValueError(
+                    f"Source '{source_id}' has multiple tensors ({len(source_desc.tensors)}), "
+                    f"tensor_id must be specified"
+                )
 
         # Find tensor descriptor
         tensor_desc = None

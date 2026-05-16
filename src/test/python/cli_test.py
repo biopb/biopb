@@ -11,7 +11,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from biopb.tensor.cli import app, _parse_slice_hint
+from biopb.tensor.cli import app, _parse_array_id, _parse_slice_hint
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 
@@ -131,7 +131,7 @@ class TestQueryCommand:
             result = runner.invoke(app, ["query"])
 
             assert result.exit_code == 0
-            assert "No sources found" in result.stdout
+            assert "No sources found" in result.stderr
 
     def test_query_connection_error(self):
         """Test that query handles connection errors."""
@@ -141,7 +141,7 @@ class TestQueryCommand:
             result = runner.invoke(app, ["query"])
 
             assert result.exit_code == 1
-            assert "Cannot connect" in result.stdout
+            assert "Cannot connect" in result.stderr
 
 
 class TestMetadataCommand:
@@ -193,7 +193,7 @@ class TestMetadataCommand:
             result = runner.invoke(app, ["metadata", "nonexistent"])
 
             assert result.exit_code == 1
-            assert "Source not found" in result.stdout
+            assert "Source not found" in result.stderr
 
     def test_metadata_tensor_not_found(self):
         """Test that --tensor handles missing tensor."""
@@ -206,21 +206,21 @@ class TestMetadataCommand:
             )
 
             assert result.exit_code == 1
-            assert "Tensor not found" in result.stdout
+            assert "Tensor not found" in result.stderr
 
 
-class TestReadCommand:
-    """Tests for the 'read' command."""
+class TestStatsCommand:
+    """Tests for the 'stats' command."""
 
-    def test_read_computes_values(self):
-        """Test that read computes min, max, mean."""
+    def test_stats_computes_values(self):
+        """Test that stats computes min, max, mean."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             with patch("biopb.tensor.cli.dask.compute") as mock_compute:
                 mock_client = _build_mock_client()
                 mock_fc_class.return_value = mock_client
                 mock_compute.return_value = (10, 200, 100.5)
 
-                result = runner.invoke(app, ["read", "my-source", "pos_0"])
+                result = runner.invoke(app, ["stats", "my-source/pos_0"])
 
                 assert result.exit_code == 0
                 assert "min" in result.stdout
@@ -231,15 +231,15 @@ class TestReadCommand:
                 assert "100.5" in result.stdout
                 mock_client.close.assert_called_once()
 
-    def test_read_with_slice(self):
-        """Test that read respects --slice option."""
+    def test_stats_with_slice(self):
+        """Test that stats respects --slice option."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(
                 app,
-                ["read", "my-source", "pos_0", "--slice", "0:100,0:100"],
+                ["stats", "my-source/pos_0", "--slice", "0:100,0:100"],
             )
 
             assert result.exit_code == 0
@@ -247,25 +247,25 @@ class TestReadCommand:
             call_args = mock_client.get_tensor.call_args
             assert call_args[1]["slice_hint"] == (slice(0, 100), slice(0, 100))
 
-    def test_read_missing_tensor(self):
-        """Test that read handles missing tensor."""
+    def test_stats_missing_tensor(self):
+        """Test that stats handles missing tensor."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_client.get_tensor.side_effect = ValueError("Tensor not found")
             mock_fc_class.return_value = mock_client
 
-            result = runner.invoke(app, ["read", "my-source", "nonexistent"])
+            result = runner.invoke(app, ["stats", "my-source/nonexistent"])
 
             assert result.exit_code == 1
-            assert "Failed to compute statistics" in result.stdout
+            assert "Failed to compute statistics" in result.stderr
 
-    def test_read_displays_shape_and_dtype(self):
-        """Test that read shows tensor shape and dtype."""
+    def test_stats_displays_shape_and_dtype(self):
+        """Test that stats shows tensor shape and dtype."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
             mock_fc_class.return_value = mock_client
 
-            result = runner.invoke(app, ["read", "my-source", "pos_0"])
+            result = runner.invoke(app, ["stats", "my-source/pos_0"])
 
             assert result.exit_code == 0
             assert "[512, 512]" in result.stdout
@@ -313,6 +313,29 @@ class TestParseSliceHint:
         assert result == (slice(10, 20),)
 
 
+class TestParseArrayId:
+    """Tests for _parse_array_id helper function."""
+
+    def test_parse_with_tensor_id(self):
+        """Test parsing array_id with explicit tensor_id."""
+        source_id, tensor_id = _parse_array_id("my-source/pos_0")
+        assert source_id == "my-source"
+        assert tensor_id == "pos_0"
+
+    def test_parse_without_tensor_id(self):
+        """Test parsing array_id without tensor_id."""
+        source_id, tensor_id = _parse_array_id("my-source")
+        assert source_id == "my-source"
+        assert tensor_id is None
+
+    def test_parse_with_nested_path(self):
+        """Test parsing array_id with tensor_id containing slashes."""
+        # Only first slash is used as delimiter
+        source_id, tensor_id = _parse_array_id("my-source/sub/path")
+        assert source_id == "my-source"
+        assert tensor_id == "sub/path"
+
+
 class TestCliIntegration:
     """Integration-level CLI tests."""
 
@@ -325,10 +348,13 @@ class TestCliIntegration:
         result = runner.invoke(app, ["metadata", "--help"])
         assert result.exit_code == 0
 
-        result = runner.invoke(app, ["read", "--help"])
+        result = runner.invoke(app, ["get", "--help"])
+        assert result.exit_code == 0
+
+        result = runner.invoke(app, ["stats", "--help"])
         assert result.exit_code == 0
 
     def test_app_version(self):
         """Test that the app has a name and help text."""
-        assert app.info.name == "biopb-diagnose"
+        assert app.info.name == "tensor"
         assert app.info.help is not None

@@ -184,13 +184,13 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 
 ## CLI Launcher
 
-**Command:** `biopb-tensor launch`
+**Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor launch --config biopb-tensor.toml [--web-port 8816] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb-tensor.toml [--web-port 8816] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
 
 # for grpc only (no sidecar)
-biopb-tensor serve ...
+biopb-tensor-server serve ...
 ```
 
 Startup sequence:
@@ -572,7 +572,7 @@ location / {
 The sidecar (`VITE_TENSOR_API`) must be reachable from the browser — configure CORS origins (default to localhost:5173) in the tensor server accordingly. I.e, for nginx deployment:
 
 ```
-biopb-tensor launch config.toml --web-url https://yourdomain.com --token mytoken...
+biopb-tensor-server launch config.toml --web-url https://yourdomain.com --token mytoken...
 ```
 
 ### Auth flow
@@ -694,8 +694,8 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
-| `BIOPB_TENSOR_TOKEN` | `biopb-tensor launch` (server) | Pre-set sidecar token (skips CLI prompt) |
-| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor launch` (server) | Enable dev-mode token bypass (localhost only) |
+| `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set sidecar token (skips CLI prompt) |
+| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only) |
 | `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI sidecar (default `http://localhost:8816`) |
 
 ---
@@ -705,7 +705,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
-- Dev mode (`biopb-tensor launch --dev`) disables token enforcement on the backend; the frontend still shows the unlock page but any string is accepted.
+- Dev mode (`biopb-tensor-server launch --dev`) disables token enforcement on the backend; the frontend still shows the unlock page but any string is accepted.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
 
 ---
