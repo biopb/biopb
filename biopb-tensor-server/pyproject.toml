@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biopb-tensor-server"
-version = "0.1.0"
+dynamic = ["version"]
 requires-python = ">=3.8"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "BioPB Tensor Arrow Flight server for multi-dimensional array storage"
@@ -63,6 +63,9 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["biopb_tensor_server*"]
+
+[tool.setuptools.cmdclass]
+build_py = "build_version.read_version"
 
 [tool.ruff.lint]
 # Enable specific rules for import cleanup

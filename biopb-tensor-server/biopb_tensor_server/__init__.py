@@ -71,14 +71,17 @@ from biopb_tensor_server.server import (
 )
 
 try:
-    import importlib.metadata as _importlib_metadata
+    from biopb_tensor_server._version import __version__
 except ImportError:
-    import importlib_metadata as _importlib_metadata
+    try:
+        import importlib.metadata as _importlib_metadata
+    except ImportError:
+        import importlib_metadata as _importlib_metadata
 
-try:
-    __version__ = _importlib_metadata.version("biopb-tensor-server")
-except Exception:
-    __version__ = "0.1.0"
+    try:
+        __version__ = _importlib_metadata.version("biopb-tensor-server")
+    except Exception:
+        __version__ = "0.1.0"
 
 __all__ = [
     "TensorFlightServer",

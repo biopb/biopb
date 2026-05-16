@@ -707,3 +707,23 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
 - Dev mode (`biopb-tensor launch --dev`) disables token enforcement on the backend; the frontend still shows the unlock page but any string is accepted.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
+
+---
+
+## Versioning
+
+Server components use `server-v*` tags (distinct from SDK `v*` tags):
+
+```
+biopb-tensor-server/VERSION  →  single source of truth
+```
+
+**Release:**
+```bash
+echo "0.2.0" > biopb-tensor-server/VERSION
+pnpm sync-version
+git commit -am "bump tensor-server to 0.2.0"
+git tag server-v0.2.0 && git push --tags
+```
+
+CI builds Docker image: `ghcr.io/.../biopb-tensor-server:0.2.0`, `:latest`
