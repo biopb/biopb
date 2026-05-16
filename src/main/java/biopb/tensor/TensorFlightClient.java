@@ -588,6 +588,9 @@ public class TensorFlightClient implements AutoCloseable {
      * independently. Each worker process maintains its own connection pool
      * and cache keyed by (location, authToken).
      *
+     * If endpoints field is empty, calls GetFlightInfo on the server
+     * to rebuild the endpoint list.
+     *
      * @param pb          SerializedTensor protobuf object
      * @param cacheBytes  Maximum cache size in bytes
      * @param <T>         The pixel type
@@ -602,11 +605,29 @@ public class TensorFlightClient implements AutoCloseable {
         long[] dims = toLongArray(descriptor.getShapeList());
         int[] cellDimensions = toIntArray(descriptor.getChunkShapeList());
 
-        // Build endpoint index from SerializedEndpoint list
-        SerializedEndpointIndex endpointIndex = buildSerializedEndpointIndex(pb, dims, cellDimensions);
+        // Build endpoint index - if endpoints empty, fetch via GetFlightInfo
+        final SerializedTensor pbEffective;
+        if (pb.getEndpointsCount() == 0) {
+            LOGGER.fine("tensorFromPb: endpoints empty, fetching via GetFlightInfo");
+            List<SerializedEndpoint> fetchedEndpoints = fetchEndpointsViaGetFlightInfo(pb);
+            SerializedTensor.Builder pbBuilder = SerializedTensor.newBuilder()
+                    .setTensorDescriptor(descriptor)
+                    .setLocation(pb.getLocation())
+                    .setAuthToken(pb.getAuthToken())
+                    .addAllEndpoints(fetchedEndpoints);
+            if (pb.hasOriginalSliceHint()) {
+                pbBuilder.setOriginalSliceHint(pb.getOriginalSliceHint());
+            }
+            pbEffective = pbBuilder.build();
+        } else {
+            pbEffective = pb;
+        }
+
+        SerializedEndpointIndex endpointIndex = buildSerializedEndpointIndex(pbEffective, dims, cellDimensions);
 
         if (endpointIndex == null) {
-            return materializeSerializedArray(pb, cacheBytes);
+            // Materialize array for non-aligned endpoint layout
+            return materializeSerializedArray(pbEffective, cacheBytes);
         }
 
         long estimatedChunkBytes = estimateChunkBytes(descriptor);
@@ -618,7 +639,94 @@ public class TensorFlightClient implements AutoCloseable {
 
         ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
         return (RandomAccessibleInterval<T>) factory.create(dims, type,
-                cell -> loadCellFromSerialized(cell, endpointIndex, pb));
+                cell -> loadCellFromSerialized(cell, endpointIndex, pbEffective));
+    }
+
+    /**
+     * Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
+     */
+    private static List<SerializedEndpoint> fetchEndpointsViaGetFlightInfo(SerializedTensor pb) {
+        TensorDescriptor descriptor = pb.getTensorDescriptor();
+
+        // Parse location URI
+        Location location = parseLocationUri(pb.getLocation());
+
+        // Build TensorReadOption from descriptor's fields
+        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
+                .setTensorId(descriptor.getArrayId())
+                .setWithMetadata(false);
+
+        if (descriptor.hasSliceHint()) {
+            readBuilder.setSliceHint(descriptor.getSliceHint());
+        }
+        for (long scale : descriptor.getScaleHintList()) {
+            readBuilder.addScaleHint(scale);
+        }
+        if (!descriptor.getReductionMethod().isEmpty()) {
+            readBuilder.setReductionMethod(descriptor.getReductionMethod());
+        }
+
+        // Build FlightCmd - use array_id as source_id (convention for single-tensor sources)
+        FlightCmd cmd = FlightCmd.newBuilder()
+                .setSourceId(descriptor.getArrayId())
+                .setTensorRead(readBuilder.build())
+                .build();
+
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        CredentialCallOption authOption = (pb.getAuthToken() != null && !pb.getAuthToken().isEmpty())
+                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + pb.getAuthToken()))
+                : null;
+
+        try (FlightClient client = FlightClient.builder(allocator, location).build()) {
+            FlightInfo info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
+
+            List<SerializedEndpoint> endpoints = new ArrayList<>();
+            for (FlightEndpoint endpoint : info.getEndpoints()) {
+                TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
+                ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
+                SerializedEndpoint serializedEp = SerializedEndpoint.newBuilder()
+                        .setTicket(ticket)
+                        .setChunkBounds(bounds)
+                        .build();
+                endpoints.add(serializedEp);
+            }
+
+            LOGGER.fine("fetchEndpointsViaGetFlightInfo: got " + endpoints.size() + " endpoints");
+            return endpoints;
+
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to fetch endpoints via GetFlightInfo", e);
+        } finally {
+            try {
+                allocator.close();
+            } catch (Exception e) {
+                // Ignore allocator close errors
+            }
+        }
+    }
+
+    /**
+     * Parse location URI string to Arrow Flight Location.
+     */
+    private static Location parseLocationUri(String locationStr) {
+        if (locationStr.startsWith("grpc://")) {
+            String uriPart = locationStr.substring(7);
+            int colonIdx = uriPart.lastIndexOf(':');
+            if (colonIdx > 0) {
+                String host = uriPart.substring(0, colonIdx);
+                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
+                return Location.forGrpcInsecure(host, port);
+            }
+        } else if (locationStr.startsWith("grpc+tcp://")) {
+            String uriPart = locationStr.substring(11);
+            int colonIdx = uriPart.lastIndexOf(':');
+            if (colonIdx > 0) {
+                String host = uriPart.substring(0, colonIdx);
+                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
+                return Location.forGrpcInsecure(host, port);
+            }
+        }
+        throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
     }
 
     /**

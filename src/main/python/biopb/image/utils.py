@@ -2,9 +2,9 @@ import warnings
 
 import numpy as np
 import dask.array as da
-from typing import Union
+from typing import Optional, Sequence, Tuple, Union
 
-from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData
+from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData, Tensor
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.serialized_pb2 import SerializedTensor
 
@@ -380,11 +380,92 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
     return roi
 
 
+def get_image_data_dim_labels(image_data: ImageData) -> Optional[Tuple[str]]:
+    """Get a copy of the dimension labels from ImageData."""
+    data_type = image_data.WhichOneof('data')
+    if data_type == 'eager_data':
+        dim_labels = image_data.eager_data.dim_labels
+    elif data_type == 'lazy_data':
+        dim_labels = image_data.lazy_data.tensor_descriptor.dim_labels
+    else:
+        dim_labels = None
+
+    if dim_labels:
+        return list(dim_labels) # is a copy
+    else:
+        return None
+
+
+def get_image_data_shape(image_data: ImageData) -> Optional[Tuple[int]]:
+    data_type = image_data.WhichOneof('data')
+    if data_type == 'eager_data':
+        return tuple(image_data.eager_data.dims)
+    elif data_type == 'lazy_data':
+        return tuple(image_data.lazy_data.tensor_descriptor.shape)
+    else:
+        return None
+
+
+def _np_from_pb(tensor: Tensor) -> np.ndarray:
+    """Helper to convert protobuf Tensor to numpy array."""
+    dtype_str = tensor.dtype
+    if dtype_str and dtype_str[0] in '<>|=':
+        dtype_prefix = dtype_str[0]
+        # '=' means native byteorder, which could match either
+        if dtype_prefix != '=':
+            expected_endian = '<' if tensor.bindata.endianness == BinData.Endianness.LITTLE else '>'
+            if dtype_prefix != expected_endian:
+                endianness_name = "LITTLE" if tensor.bindata.endianness == BinData.Endianness.LITTLE else "BIG"
+                warnings.warn(
+                    f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
+                    f"but BinData.endianness={endianness_name}. "
+                    f"Using BinData.endianness as authoritative source."
+                )
+
+    def _get_dtype() -> np.dtype:
+        dt = np.dtype(tensor.dtype)
+
+        if tensor.bindata.endianness == BinData.Endianness.BIG:
+            dt = dt.newbyteorder(">")
+        else:
+            dt = dt.newbyteorder("<")
+
+        return dt
+    
+    np_array = np.frombuffer(
+        tensor.bindata.data,
+        dtype=_get_dtype(),
+    )
+    return np_array.reshape(tuple(tensor.dims))
+
+
+def _pb_from_np(np_array: np.ndarray, *, dim_labels: Optional[Sequence[str]] = None) -> Tensor:
+    dtype = _canonicalize_dtype(np_array.dtype.str)
+
+    byteorder = np_array.dtype.byteorder
+    if byteorder == "=":
+        import sys
+        byteorder = "<" if sys.byteorder == 'little' else ">"
+
+    endianness = 1 if byteorder == "<" else 0
+
+    tensor = Tensor(
+        bindata = BinData(data=np_array.tobytes(), endianness=endianness),
+        dims = list(np_array.shape),
+        dtype = dtype,
+    )
+    if dim_labels:
+        if len(dim_labels) != np_array.ndim:
+            raise ValueError(
+                f"Length of dim_labels ({len(dim_labels)}) must match number of dimensions in np_array ({np_array.ndim})"
+            )
+        tensor.dim_labels.extend(dim_labels)
+    return tensor
+
+
 def deserialize_image_data(
     image_data: ImageData,
     *,
-    singleton_t: bool = True,
-    np_index_order: str = "ZYXC",
     cache_bytes: int = 1_000_000_000,
 ) -> Union[np.ndarray, da.Array]:
     '''Convert protobuf ImageData to a numpy array or dask array.
@@ -395,8 +476,7 @@ def deserialize_image_data(
     Args:
         image_data: protobuf ImageData message
     Keyword Args:
-        singleton_t: DEPRECATED. Use np_index_order to control output dimensions.
-        np_index_order: Numpy index order string for eager_data deserialization.
+        output_dim_order: Output dimension order string for eager_data deserialization. Default to input order.
         cache_bytes: Cache size for lazy_data chunk cache (default 1GB).
 
     Returns:
@@ -406,11 +486,7 @@ def deserialize_image_data(
     data_type = image_data.WhichOneof('data')
 
     if data_type == 'eager_data':
-        return deserialize_to_numpy(
-            image_data.eager_data,
-            singleton_t=singleton_t,
-            np_index_order=np_index_order,
-        )
+        return _np_from_pb(image_data.eager_data)
     elif data_type == 'lazy_data':
         return TensorFlightClient.tensor_from_pb(
             image_data.lazy_data,
@@ -419,10 +495,10 @@ def deserialize_image_data(
     elif data_type is None:
         # Legacy fallback: check deprecated pixels field
         if image_data.HasField('pixels'):
+            dim_order = image_data.pixels.dimension_order
             return deserialize_to_numpy(
                 image_data.pixels,
-                singleton_t=singleton_t,
-                np_index_order=np_index_order,
+                np_index_order=dim_order[::-1], # dimension_order is F-order, so reverse for C-order index
             )
         else:
             raise ValueError("ImageData has no data field set")
@@ -433,25 +509,20 @@ def deserialize_image_data(
 
 def serialize_from_numpy_to_image_data(
     np_img: np.ndarray,
-    dimension_order: str = "CXYZT",
-    np_index_order: str = None,
-    **kwargs
+    *,
+    dim_labels: Optional[Sequence[str]] = None,
 ) -> ImageData:
     '''Convert numpy array to protobuf ImageData with eager_data.
 
     Args:
         np_img: image as numpy array (any memory order is accepted)
-        dimension_order: F-order string describing dimension order in output.
-        np_index_order: Numpy index order string (see serialize_from_numpy).
-        **kwargs: additional metadata (physical_size_x etc).
-
+    Keyword Args:
+        dim_labels: Dimension labels for the tensor. Must be same length as np_img.ndim.
     Returns:
         protobuf ImageData with eager_data set.
     '''
-    pixels = serialize_from_numpy(
+    tensor = _pb_from_np(
         np_img,
-        dimension_order=dimension_order,
-        np_index_order=np_index_order,
-        **kwargs,
+        dim_labels=dim_labels,
     )
-    return ImageData(eager_data=pixels)
+    return ImageData(eager_data=tensor)

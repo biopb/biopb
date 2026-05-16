@@ -18,7 +18,7 @@ from biopb.image.detection_request_pb2 import DetectionRequest
 from biopb.image.detection_response_pb2 import DetectionResponse, ScoredROI
 from biopb.image.bindata_pb2 import BinData
 from biopb.image.detection_settings_pb2 import DetectionSettings
-from biopb.image.image_data_pb2 import ImageData, Pixels, ImageAnnotation
+from biopb.image.image_data_pb2 import ImageData, Pixels, ImageAnnotation, Tensor
 from biopb.image.roi_pb2 import ROI, Rectangle, Mask, Mesh, Polygon, Point
 
 # Utility functions for image data serialization/deserialization

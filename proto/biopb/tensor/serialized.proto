@@ -24,7 +24,8 @@ message SerializedTensor {
   // Auth token (empty if no auth)
   string auth_token = 4;
 
-  // Serialized flight endpoints
+  // Serialized flight endpoints. This is optional field. If not present, client
+  // Should call GetFlightInfo on the server to rebuild endpoint list.
   repeated SerializedEndpoint endpoints = 5;
 }
 

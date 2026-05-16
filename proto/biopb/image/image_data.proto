@@ -83,10 +83,33 @@ message ImageAnnotation {
 
     // additional text annotation
     string annotation = 2;
+
+    // physical size of a pixel. 
+    repeated float pixels_sizes = 4;
 }
 
-message ImageData {
+// Generic nd tensor
+message Tensor {
+    // Pixel values
+    BinData bindata = 1;
 
+    // A string describing the data type using numpy's convention. E.g., 'i8'
+    // represent int64. Endianness indicator, e.g. '=i8', is allowed but will be
+    // ignored. Instead the endianness will be determined by the field within
+    // the Bindata structure.
+    string dtype = 2;
+
+    // A list of Dimensional size of pixel data array, e.g. [10, 5, 512, 512, 3]
+    repeated uint32 dims = 3;
+
+    // A list of strings describing the dimension order of the pixel data
+    // e.g. ['T', 'Z', 'Y', 'X', 'C']. The order of the list specifies the 
+    // order of dimensions in the bindata.
+    repeated string dim_labels = 4;
+}
+
+
+message ImageData {
     // Legacy field - servers should check this for backward compatibility
     Pixels pixels = 1 [deprecated = true];
 
@@ -97,8 +120,8 @@ message ImageData {
     ImageAnnotation image_annotation = 2;
 
     oneof data {
-        // Inline pixel data (eager/lazy naming distinguishes from legacy pixels field)
-        Pixels eager_data = 3;
+        // Inline pixel data
+        Tensor eager_data = 3;
         // Lazy tensor reference for larger-than-memory datasets
         biopb.tensor.SerializedTensor lazy_data = 4;
     }

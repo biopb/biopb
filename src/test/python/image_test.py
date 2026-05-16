@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import biopb.tensor.ticket_pb2
 
-from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype, deserialize_image_data, serialize_from_numpy_to_image_data
-from biopb.image import BinData, Pixels, ImageData
+from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype, deserialize_image_data, serialize_from_numpy_to_image_data, _pb_from_np, _np_from_pb, get_image_data_dim_labels, get_image_data_shape
+from biopb.image import BinData, Pixels, ImageData, Tensor
 
 
 def test_import():
@@ -388,18 +388,19 @@ def test_serialize_f_order_input():
 # ============================================================================
 
 def test_deserialize_image_data_eager_data():
-    """Test deserialize_image_data with eager_data."""
+    """Test deserialize_image_data with eager_data (Tensor)."""
     from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
-    pixels = serialize_from_numpy(img)
 
-    image_data = ImageData(eager_data=pixels)
+    # Use the new Tensor-based serialization
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
     result = deserialize_image_data(image_data)
 
     assert isinstance(result, np.ndarray)
-    assert result.shape == (1, 32, 32, 3)
+    assert result.shape == (32, 32, 3)
+    np.testing.assert_array_equal(result, img)
 
 
 def test_deserialize_image_data_lazy_data():
@@ -458,7 +459,12 @@ def test_deserialize_image_data_legacy_pixels():
     result = deserialize_image_data(image_data)
 
     assert isinstance(result, np.ndarray)
-    assert result.shape == (1, 32, 32, 3)
+    # Legacy pixels uses dimension_order reversed for np_index_order
+    # Default dimension_order="CXYZT" -> np_index_order="TXYZC"
+    # The resulting shape preserves all dimensions in the order specified
+    assert result.shape == (1, 1, 32, 32, 3)
+    # The data round-trips correctly when squeezed
+    np.testing.assert_array_equal(result.squeeze(), img)
 
 
 def test_deserialize_image_data_no_data_raises():
@@ -485,39 +491,58 @@ def test_serialize_from_numpy_to_image_data():
     assert isinstance(image_data, ImageData)
     assert image_data.HasField('eager_data')
 
-    # Verify dimensions
-    assert image_data.eager_data.size_y == 32
-    assert image_data.eager_data.size_x == 32
-    assert image_data.eager_data.size_c == 3
+    # Verify dimensions - Tensor uses dims list
+    assert list(image_data.eager_data.dims) == [32, 32, 3]
+    assert image_data.eager_data.dtype == 'u1'
 
 
-def test_serialize_from_numpy_to_image_data_with_dimension_order():
-    """Test serialize_from_numpy_to_image_data with custom dimension_order."""
+def test_serialize_from_numpy_to_image_data_with_dim_labels():
+    """Test serialize_from_numpy_to_image_data with dim_labels."""
     from biopb.image.utils import serialize_from_numpy_to_image_data
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
-    image_data = serialize_from_numpy_to_image_data(img, dimension_order="CXYZT")
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
 
-    assert image_data.eager_data.dimension_order == "CXYZT"
+    assert list(image_data.eager_data.dim_labels) == ['Y', 'X', 'C']
 
 
-def test_deserialize_image_data_np_index_order():
-    """Test deserialize_image_data with np_index_order parameter."""
-    from biopb.image.utils import deserialize_image_data
-    from biopb.image import ImageData
-
+def test_get_image_data_dim_labels():
+    """Test get_image_data_dim_labels helper."""
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
-    pixels = serialize_from_numpy(img)
 
-    image_data = ImageData(eager_data=pixels)
+    # With dim_labels
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
+    labels = get_image_data_dim_labels(image_data)
+    assert labels == ['Y', 'X', 'C']
 
-    # Test with different np_index_order
-    result_zyxc = deserialize_image_data(image_data, np_index_order="ZYXC")
-    assert result_zyxc.shape == (1, 32, 32, 3)
+    # Without dim_labels - returns None when not set
+    image_data2 = serialize_from_numpy_to_image_data(img)
+    labels2 = get_image_data_dim_labels(image_data2)
+    assert labels2 is None
 
-    result_yxcz = deserialize_image_data(image_data, np_index_order="YXCZ")
-    assert result_yxcz.shape == (32, 32, 3, 1)
+
+def test_get_image_data_shape():
+    """Test get_image_data_shape helper."""
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+
+    image_data = serialize_from_numpy_to_image_data(img)
+    shape = get_image_data_shape(image_data)
+    assert shape == (32, 32, 3)
+
+
+def test_pb_from_np_and_np_from_pb():
+    """Test _pb_from_np and _np_from_pb helpers."""
+    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
+
+    tensor = _pb_from_np(img, dim_labels=['Y', 'X', 'C'])
+    assert list(tensor.dims) == [32, 32, 3]
+    assert tensor.dtype == 'u1'
+    assert list(tensor.dim_labels) == ['Y', 'X', 'C']
+
+    img_back = _np_from_pb(tensor)
+    assert img_back.shape == img.shape
+    np.testing.assert_array_equal(img_back, img)
 
 
 def test_deserialize_image_data_cache_bytes_parameter():

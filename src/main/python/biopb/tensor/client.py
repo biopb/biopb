@@ -282,6 +282,72 @@ def _fetch_chunk_distributed(
     return arr
 
 
+def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[bytes], List[ChunkBounds]]:
+    """Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
+
+    This is used when the endpoints field in SerializedTensor is empty.
+    The client connects to the server and calls GetFlightInfo to get
+    the endpoint list for the tensor.
+
+    Args:
+        pb: SerializedTensor protobuf (endpoints field empty)
+
+    Returns:
+        Tuple of (chunk_ids, chunk_bounds) extracted from FlightInfo
+    """
+    descriptor = pb.tensor_descriptor
+
+    # Build TensorReadOption from descriptor's fields
+    read_opt = TensorReadOption(
+        tensor_id=descriptor.array_id,
+        with_metadata=False,
+    )
+    if descriptor.HasField("slice_hint"):
+        read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
+    if descriptor.scale_hint:
+        read_opt.scale_hint[:] = list(descriptor.scale_hint)
+    if descriptor.reduction_method:
+        read_opt.reduction_method = descriptor.reduction_method
+
+    # Build FlightCmd - use array_id as source_id (convention for single-tensor sources)
+    # For multi-tensor sources, endpoints should be populated in SerializedTensor
+    cmd = FlightCmd(
+        source_id=descriptor.array_id,
+        tensor_read=read_opt,
+    )
+
+    # Create temporary client for this GetFlightInfo call
+    client = flight.FlightClient(pb.location)
+    call_options = (
+        flight.FlightCallOptions(
+            headers=[(b"authorization", f"Bearer {pb.auth_token}".encode())]
+        )
+        if pb.auth_token
+        else flight.FlightCallOptions()
+    )
+
+    flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+    info = client.get_flight_info(flight_desc, options=call_options)
+    response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+    # Check schema version compatibility
+    _check_schema_version(info.schema)
+
+    # Parse endpoints into chunk info
+    chunks = []
+    chunk_bounds_list = []
+    for endpoint in info.endpoints:
+        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+        bounds = ChunkBounds.FromString(endpoint.app_metadata)
+        chunks.append(ticket.chunk_id)
+        chunk_bounds_list.append(bounds)
+
+    client.close()
+    logger.debug(f"_fetch_endpoints_via_get_flight_info: got {len(chunks)} endpoints")
+
+    return chunks, chunk_bounds_list
+
+
 def _parse_version(version_str: str) -> Tuple[int, int, int]:
     """Parse semantic version string to (major, minor, patch) tuple."""
     # Handle dev versions like "0.3.1.dev43+g..."
@@ -770,6 +836,9 @@ class TensorFlightClient:
         independently. Each worker process maintains its own connection
         pool and LRU cache keyed by (location, auth_token).
 
+        If endpoints field is empty, calls GetFlightInfo on the server
+        to rebuild the endpoint list.
+
         Args:
             pb: SerializedTensor protobuf object
             cache_bytes: Maximum bytes for chunk cache (default 1GB).
@@ -783,12 +852,19 @@ class TensorFlightClient:
         shape = tuple(descriptor.shape)
         dtype = np.dtype(descriptor.dtype)
 
-        # Parse endpoints
+        # Parse endpoints - if empty, fetch from GetFlightInfo
         chunks = []
         chunk_bounds_list = []
-        for ep in pb.endpoints:
-            chunks.append(ep.ticket.chunk_id)
-            chunk_bounds_list.append(ep.chunk_bounds)
+
+        if pb.endpoints:
+            # Use serialized endpoints directly
+            for ep in pb.endpoints:
+                chunks.append(ep.ticket.chunk_id)
+                chunk_bounds_list.append(ep.chunk_bounds)
+        else:
+            # Endpoints not provided - call GetFlightInfo to rebuild
+            logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
+            chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
 
         # Build chunk map
         chunk_map = {}

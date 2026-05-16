@@ -630,7 +630,7 @@ public final class Utils {
     /**
      * Deserialize an ImageData protobuf message to a RandomAccessibleInterval.
      *
-     * Handles both eager_data (inline Pixels) and lazy_data (SerializedTensor).
+     * Handles both eager_data (inline Tensor) and lazy_data (SerializedTensor).
      * Also handles legacy pixels field for backward compatibility.
      *
      * @param imageData the protobuf message containing serialized image data
@@ -643,7 +643,7 @@ public final class Utils {
         ImageData.DataCase dataCase = imageData.getDataCase();
 
         if (dataCase == ImageData.DataCase.EAGER_DATA) {
-            return DeserializeToInterval(imageData.getEagerData());
+            return intervalFromTensor(imageData.getEagerData());
         } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
             return reconstructFromSerializedTensor(imageData.getLazyData());
         } else if (dataCase == ImageData.DataCase.DATA_NOT_SET) {
@@ -707,6 +707,284 @@ public final class Utils {
         return out;
     }
 
+    // ============================================================================
+    // Tensor serialization/deserialization methods
+    // ============================================================================
+
+    /**
+     * Serialize a RandomAccessibleInterval to Tensor protobuf.
+     *
+     * <p>Creates a generic nd tensor with optional dimension labels.
+     * The data is stored in C-order (last dimension varies fastest).
+     *
+     * @param interval the input RandomAccessibleInterval to serialize
+     * @param dimLabels optional dimension labels (null if not needed)
+     * @return a Tensor protobuf message
+     */
+    public static <T extends RealType<T> & NativeType<T>> Tensor tensorFromInterval(
+            RandomAccessibleInterval<T> interval,
+            java.util.List<String> dimLabels) {
+
+        int nd = interval.numDimensions();
+        String dtype = getDtypeFromRealType(interval.getType());
+        int bytesPerPixel = getBytesPerPixel(dtype);
+
+        // Get dimensions
+        long[] dims = new long[nd];
+        for (int i = 0; i < nd; i++) {
+            dims[i] = interval.dimension(i);
+        }
+
+        // Calculate total size
+        long totalSize = 1L;
+        for (int i = 0; i < nd; i++) {
+            totalSize *= dims[i];
+        }
+
+        ByteBuffer buffer = ByteBuffer.allocate((int) (totalSize * bytesPerPixel));
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        // Iterate in C-order (last dimension varies fastest)
+        iterateAndCopyTensor(interval, buffer, dims, nd - 1, new long[nd], dtype);
+
+        BinData bindata = BinData.newBuilder()
+                .setData(ByteString.copyFrom(buffer.array()))
+                .setEndianness(BinData.Endianness.BIG)
+                .build();
+
+        Tensor.Builder tensorBuilder = Tensor.newBuilder()
+                .setBindata(bindata)
+                .setDtype(dtype);
+
+        // Add dimensions as uint32
+        for (int i = 0; i < nd; i++) {
+            tensorBuilder.addDims((int) dims[i]);
+        }
+
+        // Add dimension labels if provided
+        if (dimLabels != null) {
+            if (dimLabels.size() != nd) {
+                throw new IllegalArgumentException(
+                    "dimLabels size (" + dimLabels.size() + ") must match interval dimensions (" + nd + ")");
+            }
+            for (String label : dimLabels) {
+                tensorBuilder.addDimLabels(label);
+            }
+        }
+
+        return tensorBuilder.build();
+    }
+
+    /**
+     * Serialize a RandomAccessibleInterval to Tensor protobuf without dimension labels.
+     */
+    public static <T extends RealType<T> & NativeType<T>> Tensor tensorFromInterval(
+            RandomAccessibleInterval<T> interval) {
+        return tensorFromInterval(interval, null);
+    }
+
+    /**
+     * Recursively iterate over dimensions in C-order and copy values to buffer.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T extends RealType<T> & NativeType<T>> void iterateAndCopyTensor(
+            RandomAccessibleInterval<T> interval,
+            ByteBuffer buffer,
+            long[] dims,
+            int axis,
+            long[] pos,
+            String dtype) {
+
+        if (axis < 0) {
+            // All dimensions iterated, copy the value
+            T pixel = interval.getAt(pos);
+            if (dtype.equals("f4")) {
+                buffer.putFloat(pixel.getRealFloat());
+            } else if (dtype.equals("f8")) {
+                buffer.putDouble(pixel.getRealDouble());
+            } else if (dtype.equals("u1")) {
+                buffer.put((byte) ((UnsignedByteType) pixel).get());
+            } else if (dtype.equals("i1")) {
+                buffer.put(((ByteType) pixel).get());
+            } else if (dtype.equals("u2")) {
+                buffer.putShort((short) ((UnsignedShortType) pixel).get());
+            } else if (dtype.equals("i2")) {
+                buffer.putShort(((ShortType) pixel).get());
+            } else if (dtype.equals("u4")) {
+                buffer.putInt((int) ((UnsignedIntType) pixel).get());
+            } else if (dtype.equals("i4")) {
+                buffer.putInt(((IntType) pixel).get());
+            } else {
+                buffer.putFloat(pixel.getRealFloat());
+            }
+            return;
+        }
+
+        for (long i = 0; i < dims[axis]; i++) {
+            pos[axis] = i;
+            iterateAndCopyTensor(interval, buffer, dims, axis - 1, pos, dtype);
+        }
+    }
+
+    /**
+     * Deserialize a Tensor protobuf to a RandomAccessibleInterval.
+     *
+     * <p>The returned interval has dimensions matching the Tensor's dims field,
+     * in C-order (last dimension varies fastest).
+     *
+     * @param tensor the Tensor protobuf message
+     * @return a RandomAccessibleInterval (ArrayImg)
+     */
+    public static RandomAccessibleInterval<?> intervalFromTensor(Tensor tensor) {
+        String originalDtype = tensor.getDtype();
+        String dtype = stripDtypePrefix(originalDtype);
+
+        // Check for endianness conflict
+        if (originalDtype.length() > 0) {
+            char prefix = originalDtype.charAt(0);
+            if (prefix == '<' || prefix == '>') {
+                boolean dtypeIsLittleEndian = (prefix == '<');
+                boolean bindataIsLittleEndian = (tensor.getBindata().getEndianness() == BinData.Endianness.LITTLE);
+                if (dtypeIsLittleEndian != bindataIsLittleEndian) {
+                    LOGGER.warning(
+                        "Endianness conflict: dtype=" + originalDtype + " indicates " +
+                        (dtypeIsLittleEndian ? "little" : "big") + "-endian but " +
+                        "BinData.endianness=" + tensor.getBindata().getEndianness().name() + ". " +
+                        "Using BinData.endianness as authoritative source."
+                    );
+                }
+            }
+        }
+
+        ByteBuffer buffer = ByteBuffer.wrap(tensor.getBindata().getData().toByteArray());
+        if (tensor.getBindata().getEndianness() == BinData.Endianness.LITTLE) {
+            buffer.order(ByteOrder.LITTLE_ENDIAN);
+        } else {
+            buffer.order(ByteOrder.BIG_ENDIAN);
+        }
+
+        // Get dimensions from Tensor
+        long[] dims = new long[tensor.getDimsCount()];
+        for (int i = 0; i < tensor.getDimsCount(); i++) {
+            dims[i] = tensor.getDims(i);
+        }
+
+        // Create ArrayImg and fill from buffer
+        if (dtype.equals("f4") || dtype.equals("float32")) {
+            RandomAccessibleInterval<FloatType> interval = new ArrayImgFactory<>(new FloatType()).create(dims);
+            for (FloatType p : Views.flatIterable(interval)) {
+                p.set(buffer.getFloat());
+            }
+            return interval;
+
+        } else if (dtype.equals("f8") || dtype.equals("float64")) {
+            RandomAccessibleInterval<DoubleType> interval = new ArrayImgFactory<>(new DoubleType()).create(dims);
+            for (DoubleType p : Views.flatIterable(interval)) {
+                p.set(buffer.getDouble());
+            }
+            return interval;
+
+        } else if (dtype.equals("u1") || dtype.equals("uint8")) {
+            RandomAccessibleInterval<UnsignedByteType> interval = new ArrayImgFactory<>(new UnsignedByteType()).create(dims);
+            for (UnsignedByteType p : Views.flatIterable(interval)) {
+                p.set(buffer.get());
+            }
+            return interval;
+
+        } else if (dtype.equals("u2") || dtype.equals("uint16")) {
+            RandomAccessibleInterval<UnsignedShortType> interval = new ArrayImgFactory<>(new UnsignedShortType()).create(dims);
+            for (UnsignedShortType p : Views.flatIterable(interval)) {
+                p.set(buffer.getShort() & 0xFFFF);
+            }
+            return interval;
+
+        } else if (dtype.equals("u4") || dtype.equals("uint32")) {
+            RandomAccessibleInterval<UnsignedIntType> interval = new ArrayImgFactory<>(new UnsignedIntType()).create(dims);
+            for (UnsignedIntType p : Views.flatIterable(interval)) {
+                p.set(buffer.getInt() & 0xFFFFFFFFL);
+            }
+            return interval;
+
+        } else if (dtype.equals("i1") || dtype.equals("int8")) {
+            RandomAccessibleInterval<ByteType> interval = new ArrayImgFactory<>(new ByteType()).create(dims);
+            for (ByteType p : Views.flatIterable(interval)) {
+                p.set(buffer.get());
+            }
+            return interval;
+
+        } else if (dtype.equals("i2") || dtype.equals("int16")) {
+            RandomAccessibleInterval<ShortType> interval = new ArrayImgFactory<>(new ShortType()).create(dims);
+            for (ShortType p : Views.flatIterable(interval)) {
+                p.set(buffer.getShort());
+            }
+            return interval;
+
+        } else if (dtype.equals("i4") || dtype.equals("int32")) {
+            RandomAccessibleInterval<IntType> interval = new ArrayImgFactory<>(new IntType()).create(dims);
+            for (IntType p : Views.flatIterable(interval)) {
+                p.set(buffer.getInt());
+            }
+            return interval;
+
+        } else {
+            throw new IllegalArgumentException("Unsupported data type: " + dtype);
+        }
+    }
+
+    /**
+     * Get dimension labels from ImageData.
+     *
+     * @param imageData the ImageData protobuf
+     * @return list of dimension labels, or null if not available
+     */
+    public static java.util.List<String> getImageDataDimLabels(ImageData imageData) {
+        ImageData.DataCase dataCase = imageData.getDataCase();
+
+        if (dataCase == ImageData.DataCase.EAGER_DATA) {
+            Tensor tensor = imageData.getEagerData();
+            if (tensor.getDimLabelsCount() > 0) {
+                return new java.util.ArrayList<>(tensor.getDimLabelsList());
+            }
+            return null;
+        } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
+            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            if (descriptor.getDimLabelsCount() > 0) {
+                return new java.util.ArrayList<>(descriptor.getDimLabelsList());
+            }
+            return null;
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Get shape from ImageData.
+     *
+     * @param imageData the ImageData protobuf
+     * @return array of dimension sizes, or null if not available
+     */
+    public static long[] getImageDataShape(ImageData imageData) {
+        ImageData.DataCase dataCase = imageData.getDataCase();
+
+        if (dataCase == ImageData.DataCase.EAGER_DATA) {
+            Tensor tensor = imageData.getEagerData();
+            long[] shape = new long[tensor.getDimsCount()];
+            for (int i = 0; i < tensor.getDimsCount(); i++) {
+                shape[i] = tensor.getDims(i);
+            }
+            return shape;
+        } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
+            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            long[] shape = new long[descriptor.getShapeCount()];
+            for (int i = 0; i < descriptor.getShapeCount(); i++) {
+                shape[i] = descriptor.getShape(i);
+            }
+            return shape;
+        } else {
+            return null;
+        }
+    }
+
     /**
      * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data.
      *
@@ -716,42 +994,26 @@ public final class Utils {
      */
     public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
             RandomAccessibleInterval<T> crop) {
-        Pixels pixels = SerializeFromInterval(crop);
+        Tensor tensor = tensorFromInterval(crop);
         return ImageData.newBuilder()
-                .setEagerData(pixels)
+                .setEagerData(tensor)
                 .build();
     }
 
     /**
      * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data
-     * and specified dimension order.
+     * and dimension labels.
      *
      * @param crop the input RandomAccessibleInterval to serialize
-     * @param dimensionOrder F-order string for output protobuf
+     * @param dimLabels dimension labels for the tensor (must match number of dimensions)
      * @return an ImageData protobuf message with eager_data set
      */
     public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
-            RandomAccessibleInterval<T> crop, String dimensionOrder) {
-        Pixels pixels = SerializeFromInterval(crop, dimensionOrder);
+            RandomAccessibleInterval<T> crop,
+            java.util.List<String> dimLabels) {
+        Tensor tensor = tensorFromInterval(crop, dimLabels);
         return ImageData.newBuilder()
-                .setEagerData(pixels)
-                .build();
-    }
-
-    /**
-     * Serialize a RandomAccessibleInterval to ImageData protobuf with eager_data
-     * and specified dimension orders.
-     *
-     * @param crop the input RandomAccessibleInterval to serialize
-     * @param dimensionOrder F-order string for output protobuf
-     * @param imglibIndexOrder String describing imglib2 dimension mapping
-     * @return an ImageData protobuf message with eager_data set
-     */
-    public static <T extends RealType<T> & NativeType<T>> ImageData serializeFromIntervalToImageData(
-            RandomAccessibleInterval<T> crop, String dimensionOrder, String imglibIndexOrder) {
-        Pixels pixels = SerializeFromInterval(crop, dimensionOrder, imglibIndexOrder);
-        return ImageData.newBuilder()
-                .setEagerData(pixels)
+                .setEagerData(tensor)
                 .build();
     }
 

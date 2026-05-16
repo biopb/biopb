@@ -949,31 +949,40 @@ public class UtilsTest {
         ImageData imageData = Utils.serializeFromIntervalToImageData(image);
 
         Assert.assertTrue(imageData.hasEagerData());
-        Assert.assertEquals(10, imageData.getEagerData().getSizeX());
-        Assert.assertEquals(10, imageData.getEagerData().getSizeY());
+        // Tensor uses dims list, not sizeX/sizeY
+        Assert.assertEquals(2, imageData.getEagerData().getDimsCount());
+        Assert.assertEquals(10, imageData.getEagerData().getDims(0));
+        Assert.assertEquals(10, imageData.getEagerData().getDims(1));
     }
 
     @Test
-    public void testSerializeFromIntervalToImageDataWithDimensionOrder() {
+    public void testSerializeFromIntervalToImageDataWithDimLabels() {
         ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
         RandomAccessibleInterval<FloatType> image = factory.create(10, 10, 2);
 
-        ImageData imageData = Utils.serializeFromIntervalToImageData(image, "CXYZT");
+        java.util.List<String> dimLabels = java.util.Arrays.asList("X", "Y", "Z");
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, dimLabels);
 
-        Assert.assertEquals("CXYZT", imageData.getEagerData().getDimensionOrder());
+        Assert.assertEquals(3, imageData.getEagerData().getDimsCount());
+        Assert.assertEquals(3, imageData.getEagerData().getDimLabelsCount());
+        Assert.assertEquals("X", imageData.getEagerData().getDimLabels(0));
+        Assert.assertEquals("Y", imageData.getEagerData().getDimLabels(1));
+        Assert.assertEquals("Z", imageData.getEagerData().getDimLabels(2));
     }
 
     @Test
-    public void testSerializeFromIntervalToImageDataWithAllOrders() {
+    public void testSerializeFromIntervalToImageData4D() {
         ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
         RandomAccessibleInterval<FloatType> image = factory.create(4, 3, 2, 2);
 
-        ImageData imageData = Utils.serializeFromIntervalToImageData(image, "CXYZT", "XYZC");
+        java.util.List<String> dimLabels = java.util.Arrays.asList("X", "Y", "Z", "C");
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, dimLabels);
 
-        Assert.assertEquals(4, imageData.getEagerData().getSizeX());
-        Assert.assertEquals(3, imageData.getEagerData().getSizeY());
-        Assert.assertEquals(2, imageData.getEagerData().getSizeZ());
-        Assert.assertEquals(2, imageData.getEagerData().getSizeC());
+        Assert.assertEquals(4, imageData.getEagerData().getDimsCount());
+        Assert.assertEquals(4, imageData.getEagerData().getDims(0));
+        Assert.assertEquals(3, imageData.getEagerData().getDims(1));
+        Assert.assertEquals(2, imageData.getEagerData().getDims(2));
+        Assert.assertEquals(2, imageData.getEagerData().getDims(3));
     }
 
     // ========================================================================
@@ -993,8 +1002,72 @@ public class UtilsTest {
         RandomAccessibleInterval<?> deserialized = Utils.deserializeImageData(imageData);
 
         Assert.assertNotNull(deserialized);
-        Assert.assertEquals(10, deserialized.dimension(0));  // X
-        Assert.assertEquals(10, deserialized.dimension(1));  // Y
+        // Tensor-based: dimensions are in original order (10, 10)
+        Assert.assertEquals(10, deserialized.dimension(0));
+        Assert.assertEquals(10, deserialized.dimension(1));
+    }
+
+    @Test
+    public void testDeserializeImageDataEagerDataRoundTrip() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(5, 4, 3);
+
+        float value = 0.0f;
+        for (FloatType pixel : Views.flatIterable(image)) {
+            pixel.set(value++);
+        }
+
+        java.util.List<String> dimLabels = java.util.Arrays.asList("X", "Y", "Z");
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, dimLabels);
+        RandomAccessibleInterval<?> deserialized = Utils.deserializeImageData(imageData);
+
+        // Verify shape
+        Assert.assertEquals(3, deserialized.numDimensions());
+        Assert.assertEquals(5, deserialized.dimension(0));
+        Assert.assertEquals(4, deserialized.dimension(1));
+        Assert.assertEquals(3, deserialized.dimension(2));
+
+        // Verify data round-trips
+        value = 0.0f;
+        for (Object obj : Views.flatIterable(deserialized)) {
+            FloatType pixel = (FloatType) obj;
+            Assert.assertEquals(value, pixel.get(), DELTA);
+            value++;
+        }
+    }
+
+    @Test
+    public void testGetImageDataDimLabels() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(10, 10);
+
+        // With dimLabels
+        java.util.List<String> dimLabels = java.util.Arrays.asList("Y", "X");
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image, dimLabels);
+
+        java.util.List<String> labels = Utils.getImageDataDimLabels(imageData);
+        Assert.assertEquals(2, labels.size());
+        Assert.assertEquals("Y", labels.get(0));
+        Assert.assertEquals("X", labels.get(1));
+
+        // Without dimLabels
+        ImageData imageDataNoLabels = Utils.serializeFromIntervalToImageData(image);
+        java.util.List<String> noLabels = Utils.getImageDataDimLabels(imageDataNoLabels);
+        Assert.assertNull(noLabels);
+    }
+
+    @Test
+    public void testGetImageDataShape() {
+        ArrayImgFactory<FloatType> factory = new ArrayImgFactory<>(new FloatType());
+        RandomAccessibleInterval<FloatType> image = factory.create(5, 4, 3);
+
+        ImageData imageData = Utils.serializeFromIntervalToImageData(image);
+        long[] shape = Utils.getImageDataShape(imageData);
+
+        Assert.assertEquals(3, shape.length);
+        Assert.assertEquals(5, shape[0]);
+        Assert.assertEquals(4, shape[1]);
+        Assert.assertEquals(3, shape[2]);
     }
 
     @Test
