@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import threading
 
+from dataclasses import dataclass
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -37,6 +39,23 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Internal context for tensor flight info
+# ==============================================================================
+
+@dataclass
+class _TensorContext:
+    """Internal context returned by _get_tensor_context().
+
+    Contains all parsed flight info needed to build either a dask array
+    or a SerializedTensor protobuf.
+    """
+    descriptor: TensorDescriptor
+    endpoints: List[Tuple[bytes, ChunkBounds]]  # (chunk_id, bounds) pairs
+    read_opt: TensorReadOption
+    original_slice_hint: Optional[SliceHint]
 
 
 # ==============================================================================
@@ -590,6 +609,121 @@ class TensorFlightClient:
             return wrapped.get("metadata", {})
         return {}
 
+    def _get_tensor_context(
+        self,
+        source_id: str,
+        tensor_id: Optional[str] = None,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> _TensorContext:
+        """Get flight info context for a tensor (internal helper).
+
+        This is a shared helper used by both get_tensor() and get_tensor_pb()
+        to avoid code duplication. It handles all the common logic for:
+        - Source validation and tensor resolution
+        - Slice hint conversion
+        - TensorReadOption building
+        - FlightCmd construction
+        - GetFlightInfo call and endpoint parsing
+
+        Args:
+            source_id: Data source identifier
+            tensor_id: Tensor identifier (optional if source has single tensor)
+            slice_hint: Optional slice tuple to filter chunks
+            scale_hint: Optional per-dimension downsampling factors
+            reduction_method: Optional dynamic reduction method
+
+        Returns:
+            _TensorContext with descriptor, endpoints, read_opt, and original_slice_hint
+        """
+        logger.debug(f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}")
+
+        # Ensure sources are loaded
+        if source_id not in self._sources:
+            self.list_sources()
+
+        source_desc = self._sources.get(source_id)
+        if source_desc is None:
+            raise ValueError(f"Source not found: {source_id}")
+
+        # Resolve tensor_id if not provided
+        if tensor_id is None:
+            if len(source_desc.tensors) == 1:
+                tensor_id = source_desc.tensors[0].array_id
+            elif len(source_desc.tensors) == 0:
+                raise ValueError(f"Source '{source_id}' has no tensors")
+            else:
+                raise ValueError(
+                    f"Source '{source_id}' has multiple tensors ({len(source_desc.tensors)}), "
+                    f"tensor_id must be specified"
+                )
+
+        # Find tensor descriptor to get shape for slice validation
+        tensor_desc = None
+        for desc in source_desc.tensors:
+            if desc.array_id == tensor_id:
+                tensor_desc = desc
+                break
+
+        if tensor_desc is None:
+            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
+
+        # Convert slice_hint to SliceHint proto
+        slice_hint_proto = None
+        if slice_hint is not None:
+            starts = []
+            stops = []
+            for s in slice_hint:
+                starts.append(s.start if s.start is not None else 0)
+                stops.append(
+                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
+                )
+            slice_hint_proto = SliceHint(start=starts, stop=stops)
+
+        # Build TensorReadOption with flattened fields
+        read_opt = TensorReadOption(
+            tensor_id=tensor_id,
+            with_metadata=False,
+        )
+        if slice_hint_proto is not None:
+            read_opt.slice_hint.CopyFrom(slice_hint_proto)
+        if scale_hint is not None:
+            read_opt.scale_hint[:] = list(scale_hint)
+        if reduction_method is not None:
+            read_opt.reduction_method = reduction_method
+
+        # Build FlightCmd for the request
+        cmd = FlightCmd(
+            source_id=source_id,
+            tensor_read=read_opt,
+        )
+
+        # Get flight info
+        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        info = self._client.get_flight_info(flight_desc, options=self._call_options)
+        response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+        # Check schema version compatibility
+        _check_schema_version(info.schema)
+
+        # Cache the response descriptor
+        self._descriptors[response_desc.array_id] = response_desc
+
+        # Parse endpoints into (chunk_id, bounds) pairs
+        endpoints = []
+        for endpoint in info.endpoints:
+            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+            bounds = ChunkBounds.FromString(endpoint.app_metadata)
+            endpoints.append((ticket.chunk_id, bounds))
+
+        return _TensorContext(
+            descriptor=response_desc,
+            endpoints=endpoints,
+            read_opt=read_opt,
+            original_slice_hint=slice_hint_proto,
+        )
+
     def get_tensor(
         self,
         source_id: str,
@@ -615,94 +749,21 @@ class TensorFlightClient:
                 for a multi-tensor source
         """
         logger.debug(f"get_tensor: source_id={source_id}, tensor_id={tensor_id}")
-        # Get tensor descriptor from cached source info
-        if source_id not in self._sources:
-            self.list_sources()
 
-        source_desc = self._sources.get(source_id)
-        if source_desc is None:
-            raise ValueError(f"Source not found: {source_id}")
-
-        # Resolve tensor_id if not provided
-        if tensor_id is None:
-            if len(source_desc.tensors) == 1:
-                tensor_id = source_desc.tensors[0].array_id
-            elif len(source_desc.tensors) == 0:
-                raise ValueError(f"Source '{source_id}' has no tensors")
-            else:
-                raise ValueError(
-                    f"Source '{source_id}' has multiple tensors ({len(source_desc.tensors)}), "
-                    f"tensor_id must be specified"
-                )
-
-        # Find tensor descriptor
-        tensor_desc = None
-        for desc in source_desc.tensors:
-            if desc.array_id == tensor_id:
-                tensor_desc = desc
-                break
-
-        if tensor_desc is None:
-            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
-
-        # Convert slice_hint to SliceHint proto
-        slice_hint_proto = None
-        if slice_hint is not None:
-            starts = []
-            stops = []
-            for s in slice_hint:
-                starts.append(s.start if s.start is not None else 0)
-                stops.append(
-                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
-                )
-            slice_hint_proto = SliceHint(start=starts, stop=stops)
-
-        # Build TensorReadOption with flattened fields
-        read_opt = TensorReadOption(
-            tensor_id=tensor_id,
-            with_metadata=False,
-        )
-        if slice_hint_proto is not None:
-            read_opt.slice_hint.CopyFrom(slice_hint_proto)
-        if scale_hint is not None:
-            read_opt.scale_hint[:] = list(scale_hint)
-        if reduction_method is not None:
-            read_opt.reduction_method = reduction_method
-
-        # Build FlightCmd for the request
-        cmd = FlightCmd(
+        # Get flight info context
+        ctx = self._get_tensor_context(
             source_id=source_id,
-            tensor_read=read_opt,
+            tensor_id=tensor_id,
+            slice_hint=slice_hint,
+            scale_hint=scale_hint,
+            reduction_method=reduction_method,
         )
 
-        # Get flight info
-        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._client.get_flight_info(flight_desc, options=self._call_options)
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
-
-        # Check schema version compatibility
-        _check_schema_version(info.schema)
-
-        # Cache the response descriptor
-        self._descriptors[response_desc.array_id] = response_desc
-
-        # Parse endpoints into chunk info
-        chunks = []
-        chunk_bounds_list = []
-
-        for endpoint in info.endpoints:
-            # Parse ticket
-            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-
-            # Parse chunk bounds from app_metadata
-            bounds = ChunkBounds.FromString(endpoint.app_metadata)
-
-            chunks.append(ticket.chunk_id)
-            chunk_bounds_list.append(bounds)
-
-        # Build dask array from chunks
+        # Build dask array from context
+        chunks = [ep[0] for ep in ctx.endpoints]
+        chunk_bounds_list = [ep[1] for ep in ctx.endpoints]
         dask_arr = self._build_dask_array(
-            desc=response_desc,
+            desc=ctx.descriptor,
             chunks=chunks,
             chunk_bounds=chunk_bounds_list,
         )
@@ -711,15 +772,14 @@ class TensorFlightClient:
         # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         # the returned descriptor.shape may be larger than what was requested.
         # We crop the dask array back to the exact requested region here.
-        if slice_hint_proto is not None and response_desc.HasField("slice_hint"):
-            realized = response_desc.slice_hint
-            ndim = len(response_desc.shape)
-            # Use scale_hint from read_opt (flattened field)
-            scale = list(read_opt.scale_hint) if read_opt.scale_hint else None
+        if ctx.original_slice_hint is not None and ctx.descriptor.HasField("slice_hint"):
+            realized = ctx.descriptor.slice_hint
+            ndim = len(ctx.descriptor.shape)
+            scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
             crop = []
             for ax in range(ndim):
-                req_start = int(slice_hint_proto.start[ax])
-                req_stop = int(slice_hint_proto.stop[ax])
+                req_start = int(ctx.original_slice_hint.start[ax])
+                req_stop = int(ctx.original_slice_hint.stop[ax])
                 ret_start = int(realized.start[ax])
                 s = int(scale[ax]) if scale and ax < len(scale) else 1
                 if s > 1:
@@ -736,7 +796,7 @@ class TensorFlightClient:
     def get_tensor_pb(
         self,
         source_id: str,
-        tensor_id: str,
+        tensor_id: Optional[str] = None,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
@@ -750,7 +810,7 @@ class TensorFlightClient:
 
         Args:
             source_id: Data source identifier
-            tensor_id: Tensor identifier within the source
+            tensor_id: Tensor identifier within the source (optional if source has single tensor)
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
@@ -759,70 +819,20 @@ class TensorFlightClient:
             SerializedTensor protobuf object
         """
         logger.debug(f"get_tensor_pb: source_id={source_id}, tensor_id={tensor_id}")
-        # Get tensor descriptor from cached source info
-        if source_id not in self._sources:
-            self.list_sources()
 
-        source_desc = self._sources.get(source_id)
-        if source_desc is None:
-            raise ValueError(f"Source not found: {source_id}")
-
-        # Find tensor descriptor
-        tensor_desc = None
-        for desc in source_desc.tensors:
-            if desc.array_id == tensor_id:
-                tensor_desc = desc
-                break
-
-        if tensor_desc is None:
-            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
-
-        # Convert slice_hint to SliceHint proto
-        slice_hint_proto = None
-        if slice_hint is not None:
-            starts = []
-            stops = []
-            for s in slice_hint:
-                starts.append(s.start if s.start is not None else 0)
-                stops.append(
-                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
-                )
-            slice_hint_proto = SliceHint(start=starts, stop=stops)
-
-        # Build TensorReadOption with flattened fields
-        read_opt = TensorReadOption(
-            tensor_id=tensor_id,
-            with_metadata=False,
-        )
-        if slice_hint_proto is not None:
-            read_opt.slice_hint.CopyFrom(slice_hint_proto)
-        if scale_hint is not None:
-            read_opt.scale_hint[:] = list(scale_hint)
-        if reduction_method is not None:
-            read_opt.reduction_method = reduction_method
-
-        # Build FlightCmd for the request
-        cmd = FlightCmd(
+        # Get flight info context
+        ctx = self._get_tensor_context(
             source_id=source_id,
-            tensor_read=read_opt,
+            tensor_id=tensor_id,
+            slice_hint=slice_hint,
+            scale_hint=scale_hint,
+            reduction_method=reduction_method,
         )
-
-        # Get flight info
-        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._client.get_flight_info(flight_desc, options=self._call_options)
-        response_desc = TensorDescriptor.FromString(info.descriptor.command)
-
-        # Check schema version compatibility
-        _check_schema_version(info.schema)
-
-        # Cache the response descriptor
-        self._descriptors[response_desc.array_id] = response_desc
 
         # Serialize endpoints
         serialized_endpoints = []
-        for endpoint in info.endpoints:
-            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-            bounds = ChunkBounds.FromString(endpoint.app_metadata)
+        for chunk_id, bounds in ctx.endpoints:
+            ticket = TensorTicket(chunk_id=chunk_id)
             serialized_ep = SerializedEndpoint(
                 ticket=ticket,
                 chunk_bounds=bounds,
@@ -831,13 +841,13 @@ class TensorFlightClient:
 
         # Build SerializedTensor
         serialized_tensor = SerializedTensor(
-            tensor_descriptor=response_desc,
+            tensor_descriptor=ctx.descriptor,
             location=self._location,
             auth_token=self._token or "",
             endpoints=serialized_endpoints,
         )
-        if slice_hint_proto is not None:
-            serialized_tensor.original_slice_hint.CopyFrom(slice_hint_proto)
+        if ctx.original_slice_hint is not None:
+            serialized_tensor.original_slice_hint.CopyFrom(ctx.original_slice_hint)
 
         return serialized_tensor
 
@@ -986,47 +996,8 @@ class TensorFlightClient:
             )
             chunk_map[chunk_idx] = (chunk_id, bounds)
 
-        # Create delayed function to fetch chunk
-        # Cache lookup happens INSIDE this function at compute time
-        def fetch_chunk(chunk_id: bytes, bounds: ChunkBounds) -> np.ndarray:
-            """Fetch and cache a chunk from the server."""
-            cache_key = chunk_id.hex()
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                with self._cache_lock:
-                    self._cache_hits += 1
-                logger.debug(f"fetch_chunk: cache hit for {cache_key[:16]}")
-                return cached
-
-            with self._cache_lock:
-                self._cache_misses += 1
-
-            logger.debug(f"fetch_chunk: fetching {cache_key[:16]} from server")
-            # Fetch from server
-            ticket = TensorTicket(chunk_id=chunk_id)
-            reader = self._client.do_get(
-                flight.Ticket(ticket.SerializeToString()), options=self._call_options
-            )
-
-            # Read all data from the stream
-            table = reader.read_all()
-
-            # Extract data from list column (each row is one chunk's flattened data)
-            # Data column is list<dtype>, we get the first row's list
-            arr = table.column("data").to_numpy()[0]  # First row's data list
-
-            # Get shape from shape column (list<int64>)
-            shape = tuple(table.column("shape").to_pylist()[0])
-            arr = arr.reshape(shape)
-
-            # Cache the result
-            self._cache.put(cache_key, arr, cost=arr.nbytes)
-
-            return arr
-
         # Build dask array using da.from_delayed for each chunk
-        # The fetch_chunk function is called at compute time, not graph-build time
-        # Find the grid dimensions
+        # The actual fetch is done by _fetch_chunk_distributed which uses module-level pools
         ndim = len(shape)
         grid_shape = tuple(
             max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
