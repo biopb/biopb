@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package biopb.tensor;
+
+option java_package = "biopb.tensor";
+option java_multiple_files = true;
+
+import "biopb/tensor/descriptor.proto";
+import "biopb/tensor/ticket.proto";
+
+// Serialized tensor for cross-process transfer.
+// Contains connection info + chunk tickets for lazy reconstruction.
+message SerializedTensor {
+  // Tensor metadata (shape, dtype, chunk_shape, scale_hint, reduction_method, realized slice_hint)
+  TensorDescriptor tensor_descriptor = 1;
+
+  // Original user-requested slice_hint (before LCM alignment).
+  // Used for cropping after reconstruction.
+  SliceHint original_slice_hint = 2;
+
+  // Flight server location URI (e.g., "grpc://localhost:8815")
+  string location = 3;
+
+  // Auth token (empty if no auth)
+  string auth_token = 4;
+
+  // Serialized flight endpoints
+  repeated SerializedEndpoint endpoints = 5;
+}
+
+// Serialized FlightEndpoint for lazy chunk fetching.
+message SerializedEndpoint {
+  // TensorTicket for chunk retrieval
+  TensorTicket ticket = 1;
+
+  // ChunkBounds describing chunk position
+  ChunkBounds chunk_bounds = 2;
+}

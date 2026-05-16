@@ -318,6 +318,117 @@ class TestTensorFlightClient:
         with pytest.raises(ValueError, match="Source not found"):
             server_client.get_tensor('nonexistent-source', 'some-tensor')
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_tensor_pb(self, server_client):
+        """Test get_tensor_pb returns SerializedTensor protobuf."""
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        pb = server_client.get_tensor_pb('test-tensor', 'test-tensor')
+
+        # Verify it's a SerializedTensor
+        assert isinstance(pb, SerializedTensor)
+
+        # Verify descriptor is populated
+        assert pb.tensor_descriptor.array_id == 'test-tensor'
+        assert list(pb.tensor_descriptor.shape) == [128, 128]
+        # dtype may be uint8 or |u1 depending on server
+        assert pb.tensor_descriptor.dtype in ('uint8', '|u1')
+        assert list(pb.tensor_descriptor.chunk_shape) == [64, 64]
+
+        # Verify location is populated
+        assert pb.location == 'grpc://localhost:8890'
+
+        # Verify endpoints are populated
+        assert len(pb.endpoints) == 4  # 4 chunks
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_tensor_from_pb(self, server_client):
+        """Test tensor_from_pb reconstructs dask array."""
+        pb = server_client.get_tensor_pb('test-tensor', 'test-tensor')
+
+        # Reconstruct array
+        darr = TensorFlightClient.tensor_from_pb(pb)
+
+        # Verify shape and dtype
+        assert darr.shape == (128, 128)
+        assert darr.dtype == np.uint8
+
+        # Verify data values match direct get_tensor
+        direct_darr = server_client.get_tensor('test-tensor', 'test-tensor')
+
+        # Top-left chunk
+        np.testing.assert_array_equal(
+            darr[:64, :64].compute(),
+            direct_darr[:64, :64].compute()
+        )
+        assert darr[:64, :64].compute().mean() == 10.0
+
+        # Bottom-right chunk
+        np.testing.assert_array_equal(
+            darr[64:, 64:].compute(),
+            direct_darr[64:, 64:].compute()
+        )
+        assert darr[64:, 64:].compute().mean() == 40.0
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_tensor_pb_serialization(self, server_client):
+        """Test SerializedTensor can be serialized to bytes and reconstructed."""
+        pb = server_client.get_tensor_pb('test-tensor', 'test-tensor')
+
+        # Serialize to bytes
+        serialized_bytes = pb.SerializeToString()
+
+        # Deserialize
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+        pb2 = SerializedTensor.FromString(serialized_bytes)
+
+        # Reconstruct array from deserialized protobuf
+        darr = TensorFlightClient.tensor_from_pb(pb2)
+
+        # Verify data is correct
+        assert darr[:64, :64].compute().mean() == 10.0
+        assert darr[64:, 64:].compute().mean() == 40.0
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_tensor_pb_with_slice_hint(self, server_client):
+        """Test get_tensor_pb with slice_hint cropping."""
+        pb = server_client.get_tensor_pb(
+            'test-tensor',
+            'test-tensor',
+            slice_hint=(slice(0, 64), slice(0, 64))  # Top-left quadrant
+        )
+
+        # Verify original_slice_hint is populated
+        assert pb.HasField('original_slice_hint')
+        assert list(pb.original_slice_hint.start) == [0, 0]
+        assert list(pb.original_slice_hint.stop) == [64, 64]
+
+        # Reconstruct and verify cropping
+        darr = TensorFlightClient.tensor_from_pb(pb)
+        assert darr.shape == (64, 64)
+        assert darr.compute().mean() == 10.0
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_tensor_pb_with_scale_hint(self, server_client):
+        """Test get_tensor_pb with scale_hint."""
+        pb = server_client.get_tensor_pb(
+            'test-tensor',
+            'test-tensor',
+            scale_hint=[2, 2],
+            reduction_method='nearest',
+        )
+
+        # Verify scale_hint in descriptor
+        assert list(pb.tensor_descriptor.scale_hint) == [2, 2]
+
+        # Reconstruct and verify downscaled shape
+        darr = TensorFlightClient.tensor_from_pb(pb)
+        assert darr.shape == (64, 64)
+
+        # Verify data values
+        assert darr[:32, :32].compute().mean() == 10.0
+        assert darr[32:, 32:].compute().mean() == 40.0
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -9,10 +9,6 @@ option java_multiple_files = true;
 // Opaque chunk identifier - server determines encoding based on backend
 message TensorTicket {
   // Backend-specific chunk identifier
-  // - Zarr/N5: UTF-8 encoded chunk key (e.g., "0/1/2")
-  // - HDF5: Serialized chunk coordinates
-  // - OME-TIFF: Serialized {ifd_index, tile_row, tile_col}
-  // - TileDB: Native chunk query identifier
   bytes chunk_id = 1;
 }
 

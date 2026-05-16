@@ -314,6 +314,92 @@ public class TensorFlightClientTest {
         }
     }
 
+    @Test
+    public void testGetTensorAsPb() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+
+                // Verify descriptor is populated
+                Assert.assertEquals("test-tensor", pb.getTensorDescriptor().getArrayId());
+                Assert.assertEquals(Arrays.asList(4L, 4L), pb.getTensorDescriptor().getShapeList());
+                Assert.assertEquals("float32", pb.getTensorDescriptor().getDtype());
+                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getChunkShapeList());
+
+                // Verify location is populated
+                Assert.assertTrue(pb.getLocation().contains("localhost"));
+
+                // Verify endpoints are populated
+                Assert.assertEquals(4, pb.getEndpointsCount());
+            }
+        }
+    }
+
+    @Test
+    public void testTensorFromPb() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+
+                // Reconstruct array
+                RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb, 10_000_000L);
+
+                // Verify shape and type
+                Assert.assertEquals(4, image.dimension(0));
+                Assert.assertEquals(4, image.dimension(1));
+
+                // Verify data values
+                Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
+                Assert.assertEquals(6.0f, image.getAt(1, 1).get(), 0.0001f);
+                Assert.assertEquals(16.0f, image.getAt(3, 3).get(), 0.0001f);
+            }
+        }
+    }
+
+    @Test
+    public void testTensorPbSerialization() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, null, null);
+
+                // Serialize to bytes
+                byte[] serializedBytes = pb.toByteArray();
+
+                // Deserialize
+                SerializedTensor pb2 = SerializedTensor.parseFrom(serializedBytes);
+
+                // Reconstruct array from deserialized protobuf
+                RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb2, 10_000_000L);
+
+                // Verify data is correct
+                Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
+                Assert.assertEquals(16.0f, image.getAt(3, 3).get(), 0.0001f);
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorAsPbWithScaleHint() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                long[] scaleHint = new long[] {2, 2};
+                SerializedTensor pb = client.getTensorAsPb("test-source", "test-tensor", null, scaleHint, "nearest");
+
+                // Verify scale_hint in descriptor
+                Assert.assertEquals(Arrays.asList(2L, 2L), pb.getTensorDescriptor().getScaleHintList());
+
+                // Reconstruct and verify downscaled shape
+                RandomAccessibleInterval<FloatType> image = TensorFlightClient.tensorFromPb(pb, 10_000_000L);
+                Assert.assertEquals(2, image.dimension(0));
+                Assert.assertEquals(2, image.dimension(1));
+
+                // Verify data values
+                Assert.assertEquals(1.0f, image.getAt(0, 0).get(), 0.0001f);
+                Assert.assertEquals(11.0f, image.getAt(1, 1).get(), 0.0001f);
+            }
+        }
+    }
+
     private static class TestFlightServer implements AutoCloseable {
         private final BufferAllocator allocator;
         private final FlightServer server;

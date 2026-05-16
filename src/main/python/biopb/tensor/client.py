@@ -34,6 +34,7 @@ from biopb.tensor.descriptor_pb2 import (
     MetadataQueryOption,
     DataSourceDescriptor,
 )
+from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +638,214 @@ class TensorFlightClient:
             for ax in range(ndim):
                 req_start = int(slice_hint_proto.start[ax])
                 req_stop = int(slice_hint_proto.stop[ax])
+                ret_start = int(realized.start[ax])
+                s = int(scale[ax]) if scale and ax < len(scale) else 1
+                if s > 1:
+                    logical_start = (req_start - ret_start) // s
+                    logical_stop = (req_stop - ret_start + s - 1) // s
+                else:
+                    logical_start = req_start - ret_start
+                    logical_stop = req_stop - ret_start
+                crop.append(slice(logical_start, logical_stop))
+            dask_arr = dask_arr[tuple(crop)]
+
+        return dask_arr
+
+    def get_tensor_pb(
+        self,
+        source_id: str,
+        tensor_id: str,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> SerializedTensor:
+        """Get a SerializedTensor protobuf for cross-process transfer.
+
+        Returns a protobuf containing connection info and chunk tickets
+        for lazy reconstruction. The protobuf can be serialized to bytes
+        and broadcast to worker processes, where each worker can call
+        tensor_from_pb() to reconstruct a lazy dask array.
+
+        Args:
+            source_id: Data source identifier
+            tensor_id: Tensor identifier within the source
+            slice_hint: Optional slice tuple to filter chunks
+            scale_hint: Optional per-dimension integer downsampling factors
+            reduction_method: Optional dynamic reduction method for scaled reads
+
+        Returns:
+            SerializedTensor protobuf object
+        """
+        logger.debug(f"get_tensor_pb: source_id={source_id}, tensor_id={tensor_id}")
+        # Get tensor descriptor from cached source info
+        if source_id not in self._sources:
+            self.list_sources()
+
+        source_desc = self._sources.get(source_id)
+        if source_desc is None:
+            raise ValueError(f"Source not found: {source_id}")
+
+        # Find tensor descriptor
+        tensor_desc = None
+        for desc in source_desc.tensors:
+            if desc.array_id == tensor_id:
+                tensor_desc = desc
+                break
+
+        if tensor_desc is None:
+            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
+
+        # Convert slice_hint to SliceHint proto
+        slice_hint_proto = None
+        if slice_hint is not None:
+            starts = []
+            stops = []
+            for s in slice_hint:
+                starts.append(s.start if s.start is not None else 0)
+                stops.append(
+                    s.stop if s.stop is not None else tensor_desc.shape[len(starts) - 1]
+                )
+            slice_hint_proto = SliceHint(start=starts, stop=stops)
+
+        # Build TensorReadOption with flattened fields
+        read_opt = TensorReadOption(
+            tensor_id=tensor_id,
+            with_metadata=False,
+        )
+        if slice_hint_proto is not None:
+            read_opt.slice_hint.CopyFrom(slice_hint_proto)
+        if scale_hint is not None:
+            read_opt.scale_hint[:] = list(scale_hint)
+        if reduction_method is not None:
+            read_opt.reduction_method = reduction_method
+
+        # Build FlightCmd for the request
+        cmd = FlightCmd(
+            source_id=source_id,
+            tensor_read=read_opt,
+        )
+
+        # Get flight info
+        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        info = self._client.get_flight_info(flight_desc, options=self._call_options)
+        response_desc = TensorDescriptor.FromString(info.descriptor.command)
+
+        # Check schema version compatibility
+        _check_schema_version(info.schema)
+
+        # Cache the response descriptor
+        self._descriptors[response_desc.array_id] = response_desc
+
+        # Serialize endpoints
+        serialized_endpoints = []
+        for endpoint in info.endpoints:
+            ticket = TensorTicket.FromString(endpoint.ticket.ticket)
+            bounds = ChunkBounds.FromString(endpoint.app_metadata)
+            serialized_ep = SerializedEndpoint(
+                ticket=ticket,
+                chunk_bounds=bounds,
+            )
+            serialized_endpoints.append(serialized_ep)
+
+        # Build SerializedTensor
+        serialized_tensor = SerializedTensor(
+            tensor_descriptor=response_desc,
+            location=self._location,
+            auth_token=self._token or "",
+            endpoints=serialized_endpoints,
+        )
+        if slice_hint_proto is not None:
+            serialized_tensor.original_slice_hint.CopyFrom(slice_hint_proto)
+
+        return serialized_tensor
+
+    @staticmethod
+    def tensor_from_pb(
+        pb: SerializedTensor,
+        cache_bytes: int = 1_000_000_000,
+    ) -> da.Array:
+        """Reconstruct a lazy dask array from SerializedTensor protobuf.
+
+        Creates a dask array that fetches chunks from the Flight server
+        independently. Each worker process maintains its own connection
+        pool and LRU cache keyed by (location, auth_token).
+
+        Args:
+            pb: SerializedTensor protobuf object
+            cache_bytes: Maximum bytes for chunk cache (default 1GB).
+                Only effective for the first tensor created in a process
+                for a given (location, auth_token) pair.
+
+        Returns:
+            dask.array with lazy chunk loading
+        """
+        descriptor = pb.tensor_descriptor
+        shape = tuple(descriptor.shape)
+        dtype = np.dtype(descriptor.dtype)
+
+        # Parse endpoints
+        chunks = []
+        chunk_bounds_list = []
+        for ep in pb.endpoints:
+            chunks.append(ep.ticket.chunk_id)
+            chunk_bounds_list.append(ep.chunk_bounds)
+
+        # Build chunk map
+        chunk_map = {}
+        axis_starts = [
+            sorted({int(bounds.start[axis]) for bounds in chunk_bounds_list})
+            for axis in range(len(shape))
+        ]
+        axis_index_maps = [
+            {start: index for index, start in enumerate(starts)}
+            for starts in axis_starts
+        ]
+        for chunk_id, bounds in zip(chunks, chunk_bounds_list):
+            chunk_idx = tuple(
+                axis_index_maps[d][int(bounds.start[d])] for d in range(len(shape))
+            )
+            chunk_map[chunk_idx] = (chunk_id, bounds)
+
+        # Build dask array with delayed chunk fetching
+        ndim = len(shape)
+        grid_shape = tuple(
+            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
+        )
+
+        blocks = np.empty(grid_shape, dtype=object)
+        for chunk_idx, (chunk_id, bounds) in chunk_map.items():
+            chunk_shape = tuple(
+                stop - start for start, stop in zip(bounds.start, bounds.stop)
+            )
+            delayed_arr = da.from_delayed(
+                delayed(_fetch_chunk_distributed)(
+                    pb.location,
+                    pb.auth_token if pb.auth_token else None,
+                    chunk_id,
+                    tuple(bounds.start),
+                    tuple(bounds.stop),
+                    cache_bytes,
+                ),
+                shape=chunk_shape,
+                dtype=dtype,
+            )
+            blocks[chunk_idx] = delayed_arr
+
+        if blocks.size == 0:
+            raise ValueError("No chunks found in SerializedTensor")
+
+        dask_arr = da.block(blocks.tolist())
+
+        # Crop to the originally requested region if original_slice_hint present
+        if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
+            realized = descriptor.slice_hint
+            original = pb.original_slice_hint
+            ndim = len(descriptor.shape)
+            scale = list(descriptor.scale_hint) if descriptor.scale_hint else None
+            crop = []
+            for ax in range(ndim):
+                req_start = int(original.start[ax])
+                req_stop = int(original.stop[ax])
                 ret_start = int(realized.start[ax])
                 s = int(scale[ax]) if scale and ax < len(scale) else 1
                 if s > 1:

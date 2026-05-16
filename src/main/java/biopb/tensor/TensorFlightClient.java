@@ -527,6 +527,366 @@ public class TensorFlightClient implements AutoCloseable {
                 sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
     }
 
+    /**
+     * Get a SerializedTensor protobuf for cross-process transfer.
+     *
+     * Returns a protobuf containing connection info and chunk tickets
+     * for lazy reconstruction. The protobuf can be serialized to bytes
+     * and broadcast to worker processes (e.g., Spark), where each worker
+     * can call tensorFromPb() to reconstruct a lazy imglib2 array.
+     *
+     * @param sourceId        Data source identifier
+     * @param tensorId        Tensor identifier within the source
+     * @param sliceHint       Optional slice hint
+     * @param scaleHint       Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @return SerializedTensor protobuf object
+     */
+    public SerializedTensor getTensorAsPb(
+            String sourceId,
+            String tensorId,
+            SliceHint sliceHint,
+            long[] scaleHint,
+            String reductionMethod) {
+
+        LOGGER.fine("getTensorAsPb: sourceId=" + sourceId + ", tensorId=" + tensorId);
+        RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
+
+        // Serialize endpoints
+        List<SerializedEndpoint> serializedEndpoints = new ArrayList<>();
+        for (FlightEndpoint endpoint : context.endpoints) {
+            TensorTicket ticket = parseTicket(endpoint.getTicket().getBytes());
+            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
+            SerializedEndpoint serializedEp = SerializedEndpoint.newBuilder()
+                    .setTicket(ticket)
+                    .setChunkBounds(bounds)
+                    .build();
+            serializedEndpoints.add(serializedEp);
+        }
+
+        // Build SerializedTensor
+        SerializedTensor.Builder builder = SerializedTensor.newBuilder()
+                .setTensorDescriptor(context.descriptor)
+                .setLocation(location.getUri().toString())
+                .addAllEndpoints(serializedEndpoints);
+
+        if (token != null && !token.isEmpty()) {
+            builder.setAuthToken(token);
+        }
+
+        if (sliceHint != null) {
+            builder.setOriginalSliceHint(sliceHint);
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Reconstruct a lazy RandomAccessibleInterval from SerializedTensor protobuf.
+     *
+     * Creates an imglib2 array that fetches chunks from the Flight server
+     * independently. Each worker process maintains its own connection pool
+     * and cache keyed by (location, authToken).
+     *
+     * @param pb          SerializedTensor protobuf object
+     * @param cacheBytes  Maximum cache size in bytes
+     * @param <T>         The pixel type
+     * @return RandomAccessibleInterval with lazy chunk loading
+     */
+    public static <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> tensorFromPb(
+            SerializedTensor pb,
+            long cacheBytes) {
+
+        TensorDescriptor descriptor = pb.getTensorDescriptor();
+        T type = (T) createType(descriptor.getDtype());
+        long[] dims = toLongArray(descriptor.getShapeList());
+        int[] cellDimensions = toIntArray(descriptor.getChunkShapeList());
+
+        // Build endpoint index from SerializedEndpoint list
+        SerializedEndpointIndex endpointIndex = buildSerializedEndpointIndex(pb, dims, cellDimensions);
+
+        if (endpointIndex == null) {
+            return materializeSerializedArray(pb, cacheBytes);
+        }
+
+        long estimatedChunkBytes = estimateChunkBytes(descriptor);
+        long maxCells = Math.max(1L, cacheBytes / Math.max(estimatedChunkBytes, 1L));
+        ReadOnlyCachedCellImgOptions options = ReadOnlyCachedCellImgOptions.options()
+                .cellDimensions(cellDimensions)
+                .cacheType(CacheType.BOUNDED)
+                .maxCacheSize(maxCells);
+
+        ReadOnlyCachedCellImgFactory factory = new ReadOnlyCachedCellImgFactory(options);
+        return (RandomAccessibleInterval<T>) factory.create(dims, type,
+                cell -> loadCellFromSerialized(cell, endpointIndex, pb));
+    }
+
+    /**
+     * Load a cell from the Flight server using SerializedEndpoint data.
+     */
+    private static <T extends NativeType<T> & RealType<T>> void loadCellFromSerialized(
+            SingleCellArrayImg<T, ?> cell,
+            SerializedEndpointIndex endpointIndex,
+            SerializedTensor pb) {
+
+        long cellIndex = endpointIndex.indexFor(cell);
+        SerializedEndpointData epData = endpointIndex.endpoints.get(cellIndex);
+        if (epData == null) {
+            throw new IllegalStateException("No endpoint found for cell index " + cellIndex);
+        }
+
+        TensorTicket ticket = epData.ticket;
+        ChunkBounds bounds = epData.chunkBounds;
+        double[] values = fetchChunkValuesStatic(
+                pb.getLocation(),
+                pb.getAuthToken(),
+                ticket.getChunkId().toByteArray());
+        writeChunk(cell.randomAccess(), bounds, values);
+    }
+
+    /**
+     * Build index from SerializedEndpoint list for aligned chunk grid.
+     */
+    private static SerializedEndpointIndex buildSerializedEndpointIndex(
+            SerializedTensor pb,
+            long[] dims,
+            int[] cellDimensions) {
+
+        if (dims.length == 0 || pb.getEndpointsCount() == 0) {
+            return null;
+        }
+
+        CellGrid grid = new CellGrid(dims, cellDimensions);
+        Map<Long, SerializedEndpointData> endpointMap = new HashMap<>();
+        long[] gridDimensions = grid.getGridDimensions();
+        long[] gridPosition = new long[dims.length];
+        long[] expectedMin = new long[dims.length];
+        int[] expectedDimensions = new int[dims.length];
+
+        for (SerializedEndpoint ep : pb.getEndpointsList()) {
+            ChunkBounds bounds = ep.getChunkBounds();
+            if (bounds.getStartCount() != dims.length || bounds.getStopCount() != dims.length) {
+                return null;
+            }
+
+            for (int axis = 0; axis < dims.length; axis++) {
+                long start = bounds.getStart(axis);
+                long stop = bounds.getStop(axis);
+                int nominalCellDimension = cellDimensions[axis];
+                if (start < 0 || stop < start || nominalCellDimension <= 0) {
+                    return null;
+                }
+                if (start % nominalCellDimension != 0) {
+                    return null;
+                }
+                gridPosition[axis] = start / nominalCellDimension;
+                if (gridPosition[axis] >= gridDimensions[axis]) {
+                    return null;
+                }
+            }
+
+            grid.getCellDimensions(gridPosition, expectedMin, expectedDimensions);
+            for (int axis = 0; axis < dims.length; axis++) {
+                if (expectedMin[axis] != bounds.getStart(axis)) {
+                    return null;
+                }
+                if ((long) expectedDimensions[axis] != bounds.getStop(axis) - bounds.getStart(axis)) {
+                    return null;
+                }
+            }
+
+            long cellIndex = grid.getCellGridIndexFlat(gridPosition);
+            if (endpointMap.put(cellIndex, new SerializedEndpointData(ep.getTicket(), ep.getChunkBounds())) != null) {
+                return null;
+            }
+        }
+
+        if (endpointMap.size() != cellCount(gridDimensions)) {
+            return null;
+        }
+
+        return new SerializedEndpointIndex(grid, cellDimensions, endpointMap);
+    }
+
+    /**
+     * Materialize array for non-aligned endpoint layout.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeSerializedArray(
+            SerializedTensor pb,
+            long cacheBytes) {
+
+        TensorDescriptor descriptor = pb.getTensorDescriptor();
+        T type = (T) createType(descriptor.getDtype());
+        long[] dims = toLongArray(descriptor.getShapeList());
+        ArrayImg<T, ?> image = (ArrayImg<T, ?>) new ArrayImgFactory<>(type).create(dims);
+        RandomAccess<T> access = image.randomAccess();
+
+        for (SerializedEndpoint ep : pb.getEndpointsList()) {
+            TensorTicket ticket = ep.getTicket();
+            ChunkBounds bounds = ep.getChunkBounds();
+            double[] values = fetchChunkValuesStatic(
+                    pb.getLocation(),
+                    pb.getAuthToken(),
+                    ticket.getChunkId().toByteArray());
+            writeChunk(access, bounds, values);
+        }
+
+        // Apply cropping if original_slice_hint present
+        if (pb.hasOriginalSliceHint() && descriptor.hasSliceHint()) {
+            SliceHint realized = descriptor.getSliceHint();
+            SliceHint original = pb.getOriginalSliceHint();
+            int ndim = descriptor.getShapeCount();
+            long[] cropMin = new long[ndim];
+            long[] cropMax = new long[ndim];
+            for (int ax = 0; ax < ndim; ax++) {
+                long reqStart = original.getStart(ax);
+                long reqStop = original.getStop(ax);
+                long retStart = realized.getStart(ax);
+                long scale = 1L;
+                if (descriptor.getScaleHintCount() > ax) {
+                    scale = descriptor.getScaleHint(ax);
+                }
+                if (scale > 1L) {
+                    cropMin[ax] = (reqStart - retStart) / scale;
+                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
+                } else {
+                    cropMin[ax] = reqStart - retStart;
+                    cropMax[ax] = reqStop - retStart - 1L;
+                }
+            }
+            return Views.zeroMin(Views.interval(image, new FinalInterval(cropMin, cropMax)));
+        }
+
+        return image;
+    }
+
+    /**
+     * Helper class to store endpoint message objects.
+     */
+    private static class SerializedEndpointData {
+        final TensorTicket ticket;
+        final ChunkBounds chunkBounds;
+
+        SerializedEndpointData(TensorTicket ticket, ChunkBounds chunkBounds) {
+            this.ticket = ticket;
+            this.chunkBounds = chunkBounds;
+        }
+    }
+
+    /**
+     * Index mapping cell positions to serialized endpoint data.
+     */
+    private static class SerializedEndpointIndex {
+        final CellGrid grid;
+        final int[] nominalCellDimensions;
+        final Map<Long, SerializedEndpointData> endpoints;
+
+        SerializedEndpointIndex(
+                CellGrid grid,
+                int[] nominalCellDimensions,
+                Map<Long, SerializedEndpointData> endpoints) {
+            this.grid = grid;
+            this.nominalCellDimensions = nominalCellDimensions.clone();
+            this.endpoints = endpoints;
+        }
+
+        long indexFor(Interval interval) {
+            long[] gridPosition = new long[interval.numDimensions()];
+            for (int axis = 0; axis < interval.numDimensions(); axis++) {
+                long min = interval.min(axis);
+                int nominalCellDimension = nominalCellDimensions[axis];
+                if (min % nominalCellDimension != 0) {
+                    throw new IllegalStateException("Cell minimum is not aligned to the logical chunk grid");
+                }
+                gridPosition[axis] = min / nominalCellDimension;
+            }
+            return grid.getCellGridIndexFlat(gridPosition);
+        }
+    }
+
+    /**
+     * Fetch chunk values using pooled FlightClient connection.
+     */
+    private static double[] fetchChunkValuesStatic(String locationStr, String authToken, byte[] chunkId) {
+        LOGGER.fine("fetchChunkStatic: chunkId=" + bytesToHex(chunkId, 16));
+        TensorTicket tensorTicket = TensorTicket.newBuilder()
+                .setChunkId(ByteString.copyFrom(chunkId))
+                .build();
+
+        // Parse location URI
+        Location location;
+        if (locationStr.startsWith("grpc://")) {
+            String uriPart = locationStr.substring(7);
+            int colonIdx = uriPart.lastIndexOf(':');
+            if (colonIdx > 0) {
+                String host = uriPart.substring(0, colonIdx);
+                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
+                location = Location.forGrpcInsecure(host, port);
+            } else {
+                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
+            }
+        } else if (locationStr.startsWith("grpc+tcp://")) {
+            String uriPart = locationStr.substring(11);
+            int colonIdx = uriPart.lastIndexOf(':');
+            if (colonIdx > 0) {
+                String host = uriPart.substring(0, colonIdx);
+                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
+                location = Location.forGrpcInsecure(host, port);
+            } else {
+                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
+            }
+        } else {
+            throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
+        }
+
+        // Get pooled client
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        CredentialCallOption authOption = (authToken != null && !authToken.isEmpty())
+                ? new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + authToken))
+                : null;
+
+        try (FlightClient client = FlightClient.builder(allocator, location).build()) {
+            try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
+                double[] values = new double[0];
+                while (stream.next()) {
+                    List<FieldVector> vectors = stream.getRoot().getFieldVectors();
+                    if (vectors.isEmpty()) {
+                        throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
+                    }
+
+                    FieldVector dataVector = stream.getRoot().getVector("data");
+                    if (dataVector == null) {
+                        throw new IllegalStateException("Chunk payload missing 'data' column");
+                    }
+
+                    int rowCount = stream.getRoot().getRowCount();
+                    for (int row = 0; row < rowCount; row++) {
+                        Object rowObj = dataVector.getObject(row);
+                        if (!(rowObj instanceof List)) {
+                            throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                        }
+                        List<?> dataList = (List<?>) rowObj;
+                        int offset = values.length;
+                        values = Arrays.copyOf(values, offset + dataList.size());
+                        for (int i = 0; i < dataList.size(); i++) {
+                            values[offset + i] = asDouble(dataList.get(i));
+                        }
+                    }
+                }
+                return values;
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to fetch chunk payload", e);
+        } finally {
+            try {
+                allocator.close();
+            } catch (Exception e) {
+                // Ignore allocator close errors
+            }
+        }
+    }
+
     @Override
     public void close() {
         LOGGER.info("Closing Flight client");
