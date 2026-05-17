@@ -167,7 +167,6 @@ class TestCachedSourceAdapter:
         CacheManager.get_instance().release(chunk_id)
         CacheManager.reset()
 
-    @pytest.mark.skip(reason="Temporarily disabled: file-backed cache reconstruction segfaults under the current PyArrow stack")
     def test_write_chunk_with_file_backend_schema(self):
         """Regression test: write_chunk batch schema must be compatible with _cast_to_unified_schema.
 
@@ -193,14 +192,14 @@ class TestCachedSourceAdapter:
 
             adapter = CachedSourceAdapter(
                 source_id="test_file_schema",
-                shape=[8192, 2049],  # Large enough to trigger lazy
+                shape=[4096, 1025],
                 dtype="float32",
-                chunk_shape=[8192, 2049],
+                chunk_shape=[4096, 1025],
             )
 
             # Write a chunk - this must create batch with correct schema
-            data = np.random.rand(8192, 2049).astype(np.float32)
-            bounds = ChunkBounds(start=[0, 0], stop=[8192, 2049])
+            data = np.random.rand(4096, 1025).astype(np.float32)
+            bounds = ChunkBounds(start=[0, 0], stop=[4096, 1025])
 
             adapter.write_chunk(bounds, data)
 

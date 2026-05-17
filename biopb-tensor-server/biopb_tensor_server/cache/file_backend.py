@@ -101,9 +101,9 @@ def _cast_to_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
     # Create binary array from values buffer
     # Binary needs: [validity, offsets, data]
     # For single binary blob: offsets = [0, N]
-    num_bytes = len(values)
+    values_buf = values.buffers()[1]
+    num_bytes = values_buf.size
     offsets_buf = pa.py_buffer(np.array([0, num_bytes], dtype=np.int32))
-    values_buf = values.buffers()[1]  # data buffer (index 0 is validity)
 
     binary_arr = pa.Array.from_buffers(
         pa.binary(),
