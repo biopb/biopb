@@ -1,1 +1,1 @@
-# Tests for biopb-image-server
+"""Tests package for biopb-image-server."""

@@ -28,6 +28,7 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
     MetadataQueryOption,
 )
+from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
 # Import client
 from biopb.tensor.client import TensorFlightClient
@@ -43,6 +44,8 @@ __all__ = [
     'FlightCmd',
     'TensorReadOption',
     'MetadataQueryOption',
+    'SerializedTensor',
+    'SerializedEndpoint',
     # Client
     'TensorFlightClient',
 ]

@@ -1,0 +1,46 @@
+# Single-container setup: image-server with embedded tensor cache
+# For testing lazy data handling and gRPC infrastructure
+#
+# Build from repo root:
+#   docker compose -f biopb-image-server/docker-compose.yaml build
+#   docker compose -f biopb-image-server/docker-compose.yaml up
+#
+# Ports:
+#   50051: gRPC image service (ObjectDetection, ProcessImage)
+#   8817: Arrow Flight tensor server (for lazy data access from clients)
+#
+# Note: tensor-external-location should be set to host's externally reachable address
+# For local testing: "grpc://localhost:8817"
+# For deployment: "grpc://<hostname>:8817"
+
+services:
+  mock:
+    build:
+      context: ..
+      dockerfile: biopb-image-server/Dockerfile
+    ports:
+      - "50051:50051"
+      - "8817:8817"
+    volumes:
+      - tensor-cache:/data/cache
+    environment:
+      BIOPB_LOG_LEVEL: "INFO"
+    command: [
+      "python", "-m", "biopb_image_base.mock_servicer",
+      "--port", "50051",
+      "--mode", "echo",
+      "--cache-dir", "/data/cache",
+      "--cache-size", "32GB",
+      "--tensor-port", "8817",
+      "--tensor-external-location", "grpc://localhost:8817",
+    ]
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  tensor-cache:
+    # Named volume for embedded tensor cache
+    # Data persists across container restarts

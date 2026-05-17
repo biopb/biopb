@@ -75,6 +75,7 @@ def mock_server() -> Generator[str, None, None]:
         proc.kill()
 
     # Clean cache directory
+    import shutil
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 

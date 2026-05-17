@@ -1,0 +1,8 @@
+grpcio-health-checking
+imageio
+typer
+numpy
+# For lazy data handling (TensorFlightClient)
+pyarrow >= 14.0.0
+dask[array]
+cachey >= 0.1.0
