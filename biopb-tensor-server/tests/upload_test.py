@@ -128,9 +128,13 @@ class TestCachedSourceAdapter:
         entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
         assert entry.state.name == "READY"
 
-        # Verify data shape
-        arr = entry.data.column(0).to_numpy()
-        assert len(arr) == 50 * 50
+        # Verify batch schema: [data: list<dtype>, shape: list<int64>, dtype: string]
+        batch = entry.data
+        assert batch.schema.names == ["data", "shape", "dtype"]
+
+        # Verify data shape via the list array
+        flat_data = batch.column("data").to_pylist()[0]
+        assert len(flat_data) == 50 * 50
 
         CacheManager.get_instance().release(chunk_id)
         CacheManager.reset()
@@ -160,8 +164,70 @@ class TestCachedSourceAdapter:
         entry, is_owner = CacheManager.get_instance().start_compute(chunk_id)
         assert entry.state.name == "READY"
         CacheManager.get_instance().release(chunk_id)
+        CacheManager.reset()
+
+    def test_write_chunk_with_file_backend_schema(self):
+        """Regression test: write_chunk batch schema must be compatible with _cast_to_unified_schema.
+
+        The batch must use ListArray (pa.array([flattened_data])) not primitive array,
+        since _cast_to_unified_schema expects data_col.values to be accessible.
+
+        Bug: AttributeError: 'pyarrow.lib.FloatArray' object has no attribute 'values'
+        """
+        import tempfile
+        import shutil
 
         CacheManager.reset()
+
+        # Use file backend - this calls _cast_to_unified_schema
+        cache_dir = tempfile.mkdtemp(prefix="test-cached-source-")
+        try:
+            config = CacheConfig(
+                backend="file",
+                file_cache_dir=Path(cache_dir),
+                file_max_total_bytes=100 * 1024 * 1024,  # 100MB
+            )
+            CacheManager.initialize(config)
+
+            adapter = CachedSourceAdapter(
+                source_id="test_file_schema",
+                shape=[8192, 2049],  # Large enough to trigger lazy
+                dtype="float32",
+                chunk_shape=[8192, 2049],
+            )
+
+            # Write a chunk - this must create batch with correct schema
+            data = np.random.rand(8192, 2049).astype(np.float32)
+            bounds = ChunkBounds(start=[0, 0], stop=[8192, 2049])
+
+            adapter.write_chunk(bounds, data)
+
+            # Verify chunk is stored and readable
+            chunk_id = encode_chunk_id("test_file_schema", bounds)
+            cache_manager = CacheManager.get_instance()
+
+            # Read back via cache backend (triggers _cast_from_unified_schema)
+            entry = cache_manager.get_or_acquire(chunk_id, lambda: (None, 0))
+            assert entry.state.name == "READY"
+
+            # Verify batch schema: should be [data: list<dtype>, shape: list<int64>, dtype: string]
+            batch = entry.data
+            assert batch.schema.names == ["data", "shape", "dtype"]
+            assert isinstance(batch.column("data"), pa.ListArray)
+
+            # Verify data can be reconstructed
+            flat_data = batch.column("data").to_pylist()[0]
+            shape = batch.column("shape").to_pylist()[0]
+            dtype_str = batch.column("dtype").to_pylist()[0]
+
+            reconstructed = np.array(flat_data, dtype=np.dtype(dtype_str)).reshape(shape)
+            assert reconstructed.shape == data.shape
+            assert reconstructed.dtype == data.dtype
+
+            cache_manager.release(chunk_id)
+        finally:
+            CacheManager.reset()
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 class TestChunkEncoding:

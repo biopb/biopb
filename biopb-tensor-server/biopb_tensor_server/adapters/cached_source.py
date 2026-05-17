@@ -149,9 +149,20 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         # Encode chunk_id directly with bounds
         chunk_id = encode_chunk_id(self.source_id, bounds)
 
-        # Flatten data and create Arrow RecordBatch
+        # Create Arrow RecordBatch matching the schema expected by cache backend
+        # Schema: [data: list<dtype>, shape: list<int64>, dtype: string]
         flat_data = data.ravel()
-        batch = pa.RecordBatch.from_arrays([pa.array(flat_data)], ["data"])
+        logical_shape = list(data.shape)
+        dtype_str = str(data.dtype)
+
+        batch = pa.RecordBatch.from_arrays(
+            [
+                pa.array([flat_data]),  # ListArray containing flattened data
+                pa.array([logical_shape]),
+                pa.array([dtype_str]),
+            ],
+            ["data", "shape", "dtype"]
+        )
         size_bytes = data.nbytes
 
         # Use start_compute + complete_entry pattern to directly write
