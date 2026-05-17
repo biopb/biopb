@@ -228,6 +228,7 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
+            flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
         ]
 
     def do_action(
@@ -254,6 +255,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 "uptime_seconds": uptime_seconds,
             }
             yield json.dumps(health_status).encode("utf-8")
+        elif action.type == "create_source":
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+            req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
+            response_desc = self._create_source(req_desc)
+            yield response_desc.SerializeToString()
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -550,10 +558,8 @@ class TensorFlightServer(flight.FlightServerBase):
         except Exception as e:
             raise flight.FlightServerError(f"Invalid upload command: {e}")
 
-    def _handle_create_source(
-        self, req_desc: TensorDescriptor, writer: flight.FlightMetadataWriter
-    ) -> None:
-        """Create source from TensorDescriptor.
+    def _create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
+        """Create source from TensorDescriptor and return its resolved descriptor.
 
         array_id format in request:
         - "cache:name" → cache-backed with given name
@@ -563,7 +569,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Args:
             req_desc: TensorDescriptor request
-            writer: Flight metadata writer for response
+        Returns:
+            TensorDescriptor with resolved server-side source_id
         """
         array_id = req_desc.array_id
 
@@ -645,15 +652,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix"
             )
 
-        # Return TensorDescriptor with actual source_id via writer
-        response_desc = TensorDescriptor(
+        return TensorDescriptor(
             array_id=source_id,
             dim_labels=req_desc.dim_labels,
             shape=req_desc.shape,
             chunk_shape=req_desc.chunk_shape,
             dtype=req_desc.dtype,
         )
-        writer.write(response_desc.SerializeToString())
+
+    def _handle_create_source(
+        self, req_desc: TensorDescriptor, writer: flight.FlightMetadataWriter
+    ) -> None:
+        """Backward-compatible DoPut handler for source creation."""
+        writer.write(self._create_source(req_desc).SerializeToString())
 
     def _handle_chunk_upload(
         self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
@@ -664,16 +675,22 @@ class TensorFlightServer(flight.FlightServerBase):
         For cache-backed sources: arbitrary bounds allowed.
         """
         table = reader.read_all()
-        data = table.column(0).to_numpy()
+        data_column = table.column(0)
 
         adapter = self._sources.get(upload.source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {upload.source_id}")
 
         bounds = upload.bounds
+        expected_shape = tuple(
+            stop - start for start, stop in zip(bounds.start, bounds.stop)
+        )
 
         # Check chunk alignment for OmeZarr-backed sources
         if hasattr(adapter, "zarr_array"):
+            data = data_column.to_numpy()
+            if expected_shape:
+                data = data.reshape(expected_shape)
             desc = adapter.get_tensor_descriptor()
             chunk_shape = list(desc.chunk_shape)
 
@@ -703,7 +720,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         elif isinstance(adapter, CachedSourceAdapter):
             # Cache-backed sources accept arbitrary bounds
-            adapter.write_chunk(bounds, data)
+            dtype = table.schema.field(0).type.to_pandas_dtype()
+            adapter.write_chunk_arrow(bounds, data_column, expected_shape, dtype)
 
         else:
             raise flight.FlightServerError(f"Source type does not support writes")

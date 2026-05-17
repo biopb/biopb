@@ -142,39 +142,64 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data (any shape matching bounds)
         """
+        flat_data = pa.array([data.ravel()])
+        self.write_chunk_arrow(bounds, flat_data, data.shape, data.dtype)
+
+    def write_chunk_arrow(
+        self,
+        bounds: ChunkBounds,
+        data: pa.Array | pa.ChunkedArray,
+        logical_shape: Tuple[int, ...] | List[int],
+        dtype: np.dtype | str,
+    ) -> None:
+        """Write chunk data to cache without converting Arrow payloads through NumPy.
+
+        Args:
+            bounds: Chunk start/stop coordinates
+            data: Flattened Arrow values or list array payload for the chunk
+            logical_shape: Logical chunk shape matching bounds
+            dtype: NumPy dtype or dtype string for the chunk data
+        """
         cache_manager = CacheManager.get_instance()
         if cache_manager is None:
             raise RuntimeError("Cache not initialized")
 
-        # Encode chunk_id directly with bounds
         chunk_id = encode_chunk_id(self.source_id, bounds)
 
-        # Create Arrow RecordBatch matching the schema expected by cache backend
-        # Schema: [data: list<dtype>, shape: list<int64>, dtype: string]
-        flat_data = data.ravel()
-        logical_shape = list(data.shape)
-        dtype_str = str(data.dtype)
+        if isinstance(data, pa.ChunkedArray):
+            data = data.combine_chunks()
+
+        if pa.types.is_list(data.type):
+            list_arr = data
+            values = data.values
+        else:
+            offsets = pa.array([0, len(data)], type=pa.int32())
+            list_arr = pa.ListArray.from_arrays(offsets, data)
+            values = data
+
+        logical_shape = list(logical_shape)
+        dtype_str = np.dtype(dtype).str
+        size_bytes = values.nbytes
 
         batch = pa.RecordBatch.from_arrays(
             [
-                pa.array([flat_data]),  # ListArray containing flattened data
+                list_arr,
                 pa.array([logical_shape]),
                 pa.array([dtype_str]),
             ],
             ["data", "shape", "dtype"]
         )
-        size_bytes = data.nbytes
 
-        # Use start_compute + complete_entry pattern to directly write
-        entry, is_owner = cache_manager.start_compute(chunk_id, metadata={
-            'bounds': bounds.SerializeToString()
-        })
-
+        entry, is_owner = cache_manager.start_compute(
+            chunk_id,
+            metadata={"bounds": bounds.SerializeToString()},
+        )
         if is_owner:
-            # We own the compute - complete it with our data
             cache_manager.complete_entry(chunk_id, batch, size_bytes)
 
-        # Track the written chunk with its full bounds
         self._written_chunks[chunk_id] = bounds
 
-        logger.debug(f"write_chunk: stored {size_bytes} bytes at bounds {list(bounds.start)} to {list(bounds.stop)}")
+        logger.debug(
+            f"write_chunk_arrow: stored {size_bytes} bytes at bounds "
+            f"{list(bounds.start)} to {list(bounds.stop)}"
+        )

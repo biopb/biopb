@@ -1202,14 +1202,14 @@ class TensorFlightClient:
             metadata_json=json.dumps(ome_metadata) if ome_metadata else "",
         )
 
-        desc = flight.FlightDescriptor.for_command(req_desc.SerializeToString())
-        writer, reader = self._client.do_put(
-            desc, pa.schema([]), options=self._call_options
-        )
-        writer.close()
+        action = flight.Action("create_source", req_desc.SerializeToString())
+        results = self._client.do_action(action, options=self._call_options)
+        try:
+            result = next(results)
+        except StopIteration as exc:
+            raise RuntimeError("create_source: server returned no result") from exc
 
-        metadata = reader.read()
-        response_desc = TensorDescriptor.FromString(metadata.to_pybytes())
+        response_desc = TensorDescriptor.FromString(result.body.to_pybytes())
         logger.info(f"create_source: created {response_desc.array_id}")
         return response_desc.array_id
 
@@ -1237,6 +1237,7 @@ class TensorFlightClient:
         writer, reader = self._client.do_put(desc, schema, options=self._call_options)
         batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
         writer.write_batch(batch)
+        writer.done_writing()
         writer.close()
         reader.read()
         logger.debug(f"upload_chunk: uploaded {data.nbytes} bytes to {source_id}")
