@@ -8,6 +8,7 @@ Useful for:
 """
 
 import logging
+import os
 import random
 import typer
 from typing import TYPE_CHECKING, Optional
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from biopb_image_base.server import EmbeddedTensorCache
 
 logger = logging.getLogger(__name__)
+
+_TENSOR_SERVER_URL_ENV = "TENSOR_SERVER_URL"
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -202,10 +205,11 @@ def main(
         tensor_external_location: External URL for tensor server (e.g., "grpc://hostname:8817")
     """
     # Validate configuration before starting
-    if cache_dir is not None and not local and ip == "0.0.0.0" and not tensor_external_location:
+    external_tensor_server = os.environ.get(_TENSOR_SERVER_URL_ENV)
+    if cache_dir is not None and external_tensor_server is None and not local and ip == "0.0.0.0" and not tensor_external_location:
         typer.echo(
             "ERROR: --tensor-external-location is required when binding to 0.0.0.0 "
-            "with cache enabled (not --local mode).\n"
+            "with embedded cache enabled (not --local mode).\n"
             "Set it to the externally reachable address "
             "(e.g., 'grpc://hostname:8817')",
             err=True,

@@ -6,6 +6,7 @@ Optionally starts an embedded tensor cache server for lazy data handling.
 """
 
 import logging
+import os
 import secrets
 import threading
 from concurrent import futures
@@ -24,6 +25,8 @@ from biopb_image_base.logging_config import setup_logging, LogLevel
 from biopb_image_base.debug import get_system_info
 
 logger = logging.getLogger(__name__)
+
+_TENSOR_SERVER_URL_ENV = "TENSOR_SERVER_URL"
 
 
 def _resolve_tensor_external_location(
@@ -189,6 +192,56 @@ class EmbeddedTensorCache:
         return serialized
 
 
+class ExternalTensorCache:
+    """Upload lazy results to an existing writable tensor server."""
+
+    def __init__(self, location: str):
+        from biopb.tensor import TensorFlightClient
+
+        self._location = location
+        self._client = TensorFlightClient(location)
+
+    def create_source(
+        self,
+        array: Union[np.ndarray, da.Array],
+        source_name: Optional[str] = None,
+        dim_labels: Optional[list] = None,
+    ) -> str:
+        import hashlib
+        import uuid
+
+        if isinstance(array, np.ndarray):
+            chunk_shape = tuple(array.shape)
+            array = da.from_array(array, chunks=chunk_shape)
+        else:
+            chunk_shape = array.chunksize
+
+        normalized_name = source_name or ""
+        if normalized_name.startswith("cache:"):
+            normalized_name = normalized_name[6:]
+        if not normalized_name:
+            normalized_name = f"upload-{uuid.uuid4().hex}"
+
+        upload_name = f"cache:{normalized_name}"
+        source_id = self._client.upload_array(
+            array,
+            source_name=upload_name,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+        )
+        return source_id
+
+    def to_serialized_tensor(
+        self,
+        source_id: str,
+        tensor_id: Optional[str] = None,
+    ) -> tensor_proto.SerializedTensor:
+        return self._client.get_tensor_pb(source_id, tensor_id=tensor_id)
+
+    def close(self) -> None:
+        self._client.close()
+
+
 def _start_embedded_tensor_cache(
     cache_dir: Path,
     cache_size: int,
@@ -261,7 +314,7 @@ def create_server(
     compression: bool = True,
     health_check: bool = True,
     readiness_check: Optional[callable] = None,
-    tensor_cache: Optional[EmbeddedTensorCache] = None,
+    tensor_cache: Optional[EmbeddedTensorCache | ExternalTensorCache] = None,
 ) -> tuple[grpc.Server, Optional[str], Optional[HealthServicer]]:
     """Create a configured gRPC server with standard features.
 
@@ -283,7 +336,7 @@ def create_server(
         compression: Enable gzip compression
         health_check: Enable gRPC health check service
         readiness_check: Optional callable for readiness probe
-        tensor_cache: Optional EmbeddedTensorCache for lazy data handling
+        tensor_cache: Optional tensor cache for lazy data handling
 
     Returns:
         Tuple of (server, token_string, health_servicer)
@@ -400,7 +453,11 @@ def run_server(
                     f"{gpu['free_mb']:.0f}MB free")
 
     tensor_cache = None
-    if cache_dir is not None:
+    external_tensor_server = os.environ.get(_TENSOR_SERVER_URL_ENV)
+    if external_tensor_server:
+        tensor_cache = ExternalTensorCache(external_tensor_server)
+        logger.info(f"Using external tensor server for lazy uploads: {external_tensor_server}")
+    elif cache_dir is not None:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
@@ -422,9 +479,6 @@ def run_server(
             tensor_port=tensor_port,
             tensor_external_location=tensor_external_location,
         )
-
-        # TODO: Support uploading lazy data to an external writable tensor server
-        # via TENSOR_SERVER_URL once the SDK upload path is reliable.
 
         # Start embedded tensor server (binds to 0.0.0.0 for external access)
         tensor_server, bind_location = _start_embedded_tensor_cache(
