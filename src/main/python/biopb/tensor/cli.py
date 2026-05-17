@@ -3,11 +3,11 @@
 Commands:
     query       List sources and tensors from a running server
     metadata    Inspect source metadata and tensor descriptors
-    get         Download a tensor to file or stdout
+    get         Download a tensor to file or stdout (pickle, zarr, or protobuf format)
     stats       Compute statistics (min, max, mean) for a tensor
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 import json
 import pickle
 import sys
@@ -15,8 +15,8 @@ import time
 
 from pathlib import Path
 import dask
-import numpy as np
 import typer
+import zarr
 from rich.console import Console
 from rich.table import Table
 
@@ -88,6 +88,33 @@ def _parse_array_id(array_id: str) -> Tuple[str, Optional[str]]:
         source_id, tensor_id = array_id.split("/", 1)
         return source_id, tensor_id
     return array_id, None
+
+
+def _infer_format(output: str, format: Optional[str]) -> Literal["pickle", "zarr", "pb"]:
+    """Infer output format from filename or explicit format option.
+
+    Args:
+        output: Output path or "-" for stdout
+        format: Explicit format option (None to infer from filename)
+
+    Returns:
+        Format string: "pickle", "zarr", or "pb"
+    """
+    if format:
+        fmt = format.lower()
+        if fmt not in ("pickle", "zarr", "pb"):
+            raise typer.BadParameter(f"Invalid format: {format}. Must be pickle, zarr, or pb.")
+        return fmt
+
+    if output == "-":
+        return "pickle"  # stdout default
+
+    ext = Path(output).suffix.lower()
+    if ext in (".zarr", ".zr"):
+        return "zarr"
+    if ext in (".pb", ".protobuf"):
+        return "pb"
+    return "pickle"  # default for .pkl, no extension, etc.
 
 
 @app.command()
@@ -251,7 +278,13 @@ def get(
         "-",
         "--output",
         "-o",
-        help="Output path for tensor data (pickle format). Use '-' for stdout.",
+        help="Output path. Use '-' for stdout. Format inferred from extension: .pkl (pickle), .zarr (zarr), .pb (protobuf)",
+    ),
+    format: Optional[str] = typer.Option(
+        None,
+        "--format",
+        "-f",
+        help="Output format: pickle (lazy dask), zarr (realized), pb (protobuf). Inferred from filename if not set.",
     ),
     server: str = typer.Option(
         "grpc://localhost:8815",
@@ -271,50 +304,77 @@ def get(
         help="Maximum bytes for client-side chunk cache",
     ),
 ):
-    """Download a tensor to file or stdout (pickle format).
+    """Download a tensor to file or stdout.
 
-    The slice option restricts the region downloaded. If not specified,
-    the entire tensor is downloaded.
+    Supports multiple output formats:
+    - pickle: Lazy dask array (task graph, no data transfer)
+    - zarr: Realized numpy array written to zarr format
+    - pb: SerializedTensor protobuf (lazy, contains chunk tickets)
+
+    Format is inferred from output filename extension, or can be set explicitly with --format.
 
     Example:
-        biopb tensor get my-source -o output.pkl
-        biopb tensor get my-source/pos_0 -o output.pkl
-        biopb tensor get my-source/pos_0 -o - > output.pkl
-        biopb tensor get my-source/pos_0 --slice 0:100,0:100 -o sliced.pkl
-        biopb tensor get my-source/pos_0 -S 0:512 -s grpc://myhost:9000 -o data.pkl
+        biopb tensor get my-source -o output.pkl        # pickle (lazy)
+        biopb tensor get my-source -o output.zarr       # zarr (realized)
+        biopb tensor get my-source -o output.pb         # protobuf (lazy)
+        biopb tensor get my-source -o -                 # stdout (pickle)
+        biopb tensor get my-source -f zarr -o data      # explicit format
+        biopb tensor get my-source --slice 0:100 -o slice.pkl
     """
     start_time = time.time()
     client = _create_flight_client(server, cache_bytes)
     try:
         source_id, tensor_id = _parse_array_id(array_id)
         selection = _parse_slice_hint(slice_hint)
+        fmt = _infer_format(output, format)
 
         stderr_console.print(
-            f"[green]Downloading tensor[/green] {array_id}"
+            f"[green]Fetching tensor[/green] {array_id} (format: {fmt})"
             + (f" (region: {slice_hint})" if slice_hint else "")
         )
 
-        arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+        if fmt == "pb":
+            # Protobuf format: lazy SerializedTensor
+            serialized = client.get_tensor_pb(source_id, tensor_id, slice_hint=selection)
+            pb_bytes = serialized.SerializeToString()
 
-        # Compute the array (lazy dask array -> actual numpy array)
-        result = arr.compute()
+            if output == "-":
+                sys.stdout.buffer.write(pb_bytes)
+                stderr_console.print(f"[green]Protobuf written to stdout[/green] ({len(pb_bytes)} bytes)")
+            else:
+                with open(output, "wb") as f:
+                    f.write(pb_bytes)
+                stderr_console.print(f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)")
 
-        if output == "-":
-            # Write to stdout in pickle format
-            pickle.dump(result, sys.stdout.buffer)
-            stderr_console.print(f"[green]Tensor written to stdout[/green] ({result.nbytes} bytes)")
+        elif fmt == "zarr":
+            # Zarr format: realized array
+            arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+            result = arr.compute()
+
+            if output == "-":
+                raise typer.BadParameter("zarr format requires file output, not stdout")
+
+            zarr.save_array(output, result)
+            stderr_console.print(f"[green]Zarr saved to:[/green] {output} ({result.nbytes} bytes)")
+
         else:
-            # Write to file
-            with open(output, "wb") as f:
-                pickle.dump(result, f)
-            stderr_console.print(f"[green]Tensor saved to:[/green] {output} ({result.nbytes} bytes)")
+            # Pickle format: lazy dask array (no compute)
+            arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+
+            if output == "-":
+                pickle.dump(arr, sys.stdout.buffer)
+                stderr_console.print(f"[green]Dask array written to stdout[/green] (shape={list(arr.shape)})")
+            else:
+                with open(output, "wb") as f:
+                    pickle.dump(arr, f)
+                stderr_console.print(f"[green]Dask array saved to:[/green] {output} (shape={list(arr.shape)})")
 
         _log_timing(start_time)
 
     except typer.Exit:
         raise
     except Exception as exc:
-        stderr_console.print(f"[red]Failed to download tensor:[/red] {exc}")
+        stderr_console.print(f"[red]Failed to fetch tensor:[/red] {exc}")
         raise typer.Exit(1)
     finally:
         client.close()
