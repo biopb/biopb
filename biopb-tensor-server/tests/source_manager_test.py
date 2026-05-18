@@ -1,5 +1,7 @@
 """Regression tests for periodic SourceManager reconciliation."""
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -561,28 +563,33 @@ class TestSourceManagerRegressions:
             aggressive_dir_pruning=True,
         )
 
-        clock = {"now": 100.0}
+        base_time = time.time()
+        clock = {"now": base_time}
         monkeypatch.setattr(
             "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
 
-        clock["now"] = 131.0
+        clock["now"] = base_time + 31.0
         manager._handle_rescan()
 
-        clock["now"] = 162.0
+        clock["now"] = base_time + 62.0
         manager._handle_rescan()
         assert str(monitored_dir.resolve()) in manager._skipped_stable_dirs
 
         data_path = monitored_dir / "sample.dat"
         data_path.write_text("hello")
+        changed_at = base_time + 63.0
+        changed_ns = int(changed_at * 1_000_000_000)
+        os.utime(data_path, ns=(changed_ns, changed_ns))
+        os.utime(monitored_dir, ns=(changed_ns, changed_ns))
 
-        clock["now"] = 163.0
+        clock["now"] = changed_at
         manager._handle_rescan()
         assert state.claims == {}
 
-        clock["now"] = 194.0
+        clock["now"] = base_time + 94.0
         manager._handle_rescan()
 
         assert len(state.claims) == 1

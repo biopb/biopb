@@ -937,23 +937,8 @@ def create_source_manager(
         )
         manager._commit_add_claim(claim)
 
-    # Filesystem discovery for monitored sources (callbacks fire here too)
-    for source in monitored_sources:
-        if source.is_remote:
-            # Remote sources are handled above as static claims
-            continue
-
-        local_path = source.local_path
-        if local_path is None:
-            continue
-
-        state = discover_sources(
-            local_path,
-            registry,
-            dim_labels=source.dim_labels,
-        )
-
-        for claim in state.get_all_claims():
-            manager._commit_add_claim(claim)
+    # Bootstrap monitored discovery through the same rescan pipeline used at runtime.
+    if monitored_dirs:
+        manager._handle_rescan()
 
     return manager
