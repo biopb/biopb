@@ -164,6 +164,10 @@ class SourceManager:
         if not self._monitored_dirs:
             return
 
+        self._cleanup_deleted_monitored_dirs()
+        if not self._monitored_dirs:
+            return
+
         force_full_rescan = self._should_force_full_rescan()
         skipped_dirs = self._refresh_entry_state(force_full=force_full_rescan)
         discovered_state = DiscoveryState()
@@ -186,6 +190,64 @@ class SourceManager:
 
         if force_full_rescan:
             self._last_full_rescan_at = time.time()
+
+    def _cleanup_deleted_monitored_dirs(self) -> None:
+        """Remove claims for monitored roots that no longer exist."""
+        deleted_dirs = []
+        for monitored_dir in sorted(self._monitored_dirs):
+            try:
+                exists = monitored_dir.exists()
+            except OSError:
+                exists = False
+            if not exists:
+                deleted_dirs.append(monitored_dir)
+
+        for deleted_dir in deleted_dirs:
+            self._cleanup_deleted_monitored_dir(deleted_dir)
+
+    def _cleanup_deleted_monitored_dir(self, deleted_dir: Path) -> None:
+        """Remove sources and cache state for a monitored root that disappeared."""
+        removed_source_ids = []
+        deleted_root = deleted_dir.resolve(strict=False)
+
+        with self._lock:
+            current_claims = list(self._state.claims.items())
+
+        for source_id, claim in current_claims:
+            if is_remote_url(claim.primary_path):
+                continue
+            try:
+                claim_path = Path(claim.primary_path).resolve(strict=False)
+            except OSError:
+                continue
+            if claim_path == deleted_root or claim_path.is_relative_to(deleted_root):
+                if self._commit_remove_source(source_id):
+                    removed_source_ids.append(source_id)
+
+        deleted_root_str = str(deleted_root)
+        self._monitored_dirs.discard(deleted_dir)
+        self._skipped_stable_dirs.discard(deleted_root_str)
+
+        entry_paths_to_remove = [
+            path_str
+            for path_str in self._entry_state
+            if path_str == deleted_root_str
+            or Path(path_str).is_relative_to(deleted_root)
+        ]
+        for path_str in entry_paths_to_remove:
+            self._entry_state.pop(path_str, None)
+
+        if removed_source_ids:
+            logger.warning(
+                "Removed %d sources after monitored directory disappeared: %s",
+                len(removed_source_ids),
+                deleted_dir,
+            )
+        else:
+            logger.warning(
+                "Stopped monitoring deleted directory with no active sources: %s",
+                deleted_dir,
+            )
 
     def _refresh_entry_state(self, force_full: bool = False) -> Set[str]:
         """Refresh cached filesystem signatures for all monitored trees."""

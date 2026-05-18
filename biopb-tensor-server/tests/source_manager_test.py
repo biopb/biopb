@@ -264,6 +264,38 @@ class TestSourceManagerRegressions:
         assert server._metadata_db.added == []
         assert server._metadata_db.removed == []
 
+    def test_deleted_monitored_root_removes_claims_and_stops_monitoring(self, tmp_path):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+
+        data_path.unlink()
+        monitored_dir.rmdir()
+
+        manager._handle_rescan()
+
+        assert source_id not in state.claims
+        assert monitored_dir not in manager._monitored_dirs
+        assert server.unregistered == [source_id]
+        assert server._metadata_db.removed == [source_id]
+
     def test_full_rescan_backstop_recovers_stale_skipped_subtree(self, tmp_path, monkeypatch):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
