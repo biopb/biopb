@@ -236,6 +236,8 @@ class ServerConfig:
             "periodic": Run periodic rescans for monitored local directories.
             "off": Disable background rescans after initial discovery.
         rescan_interval: Seconds between background rescan attempts.
+        full_rescan_interval: Seconds between forced full rescans that bypass
+            subtree pruning. Values <= 0 disable the periodic full-scan backstop.
         stability_window: Minimum quiet period before a path/subtree is eligible
             for discovery or removal checks.
         probe_open_files: When True, verify candidate files can be opened for append
@@ -259,6 +261,7 @@ class ServerConfig:
     gpu_min_merged_chunks: int = 4
     monitor_mode: str = "periodic"
     rescan_interval: float = 30.0
+    full_rescan_interval: float = 3600.0
     stability_window: float = 30.0
     probe_open_files: bool = True
     writable: bool = False  # Enable write mode
@@ -318,6 +321,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     if rescan_interval is None:
         rescan_interval = server_data.get("poll_interval", 30.0)
 
+    full_rescan_interval = server_data.get("full_rescan_interval", 3600.0)
     stability_window = server_data.get("stability_window", 30.0)
     probe_open_files = server_data.get("probe_open_files", True)
     writable = server_data.get("writable", False)
@@ -424,6 +428,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         log_scope_to_biopb=log_scope_to_biopb,
         monitor_mode=monitor_mode,
         rescan_interval=float(rescan_interval),
+        full_rescan_interval=float(full_rescan_interval),
         stability_window=float(stability_window),
         probe_open_files=bool(probe_open_files),
         compute_backend=compute_backend,

@@ -87,6 +87,7 @@ class TestTensorConfig:
             'server': {
                 'monitor_mode': 'periodic',
                 'rescan_interval': 12,
+                'full_rescan_interval': 120,
                 'stability_window': 45,
                 'probe_open_files': False,
             },
@@ -95,6 +96,7 @@ class TestTensorConfig:
 
         assert config.monitor_mode == 'periodic'
         assert config.rescan_interval == 12.0
+        assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
         assert config.probe_open_files is False
 
@@ -109,6 +111,7 @@ class TestTensorConfig:
 
         assert config.monitor_mode == 'off'
         assert config.rescan_interval == 9.0
+        assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
         assert config.probe_open_files is True
 

@@ -234,6 +234,7 @@ def _setup_flight_server(
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
         probe_open_files=server_config.probe_open_files,
+        full_rescan_interval=server_config.full_rescan_interval,
     )
 
     if source_manager is None:

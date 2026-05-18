@@ -58,6 +58,7 @@ class SourceManager:
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
         probe_open_files: bool = True,
+        full_rescan_interval: float = 3600.0,
     ):
         self._server = server
         self._registry = registry
@@ -68,6 +69,7 @@ class SourceManager:
         self._credentials_config = credentials_config
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
+        self._full_rescan_interval = full_rescan_interval
 
         # Thread management
         self._thread: Optional[threading.Thread] = None
@@ -86,6 +88,9 @@ class SourceManager:
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         # source_id -> retry/logging state for repeatedly failing datasets.
         self._failed_sources: Dict[str, _FailureTracker] = {}
+        # Rescan bookkeeping for low-overhead subtree pruning.
+        self._skipped_stable_dirs: Set[str] = set()
+        self._last_full_rescan_at: float = float("-inf")
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
@@ -159,9 +164,13 @@ class SourceManager:
         if not self._monitored_dirs:
             return
 
-        self._refresh_entry_state()
+        force_full_rescan = self._should_force_full_rescan()
+        skipped_dirs = self._refresh_entry_state(force_full=force_full_rescan)
         discovered_state = DiscoveryState()
         for monitored_dir in sorted(self._monitored_dirs):
+            resolved_dir = monitored_dir.resolve()
+            if str(resolved_dir) in skipped_dirs:
+                continue
             discover_sources(
                 monitored_dir,
                 self._registry,
@@ -170,22 +179,40 @@ class SourceManager:
                 path_filter=self._should_scan_path,
             )
 
+        self._preserve_skipped_claims(discovered_state, skipped_dirs)
+
         unstable_paths = self._get_unstable_paths()
         self._reconcile_discovered_state(discovered_state, unstable_paths)
 
-    def _refresh_entry_state(self) -> None:
+        if force_full_rescan:
+            self._last_full_rescan_at = time.time()
+
+    def _refresh_entry_state(self, force_full: bool = False) -> Set[str]:
         """Refresh cached filesystem signatures for all monitored trees."""
         now = time.time()
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        skipped_dirs: Set[str] = set()
         for monitored_dir in sorted(self._monitored_dirs):
-            self._scan_tree_state(monitored_dir.resolve(), now, next_state)
+            self._scan_tree_state(
+                monitored_dir.resolve(),
+                now,
+                next_state,
+                skipped_dirs,
+                force_full,
+                False,
+            )
         self._entry_state = next_state
+        self._skipped_stable_dirs = skipped_dirs
+        return skipped_dirs
 
     def _scan_tree_state(
         self,
         path: Path,
         now: float,
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
+        skipped_dirs: Set[str],
+        force_full: bool,
+        allow_prune: bool,
     ) -> None:
         """Capture the current filesystem signature state for one subtree."""
         try:
@@ -212,11 +239,52 @@ class SourceManager:
         if not is_directory or resolved_path.is_symlink():
             return
 
+        if (
+            allow_prune
+            and
+            not force_full
+            and previous_entry is not None
+            and previous_entry[:2] == (is_directory, signature)
+            and now - previous_entry[2] >= self._stability_window
+        ):
+            skipped_dirs.add(path_str)
+            self._copy_cached_subtree_entries(path_str, next_state)
+            return
+
         try:
             for child in resolved_path.iterdir():
-                self._scan_tree_state(child, now, next_state)
+                self._scan_tree_state(
+                    child,
+                    now,
+                    next_state,
+                    skipped_dirs,
+                    force_full,
+                    True,
+                )
         except OSError:
             return
+
+    def _copy_cached_subtree_entries(
+        self,
+        root_path_str: str,
+        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
+    ) -> None:
+        """Carry forward cached descendants when a stable subtree is skipped."""
+        root_path = Path(root_path_str)
+        for cached_path, entry in self._entry_state.items():
+            if cached_path == root_path_str or cached_path in next_state:
+                continue
+            try:
+                if Path(cached_path).is_relative_to(root_path):
+                    next_state[cached_path] = entry
+            except OSError:
+                continue
+
+    def _should_force_full_rescan(self) -> bool:
+        """Return True when a full tree walk should bypass subtree pruning."""
+        if self._full_rescan_interval <= 0:
+            return False
+        return time.time() - self._last_full_rescan_at >= self._full_rescan_interval
 
     def _build_entry_signature(
         self,
@@ -247,6 +315,9 @@ class SourceManager:
             return False
 
         if resolved_path.name.startswith("."):
+            return False
+
+        if str(resolved_path) in self._skipped_stable_dirs:
             return False
 
         entry = self._entry_state.get(str(resolved_path))
@@ -383,6 +454,46 @@ class SourceManager:
                 resolved_path.is_dir(),
             )
         return signatures
+
+    def _preserve_skipped_claims(
+        self,
+        discovered_state: DiscoveryState,
+        skipped_dirs: Set[str],
+    ) -> None:
+        """Carry forward claims whose subtree was intentionally skipped this cycle."""
+        if not skipped_dirs:
+            return
+
+        skipped_paths = [Path(path_str) for path_str in sorted(skipped_dirs)]
+        with self._lock:
+            current_claims = list(self._state.claims.values())
+
+        for claim in current_claims:
+            if not self._is_monitored_claim(claim):
+                continue
+            if claim.source_id in discovered_state.claims:
+                continue
+            if self._claim_overlaps_skipped_subtree(claim, skipped_paths):
+                discovered_state.add_claim(claim, notify=False)
+
+    def _claim_overlaps_skipped_subtree(
+        self,
+        claim: SourceClaim,
+        skipped_dirs: List[Path],
+    ) -> bool:
+        """Return True when a claim lives in a subtree skipped as unchanged."""
+        claim_paths = {claim.primary_path, *claim.member_paths}
+        for claim_path_str in claim_paths:
+            if is_remote_url(claim_path_str):
+                continue
+            try:
+                claim_path = Path(claim_path_str).resolve(strict=False)
+            except OSError:
+                continue
+            for skipped_dir in skipped_dirs:
+                if claim_path == skipped_dir or claim_path.is_relative_to(skipped_dir):
+                    return True
+        return False
 
     def _commit_add_claim(self, claim: SourceClaim) -> bool:
         """Register a discovered source, then commit it into confirmed state."""
@@ -607,6 +718,7 @@ def create_source_manager(
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
     probe_open_files: bool = True,
+    full_rescan_interval: float = 3600.0,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
 
@@ -672,6 +784,7 @@ def create_source_manager(
         credentials_config=credentials_config,
         stability_window=stability_window,
         probe_open_files=probe_open_files,
+        full_rescan_interval=full_rescan_interval,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)

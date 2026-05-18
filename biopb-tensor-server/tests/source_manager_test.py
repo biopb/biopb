@@ -221,6 +221,99 @@ class TestSourceManagerRegressions:
         assert server._metadata_db.added == []
         assert server._metadata_db.removed == []
 
+    def test_skipped_stable_subtree_preserves_existing_claims(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        stable_dir = monitored_dir / "stable"
+        stable_dir.mkdir()
+        data_path = stable_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        server.registered.clear()
+        server.unregistered.clear()
+        server._metadata_db.added.clear()
+        server._metadata_db.removed.clear()
+
+        clock["now"] = 101.0
+        manager._handle_rescan()
+
+        assert str(stable_dir.resolve()) in manager._skipped_stable_dirs
+        assert source_id in state.claims
+        assert server.registered == []
+        assert server.unregistered == []
+        assert server._metadata_db.added == []
+        assert server._metadata_db.removed == []
+
+    def test_full_rescan_backstop_recovers_stale_skipped_subtree(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+            full_rescan_interval=10.0,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        data_path.unlink()
+
+        original_refresh = manager._refresh_entry_state
+        refresh_calls = {"count": 0}
+
+        def fake_refresh(force_full=False):
+            refresh_calls["count"] += 1
+            if refresh_calls["count"] == 1:
+                manager._skipped_stable_dirs = {str(monitored_dir.resolve())}
+                return manager._skipped_stable_dirs
+            return original_refresh(force_full=force_full)
+
+        monkeypatch.setattr(manager, "_refresh_entry_state", fake_refresh)
+
+        clock["now"] = 101.0
+        manager._handle_rescan()
+        assert source_id in state.claims
+
+        clock["now"] = 111.0
+        manager._handle_rescan()
+
+        assert source_id not in state.claims
+        assert server.unregistered == [source_id]
+
     def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
