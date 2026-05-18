@@ -72,8 +72,8 @@ class SourceManager:
         # Thread management
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        # The event loop already holds this lock while dispatching events.
-        # Directory delete handling re-enters helper paths that also need it.
+        # Rescan/reconcile helpers may re-enter other state-mutating helpers.
+        # Use an RLock so nested calls on the same thread do not deadlock.
         self._lock = threading.RLock()
 
         # Path tracking for move handling
