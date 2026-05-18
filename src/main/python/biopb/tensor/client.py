@@ -403,6 +403,16 @@ def _check_schema_version(schema: pa.Schema) -> None:
         )
 
 
+def _normalize_location(location: str) -> str:
+    """Normalize location URI for Arrow Flight.
+
+    Converts grpcs:// to grpc+tls:// (Arrow Flight's TLS scheme).
+    """
+    if location.startswith("grpcs://"):
+        return "grpc+tls://" + location[8:]
+    return location
+
+
 class TensorFlightClient:
     """Client for accessing tensors from a TensorFlightServer.
 
@@ -447,12 +457,14 @@ class TensorFlightClient:
         logger.info(
             f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
         )
+        # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
+        normalized = _normalize_location(location)
         # Store pickle-safe connection parameters
-        self._location = location
+        self._location = normalized
         self._token = token
         self._cache_bytes = cache_bytes
         # Create FlightClient for direct API calls (list_flights, get_flight_info, uploads)
-        self._client = flight.FlightClient(location)
+        self._client = flight.FlightClient(normalized)
         self._call_options = (
             flight.FlightCallOptions(
                 headers=[(b"authorization", f"Bearer {token}".encode())]

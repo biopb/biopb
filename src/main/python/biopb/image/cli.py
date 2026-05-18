@@ -45,18 +45,28 @@ def _log_timing(start_time: float) -> None:
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
-def _parse_server_address(server: str) -> str:
-    """Parse server address, strip grpc:// prefix if present."""
+def _parse_server_address(server: str) -> tuple[str, bool]:
+    """Parse server address, strip grpc:// or grpcs:// prefix.
+
+    Returns:
+        Tuple of (address, use_tls)
+    """
+    if server.startswith("grpcs://"):
+        return server[8:], True
     if server.startswith("grpc://"):
-        return server[7:]
-    return server
+        return server[7:], False
+    return server, False
 
 
 def _create_grpc_channel(server: str) -> grpc.Channel:
     """Create gRPC channel with user-friendly error handling."""
-    addr = _parse_server_address(server)
+    addr, use_tls = _parse_server_address(server)
     try:
-        return grpc.insecure_channel(addr)
+        if use_tls:
+            credentials = grpc.ssl_channel_credentials()
+            return grpc.secure_channel(addr, credentials)
+        else:
+            return grpc.insecure_channel(addr)
     except Exception as exc:
         stderr_console.print(f"[red]Cannot connect to server at {server}:[/red] {exc}")
         raise typer.Exit(1)
@@ -253,6 +263,7 @@ def ops(
         "grpc://localhost:50051",
         "--server",
         "-s",
+        envvar="BIOPB_IMAGE_SERVER",
         help="ProcessImage server URI",
     ),
 ) -> None:
@@ -342,6 +353,7 @@ def process(
         "grpc://localhost:50051",
         "--server",
         "-s",
+        envvar="BIOPB_IMAGE_SERVER",
         help="ProcessImage server URI",
     ),
 ) -> None:

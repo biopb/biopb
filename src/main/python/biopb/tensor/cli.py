@@ -38,10 +38,21 @@ def _log_timing(start_time: float) -> None:
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
+def _normalize_location(location: str) -> str:
+    """Normalize location URI for Arrow Flight.
+
+    Converts grpcs:// to grpc+tls:// (Arrow Flight's TLS scheme).
+    """
+    if location.startswith("grpcs://"):
+        return "grpc+tls://" + location[8:]
+    return location
+
+
 def _create_flight_client(location: str, cache_bytes: int) -> TensorFlightClient:
     """Create a Flight client, with user-friendly error handling."""
     try:
-        return TensorFlightClient(location=location, cache_bytes=cache_bytes)
+        normalized = _normalize_location(location)
+        return TensorFlightClient(location=normalized, cache_bytes=cache_bytes)
     except Exception as exc:
         stderr_console.print(f"[red]Cannot connect to server at {location}:[/red] {exc}")
         raise typer.Exit(1)
@@ -107,14 +118,16 @@ def _infer_format(output: str, format: Optional[str]) -> Literal["pickle", "zarr
         return fmt
 
     if output == "-":
-        return "pickle"  # stdout default
+        return "pb"  # stdout default
 
     ext = Path(output).suffix.lower()
     if ext in (".zarr", ".zr"):
         return "zarr"
     if ext in (".pb", ".protobuf"):
         return "pb"
-    return "pickle"  # default for .pkl, no extension, etc.
+    if ext in (".pkl", ".pickle"):
+        return "pickle"
+    return "pb"  # default
 
 
 @app.command()
@@ -123,6 +136,7 @@ def query(
         "grpc://localhost:8815",
         "--server",
         "-s",
+        envvar="BIOPB_TENSOR_SERVER",
         help="TensorFlight server URI",
     ),
     cache_bytes: int = typer.Option(
@@ -190,6 +204,7 @@ def metadata(
         "grpc://localhost:8815",
         "--server",
         "-s",
+        envvar="BIOPB_TENSOR_SERVER",
         help="TensorFlight server URI",
     ),
     tensor: Optional[str] = typer.Option(
@@ -290,6 +305,7 @@ def get(
         "grpc://localhost:8815",
         "--server",
         "-s",
+        envvar="BIOPB_TENSOR_SERVER",
         help="TensorFlight server URI",
     ),
     slice_hint: Optional[str] = typer.Option(
@@ -390,6 +406,7 @@ def stats(
         "grpc://localhost:8815",
         "--server",
         "-s",
+        envvar="BIOPB_TENSOR_SERVER",
         help="TensorFlight server URI",
     ),
     slice_hint: Optional[str] = typer.Option(
