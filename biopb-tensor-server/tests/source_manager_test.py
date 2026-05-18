@@ -424,6 +424,171 @@ class TestSourceManagerRegressions:
 
         assert manager._should_scan_path(data_path) is False
 
+    def test_should_scan_path_can_require_multiple_stable_rescans(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            stable_rescans_required=2,
+            probe_open_files=False,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._refresh_entry_state()
+        assert manager._should_scan_path(data_path) is False
+
+        clock["now"] = 131.0
+        manager._refresh_entry_state()
+        assert manager._should_scan_path(data_path) is False
+
+        clock["now"] = 162.0
+        manager._refresh_entry_state()
+        assert manager._should_scan_path(data_path) is True
+
+    def test_aggressive_dir_pruning_can_skip_monitored_root(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+            aggressive_dir_pruning=True,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        server.registered.clear()
+        server.unregistered.clear()
+
+        clock["now"] = 101.0
+        manager._handle_rescan()
+
+        assert str(monitored_dir.resolve()) in manager._skipped_stable_dirs
+        assert source_id in state.claims
+        assert server.registered == []
+        assert server.unregistered == []
+
+    def test_non_aggressive_root_rescan_after_stability_delay(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+            aggressive_dir_pruning=False,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+
+        clock["now"] = 131.0
+        manager._handle_rescan()
+        assert str(monitored_dir.resolve()) not in manager._skipped_stable_dirs
+
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        clock["now"] = 132.0
+        manager._handle_rescan()
+        assert state.claims == {}
+        assert str(monitored_dir.resolve()) not in manager._skipped_stable_dirs
+
+        clock["now"] = 163.0
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+        assert str(monitored_dir.resolve()) not in manager._skipped_stable_dirs
+
+    def test_aggressive_root_rescan_uses_child_fs_age_after_skipped_root_change(
+        self, tmp_path, monkeypatch
+    ):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+            aggressive_dir_pruning=True,
+        )
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+
+        clock["now"] = 131.0
+        manager._handle_rescan()
+
+        clock["now"] = 162.0
+        manager._handle_rescan()
+        assert str(monitored_dir.resolve()) in manager._skipped_stable_dirs
+
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        clock["now"] = 163.0
+        manager._handle_rescan()
+        assert state.claims == {}
+
+        clock["now"] = 194.0
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
     def test_reconcile_keeps_unstable_missing_source(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()

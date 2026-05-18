@@ -89,7 +89,9 @@ class TestTensorConfig:
                 'rescan_interval': 12,
                 'full_rescan_interval': 120,
                 'stability_window': 45,
+                'stable_rescans_required': 2,
                 'probe_open_files': False,
+                'aggressive_dir_pruning': True,
             },
             'sources': [],
         })
@@ -98,7 +100,9 @@ class TestTensorConfig:
         assert config.rescan_interval == 12.0
         assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
+        assert config.stable_rescans_required == 2
         assert config.probe_open_files is False
+        assert config.aggressive_dir_pruning is True
 
     def test_parse_legacy_monitor_aliases(self):
         config = parse_config({
@@ -113,7 +117,9 @@ class TestTensorConfig:
         assert config.rescan_interval == 9.0
         assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
+        assert config.stable_rescans_required == 0
         assert config.probe_open_files is True
+        assert config.aggressive_dir_pruning is False
 
 
 class TestComputeBackendSelection:

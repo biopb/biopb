@@ -59,6 +59,8 @@ class SourceManager:
         stability_window: float = 30.0,
         probe_open_files: bool = True,
         full_rescan_interval: float = 3600.0,
+        stable_rescans_required: int = 0,
+        aggressive_dir_pruning: bool = False,
     ):
         self._server = server
         self._registry = registry
@@ -70,6 +72,8 @@ class SourceManager:
         self._stability_window = stability_window
         self._probe_open_files = probe_open_files
         self._full_rescan_interval = full_rescan_interval
+        self._stable_rescans_required = max(0, stable_rescans_required)
+        self._aggressive_dir_pruning = aggressive_dir_pruning
 
         # Thread management
         self._thread: Optional[threading.Thread] = None
@@ -84,6 +88,10 @@ class SourceManager:
         # Cached filesystem signatures for stability and change detection.
         # path -> (is_directory, signature_tuple, last_changed_epoch)
         self._entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        # path -> consecutive unchanged rescans observed since the last change.
+        self._entry_stable_observations: Dict[str, int] = {}
+        # path -> whether the current signature still needs one eligible discovery pass.
+        self._entry_pending_scan: Dict[str, bool] = {}
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         # source_id -> retry/logging state for repeatedly failing datasets.
@@ -236,6 +244,7 @@ class SourceManager:
         ]
         for path_str in entry_paths_to_remove:
             self._entry_state.pop(path_str, None)
+            self._entry_pending_scan.pop(path_str, None)
 
         if removed_source_ids:
             logger.warning(
@@ -253,17 +262,23 @@ class SourceManager:
         """Refresh cached filesystem signatures for all monitored trees."""
         now = time.time()
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        next_stable_observations: Dict[str, int] = {}
+        next_pending_scan: Dict[str, bool] = {}
         skipped_dirs: Set[str] = set()
         for monitored_dir in sorted(self._monitored_dirs):
             self._scan_tree_state(
                 monitored_dir.resolve(),
                 now,
                 next_state,
+                next_stable_observations,
+                next_pending_scan,
                 skipped_dirs,
                 force_full,
-                False,
+                self._aggressive_dir_pruning,
             )
         self._entry_state = next_state
+        self._entry_stable_observations = next_stable_observations
+        self._entry_pending_scan = next_pending_scan
         self._skipped_stable_dirs = skipped_dirs
         return skipped_dirs
 
@@ -272,6 +287,8 @@ class SourceManager:
         path: Path,
         now: float,
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
+        next_stable_observations: Dict[str, int],
+        next_pending_scan: Dict[str, bool],
         skipped_dirs: Set[str],
         force_full: bool,
         allow_prune: bool,
@@ -290,13 +307,22 @@ class SourceManager:
         path_str = str(resolved_path)
         signature = self._build_entry_signature(stat_result, is_directory)
         previous_entry = self._entry_state.get(path_str)
-        last_changed = now
+        last_changed = self._get_entry_change_time(stat_result, now)
+        stable_observations = 0
         if previous_entry is not None and previous_entry[:2] == (
             is_directory,
             signature,
         ):
             last_changed = previous_entry[2]
+            stable_observations = (
+                self._entry_stable_observations.get(path_str, 0) + 1
+            )
+            pending_scan = self._entry_pending_scan.get(path_str, False)
+        else:
+            pending_scan = True
         next_state[path_str] = (is_directory, signature, last_changed)
+        next_stable_observations[path_str] = stable_observations
+        next_pending_scan[path_str] = pending_scan
 
         if not is_directory or resolved_path.is_symlink():
             return
@@ -307,10 +333,17 @@ class SourceManager:
             not force_full
             and previous_entry is not None
             and previous_entry[:2] == (is_directory, signature)
+            and not pending_scan
             and now - previous_entry[2] >= self._stability_window
+            and stable_observations >= self._stable_rescans_required
         ):
             skipped_dirs.add(path_str)
-            self._copy_cached_subtree_entries(path_str, next_state)
+            self._copy_cached_subtree_entries(
+                path_str,
+                next_state,
+                next_stable_observations,
+                next_pending_scan,
+            )
             return
 
         try:
@@ -319,6 +352,8 @@ class SourceManager:
                     child,
                     now,
                     next_state,
+                    next_stable_observations,
+                    next_pending_scan,
                     skipped_dirs,
                     force_full,
                     True,
@@ -330,6 +365,8 @@ class SourceManager:
         self,
         root_path_str: str,
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
+        next_stable_observations: Dict[str, int],
+        next_pending_scan: Dict[str, bool],
     ) -> None:
         """Carry forward cached descendants when a stable subtree is skipped."""
         root_path = Path(root_path_str)
@@ -339,6 +376,13 @@ class SourceManager:
             try:
                 if Path(cached_path).is_relative_to(root_path):
                     next_state[cached_path] = entry
+                    next_stable_observations[cached_path] = (
+                        self._entry_stable_observations.get(cached_path, 0)
+                    )
+                    next_pending_scan[cached_path] = self._entry_pending_scan.get(
+                        cached_path,
+                        False,
+                    )
             except OSError:
                 continue
 
@@ -369,6 +413,20 @@ class SourceManager:
             stat_result.st_ctime_ns,
         )
 
+    def _get_entry_change_time(self, stat_result: Any, now: float) -> float:
+        """Return the best available filesystem change timestamp for an entry."""
+        mtime_ns = getattr(stat_result, "st_mtime_ns", None)
+        ctime_ns = getattr(stat_result, "st_ctime_ns", None)
+        if mtime_ns is not None and ctime_ns is not None:
+            return min(now, max(mtime_ns, ctime_ns) / 1_000_000_000)
+
+        mtime = getattr(stat_result, "st_mtime", None)
+        ctime = getattr(stat_result, "st_ctime", None)
+        if mtime is not None and ctime is not None:
+            return min(now, max(float(mtime), float(ctime)))
+
+        return now
+
     def _should_scan_path(self, path: Path) -> bool:
         """Return True when a path is stable enough to participate in discovery."""
         try:
@@ -390,13 +448,27 @@ class SourceManager:
         if age < self._stability_window:
             return False
 
-        if not entry[0] and self._probe_open_files:
-            return self._can_open_for_append(resolved_path)
+        stable_observations = self._entry_stable_observations.get(
+            str(resolved_path),
+            self._stable_rescans_required,
+        )
+        if stable_observations < self._stable_rescans_required:
+            return False
 
+        if not entry[0] and self._probe_open_files:
+            if not self._can_open_for_append(resolved_path):
+                return False
+
+        self._entry_pending_scan[str(resolved_path)] = False
         return True
 
     def _can_open_for_append(self, path: Path) -> bool:
-        """Best-effort check that a file handle is no longer actively held."""
+        """Best-effort probe that a file is not obviously blocked for append.
+
+        This is not a reliable active-writer detector on POSIX filesystems.
+        Stability gating still primarily relies on signature age and repeated
+        unchanged rescans rather than this probe alone.
+        """
         try:
             with open(path, "a"):
                 return True
@@ -781,6 +853,8 @@ def create_source_manager(
     stability_window: float = 30.0,
     probe_open_files: bool = True,
     full_rescan_interval: float = 3600.0,
+    stable_rescans_required: int = 0,
+    aggressive_dir_pruning: bool = False,
 ) -> Optional[SourceManager]:
     """Create a SourceManager for all configured sources.
 
@@ -847,6 +921,8 @@ def create_source_manager(
         stability_window=stability_window,
         probe_open_files=probe_open_files,
         full_rescan_interval=full_rescan_interval,
+        stable_rescans_required=stable_rescans_required,
+        aggressive_dir_pruning=aggressive_dir_pruning,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)

@@ -240,8 +240,13 @@ class ServerConfig:
             subtree pruning. Values <= 0 disable the periodic full-scan backstop.
         stability_window: Minimum quiet period before a path/subtree is eligible
             for discovery or removal checks.
-        probe_open_files: When True, verify candidate files can be opened for append
-            before considering them stable.
+        stable_rescans_required: Additional unchanged rescans required before a
+            path is considered stable. The default 0 preserves current behavior.
+        probe_open_files: When True, perform a best-effort append-open probe
+            before considering candidate files stable. This is advisory only.
+        aggressive_dir_pruning: When True, allow unchanged monitored roots to be
+            pruned in addition to descendant subdirectories. This reduces scan
+            cost further but may defer root-level file updates until a later scan.
         writable: Enable write mode for source creation and data upload
         write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
@@ -263,7 +268,9 @@ class ServerConfig:
     rescan_interval: float = 30.0
     full_rescan_interval: float = 3600.0
     stability_window: float = 30.0
+    stable_rescans_required: int = 0
     probe_open_files: bool = True
+    aggressive_dir_pruning: bool = False
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -323,7 +330,9 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
     full_rescan_interval = server_data.get("full_rescan_interval", 3600.0)
     stability_window = server_data.get("stability_window", 30.0)
+    stable_rescans_required = server_data.get("stable_rescans_required", 0)
     probe_open_files = server_data.get("probe_open_files", True)
+    aggressive_dir_pruning = server_data.get("aggressive_dir_pruning", False)
     writable = server_data.get("writable", False)
     write_dir_str = server_data.get("write_dir", None)
     write_dir = Path(write_dir_str) if write_dir_str else None
@@ -430,7 +439,9 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         rescan_interval=float(rescan_interval),
         full_rescan_interval=float(full_rescan_interval),
         stability_window=float(stability_window),
+        stable_rescans_required=max(0, int(stable_rescans_required)),
         probe_open_files=bool(probe_open_files),
+        aggressive_dir_pruning=bool(aggressive_dir_pruning),
         compute_backend=compute_backend,
         gpu_min_input_mb=float(gpu_min_input_mb),
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),

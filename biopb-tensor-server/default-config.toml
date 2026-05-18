@@ -6,7 +6,9 @@ monitor_mode = "periodic"  # periodic or off
 rescan_interval = 60.0
 full_rescan_interval = 3600.0
 stability_window = 30.0
+stable_rescans_required = 0
 probe_open_files = true
+aggressive_dir_pruning = false
 
 [cache]
 memory_max_bytes = 4294967296  # 4 GB

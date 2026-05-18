@@ -235,6 +235,8 @@ def _setup_flight_server(
         stability_window=server_config.stability_window,
         probe_open_files=server_config.probe_open_files,
         full_rescan_interval=server_config.full_rescan_interval,
+        stable_rescans_required=server_config.stable_rescans_required,
+        aggressive_dir_pruning=server_config.aggressive_dir_pruning,
     )
 
     if source_manager is None:
