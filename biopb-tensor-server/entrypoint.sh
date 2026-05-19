@@ -17,7 +17,7 @@ set -e
 # Default 8810 → HTTP=8814, gRPC=8815, Sidecar=8816, Flight=8817
 BIOPB_BASE_PORT="${BIOPB_BASE_PORT:-8810}"
 
-# Find available port (for Singularity host network mode)
+# Find available port starting from base, scanning upward
 find_available_port() {
     local base=$1
     local max_attempts=100
@@ -31,11 +31,12 @@ find_available_port() {
     echo $base  # fallback
 }
 
-# Derive all ports from base with conflict detection
+# Derive all ports sequentially, using previous port as starting point
+# This ensures no overlap between discovered ports
 NGINX_HTTP_PORT=$(find_available_port $((BIOPB_BASE_PORT + 4)))
-NGINX_GRPC_PORT=$(find_available_port $((BIOPB_BASE_PORT + 5)))
-WEB_PORT=$(find_available_port $((BIOPB_BASE_PORT + 6)))
-PORT=$(find_available_port $((BIOPB_BASE_PORT + 7)))
+NGINX_GRPC_PORT=$(find_available_port $((NGINX_HTTP_PORT + 1)))
+WEB_PORT=$(find_available_port $((NGINX_GRPC_PORT + 1)))
+PORT=$(find_available_port $((WEB_PORT + 1)))
 
 echo "Ports: HTTP=$NGINX_HTTP_PORT gRPC=$NGINX_GRPC_PORT Sidecar=$WEB_PORT Flight=$PORT"
 
