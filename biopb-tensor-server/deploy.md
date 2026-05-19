@@ -108,6 +108,8 @@ The container uses a unified entrypoint that supports two configuration methods:
 1. **Config file**: If `CONFIG_FILE` is set and the file exists, uses that TOML file
 2. **Environment variables**: Otherwise, generates config from `DATA_DIR`, `MONITOR`, etc.
 
+When `MONITOR=true`, initial dataset discovery follows the same stability checks as later rescans. On startup, the server may therefore come up healthy before newly written files under the monitored directory are exposed as sources. With the default settings, expect monitored datasets to appear only after they have remained unchanged for the configured stability window.
+
 ### Examples
 
 ```bash
@@ -137,6 +139,8 @@ docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
 ```
 
 ### Health Checks
+
+These checks report service readiness, not completion of monitored dataset discovery. A healthy container can still have zero visible monitored sources briefly after startup while stability gating defers initial registration.
 
 ```bash
 # Liveness (HTTP)
