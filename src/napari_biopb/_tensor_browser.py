@@ -16,6 +16,7 @@ from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -753,20 +754,28 @@ class TensorBrowserWidget(QWidget):
         url_parts = _get_path_parts(src.source_url)
         stem = url_parts[-1] if url_parts else source_id
 
-        for tensor in src.tensors:
-            try:
-                arr = self._client.get_tensor(source_id, tensor.array_id)
-                tensor_name = _tensor_short_name(tensor.array_id)
-                layer_name = f"{stem}/{tensor_name}"
-                self._viewer.add_image(arr, name=layer_name)
-                logger.info(
-                    "Added tensor '%s' from source '%s' to viewer as '%s'",
-                    tensor.array_id,
-                    source_id,
-                    layer_name,
-                )
-            except Exception:
-                logger.exception("Failed to load tensor %s", tensor.array_id)
+        # Show busy cursor during loading
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+
+        try:
+            for tensor in src.tensors:
+                try:
+                    arr = self._client.get_tensor(source_id, tensor.array_id)
+                    tensor_name = _tensor_short_name(tensor.array_id)
+                    layer_name = f"{stem}/{tensor_name}"
+                    self._viewer.add_image(arr, name=layer_name)
+                    logger.info(
+                        "Added tensor '%s' from source '%s' to viewer as '%s'",
+                        tensor.array_id,
+                        source_id,
+                        layer_name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to load tensor %s", tensor.array_id
+                    )
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _show_metadata_dialog(self, source_id: str, tensor_id: Optional[str]):
         """Show metadata dialog for source/tensor."""
@@ -894,6 +903,9 @@ class TensorBrowserWidget(QWidget):
             return
 
         try:
+            # Show busy cursor during loading
+            QApplication.setOverrideCursor(Qt.BusyCursor)
+
             arr = self._client.get_tensor(
                 self._selected_source_id, self._selected_tensor_id
             )
@@ -923,3 +935,5 @@ class TensorBrowserWidget(QWidget):
                 self._selected_tensor_id,
                 self._selected_source_id,
             )
+        finally:
+            QApplication.restoreOverrideCursor()
