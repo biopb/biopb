@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest >= 7.0",
+  "biopb-tensor-server",
 ]
 
 [tool.setuptools.packages.find]
