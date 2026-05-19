@@ -58,6 +58,7 @@ def _setup_flight_server(
     gpu_memory_safety_factor: Optional[int] = None,
     gpu_min_merged_chunks: Optional[int] = None,
     writable: Optional[bool] = None,
+    token: Optional[str] = None,
 ) -> Tuple[TensorFlightServer, Optional[object], Optional[object]]:
     """Set up the Flight server with cache, sources, and monitoring.
 
@@ -67,6 +68,7 @@ def _setup_flight_server(
         port: Override port
         compute_backend: Override compute backend policy
         gpu_* params: Override GPU policy parameters
+        token: Access token for Flight server authentication
 
     Returns:
         Tuple of (flight_server, source_manager, watcher)
@@ -192,10 +194,9 @@ def _setup_flight_server(
 
     # Create and start server
     location = f"grpc://{host}:{port}"
-    flight_token = os.environ.get("BIOPB_WEB_TOKEN") or None
     server = TensorFlightServer(
         location,
-        token=flight_token,
+        token=token,
         writable=effective_writable,
         write_dir=write_dir,
         metadata_db=metadata_db,
@@ -362,6 +363,9 @@ def serve(
     )
     setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
 
+    # Token from env var only (no auto-gen for serve - it's non-interactive)
+    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
+
     server, source_manager, watcher = _setup_flight_server(
         server_config,
         host=host,
@@ -372,6 +376,7 @@ def serve(
         gpu_memory_safety_factor=gpu_memory_safety_factor,
         gpu_min_merged_chunks=gpu_min_merged_chunks,
         writable=writable,
+        token=token,
     )
 
     location = f"grpc://{host or server_config.host}:{port or server_config.port}"
@@ -660,7 +665,9 @@ def launch(
         )
 
     # --- Start Flight server ---
-    flight_server, source_manager, watcher = _setup_flight_server(server_config)
+    flight_server, source_manager, watcher = _setup_flight_server(
+        server_config, token=effective_token
+    )
 
     flight_location = f"grpc://{server_config.host}:{server_config.port}"
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)

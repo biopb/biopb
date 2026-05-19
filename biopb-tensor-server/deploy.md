@@ -79,34 +79,46 @@ docker run -d \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | `/app/config/default-config.toml` | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
+| `CONFIG_FILE` | (none) | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
 | `DATA_DIR` | `/data` | Directory containing microscopy files (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (NFS/Lustre: set to false) |
-| `HOST` | `127.0.0.1` | gRPC server host (internal, proxied through nginx) |
-| `PORT` | `8817` | gRPC server port (internal, proxied through nginx) |
-| `WEB_HOST` | `127.0.0.1` | HTTP sidecar host (internal) |
-| `WEB_PORT` | `8816` | HTTP sidecar port (internal) |
-| `NGINX_HTTP_PORT` | `8814` | nginx/webapp HTTP port (external) |
-| `NGINX_GRPC_PORT` | `8815` | nginx gRPC port (external) |
+| `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5, Sidecar=BASE+6, Flight=BASE+7 |
 | `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Base temp directory (avoids multi-user collisions on shared /tmp) |
+
+### Port Derivation
+
+All ports are derived from `BIOPB_BASE_PORT`:
+
+| Service | Port | Formula |
+|---------|------|---------|
+| nginx HTTP (external) | 8814 | BASE + 4 |
+| nginx gRPC (external) | 8815 | BASE + 5 |
+| HTTP Sidecar (internal) | 8816 | BASE + 6 |
+| TensorFlightServer (internal) | 8817 | BASE + 7 |
+
+Ports are auto-discovered to avoid conflicts (especially for Singularity on HPC where host network is shared).
 
 ### Configuration Methods
 
 The container uses a unified entrypoint that supports two configuration methods:
 
 1. **Config file**: If `CONFIG_FILE` is set and the file exists, uses that TOML file
-2. **Environment variables**: Otherwise, generates config from `DATA_DIR`, `HOST`, `PORT`, etc.
-
-Docker sets `CONFIG_FILE=/app/config/default-config.toml` by default, so it uses the baked-in config. Singularity inherits this behavior; use `--cleanenv` to generate from env vars instead.
+2. **Environment variables**: Otherwise, generates config from `DATA_DIR`, `MONITOR`, etc.
 
 ### Examples
 
 ```bash
-# Basic run (uses baked-in default-config.toml)
+# Basic run (auto port discovery, default base 8810)
 docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server:latest
+
+# Custom base port (HTTP=9004, gRPC=9005, etc.)
+docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
+    -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
@@ -118,28 +130,10 @@ docker run -d -p 8814:8814 -p 8815:8815 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
-# Generate config from env vars (unset CONFIG_FILE)
-docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
-    -e CONFIG_FILE="" \
-    -e DATA_DIR=/data \
-    -e COMPUTE_BACKEND=cpu \
-    -e BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server:latest
-
 # Dev mode (localhost only, no token required)
 docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
     -e BIOPB_WEB_DEV_BYPASS=true \
     biopb-tensor-server:latest
-
-# HTTP only (webapp access only, no external gRPC)
-docker run -d -p 8814:8814 -v ~/data:/data \
-    -e BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server:latest
-
-# gRPC only (no webapp)
-docker run -d -p 8815:8815 -v ~/data:/data \
-    -e BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server:latest serve
 ```
 
 ### Health Checks
@@ -176,27 +170,18 @@ singularity build biopb-tensor-server.sif docker://ghcr.io/jiyuuchc/biopb-tensor
 ### Basic Singularity Run
 
 ```bash
+# Simple run - auto port discovery from default base (8810)
 singularity run \
     --bind ~/data:/data \
     --env BIOPB_TENSOR_TOKEN=your_secure_token \
     biopb-tensor-server.sif
 ```
 
-By default, Singularity inherits the Docker image's `CONFIG_FILE` environment variable, so it uses the baked-in config. To generate config from env vars instead:
-
-```bash
-# Use --cleanenv to not inherit Docker env vars, then set your own
-singularity run --cleanenv \
-    --bind ~/data:/data \
-    --env DATA_DIR=/data \
-    --env NGINX_HTTP_PORT=8814 \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-```
+Ports are auto-discovered to avoid conflicts on shared HPC nodes. The container will print discovered ports on startup.
 
 ### Configuration Options
 
-**Method 1: Use baked-in config (default)**
+**Method 1: Default (auto port discovery)**
 ```bash
 singularity run \
     --bind ~/data:/data \
@@ -204,13 +189,12 @@ singularity run \
     biopb-tensor-server.sif
 ```
 
-**Method 2: Generate from environment variables**
+**Method 2: Custom base port**
 ```bash
-singularity run --cleanenv \
+# Use BIOPB_BASE_PORT=9000 → HTTP=9004, gRPC=9005, Sidecar=9006, Flight=9007
+singularity run \
     --bind ~/data:/data \
-    --env DATA_DIR=/data \
-    --env NGINX_HTTP_PORT=8814 \
-    --env NGINX_GRPC_PORT=8815 \
+    --env BIOPB_BASE_PORT=9000 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 ```
@@ -228,17 +212,16 @@ singularity run \
 ### HPC Cluster Examples
 
 ```bash
-# SLURM interactive session
+# SLURM interactive session - auto port discovery
 srun --pty singularity run \
     --bind /scratch/user/data:/data \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# With custom ports
+# Custom base port range (avoid conflicts with other users)
 singularity run \
     --bind ~/data:/data \
-    --env NGINX_HTTP_PORT=8888 \
-    --env NGINX_GRPC_PORT=8889 \
+    --env BIOPB_BASE_PORT=9000 \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
@@ -316,11 +299,13 @@ The image now includes `bioformats-jar` and `aicsimageio[nd2]` for ND2 support. 
 
 ## Ports Summary
 
-| Port | Service | External Access | Configurable via |
-|------|---------|-----------------|------------------|
-| 8814 (default) | nginx HTTP | Yes (webapp + API + health) | `NGINX_HTTP_PORT` env var |
-| 8815 (default) | nginx gRPC | Yes (gRPC + health check) | `NGINX_GRPC_PORT` env var |
-| 8816 | FastAPI sidecar | No (internal only) | `WEB_PORT` env var |
-| 8817 | TensorFlightServer | No (internal, proxied via nginx gRPC) | `PORT` env var |
+All ports derived from `BIOPB_BASE_PORT` (default: 8810):
 
-Expose nginx HTTP (8814) for webapp access and nginx gRPC (8815) for programmatic gRPC clients. Internal ports 8816 and 8817 are not exposed directly.
+| Port | Service | External Access | Formula |
+|------|---------|-----------------|---------|
+| BASE+4 | nginx HTTP | Yes (webapp + API + health) | `BIOPB_BASE_PORT + 4` |
+| BASE+5 | nginx gRPC | Yes (gRPC + health check) | `BIOPB_BASE_PORT + 5` |
+| BASE+6 | FastAPI sidecar | No (internal only) | `BIOPB_BASE_PORT + 6` |
+| BASE+7 | TensorFlightServer | No (internal, proxied via nginx) | `BIOPB_BASE_PORT + 7` |
+
+Ports are auto-discovered at startup to avoid conflicts. Expose HTTP (BASE+4) for webapp access and gRPC (BASE+5) for programmatic clients.

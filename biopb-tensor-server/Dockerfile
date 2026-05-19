@@ -17,6 +17,8 @@ COPY wheels/biopb-*.whl /app/wheels/
 
 # Copy tensor server source
 COPY biopb-tensor-server/pyproject.toml ./tensor-server/
+COPY biopb-tensor-server/build_version.py ./tensor-server/                                                                                          
+COPY biopb-tensor-server/VERSION ./tensor-server/    
 COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
 
 # Install with correct order:
@@ -52,8 +54,6 @@ COPY biopb-tensor-server/entrypoint.sh /usr/local/bin/
 COPY biopb-tensor-server/nginx.conf /etc/nginx/nginx.conf
 COPY biopb-tensor-server/default-config.toml /app/config/
 
-# Set default config file (can be overridden at runtime)
-ENV CONFIG_FILE=/app/config/default-config.toml
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
 # Configure scyjava to use system JDK instead of downloading via cjdk

@@ -8,7 +8,7 @@ stability_window = 30.0
 probe_open_files = true
 
 [cache]
-memory_max_bytes=1073741824 * 4 # 4 GB
+memory_max_bytes = 4294967296  # 4 GB
 
 [compute]
 backend = "auto"
