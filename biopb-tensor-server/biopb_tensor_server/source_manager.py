@@ -177,26 +177,50 @@ class SourceManager:
             return
 
         force_full_rescan = self._should_force_full_rescan()
-        skipped_dirs = self._refresh_entry_state(force_full=force_full_rescan)
-        discovered_state = DiscoveryState()
-        for monitored_dir in sorted(self._monitored_dirs):
-            resolved_dir = monitored_dir.resolve()
-            if str(resolved_dir) in skipped_dirs:
-                continue
-            discover_sources(
-                monitored_dir,
-                self._registry,
-                state=discovered_state,
-                dim_labels=self._dim_labels,
-                path_filter=self._should_scan_path,
-            )
+        (
+            next_state,
+            next_stable_observations,
+            next_pending_scan,
+            skipped_dirs,
+        ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
+        previous_state = self._entry_state
+        previous_stable_observations = self._entry_stable_observations
+        previous_pending_scan = self._entry_pending_scan
+        previous_skipped_dirs = self._skipped_stable_dirs
 
-        self._preserve_skipped_claims(discovered_state, skipped_dirs)
+        self._entry_state = next_state
+        self._entry_stable_observations = next_stable_observations
+        self._entry_pending_scan = next_pending_scan
+        self._skipped_stable_dirs = skipped_dirs
 
-        unstable_paths = self._get_unstable_paths()
-        self._reconcile_discovered_state(discovered_state, unstable_paths)
+        rescan_succeeded = False
+        try:
+            discovered_state = DiscoveryState()
+            for monitored_dir in sorted(self._monitored_dirs):
+                resolved_dir = monitored_dir.resolve()
+                if str(resolved_dir) in skipped_dirs:
+                    continue
+                discover_sources(
+                    monitored_dir,
+                    self._registry,
+                    state=discovered_state,
+                    dim_labels=self._dim_labels,
+                    path_filter=self._should_scan_path,
+                )
 
-        if force_full_rescan:
+            self._preserve_skipped_claims(discovered_state, skipped_dirs)
+
+            unstable_paths = self._get_unstable_paths()
+            self._reconcile_discovered_state(discovered_state, unstable_paths)
+            rescan_succeeded = True
+        finally:
+            if not rescan_succeeded:
+                self._entry_state = previous_state
+                self._entry_stable_observations = previous_stable_observations
+                self._entry_pending_scan = previous_pending_scan
+                self._skipped_stable_dirs = previous_skipped_dirs
+
+        if force_full_rescan and rescan_succeeded:
             self._last_full_rescan_at = time.time()
 
     def _cleanup_deleted_monitored_dirs(self) -> None:
@@ -258,7 +282,16 @@ class SourceManager:
                 deleted_dir,
             )
 
-    def _refresh_entry_state(self, force_full: bool = False) -> Set[str]:
+    def _refresh_entry_state(
+        self,
+        force_full: bool = False,
+        publish: bool = True,
+    ) -> Tuple[
+        Dict[str, Tuple[bool, Tuple[Any, ...], float]],
+        Dict[str, int],
+        Dict[str, bool],
+        Set[str],
+    ]:
         """Refresh cached filesystem signatures for all monitored trees."""
         now = time.time()
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
@@ -276,11 +309,17 @@ class SourceManager:
                 force_full,
                 self._aggressive_dir_pruning,
             )
-        self._entry_state = next_state
-        self._entry_stable_observations = next_stable_observations
-        self._entry_pending_scan = next_pending_scan
-        self._skipped_stable_dirs = skipped_dirs
-        return skipped_dirs
+        if publish:
+            self._entry_state = next_state
+            self._entry_stable_observations = next_stable_observations
+            self._entry_pending_scan = next_pending_scan
+            self._skipped_stable_dirs = skipped_dirs
+        return (
+            next_state,
+            next_stable_observations,
+            next_pending_scan,
+            skipped_dirs,
+        )
 
     def _scan_tree_state(
         self,

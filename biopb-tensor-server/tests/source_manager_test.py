@@ -329,12 +329,17 @@ class TestSourceManagerRegressions:
         original_refresh = manager._refresh_entry_state
         refresh_calls = {"count": 0}
 
-        def fake_refresh(force_full=False):
+        def fake_refresh(force_full=False, publish=True):
             refresh_calls["count"] += 1
             if refresh_calls["count"] == 1:
                 manager._skipped_stable_dirs = {str(monitored_dir.resolve())}
-                return manager._skipped_stable_dirs
-            return original_refresh(force_full=force_full)
+                return (
+                    manager._entry_state,
+                    manager._entry_stable_observations,
+                    manager._entry_pending_scan,
+                    manager._skipped_stable_dirs,
+                )
+            return original_refresh(force_full=force_full, publish=publish)
 
         monkeypatch.setattr(manager, "_refresh_entry_state", fake_refresh)
 
@@ -347,6 +352,49 @@ class TestSourceManagerRegressions:
 
         assert source_id not in state.claims
         assert server.unregistered == [source_id]
+
+    def test_failed_rescan_preserves_previous_entry_cache(self, tmp_path, monkeypatch):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        manager._handle_rescan()
+        previous_entry_state = dict(manager._entry_state)
+        previous_stable_observations = dict(manager._entry_stable_observations)
+        previous_pending_scan = dict(manager._entry_pending_scan)
+        previous_skipped_dirs = set(manager._skipped_stable_dirs)
+
+        data_path.write_text("changed")
+        monkeypatch.setattr(
+            manager,
+            "_reconcile_discovered_state",
+            lambda discovered_state, unstable_paths: (_ for _ in ()).throw(
+                RuntimeError("reconcile failed")
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="reconcile failed"):
+            manager._handle_rescan()
+
+        assert manager._entry_state == previous_entry_state
+        assert (
+            manager._entry_stable_observations == previous_stable_observations
+        )
+        assert manager._entry_pending_scan == previous_pending_scan
+        assert manager._skipped_stable_dirs == previous_skipped_dirs
 
     def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
         monitored_dir = tmp_path / "monitored"
