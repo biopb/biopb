@@ -1,6 +1,7 @@
 name: Build Bundled Installer
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       ref:
