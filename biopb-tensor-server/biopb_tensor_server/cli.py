@@ -662,9 +662,9 @@ def launch(
                 effective_token = secrets.token_urlsafe(32)
                 console.print("[yellow]Auto-generated secure access token.[/yellow]")
 
-        access_url = f"{web_url}"
         console.print(
-            f"\n[bold green]Access token (shown once — do not share):[/bold green]\n  {effective_token}\n"
+            f"\n[bold green]Access URL (shown once — do not share):[/bold green]\n"
+            f"  {web_url}/?token={effective_token}\n"
         )
 
     # --- Start Flight server ---

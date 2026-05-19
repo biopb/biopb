@@ -11,6 +11,7 @@ set -e
 # COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for webapp and gRPC (auto-generated if not set)
 # BIOPB_WEB_DEV_BYPASS - Set to "true" for dev mode
+# BIOPB_EXTERNAL_HOST - External hostname/IP for webapp URL (auto-detected if not set)
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
 
 # Single base port env var - all ports derived from it
@@ -102,9 +103,26 @@ if [ "${BIOPB_WEB_DEV_BYPASS}" = "true" ] || [ "${BIOPB_WEB_DEV_BYPASS}" = "1" ]
     export BIOPB_LOG_LEVEL="${BIOPB_LOG_LEVEL:-DEBUG}"
 fi
 
+# Construct best-effort external URL for webapp access
+# Priority: env var override > hostname > IP from default route > localhost
+if [ -n "$BIOPB_EXTERNAL_HOST" ]; then
+    WEB_HOST="$BIOPB_EXTERNAL_HOST"
+elif hostname -f 2>/dev/null | grep -q '\.'; then
+    # Has FQDN (e.g., server.example.com)
+    WEB_HOST="$(hostname -f)"
+elif hostname -I 2>/dev/null | grep -qE '^[0-9]+\.'; then
+    # Pick first non-localhost IP from hostname -I output
+    WEB_HOST="$(hostname -I | awk '{for(i=1;i<=NF;i++) if($i !~ /^127\./ && $i !~ /^169\.254\./) {print $i; exit}}')"
+    # Fallback if nothing found
+    [ -z "$WEB_HOST" ] && WEB_HOST="$(hostname -I | awk '{print $1}')"
+else
+    WEB_HOST="localhost"
+fi
+
 exec biopb-tensor-server "$COMMAND" \
     --config "$CONFIG_FILE" \
     --web-host 127.0.0.1 \
     --web-port ${WEB_PORT} \
+    --web-url "http://${WEB_HOST}:${NGINX_HTTP_PORT}" \
     --cors "*" \
     "$@"
