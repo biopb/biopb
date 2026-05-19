@@ -73,7 +73,7 @@ jobs:
     # github secrets (see readme for details)
     needs: [test]
     runs-on: ubuntu-latest
-    if: contains(github.ref, 'tags')
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v5
       - name: Set up Python
@@ -92,3 +92,22 @@ jobs:
           git tag
           python -m build .
           twine upload dist/*
+
+  trigger-bundle:
+    name: Trigger bundle build
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger bundle workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'release_bundle.yml',
+              ref: context.ref
+            })
