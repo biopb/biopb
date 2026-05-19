@@ -19,6 +19,9 @@ DEFAULT_CONFIG = {
     "server": {
         "url": "lacss.biopb.org",
     },
+    "tensor_browser": {
+        "server_url": "grpc://localhost:8815",
+    },
     "detection": {
         "min_score": 0.4,
         "size_hint": 32.0,

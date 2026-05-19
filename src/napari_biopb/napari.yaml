@@ -5,6 +5,9 @@ visibility: public
 categories: ["Annotation", "Segmentation", "Image Processing"]
 contributions:
   commands:
+    - id: napari-biopb.make_tensor_browser_widget
+      python_name: napari_biopb:TensorBrowserWidget
+      title: Tensor Browser
     - id: napari-biopb.make_object_detection_widget
       python_name: napari_biopb:ObjectDetectionWidget
       title: Object Detection
@@ -12,8 +15,9 @@ contributions:
       python_name: napari_biopb:ImageProcessingWidget
       title: Image Processing
   widgets:
+    - command: napari-biopb.make_tensor_browser_widget
+      display_name: Tensor Browser
     - command: napari-biopb.make_object_detection_widget
       display_name: Object Detection
     - command: napari-biopb.make_image_processing_widget
       display_name: Image Processing
-    #   autogenerate: true

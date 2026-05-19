@@ -9,5 +9,10 @@ except Exception:
 
 from ._object_detection import ObjectDetectionWidget
 from ._image_processing import ImageProcessingWidget
+from ._tensor_browser import TensorBrowserWidget
 
-__all__ = ("ObjectDetectionWidget", "ImageProcessingWidget")
+__all__ = (
+    "ObjectDetectionWidget",
+    "ImageProcessingWidget",
+    "TensorBrowserWidget",
+)
