@@ -107,6 +107,7 @@ class TestQueryCommand:
             mock_fc_class.assert_called_once_with(
                 location="grpc://custom:9000",
                 cache_bytes=100_000_000,
+                token=None,
             )
 
     def test_query_shows_cache_info(self):

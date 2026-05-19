@@ -48,11 +48,15 @@ def _normalize_location(location: str) -> str:
     return location
 
 
-def _create_flight_client(location: str, cache_bytes: int) -> TensorFlightClient:
+def _create_flight_client(
+    location: str,
+    cache_bytes: int,
+    token: Optional[str] = None,
+) -> TensorFlightClient:
     """Create a Flight client, with user-friendly error handling."""
     try:
         normalized = _normalize_location(location)
-        return TensorFlightClient(location=normalized, cache_bytes=cache_bytes)
+        return TensorFlightClient(location=normalized, cache_bytes=cache_bytes, token=token)
     except Exception as exc:
         stderr_console.print(f"[red]Cannot connect to server at {location}:[/red] {exc}")
         raise typer.Exit(1)
@@ -139,6 +143,13 @@ def query(
         envvar="BIOPB_TENSOR_SERVER",
         help="TensorFlight server URI",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        envvar="BIOPB_TENSOR_TOKEN",
+        help="Bearer token for server authentication",
+    ),
     cache_bytes: int = typer.Option(
         100_000_000,
         "--cache-bytes",
@@ -149,10 +160,11 @@ def query(
 
     Example:
         biopb tensor query --server grpc://localhost:8815
-        biopb tensor query -s grpc://myhost:9000
+        biopb tensor query -s grpc://myhost:9000 --token mytoken123
+        BIOPB_TENSOR_TOKEN=mytoken123 biopb tensor query
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes)
+    client = _create_flight_client(server, cache_bytes, token)
     try:
         sources = client.list_sources()
         if not sources:
@@ -210,8 +222,14 @@ def metadata(
     tensor: Optional[str] = typer.Option(
         None,
         "--tensor",
-        "-t",
         help="Specific tensor ID to inspect (optional)",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-T",
+        envvar="BIOPB_TENSOR_TOKEN",
+        help="Bearer token for server authentication",
     ),
     cache_bytes: int = typer.Option(
         100_000_000,
@@ -224,10 +242,10 @@ def metadata(
     Example:
         biopb tensor metadata my-source
         biopb tensor metadata my-source --tensor pos_0
-        biopb tensor metadata my-source -s grpc://myhost:9000
+        biopb tensor metadata my-source -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes)
+    client = _create_flight_client(server, cache_bytes, token)
     try:
         sources = client.list_sources()
         if source_id not in sources:
@@ -314,6 +332,13 @@ def get(
         "-S",
         help="Slice specification, e.g. '0:100,0:200'",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        envvar="BIOPB_TENSOR_TOKEN",
+        help="Bearer token for server authentication",
+    ),
     cache_bytes: int = typer.Option(
         100_000_000,
         "--cache-bytes",
@@ -336,9 +361,10 @@ def get(
         biopb tensor get my-source -o -                 # stdout (pickle)
         biopb tensor get my-source -f zarr -o data      # explicit format
         biopb tensor get my-source --slice 0:100 -o slice.pkl
+        biopb tensor get my-source --token mytoken123 -o output.pkl
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes)
+    client = _create_flight_client(server, cache_bytes, token)
     try:
         source_id, tensor_id = _parse_array_id(array_id)
         selection = _parse_slice_hint(slice_hint)
@@ -415,6 +441,13 @@ def stats(
         "-S",
         help="Slice specification, e.g. '0:100,0:200'",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        envvar="BIOPB_TENSOR_TOKEN",
+        help="Bearer token for server authentication",
+    ),
     cache_bytes: int = typer.Option(
         100_000_000,
         "--cache-bytes",
@@ -430,10 +463,10 @@ def stats(
         biopb tensor stats my-source
         biopb tensor stats my-source/pos_0
         biopb tensor stats my-source/pos_0 --slice 0:100,0:100
-        biopb tensor stats my-source/pos_0 -S 0:512 -s grpc://myhost:9000
+        biopb tensor stats my-source/pos_0 -S 0:512 -s grpc://myhost:9000 --token mytoken123
     """
     start_time = time.time()
-    client = _create_flight_client(server, cache_bytes)
+    client = _create_flight_client(server, cache_bytes, token)
     try:
         source_id, tensor_id = _parse_array_id(array_id)
         selection = _parse_slice_hint(slice_hint)

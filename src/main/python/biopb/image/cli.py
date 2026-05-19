@@ -266,18 +266,27 @@ def ops(
         envvar="BIOPB_IMAGE_SERVER",
         help="ProcessImage server URI",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        envvar="BIOPB_IMAGE_TOKEN",
+        help="Bearer token for server authentication",
+    ),
 ) -> None:
     """List available operations from a ProcessImage server.
 
     Example:
         biopb image ops --server grpc://localhost:50051
-        biopb image ops -s grpc://myhost:9000
+        biopb image ops -s grpc://myhost:9000 --token mytoken123
+        BIOPB_IMAGE_TOKEN=mytoken123 biopb image ops
     """
     start_time = time.time()
     channel = _create_grpc_channel(server)
+    metadata = [("authorization", f"Bearer {token}")] if token else None
     try:
         stub = ProcessImageStub(channel)
-        response: OpNames = stub.GetOpNames(empty_pb2.Empty(), timeout=10)
+        response: OpNames = stub.GetOpNames(empty_pb2.Empty(), metadata=metadata, timeout=10)
 
         if not response.names:
             stderr_console.print(f"[yellow]No operations found on {server}[/yellow]")
@@ -356,6 +365,13 @@ def process(
         envvar="BIOPB_IMAGE_SERVER",
         help="ProcessImage server URI",
     ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        envvar="BIOPB_IMAGE_TOKEN",
+        help="Bearer token for server authentication",
+    ),
 ) -> None:
     """Execute an image processing operation.
 
@@ -372,10 +388,12 @@ def process(
         biopb image process input.png --op mock_echo --output output.png
         biopb image process input.pb --op mock_echo -O output.pb
         biopb tensor get my-source -o - | biopb image process --op segment -O -
+        biopb image process input.png --op segment --token mytoken123 -O output.pb
     """
     start_time = time.time()
     channel = _create_grpc_channel(server)
     fmt = _infer_format(output, format)
+    metadata = [("authorization", f"Bearer {token}")] if token else None
 
     try:
         # Parse input
@@ -394,7 +412,7 @@ def process(
 
         # Call server
         stub = ProcessImageStub(channel)
-        response: ProcessResponse = stub.Run(request, timeout=60)
+        response: ProcessResponse = stub.Run(request, metadata=metadata, timeout=60)
 
         # Write output
         _write_output(response, output, fmt)
