@@ -9,7 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor import TensorFlightClient
@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # Threshold for switching to server-side SQL query
 SERVER_QUERY_THRESHOLD = 1000
+
+# Threshold for building pyramid (x-y dimensions must exceed this)
+PYRAMID_THRESHOLD = 4096
 
 
 # ==============================================================================
@@ -243,6 +246,90 @@ def _filter_empty_metadata(metadata: Dict) -> Dict:
             filtered[key] = value
 
     return filtered
+
+
+def _get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
+    """Get indices of x and y dimensions from tensor descriptor.
+
+    Uses dim_labels as primary source (looks for 'x', 'y').
+    Falls back to last two dimensions if dim_labels not available.
+
+    Returns:
+        Tuple of (y_index, x_index) - y first for row/col convention
+    """
+    ndim = len(tensor_desc.shape)
+
+    if tensor_desc.dim_labels:
+        # Find x and y from dim_labels
+        labels_lower = [l.lower() for l in tensor_desc.dim_labels]
+        try:
+            x_idx = labels_lower.index("x")
+            y_idx = labels_lower.index("y")
+            return (y_idx, x_idx)
+        except ValueError:
+            pass
+
+    # Fall back to last two dimensions (common convention: ...x, y)
+    if ndim >= 2:
+        return (ndim - 1, ndim - 2)  # (y, x)
+
+    return (0, 1) if ndim == 2 else (0, 0)
+
+
+def _build_pyramid_levels(
+    client: TensorFlightClient,
+    source_id: str,
+    tensor_id: str,
+    tensor_desc,
+) -> List:
+    """Build pyramid levels for large x-y datasets.
+
+    Args:
+        client: TensorFlightClient instance
+        source_id: Source identifier
+        tensor_id: Tensor identifier
+        tensor_desc: TensorDescriptor with shape info
+
+    Returns:
+        List of dask arrays at different resolution levels (pyramid)
+    """
+    shape = tensor_desc.shape
+    ndim = len(shape)
+
+    y_idx, x_idx = _get_xy_dim_indices(tensor_desc)
+
+    x_size = shape[x_idx]
+    y_size = shape[y_idx]
+
+    # Check if x-y dimensions exceed threshold
+    if x_size <= PYRAMID_THRESHOLD and y_size <= PYRAMID_THRESHOLD:
+        # No pyramid needed
+        return [client.get_tensor(source_id, tensor_id)]
+
+    # Build pyramid levels: 1x, 2x, 4x, 8x, ... until smallest >= 256
+    levels = []
+    scale = 1
+    min_size = 256
+
+    while True:
+        # Build scale_hint: downsample only x-y dimensions
+        scale_hint = [1] * ndim
+        scale_hint[y_idx] = scale
+        scale_hint[x_idx] = scale
+
+        arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
+        levels.append(arr)
+
+        # Check if we've reached minimum size
+        scaled_x = x_size // scale
+        scaled_y = y_size // scale
+        if scaled_x < min_size or scaled_y < min_size:
+            break
+
+        # Double downsampling for next level
+        scale *= 2
+
+    return levels
 
 
 class MetadataDialog(QDialog):
@@ -760,16 +847,32 @@ class TensorBrowserWidget(QWidget):
         try:
             for tensor in src.tensors:
                 try:
-                    arr = self._client.get_tensor(source_id, tensor.array_id)
+                    # Build pyramid levels if needed
+                    levels = _build_pyramid_levels(
+                        self._client, source_id, tensor.array_id, tensor
+                    )
                     tensor_name = _tensor_short_name(tensor.array_id)
                     layer_name = f"{stem}/{tensor_name}"
-                    self._viewer.add_image(arr, name=layer_name)
-                    logger.info(
-                        "Added tensor '%s' from source '%s' to viewer as '%s'",
-                        tensor.array_id,
-                        source_id,
-                        layer_name,
-                    )
+
+                    # Add as multiscale pyramid if multiple levels
+                    if len(levels) > 1:
+                        self._viewer.add_image(
+                            levels, name=layer_name, multiscale=True
+                        )
+                        logger.info(
+                            "Added multiscale pyramid '%s' (%d levels) from source '%s'",
+                            layer_name,
+                            len(levels),
+                            source_id,
+                        )
+                    else:
+                        self._viewer.add_image(levels[0], name=layer_name)
+                        logger.info(
+                            "Added tensor '%s' from source '%s' to viewer as '%s'",
+                            tensor.array_id,
+                            source_id,
+                            layer_name,
+                        )
                 except Exception:
                     logger.exception(
                         "Failed to load tensor %s", tensor.array_id
@@ -902,12 +1005,25 @@ class TensorBrowserWidget(QWidget):
             self._show_error("Source not found")
             return
 
+        # Find tensor descriptor
+        tensor_desc = next(
+            (t for t in src.tensors if t.array_id == self._selected_tensor_id),
+            None,
+        )
+        if not tensor_desc:
+            self._show_error("Tensor descriptor not found")
+            return
+
         try:
             # Show busy cursor during loading
             QApplication.setOverrideCursor(Qt.BusyCursor)
 
-            arr = self._client.get_tensor(
-                self._selected_source_id, self._selected_tensor_id
+            # Build pyramid levels if x-y dimensions are large
+            levels = _build_pyramid_levels(
+                self._client,
+                self._selected_source_id,
+                self._selected_tensor_id,
+                tensor_desc,
             )
 
             # Build layer name: source_url.stem[/tensor_short_name]
@@ -920,13 +1036,25 @@ class TensorBrowserWidget(QWidget):
                 tensor_name = _tensor_short_name(self._selected_tensor_id)
                 layer_name = f"{stem}/{tensor_name}"
 
-            self._viewer.add_image(arr, name=layer_name)
-            logger.info(
-                "Added tensor '%s' from source '%s' to viewer as '%s'",
-                self._selected_tensor_id,
-                self._selected_source_id,
-                layer_name,
-            )
+            # Add as multiscale pyramid if multiple levels, otherwise single array
+            if len(levels) > 1:
+                self._viewer.add_image(
+                    levels, name=layer_name, multiscale=True
+                )
+                logger.info(
+                    "Added multiscale pyramid '%s' (%d levels) from source '%s'",
+                    layer_name,
+                    len(levels),
+                    self._selected_source_id,
+                )
+            else:
+                self._viewer.add_image(levels[0], name=layer_name)
+                logger.info(
+                    "Added tensor '%s' from source '%s' to viewer as '%s'",
+                    self._selected_tensor_id,
+                    self._selected_source_id,
+                    layer_name,
+                )
 
         except Exception:
             self._show_error("Failed to load tensor")
