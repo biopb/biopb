@@ -11,13 +11,31 @@ A [biopb](https://github.com/jiyuuchc/biopb) plugin for [napari](https://github.
 
 ## Installation
 
-You can install `napari-biopb` via [pip]:
+### Bundled Installers
+
+Pre-built standalone installers are available from the [Releases](https://github.com/jiyuuchc/napari-biopb/releases) page. These include napari with the napari-biopb plugin pre-installed—no Python setup required.
+
+| Platform | Download |
+|----------|----------|
+| Windows | `napari-biopb-windows.zip` |
+| macOS (Intel) | `napari-biopb-macos-intel.tar.gz` |
+| macOS (Apple Silicon) | `napari-biopb-macos-arm.tar.gz` |
+| Linux | `napari-biopb-linux.tar.gz` |
+
+**Usage:**
+- **Windows**: Extract the zip and run `napari-biopb.exe`
+- **macOS**: Extract and open `napari-biopb.app` (right-click → "Open" to bypass Gatekeeper for unsigned apps)
+- **Linux**: Extract and run `./napari-biopb`
+
+### From PyPI
+
+For users with existing virtual environement setup for napari: install `napari-biopb` via [pip]:
 
     pip install napari-biopb
 
+### Development Version
 
-
-To install latest development version :
+To install latest development version:
 
     pip install git+https://github.com/jiyuuchc/napari-biopb.git
 
