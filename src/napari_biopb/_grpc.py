@@ -10,7 +10,10 @@ import biopb.image as proto
 import grpc
 import numpy as np
 import pandas as pd
-from biopb.image.utils import deserialize_to_numpy, serialize_from_numpy
+from biopb.image.utils import (
+    deserialize_image_data,
+    serialize_from_numpy_to_image_data,
+)
 from google.protobuf import empty_pb2, struct_pb2
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from napari.qt.threading import thread_worker
@@ -158,8 +161,8 @@ def _parse_annotation_tsv(annotation: str) -> pd.DataFrame:
 
 def _encode_image(
     image: np.ndarray, np_index_order: str = "YXC", z_ratio: float = 1.0
-):
-    """Encode numpy image array to protobuf Pixels format.
+) -> proto.ImageData:
+    """Encode numpy image array to protobuf ImageData format.
 
     Args:
         image: Input image array (must match np_index_order specification)
@@ -167,7 +170,7 @@ def _encode_image(
         z_ratio: Z aspect ratio for 3D images
 
     Returns:
-        protobuf Pixels object
+        protobuf ImageData object
 
     Raises:
         ValueError: If image dimensions don't match np_index_order
@@ -179,17 +182,18 @@ def _encode_image(
             f"Got shape {image.shape} with {image.ndim} dimensions"
         )
 
-    # Add batch dimension (B, ...) for serialize_from_numpy
+    # Add batch dimension (B, ...) for processing
     image = image[None, ...]
 
-    pixels = serialize_from_numpy(
+    # Convert axis order string to list of individual labels
+    dim_labels = list(np_index_order)
+
+    image_data = serialize_from_numpy_to_image_data(
         image,
-        physical_size_x=1.0,
-        physical_size_y=1.0,
-        physical_size_z=z_ratio,
+        dim_labels=["B"] + dim_labels,
     )
 
-    return pixels
+    return image_data
 
 
 def _object_detection_build_request(
@@ -207,14 +211,14 @@ def _object_detection_build_request(
             f"Object detection image must have 3 or 4 dimensions. Got {image.ndim}"
         )
 
-    pixels = _encode_image(
+    image_data = _encode_image(
         image,
         np_index_order=np_index_order,
         z_ratio=settings["Z Aspect Ratio"],
     )
 
     request = proto.DetectionRequest(
-        image_data=proto.ImageData(pixels=pixels),
+        image_data=image_data,
         detection_settings=_get_detection_settings(settings),
     )
 
@@ -474,10 +478,14 @@ def _process_single_chunk(
     Returns:
         Tuple of (output, position, annotation_data)
     """
-    pixels = serialize_from_numpy(chunk, np_index_order=iter_spec.axis_order)
+    # Convert axis order to dim_labels list
+    dim_labels = list(iter_spec.axis_order)
+    image_data = serialize_from_numpy_to_image_data(
+        chunk, dim_labels=dim_labels
+    )
 
     request = proto.ProcessRequest(
-        image_data=proto.ImageData(pixels=pixels),
+        image_data=image_data,
         op_name=op_name,
         kwargs=dict_to_struct(kwargs),
     )
@@ -491,16 +499,13 @@ def _process_single_chunk(
     annotation_data = _parse_annotation_tsv(response.annotation)
 
     # Check if response has image data
-    has_image = (
-        response.image_data is not None
-        and response.image_data.pixels is not None
-        and response.image_data.pixels.ByteSize() > 0
-    )
+    has_image = response.image_data is not None
 
     if has_image:
-        output = deserialize_to_numpy(
-            response.image_data.pixels, np_index_order="TZCYX"
-        )
+        output = deserialize_image_data(response.image_data)
+        # Ensure numpy array (dask arrays are computed)
+        if hasattr(output, "compute"):
+            output = output.compute()
         output = output.astype(output.dtype.type)
 
         # Validate: all iter dims must be singleton in output
