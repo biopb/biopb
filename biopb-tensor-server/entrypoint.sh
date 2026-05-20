@@ -13,6 +13,8 @@ set -e
 # BIOPB_WEB_DEV_BYPASS - Set to "true" for dev mode
 # BIOPB_EXTERNAL_HOST - External hostname/IP for webapp URL (auto-detected if not set)
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
+# CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
+# CACHE_MAX_TOTAL_GB   - Max total size for file cache (default: 128)
 
 # Single base port env var - all ports derived from it
 # Default 8810 → HTTP=8814, gRPC=8815, Sidecar=8816, Flight=8817
@@ -57,6 +59,15 @@ else
 [server]
 host = "127.0.0.1"
 port = $PORT
+aggressive_dir_pruning = true
+
+[cache]
+backend = "file"
+file_max_segment_mb = ${CACHE_MAX_SEGMENT_MB:-256}
+file_max_total_gb = ${CACHE_MAX_TOTAL_GB:-128}
+
+[metadata_db]
+enabled = true
 
 [compute]
 backend = "${COMPUTE_BACKEND:-auto}"
