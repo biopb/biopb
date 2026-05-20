@@ -81,10 +81,32 @@ CMD ["--cache-dir", "/data/cache"]
 Then run it:
 
 ```bash
-docker run --rm -p 50051:50051 -p 8817:8817 -v tensor-cache:/data/cache \
-    my-biopb-servicer \
-    --cache-dir /data/cache --cache-size 32GB --tensor-external-location grpc://localhost:8817
+# For deployment: use externally reachable hostname/IP
+docker run --rm \
+  -p 50051:50051 \
+  -p 8817:8817  \
+  -v tensor-cache:/data/cache \
+  my-biopb-servicer \
+    --cache-dir /data/cache \
+    --cache-size 32GB \
+    --tensor-external-location \
+    grpc://$(hostname):8817
+
+# For local testing only (clients on same host):
+docker run --rm \
+  -p 50051:50051 \
+  -p 8817:8817  \
+  -v tensor-cache:/data/cache \
+  my-biopb-servicer \
+    --cache-dir /data/cache \
+    --cache-size 32GB \
+    --tensor-external-location \
+    grpc://localhost:8817
 ```
+
+**Note:** `--tensor-external-location` must be an address that clients can reach.
+Using `localhost` only works when clients run on the same host machine.
+For deployment, use the server's hostname or IP (e.g., `grpc://server-host:8817`).
 
 ### Run the Mock Service Explicitly
 
@@ -93,7 +115,7 @@ The mock servicer is available for pytest and explicit development workflows. Ru
 **With embedded cache:**
 
 ```bash
-docker run --rm -p 50051:50051 -p 8817:8817 -v tensor-cache:/data/cache \
+docker run --rm -p 50051:50051 -p 50052:8817 -v tensor-cache:/data/cache \
     biopb-image-base \
     python -m biopb_image_base.mock_servicer \
     --cache-dir /data/cache --cache-size 32GB

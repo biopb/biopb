@@ -37,6 +37,13 @@ def _resolve_tensor_external_location(
 ) -> str:
     """Resolve the client-visible tensor server URL for the embedded server."""
     if tensor_external_location:
+        # Warn if localhost used with 0.0.0.0 binding (external clients won't reach it)
+        if "localhost" in tensor_external_location and ip == "0.0.0.0" and not local:
+            logger.warning(
+                "tensor-external-location uses 'localhost' while binding to 0.0.0.0. "
+                "External clients cannot reach localhost. Use hostname or IP instead "
+                "(e.g., 'grpc://hostname:8817')"
+            )
         return tensor_external_location
     if local:
         return f"grpc://localhost:{tensor_port}"
