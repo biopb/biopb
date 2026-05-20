@@ -40,6 +40,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip cache purge
           pip install pyinstaller
           pip install napari[all]
           pip install .
@@ -70,7 +71,7 @@ jobs:
           7z a napari-biopb-${{ matrix.platform }}.zip napari-biopb
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: napari-biopb-${{ matrix.platform }}
           path: dist/napari-biopb-${{ matrix.platform }}.*
@@ -86,7 +87,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: napari-biopb-*
