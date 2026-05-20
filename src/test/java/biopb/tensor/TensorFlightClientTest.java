@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.arrow.flight.Criteria;
+import org.apache.arrow.flight.Action;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
@@ -19,6 +20,7 @@ import org.apache.arrow.flight.FlightProducer;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.NoOpFlightProducer;
+import org.apache.arrow.flight.Result;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -34,6 +36,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.Assert;
 import org.junit.Test;
 
+import com.google.gson.Gson;
 import com.google.protobuf.ByteString;
 
 import net.imglib2.RandomAccessibleInterval;
@@ -400,6 +403,99 @@ public class TensorFlightClientTest {
         }
     }
 
+    @Test
+    public void testGetUploadStatusFromSerializedTensor() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUploadStatusSequence("upload-source",
+                    status("upload-source", "PENDING", 4, 1));
+
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = SerializedTensor.newBuilder()
+                        .setTensorDescriptor(TensorDescriptor.newBuilder().setArrayId("upload-source").build())
+                        .build();
+
+                Map<String, Object> status = client.getUploadStatus(pb);
+                Assert.assertEquals("PENDING", status.get("state"));
+                Assert.assertEquals(1.0d, ((Number) status.get("uploaded_chunks")).doubleValue(), 0.0d);
+            }
+        }
+    }
+
+    @Test
+    public void testWaitForUploadReadyFromSerializedTensor() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUploadStatusSequence(
+                    "upload-source",
+                    status("upload-source", "PENDING", 4, 1),
+                    status("upload-source", "READY", 4, 4));
+
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = SerializedTensor.newBuilder()
+                        .setTensorDescriptor(TensorDescriptor.newBuilder().setArrayId("upload-source").build())
+                        .build();
+
+                Map<String, Object> status = client.waitForUploadReady(pb, 100L, 0L);
+                Assert.assertEquals("READY", status.get("state"));
+                Assert.assertEquals(4.0d, ((Number) status.get("uploaded_chunks")).doubleValue(), 0.0d);
+            }
+        }
+    }
+
+    @Test
+    public void testWaitForUploadReadyTimesOut() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUploadStatusSequence("upload-source",
+                    status("upload-source", "PENDING", 4, 1));
+
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IOException error = Assert.assertThrows(
+                        IOException.class,
+                        () -> client.waitForUploadReady("upload-source", 0L, 0L));
+                Assert.assertTrue(error.getMessage().contains("Timed out waiting for upload readiness"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetUploadStatusRequiresArrayId() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                SerializedTensor pb = SerializedTensor.newBuilder()
+                        .setTensorDescriptor(TensorDescriptor.newBuilder().build())
+                        .build();
+
+                IllegalArgumentException error = Assert.assertThrows(
+                        IllegalArgumentException.class,
+                        () -> client.getUploadStatus(pb));
+                Assert.assertTrue(error.getMessage().contains("tensor_descriptor.array_id is required"));
+            }
+        }
+    }
+
+    @Test
+    public void testWaitForUploadReadyRaisesOnFailedState() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUploadStatusSequence("upload-source",
+                    status("upload-source", "FAILED", 4, 2));
+
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IOException error = Assert.assertThrows(
+                        IOException.class,
+                        () -> client.waitForUploadReady("upload-source", 100L, 0L));
+                Assert.assertTrue(error.getMessage().contains("Upload failed for source 'upload-source'"));
+            }
+        }
+    }
+
+    private static Map<String, Object> status(String sourceId, String state, int expectedChunks, int uploadedChunks) {
+        Map<String, Object> status = new HashMap<>();
+        status.put("source_id", sourceId);
+        status.put("state", state);
+        status.put("expected_chunks", expectedChunks);
+        status.put("uploaded_chunks", uploadedChunks);
+        return status;
+    }
+
     private static class TestFlightServer implements AutoCloseable {
         private final BufferAllocator allocator;
         private final FlightServer server;
@@ -432,6 +528,10 @@ public class TensorFlightClientTest {
             return producer.getLastReductionMethod();
         }
 
+        void setUploadStatusSequence(String sourceId, Map<String, Object>... statuses) {
+            producer.setUploadStatusSequence(sourceId, Arrays.asList(statuses));
+        }
+
         @Override
         public void close() throws Exception {
             server.close();
@@ -446,6 +546,8 @@ public class TensorFlightClientTest {
         private final org.apache.arrow.vector.types.pojo.Schema schema;
         private final Map<String, float[]> chunkData;
         private final Map<String, AtomicInteger> chunkRequests;
+        private final Map<String, List<Map<String, Object>>> uploadStatusSequences;
+        private final Map<String, AtomicInteger> uploadStatusCalls;
         private volatile FlightCmd lastCmd;
 
         TensorTestProducer(BufferAllocator allocator) {
@@ -475,6 +577,8 @@ public class TensorFlightClientTest {
             this.schema = createSchema(allocator);
             this.chunkData = new HashMap<>();
             this.chunkRequests = new ConcurrentHashMap<>();
+            this.uploadStatusSequences = new ConcurrentHashMap<>();
+            this.uploadStatusCalls = new ConcurrentHashMap<>();
             chunkData.put("base-0-0", new float[] {1, 2, 5, 6});
             chunkData.put("base-0-1", new float[] {3, 4, 7, 8});
             chunkData.put("base-1-0", new float[] {9, 10, 13, 14});
@@ -487,6 +591,11 @@ public class TensorFlightClientTest {
             chunkData.put("scaled-edge-0-1", new float[] {3, 6});
             chunkData.put("scaled-edge-1-0", new float[] {7, 8});
             chunkData.put("scaled-edge-1-1", new float[] {9});
+        }
+
+        void setUploadStatusSequence(String sourceId, List<Map<String, Object>> statuses) {
+            uploadStatusSequences.put(sourceId, statuses);
+            uploadStatusCalls.put(sourceId, new AtomicInteger());
         }
 
         int getChunkRequestCount(String chunkId) {
@@ -597,6 +706,29 @@ public class TensorFlightClientTest {
                     baseEndpoints(),
                     -1,
                     -1);
+        }
+
+        @Override
+        public void doAction(
+                FlightProducer.CallContext context,
+                Action action,
+                FlightProducer.StreamListener<Result> listener) {
+            if (!"upload_status".equals(action.getType())) {
+                listener.onError(new IllegalArgumentException("Unknown action: " + action.getType()));
+                return;
+            }
+
+            String sourceId = new String(action.getBody(), StandardCharsets.UTF_8);
+            List<Map<String, Object>> sequence = uploadStatusSequences.get(sourceId);
+            if (sequence == null || sequence.isEmpty()) {
+                sequence = Collections.singletonList(status(sourceId, "UNKNOWN", 0, 0));
+            }
+
+            AtomicInteger calls = uploadStatusCalls.computeIfAbsent(sourceId, ignored -> new AtomicInteger());
+            int index = Math.min(calls.getAndIncrement(), sequence.size() - 1);
+            String json = new Gson().toJson(sequence.get(index));
+            listener.onNext(new Result(json.getBytes(StandardCharsets.UTF_8)));
+            listener.onCompleted();
         }
 
         @Override

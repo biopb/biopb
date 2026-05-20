@@ -16,8 +16,9 @@ import json
 import logging
 import os
 import time
+from math import ceil
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import threading
 import pyarrow as pa
@@ -29,9 +30,17 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.chunk import encode_chunk_id
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
+
+
+def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
+    count = 1
+    for dim, chunk in zip(shape, chunk_shape):
+        count *= ceil(dim / chunk)
+    return count
 
 
 class _NoopMiddleware(flight.ServerMiddleware):
@@ -121,6 +130,8 @@ class TensorFlightServer(flight.FlightServerBase):
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._max_list_flights_results = max_list_flights_results
         self._start_time: float = time.time()
+        self._upload_state_lock = threading.RLock()
+        self._upload_states: Dict[str, Dict[str, Any]] = {}
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -141,7 +152,58 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         with self._sources_lock:
             self._sources.pop(source_id, None)
+        with self._upload_state_lock:
+            self._upload_states.pop(source_id, None)
         logger.debug(f"Unregistered source: {source_id}")
+
+    def initialize_upload(
+        self,
+        source_id: str,
+        shape: List[int] | Tuple[int, ...],
+        chunk_shape: List[int] | Tuple[int, ...],
+    ) -> None:
+        expected_chunks = _expected_chunk_count(list(shape), list(chunk_shape))
+        with self._upload_state_lock:
+            self._upload_states[source_id] = {
+                "source_id": source_id,
+                "state": "PENDING",
+                "expected_chunks": expected_chunks,
+                "uploaded_chunks": 0,
+                "uploaded_chunk_ids": set(),
+            }
+
+    def mark_upload_chunk(self, source_id: str, bounds: ChunkBounds) -> None:
+        chunk_id = encode_chunk_id(source_id, bounds)
+        with self._upload_state_lock:
+            state = self._upload_states.get(source_id)
+            if state is None:
+                return
+            uploaded_chunk_ids = state["uploaded_chunk_ids"]
+            if chunk_id not in uploaded_chunk_ids:
+                uploaded_chunk_ids.add(chunk_id)
+                state["uploaded_chunks"] = len(uploaded_chunk_ids)
+            state["state"] = (
+                "READY"
+                if state["uploaded_chunks"] >= state["expected_chunks"]
+                else "PENDING"
+            )
+
+    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
+        with self._upload_state_lock:
+            state = self._upload_states.get(source_id)
+            if state is None:
+                return {
+                    "source_id": source_id,
+                    "state": "UNKNOWN",
+                    "expected_chunks": 0,
+                    "uploaded_chunks": 0,
+                }
+            return {
+                "source_id": source_id,
+                "state": state["state"],
+                "expected_chunks": state["expected_chunks"],
+                "uploaded_chunks": state["uploaded_chunks"],
+            }
 
     def _get_source_adapter(self, source_id: str) -> Optional[SourceAdapter]:
         """Thread-safe source lookup."""
@@ -229,6 +291,7 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
+            flight.ActionType("upload_status", "Upload status for a writable source"),
         ]
 
     def do_action(
@@ -262,6 +325,9 @@ class TensorFlightServer(flight.FlightServerBase):
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             response_desc = self._create_source(req_desc)
             yield response_desc.SerializeToString()
+        elif action.type == "upload_status":
+            source_id = action.body.to_pybytes().decode("utf-8")
+            yield json.dumps(self.get_upload_status(source_id)).encode("utf-8")
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -597,6 +663,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 ome_metadata=ome_metadata,
             )
             self.register_source(source_id, adapter)
+            self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created cache-backed source: {source_id}")
 
@@ -644,6 +711,7 @@ class TensorFlightServer(flight.FlightServerBase):
             )
 
             self.register_source(source_id, adapter)
+            self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
 
@@ -725,6 +793,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         else:
             raise flight.FlightServerError(f"Source type does not support writes")
+
+        self.mark_upload_chunk(upload.source_id, bounds)
 
         logger.debug(
             f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"

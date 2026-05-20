@@ -6,10 +6,13 @@ import tempfile
 import os
 import pytest
 import numpy as np
+from unittest.mock import Mock
 
 from biopb.tensor import (
     TensorFlightClient,
 )
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
 
@@ -428,6 +431,116 @@ class TestTensorFlightClient:
         # Verify data values
         assert darr[:32, :32].compute().mean() == 10.0
         assert darr[32:, 32:].compute().mean() == 40.0
+
+    def test_get_upload_status_pb_uses_tensor_descriptor_array_id(self):
+        client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+        client.get_upload_status = Mock(return_value={
+            "source_id": "cache_test",
+            "state": "PENDING",
+            "expected_chunks": 4,
+            "uploaded_chunks": 1,
+        })
+
+        pb = SerializedTensor(
+            tensor_descriptor=TensorDescriptor(array_id='cache_test')
+        )
+
+        try:
+            status = client.get_upload_status_pb(pb)
+        finally:
+            client.close()
+
+        client.get_upload_status.assert_called_once_with('cache_test')
+        assert status['state'] == 'PENDING'
+
+    def test_wait_for_upload_ready_pb_returns_when_ready(self):
+        client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+        client.get_upload_status = Mock(side_effect=[
+            {
+                "source_id": "cache_test",
+                "state": "PENDING",
+                "expected_chunks": 4,
+                "uploaded_chunks": 1,
+            },
+            {
+                "source_id": "cache_test",
+                "state": "READY",
+                "expected_chunks": 4,
+                "uploaded_chunks": 4,
+            },
+        ])
+
+        pb = SerializedTensor(
+            tensor_descriptor=TensorDescriptor(array_id='cache_test')
+        )
+
+        try:
+            status = client.wait_for_upload_ready_pb(
+                pb,
+                timeout_seconds=0.1,
+                poll_interval_seconds=0.0,
+            )
+        finally:
+            client.close()
+
+        assert status['state'] == 'READY'
+        assert client.get_upload_status.call_count == 2
+
+    def test_wait_for_upload_ready_pb_times_out(self):
+        client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+        client.get_upload_status = Mock(return_value={
+            "source_id": "cache_test",
+            "state": "PENDING",
+            "expected_chunks": 4,
+            "uploaded_chunks": 1,
+        })
+
+        pb = SerializedTensor(
+            tensor_descriptor=TensorDescriptor(array_id='cache_test')
+        )
+
+        try:
+            with pytest.raises(TimeoutError, match="Timed out waiting for upload readiness"):
+                client.wait_for_upload_ready_pb(
+                    pb,
+                    timeout_seconds=0.0,
+                    poll_interval_seconds=0.0,
+                )
+        finally:
+            client.close()
+
+    def test_get_upload_status_pb_requires_array_id(self):
+        client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+        pb = SerializedTensor(tensor_descriptor=TensorDescriptor())
+
+        try:
+            with pytest.raises(ValueError, match="tensor_descriptor.array_id is required"):
+                client.get_upload_status_pb(pb)
+        finally:
+            client.close()
+
+    def test_wait_for_upload_ready_pb_raises_on_failed_state(self):
+        client = TensorFlightClient('grpc://localhost:8890', cache_bytes=10_000_000)
+        client.get_upload_status = Mock(return_value={
+            "source_id": "cache_test",
+            "state": "FAILED",
+            "expected_chunks": 4,
+            "uploaded_chunks": 2,
+        })
+
+        pb = SerializedTensor(
+            tensor_descriptor=TensorDescriptor(array_id='cache_test')
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="Upload failed for source 'cache_test'"):
+                client.wait_for_upload_ready_pb(
+                    pb,
+                    timeout_seconds=0.1,
+                    poll_interval_seconds=0.0,
+                )
+        finally:
+            client.close()
 
 
 if __name__ == '__main__':

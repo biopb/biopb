@@ -54,9 +54,13 @@ COPY biopb-image-server/tests/test_image.png /opt/biopb/tests/test_image.png
 
 WORKDIR $HOME
 
-# Create non-root user and cache directory
-RUN mkdir -p /data/cache && chmod 777 /data/cache \
-    && useradd -m biopb && chown -R biopb:biopb /opt/biopb /data/cache
+# Create non-root user with writable home directory
+RUN useradd -m biopb \
+    && mkdir -p /home/biopb/.local/bin \
+              /home/biopb/.cache \
+              /data/cache \
+    && chown -R biopb:biopb /home/biopb /opt/biopb /data/cache \
+    && chmod 777 /data/cache
 USER biopb
 
 VOLUME /data/cache

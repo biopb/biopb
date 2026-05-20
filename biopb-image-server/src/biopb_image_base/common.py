@@ -181,9 +181,145 @@ def parse_kwargs(request, defaults: dict) -> dict:
     """
     kwargs = defaults.copy()
     if request.HasField("kwargs"):
-        request_kwargs = MessageToDict(request.kwargs)
-        kwargs.update(request_kwargs)
+        # Struct.fields is a map<string, Value>, so we iterate through it directly
+        # This converts protobuf Value types to Python native types
+        for key, value in request.kwargs.fields.items():
+            # Convert Value to Python native type
+            if value.HasField("number_value"):
+                kwargs[key] = value.number_value
+            elif value.HasField("string_value"):
+                kwargs[key] = value.string_value
+            elif value.HasField("bool_value"):
+                kwargs[key] = value.bool_value
+            elif value.HasField("list_value"):
+                # Convert ListValue to Python list
+                kwargs[key] = [
+                    item.number_value if item.HasField("number_value")
+                    else item.string_value if item.HasField("string_value")
+                    else item.bool_value if item.HasField("bool_value")
+                    else None
+                    for item in value.list_value.values
+                ]
+            elif value.HasField("struct_value"):
+                # Convert nested Struct to Python dict
+                kwargs[key] = {
+                    k: v.number_value if v.HasField("number_value")
+                    else v.string_value if v.HasField("string_value")
+                    else v.bool_value if v.HasField("bool_value")
+                    else None
+                    for k, v in value.struct_value.fields.items()
+                }
     return kwargs
+
+
+def ensure_eager(image: Union[np.ndarray, da.Array]) -> np.ndarray:
+    """Ensure image is a numpy array (eager), not a dask array (lazy).
+
+    Args:
+        image: Numpy array or Dask array
+
+    Returns:
+        Numpy array
+
+    Raises:
+        ValueError: If image is a lazy dask array
+    """
+    if isinstance(image, da.Array):
+        raise ValueError(
+            "Lazy data (dask array) not supported. "
+            "Services currently only process eager data. "
+            f"Received lazy array with shape {image.shape}, dtype {image.dtype}."
+        )
+    return image
+
+
+def validate_kwargs(kwargs: dict, schema: dict) -> list[str]:
+    """Validate kwargs against a schema.
+
+    Args:
+        kwargs: Dictionary of parameter values to validate
+        schema: Dictionary defining validation rules for each parameter.
+            Each key is a parameter name, value is a dict with:
+            - "type": expected type ("array", "number", "int", "bool", "string")
+            - "item_type": for arrays, expected type of items
+            - "min_length", "max_length": for arrays, length constraints
+            - "minimum", "maximum": for numeric types, value constraints
+            - "description": optional description for error messages
+
+    Returns:
+        List of error messages (empty if valid)
+    """
+    errors = []
+
+    for key, rules in schema.items():
+        if key not in kwargs:
+            continue
+
+        value = kwargs[key]
+        expected_type = rules.get("type")
+
+        if expected_type == "array":
+            if not isinstance(value, list):
+                errors.append(f"{key}: expected array, got {type(value).__name__}")
+                continue
+
+            item_type = rules.get("item_type")
+            if item_type:
+                for i, item in enumerate(value):
+                    if item_type == "int":
+                        # Accept int or float that is an integer value
+                        if isinstance(item, float) and item == int(item):
+                            # Valid - float representing an integer (e.g., from protobuf)
+                            pass
+                        elif not isinstance(item, int):
+                            errors.append(f"{key}[{i}]: expected int, got {type(item).__name__}")
+                    elif item_type == "number" and not isinstance(item, (int, float)):
+                        errors.append(f"{key}[{i}]: expected number, got {type(item).__name__}")
+
+            min_len = rules.get("min_length")
+            max_len = rules.get("max_length")
+            if min_len and len(value) < min_len:
+                errors.append(f"{key}: minimum length {min_len}, got {len(value)}")
+            if max_len and len(value) > max_len:
+                errors.append(f"{key}: maximum length {max_len}, got {len(value)}")
+
+        elif expected_type == "number":
+            if not isinstance(value, (int, float)):
+                errors.append(f"{key}: expected number, got {type(value).__name__}")
+            else:
+                minimum = rules.get("minimum")
+                maximum = rules.get("maximum")
+                if minimum is not None and value < minimum:
+                    errors.append(f"{key}: minimum {minimum}, got {value}")
+                if maximum is not None and value > maximum:
+                    errors.append(f"{key}: maximum {maximum}, got {value}")
+
+        elif expected_type == "int":
+            # Accept int or float that is an integer value
+            if isinstance(value, int):
+                pass  # valid
+            elif isinstance(value, float) and value == int(value):
+                value = int(value)  # Convert to int for range checks
+            else:
+                errors.append(f"{key}: expected int, got {type(value).__name__}")
+                continue  # Skip range checks if type is wrong
+
+            minimum = rules.get("minimum")
+            maximum = rules.get("maximum")
+            if minimum is not None and value < minimum:
+                errors.append(f"{key}: minimum {minimum}, got {value}")
+            if maximum is not None and value > maximum:
+                errors.append(f"{key}: maximum {maximum}, got {value}")
+
+        elif expected_type == "bool":
+            if not isinstance(value, bool):
+                errors.append(f"{key}: expected bool, got {type(value).__name__}")
+
+        elif expected_type == "string":
+            if not isinstance(value, str):
+                errors.append(f"{key}: expected string, got {type(value).__name__}")
+
+    return errors
 
 
 def abort_invalid_argument(context: grpc.ServicerContext, message: str) -> None:

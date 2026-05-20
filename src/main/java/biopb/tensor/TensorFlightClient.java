@@ -1041,6 +1041,104 @@ public class TensorFlightClient implements AutoCloseable {
         return unknown;
     }
 
+    /**
+     * Get upload status for a writable source.
+     *
+     * @param sourceId Source identifier returned by create_source()
+     * @return Map containing source_id, state, expected_chunks, and uploaded_chunks
+     * @throws IOException If the action fails
+     */
+    public Map<String, Object> getUploadStatus(String sourceId) throws IOException {
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+                "upload_status",
+                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        if (iter.hasNext()) {
+            org.apache.arrow.flight.Result result = iter.next();
+            byte[] body = result.getBody();
+            if (body != null && body.length > 0) {
+                return GSON.fromJson(new String(body, java.nio.charset.StandardCharsets.UTF_8),
+                        new TypeToken<Map<String, Object>>() {
+                        }.getType());
+            }
+        }
+
+        Map<String, Object> unknown = new HashMap<>();
+        unknown.put("source_id", sourceId);
+        unknown.put("state", "UNKNOWN");
+        unknown.put("expected_chunks", 0.0d);
+        unknown.put("uploaded_chunks", 0.0d);
+        return unknown;
+    }
+
+    /**
+     * Get upload status for a registration-first SerializedTensor handle.
+     *
+     * This helper is intended for cache-backed handles returned before upload
+     * completion, where tensor_descriptor.array_id is the source identifier.
+     *
+     * @param pb SerializedTensor handle from a registration-first flow
+     * @return Map containing source_id, state, expected_chunks, and uploaded_chunks
+     * @throws IOException If the action fails
+     */
+    public Map<String, Object> getUploadStatus(SerializedTensor pb) throws IOException {
+        return getUploadStatus(getUploadSourceId(pb));
+    }
+
+    /**
+     * Poll upload status until the source reports READY.
+     *
+     * @param sourceId Source identifier returned by create_source()
+     * @param timeoutMillis Maximum time to wait before timing out
+     * @param pollIntervalMillis Delay between status checks
+     * @return Final upload status map when READY
+     * @throws IOException If the upload fails, times out, or the action fails
+     */
+    public Map<String, Object> waitForUploadReady(
+            String sourceId,
+            long timeoutMillis,
+            long pollIntervalMillis) throws IOException {
+
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        while (true) {
+            Map<String, Object> status = getUploadStatus(sourceId);
+            Object stateValue = status.get("state");
+            String state = stateValue != null ? stateValue.toString() : "UNKNOWN";
+            if ("READY".equals(state)) {
+                return status;
+            }
+            if ("FAILED".equals(state)) {
+                throw new IOException("Upload failed for source '" + sourceId + "'");
+            }
+            if (System.nanoTime() >= deadline) {
+                throw new IOException("Timed out waiting for upload readiness for source '" + sourceId + "'");
+            }
+            try {
+                Thread.sleep(Math.max(0L, pollIntervalMillis));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for upload readiness", e);
+            }
+        }
+    }
+
+    /**
+     * Poll upload status until a registration-first SerializedTensor is READY.
+     *
+     * @param pb SerializedTensor handle from a registration-first flow
+     * @param timeoutMillis Maximum time to wait before timing out
+     * @param pollIntervalMillis Delay between status checks
+     * @return Final upload status map when READY
+     * @throws IOException If the upload fails, times out, or the action fails
+     */
+    public Map<String, Object> waitForUploadReady(
+            SerializedTensor pb,
+            long timeoutMillis,
+            long pollIntervalMillis) throws IOException {
+        return waitForUploadReady(getUploadSourceId(pb), timeoutMillis, pollIntervalMillis);
+    }
+
     // Note: Upload API (uploadCellImg) not yet implemented for Java client.
     // Use the Python client for upload functionality.
 
@@ -1562,6 +1660,14 @@ public class TensorFlightClient implements AutoCloseable {
             result.put("raw", json);
             return result;
         }
+    }
+
+    private static String getUploadSourceId(SerializedTensor pb) {
+        String sourceId = pb.getTensorDescriptor().getArrayId();
+        if (sourceId == null || sourceId.isEmpty()) {
+            throw new IllegalArgumentException("SerializedTensor tensor_descriptor.array_id is required");
+        }
+        return sourceId;
     }
 
     private static class EndpointIndex {

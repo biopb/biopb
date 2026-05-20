@@ -10,14 +10,18 @@ import os
 import secrets
 import threading
 from concurrent import futures
+from itertools import product
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, Optional, Sequence, Union
 
 import numpy as np
 import dask.array as da
 import biopb.image as proto
 import biopb.tensor as tensor_proto
 import grpc
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.serialized_pb2 import SerializedTensor
+from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_image_base.common import TokenValidationInterceptor, _MAX_MSG_SIZE
 from biopb_image_base.health import HealthServicer, add_health_servicer
@@ -27,6 +31,9 @@ from biopb_image_base.debug import get_system_info
 logger = logging.getLogger(__name__)
 
 _TENSOR_SERVER_URL_ENV = "TENSOR_SERVER_URL"
+_NON_UNIFORM_CHUNKS_ERROR = (
+    "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
+)
 
 
 def _resolve_tensor_external_location(
@@ -56,6 +63,75 @@ def _resolve_tensor_external_location(
     return f"grpc://{ip}:{tensor_port}"
 
 
+def _normalize_dim_labels(
+    dim_labels: Optional[Sequence[str]],
+    ndim: int,
+) -> list[str]:
+    if dim_labels is not None:
+        return list(dim_labels)
+    return [f"dim{i}" for i in range(ndim)]
+
+
+def _as_dask_array(array: Union[np.ndarray, da.Array]) -> da.Array:
+    if isinstance(array, da.Array):
+        return array
+    return da.from_array(array, chunks=array.shape)
+
+
+def _uniform_chunk_shape(array: da.Array) -> tuple[int, ...]:
+    if not all(len(set(axis_chunks)) == 1 for axis_chunks in array.chunks):
+        raise ValueError(_NON_UNIFORM_CHUNKS_ERROR)
+    return tuple(int(axis_chunks[0]) for axis_chunks in array.chunks)
+
+
+def _iter_chunk_bounds(
+    shape: Sequence[int],
+    chunk_shape: Sequence[int],
+) -> Iterator[ChunkBounds]:
+    chunk_starts = [range(0, int(dim), int(chunk)) for dim, chunk in zip(shape, chunk_shape)]
+    for start_coords in product(*chunk_starts):
+        stop_coords = [
+            min(start + int(chunk_shape[axis]), int(shape[axis]))
+            for axis, start in enumerate(start_coords)
+        ]
+        yield ChunkBounds(start=list(start_coords), stop=stop_coords)
+
+
+def _bounds_to_slices(bounds: ChunkBounds) -> tuple[slice, ...]:
+    return tuple(slice(start, stop) for start, stop in zip(bounds.start, bounds.stop))
+
+
+def _build_registration_tensor(
+    source_id: str,
+    shape: Sequence[int],
+    dtype: str,
+    chunk_shape: Sequence[int],
+    dim_labels: Optional[Sequence[str]],
+    location: str,
+    auth_token: str = "",
+) -> SerializedTensor:
+    descriptor = TensorDescriptor(
+        array_id=source_id,
+        dim_labels=_normalize_dim_labels(dim_labels, len(shape)),
+        shape=list(shape),
+        chunk_shape=list(chunk_shape),
+        dtype=dtype,
+    )
+    return SerializedTensor(
+        tensor_descriptor=descriptor,
+        location=location,
+        auth_token=auth_token,
+        endpoints=[],
+    )
+
+
+def _normalize_cache_source_name(source_name: Optional[str]) -> str:
+    normalized_name = source_name or ""
+    if normalized_name.startswith("cache:"):
+        normalized_name = normalized_name[6:]
+    return normalized_name
+
+
 class EmbeddedTensorCache:
     """Wrapper for embedded TensorFlightServer with location rewriting.
 
@@ -77,6 +153,70 @@ class EmbeddedTensorCache:
         self._server = tensor_server
         self._external_location = external_location
 
+    def _register_array_template(
+        self,
+        array_template: da.Array,
+        source_name: Optional[str] = None,
+        dim_labels: Optional[Sequence[str]] = None,
+    ) -> tuple[str, da.Array, tuple[int, ...]]:
+        import hashlib
+
+        from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
+
+        chunk_shape = _uniform_chunk_shape(array_template)
+        normalized_name = _normalize_cache_source_name(source_name)
+
+        if normalized_name:
+            source_id = f"cache_{hashlib.sha256(normalized_name.encode()).hexdigest()[:12]}"
+        else:
+            source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
+
+        adapter = CachedSourceAdapter(
+            source_id=source_id,
+            shape=list(array_template.shape),
+            dtype=array_template.dtype.str,
+            chunk_shape=list(chunk_shape),
+            dim_labels=list(dim_labels) if dim_labels is not None else None,
+        )
+        self._server.register_source(source_id, adapter)
+        self._server.initialize_upload(source_id, array_template.shape, chunk_shape)
+        return source_id, array_template, chunk_shape
+
+    def create_array(
+        self,
+        source_name: Optional[str],
+        dim_labels: Optional[list],
+        array_template: da.Array,
+    ) -> tensor_proto.SerializedTensor:
+        source_id, normalized_array, chunk_shape = self._register_array_template(
+            array_template=array_template,
+            source_name=source_name,
+            dim_labels=dim_labels,
+        )
+        return _build_registration_tensor(
+            source_id=source_id,
+            shape=normalized_array.shape,
+            dtype=normalized_array.dtype.str,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+            location=self._external_location,
+        )
+
+    def upload_array_chunks(
+        self,
+        source_id: str,
+        endpoint: ChunkBounds,
+        chunk: np.ndarray,
+    ) -> None:
+        adapter = self._server._get_source_adapter(source_id)
+        if adapter is None:
+            raise ValueError(f"Source not found: {source_id}")
+        adapter.write_chunk(endpoint, chunk)
+        self._server.mark_upload_chunk(source_id, endpoint)
+
+    def get_upload_status(self, source_id: str) -> dict:
+        return self._server.get_upload_status(source_id)
+
     def create_source(
         self,
         array: Union[np.ndarray, da.Array],
@@ -93,67 +233,23 @@ class EmbeddedTensorCache:
         Returns:
             Source ID for use with to_serialized_tensor()
         """
-        import hashlib
-
-        from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
-        from biopb_tensor_server.chunk import encode_chunk_id
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-
-        # Handle dask arrays - compute to numpy
-        if isinstance(array, da.Array):
-            array = array.compute()
-
-        # Generate source ID
-        if source_name:
-            source_id = f"cache_{hashlib.sha256(source_name.encode()).hexdigest()[:12]}"
-        else:
-            import os
-            source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
-
-        # Compute chunking
-        shape = list(array.shape)
-        dtype = str(array.dtype)
-
-        # Use array's chunks if dask, otherwise single chunk
-        if hasattr(array, 'chunks') and array.chunks:
-            chunk_shape = [c[0] if isinstance(c, tuple) else c for c in array.chunks]
-        else:
-            chunk_shape = shape
-
-        # Create adapter
-        adapter = CachedSourceAdapter(
-            source_id=source_id,
-            shape=shape,
-            dtype=dtype,
-            chunk_shape=chunk_shape,
+        dask_array = _as_dask_array(array)
+        source_id, normalized_array, chunk_shape = self._register_array_template(
+            array_template=dask_array,
+            source_name=source_name,
             dim_labels=dim_labels,
         )
 
-        # Register with server
-        self._server.register_source(source_id, adapter)
+        for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
+            chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
+            self.upload_array_chunks(source_id, bounds, chunk_data)
 
-        # Write chunks
-        ndim = len(shape)
-        chunk_starts = []
-        for ax, (sh, ch) in enumerate(zip(shape, chunk_shape)):
-            starts = list(range(0, sh, ch))
-            chunk_starts.append(starts)
-
-        # Iterate through all chunk start positions
-        from itertools import product
-        for start_coords in product(*chunk_starts):
-            # Compute stop coords
-            stop_coords = [min(s + chunk_shape[ax], shape[ax]) for ax, s in enumerate(start_coords)]
-
-            # Extract chunk data
-            slices = tuple(slice(s, st) for s, st in zip(start_coords, stop_coords))
-            chunk_data = array[slices]
-
-            # Create bounds and write
-            bounds = ChunkBounds(start=list(start_coords), stop=stop_coords)
-            adapter.write_chunk(bounds, chunk_data)
-
-        logger.debug(f"Created cache source {source_id}: shape={shape}, dtype={dtype}")
+        logger.debug(
+            "Created cache source %s: shape=%s, dtype=%s",
+            source_id,
+            list(normalized_array.shape),
+            normalized_array.dtype.str,
+        )
         return source_id
 
     def to_serialized_tensor(
@@ -208,34 +304,77 @@ class ExternalTensorCache:
         self._location = location
         self._client = TensorFlightClient(location)
 
+    def _register_array_template(
+        self,
+        array_template: da.Array,
+        source_name: Optional[str] = None,
+        dim_labels: Optional[Sequence[str]] = None,
+    ) -> tuple[str, da.Array, tuple[int, ...]]:
+        import uuid
+
+        normalized_name = _normalize_cache_source_name(source_name)
+        if not normalized_name:
+            normalized_name = f"upload-{uuid.uuid4().hex}"
+
+        chunk_shape = _uniform_chunk_shape(array_template)
+        upload_name = f"cache:{normalized_name}"
+        source_id = self._client.create_source(
+            source_name=upload_name,
+            shape=array_template.shape,
+            dtype=array_template.dtype.str,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+        )
+        return source_id, array_template, chunk_shape
+
+    def create_array(
+        self,
+        source_name: Optional[str],
+        dim_labels: Optional[list],
+        array_template: da.Array,
+    ) -> tensor_proto.SerializedTensor:
+        source_id, normalized_array, chunk_shape = self._register_array_template(
+            array_template=array_template,
+            source_name=source_name,
+            dim_labels=dim_labels,
+        )
+        return _build_registration_tensor(
+            source_id=source_id,
+            shape=normalized_array.shape,
+            dtype=normalized_array.dtype.str,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+            location=self._location,
+        )
+
+    def upload_array_chunks(
+        self,
+        source_id: str,
+        endpoint: ChunkBounds,
+        chunk: np.ndarray,
+    ) -> None:
+        self._client.upload_chunk(source_id, endpoint, chunk)
+
+    def get_upload_status(self, source_id: str) -> dict:
+        return self._client.get_upload_status(source_id)
+
     def create_source(
         self,
         array: Union[np.ndarray, da.Array],
         source_name: Optional[str] = None,
         dim_labels: Optional[list] = None,
     ) -> str:
-        import hashlib
-        import uuid
-
-        if isinstance(array, np.ndarray):
-            chunk_shape = tuple(array.shape)
-            array = da.from_array(array, chunks=chunk_shape)
-        else:
-            chunk_shape = array.chunksize
-
-        normalized_name = source_name or ""
-        if normalized_name.startswith("cache:"):
-            normalized_name = normalized_name[6:]
-        if not normalized_name:
-            normalized_name = f"upload-{uuid.uuid4().hex}"
-
-        upload_name = f"cache:{normalized_name}"
-        source_id = self._client.upload_array(
-            array,
-            source_name=upload_name,
-            chunk_shape=chunk_shape,
+        dask_array = _as_dask_array(array)
+        source_id, normalized_array, chunk_shape = self._register_array_template(
+            array_template=dask_array,
+            source_name=source_name,
             dim_labels=dim_labels,
         )
+
+        for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
+            chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
+            self.upload_array_chunks(source_id, bounds, chunk_data)
+
         return source_id
 
     def to_serialized_tensor(

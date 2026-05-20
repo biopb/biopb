@@ -14,8 +14,9 @@ import logging
 import importlib.metadata
 import json
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import threading
 
 from dataclasses import dataclass
@@ -347,7 +348,6 @@ def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[byt
 
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
-    response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
     # Check schema version compatibility
     _check_schema_version(info.schema)
@@ -411,6 +411,14 @@ def _normalize_location(location: str) -> str:
     if location.startswith("grpcs://"):
         return "grpc+tls://" + location[8:]
     return location
+
+
+def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
+    """Extract upload-status source_id from a registration-first SerializedTensor."""
+    source_id = pb.tensor_descriptor.array_id
+    if not source_id:
+        raise ValueError("SerializedTensor tensor_descriptor.array_id is required")
+    return source_id
 
 
 class TensorFlightClient:
@@ -1278,6 +1286,87 @@ class TensorFlightClient:
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {"status": "UNKNOWN"}
+
+    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
+        """Get upload status for a writable source.
+
+        Args:
+            source_id: Source identifier returned by create_source()
+
+        Returns:
+            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
+        """
+        action = flight.Action("upload_status", source_id.encode("utf-8"))
+        results = self._client.do_action(action, options=self._call_options)
+        for result in results:
+            return json.loads(result.body.to_pybytes())
+        return {
+            "source_id": source_id,
+            "state": "UNKNOWN",
+            "expected_chunks": 0,
+            "uploaded_chunks": 0,
+        }
+
+    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
+        """Get upload status for a registration-first SerializedTensor handle.
+
+        This helper is intended for cache-backed handles returned before upload
+        completion, where tensor_descriptor.array_id is the source identifier.
+
+        Args:
+            pb: SerializedTensor handle returned by a registration-first flow.
+
+        Returns:
+            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
+        """
+        return self.get_upload_status(_upload_source_id_from_pb(pb))
+
+    def wait_for_upload_ready(
+        self,
+        source_id: str,
+        timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Poll upload status until the source reports READY.
+
+        Args:
+            source_id: Source identifier returned by create_source().
+            timeout_seconds: Maximum time to wait before timing out.
+            poll_interval_seconds: Delay between status checks.
+
+        Returns:
+            Final upload status dictionary when READY.
+
+        Raises:
+            TimeoutError: If the upload does not reach READY within the timeout.
+            RuntimeError: If the upload reports FAILED.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            status = self.get_upload_status(source_id)
+            state = status.get("state")
+            if state == "READY":
+                return status
+            if state == "FAILED":
+                raise RuntimeError(f"Upload failed for source '{source_id}'")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for upload readiness for source '{source_id}'"
+                )
+            time.sleep(poll_interval_seconds)
+
+    def wait_for_upload_ready_pb(
+        self,
+        pb: SerializedTensor,
+        timeout_seconds: float = 60.0,
+        poll_interval_seconds: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Poll upload status until a registration-first SerializedTensor is READY."""
+        return self.wait_for_upload_ready(
+            _upload_source_id_from_pb(pb),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
     def cache_info(self) -> Dict:
         """Return cache statistics from the pooled cache for this connection.

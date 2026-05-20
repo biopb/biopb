@@ -15,6 +15,9 @@ from biopb_image_base.common import (
     decode_image_data,
     encode_image,
     return_lazy_or_eager,
+    parse_kwargs,
+    validate_kwargs,
+    ensure_eager,
 )
 from biopb_image_base.health import HealthServicer, add_health_servicer
 
@@ -27,6 +30,9 @@ __all__ = [
     "decode_image_data",
     "encode_image",
     "return_lazy_or_eager",
+    "parse_kwargs",
+    "validate_kwargs",
+    "ensure_eager",
     "HealthServicer",
     "add_health_servicer",
 ]
