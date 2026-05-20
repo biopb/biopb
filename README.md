@@ -41,7 +41,7 @@ Schema, utilities and cli for building your own workflow. Play around in jupyter
 #### Python
 
 ```sh
-pip install biopb
+pip install biopb[tensor]
 ```
 
 #### Java
