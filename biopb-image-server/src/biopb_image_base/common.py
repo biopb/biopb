@@ -186,30 +186,40 @@ def parse_kwargs(request, defaults: dict) -> dict:
         for key, value in request.kwargs.fields.items():
             # Convert Value to Python native type
             if value.HasField("number_value"):
-                kwargs[key] = value.number_value
+                num = value.number_value
+                # Convert float to int if it's an integer value
+                if num == int(num):
+                    kwargs[key] = int(num)
+                else:
+                    kwargs[key] = num
             elif value.HasField("string_value"):
                 kwargs[key] = value.string_value
             elif value.HasField("bool_value"):
                 kwargs[key] = value.bool_value
             elif value.HasField("list_value"):
-                # Convert ListValue to Python list
-                kwargs[key] = [
-                    item.number_value if item.HasField("number_value")
-                    else item.string_value if item.HasField("string_value")
-                    else item.bool_value if item.HasField("bool_value")
-                    else None
-                    for item in value.list_value.values
-                ]
+                # Convert ListValue to Python list, converting integer floats to int
+                kwargs[key] = [_convert_list_item(item) for item in value.list_value.values]
             elif value.HasField("struct_value"):
                 # Convert nested Struct to Python dict
                 kwargs[key] = {
-                    k: v.number_value if v.HasField("number_value")
-                    else v.string_value if v.HasField("string_value")
-                    else v.bool_value if v.HasField("bool_value")
-                    else None
-                    for k, v in value.struct_value.fields.items()
+                    k: _convert_list_item(v) for k, v in value.struct_value.fields.items()
                 }
     return kwargs
+
+
+def _convert_list_item(item):
+    """Helper to convert protobuf Value to Python native type."""
+    if item.HasField("number_value"):
+        num = item.number_value
+        # Convert float to int if it's an integer value
+        if num == int(num):
+            return int(num)
+        return num
+    elif item.HasField("string_value"):
+        return item.string_value
+    elif item.HasField("bool_value"):
+        return item.bool_value
+    return None
 
 
 def ensure_eager(image: Union[np.ndarray, da.Array]) -> np.ndarray:
