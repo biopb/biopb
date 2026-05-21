@@ -31,7 +31,7 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
 # Import client
-from biopb.tensor.client import TensorFlightClient
+from biopb.tensor.client import TensorFlightClient, make_debug_serialized_tensor
 
 __all__ = [
     # Proto messages
@@ -48,4 +48,5 @@ __all__ = [
     'SerializedEndpoint',
     # Client
     'TensorFlightClient',
+    'make_debug_serialized_tensor',
 ]

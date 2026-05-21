@@ -26,33 +26,12 @@ def _canonicalize_dtype(dtype_str: str) -> str:
     return kind_map[dt.kind] + str(dt.itemsize)
 
 
-def serialize_from_numpy(
+def _serialize_from_numpy(
     np_img: np.ndarray,
     dimension_order: str = "CXYZT",
     np_index_order: str = None,
     **kwargs
 ) -> Pixels:
-    '''Convert numpy array representation of image to protobuf representation.
-
-    Args:
-        np_img: image as numpy array (any memory order is accepted)
-        dimension_order: F-order string describing dimension order in the output protobuf.
-            Must be exactly 5 characters (a permutation of "XYZCT").
-            First letter varies fastest in the serialized bytes.
-            Default is "CXYZT".
-        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
-            First letter corresponds to numpy axis 0, second to axis 1, etc.
-            Must be 2-5 characters (a permutation of subset of "XYZCT").
-            If None (default), inferred from np_img.ndim:
-            - 2D -> "YX"
-            - 3D -> "YXC"
-            - 4D -> "ZYXC"
-            - 5D -> "TZYXC"
-        **kwargs: additional metadata, e.g. physical_size_x etc (pixel size)
-
-    Returns:
-        protobuf Pixels
-    '''
     # Validate dimension_order (must be 5 chars, F-order)
     dimension_order = dimension_order.upper()
     valid_chars = set("XYZCT")
@@ -133,38 +112,12 @@ def serialize_from_numpy(
         **kwargs,
     )
 
-
-def deserialize_to_numpy(
+def _deserialize_to_numpy(
     pixels: Pixels,
     *,
     singleton_t: bool = True,
     np_index_order: str = "ZYXC"
 ) -> np.ndarray:
-    '''Convert protobuf Pixels to a numpy array.
-
-    Args:
-        pixels: protobuf data
-    Keyword Args:
-        singleton_t: DEPRECATED. Use np_index_order to control output dimensions.
-        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
-            First letter corresponds to numpy axis 0, second to axis 1, etc.
-            Must be 2-5 characters (a permutation of subset of "ZYXCT").
-            Dimensions not in np_index_order are squeezed (must be singleton).
-            Defaults to "ZYXC" (4D output, T squeezed for backward compatibility).
-
-    Returns:
-        Numpy array (C-contiguous) with shape matching np_index_order.
-        The dtype and byteorder matches the input.
-    '''
-    # Deprecation warning for singleton_t
-    if singleton_t is not True:
-        warnings.warn(
-            "singleton_t parameter is deprecated. Use np_index_order to control "
-            "output dimensions (include T to preserve, exclude to squeeze).",
-            DeprecationWarning,
-            stacklevel=2
-        )
-
     # Check for endianness conflict between dtype prefix and BinData field
     dtype_str = pixels.dtype
     if dtype_str and dtype_str[0] in '<>|=':
@@ -260,6 +213,81 @@ def deserialize_to_numpy(
 
     return np_img
 
+def deserialize_to_numpy(
+    pixels: Pixels,
+    *,
+    singleton_t: bool = True,
+    np_index_order: str = "ZYXC"
+) -> np.ndarray:
+    '''Convert protobuf Pixels to a numpy array.
+
+    Args:
+        pixels: protobuf data
+    Keyword Args:
+        singleton_t: DEPRECATED. Use np_index_order to control output dimensions.
+        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
+            First letter corresponds to numpy axis 0, second to axis 1, etc.
+            Must be 2-5 characters (a permutation of subset of "ZYXCT").
+            Dimensions not in np_index_order are squeezed (must be singleton).
+            Defaults to "ZYXC" (4D output, T squeezed for backward compatibility).
+
+    Returns:
+        Numpy array (C-contiguous) with shape matching np_index_order.
+        The dtype and byteorder matches the input.
+    '''
+    # Deprecation warning for singleton_t
+    if singleton_t is not True:
+        warnings.warn(
+            "singleton_t parameter is deprecated. Use np_index_order to control "
+            "output dimensions (include T to preserve, exclude to squeeze).",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
+    return _deserialize_to_numpy(
+        pixels,
+        singleton_t=singleton_t,
+        np_index_order=np_index_order,
+    )
+
+def serialize_from_numpy(
+    np_img: np.ndarray,
+    dimension_order: str = "CXYZT",
+    np_index_order: str = None,
+    **kwargs
+) -> Pixels:
+    '''Convert numpy array representation of image to protobuf representation.
+
+    Args:
+        np_img: image as numpy array (any memory order is accepted)
+        dimension_order: F-order string describing dimension order in the output protobuf.
+            Must be exactly 5 characters (a permutation of "XYZCT").
+            First letter varies fastest in the serialized bytes.
+            Default is "CXYZT".
+        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
+            First letter corresponds to numpy axis 0, second to axis 1, etc.
+            Must be 2-5 characters (a permutation of subset of "XYZCT").
+            If None (default), inferred from np_img.ndim:
+            - 2D -> "YX"
+            - 3D -> "YXC"
+            - 4D -> "ZYXC"
+            - 5D -> "TZYXC"
+        **kwargs: additional metadata, e.g. physical_size_x etc (pixel size)
+
+    Returns:
+        protobuf Pixels
+    '''
+    warnings.warn(
+        "serialize_from_numpy is deprecated. Use serialize_from_numpy_to_image_data instead to get ImageData protobuf.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    return _serialize_from_numpy(
+        np_img,
+        dimension_order=dimension_order,
+        np_index_order=np_index_order,
+        **kwargs,
+    )
 
 def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
     """Convert a ROI protobuf to a binary mask.
@@ -380,8 +408,22 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
     return roi
 
 
-def get_image_data_dim_labels(image_data: ImageData) -> Optional[Tuple[str]]:
-    """Get a copy of the dimension labels from ImageData."""
+def get_image_data_dim_labels(image_data: ImageData, *, implicit: bool = False) -> Optional[Sequence[str]]:
+    """Get a copy of the dimension labels from ImageData.
+
+    Args:
+        image_data: ImageData protobuf message
+        implicit: If True and dim_labels field is unset, return heuristic labels
+            based on shape. Heuristics:
+            - 2D -> ['y', 'x']
+            - 3D and dim[0] <= 4 -> ['c', 'y', 'x']
+            - 3D and dim[-1] <= 4 -> ['y', 'x', 'c']
+            - All other cases -> None
+
+    Returns:
+        List of dimension labels, or None if unset and implicit=False or
+        heuristics don't apply.
+    """
     data_type = image_data.WhichOneof('data')
     if data_type == 'eager_data':
         dim_labels = image_data.eager_data.dim_labels
@@ -391,7 +433,27 @@ def get_image_data_dim_labels(image_data: ImageData) -> Optional[Tuple[str]]:
         dim_labels = None
 
     if dim_labels:
-        return list(dim_labels) # is a copy
+        return list(dim_labels)  # is a copy
+
+    if not implicit:
+        return None
+
+    # Apply heuristic when dim_labels is unset and implicit=True
+    shape = get_image_data_shape(image_data)
+    if shape is None:
+        return None
+
+    ndim = len(shape)
+
+    if ndim == 2:
+        return ['y', 'x']
+    elif ndim == 3:
+        if shape[0] <= 4:
+            return ['c', 'y', 'x']
+        elif shape[-1] <= 4:
+            return ['y', 'x', 'c']
+        else:
+            return None
     else:
         return None
 
@@ -505,6 +567,96 @@ def deserialize_image_data(
 
     else:
         raise ValueError(f"Unknown ImageData data type: {data_type}")
+
+
+def normalize_array_dims(
+    arr: Union[np.ndarray, da.Array],
+    dim_labels: Optional[Sequence[str]],
+    target_dim_labels: Sequence[str],
+) -> Union[np.ndarray, da.Array]:
+    """Normalize array dimensions to match target dimension labels.
+
+    Transposes, squeezes, and adds singleton dimensions to convert an array
+    with given dimension labels to match the target dimension order.
+
+    Args:
+        arr: Input array (numpy or dask)
+        dim_labels: Current dimension labels for each axis of arr.
+            If None, raises ValueError.
+        target_dim_labels: Target dimension labels for the output array.
+
+    Returns:
+        Array with dimensions reordered to match target_dim_labels.
+        The output will have len(target_dim_labels) dimensions.
+
+    Raises:
+        ValueError: If dim_labels is None,
+            if dim_labels length doesn't match array ndim,
+            if dim_labels or target_dim_labels has duplicates,
+            or if a dimension exists in dim_labels but not target_dim_labels
+            with size > 1 (cannot squeeze non-singleton dimension).
+    """
+    if dim_labels is None:
+        raise ValueError("dim_labels is None, cannot normalize array dimensions")
+
+    dim_labels = list(dim_labels)
+    target_dim_labels = list(target_dim_labels)
+
+    # Use uppercase for case-insensitive comparison
+    dim_labels_upper = [label.upper() for label in dim_labels]
+    target_dim_labels_upper = [label.upper() for label in target_dim_labels]
+
+    if len(dim_labels) != arr.ndim:
+        raise ValueError(
+            f"dim_labels length ({len(dim_labels)}) does not match "
+            f"array dimensions ({arr.ndim})"
+        )
+
+    if len(set(dim_labels_upper)) != len(dim_labels_upper):
+        raise ValueError(f"dim_labels has duplicate labels: {dim_labels}")
+    if len(set(target_dim_labels_upper)) != len(target_dim_labels_upper):
+        raise ValueError(f"target_dim_labels has duplicate labels: {target_dim_labels}")
+
+    shape_dict = {label.upper(): size for label, size in zip(dim_labels, arr.shape)}
+
+    squeeze_dims = set(dim_labels_upper) - set(target_dim_labels_upper)
+    for label_upper in squeeze_dims:
+        if shape_dict[label_upper] != 1:
+            original_label = dim_labels[dim_labels_upper.index(label_upper)]
+            raise ValueError(
+                f"Dimension '{original_label}' has size {shape_dict[label_upper]} but is not in "
+                f"target_dim_labels {target_dim_labels}. Cannot squeeze non-singleton dimension."
+            )
+
+    expand_dims = set(target_dim_labels_upper) - set(dim_labels_upper)
+
+    # Step 1: Squeeze dimensions not in target
+    if squeeze_dims:
+        squeeze_axes = tuple(i for i, label in enumerate(dim_labels_upper) if label in squeeze_dims)
+        if isinstance(arr, da.Array):
+            arr = arr.squeeze(axis=squeeze_axes)
+        else:
+            arr = arr.squeeze(axis=squeeze_axes)
+        dim_labels = [label for i, label in enumerate(dim_labels) if i not in squeeze_axes]
+        dim_labels_upper = [label for label in dim_labels_upper if label not in squeeze_dims]
+
+    # Step 2: Insert singleton dimensions for labels in target but not source
+    for target_label in target_dim_labels:
+        if target_label.upper() in expand_dims:
+            insert_pos = target_dim_labels.index(target_label)
+            if isinstance(arr, da.Array):
+                arr = da.expand_dims(arr, axis=insert_pos)
+            else:
+                arr = np.expand_dims(arr, axis=insert_pos)
+            dim_labels.insert(insert_pos, target_label)
+            dim_labels_upper.insert(insert_pos, target_label.upper())
+
+    # Step 3: Transpose to match target order
+    if dim_labels_upper != target_dim_labels_upper:
+        transpose_axes = tuple(dim_labels_upper.index(label) for label in target_dim_labels_upper)
+        arr = arr.transpose(transpose_axes)
+
+    return arr
 
 
 def serialize_from_numpy_to_image_data(

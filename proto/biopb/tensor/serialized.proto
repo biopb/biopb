@@ -27,6 +27,11 @@ message SerializedTensor {
   // Serialized flight endpoints. This is optional field. If not present, client
   // Should call GetFlightInfo on the server to rebuild endpoint list.
   repeated SerializedEndpoint endpoints = 5;
+
+  // A python-only debugging field carrying pickeled stream of da.array, allowing
+  // integration tests to bypass the Flight server and directly reconstruct the 
+  // tensor on the client side.
+  bytes debug_pickled_array = 100;
 }
 
 // Serialized FlightEndpoint for lazy chunk fetching.

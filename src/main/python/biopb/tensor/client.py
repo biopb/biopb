@@ -413,6 +413,41 @@ def _normalize_location(location: str) -> str:
     return location
 
 
+def make_debug_serialized_tensor(arr: da.Array, array_id: str = "debug") -> SerializedTensor:
+    """Create a SerializedTensor with debug_pickled_array for testing.
+
+    Eagerly computes the array and pickles it, bypassing Flight server.
+    Preserves original chunk structure for testing chunk-related behavior.
+    Populates inferable tensor_descriptor fields.
+
+    Args:
+        arr: Dask array to serialize
+        array_id: Optional array identifier
+
+    Returns:
+        SerializedTensor with debug_pickled_array populated
+    """
+    import pickle
+
+    # Eager compute
+    np_arr = arr.compute()
+
+    # Rechunk to original chunk structure (preserves chunk boundaries for testing)
+    computed_da = da.from_array(np_arr, chunks=arr.chunksize)
+
+    descriptor = TensorDescriptor(
+        array_id=array_id,
+        shape=list(arr.shape),
+        dtype=np.dtype(arr.dtype).str,
+        chunk_shape=list(arr.chunksize),
+    )
+
+    return SerializedTensor(
+        tensor_descriptor=descriptor,
+        debug_pickled_array=pickle.dumps(computed_da),
+    )
+
+
 def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
     """Extract upload-status source_id from a registration-first SerializedTensor."""
     source_id = pb.tensor_descriptor.array_id
@@ -885,6 +920,8 @@ class TensorFlightClient:
         If endpoints field is empty, calls GetFlightInfo on the server
         to rebuild the endpoint list.
 
+        If debug_pickled_array is populated, unpickles directly (bypasses server).
+
         Args:
             pb: SerializedTensor protobuf object
             cache_bytes: Maximum bytes for chunk cache (default 1GB).
@@ -894,6 +931,12 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
+        import pickle
+
+        # Debug path: unpickle directly if debug_pickled_array is present
+        if pb.debug_pickled_array:
+            return pickle.loads(pb.debug_pickled_array)
+
         descriptor = pb.tensor_descriptor
         shape = tuple(descriptor.shape)
         dtype = np.dtype(descriptor.dtype)

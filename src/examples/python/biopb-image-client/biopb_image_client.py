@@ -4,11 +4,11 @@ import grpc
 import imageio.v2 as imageio
 import biopb.image as proto
 
-from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy
+from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy
 
 def grpc_call(server, image, use_https=False):
     request = proto.ProcessRequest(
-        image_data = proto.ImageData(pixels=serialize_from_numpy(image)),
+        image_data = proto.ImageData(pixels=_serialize_from_numpy(image)),
     )
 
     if use_https:
