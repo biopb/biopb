@@ -1,4 +1,4 @@
-# biopb-image-server
+# biopb-image-runtime
 
 Base Docker image and utilities for gRPC services implementing the `biopb.image` protocol.
 
@@ -41,10 +41,10 @@ Run from repo root:
 
 ```bash
 cd /path/to/biopb  # repo root
-./biopb-image-server/scripts/build.sh
+./biopb-image-runtime/scripts/build.sh
 
 # Force rebuild without cache
-./biopb-image-server/scripts/build.sh --no-cache
+./biopb-image-runtime/scripts/build.sh --no-cache
 ```
 
 Or manually (requires pre-built wheel):
@@ -56,7 +56,7 @@ cd /path/to/biopb  # repo root
 pip wheel . --no-deps -w wheels/
 
 # Build Docker image
-docker build -t biopb-image-base -f biopb-image-server/Dockerfile .
+docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
 ```
 
 ### Run a Derived Service
@@ -133,7 +133,7 @@ docker run --rm -p 50051:50051 \
 
 ```bash
 cd /path/to/biopb
-docker compose -f biopb-image-server/docker-compose.yaml up
+docker compose -f biopb-image-runtime/docker-compose.yaml up
 ```
 
 The compose file defines the mock service health check explicitly.
@@ -158,7 +158,7 @@ python /opt/biopb/tests/client.py --port 50051 streaming --iterations 4
 **Local pytest tests (for mock servicer):**
 
 ```bash
-cd biopb-image-server
+cd biopb-image-runtime
 pip install -e .[test]
 
 # Run against local mock server
@@ -270,7 +270,7 @@ docker run --rm -p 50051:50051 \
 ## Files
 
 ```
-biopb-image-server/
+biopb-image-runtime/
 ├── Dockerfile              # Base image for derived services
 ├── docker-compose.yaml     # Development setup
 ├── pyproject.toml          # Python package

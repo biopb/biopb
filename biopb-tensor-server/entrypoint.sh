@@ -10,7 +10,7 @@ set -e
 #                  HTTP=BASE+4, gRPC=BASE+5, Sidecar=BASE+6, Flight=BASE+7
 # COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for webapp and gRPC (auto-generated if not set)
-# BIOPB_WEB_DEV_BYPASS - Set to "true" for dev mode
+# BIOPB_BIND_LOCALHOST - Set to "true" to bind nginx to localhost only (Singularity/HPC only)
 # BIOPB_EXTERNAL_HOST - External hostname/IP for webapp URL (auto-detected if not set)
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
 # CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
@@ -85,10 +85,19 @@ cp /etc/nginx/nginx.conf "$BIOPB_TMP/nginx.conf"
 # Update all /tmp paths in nginx.conf to use our unique prefix
 sed -i "s|/tmp/biopb|${BIOPB_TMP}|g" "$BIOPB_TMP/nginx.conf"
 
-# Update nginx listen ports (bind to localhost only in dev bypass mode for security)
-if [ "${BIOPB_WEB_DEV_BYPASS}" = "true" ] || [ "${BIOPB_WEB_DEV_BYPASS}" = "1" ]; then
-    sed -i "s/listen 8814;/listen 127.0.0.1:${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
-    sed -i "s/listen 8815;/listen 127.0.0.1:${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
+# Update nginx listen ports
+# Binding controlled by BIOPB_BIND_LOCALHOST (separate from dev bypass)
+# In Docker, this setting is ignored since it breaks external access
+if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]; then
+    if [ -f "/.dockerenv" ]; then
+        echo "WARNING: BIOPB_BIND_LOCALHOST ignored in Docker (would break external access)"
+        echo "         Use '-p 127.0.0.1:PORT:PORT' to restrict to localhost instead"
+        sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
+        sed -i "s/listen 8815;/listen ${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
+    else
+        sed -i "s/listen 8814;/listen 127.0.0.1:${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
+        sed -i "s/listen 8815;/listen 127.0.0.1:${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
+    fi
 else
     sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
     sed -i "s/listen 8815;/listen ${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"

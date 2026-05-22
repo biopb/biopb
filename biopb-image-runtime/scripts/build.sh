@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build script for biopb-image-server Docker images
+# Build script for biopb-image-runtime Docker images
 #
 # Versioning: SDK version from biopb wheel (setuptools_scm),
 # image revision (-N) from git SHA

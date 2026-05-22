@@ -113,8 +113,7 @@ X-Biopb-Token: <token>
 ```
 
 `secrets.compare_digest` is used for timing-safe comparison.
-`dev_mode=True` skips the check entirely (enforced to localhost-only by the
-CLI launcher).
+`dev_mode=True` skips the check entirely. Dev mode is enabled via `--dev` flag or `BIOPB_WEB_DEV_BYPASS` env var, and is only allowed when `--web-host` is a loopback address (enforced by CLI).
 
 ### Endpoints
 
@@ -695,7 +694,8 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set sidecar token (skips CLI prompt) |
-| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only) |
+| `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only, enforced by CLI) |
+| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind nginx to localhost (Singularity/HPC only; ignored in Docker) |
 | `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI sidecar (default `http://localhost:8816`) |
 
 ---
@@ -705,7 +705,9 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 - Token is stored in `sessionStorage` (clears on tab close, never persisted to disk).
 - The FastAPI sidecar validates `Authorization: Bearer <token>` on every request via `HTTPBearer`.
 - The Arrow Flight server validates the same token via `BearerAuthMiddlewareFactory`.
-- Dev mode (`biopb-tensor-server launch --dev`) disables token enforcement on the backend; the frontend still shows the unlock page but any string is accepted.
+- Dev mode (`biopb-tensor-server launch --dev` or `BIOPB_WEB_DEV_BYPASS`) disables token enforcement; only allowed when `--web-host` is localhost (enforced by CLI).
+- For Docker dev mode with localhost-only access, use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815`.
+- For Singularity/HPC dev mode with localhost-only binding, use `BIOPB_BIND_LOCALHOST=true`.
 - Error messages are redacted before logging/storage (filesystem paths and potential tokens replaced with `[REDACTED]`).
 
 ---

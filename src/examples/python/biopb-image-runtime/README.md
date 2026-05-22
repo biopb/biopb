@@ -9,7 +9,7 @@ pip install biopb cellpose
 
 Run server
 ```
-python examples/python/biopb-image-server/minimal_cellpose_server.py
+python examples/python/biopb-image-runtime/minimal_cellpose_server.py
 ```
 
 > **_NOTE:_**  This server runs at `localhost:50051` on HTTP (unencrypted).

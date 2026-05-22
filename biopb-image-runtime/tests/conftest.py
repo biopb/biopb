@@ -1,4 +1,4 @@
-"""Pytest configuration for biopb-image-server tests."""
+"""Pytest configuration for biopb-image-runtime tests."""
 
 import subprocess
 import time

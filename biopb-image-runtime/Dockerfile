@@ -6,8 +6,8 @@
 # It does not define a default entrypoint; derived images must provide one.
 #
 # Usage:
-#   docker build -t biopb-image-base -f biopb-image-server/Dockerfile .
-#   docker compose -f biopb-image-server/docker-compose.yaml up
+#   docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
+#   docker compose -f biopb-image-runtime/docker-compose.yaml up
 
 FROM python:3.10-slim-bookworm
 
@@ -27,7 +27,7 @@ ENV HOME=/home/biopb
 ENV PATH="$PATH:$HOME/.local/bin"
 
 # Install Python dependencies (includes tensor server deps)
-COPY biopb-image-server/requirements.txt ./requirements.txt
+COPY biopb-image-runtime/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt && rm requirements.txt
 
 # Install biopb wheel with tensor extras (must be pre-built in wheels/ directory)
@@ -45,12 +45,12 @@ RUN pip install --no-cache-dir "."
 WORKDIR /app
 
 # Copy base utilities (includes mock_servicer for tests and explicit dev use)
-COPY biopb-image-server/src/biopb_image_base /opt/biopb/biopb_image_base
+COPY biopb-image-runtime/src/biopb_image_base /opt/biopb/biopb_image_base
 ENV PYTHONPATH="/opt/biopb"
 
 # Copy test client (for testing real servicers within Docker)
-COPY biopb-image-server/tests/client.py /opt/biopb/tests/client.py
-COPY biopb-image-server/tests/test_image.png /opt/biopb/tests/test_image.png
+COPY biopb-image-runtime/tests/client.py /opt/biopb/tests/client.py
+COPY biopb-image-runtime/tests/test_image.png /opt/biopb/tests/test_image.png
 
 WORKDIR $HOME
 

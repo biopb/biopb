@@ -6,7 +6,7 @@ BioPB provides a standardized way to share multi-dimensional microscopy datasets
 
 ## Biopb-Tensor
 
-A blazing-fast microscopy data server for sharing your lab's petabyte-scale datasets to team members and/or collaborators. [Read More...](biopb-tensor-server/ARCHITECTURE.md)
+A blazing-fast microscopy data server for sharing your lab's petabyte-scale datasets to team members and/or collaborators. [Read More...](biopb-tensor-server/README.md)
 
   - **Uniform Representation**: all source data mapped to a _multi-resolution_ and _lazy-read_ array for client access
   - **Multi-language**: dask array for Python and ImgLib2.CellImg for Java
@@ -18,25 +18,28 @@ A blazing-fast microscopy data server for sharing your lab's petabyte-scale data
 ### Quick Start
 ```sh
 # Ports: 8814 (browser), 8815 (data)
-docker run -d --rm \
+# Dev mode with localhost-only access (no token required)
+docker run --rm \
   --name tensor-server \
-  -p 8814:8814 \
-  -p 8815:8815 \
+  -e BIOPB_WEB_DEV_BYPASS=1 \
+  -p 127.0.0.1:8814:8814 \
+  -p 127.0.0.1:8815:8815 \
   -v ${DIR_YOUR_DATA}:/data \
   jiyuuchc/biopb-tensor-server:latest
 ```
+Point your browser to http://localhost:8814
 
 ## Biopb-Image
 
-Deploy complex image processing algorithms (e.g., large deep-learning models) on the network as services. Pre-built containers for popular algorithms (e.g., segmentation) included. [Read More...](https://github.com/biopb/biopb-server)
+Deploy complex image processing algorithms (e.g., large deep-learning models) on the network as services, including pre-built containers for popular algorithms (e.g., segmentation). [Read More...](https://github.com/biopb/biopb-server)
 
-## Napari-biopb
+## Napari-Biopb
 
 GUI app for the end-users. The power of biopb in a familiar interface. [Read More...](https://github.com/biopb/napari-biopb)
 
 ## SDK
 
-Schema, utilities and cli for building your own workflow. Play around in jupyter notebook etc.
+Schema, utilities and cli for building your own workflow. Explore your data in jupyter notebook etc.
 
 #### Python
 

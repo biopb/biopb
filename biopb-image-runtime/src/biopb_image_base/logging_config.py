@@ -1,4 +1,4 @@
-"""Logging configuration for biopb-image-server.
+"""Logging configuration for biopb-image-runtime.
 
 Provides centralized logging setup with configurable level via:
 - CLI option --log-level
@@ -37,7 +37,7 @@ def setup_logging(
     datefmt: str = DEFAULT_DATE_FORMAT,
     scope_to_biopb: bool = True,
 ) -> None:
-    """Configure logging for biopb-image-server.
+    """Configure logging for biopb-image-runtime.
 
     Sets up a StreamHandler with standard format including timestamp,
     level, module name, and message.

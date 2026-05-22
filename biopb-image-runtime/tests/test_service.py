@@ -171,7 +171,7 @@ class TestProcessImageLazy:
             "--cache-dir", cache_dir,
             "--cache-size", "1GB",
             "--tensor-port", "8819",
-        ], env={**os.environ, "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-server/src", "BIOPB_LOG_LEVEL": "WARNING"})
+        ], env={**os.environ, "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-runtime/src", "BIOPB_LOG_LEVEL": "WARNING"})
 
         # Wait for server
         time.sleep(3)
@@ -236,7 +236,7 @@ class TestProcessImageLazy:
             "--cache-size", "1GB",
         ], env={
             **os.environ,
-            "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-server/src",
+            "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-runtime/src",
             "BIOPB_LOG_LEVEL": "WARNING",
             "TENSOR_SERVER_URL": external_location,
         })

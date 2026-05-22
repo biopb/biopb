@@ -86,6 +86,7 @@ docker run -d \
 | `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
+| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind nginx to localhost (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Base temp directory (avoids multi-user collisions on shared /tmp) |
 
 ### Port Derivation
@@ -133,7 +134,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
     biopb-tensor-server:latest
 
 # Dev mode (localhost only, no token required)
-docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
+docker run -d -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 -v ~/data:/data \
     -e BIOPB_WEB_DEV_BYPASS=true \
     biopb-tensor-server:latest
 ```
@@ -229,10 +230,11 @@ singularity run \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
-# Dev mode for debugging (no token)
+# Dev mode for debugging (no token, localhost only on shared HPC node)
 singularity run \
     --bind ~/data:/data \
     --env BIOPB_WEB_DEV_BYPASS=true \
+    --env BIOPB_BIND_LOCALHOST=true \
     biopb-tensor-server.sif
 ```
 
@@ -255,6 +257,16 @@ Container (external ports 8814, 8815)
 ```
 
 All internal services bind to `127.0.0.1`. External access is through nginx proxies only.
+
+### Network Binding Control
+
+By default, nginx binds to all interfaces inside the container. Docker's port forwarding (`-p PORT:PORT`) then exposes the service to the host's network.
+
+**For localhost-only access:**
+- **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
+- **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind nginx to localhost (useful on shared nodes)
+
+Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).
 
 ## Supported File Formats
 
@@ -286,7 +298,7 @@ Common causes:
 
 - Verify token matches `BIOPB_TENSOR_TOKEN`
 - Check token is 16-128 characters, URL-safe (`[A-Za-z0-9_-]`)
-- Dev mode bypasses token check: `--env BIOPB_WEB_DEV_BYPASS=true`
+- Dev mode bypasses token check: use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` with `--env BIOPB_WEB_DEV_BYPASS=true`
 
 ### Files not appearing in webapp
 

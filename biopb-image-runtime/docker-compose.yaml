@@ -2,8 +2,8 @@
 # For testing lazy data handling and gRPC infrastructure
 #
 # Build from repo root:
-#   docker compose -f biopb-image-server/docker-compose.yaml build
-#   docker compose -f biopb-image-server/docker-compose.yaml up
+#   docker compose -f biopb-image-runtime/docker-compose.yaml build
+#   docker compose -f biopb-image-runtime/docker-compose.yaml up
 #
 # Ports:
 #   50051: gRPC image service (ObjectDetection, ProcessImage)
@@ -17,7 +17,7 @@ services:
   mock:
     build:
       context: ..
-      dockerfile: biopb-image-server/Dockerfile
+      dockerfile: biopb-image-runtime/Dockerfile
     ports:
       - "50051:50051"
       - "8817:8817"
