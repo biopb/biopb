@@ -84,3 +84,36 @@ export interface QuerySourcesResult {
   returnedSources: number;
   truncated: boolean;
 }
+
+/** Parameters for backend rendering request. */
+export interface RenderRequest {
+  source_id: string;
+  tensor_id: string;
+  slice_start?: number[];
+  slice_stop?: number[];
+  scale_hint?: number[];
+  reduction_method?: string;
+  percentile_lo?: number;
+  percentile_hi?: number;
+  color?: string;  // preset name or hex (#rrggbb)
+  channel_name?: string;  // for auto color resolution
+  use_min_max?: boolean;
+  output_format?: "png" | "jpeg" | "raw";  // raw = uncompressed RGBA bytes
+  pixel_budget?: number;
+}
+
+/** Result of backend rendering request. */
+export interface RenderResult {
+  /** Image blob (PNG/JPEG) or ArrayBuffer (raw). */
+  blob: Blob | ArrayBuffer;
+  /** Width of rendered image. */
+  width: number;
+  /** Height of rendered image. */
+  height: number;
+  /** Actual computed lo percentile value. */
+  percentileLoValue: number;
+  /** Actual computed hi percentile value. */
+  percentileHiValue: number;
+  /** Output format used (from X-Image-Format header). */
+  format?: string;
+}

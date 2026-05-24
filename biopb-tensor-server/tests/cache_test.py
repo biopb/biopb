@@ -880,14 +880,14 @@ class TestSchemaPooling:
         shutil.rmtree(cache_dir)
 
     def test_large_chunks_skip_file_cache(self):
-        """Large chunks (>=256MB) skip file cache and stay in memory."""
+        """Large chunks (>64MB) skip file cache and stay in memory."""
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
         backend = ArrowFileBackend(config)
 
-        # Create a batch that would be classified as large
-        # Use the MEDIUM threshold (>=256MB = large)
-        large_size = SIZE_CLASS_MEDIUM_THRESHOLD + 1000
+        # Create a batch that would be classified as oversized
+        # Use the MAX_ARROW_BATCH_BYTES threshold (>64MB triggers oversized skip)
+        large_size = MAX_ARROW_BATCH_BYTES + 1000
         data = pa.RecordBatch.from_arrays(
             [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(['int64'])],
             ["data", "shape", "dtype"]

@@ -291,26 +291,17 @@ def _fetch_chunk_distributed(
 
     logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
 
-    # Fetch from server - measure Flight transfer time
-    t0_flight = time.monotonic()
+    # Fetch from server
     ticket = TensorTicket(chunk_id=chunk_id)
     reader = client.do_get(
         flight.Ticket(ticket.SerializeToString()), options=call_options
     )
     table = reader.read_all()
-    flight_ms = (time.monotonic() - t0_flight) * 1000
-
     arr = table.column("data").to_numpy()[0]  # First row's data list
 
     # Get shape from shape column (list<int64>)
     shape = tuple(table.column("shape").to_pylist()[0])
     arr = arr.reshape(shape)
-
-    # Use INFO level so timing shows by default
-    logging.info(
-        f"fetch_chunk: flight transfer {arr.nbytes}B in {flight_ms:.1f}ms "
-        f"({arr.nbytes / flight_ms / 1000:.1f} MB/s)"
-    )
 
     # Cache the result
     cache.put(cache_key, arr, cost=arr.nbytes)

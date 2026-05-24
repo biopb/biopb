@@ -32,7 +32,6 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const getChannelColor = useAppStore((s) => s.getChannelColor);
   const setChannelColor = useAppStore((s) => s.setChannelColor);
   const loadChannelNames = useAppStore((s) => s.loadChannelNames);
-  const showAdvancedOptions = useAppStore((s) => s.showAdvancedOptions);
 
   // Track custom color picker state (separate from preset dropdown)
   const [useCustomColor, setUseCustomColor] = useState(false);
@@ -311,22 +310,6 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               </span>
             )}
           </div>
-        )}
-
-        {showAdvancedOptions && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ minWidth: 60 }}>Reduction</span>
-            <select
-              value={slice.reductionMethod}
-              onChange={(e) => setSlice({ reductionMethod: e.target.value })}
-              style={{ flex: 1 }}
-            >
-              <option value="nearest">nearest</option>
-              <option value="linear">linear</option>
-              <option value="area">area</option>
-              <option value="mean">mean</option>
-            </select>
-          </label>
         )}
       </div>
     </section>
