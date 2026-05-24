@@ -11,7 +11,7 @@ import logging
 import struct
 from dataclasses import dataclass
 from math import lcm
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import SliceHint
@@ -20,7 +20,8 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_ARROW_BATCH_BYTES = 2 * 1024 * 1024 * 1024 - 1  # ~2GB
+# 64MB threshold for chunk splitting - enables parallel Flight transfers
+MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
@@ -413,8 +414,16 @@ def compute_safe_chunk_size(
 ) -> Tuple[int, ...]:
     """Compute a chunk size that fits within Arrow batch limit.
 
-    Splits along semantic axis (same logic as old split_endpoint).
-    Returns chunk size that is guaranteed to not need splitting.
+    Uses hierarchical splitting: split along highest priority axis first,
+    then next priority axis if still too large, etc.
+
+    Args:
+        chunk_size: Original chunk size tuple
+        dtype: Data type string
+        dim_labels: Optional dimension labels for semantic axis mapping
+
+    Returns:
+        Chunk size tuple guaranteed to fit within MAX_ARROW_BATCH_BYTES
     """
     item_size = np.dtype(dtype).itemsize
     chunk_bytes = int(np.prod(chunk_size)) * item_size
@@ -422,15 +431,106 @@ def compute_safe_chunk_size(
     if chunk_bytes <= MAX_ARROW_BATCH_BYTES:
         return chunk_size
 
-    n_splits = int(np.ceil(chunk_bytes / MAX_ARROW_BATCH_BYTES))
-
-    # Choose split axis using semantic priority
-    split_axis = _choose_split_axis(chunk_size, dim_labels, n_splits)
-
-    # Compute safe size on split axis
-    safe_axis_size = chunk_size[split_axis] // n_splits
-
+    # Hierarchical splitting: iteratively reduce axes by priority
     safe_size = list(chunk_size)
-    safe_size[split_axis] = safe_axis_size
+    axes_already_split = set()  # Track axes we've already reduced
+
+    while chunk_bytes > MAX_ARROW_BATCH_BYTES:
+        # Calculate how many more splits we need
+        n_splits_needed = int(np.ceil(chunk_bytes / MAX_ARROW_BATCH_BYTES))
+
+        # Choose next axis to split (excluding already-split axes)
+        split_axis = _choose_split_axis_excluding(
+            tuple(safe_size), dim_labels, n_splits_needed, axes_already_split
+        )
+
+        if split_axis is None:
+            # No more axes can be split - shouldn't happen if MAX_ARROW_BATCH_BYTES > 0
+            logger.warning(
+                f"Cannot split chunk further: size={safe_size}, "
+                f"bytes={chunk_bytes}, target={MAX_ARROW_BATCH_BYTES}"
+            )
+            break
+
+        # Calculate splits for this axis
+        axis_size = safe_size[split_axis]
+        # Number of splits on this axis (at least 2, at most axis_size)
+        n_axis_splits = min(axis_size, max(2, n_splits_needed))
+
+        # Reduce axis size
+        safe_size[split_axis] = axis_size // n_axis_splits
+        axes_already_split.add(split_axis)
+
+        # Recalculate bytes
+        chunk_bytes = int(np.prod(safe_size)) * item_size
 
     return tuple(safe_size)
+
+
+def _choose_split_axis_excluding(
+    shape: Tuple[int, ...],
+    dim_labels: Optional[List[str]],
+    n_splits: int,
+    exclude_axes: Set[int],
+) -> Optional[int]:
+    """Choose axis for splitting, excluding already-split axes.
+
+    Uses same priority as _choose_split_axis but skips excluded axes.
+
+    Returns None if no eligible axis can accommodate n_splits.
+    """
+    SPATIAL_LABELS = {'y', 'x', 'z', 'c'}
+
+    # Build label -> axis mapping
+    label_to_axis: Dict[str, int] = {}
+    if dim_labels:
+        for ax, label in enumerate(dim_labels):
+            label_to_axis[label.lower()] = ax
+
+    # Eligible axes: not excluded and large enough for splits
+    eligible = [ax for ax in range(len(shape))
+                if ax not in exclude_axes and shape[ax] >= 2]
+
+    if not eligible:
+        return None
+
+    # Priority 1: Non-spatial axes (t, v, frame, etc.)
+    non_spatial = []
+    if dim_labels:
+        for ax in eligible:
+            label = dim_labels[ax].lower()
+            if label not in SPATIAL_LABELS:
+                non_spatial.append(ax)
+    else:
+        non_spatial = eligible
+
+    if non_spatial:
+        return max(non_spatial, key=lambda ax: shape[ax])
+
+    # Priority 2: 'c' (channel)
+    if 'c' in label_to_axis:
+        c_ax = label_to_axis['c']
+        if c_ax in eligible:
+            return c_ax
+
+    # Priority 3: 'z' (depth)
+    if 'z' in label_to_axis:
+        z_ax = label_to_axis['z']
+        if z_ax in eligible:
+            return z_ax
+
+    # Priority 4: Larger of 'y' or 'x'
+    y_ax = label_to_axis.get('y')
+    x_ax = label_to_axis.get('x')
+    y_eligible = y_ax in eligible if y_ax else False
+    x_eligible = x_ax in eligible if x_ax else False
+
+    if y_eligible and x_eligible:
+        return y_ax if shape[y_ax] >= shape[x_ax] else x_ax
+    elif y_eligible:
+        return y_ax
+    elif x_eligible:
+        return x_ax
+
+    # Fallback: largest eligible axis
+    return max(eligible, key=lambda ax: shape[ax])

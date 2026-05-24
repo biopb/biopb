@@ -48,10 +48,12 @@ COLD_FREQUENCY_THRESHOLD = 0  # frequency == 0
 MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 
-# Size class thresholds derived from Arrow batch limit (~2GB)
-SIZE_CLASS_TINY_THRESHOLD = MAX_ARROW_BATCH_BYTES // 1000   # ~2MB
-SIZE_CLASS_SMALL_THRESHOLD = MAX_ARROW_BATCH_BYTES // 64    # ~32MB
-SIZE_CLASS_MEDIUM_THRESHOLD = MAX_ARROW_BATCH_BYTES // 8    # ~256MB
+# Size class thresholds for pooling (fixed values, not derived from MAX_ARROW_BATCH_BYTES)
+# With 64MB max chunk size, we want reasonable pooling buckets
+SIZE_CLASS_TINY_THRESHOLD = 1 * 1024 * 1024      # <1MB
+SIZE_CLASS_SMALL_THRESHOLD = 8 * 1024 * 1024     # 1-8MB
+SIZE_CLASS_MEDIUM_THRESHOLD = 32 * 1024 * 1024   # 8-32MB
+# large: >=32MB (still cached, just pooled separately)
 
 SizeClass = Literal["tiny", "small", "medium", "large"]
 
@@ -891,12 +893,8 @@ class ArrowFileBackend(CacheBackend):
             # Determine pool for this entry
             size_class = _get_size_class(size_bytes)
 
-            # Handle LARGE chunks - skip file cache, use memory only
-            if size_class == "large":
-                logger.debug(f"Skipping file cache for large chunk: {size_bytes} bytes")
-                entry.set_ready(data, size_bytes)
-                self._oversized_skips += 1
-                return
+            # All chunks <= MAX_ARROW_BATCH_BYTES (64MB) are cached
+            # "large" pool (32-64MB) is cached too, just pooled separately
 
             # Evict if needed before storing
             while self._get_total_size() + size_bytes > self._config.max_total_bytes:

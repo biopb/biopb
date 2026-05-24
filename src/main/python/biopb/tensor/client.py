@@ -153,8 +153,15 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
             # Legacy format (shouldn't happen, but handle gracefully)
             return pid_client
 
-    # Slow path: create new client, register for cleanup
-    client = flight.FlightClient(location)
+    # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
+    # 80MB max message size (slightly above 64MB chunk threshold)
+    client = flight.FlightClient(
+        location,
+        generic_options=[
+            ("grpc.max_send_message_size", 80 * 1024 * 1024),
+            ("grpc.max_receive_message_size", 80 * 1024 * 1024),
+        ]
+    )
     local_pool[key] = (current_pid, client)
 
     thread_id = threading.current_thread().ident
@@ -284,17 +291,26 @@ def _fetch_chunk_distributed(
 
     logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
 
-    # Fetch from server
+    # Fetch from server - measure Flight transfer time
+    t0_flight = time.monotonic()
     ticket = TensorTicket(chunk_id=chunk_id)
     reader = client.do_get(
         flight.Ticket(ticket.SerializeToString()), options=call_options
     )
     table = reader.read_all()
+    flight_ms = (time.monotonic() - t0_flight) * 1000
+
     arr = table.column("data").to_numpy()[0]  # First row's data list
 
     # Get shape from shape column (list<int64>)
     shape = tuple(table.column("shape").to_pylist()[0])
     arr = arr.reshape(shape)
+
+    # Use INFO level so timing shows by default
+    logging.info(
+        f"fetch_chunk: flight transfer {arr.nbytes}B in {flight_ms:.1f}ms "
+        f"({arr.nbytes / flight_ms / 1000:.1f} MB/s)"
+    )
 
     # Cache the result
     cache.put(cache_key, arr, cost=arr.nbytes)

@@ -192,8 +192,9 @@ def _setup_flight_server(
             f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
         )
 
-    # Create and start server
+    # Create and start server with gRPC message size tuned for 64MB chunks
     location = f"grpc://{host}:{port}"
+    # 80MB max message size (slightly above 64MB chunk threshold)
     server = TensorFlightServer(
         location,
         token=token,
@@ -201,6 +202,7 @@ def _setup_flight_server(
         write_dir=write_dir,
         metadata_db=metadata_db,
         max_list_flights_results=server_config.metadata_db.max_list_flights_results,
+        grpc_max_message_size=80 * 1024 * 1024,
     )
 
     # Set up watcher for monitored sources (None for static-only configs)
