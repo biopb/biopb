@@ -15,15 +15,18 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-import threading
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb.tensor.descriptor_pb2 import TensorDescriptor, FlightCmd, TensorReadOption, MetadataQueryOption
+from biopb.tensor.descriptor_pb2 import (
+    FlightCmd,
+    TensorDescriptor,
+)
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
@@ -107,6 +110,7 @@ class TensorFlightServer(flight.FlightServerBase):
         write_dir: Optional[Path] = None,
         metadata_db: Optional[MetadataDatabase] = None,
         max_list_flights_results: int = 100000,
+        grpc_max_message_size: Optional[int] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -118,8 +122,14 @@ class TensorFlightServer(flight.FlightServerBase):
             write_dir: Directory for zarr-backed uploaded sources (required if writable)
             metadata_db: MetadataDatabase instance for source filtering queries (optional)
             max_list_flights_results: Safety cap on list_flights() returned sources
+            grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
             **kwargs: Additional arguments passed to FlightServerBase
         """
+        # Apply gRPC max message size via URL query parameter
+        if grpc_max_message_size:
+            separator = '&' if '?' in location else '?'
+            location = f"{location}{separator}grpc.max_send_message_size={grpc_max_message_size}&grpc.max_receive_message_size={grpc_max_message_size}"
+
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)

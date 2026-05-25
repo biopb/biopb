@@ -7,41 +7,23 @@ set -e
 # DATA_DIR       - Directory to monitor (default: /data)
 # MONITOR        - Enable live fs monitoring (default: true)
 # BIOPB_BASE_PORT - Base port for all services (default: 8810)
-#                  HTTP=BASE+4, gRPC=BASE+5, Sidecar=BASE+6, Flight=BASE+7
+#                  HTTP=BASE+4, gRPC=BASE+5
 # COMPUTE_BACKEND - auto/cpu/gpu
 # BIOPB_TENSOR_TOKEN - Access token for webapp and gRPC (auto-generated if not set)
-# BIOPB_BIND_LOCALHOST - Set to "true" to bind nginx to localhost only (Singularity/HPC only)
+# BIOPB_BIND_LOCALHOST - Set to "true" to bind HTTP to localhost only (Singularity/HPC only)
 # BIOPB_EXTERNAL_HOST - External hostname/IP for webapp URL (auto-detected if not set)
 # BIOPB_TMP      - Base temp directory (default: /tmp/biopb-${USER:-$$})
 # CACHE_MAX_SEGMENT_MB - Max segment size for file cache (default: 256)
 # CACHE_MAX_TOTAL_GB   - Max total size for file cache (default: 128)
 
 # Single base port env var - all ports derived from it
-# Default 8810 → HTTP=8814, gRPC=8815, Sidecar=8816, Flight=8817
+# Default 8810 → HTTP=8814, gRPC=8815
 BIOPB_BASE_PORT="${BIOPB_BASE_PORT:-8810}"
 
-# Find available port starting from base, scanning upward
-find_available_port() {
-    local base=$1
-    local max_attempts=100
-    for port in $(seq $base $((base + max_attempts))); do
-        if ! ss -tuln 2>/dev/null | grep -q ":$port " && \
-           ! netstat -tuln 2>/dev/null | grep -q ":$port "; then
-            echo $port
-            return 0
-        fi
-    done
-    echo $base  # fallback
-}
+HTTP_PORT=$((BIOPB_BASE_PORT + 4))
+GRPC_PORT=$((BIOPB_BASE_PORT + 5))
 
-# Derive all ports sequentially, using previous port as starting point
-# This ensures no overlap between discovered ports
-NGINX_HTTP_PORT=$(find_available_port $((BIOPB_BASE_PORT + 4)))
-NGINX_GRPC_PORT=$(find_available_port $((NGINX_HTTP_PORT + 1)))
-WEB_PORT=$(find_available_port $((NGINX_GRPC_PORT + 1)))
-PORT=$(find_available_port $((WEB_PORT + 1)))
-
-echo "Ports: HTTP=$NGINX_HTTP_PORT gRPC=$NGINX_GRPC_PORT Sidecar=$WEB_PORT Flight=$PORT"
+echo "Ports: HTTP=$HTTP_PORT gRPC=$GRPC_PORT"
 
 # Create unique temp directory prefix to avoid multi-user collisions on shared /tmp
 # Use USER env var if available, else use PID as unique identifier
@@ -58,7 +40,7 @@ else
     cat > "$BIOPB_TMP/runtime-config.toml" << EOF
 [server]
 host = "127.0.0.1"
-port = $PORT
+port = $GRPC_PORT
 aggressive_dir_pruning = true
 
 [cache]
@@ -78,45 +60,6 @@ monitor = $MONITOR
 EOF
     CONFIG_FILE="$BIOPB_TMP/runtime-config.toml"
 fi
-
-# Copy nginx.conf to temp location and update paths
-cp /etc/nginx/nginx.conf "$BIOPB_TMP/nginx.conf"
-
-# Update all /tmp paths in nginx.conf to use our unique prefix
-sed -i "s|/tmp/biopb|${BIOPB_TMP}|g" "$BIOPB_TMP/nginx.conf"
-
-# Update nginx listen ports
-# Binding controlled by BIOPB_BIND_LOCALHOST (separate from dev bypass)
-# In Docker, this setting is ignored since it breaks external access
-if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]; then
-    if [ -f "/.dockerenv" ]; then
-        echo "WARNING: BIOPB_BIND_LOCALHOST ignored in Docker (would break external access)"
-        echo "         Use '-p 127.0.0.1:PORT:PORT' to restrict to localhost instead"
-        sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
-        sed -i "s/listen 8815;/listen ${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
-    else
-        sed -i "s/listen 8814;/listen 127.0.0.1:${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
-        sed -i "s/listen 8815;/listen 127.0.0.1:${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
-    fi
-else
-    sed -i "s/listen 8814;/listen ${NGINX_HTTP_PORT};/" "$BIOPB_TMP/nginx.conf"
-    sed -i "s/listen 8815;/listen ${NGINX_GRPC_PORT};/" "$BIOPB_TMP/nginx.conf"
-fi
-
-# Update nginx proxy targets to use discovered internal ports
-sed -i "s/:8817/:${PORT}/g" "$BIOPB_TMP/nginx.conf"
-sed -i "s/:8816/:${WEB_PORT}/g" "$BIOPB_TMP/nginx.conf"
-
-# Create nginx temp directories
-mkdir -p "$BIOPB_TMP/nginx_client_body" "$BIOPB_TMP/nginx_proxy" "$BIOPB_TMP/nginx_fastcgi" "$BIOPB_TMP/nginx_uwsgi" "$BIOPB_TMP/nginx_scgi"
-
-# Start nginx using temp config
-nginx -c "$BIOPB_TMP/nginx.conf"
-
-# Start tensor server (foreground process)
-# First argument is the subcommand (launch/serve), rest are passed through
-COMMAND="${1:-launch}"
-shift 2>/dev/null || true
 
 # Enable debug logging if dev bypass mode is active
 if [ "${BIOPB_WEB_DEV_BYPASS}" = "true" ] || [ "${BIOPB_WEB_DEV_BYPASS}" = "1" ]; then
@@ -139,10 +82,32 @@ else
     WEB_HOST="localhost"
 fi
 
-exec biopb-tensor-server "$COMMAND" \
-    --config "$CONFIG_FILE" \
-    --web-host 127.0.0.1 \
-    --web-port ${WEB_PORT} \
-    --web-url "http://${WEB_HOST}:${NGINX_HTTP_PORT}" \
-    --cors "*" \
-    "$@"
+# Build command args
+COMMAND="${1:-launch}"
+shift 2>/dev/null || true
+
+# HTTP bind address: localhost only or all interfaces
+HTTP_BIND="0.0.0.0"
+if [ "${BIOPB_BIND_LOCALHOST}" = "true" ] || [ "${BIOPB_BIND_LOCALHOST}" = "1" ]; then
+    if [ -f "/.dockerenv" ]; then
+        echo "WARNING: BIOPB_BIND_LOCALHOST ignored in Docker (would break external access)"
+        echo "         Use '-p 127.0.0.1:PORT:PORT' to restrict to localhost instead"
+    else
+        HTTP_BIND="127.0.0.1"
+    fi
+fi
+
+ARGS=(
+    --config "$CONFIG_FILE"
+    --web-host "$HTTP_BIND"
+    --web-port "$HTTP_PORT"
+    --web-url "http://${WEB_HOST}:${HTTP_PORT}"
+    --cors "*"
+)
+
+# Add static-dir only if webapp directory exists
+if [ -d "/app/webapp" ]; then
+    ARGS+=(--static-dir /app/webapp)
+fi
+
+exec biopb-tensor-server "$COMMAND" "${ARGS[@]}" "$@"

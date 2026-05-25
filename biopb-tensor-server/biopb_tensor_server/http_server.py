@@ -38,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,27 @@ class QuerySourcesRequest(BaseModel):
     sql: str
 
 
+class RenderRequest(BaseModel):
+    """Request for backend-rendered image output.
+
+    Returns PNG/JPEG image instead of raw numpy bytes.
+    Uses VTK or PIL for rendering on the server side.
+    """
+    source_id: str
+    tensor_id: str
+    slice_start: Optional[List[int]] = None
+    slice_stop: Optional[List[int]] = None
+    scale_hint: Optional[List[int]] = None
+    reduction_method: Optional[str] = None
+    percentile_lo: float = 1.0
+    percentile_hi: float = 99.0
+    color: str = "auto"  # preset name or hex (#rrggbb)
+    channel_name: Optional[str] = None  # for auto color resolution
+    use_min_max: bool = False  # use full min-max range instead of percentiles
+    output_format: str = "png"  # "png" or "jpeg"
+    pixel_budget: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -250,8 +272,9 @@ def create_app(
     flight_location: str = "grpc://localhost:8815",
     token: Optional[str] = None,
     dev_mode: bool = False,
-    cache_bytes: int = 0,  # Disabled - sidecar runs on same machine as gRPC server
+    cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
+    static_dir: Optional[str] = None,  # Directory for static webapp files (None = API only)
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -309,7 +332,11 @@ def create_app(
         allow_credentials=True,
         allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "X-Biopb-Token", "Content-Type"],
-        expose_headers=["X-Shape", "X-Dtype", "X-Dim-Labels"],
+        expose_headers=[
+            "X-Shape", "X-Dtype", "X-Dim-Labels",
+            "X-Image-Width", "X-Image-Height",
+            "X-Percentile-Lo-Value", "X-Percentile-Hi-Value",
+        ],
     )
 
     # -----------------------------------------------------------------------
@@ -611,6 +638,47 @@ def create_app(
     # Slice (binary response)
     # -----------------------------------------------------------------------
 
+    def _get_slice(
+        client: TensorFlightClient,
+        req: SliceRequest,
+    ) -> np.ndarray:
+        """Helper to fetch a slice of a tensor as a numpy array."""
+        slice_hint: Optional[Tuple[slice, ...]] = None
+        if req.slice_start is not None and req.slice_stop is not None:
+            if len(req.slice_start) != len(req.slice_stop):
+                raise HTTPException(
+                    status_code=422,
+                    detail="slice_start and slice_stop must have the same length",
+                )
+            slice_hint = tuple(
+                slice(s, e) for s, e in zip(req.slice_start, req.slice_stop)
+            )
+
+        # Build read_options
+        scale_hint = req.scale_hint or None
+        reduction_method = req.reduction_method or None
+
+        # Pass slice_hint to gRPC for optimized slicing (in world coordinates)
+        # slice_hint is applied BEFORE scaling, so coordinates are in original tensor units
+        arr_lazy = client.get_tensor(
+            source_id=req.source_id,
+            tensor_id=req.tensor_id,
+            slice_hint=slice_hint,
+            scale_hint=scale_hint,
+            reduction_method=reduction_method,
+        )
+
+        arr: np.ndarray = arr_lazy.compute()
+
+        if arr.dtype.byteorder not in ("=", "|"):
+            arr = arr.astype(arr.dtype.newbyteorder("="), copy=False)
+
+        # Ensure C-contiguous layout for predictable byte order on the client
+        arr = np.ascontiguousarray(arr)
+
+        return arr
+
+
     @app.post("/api/slice")
     async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         """Fetch a slice of a tensor and return raw bytes.
@@ -713,6 +781,184 @@ def create_app(
                 status_code=502, detail=f"Flight error: {type(exc).__name__}"
             )
 
+    # -----------------------------------------------------------------------
+    # Render (image output)
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/render")
+    async def render_tensor(req: RenderRequest, request: Request) -> Response:
+        """Render a tensor slice and return PNG/JPEG image.
+
+        Backend rendering using VTK or PIL. Returns compressed image
+        instead of raw bytes, potentially more efficient for large datasets.
+
+        Response headers:
+          X-Image-Width        — width of rendered image
+          X-Image-Height       — height of rendered image
+          X-Percentile-Lo-Value — actual computed lo percentile value
+          X-Percentile-Hi-Value — actual computed hi percentile value
+
+        Response body:
+          PNG or JPEG image bytes.
+        """
+        _check_token(request)
+        t0 = time.monotonic()
+
+        logger.debug(
+            f"render: source={req.source_id}, tensor={req.tensor_id}, "
+            f"slice={req.slice_start}-{req.slice_stop}, scale={req.scale_hint}, "
+            f"percentiles={req.percentile_lo}-{req.percentile_hi}, "
+            f"color={req.color}, format={req.output_format}"
+        )
+
+        if req.pixel_budget is not None:
+            diag.pixel_budget = req.pixel_budget
+
+        try:
+            client = _get_client()
+
+            # Build slice_hint (same logic as slice endpoint)
+            slice_hint: Optional[Tuple[slice, ...]] = None
+            if req.slice_start is not None and req.slice_stop is not None:
+                if len(req.slice_start) != len(req.slice_stop):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="slice_start and slice_stop must have the same length",
+                    )
+                slice_hint = tuple(
+                    slice(s, e) for s, e in zip(req.slice_start, req.slice_stop)
+                )
+
+            # Get tensor
+            scale_hint = req.scale_hint or None
+            reduction_method = req.reduction_method or None
+
+            arr_lazy = client.get_tensor(
+                source_id=req.source_id,
+                tensor_id=req.tensor_id,
+                slice_hint=slice_hint,
+                scale_hint=scale_hint,
+                reduction_method=reduction_method,
+            )
+
+            # Compute (blocking)
+            t0_compute = time.monotonic()
+            arr: np.ndarray = arr_lazy.compute()
+            compute_ms = (time.monotonic() - t0_compute) * 1000
+
+            # Get dim_labels from descriptor
+            dim_labels: List[str] = []
+            try:
+                sources = client._sources  # type: ignore[attr-defined]
+                if req.source_id in sources:
+                    for td in sources[req.source_id].tensors:
+                        if td.array_id == req.tensor_id:
+                            dim_labels = list(td.dim_labels)
+                            break
+            except Exception:
+                pass
+
+            # Use shape-based fallback if dim_labels not found
+            if not dim_labels:
+                dim_labels = [f"d{i}" for i in range(arr.ndim)]
+
+            logger.debug(
+                f"render: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B, "
+                f"dim_labels={dim_labels}, compute_time={compute_ms:.1f}ms"
+            )
+
+            # Import renderer
+            from .vtk_renderer import is_vtk_available, render_array_to_image_bytes_simple
+
+            # Use PIL-based renderer (VTK optional)
+            # For experiment, use simpler PIL approach
+            t0_render = time.monotonic()
+            image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes_simple(
+                arr=arr,
+                dim_labels=dim_labels,
+                percentile_lo=req.percentile_lo if not req.use_min_max else 0.0,
+                percentile_hi=req.percentile_hi if not req.use_min_max else 100.0,
+                color=req.color,
+                channel_name=req.channel_name,
+                output_format=req.output_format,
+            )
+            render_ms = (time.monotonic() - t0_render) * 1000
+
+            elapsed = (time.monotonic() - t0) * 1000
+            diag.latency.record(elapsed)
+            logger.debug(
+                f"render: image size={width}x{height}, "
+                f"bytes={len(image_bytes)}, total={elapsed:.1f}ms, "
+                f"compute={compute_ms:.1f}ms, render={render_ms:.1f}ms"
+            )
+
+            # Build response
+            format_lower = req.output_format.lower()
+            if format_lower == "raw":
+                media_type = "application/octet-stream"  # Raw RGBA bytes
+            elif format_lower == "png":
+                media_type = "image/png"
+            else:
+                media_type = "image/jpeg"
+            headers = {
+                "X-Image-Width": str(width),
+                "X-Image-Height": str(height),
+                "X-Percentile-Lo-Value": str(lo_val),
+                "X-Percentile-Hi-Value": str(hi_val),
+                "X-Image-Format": format_lower,  # Tell client what format was used
+            }
+
+            return Response(
+                content=image_bytes,
+                media_type=media_type,
+                headers=headers,
+            )
+
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Rendering not available: {exc}"
+            )
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            diag.mark_error("RENDER_FAILED", str(exc))
+            logger.error(f"render failed: {exc}\n{tb}")
+            raise HTTPException(
+                status_code=502, detail=f"Render error: {type(exc).__name__}: {exc}"
+            )
+
+    # -----------------------------------------------------------------------
+    # Static files (optional)
+    # -----------------------------------------------------------------------
+
+    if static_dir:
+        from pathlib import Path as _Path
+        static_path = _Path(static_dir)
+        if static_path.is_dir():
+            # SPA fallback middleware - serve index.html for non-API routes
+            @app.middleware("http")
+            async def spa_fallback(request: Request, call_next):
+                response = await call_next(request)
+                # Only intercept 404s for non-API, non-health routes
+                if response.status_code == 404:
+                    path = request.url.path
+                    if not path.startswith("/api") and not path.startswith("/live") and not path.startswith("/ready") and not path.startswith("/health"):
+                        index_file = static_path / "index.html"
+                        if index_file.exists():
+                            return Response(
+                                content=index_file.read_bytes(),
+                                media_type="text/html",
+                            )
+                return response
+
+            # Mount static files at root (must be after all API routes)
+            app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
+
     return app
 
 
@@ -753,8 +999,9 @@ def run(
     dev_mode: bool = False,
     host: str = "127.0.0.1",
     port: int = 8816,
-    cache_bytes: int = 0,  # Disabled - sidecar runs on same machine as gRPC server
+    cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
+    static_dir: Optional[str] = None,  # Directory for static webapp files
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -765,5 +1012,6 @@ def run(
         dev_mode=dev_mode,
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
+        static_dir=static_dir,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

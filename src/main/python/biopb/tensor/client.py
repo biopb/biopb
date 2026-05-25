@@ -153,8 +153,15 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
             # Legacy format (shouldn't happen, but handle gracefully)
             return pid_client
 
-    # Slow path: create new client, register for cleanup
-    client = flight.FlightClient(location)
+    # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
+    # 80MB max message size (slightly above 64MB chunk threshold)
+    client = flight.FlightClient(
+        location,
+        generic_options=[
+            ("grpc.max_send_message_size", 80 * 1024 * 1024),
+            ("grpc.max_receive_message_size", 80 * 1024 * 1024),
+        ]
+    )
     local_pool[key] = (current_pid, client)
 
     thread_id = threading.current_thread().ident

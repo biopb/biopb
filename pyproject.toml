@@ -21,7 +21,6 @@ dependencies = [
 [project.optional-dependencies]
   test = [
     "pytest >= 7.0",
-    "opencv-python-headless",
   ]
   tensor = [
     "pyarrow >= 14.0.0",
@@ -49,3 +48,4 @@ build_py = "build_proto.build_proto"
 [tool.setuptools_scm]
 version_file = "src/main/python/biopb/_version.py"
 tag_regex = "^v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+git_describe_command = "git describe --tags --match 'v*'"

@@ -4,16 +4,15 @@
 
 `biopb-tensor-server` provides two complementary server components:
 
-1. **TensorFlightServer** — Arrow Flight / gRPC server for chunked array access.
-2. **HTTP Sidecar** — FastAPI proxy that translates Flight calls into
-   browser-accessible HTTP endpoints.
+1. **TensorFlightServer** — Arrow Flight / gRPC server for chunked array access (port 8815).
+2. **FastAPI HTTP Server** — Browser-accessible HTTP API that also serves the React webapp (port 8814).
 
 ```
 Client (Python or TypeScript)
     │
     ├── Arrow Flight / gRPC  (default :8815)  ─────► TensorFlightServer
     │                                                        │
-    └── HTTP/JSON + binary   (default :8816)  ─────► FastAPI Sidecar
+    └── HTTP/JSON + binary   (default :8814)  ─────► FastAPI Server
                                                              │
                                                    TensorFlightClient
                                                              │
@@ -26,10 +25,7 @@ Client (Python or TypeScript)
                                               └──────────────────────────┘
 ```
 
-The sidecar exists because browsers cannot speak gRPC directly. It wraps the
-existing Python `TensorFlightClient` and re-exposes its operations as plain
-HTTP so that the Vite web app (and any other HTTP client) can use it
-without a gRPC-Web proxy.
+The FastAPI server handles both API requests and serves the static React webapp. It wraps the Python `TensorFlightClient` and re-exposes its operations as plain HTTP so that browsers can use it without a gRPC-Web proxy.
 
 ---
 
@@ -87,11 +83,11 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ---
 
-## FastAPI HTTP Sidecar
+## FastAPI HTTP Server
 
 **Module:** `biopb_tensor_server.http_server`
-**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins) → FastAPI`
-**Default port:** `8816`
+**Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins, static_dir) → FastAPI`
+**Default port:** `8814`
 
 ### Lifecycle
 
@@ -186,9 +182,9 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb-tensor.toml [--web-port 8816] [--web-host 127.0.0.1] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb-tensor.toml [--web-port 8814] [--web-host 127.0.0.1] [--static-dir /app/webapp] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
 
-# for grpc only (no sidecar)
+# for grpc only (no web server)
 biopb-tensor-server serve ...
 ```
 
@@ -201,9 +197,10 @@ Startup sequence:
 3. Print the one-time access token.
 4. Load `biopb-tensor.toml` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
-6. Derive CORS origins from `--web-url` (default `http://localhost:5173`) or
+6. Derive CORS origins from `--web-url` (default `http://localhost:8814`) or
    explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
 7. Call `run_http_server(...)` — **blocking** uvicorn call.
+   - If `--static-dir` is provided, FastAPI also serves the React webapp.
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
@@ -435,10 +432,10 @@ Both packages live under `packages/` and are built together with
 
 ### TensorHttpClient
 
-Low-level HTTP wrapper around the sidecar's REST API.
+Low-level HTTP wrapper around the server's REST API.
 
 ```ts
-const client = new TensorHttpClient("http://localhost:8816", token);
+const client = new TensorHttpClient("http://localhost:8814", token);
 ```
 
 Internals:
@@ -540,7 +537,7 @@ Key responsibilities:
 - serve the browser UI (pure static files — no Node.js at runtime)
 - gate access via a bearer token stored in `sessionStorage`
 - initialize the client-side TensorFlight HTTP client
-- call the FastAPI sidecar (`VITE_TENSOR_API`, default `http://localhost:8816`) directly from the browser
+- call the FastAPI server (`VITE_TENSOR_API`, default `http://localhost:8814`) directly from the browser
 
 ### Build
 
@@ -549,7 +546,7 @@ pnpm run build   # tsc + vite build → dist/
 pnpm run dev     # vite dev server (HMR)
 ```
 
-Output is `dist/` — plain HTML/CSS/JS, ready for nginx or any static file server.
+Output is `dist/` — plain HTML/CSS/JS, ready for FastAPI StaticFiles or any static file server.
 
 From repo root:
 ```bash
@@ -557,18 +554,22 @@ pnpm --filter @biopb/web dev     # Vite dev server on :5173
 pnpm --filter @biopb/web build   # tsc + vite build → dist/
 ```
 
-### nginx deployment
+### Static file deployment
 
-Because React Router uses the HTML5 History API, nginx must fall back to `index.html` for all routes:
+The webapp is served directly by FastAPI when `--static-dir` is provided. For standalone deployment with a dedicated static file server (e.g., nginx), configure SPA fallback:
 
 ```nginx
 location / {
     root /path/to/dist;
     try_files $uri $uri/ /index.html;
 }
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8814;
+}
 ```
 
-The sidecar (`VITE_TENSOR_API`) must be reachable from the browser — configure CORS origins (default to localhost:5173) in the tensor server accordingly. I.e, for nginx deployment:
+The API server (`http://localhost:8814`) must be reachable from the browser — configure CORS origins accordingly:
 
 ```
 biopb-tensor-server launch config.toml --web-url https://yourdomain.com --token mytoken...
@@ -693,10 +694,10 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | Variable | Where consumed | Purpose |
 |----------|---------------|---------|
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
-| `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set sidecar token (skips CLI prompt) |
+| `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token (skips CLI prompt) |
 | `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only, enforced by CLI) |
-| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind nginx to localhost (Singularity/HPC only; ignored in Docker) |
-| `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI sidecar (default `http://localhost:8816`) |
+| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind HTTP to localhost (Singularity/HPC only; ignored in Docker) |
+| `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI server (default `http://localhost:8814`) |
 
 ---
 
@@ -717,15 +718,21 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 Server components use `server-v*` tags (distinct from SDK `v*` tags):
 
 ```
-biopb-tensor-server/VERSION  →  single source of truth
+git tags (server-vX.Y.Z)  →  setuptools_scm  →  biopb_tensor_server/_version.py
+                                                    ↓
+                                            sync-version.js → JS packages
 ```
+
+Version is derived from git tags via `setuptools_scm` with `tag_regex = "^server-v..."`.
+This mirrors the root SDK package's approach (which uses `v*` tags).
 
 **Release:**
 ```bash
-echo "0.2.0" > biopb-tensor-server/VERSION
-pnpm sync-version
-git commit -am "bump tensor-server to 0.2.0"
-git tag server-v0.2.0 && git push --tags
+git tag server-v0.3.0 && git push --tags
 ```
 
-CI builds Docker image: `ghcr.io/.../biopb-tensor-server:0.2.0`, `:latest`
+CI automatically:
+1. Extracts version from tag (`server-v0.3.0` → `0.3.0`)
+2. Syncs JS package versions via `pnpm sync-version`
+3. Builds Docker image: `ghcr.io/.../biopb-tensor-server:0.3.0`, `:latest`
+4. Creates GitHub release with webapp tarball and install.sh

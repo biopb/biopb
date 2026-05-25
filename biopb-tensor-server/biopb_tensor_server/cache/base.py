@@ -17,9 +17,9 @@ from typing import Callable, Dict, Optional, Tuple
 
 import pyarrow as pa
 
-# Arrow IPC has ~2GB batch size limit due to 32-bit offsets
-# Use a safe threshold slightly below the actual limit
-MAX_ARROW_BATCH_BYTES = 2 * 1024 * 1024 * 1024 - 1  # ~2GB
+# Chunk splitting threshold - 64MB for parallel Flight transfers
+# (Arrow IPC can handle larger, but we split for throughput optimization)
+MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 
 class EntryState(Enum):

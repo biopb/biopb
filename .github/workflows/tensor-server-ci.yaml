@@ -16,9 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Read version
+      - name: Extract version from tag
         id: version
-        run: echo "VERSION=$(cat biopb-tensor-server/VERSION)" >> $GITHUB_OUTPUT
+        run: |
+          VERSION=${GITHUB_REF_NAME#server-v}
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

@@ -16,6 +16,8 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
+  RenderRequest,
+  RenderResult,
   SliceRequest,
   TypedNdArray,
 } from "./types.js";
@@ -30,7 +32,12 @@ export class TensorApiError extends Error {
     message: string,
     public readonly detail?: unknown,
   ) {
-    super(`TensorApi ${status}: ${message}`);
+    // Include detail in message if it's a string or has a 'detail' property
+    const detailStr = typeof detail === 'string'
+      ? detail
+      : (detail as Record<string, unknown>)?.detail as string | undefined;
+    const fullMessage = detailStr ? `${message}: ${detailStr}` : message;
+    super(`TensorApi ${status}: ${fullMessage}`);
     this.name = "TensorApiError";
   }
 }
@@ -285,6 +292,35 @@ export class TensorHttpClient {
     const buffer = await res.arrayBuffer();
 
     return { buffer, shape, dtype, dimLabels };
+  }
+
+  // -------------------------------------------------------------------------
+  // Render (backend image rendering)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fetch a rendered image from the backend.
+   *
+   * Uses server-side VTK/PIL rendering to produce PNG/JPEG output.
+   * For raw format, returns RGBA bytes (4 bytes per pixel, uint8).
+   * This is an alternative to slice() + frontend rendering.
+   *
+   * @throws {TensorApiError} on HTTP error, timeout, or if rendering not enabled.
+   */
+  async render(req: RenderRequest): Promise<RenderResult> {
+    // Use longer timeout for rendering (may be slower than raw slice)
+    const res = await this.fetchBinary("/api/render", req, this.chunkTimeoutMs * 2);
+
+    const width = parseInt(res.headers.get("X-Image-Width") ?? "0", 10);
+    const height = parseInt(res.headers.get("X-Image-Height") ?? "0", 10);
+    const percentileLoValue = parseFloat(res.headers.get("X-Percentile-Lo-Value") ?? "0");
+    const percentileHiValue = parseFloat(res.headers.get("X-Percentile-Hi-Value") ?? "1");
+    const format = res.headers.get("X-Image-Format") ?? req.output_format ?? "jpeg";
+
+    // For raw format, use arrayBuffer; for png/jpeg, use blob
+    const blob = format === "raw" ? await res.arrayBuffer() : await res.blob();
+
+    return { blob, width, height, percentileLoValue, percentileHiValue, format };
   }
 
   // -------------------------------------------------------------------------

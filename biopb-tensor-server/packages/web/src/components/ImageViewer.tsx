@@ -11,6 +11,7 @@ import {
   buildAxisMap,
   computeScaleHint,
   type AxisMap,
+  type RenderResult,
 } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
@@ -292,6 +293,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const spriteRef = useRef<Sprite | null>(null);
   const textureRef = useRef<Texture | null>(null);
   const backgroundRef = useRef<Graphics | null>(null);
+  const imageBitmapRef = useRef<ImageBitmap | null>(null);  // Track ImageBitmap for cleanup
 
   const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
@@ -299,6 +301,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const channelColors = useAppStore((s) => s.channelColors);
   const channelNames = useAppStore((s) => s.channelNames);
   const getChannelColor = useAppStore((s) => s.getChannelColor);
+  const renderingMode = useAppStore((s) => s.renderingMode);
 
   // Compute percentile cutoffs from state
   const percentileLo = slice.useMinMax ? 0 : slice.percentileScale / 100;
@@ -549,6 +552,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       spriteRef.current?.destroy();
       textureRef.current?.destroy(true);
       backgroundRef.current?.destroy();
+      imageBitmapRef.current?.close();  // Clean up ImageBitmap
+      imageBitmapRef.current = null;
       appRef.current?.destroy(true, { children: true, texture: true });
       appRef.current = null;
       viewportRef.current = null;
@@ -557,6 +562,189 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       backgroundRef.current = null;
     };
   }, [descriptor]);
+
+  // Helper function for backend rendering (uses /api/render endpoint)
+  const triggerBackendRender = (scaleFactors: number[], sliceRange: { y: [number, number]; x: [number, number] }) => {
+    const viewport = viewportRef.current;
+    if (!viewport || !client || !descriptor) {
+      return;
+    }
+
+    const abortController = new AbortController();
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
+    setLoading(true);
+    setError(null);
+
+    const axisMap = buildAxisMap(descriptor.dim_labels);
+    const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
+    const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
+    const ndim = descriptor.shape.length;
+
+    // Build slice_start/slice_stop arrays in correct axis order
+    // Each dimension gets [start, stop) range
+    const sliceStart: number[] = [];
+    const sliceStop: number[] = [];
+
+    for (let i = 0; i < ndim; i++) {
+      if (i === yIdx) {
+        sliceStart.push(sliceRange.y[0]);
+        sliceStop.push(sliceRange.y[1]);
+      } else if (i === xIdx) {
+        sliceStart.push(sliceRange.x[0]);
+        sliceStop.push(sliceRange.x[1]);
+      } else if (i === axisMap.t) {
+        sliceStart.push(sliceRef.current.t);
+        sliceStop.push(sliceRef.current.t + 1);
+      } else if (i === axisMap.z) {
+        sliceStart.push(sliceRef.current.z);
+        sliceStop.push(sliceRef.current.z + 1);
+      } else if (i === axisMap.c) {
+        sliceStart.push(sliceRef.current.c);
+        sliceStop.push(sliceRef.current.c + 1);
+      } else {
+        // Unknown dimension - take full range or single slice
+        sliceStart.push(0);
+        sliceStop.push(descriptor.shape[i] ?? 1);
+      }
+    }
+
+    // Call backend render endpoint
+    const useRaw = true;  // Use raw format for localhost (adaptive in future)
+    client.http.render({
+      source_id: sourceId,
+      tensor_id: tensorId,
+      slice_start: sliceStart,
+      slice_stop: sliceStop,
+      scale_hint: scaleFactors,
+      reduction_method: sliceRef.current.reductionMethod,
+      percentile_lo: percentileLoRef.current * 100,
+      percentile_hi: percentileHiRef.current * 100,
+      color: colorRef.current,
+      channel_name: channelNameRef.current,
+      use_min_max: sliceRef.current.useMinMax,
+      output_format: useRaw ? "raw" : "jpeg",
+      pixel_budget: 1_000_000,
+    })
+      .then((result: RenderResult) => {
+        if (signal.aborted) return;
+
+        const { blob, width, height, format } = result;
+
+        // Handle different formats
+        if (format === "raw" && blob instanceof ArrayBuffer) {
+          // Raw RGBA bytes - create ImageData directly
+          const rgbaData = new Uint8ClampedArray(blob);
+          const imageData = new ImageData(rgbaData, width, height);
+
+          // Create ImageBitmap from ImageData
+          createImageBitmap(imageData).then((imageBitmap) => {
+            if (signal.aborted) {
+              imageBitmap.close();
+              return;
+            }
+
+            // Close previous ImageBitmap if exists
+            if (imageBitmapRef.current) {
+              imageBitmapRef.current.close();
+            }
+            imageBitmapRef.current = imageBitmap;
+
+            const tex = Texture.from(imageBitmap);
+
+            textureRef.current?.destroy(true);
+            textureRef.current = tex;
+
+            // Position sprite at correct world coordinates
+            const sprite = new Sprite(tex);
+            const worldY = sliceRange.y[0];
+            const worldX = sliceRange.x[0];
+            const worldWidth = sliceRange.x[1] - sliceRange.x[0];
+            const worldHeight = sliceRange.y[1] - sliceRange.y[0];
+
+            sprite.position.set(worldX, worldY);
+            sprite.width = worldWidth;
+            sprite.height = worldHeight;
+
+            // Remove old sprite
+            if (spriteRef.current) {
+              viewport.removeChild(spriteRef.current);
+              spriteRef.current.destroy();
+            }
+            viewport.addChild(sprite);
+            spriteRef.current = sprite;
+
+            // Track loaded region
+            loadedRegionRef.current = {
+              x: worldX,
+              y: worldY,
+              width: sprite.width,
+              height: sprite.height,
+              scaleFactors: scaleFactors,
+            };
+          });
+        } else {
+          // PNG/JPEG - use existing blob approach
+          createImageBitmap(blob as Blob).then((imageBitmap) => {
+            if (signal.aborted) {
+              imageBitmap.close();
+              return;
+            }
+
+            // Close previous ImageBitmap if exists
+            if (imageBitmapRef.current) {
+              imageBitmapRef.current.close();
+            }
+            imageBitmapRef.current = imageBitmap;
+
+            const tex = Texture.from(imageBitmap);
+
+            textureRef.current?.destroy(true);
+            textureRef.current = tex;
+
+            // Position sprite at correct world coordinates
+            const sprite = new Sprite(tex);
+            const worldY = sliceRange.y[0];
+            const worldX = sliceRange.x[0];
+            const worldWidth = sliceRange.x[1] - sliceRange.x[0];
+            const worldHeight = sliceRange.y[1] - sliceRange.y[0];
+
+            sprite.position.set(worldX, worldY);
+            sprite.width = worldWidth;
+            sprite.height = worldHeight;
+
+            // Remove old sprite
+            if (spriteRef.current) {
+              viewport.removeChild(spriteRef.current);
+              spriteRef.current.destroy();
+            }
+            viewport.addChild(sprite);
+            spriteRef.current = sprite;
+
+            // Track loaded region
+            loadedRegionRef.current = {
+              x: worldX,
+              y: worldY,
+              width: sprite.width,
+              height: sprite.height,
+              scaleFactors: scaleFactors,
+            };
+          });
+        }
+      })
+      .catch((e: unknown) => {
+        if (!signal.aborted) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!signal.aborted) {
+          setLoading(false);
+        }
+      });
+  };
 
   // Function to fetch tensor with cancellation support
   // Computes scaleFactors and sliceRange at fetch time for consistency
@@ -608,6 +796,13 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       sliceRange = computeSliceRange(visibleBounds, axisMap, descriptor.shape, scaleFactors);
     }
 
+    // Dispatch to backend or frontend rendering based on mode
+    if (renderingMode === "backend") {
+      triggerBackendRender(scaleFactors, sliceRange);
+      return;
+    }
+
+    // Frontend rendering path (existing logic)
     const tensor = client.getTensor(sourceId, tensorId);
 
     tensor
@@ -626,6 +821,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         const shape = arr.shape.length ? arr.shape : descriptor.shape;
         const labels = arr.dimLabels.length ? arr.dimLabels : descriptor.dim_labels;
         const dtype = arr.dtype || descriptor.dtype || "uint8";
+
         const { rgba, width, height } = toPseudoColorRgba(
           shape,
           labels,
@@ -647,37 +843,14 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
         const tex = Texture.from(canvas);
         const sprite = new Sprite(tex);
 
-        // Compute scale factors for sprite size (convert returned pixels to world units)
+        // Compute scale factors for sprite size
         const scaleFactorY = scaleFactors[yIdx] ?? 1;
         const scaleFactorX = scaleFactors[xIdx] ?? 1;
 
-        // Debug: log dimensions
-        const sliceHeight = sliceRange.y[1] - sliceRange.y[0];
-        const sliceWidth = sliceRange.x[1] - sliceRange.x[0];
-        console.log(
-          "Loaded tensor: shape=%s, width=%d, height=%d, bufferLen=%d, forceFull=%s",
-          shape.join(","),
-          width,
-          height,
-          arr.buffer.byteLength,
-          forceFull,
-        );
-        console.log(
-          "Slice range: y=%s, x=%s (world), scaleFactors=%s",
-          sliceRange.y.join(","),
-          sliceRange.x.join(","),
-          scaleFactors.join(","),
-        );
-        console.log(
-          "Sprite world: pos=(%d, %d), size=(%d x %d), requested slice=(%d x %d)",
-          sliceRange.y[0],
-          sliceRange.x[0],
-          height * scaleFactorY,
-          width * scaleFactorX,
-          sliceHeight,
-          sliceWidth,
-        );
-        console.log("Full tensor: %d x %d", fullHeight, fullWidth);
+        // Position sprite at correct world coordinates
+        sprite.position.set(sliceRange.x[0], sliceRange.y[0]);
+        sprite.width = width * scaleFactorX;
+        sprite.height = height * scaleFactorY;
 
         textureRef.current?.destroy(true);
         textureRef.current = tex;
@@ -712,7 +885,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
           scaleFactors: scaleFactors,
         };
       })
-      .catch((e) => {
+      .catch((e: unknown) => {
         if (!signal.aborted) {
           setError(e instanceof Error ? e.message : String(e));
         }

@@ -4,6 +4,7 @@ import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-fli
 import { type ColorValue, guessDefaultColor, extractChannelNames } from "./utils/colorUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
+export type RenderingMode = "frontend" | "backend";
 
 export interface SliceState {
   t: number;
@@ -21,6 +22,9 @@ export interface AppState {
   connectionError: string | null;
   devMode: boolean;
   apiBase: string;
+
+  // Rendering mode (frontend Pixi.js vs backend VTK/PIL)
+  renderingMode: RenderingMode;
 
   // Data sources
   sources: DataSourceDescriptor[];
@@ -51,6 +55,7 @@ export interface AppState {
   selectSource: (sourceId: string | null, tensorId?: string) => void;
   setSlice: (partial: Partial<SliceState>) => void;
   setShowAdvancedOptions: (value: boolean) => void;
+  setRenderingMode: (mode: RenderingMode) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -91,6 +96,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   connectionError: null,
   devMode: false,
   apiBase: "http://localhost:8816",
+
+  renderingMode: "backend",  // Default to backend VTK/PIL rendering
 
   sources: [],
   sourcesLoading: false,
@@ -169,6 +176,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setShowAdvancedOptions(value) {
     set({ showAdvancedOptions: value });
+  },
+
+  setRenderingMode(mode) {
+    set({ renderingMode: mode });
   },
 
   getChannelColor(sourceId, channelIdx) {
