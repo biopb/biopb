@@ -1,332 +1,53 @@
 "use client";
 
-import {
-  Application,
-  Graphics,
-  Sprite,
-  Texture,
-} from "pixi.js";
-import { Viewport } from "pixi-viewport";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useAppStore } from "../store";
+import { useRenderWebSocket, type RenderParams } from "../hooks/useRenderWebSocket";
 import {
   buildAxisMap,
-  computeScaleHint,
+  computeImageCSS,
+  computeInitialViewportState,
+  clampViewportToBounds,
+  computeVisibleBounds,
+  computeScaleFactors,
+  computeSliceRange,
+  shouldReload,
   type AxisMap,
-  type RenderResult,
-} from "@biopb/tensor-flight-client";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore } from "../store";
-import { type ColorValue, getColorMultipliers } from "../utils/colorUtils";
+  type LoadedRegion,
+  type ViewportState,
+} from "../utils/regionUtils";
+import { resolveAutoColor, type ColorValue } from "../utils/colorUtils";
 
 interface ImageViewerProps {
   sourceId: string;
   tensorId: string;
 }
 
-type NumericArray = Uint8Array | Uint16Array | Uint32Array | Float32Array | Float64Array | Int16Array | Int32Array;
-
-interface LoadedRegion {
-  x: number;      // world X start
-  y: number;      // world Y start
-  width: number;  // world width
-  height: number; // world height
-  scaleFactors: number[];
-}
-
-interface VisibleBounds {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-function normalizeDtype(dtype: string): string {
-  const dt = dtype.toLowerCase().replace(/\s+/g, "");
-  const core = dt.replace(/^[<>=|]/, "");
-
-  if (core === "u1" || core === "uint8") return "uint8";
-  if (core === "u2" || core === "uint16") return "uint16";
-  if (core === "u4" || core === "uint32") return "uint32";
-  if (core === "i2" || core === "int16") return "int16";
-  if (core === "i4" || core === "int32") return "int32";
-  if (core === "f4" || core === "float32" || core === "float") return "float32";
-  if (core === "f8" || core === "float64") return "float64";
-  return core;
-}
-
-function toNumericArray(dtype: string, buffer: ArrayBuffer): NumericArray {
-  const dt = normalizeDtype(dtype);
-  if (dt === "uint16") return new Uint16Array(buffer);
-  if (dt === "uint32") return new Uint32Array(buffer);
-  if (dt === "int16") return new Int16Array(buffer);
-  if (dt === "int32") return new Int32Array(buffer);
-  if (dt === "float64") return new Float64Array(buffer);
-  if (dt === "float32") return new Float32Array(buffer);
-  return new Uint8Array(buffer);
-}
-
-function computeStrides(shape: number[]): number[] {
-  const strides = new Array<number>(shape.length).fill(1);
-  for (let i = shape.length - 2; i >= 0; i--) {
-    const nextStride = strides[i + 1] as number;
-    const nextShape = shape[i + 1] as number;
-    strides[i] = nextStride * nextShape;
-  }
-  return strides;
-}
-
-function computePercentileCutoffs(
-  data: ArrayLike<number>,
-  lo: number,
-  hi: number,
-): [number, number] {
-  const n = data.length;
-  if (n === 0) return [0, 1];
-
-  const sampleSize = Math.min(n, 65536);
-  const step = n / sampleSize;
-  const sample = new Float32Array(sampleSize);
-  for (let i = 0; i < sampleSize; i++) {
-    sample[i] = Number(data[Math.floor(i * step)]);
-  }
-  sample.sort();
-
-  const loVal = sample[Math.floor(sampleSize * lo)]!;
-  const hiVal = sample[Math.min(sampleSize - 1, Math.ceil(sampleSize * hi))]!;
-  return loVal < hiVal ? [loVal, hiVal] : [0, 1];
-}
-
-function toPseudoColorRgba(
-  shape: number[],
-  dimLabels: string[],
-  dtype: string,
-  buffer: ArrayBuffer,
-  color: ColorValue = "auto",
-  channelName?: string,
-  percentileLo = 0.01,
-  percentileHi = 0.99,
-): { rgba: Uint8ClampedArray<ArrayBuffer>; width: number; height: number } {
-  const dt = normalizeDtype(dtype);
-  const labels = dimLabels.length ? dimLabels : shape.map((_, i) => `d${i}`);
-  const axisMap = buildAxisMap(labels);
-  const yIdx = axisMap.y ?? Math.max(0, shape.length - 2);
-  const xIdx = axisMap.x ?? Math.max(0, shape.length - 1);
-
-  const height = shape[yIdx] ?? 1;
-  const width = shape[xIdx] ?? 1;
-
-  const data = toNumericArray(dtype, buffer);
-  const strides = computeStrides(shape);
-
-  const needsNormalization = dt !== "uint8";
-  let loVal = 0;
-  let hiVal = 1;
-
-  if (needsNormalization) {
-    [loVal, hiVal] = computePercentileCutoffs(data, percentileLo, percentileHi);
-  }
-
-  // Get RGB multipliers for the color (works for both presets and hex colors, resolves "auto")
-  const [rMult, gMult, bMult] = getColorMultipliers(color, channelName);
-
-  const rgba = new Uint8ClampedArray(width * height * 4);
-  const coords = new Array<number>(shape.length).fill(0);
-
-  let out = 0;
-  for (let y = 0; y < height; y++) {
-    coords[yIdx] = y;
-    for (let x = 0; x < width; x++) {
-      coords[xIdx] = x;
-      let flat = 0;
-      for (let d = 0; d < coords.length; d++) {
-        flat += (coords[d] as number) * (strides[d] as number);
-      }
-      const raw = Number(data[flat] ?? 0);
-
-      let gray = 0;
-      if (dt === "uint8") {
-        gray = Math.max(0, Math.min(255, Math.round(raw)));
-      } else if (needsNormalization) {
-        const n = (raw - loVal) / Math.max(1e-8, hiVal - loVal);
-        gray = Math.max(0, Math.min(255, Math.round(n * 255)));
-      } else {
-        gray = Math.max(0, Math.min(255, Math.round(raw)));
-      }
-
-      // Apply color multipliers
-      rgba[out++] = Math.round(gray * rMult);
-      rgba[out++] = Math.round(gray * gMult);
-      rgba[out++] = Math.round(gray * bMult);
-      rgba[out++] = 255;
-    }
-  }
-
-  return { rgba, width, height };
-}
-
-const HYSTERESIS = 0.2;
-
-/**
- * Get visible world bounds from viewport, clipped to tensor bounds.
- */
-function getVisibleWorldBounds(
-  viewport: Viewport,
-  fullWidth: number,
-  fullHeight: number,
-): VisibleBounds {
-  const bounds = viewport.getVisibleBounds();
-  // Clip visible region to actual tensor bounds (no margins)
-  const x = Math.max(0, bounds.x);
-  const y = Math.max(0, bounds.y);
-  const endX = Math.min(fullWidth, bounds.x + bounds.width);
-  const endY = Math.min(fullHeight, bounds.y + bounds.height);
-  return {
-    x,
-    y,
-    width: Math.max(0, endX - x),
-    height: Math.max(0, endY - y),
-  };
-}
-
-/**
- * Compute tensor slice range from visible bounds with 50% buffer.
- * World coordinates = original tensor indices (world is sized to full tensor).
- * IMPORTANT: slice coordinates are snapped to be divisible by scaleFactors
- * to avoid 1-pixel shift issues when server processes slice_hint with scale_hint.
- */
-function computeSliceRange(
-  visibleBounds: VisibleBounds,
-  axisMap: AxisMap,
-  tensorShape: number[],
-  scaleFactors: number[],
-): { y: [number, number]; x: [number, number] } {
-  const yIdx = axisMap.y ?? 0;
-  const xIdx = axisMap.x ?? 1;
-  const fullHeight = tensorShape[yIdx] ?? 1;
-  const fullWidth = tensorShape[xIdx] ?? 1;
-  const scaleY = scaleFactors[yIdx] ?? 1;
-  const scaleX = scaleFactors[xIdx] ?? 1;
-
-  // 50% buffer margin for smooth panning (in world units)
-  const marginY = visibleBounds.height * 0.5;
-  const marginX = visibleBounds.width * 0.5;
-
-  // World coords = original tensor indices
-  // Snap to scale factor divisibility to avoid rounding issues
-  const yStartRaw = Math.max(0, Math.floor(visibleBounds.y - marginY));
-  const yEndRaw = Math.min(fullHeight, Math.ceil(visibleBounds.y + visibleBounds.height + marginY));
-  const xStartRaw = Math.max(0, Math.floor(visibleBounds.x - marginX));
-  const xEndRaw = Math.min(fullWidth, Math.ceil(visibleBounds.x + visibleBounds.width + marginX));
-
-  // Snap to multiples of scale factor (floor for start, ceil for end)
-  const yStart = scaleY > 1 ? Math.floor(yStartRaw / scaleY) * scaleY : yStartRaw;
-  const yEnd = scaleY > 1 ? Math.ceil(yEndRaw / scaleY) * scaleY : yEndRaw;
-  const xStart = scaleX > 1 ? Math.floor(xStartRaw / scaleX) * scaleX : xStartRaw;
-  const xEnd = scaleX > 1 ? Math.ceil(xEndRaw / scaleX) * scaleX : xEndRaw;
-
-  // Clamp again after snapping
-  const yStartClamped = Math.max(0, yStart);
-  const yEndClamped = Math.min(fullHeight, yEnd);
-  const xStartClamped = Math.max(0, xStart);
-  const xEndClamped = Math.min(fullWidth, xEnd);
-
-  return {
-    y: [yStartClamped, yEndClamped],
-    x: [xStartClamped, xEndClamped],
-  };
-}
-
-/**
- * Check if reload needed based on visible region coverage (no scale check).
- * Used at event time to decide whether to queue a reload.
- */
-function shouldReloadCheck(
-  visibleBounds: VisibleBounds,
-  loadedRegion: LoadedRegion | null,
-): boolean {
-  if (!loadedRegion) return true;
-
-  // Check region coverage: reload when visible region extends outside loaded region
-  const visibleEndX = visibleBounds.x + visibleBounds.width;
-  const visibleEndY = visibleBounds.y + visibleBounds.height;
-  const loadedEndX = loadedRegion.x + loadedRegion.width;
-  const loadedEndY = loadedRegion.y + loadedRegion.height;
-
-  // Small tolerance to avoid reload on rounding errors at clamped edges
-  const TOLERANCE = 1.0;
-
-  // Reload if any edge of visible region is outside loaded region (beyond tolerance)
-  if (visibleBounds.x < loadedRegion.x - TOLERANCE) return true;
-  if (visibleBounds.y < loadedRegion.y - TOLERANCE) return true;
-  if (visibleEndX > loadedEndX + TOLERANCE) return true;
-  if (visibleEndY > loadedEndY + TOLERANCE) return true;
-
-  return false;
-}
-
-/**
- * Check if reload needed: scale change OR viewport extends outside loaded region.
- * Used when both current scaleFactors and visibleBounds are known.
- */
-function shouldReload(
-  newScaleFactors: number[],
-  visibleBounds: VisibleBounds,
-  loadedRegion: LoadedRegion | null,
-): boolean {
-  if (!loadedRegion) return true;
-
-  // Check scale change (hysteresis)
-  for (let i = 0; i < newScaleFactors.length; i++) {
-    const newVal = newScaleFactors[i] ?? 1;
-    const loadedVal = loadedRegion.scaleFactors[i] ?? 1;
-    if (newVal < loadedVal * (1 - HYSTERESIS) || newVal > loadedVal * (1 + HYSTERESIS)) {
-      return true;
-    }
-  }
-
-  return shouldReloadCheck(visibleBounds, loadedRegion);
-}
+// Zoom limits
+const MIN_SCALE = 0.1;
+const MAX_SCALE = 10.0;
+const ZOOM_SENSITIVITY = 0.001;
+const RELOAD_DEBOUNCE_MS = 150;
 
 export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const appRef = useRef<Application | null>(null);
-  const viewportRef = useRef<Viewport | null>(null);
-  const spriteRef = useRef<Sprite | null>(null);
-  const textureRef = useRef<Texture | null>(null);
-  const backgroundRef = useRef<Graphics | null>(null);
-  const imageBitmapRef = useRef<ImageBitmap | null>(null);  // Track ImageBitmap for cleanup
 
-  const client = useAppStore((s) => s.client);
   const sources = useAppStore((s) => s.sources);
   const slice = useAppStore((s) => s.slice);
-  const channelColors = useAppStore((s) => s.channelColors);
   const channelNames = useAppStore((s) => s.channelNames);
   const getChannelColor = useAppStore((s) => s.getChannelColor);
-  const renderingMode = useAppStore((s) => s.renderingMode);
+  const apiBase = useAppStore((s) => s.apiBase);
+  const devMode = useAppStore((s) => s.devMode);
 
   // Compute percentile cutoffs from state
   const percentileLo = slice.useMinMax ? 0 : slice.percentileScale / 100;
   const percentileHi = slice.useMinMax ? 1 : 1 - slice.percentileScale / 100;
 
-  const [appReady, setAppReady] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const loadedRegionRef = useRef<LoadedRegion | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sliceRef = useRef(slice);  // Keep current slice for event handlers
-  const colorRef = useRef<ColorValue>("auto");  // Keep current color for rendering
-  const channelNameRef = useRef<string | undefined>(undefined);  // Keep current channel name for rendering
-  const percentileLoRef = useRef(percentileLo);  // Keep current percentile for rendering
-  const percentileHiRef = useRef(percentileHi);  // Keep current percentile for rendering
-  const pressedKeysRef = useRef<Set<string>>(new Set());  // Track held keys for slice navigation
-  const sliceWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // Debounce for scroll c/t/z
-
-  // Update sliceRef whenever slice changes
-  sliceRef.current = slice;
-
-  // Update colorRef whenever color changes
-  colorRef.current = getChannelColor(sourceId, slice.c);
+  // Get descriptor
+  const descriptor = useMemo(() => {
+    const src = sources.find((s) => s.source_id === sourceId);
+    return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
+  }, [sourceId, sources, tensorId]);
 
   // Get current channel name for color resolution
   const currentChannelName = useMemo(() => {
@@ -334,606 +55,645 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     return names?.[slice.c] ?? undefined;
   }, [channelNames, sourceId, slice.c]);
 
-  // Update channelNameRef whenever channel name changes
-  channelNameRef.current = currentChannelName;
+  // Get current color
+  const color = getChannelColor(sourceId, slice.c);
 
-  // Update percentile refs whenever they change
-  percentileLoRef.current = percentileLo;
-  percentileHiRef.current = percentileHi;
+  // Get token for WebSocket auth
+  const token = useMemo(() => {
+    if (devMode) return null;
+    return sessionStorage.getItem("biopb_token") || null;
+  }, [devMode]);
 
-  // Track current source/tensor to reset when switching
-  const prevSourceIdRef = useRef<string>(sourceId);
-  const prevTensorIdRef = useRef<string>(tensorId);
-
-  // Reset state when switching source/tensor
-  if (prevSourceIdRef.current !== sourceId || prevTensorIdRef.current !== tensorId) {
-    prevSourceIdRef.current = sourceId;
-    prevTensorIdRef.current = tensorId;
-    loadedRegionRef.current = null;
-  }
-
-  const descriptor = useMemo(() => {
-    const src = sources.find((s) => s.source_id === sourceId);
-    return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
-  }, [sourceId, sources, tensorId]);
-
-  // Setup PixiJS Application and Viewport - depends on descriptor for correct world size
-  useEffect(() => {
-    let cancelled = false;
-    const host = hostRef.current;
-    if (!host || !descriptor) return;
-
-    const axisMap = buildAxisMap(descriptor.dim_labels);
-    const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
-    const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
-    const fullHeight = descriptor.shape[yIdx] ?? 1;
-    const fullWidth = descriptor.shape[xIdx] ?? 1;
-
-    (async () => {
-      const app = new Application();
-      await app.init({
-        backgroundAlpha: 0,
-        antialias: true,
-        resizeTo: host,
-      });
-      if (cancelled) {
-        app.destroy(true, { children: true, texture: true });
-        return;
-      }
-
-      host.innerHTML = "";
-      host.appendChild(app.canvas);
-
-      // Create viewport with correct world dimensions from tensor descriptor
-      const viewport = new Viewport({
-        events: app.renderer.events,
-        screenWidth: host.clientWidth,
-        screenHeight: host.clientHeight,
-        worldWidth: fullWidth,
-        worldHeight: fullHeight,
-      });
-      app.stage.addChild(viewport);
-
-      // Add background to show pending-data regions when panning
-      const background = new Graphics();
-      background.rect(0, 0, fullWidth, fullHeight);
-      background.fill({ color: 0x1a1a2e });  // Dark blue-gray for "no data" cue
-      viewport.addChild(background);
-      backgroundRef.current = background;
-
-      // Set initial fit-to-window scale
-      const hostW = Math.max(1, host.clientWidth);
-      const hostH = Math.max(1, host.clientHeight);
-      const fitScale = Math.min(1, hostW / Math.max(1, fullWidth), hostH / Math.max(1, fullHeight));
-      viewport.scale.set(fitScale);
-      const offsetX = Math.round((hostW - fullWidth * fitScale) / 2);
-      const offsetY = Math.round((hostH - fullHeight * fitScale) / 2);
-      viewport.position.set(offsetX, offsetY);
-
-      viewport
-        .drag()
-        .clamp({ direction: "all" })
-        .pinch()
-        .wheel();
-
-      // Make canvas focusable for keyboard events
-      app.canvas.setAttribute("tabindex", "0");
-      (app.canvas as HTMLCanvasElement).style.outline = "none";
-
-      // Track pressed keys for slice navigation
-      const handleKeyDown = (e: KeyboardEvent) => {
-        const key = e.key.toLowerCase();
-        if (key === "c" || key === "t" || key === "z") {
-          pressedKeysRef.current.add(key);
-          e.preventDefault();  // Prevent browser shortcuts
-        }
-      };
-      const handleKeyUp = (e: KeyboardEvent) => {
-        const key = e.key.toLowerCase();
-        pressedKeysRef.current.delete(key);
-      };
-
-      app.canvas.addEventListener("keydown", handleKeyDown);
-      app.canvas.addEventListener("keyup", handleKeyUp);
-
-      // Focus canvas on mount so keyboard events work
-      (app.canvas as HTMLCanvasElement).focus();
-
-      // Intercept wheel before viewport's zoom handler so c/t/z + scroll never zooms.
-      app.canvas.addEventListener("wheel", (e: WheelEvent) => {
-        const keys = pressedKeysRef.current;
-        if (keys.has("c") || keys.has("t") || keys.has("z")) {
-          // Slice navigation mode - prevent zoom and update slice
-          e.preventDefault();
-          e.stopPropagation();
-          if (sliceWheelTimerRef.current) {
-            clearTimeout(sliceWheelTimerRef.current);
-          }
-          sliceWheelTimerRef.current = setTimeout(() => {
-            const delta = Math.sign(e.deltaY) * -1;  // Scroll up = increment
-            const currentSlice = sliceRef.current;
-
-            // Get axis bounds
-            const axisMap = buildAxisMap(descriptor.dim_labels);
-            const shape = descriptor.shape;
-
-            if (keys.has("t") && axisMap.t !== null) {
-              const tMax = Math.max(0, (shape[axisMap.t] ?? 1) - 1);
-              useAppStore.getState().setSlice({ t: Math.max(0, Math.min(tMax, currentSlice.t + delta)) });
-            } else if (keys.has("z") && axisMap.z !== null) {
-              const zMax = Math.max(0, (shape[axisMap.z] ?? 1) - 1);
-              useAppStore.getState().setSlice({ z: Math.max(0, Math.min(zMax, currentSlice.z + delta)) });
-            } else if (keys.has("c") && axisMap.c !== null) {
-              const cMax = Math.max(0, (shape[axisMap.c] ?? 1) - 1);
-              useAppStore.getState().setSlice({ c: Math.max(0, Math.min(cMax, currentSlice.c + delta)) });
-            }
-          }, 150);
-        }
-      }, { capture: true, passive: false });
-
-      appRef.current = app;
-      viewportRef.current = viewport;
-      setAppReady(true);
-
-      console.log("Viewport created: fitScale=%.3f, worldSize=%dx%d", fitScale, fullWidth, fullHeight);
-
-      // Helper to queue reload with debounce - actual values computed at fetch time
-      const queueReload = () => {
-        if (debounceTimerRef.current) {
-          clearTimeout(debounceTimerRef.current);
-        }
-        debounceTimerRef.current = setTimeout(() => {
-          triggerTensorFetch();
-        }, 150);  // Shorter debounce to reduce stale-state window
-      };
-
-      // Listen for zoom changes - compute scale at event time for hysteresis check only
-      viewport.on("zoomed-end", () => {
-        if (!descriptor || !client) return;
-        const currentZoom = viewport.scale.x;
-        const hostW = Math.max(1, host.clientWidth);
-        const hostH = Math.max(1, host.clientHeight);
-        const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
-        const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
-
-        const axisMap = buildAxisMap(descriptor.dim_labels);
-        const scale = computeScaleHint(
-          descriptor.shape,
-          axisMap,
-          viewportW,
-          viewportH,
-          1_000_000,
-          currentZoom,
-        );
-
-        const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
-        const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
-        const fullHeight = descriptor.shape[yIdx] ?? 1;
-        const fullWidth = descriptor.shape[xIdx] ?? 1;
-
-        const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
-        // Use full shouldReload to check scale hysteresis AND region coverage
-        if (shouldReload(scale.factors, visibleBounds, loadedRegionRef.current)) {
-          queueReload();
-        }
-      });
-
-      // Listen for pan changes - region coverage check is sufficient
-      viewport.on("moved-end", () => {
-        if (!descriptor || !client) return;
-        const axisMap = buildAxisMap(descriptor.dim_labels);
-        const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
-        const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
-        const fullHeight = descriptor.shape[yIdx] ?? 1;
-        const fullWidth = descriptor.shape[xIdx] ?? 1;
-
-        const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
-        // For pan, only need to check region coverage
-        if (shouldReloadCheck(visibleBounds, loadedRegionRef.current)) {
-          queueReload();
-        }
-      });
-    })();
-
-    return () => {
-      cancelled = true;
-      setAppReady(false);
-      loadedRegionRef.current = null;  // Reset for next viewport
-      pressedKeysRef.current.clear();  // Reset pressed keys
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-      if (sliceWheelTimerRef.current) {
-        clearTimeout(sliceWheelTimerRef.current);
-        sliceWheelTimerRef.current = null;
-      }
-      abortControllerRef.current?.abort();
-      spriteRef.current?.destroy();
-      textureRef.current?.destroy(true);
-      backgroundRef.current?.destroy();
-      imageBitmapRef.current?.close();  // Clean up ImageBitmap
-      imageBitmapRef.current = null;
-      appRef.current?.destroy(true, { children: true, texture: true });
-      appRef.current = null;
-      viewportRef.current = null;
-      spriteRef.current = null;
-      textureRef.current = null;
-      backgroundRef.current = null;
-    };
+  // Axis map
+  const axisMap: AxisMap = useMemo(() => {
+    if (!descriptor) return { t: null, z: null, c: null, y: null, x: null };
+    return buildAxisMap(descriptor.dim_labels);
   }, [descriptor]);
 
-  // Helper function for backend rendering (uses /api/render endpoint)
-  const triggerBackendRender = (scaleFactors: number[], sliceRange: { y: [number, number]; x: [number, number] }) => {
-    const viewport = viewportRef.current;
-    if (!viewport || !client || !descriptor) {
+  // Tensor dimensions
+  const yIdx = axisMap.y ?? Math.max(0, (descriptor?.shape.length ?? 2) - 2);
+  const xIdx = axisMap.x ?? Math.max(0, (descriptor?.shape.length ?? 2) - 1);
+  const fullHeight = descriptor?.shape[yIdx] ?? 1;
+  const fullWidth = descriptor?.shape[xIdx] ?? 1;
+
+  // WebSocket hook
+  const ws = useRenderWebSocket({
+    apiBase,
+    token,
+    enabled: !!descriptor,
+  });
+
+  // Use refs for ws.requestRender to avoid dependency cycles
+  const wsRef = useRef(ws);
+  wsRef.current = ws;
+
+  // Viewport state (zoom/pan) - managed locally with refs
+  const [viewportState, setViewportState] = useState<ViewportState>(() => ({
+    centerX: fullWidth / 2,
+    centerY: fullHeight / 2,
+    scale: 1,
+  }));
+  const viewportStateRef = useRef(viewportState);
+  viewportStateRef.current = viewportState;
+
+  // Use loadedRegion from WebSocket hook (set by backend)
+  const loadedRegion = ws.loadedRegion;
+  const loadedRegionRef = useRef(loadedRegion);
+  loadedRegionRef.current = loadedRegion;
+
+  // Track previous slice values to detect changes
+  const prevSliceRef = useRef({
+    t: slice.t,
+    z: slice.z,
+    c: slice.c,
+    reductionMethod: slice.reductionMethod,
+    useMinMax: slice.useMinMax,
+    percentileScale: slice.percentileScale,
+    color,
+    currentChannelName,
+    percentileLo,
+    percentileHi,
+  });
+
+  // Debounce timer
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Drag state refs
+  const isDraggingRef = useRef(false);
+  const dragStartRef = useRef({ x: 0, y: 0, centerX: 0, centerY: 0 });
+
+  // Pressed keys for slice navigation
+  const pressedKeysRef = useRef<Set<string>>(new Set());
+  const sliceWheelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Descriptor refs
+  const descriptorRef = useRef(descriptor);
+  descriptorRef.current = descriptor;
+  const axisMapRef = useRef(axisMap);
+  axisMapRef.current = axisMap;
+
+  // Build render params (uses refs - stable)
+  const buildRenderParams = useCallback(
+    (
+      sliceRange: { y: [number, number]; x: [number, number] },
+      scaleFactors: number[],
+    ): RenderParams | null => {
+      const desc = descriptorRef.current;
+      if (!desc) return null;
+
+      const am = axisMapRef.current;
+      const ndim = desc.shape.length;
+      const currentSlice = useAppStore.getState().slice;
+
+      const sliceStart: number[] = [];
+      const sliceStop: number[] = [];
+
+      for (let i = 0; i < ndim; i++) {
+        if (i === am.y) {
+          sliceStart.push(sliceRange.y[0]);
+          sliceStop.push(sliceRange.y[1]);
+        } else if (i === am.x) {
+          sliceStart.push(sliceRange.x[0]);
+          sliceStop.push(sliceRange.x[1]);
+        } else if (i === am.t) {
+          sliceStart.push(currentSlice.t);
+          sliceStop.push(currentSlice.t + 1);
+        } else if (i === am.z) {
+          sliceStart.push(currentSlice.z);
+          sliceStop.push(currentSlice.z + 1);
+        } else if (i === am.c) {
+          sliceStart.push(currentSlice.c);
+          sliceStop.push(currentSlice.c + 1);
+        } else {
+          sliceStart.push(0);
+          sliceStop.push(desc.shape[i] ?? 1);
+        }
+      }
+
+      // Resolve color: if "auto", use channel name or fallback based on channel index
+      const rawColor = useAppStore.getState().getChannelColor(sourceId, currentSlice.c);
+      const names = useAppStore.getState().channelNames[sourceId];
+      const channelName = names?.[currentSlice.c] ?? undefined;
+
+      // Resolve "auto" to actual pseudo-color
+      let resolvedColor: ColorValue;
+      if (rawColor === "auto") {
+        if (channelName) {
+          resolvedColor = resolveAutoColor("auto", channelName);
+        } else {
+          // No channel name loaded yet - use default based on channel index
+          // Cycle through: green, red, blue, magenta, cyan
+          const defaultColors: ColorValue[] = ["green", "red", "blue", "magenta", "cyan"];
+          resolvedColor = defaultColors[currentSlice.c % defaultColors.length] ?? "green";
+        }
+      } else {
+        resolvedColor = rawColor;
+      }
+
+      const pLo = currentSlice.useMinMax ? 0 : currentSlice.percentileScale / 100;
+      const pHi = currentSlice.useMinMax ? 1 : 1 - currentSlice.percentileScale / 100;
+
+      return {
+        source_id: sourceId,
+        tensor_id: tensorId,
+        slice_start: sliceStart,
+        slice_stop: sliceStop,
+        scale_hint: scaleFactors,
+        reduction_method: currentSlice.reductionMethod,
+        percentile_lo: pLo * 100,
+        percentile_hi: pHi * 100,
+        color: resolvedColor,
+        channel_name: channelName,
+        use_min_max: currentSlice.useMinMax,
+        output_format: "jpeg",
+        pixel_budget: 1_000_000,
+      };
+    },
+    [sourceId, tensorId],
+  );
+
+  // Request render helper (uses refs - stable)
+  const requestRender = useCallback(
+    (
+      sliceRange: { y: [number, number]; x: [number, number] },
+      scaleFactors: number[],
+    ) => {
+      const params = buildRenderParams(sliceRange, scaleFactors);
+      if (params) {
+        wsRef.current.requestRender(params);
+      }
+    },
+    [buildRenderParams],
+  );
+
+  // Trigger render if needed (with debounce) - uses refs
+  const triggerRenderIfNeeded = useCallback(() => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = null;
+
+      const wrapper = hostRef.current;
+      const desc = descriptorRef.current;
+      if (!wrapper || !desc) return;
+
+      const bounds = computeVisibleBounds(
+        viewportStateRef.current,
+        wrapper.clientWidth,
+        wrapper.clientHeight,
+        fullWidth,
+        fullHeight,
+      );
+
+      const viewportW = Math.max(1, Math.floor(wrapper.clientWidth * window.devicePixelRatio));
+      const viewportH = Math.max(1, Math.floor(wrapper.clientHeight * window.devicePixelRatio));
+      const scaleResult = computeScaleFactors(
+        desc.shape,
+        axisMapRef.current,
+        viewportW,
+        viewportH,
+        1_000_000,
+        viewportStateRef.current.scale,
+      );
+
+      if (shouldReload(scaleResult.factors, bounds, loadedRegionRef.current)) {
+        const sliceRange = computeSliceRange(
+          bounds,
+          axisMapRef.current,
+          desc.shape,
+          scaleResult.factors,
+        );
+        requestRender(sliceRange, scaleResult.factors);
+      }
+    }, RELOAD_DEBOUNCE_MS);
+  }, [fullWidth, fullHeight, requestRender]);
+
+  // Initialize viewport and request initial render when descriptor changes
+  useEffect(() => {
+    const desc = descriptorRef.current;
+    if (!desc) return;
+
+    const wrapper = hostRef.current;
+    if (!wrapper) return;
+
+    // Reset viewport to fit image
+    const initial = computeInitialViewportState(
+      fullWidth,
+      fullHeight,
+      wrapper.clientWidth,
+      wrapper.clientHeight,
+    );
+    setViewportState(initial);
+    viewportStateRef.current = initial;
+
+    // Request initial render (full tensor)
+    requestRender(
+      { y: [0, fullHeight], x: [0, fullWidth] },
+      desc.shape.map(() => 1),
+    );
+  }, [descriptor, fullWidth, fullHeight, requestRender]);
+
+  // Detect slice changes and request render - compare with previous values
+  useEffect(() => {
+    const prev = prevSliceRef.current;
+    const changed =
+      prev.t !== slice.t ||
+      prev.z !== slice.z ||
+      prev.c !== slice.c ||
+      prev.reductionMethod !== slice.reductionMethod ||
+      prev.useMinMax !== slice.useMinMax ||
+      prev.percentileScale !== slice.percentileScale ||
+      prev.color !== color ||
+      prev.currentChannelName !== currentChannelName ||
+      prev.percentileLo !== percentileLo ||
+      prev.percentileHi !== percentileHi;
+
+    // Only request render if values changed and conditions are met
+    if (!changed || !descriptorRef.current || !wsRef.current.connected || !loadedRegionRef.current) {
       return;
     }
 
-    const abortController = new AbortController();
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = abortController;
-    const signal = abortController.signal;
+    const wrapper = hostRef.current;
+    if (!wrapper) return;
 
-    setLoading(true);
-    setError(null);
+    const bounds = computeVisibleBounds(
+      viewportStateRef.current,
+      wrapper.clientWidth,
+      wrapper.clientHeight,
+      fullWidth,
+      fullHeight,
+    );
 
-    const axisMap = buildAxisMap(descriptor.dim_labels);
-    const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
-    const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
-    const ndim = descriptor.shape.length;
-
-    // Build slice_start/slice_stop arrays in correct axis order
-    // Each dimension gets [start, stop) range
-    const sliceStart: number[] = [];
-    const sliceStop: number[] = [];
-
-    for (let i = 0; i < ndim; i++) {
-      if (i === yIdx) {
-        sliceStart.push(sliceRange.y[0]);
-        sliceStop.push(sliceRange.y[1]);
-      } else if (i === xIdx) {
-        sliceStart.push(sliceRange.x[0]);
-        sliceStop.push(sliceRange.x[1]);
-      } else if (i === axisMap.t) {
-        sliceStart.push(sliceRef.current.t);
-        sliceStop.push(sliceRef.current.t + 1);
-      } else if (i === axisMap.z) {
-        sliceStart.push(sliceRef.current.z);
-        sliceStop.push(sliceRef.current.z + 1);
-      } else if (i === axisMap.c) {
-        sliceStart.push(sliceRef.current.c);
-        sliceStop.push(sliceRef.current.c + 1);
-      } else {
-        // Unknown dimension - take full range or single slice
-        sliceStart.push(0);
-        sliceStop.push(descriptor.shape[i] ?? 1);
-      }
-    }
-
-    // Call backend render endpoint
-    const useRaw = true;  // Use raw format for localhost (adaptive in future)
-    client.http.render({
-      source_id: sourceId,
-      tensor_id: tensorId,
-      slice_start: sliceStart,
-      slice_stop: sliceStop,
-      scale_hint: scaleFactors,
-      reduction_method: sliceRef.current.reductionMethod,
-      percentile_lo: percentileLoRef.current * 100,
-      percentile_hi: percentileHiRef.current * 100,
-      color: colorRef.current,
-      channel_name: channelNameRef.current,
-      use_min_max: sliceRef.current.useMinMax,
-      output_format: useRaw ? "raw" : "jpeg",
-      pixel_budget: 1_000_000,
-    })
-      .then((result: RenderResult) => {
-        if (signal.aborted) return;
-
-        const { blob, width, height, format } = result;
-
-        // Handle different formats
-        if (format === "raw" && blob instanceof ArrayBuffer) {
-          // Raw RGBA bytes - create ImageData directly
-          const rgbaData = new Uint8ClampedArray(blob);
-          const imageData = new ImageData(rgbaData, width, height);
-
-          // Create ImageBitmap from ImageData
-          createImageBitmap(imageData).then((imageBitmap) => {
-            if (signal.aborted) {
-              imageBitmap.close();
-              return;
-            }
-
-            // Close previous ImageBitmap if exists
-            if (imageBitmapRef.current) {
-              imageBitmapRef.current.close();
-            }
-            imageBitmapRef.current = imageBitmap;
-
-            const tex = Texture.from(imageBitmap);
-
-            textureRef.current?.destroy(true);
-            textureRef.current = tex;
-
-            // Position sprite at correct world coordinates
-            const sprite = new Sprite(tex);
-            const worldY = sliceRange.y[0];
-            const worldX = sliceRange.x[0];
-            const worldWidth = sliceRange.x[1] - sliceRange.x[0];
-            const worldHeight = sliceRange.y[1] - sliceRange.y[0];
-
-            sprite.position.set(worldX, worldY);
-            sprite.width = worldWidth;
-            sprite.height = worldHeight;
-
-            // Remove old sprite
-            if (spriteRef.current) {
-              viewport.removeChild(spriteRef.current);
-              spriteRef.current.destroy();
-            }
-            viewport.addChild(sprite);
-            spriteRef.current = sprite;
-
-            // Track loaded region
-            loadedRegionRef.current = {
-              x: worldX,
-              y: worldY,
-              width: sprite.width,
-              height: sprite.height,
-              scaleFactors: scaleFactors,
-            };
-          });
-        } else {
-          // PNG/JPEG - use existing blob approach
-          createImageBitmap(blob as Blob).then((imageBitmap) => {
-            if (signal.aborted) {
-              imageBitmap.close();
-              return;
-            }
-
-            // Close previous ImageBitmap if exists
-            if (imageBitmapRef.current) {
-              imageBitmapRef.current.close();
-            }
-            imageBitmapRef.current = imageBitmap;
-
-            const tex = Texture.from(imageBitmap);
-
-            textureRef.current?.destroy(true);
-            textureRef.current = tex;
-
-            // Position sprite at correct world coordinates
-            const sprite = new Sprite(tex);
-            const worldY = sliceRange.y[0];
-            const worldX = sliceRange.x[0];
-            const worldWidth = sliceRange.x[1] - sliceRange.x[0];
-            const worldHeight = sliceRange.y[1] - sliceRange.y[0];
-
-            sprite.position.set(worldX, worldY);
-            sprite.width = worldWidth;
-            sprite.height = worldHeight;
-
-            // Remove old sprite
-            if (spriteRef.current) {
-              viewport.removeChild(spriteRef.current);
-              spriteRef.current.destroy();
-            }
-            viewport.addChild(sprite);
-            spriteRef.current = sprite;
-
-            // Track loaded region
-            loadedRegionRef.current = {
-              x: worldX,
-              y: worldY,
-              width: sprite.width,
-              height: sprite.height,
-              scaleFactors: scaleFactors,
-            };
-          });
-        }
-      })
-      .catch((e: unknown) => {
-        if (!signal.aborted) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
-      })
-      .finally(() => {
-        if (!signal.aborted) {
-          setLoading(false);
-        }
-      });
-  };
-
-  // Function to fetch tensor with cancellation support
-  // Computes scaleFactors and sliceRange at fetch time for consistency
-  const triggerTensorFetch = (forceFull = false) => {
-    const viewport = viewportRef.current;
-    const host = hostRef.current;
-    if (!viewport || !host || !client || !descriptor) return;
-
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = new AbortController();
-    const signal = abortControllerRef.current.signal;
-
-    setLoading(true);
-    setError(null);
-
-    const axisMap = buildAxisMap(descriptor.dim_labels);
-    const yIdx = axisMap.y ?? Math.max(0, descriptor.shape.length - 2);
-    const xIdx = axisMap.x ?? Math.max(0, descriptor.shape.length - 1);
-    const fullHeight = descriptor.shape[yIdx] ?? 1;
-    const fullWidth = descriptor.shape[xIdx] ?? 1;
-
-    // Compute scaleFactors from current viewport zoom (at fetch time)
-    const currentZoom = viewport.scale.x;
-    const hostW = Math.max(1, host.clientWidth);
-    const hostH = Math.max(1, host.clientHeight);
-    const viewportW = Math.max(1, Math.floor(hostW * window.devicePixelRatio));
-    const viewportH = Math.max(1, Math.floor(hostH * window.devicePixelRatio));
-
-    const scale = computeScaleHint(
-      descriptor.shape,
-      axisMap,
+    const viewportW = Math.max(1, Math.floor(wrapper.clientWidth * window.devicePixelRatio));
+    const viewportH = Math.max(1, Math.floor(wrapper.clientHeight * window.devicePixelRatio));
+    const scaleResult = computeScaleFactors(
+      descriptorRef.current.shape,
+      axisMapRef.current,
       viewportW,
       viewportH,
       1_000_000,
-      currentZoom,
+      viewportStateRef.current.scale,
     );
-    const scaleFactors = scale.factors;
 
-    // Compute sliceRange from current viewport visibleBounds (at fetch time)
-    // Both scaleFactors and sliceRange are now computed from SAME viewport state
-    let sliceRange: { y: [number, number]; x: [number, number] };
-    if (forceFull) {
-      sliceRange = {
-        y: [0, fullHeight],
-        x: [0, fullWidth],
-      };
-    } else {
-      const visibleBounds = getVisibleWorldBounds(viewport, fullWidth, fullHeight);
-      sliceRange = computeSliceRange(visibleBounds, axisMap, descriptor.shape, scaleFactors);
-    }
+    const sliceRange = computeSliceRange(bounds, axisMapRef.current, descriptorRef.current.shape, scaleResult.factors);
 
-    // Dispatch to backend or frontend rendering based on mode
-    if (renderingMode === "backend") {
-      triggerBackendRender(scaleFactors, sliceRange);
-      return;
-    }
+    // Update previous values AFTER requesting render (so we don't lose changes if conditions weren't met)
+    prevSliceRef.current = {
+      t: slice.t,
+      z: slice.z,
+      c: slice.c,
+      reductionMethod: slice.reductionMethod,
+      useMinMax: slice.useMinMax,
+      percentileScale: slice.percentileScale,
+      color,
+      currentChannelName,
+      percentileLo,
+      percentileHi,
+    };
 
-    // Frontend rendering path (existing logic)
-    const tensor = client.getTensor(sourceId, tensorId);
-
-    tensor
-      .compute({
-        t: sliceRef.current.t,
-        z: sliceRef.current.z,
-        c: sliceRef.current.c,
-        y: sliceRange.y,
-        x: sliceRange.x,
-        scaleHint: scaleFactors,
-        reductionMethod: sliceRef.current.reductionMethod,
-        pixelBudget: 1_000_000,
-      })
-      .then((arr) => {
-        if (signal.aborted) return;
-        const shape = arr.shape.length ? arr.shape : descriptor.shape;
-        const labels = arr.dimLabels.length ? arr.dimLabels : descriptor.dim_labels;
-        const dtype = arr.dtype || descriptor.dtype || "uint8";
-
-        const { rgba, width, height } = toPseudoColorRgba(
-          shape,
-          labels,
-          dtype,
-          arr.buffer,
-          colorRef.current,
-          channelNameRef.current,
-          percentileLoRef.current,
-          percentileHiRef.current,
-        );
-
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("Failed to create 2D canvas context");
-        ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
-
-        const tex = Texture.from(canvas);
-        const sprite = new Sprite(tex);
-
-        // Compute scale factors for sprite size
-        const scaleFactorY = scaleFactors[yIdx] ?? 1;
-        const scaleFactorX = scaleFactors[xIdx] ?? 1;
-
-        // Position sprite at correct world coordinates
-        sprite.position.set(sliceRange.x[0], sliceRange.y[0]);
-        sprite.width = width * scaleFactorX;
-        sprite.height = height * scaleFactorY;
-
-        textureRef.current?.destroy(true);
-        textureRef.current = tex;
-
-        // Position sprite at correct world coordinates (sliceRange is in world units)
-        const worldY = sliceRange.y[0];
-        const worldX = sliceRange.x[0];
-        sprite.position.set(worldX, worldY);
-        // Sprite size: convert returned array dimensions to world units
-        sprite.width = width * scaleFactorX;
-        sprite.height = height * scaleFactorY;
-
-        // Remove old sprite, keep background (background is always first child)
-        if (spriteRef.current) {
-          viewport.removeChild(spriteRef.current);
-          spriteRef.current.destroy();
-        }
-        viewport.addChild(sprite);  // Adds on top of background
-        spriteRef.current = sprite;
-
-        // World size fixed to full tensor dimensions
-        viewport.worldWidth = fullWidth;
-        viewport.worldHeight = fullHeight;
-        viewport.clamp({ direction: "all" });
-
-        // Track loaded region
-        loadedRegionRef.current = {
-          x: worldX,
-          y: worldY,
-          width: sprite.width,
-          height: sprite.height,
-          scaleFactors: scaleFactors,
-        };
-      })
-      .catch((e: unknown) => {
-        if (!signal.aborted) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
-      })
-      .finally(() => {
-        if (!signal.aborted) {
-          setLoading(false);
-        }
-      });
-  };
-
-  // Fetch tensor when slice/source/tensor changes (viewport already initialized)
-  useEffect(() => {
-    if (!appReady || !client || !descriptor) return;
-    const host = hostRef.current;
-    const viewport = viewportRef.current;
-    if (!host || !viewport) return;
-
-    // First fetch for this viewport should load full tensor
-    const isInitialFetch = loadedRegionRef.current === null;
-    triggerTensorFetch(isInitialFetch);
+    requestRender(sliceRange, scaleResult.factors);
   }, [
-    appReady,
-    client,
-    descriptor,
-    slice.c,
-    slice.reductionMethod,
     slice.t,
     slice.z,
-    sourceId,
-    tensorId,
-    // Re-render when color changes
-    getChannelColor(sourceId, slice.c),
-    // Re-render when channel name is loaded (for auto color resolution)
-    currentChannelName,
-    // Re-render when intensity scaling changes
-    percentileLo,
-    percentileHi,
+    slice.c,
+    slice.reductionMethod,
     slice.useMinMax,
     slice.percentileScale,
+    color,
+    currentChannelName,
+    percentileLo,
+    percentileHi,
+    fullWidth,
+    fullHeight,
+    requestRender,
+    loadedRegion,  // Re-check when loadedRegion changes (initial render complete)
   ]);
+
+  // Mouse, key, and wheel handlers for zoom, pan, and slice navigation
+  useEffect(() => {
+    const desc = descriptorRef.current;
+    if (!desc) return;
+
+    const wrapper = hostRef.current;
+    if (!wrapper) return;
+
+    // Wheel handler (zoom or slice navigation)
+    const handleWheel = (e: WheelEvent) => {
+      const keys = pressedKeysRef.current;
+
+      // Slice navigation mode (c/t/z + scroll)
+      if (keys.has("c") || keys.has("t") || keys.has("z")) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (sliceWheelTimerRef.current) {
+          clearTimeout(sliceWheelTimerRef.current);
+        }
+
+        sliceWheelTimerRef.current = setTimeout(() => {
+          const delta = Math.sign(e.deltaY) * -1;
+          const shape = desc.shape;
+          const currentSlice = useAppStore.getState().slice;
+          const am = axisMapRef.current;
+
+          if (keys.has("t") && am.t !== null) {
+            const tMax = Math.max(0, (shape[am.t] ?? 1) - 1);
+            useAppStore.getState().setSlice({ t: Math.max(0, Math.min(tMax, currentSlice.t + delta)) });
+          } else if (keys.has("z") && am.z !== null) {
+            const zMax = Math.max(0, (shape[am.z] ?? 1) - 1);
+            useAppStore.getState().setSlice({ z: Math.max(0, Math.min(zMax, currentSlice.z + delta)) });
+          } else if (keys.has("c") && am.c !== null) {
+            const cMax = Math.max(0, (shape[am.c] ?? 1) - 1);
+            useAppStore.getState().setSlice({ c: Math.max(0, Math.min(cMax, currentSlice.c + delta)) });
+          }
+        }, 150);
+        return;
+      }
+
+      // Zoom mode
+      e.preventDefault();
+
+      const current = viewportStateRef.current;
+      const deltaScale = 1 - e.deltaY * ZOOM_SENSITIVITY;
+      const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, current.scale * deltaScale));
+
+      // Compute new center to keep zoom centered on mouse position
+      const rect = wrapper.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const mouseWorldX = current.centerX + (mouseX - wrapper.clientWidth / 2) / current.scale;
+      const mouseWorldY = current.centerY + (mouseY - wrapper.clientHeight / 2) / current.scale;
+
+      const newCenterX = mouseWorldX - (mouseX - wrapper.clientWidth / 2) / newScale;
+      const newCenterY = mouseWorldY - (mouseY - wrapper.clientHeight / 2) / newScale;
+
+      const newState = clampViewportToBounds(
+        { centerX: newCenterX, centerY: newCenterY, scale: newScale },
+        wrapper.clientWidth,
+        wrapper.clientHeight,
+        fullWidth,
+        fullHeight,
+      );
+
+      setViewportState(newState);
+      viewportStateRef.current = newState;
+
+      triggerRenderIfNeeded();
+    };
+
+    // Mouse handlers for drag
+    const handleMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      isDraggingRef.current = true;
+      dragStartRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        centerX: viewportStateRef.current.centerX,
+        centerY: viewportStateRef.current.centerY,
+      };
+      e.preventDefault();
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingRef.current) return;
+
+      const current = viewportStateRef.current;
+      const start = dragStartRef.current;
+
+      const deltaX = e.clientX - start.x;
+      const deltaY = e.clientY - start.y;
+
+      const worldDeltaX = -deltaX / current.scale;
+      const worldDeltaY = -deltaY / current.scale;
+
+      const newCenterX = start.centerX + worldDeltaX;
+      const newCenterY = start.centerY + worldDeltaY;
+
+      const newState = clampViewportToBounds(
+        { centerX: newCenterX, centerY: newCenterY, scale: current.scale },
+        wrapper.clientWidth,
+        wrapper.clientHeight,
+        fullWidth,
+        fullHeight,
+      );
+
+      setViewportState(newState);
+      viewportStateRef.current = newState;
+    };
+
+    const handleMouseUp = () => {
+      if (!isDraggingRef.current) return;
+      isDraggingRef.current = false;
+      triggerRenderIfNeeded();
+    };
+
+    // Key handlers for slice navigation mode
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if (key === "c" || key === "t" || key === "z") {
+        pressedKeysRef.current.add(key);
+        e.preventDefault();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      pressedKeysRef.current.delete(key);
+    };
+
+    wrapper.addEventListener("wheel", handleWheel, { passive: false });
+    wrapper.addEventListener("mousedown", handleMouseDown);
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    wrapper.addEventListener("keydown", handleKeyDown);
+    wrapper.addEventListener("keyup", handleKeyUp);
+
+    wrapper.setAttribute("tabindex", "0");
+    (wrapper as HTMLElement).style.outline = "none";
+    (wrapper as HTMLElement).focus();
+
+    return () => {
+      wrapper.removeEventListener("wheel", handleWheel);
+      wrapper.removeEventListener("mousedown", handleMouseDown);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      wrapper.removeEventListener("keydown", handleKeyDown);
+      wrapper.removeEventListener("keyup", handleKeyUp);
+
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+      if (sliceWheelTimerRef.current) {
+        clearTimeout(sliceWheelTimerRef.current);
+      }
+    };
+  }, [descriptor, fullWidth, fullHeight, triggerRenderIfNeeded]);
+
+  // Track previous image URL for smooth transition - revoke after new image loads
+  const prevImageUrlRef = useRef<string | null>(null);
+  const prevLoadedRegionRef = useRef<LoadedRegion | null>(null);
+  const currentImageUrlRef = useRef<string | null>(null);
+  const currentLoadedRegionRef = useRef<LoadedRegion | null>(null);
+
+  // Capture current values as "previous" before new values render
+  if (ws.imageUrl !== currentImageUrlRef.current || loadedRegion !== currentLoadedRegionRef.current) {
+    prevImageUrlRef.current = currentImageUrlRef.current;
+    prevLoadedRegionRef.current = currentLoadedRegionRef.current;
+    currentImageUrlRef.current = ws.imageUrl;
+    currentLoadedRegionRef.current = loadedRegion;
+  }
+
+  // Handle image load - revoke old URL only after new one is ready
+  const handleImageLoad = useCallback(() => {
+    if (prevImageUrlRef.current) {
+      URL.revokeObjectURL(prevImageUrlRef.current);
+      prevImageUrlRef.current = null;
+      prevLoadedRegionRef.current = null;
+    }
+  }, []);
+
+  // Compute image CSS for current image (NEW)
+  const imageCSS = useMemo(() => {
+    if (!loadedRegion || !hostRef.current) return null;
+    return computeImageCSS(
+      loadedRegion,
+      viewportState,
+      hostRef.current.clientWidth,
+      hostRef.current.clientHeight,
+    );
+  }, [loadedRegion, viewportState]);
+
+  // Compute CSS for previous image (OLD) - computed inline to react to ref changes
+  const prevImageCSS = prevLoadedRegionRef.current && hostRef.current
+    ? computeImageCSS(
+        prevLoadedRegionRef.current,
+        viewportState,
+        hostRef.current.clientWidth,
+        hostRef.current.clientHeight,
+      )
+    : null;
+
+  // Compute "missing content" pattern - areas outside loaded region that need rendering
+  const missingContentCSS = useMemo(() => {
+    if (!hostRef.current || !loadedRegion) return null;
+
+    const wrapper = hostRef.current;
+    const wrapperW = wrapper.clientWidth;
+    const wrapperH = wrapper.clientHeight;
+
+    // Pattern tile size scales with viewport
+    const baseTileWorld = 80;
+    const tileScreen = baseTileWorld * viewportState.scale;
+
+    // The pattern should cover the full image extent, but we need to position it correctly
+    // Position at world origin (0, 0) - same as image would be positioned
+    const patternLeft = (0 - viewportState.centerX) * viewportState.scale + wrapperW / 2;
+    const patternTop = (0 - viewportState.centerY) * viewportState.scale + wrapperH / 2;
+    const patternWidth = fullWidth * viewportState.scale;
+    const patternHeight = fullHeight * viewportState.scale;
+
+    return {
+      left: patternLeft,
+      top: patternTop,
+      width: patternWidth,
+      height: patternHeight,
+      tileScreen,
+    };
+  }, [loadedRegion, viewportState, fullWidth, fullHeight]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
-      <div ref={hostRef} style={{ width: "100%", height: "100%" }} />
-
-      {loading && <div className="loading-overlay">Loading slice...</div>}
-      {error && !loading && <div className="error-toast">{error}</div>}
+      <div
+        ref={hostRef}
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "hidden",
+          position: "relative",
+          backgroundColor: "#1a1a2e",
+          cursor: "grab",
+        }}
+      >
+        {/* Background pattern - covers full image extent, visible in areas outside loaded region */}
+        {missingContentCSS && (
+          <div
+            style={{
+              position: "absolute",
+              left: missingContentCSS.left,
+              top: missingContentCSS.top,
+              width: missingContentCSS.width,
+              height: missingContentCSS.height,
+              // Checkerboard pattern - tiles seamlessly
+              backgroundImage: `linear-gradient(45deg, rgba(60, 60, 80, 0.15) 25%, transparent 25%, transparent 75%, rgba(60, 60, 80, 0.15) 75%, rgba(60, 60, 80, 0.15)),
+                linear-gradient(45deg, rgba(60, 60, 80, 0.15) 25%, transparent 25%, transparent 75%, rgba(60, 60, 80, 0.15) 75%, rgba(60, 60, 80, 0.15))`,
+              backgroundSize: `${missingContentCSS.tileScreen}px ${missingContentCSS.tileScreen}px`,
+              backgroundPosition: `0 0, ${missingContentCSS.tileScreen * 0.5}px ${missingContentCSS.tileScreen * 0.5}px`,
+              userSelect: "none",
+              pointerEvents: "none",
+              zIndex: 0,
+            }}
+          />
+        )}
+        {/* NEW image - behind OLD */}
+        {ws.imageUrl && imageCSS && (
+          <img
+            src={ws.imageUrl}
+            alt="Tensor slice"
+            onLoad={handleImageLoad}
+            style={{
+              position: "absolute",
+              left: imageCSS.left,
+              top: imageCSS.top,
+              width: imageCSS.width,
+              height: imageCSS.height,
+              userSelect: "none",
+              pointerEvents: "none",
+              zIndex: 1,
+            }}
+          />
+        )}
+        {/* OLD image - on top, only when loadedRegion changed (different position) */}
+        {prevImageUrlRef.current && prevImageCSS && prevLoadedRegionRef.current &&
+         (prevLoadedRegionRef.current.x !== loadedRegion?.x ||
+          prevLoadedRegionRef.current.y !== loadedRegion?.y ||
+          prevLoadedRegionRef.current.width !== loadedRegion?.width ||
+          prevLoadedRegionRef.current.height !== loadedRegion?.height) && (
+          <img
+            src={prevImageUrlRef.current}
+            alt="Previous slice"
+            style={{
+              position: "absolute",
+              left: prevImageCSS.left,
+              top: prevImageCSS.top,
+              width: prevImageCSS.width,
+              height: prevImageCSS.height,
+              userSelect: "none",
+              pointerEvents: "none",
+              zIndex: 2,  // On top until new image onLoad fires
+            }}
+          />
+        )}
+        {ws.error && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: "10px",
+              left: "10px",
+              color: "#ff6b6b",
+              fontSize: "12px",
+              background: "rgba(0,0,0,0.7)",
+              padding: "8px",
+              borderRadius: "4px",
+              zIndex: 3,
+            }}
+          >
+            {ws.error}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

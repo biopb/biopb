@@ -1,11 +1,9 @@
-"""VTK-based image rendering for tensor-server.
+"""Image rendering for tensor-server.
 
-Provides backend rendering of microscopy images using VTK, supporting:
+Provides backend rendering of microscopy images using PIL/Pillow, supporting:
 - Percentile-based intensity normalization
 - Pseudo-color for fluorescence channels
-- In-memory PNG/JPEG output
-
-This is an experimental alternative to frontend Pixi.js rendering.
+- In-memory PNG/JPEG/Raw output
 """
 
 from __future__ import annotations
@@ -18,36 +16,6 @@ from typing import Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# VTK imports - lazy loaded to avoid import errors when VTK not installed
-_vtk_available = False
-_vtk_module = None
-_numpy_support = None
-
-
-def _ensure_vtk():
-    """Lazy load VTK modules."""
-    global _vtk_available, _vtk_module, _numpy_support
-    if _vtk_available:
-        return
-    try:
-        import vtk as _vtk_module
-        from vtk.util import numpy_support as _numpy_support
-        _vtk_available = True
-    except ImportError:
-        raise ImportError(
-            "VTK is required for backend rendering. "
-            "Install with: pip install biopb-tensor-server[vtk-render]"
-        )
-
-
-def is_vtk_available() -> bool:
-    """Check if VTK is available without importing."""
-    try:
-        import vtk  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -420,105 +388,6 @@ def render_array_to_image_bytes(
     channel_name: Optional[str] = None,
     output_format: str = "png",
 ) -> Tuple[bytes, int, int, float, float]:
-    """Render numpy array to PNG/JPEG bytes using VTK.
-
-    Args:
-        arr: Input numpy array (any dtype, may be multi-dimensional)
-        dim_labels: Dimension labels for axis mapping
-        percentile_lo: Lower percentile for intensity normalization (default 1%)
-        percentile_hi: Upper percentile for intensity normalization (default 99%)
-        color: Color preset name or hex string
-        channel_name: Channel name for auto color resolution
-        output_format: "png" or "jpeg"
-
-    Returns:
-        (image_bytes, width, height, actual_lo_val, actual_hi_val)
-    """
-    _ensure_vtk()
-
-    # Extract 2D Y/X slice
-    yx_slice = extract_yx_slice(arr, dim_labels)
-
-    # Compute percentile cutoffs
-    lo_val, hi_val = compute_percentile_cutoffs(yx_slice, percentile_lo, percentile_hi)
-
-    # Normalize to uint8
-    gray = normalize_to_uint8(yx_slice, lo_val, hi_val)
-
-    # Resolve color
-    color_multipliers = resolve_color(color, channel_name)
-
-    # Apply pseudo-color
-    rgba = apply_pseudo_color(gray, color_multipliers)
-
-    height, width = gray.shape
-
-    # Create VTK image data from RGBA array
-    vtk_array = _numpy_support.numpy_to_vtk(
-        num_array=rgba.reshape(-1, 4),
-        deep=True,
-        array_type=_vtk_module.VTK_UNSIGNED_CHAR,
-    )
-    vtk_array.SetNumberOfComponents(4)
-
-    image_data = _vtk_module.vtkImageData()
-    image_data.SetDimensions(width, height, 1)
-    image_data.GetPointData().SetScalars(vtk_array)
-
-    # Setup rendering pipeline
-    mapper = _vtk_module.vtkImageMapper()
-    mapper.SetInputData(image_data)
-    mapper.SetColorWindow(255)
-    mapper.SetColorLevel(127.5)
-
-    actor = _vtk_module.vtkActor2D()
-    actor.SetMapper(mapper)
-
-    renderer = _vtk_module.vtkRenderer()
-    renderer.AddActor2D(actor)
-    renderer.SetBackground(0.0, 0.0, 0.0)
-
-    render_window = _vtk_module.vtkRenderWindow()
-    render_window.AddRenderer(renderer)
-    render_window.SetSize(width, height)
-    render_window.OffScreenRenderingOn()  # Headless rendering
-    render_window.Render()
-
-    # Capture to image
-    window_to_image = _vtk_module.vtkWindowToImageFilter()
-    window_to_image.SetInput(render_window)
-    window_to_image.SetInputBufferTypeToRGBA()
-    window_to_image.Update()
-
-    # Write to memory using vtkMemoryFile
-    if output_format.lower() == "jpeg":
-        writer = _vtk_module.vtkJPEGWriter()
-    else:
-        writer = _vtk_module.vtkPNGWriter()
-
-    # Use memory file for in-memory output
-    memory_file = _vtk_module.vtkMemoryFile()
-    memory_file.SetArrayName("render_output")
-    writer.SetInputConnection(window_to_image.GetOutputPort())
-    writer.SetFileName(memory_file.GetFileName())
-    writer.Write()
-
-    # Get bytes from memory file
-    output_bytes = memory_file.GetArray().tobytes()
-
-    return (output_bytes, width, height, lo_val, hi_val)
-
-
-# Alternative simpler approach without full rendering pipeline (PIL fallback)
-def render_array_to_image_bytes_simple(
-    arr: np.ndarray,
-    dim_labels: list[str],
-    percentile_lo: float = 1.0,
-    percentile_hi: float = 99.0,
-    color: str = "auto",
-    channel_name: Optional[str] = None,
-    output_format: str = "png",
-) -> Tuple[bytes, int, int, float, float]:
     """Render numpy array to image bytes using PIL.
 
     Output formats:
@@ -526,7 +395,8 @@ def render_array_to_image_bytes_simple(
     - "jpeg": JPEG with quality=90
     - "raw": Raw RGBA bytes (uint8, 4 bytes per pixel) - fastest for localhost
 
-    This is a simpler alternative that doesn't require VTK.
+    Returns:
+        (image_bytes, width, height, actual_lo_val, actual_hi_val)
     """
     import time
     t0 = time.monotonic()
@@ -535,7 +405,7 @@ def render_array_to_image_bytes_simple(
         from PIL import Image
     except ImportError:
         raise ImportError(
-            "PIL/Pillow is required for simple rendering. "
+            "PIL/Pillow is required for rendering. "
             "Install with: pip install Pillow"
         )
 
@@ -586,7 +456,7 @@ def render_array_to_image_bytes_simple(
 
     total_ms = (time.monotonic() - t0) * 1000
     logger.debug(
-        f"render_simple: shape={height}x{width}, total={total_ms:.1f}ms, "
+        f"render: shape={height}x{width}, total={total_ms:.1f}ms, "
         f"extract={extract_ms:.1f}ms, percentile={percentile_ms:.1f}ms, "
         f"normalize={normalize_ms:.1f}ms, colorize={colorize_ms:.1f}ms, encode={encode_ms:.1f}ms"
     )
