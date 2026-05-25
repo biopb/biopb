@@ -6,6 +6,10 @@ on:
       - 'server-v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,7 +23,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -32,6 +36,9 @@ jobs:
 
       - name: Sync JS versions
         run: pnpm sync-version
+        
+      - name: Build packages
+        run: pnpm --filter @biopb/tensor-flight-client build
 
       - name: Build webapp
         run: VITE_TENSOR_API="" pnpm --filter @biopb/web build
