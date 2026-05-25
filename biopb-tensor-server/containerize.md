@@ -27,16 +27,13 @@ If you encounter `AttributeError: 'numpy.ndarray' object has no attribute 'newby
 pip install "numpy<2.0"
 ```
 
-### Step 1: Build biopb Wheel Locally
-
-The biopb package must be built locally because buf's remote plugins have network issues inside Docker:
+### Step 1: Build Wheel Locally
 
 ```bash
 # From repository root
 pip wheel . --no-deps -w wheels/
+pip wheel ./biopb-tensor-server --no-deps -w wheels/
 ```
-
-This creates `wheels/biopb-<version>-py3-none-any.whl`.
 
 ### Step 2: Build Webapp Locally
 
