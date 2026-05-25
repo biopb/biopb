@@ -4,11 +4,9 @@
 
 This document describes how to deploy the BioPB Tensor Server as a Docker/Singularity container. The container includes:
 
-- **TensorFlightServer** (gRPC on port 8817, internal) - Arrow Flight server for tensor data
-- **HTTP Sidecar** (port 8816, internal) - FastAPI proxy for browser access
-- **nginx HTTP** (port 8814) - Serves React webapp and proxies API requests
-- **nginx gRPC** (port 8815) - Proxies gRPC requests to TensorFlightServer
-- **Webapp** - React-based image browser UI
+- **FastAPI HTTP Server** (port 8814) - Serves React webapp, API endpoints, and health checks
+- **TensorFlightServer** (gRPC on port 8815) - Arrow Flight server for tensor data
+- **Webapp** - React-based image browser UI (served by FastAPI)
 
 ## Build Instructions
 
@@ -42,14 +40,14 @@ This creates `wheels/biopb-<version>-py3-none-any.whl`.
 
 ### Step 2: Build Webapp Locally
 
-The webapp must be built with `VITE_TENSOR_API=""` so nginx proxy works:
+The webapp is served directly by FastAPI. Build with:
 
 ```bash
 # From repository root
 VITE_TENSOR_API="" pnpm --filter @biopb/web build
 ```
 
-This creates `biopb-tensor-server/packages/web/dist/`.
+This creates `biopb-tensor-server/packages/web/dist/` which is copied into the Docker image.
 
 ### Step 3: Build Docker Image
 
@@ -82,11 +80,11 @@ docker run -d \
 | `CONFIG_FILE` | (none) | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
 | `DATA_DIR` | `/data` | Directory containing microscopy files (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (NFS/Lustre: set to false) |
-| `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5, Sidecar=BASE+6, Flight=BASE+7 |
+| `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
 | `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
-| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind nginx to localhost (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind HTTP to localhost (Singularity/HPC only; ignored in Docker) |
 | `BIOPB_TMP` | `/tmp/biopb-${USER}` | Base temp directory (avoids multi-user collisions on shared /tmp) |
 
 ### Port Derivation
@@ -95,10 +93,8 @@ All ports are derived from `BIOPB_BASE_PORT`:
 
 | Service | Port | Formula |
 |---------|------|---------|
-| nginx HTTP (external) | 8814 | BASE + 4 |
-| nginx gRPC (external) | 8815 | BASE + 5 |
-| HTTP Sidecar (internal) | 8816 | BASE + 6 |
-| TensorFlightServer (internal) | 8817 | BASE + 7 |
+| HTTP (FastAPI + webapp) | 8814 | BASE + 4 |
+| gRPC (TensorFlightServer) | 8815 | BASE + 5 |
 
 Ports are auto-discovered to avoid conflicts (especially for Singularity on HPC where host network is shared).
 
@@ -150,8 +146,8 @@ curl http://localhost:8814/livez
 # Readiness (HTTP)
 curl http://localhost:8814/readyz
 
-# gRPC health check (via nginx proxy on port 8815)
-grpcurl -plaintext localhost:8815 grpc.health.v1.Health/Check
+# Flight server health action (gRPC)
+# Use Flight's do_action("health") for gRPC health status
 ```
 
 ### Access the Webapp
@@ -242,29 +238,26 @@ singularity run \
 
 ```
 Container (external ports 8814, 8815)
-├── nginx HTTP (8814)          → serves webapp, proxies /api/* to sidecar
-│   ├── /                      → React SPA (static files)
-│   ├── /api/*                 → proxy to 127.0.0.1:8816
+├── FastAPI HTTP Server (8814)
+│   ├── /                      → React SPA (static files from /app/webapp)
+│   ├── /api/*                 → API endpoints (sources, slice, render)
 │   ├── /livez, /readyz        → health endpoints
 │
-├── nginx gRPC (8815)          → proxies gRPC to TensorFlightServer
-│   ├── /grpc.health.v1.Health/Check → health check proxy to sidecar
-│   ├── /*                     → grpc_pass to 127.0.0.1:8817
-│
-├── TensorFlightServer (8817)  → Arrow Flight gRPC (internal, nginx proxy)
-│
-└── HTTP Sidecar (8816)        → FastAPI (internal, nginx proxy)
+└── TensorFlightServer (8815)  → Arrow Flight gRPC (direct access)
+    ├── do_action("health")    → health check action
+    ├── list_flights           → list available tensors
+    └── do_get                 → fetch tensor data
 ```
 
-All internal services bind to `127.0.0.1`. External access is through nginx proxies only.
+FastAPI serves both the webapp and API endpoints on port 8814. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
 
 ### Network Binding Control
 
-By default, nginx binds to all interfaces inside the container. Docker's port forwarding (`-p PORT:PORT`) then exposes the service to the host's network.
+By default, FastAPI binds to all interfaces inside the container. Docker's port forwarding (`-p PORT:PORT`) then exposes the service to the host's network.
 
 **For localhost-only access:**
 - **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
-- **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind nginx to localhost (useful on shared nodes)
+- **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind HTTP to localhost (useful on shared nodes)
 
 Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).
 
@@ -319,9 +312,7 @@ All ports derived from `BIOPB_BASE_PORT` (default: 8810):
 
 | Port | Service | External Access | Formula |
 |------|---------|-----------------|---------|
-| BASE+4 | nginx HTTP | Yes (webapp + API + health) | `BIOPB_BASE_PORT + 4` |
-| BASE+5 | nginx gRPC | Yes (gRPC + health check) | `BIOPB_BASE_PORT + 5` |
-| BASE+6 | FastAPI sidecar | No (internal only) | `BIOPB_BASE_PORT + 6` |
-| BASE+7 | TensorFlightServer | No (internal, proxied via nginx) | `BIOPB_BASE_PORT + 7` |
+| BASE+4 | FastAPI HTTP | Yes (webapp + API + health) | `BIOPB_BASE_PORT + 4` |
+| BASE+5 | TensorFlightServer gRPC | Yes (tensor data) | `BIOPB_BASE_PORT + 5` |
 
 Ports are auto-discovered at startup to avoid conflicts. Expose HTTP (BASE+4) for webapp access and gRPC (BASE+5) for programmatic clients.

@@ -51,7 +51,7 @@ You can create custom config file to fine-tune server behavior, e.g.,specifying 
 ```toml
 [server]
 host = "127.0.0.1"
-port = 8817
+port = 8815
 log_level = "INFO"
 
 [cache]
@@ -127,17 +127,19 @@ biopb-tensor-server serve --config biopb-tensor.toml
 
 ### Web App
 
-The React web viewer runs alongside the server. From the repository root:
+The React web viewer is served directly by the FastAPI server. Build it before running the server:
 
 ```bash
-# Development (hot reload on :5173)
-pnpm --filter @biopb/web dev
-
-# Production build
-pnpm --filter @biopb/web build   # output → packages/web/dist/
+# Production build (output → packages/web/dist/)
+pnpm --filter @biopb/web build
 ```
 
-The web app connects to the FastAPI sidecar (default `http://localhost:8816`). On first load you will be prompted for the access token printed by the `launch` command.
+The webapp files are copied into the Docker image and served at the HTTP port (8814). On first load you will be prompted for the access token printed by the `launch` command.
+
+For development with hot reload, run the dev server separately:
+```bash
+pnpm --filter @biopb/web dev   # runs on :5173
+```
 
 ### CLI Reference
 
@@ -154,8 +156,9 @@ biopb-tensor-server version  Show version information
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config, -c` | (required) | Path to TOML config |
-| `--web-port` | 8816 | HTTP sidecar port |
-| `--web-host` | 127.0.0.1 | HTTP sidecar bind address |
+| `--web-port` | 8814 | HTTP server port |
+| `--web-host` | 127.0.0.1 | HTTP server bind address |
+| `--static-dir` | (none) | Directory with static webapp files (API-only if unset) |
 | `--token` | (prompt/auto) | Website access token |
 | `--dev` | false | Skip token check (localhost only) |
 | `--open` | false | Open browser after startup |
@@ -179,7 +182,7 @@ biopb-tensor-server version  Show version information
 from biopb_tensor_server import TensorFlightClient, TensorArray
 
 # Connect to running server
-client = TensorFlightClient("grpc://localhost:8817", token="your-token")
+client = TensorFlightClient("grpc://localhost:8815", token="your-token")
 
 # List available sources
 sources = client.list_sources()

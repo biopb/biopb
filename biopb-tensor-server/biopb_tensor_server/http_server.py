@@ -38,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,7 @@ def create_app(
     dev_mode: bool = False,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
+    static_dir: Optional[str] = None,  # Directory for static webapp files (None = API only)
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -930,6 +932,33 @@ def create_app(
                 status_code=502, detail=f"Render error: {type(exc).__name__}: {exc}"
             )
 
+    # -----------------------------------------------------------------------
+    # Static files (optional)
+    # -----------------------------------------------------------------------
+
+    if static_dir:
+        from pathlib import Path as _Path
+        static_path = _Path(static_dir)
+        if static_path.is_dir():
+            # SPA fallback middleware - serve index.html for non-API routes
+            @app.middleware("http")
+            async def spa_fallback(request: Request, call_next):
+                response = await call_next(request)
+                # Only intercept 404s for non-API, non-health routes
+                if response.status_code == 404:
+                    path = request.url.path
+                    if not path.startswith("/api") and not path.startswith("/live") and not path.startswith("/ready") and not path.startswith("/health"):
+                        index_file = static_path / "index.html"
+                        if index_file.exists():
+                            return Response(
+                                content=index_file.read_bytes(),
+                                media_type="text/html",
+                            )
+                return response
+
+            # Mount static files at root (must be after all API routes)
+            app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
+
     return app
 
 
@@ -972,6 +1001,7 @@ def run(
     port: int = 8816,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
+    static_dir: Optional[str] = None,  # Directory for static webapp files
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -982,5 +1012,6 @@ def run(
         dev_mode=dev_mode,
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
+        static_dir=static_dir,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

@@ -12,32 +12,27 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built biopb wheel (built locally with: pip wheel . --no-deps -w wheels/)
+# Copy pre-built wheels (built locally with: pip wheel . --no-deps -w wheels/ && pip wheel ./biopb-tensor-server --no-deps -w wheels/)
 COPY wheels/biopb-*.whl /app/wheels/
-
-# Copy tensor server source
-COPY biopb-tensor-server/pyproject.toml ./tensor-server/
-COPY biopb-tensor-server/build_version.py ./tensor-server/                                                                                          
-COPY biopb-tensor-server/VERSION ./tensor-server/    
-COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
+COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 
 # Install with correct order:
 # 1. First pin zarr/numcodecs for compatibility
-# 2. Then install biopb + tensor server with all extras (web, ome-zarr, aics, medical)
+# 2. Then install both wheels with extras
 # 3. Finally add bioformats-jar for LSM/OIF/OIB (BioFormats fallback for CZI/LIF)
-WORKDIR /app/tensor-server
-RUN pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
+WORKDIR /app
+RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
+    && pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir ".[web,ome-zarr,aics,medical,ndtiff]" \
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,ome-zarr,aics,medical,ndtiff]" \
     && pip install --no-cache-dir bioformats-jar
 
 # Stage 3: Runtime (nginx + python)
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install nginx, Java (for bioformats-jar), and runtime deps
+# Install Java (for bioformats-jar) and runtime deps - NO nginx
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx \
     libgl1 \
     default-jdk-headless \
     && rm -rf /var/lib/apt/lists/*
@@ -46,13 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=python-builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=python-builder /usr/local/bin /usr/local/bin
 
-# Copy webapp build output
-COPY --from=webapp-builder /app/biopb-tensor-server/packages/web/dist /var/www/html
+# Copy webapp build output (for FastAPI StaticFiles)
+COPY --from=webapp-builder /app/biopb-tensor-server/packages/web/dist /app/webapp
 
-# Copy entrypoint, config, and nginx config
+# Copy entrypoint
 COPY biopb-tensor-server/entrypoint.sh /usr/local/bin/
-COPY biopb-tensor-server/nginx.conf /etc/nginx/nginx.conf
-COPY biopb-tensor-server/default-config.toml /app/config/
 
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
@@ -64,8 +57,8 @@ RUN echo 'import scyjava.config; scyjava.config.set_java_constraints(fetch="neve
 RUN mkdir -p /data \
     && chmod +x /usr/local/bin/entrypoint.sh
 
-# Expose ports: nginx HTTP (8814), nginx gRPC (8815)
-# Internal services (Flight 8817, sidecar 8816) bind to localhost only
+# Expose ports: HTTP (8814), gRPC (8815)
+# Flight server gRPC binds directly (no nginx proxy)
 EXPOSE 8814 8815
 
 ENTRYPOINT ["entrypoint.sh"]

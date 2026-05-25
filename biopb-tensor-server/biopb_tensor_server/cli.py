@@ -583,6 +583,11 @@ def launch(
         "--cors",
         help="Extra CORS origin to allow (repeatable). Defaults to --web-url variants.",
     ),
+    static_dir: Optional[Path] = typer.Option(
+        None,
+        "--static-dir",
+        help="Directory containing static webapp files. If empty, serves API only.",
+    ),
 ):
     """Launch the full BioPB Tensor stack (Flight server + HTTP sidecar).
 
@@ -707,6 +712,7 @@ def launch(
             host=web_host,
             port=web_port,
             cors_origins=effective_cors,
+            static_dir=str(static_dir) if static_dir else None,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
