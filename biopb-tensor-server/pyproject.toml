@@ -34,9 +34,6 @@ dependencies = [
     "pytest >= 7.0.0",
     "httpx >= 0.25.0",
   ]
-  vtk-render = [
-    "vtk >= 9.2.0",
-  ]
   ome-zarr = [
     "ome-zarr >= 0.6.1",
   ]

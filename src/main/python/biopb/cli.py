@@ -7,13 +7,15 @@ import sys
 import time
 
 from pathlib import Path
-from rich import console
+from rich.console import Console
 from rich.table import Table
 from typing import Optional
 
 import typer
 from biopb.tensor.cli import app as tensor_app
 from biopb.image.cli import app as image_app
+
+console = Console()
 
 app = typer.Typer(
     name="biopb",
@@ -23,11 +25,11 @@ app.add_typer(tensor_app, name="tensor", help="TensorFlight client diagnostics")
 app.add_typer(image_app, name="image", help="ProcessImage client operations")
 
 # Tensor server daemon management
-tensor_server_app = typer.Typer(
-    name="tensor-server",
-    help="TensorFlight server daemon management (start/stop/restart/status)",
+server_app = typer.Typer(
+    name="server",
+    help="Biopb server daemon management (start/stop/restart/status)",
 )
-app.add_typer(tensor_server_app, name="tensor-server")
+app.add_typer(server_app, name="server")
 
 # Daemon management constants
 PID_FILE = Path.home() / ".local" / "share" / "biopb" / "tensor-server.pid"
@@ -88,7 +90,7 @@ def _get_log_file() -> Path:
     return LOG_DIR / "tensor-server.log"
 
 
-@tensor_server_app.command("start")
+@server_app.command("start")
 def start(
     config: Path = typer.Option(
         DEFAULT_CONFIG,
@@ -154,9 +156,9 @@ def start(
         "launch",
         "--config", str(config),
         "--web-port", str(web_port),
-        "--web-host", web_host,
-        "--log-level", log_level,
-        "--token", token,
+        "--web-host", str(web_host),
+        "--log-level", str(log_level),
+        "--token", str(token),
     ]
     if static_dir and static_dir.exists():
         cmd.extend(["--static-dir", str(static_dir)])
@@ -187,12 +189,12 @@ def start(
         raise typer.Exit(1)
 
     console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
-    console.print(f"  HTTP: http://{web_host}:{web_port}/?token={token}")
+    console.print(f"  HTTP: http://{web_host}:{web_port}/?token={str(token)}")
     console.print(f"  gRPC: grpc://127.0.0.1:8815")
     console.print(f"  Logs: {log_file}")
 
 
-@tensor_server_app.command("stop")
+@server_app.command("stop")
 def stop(
     timeout: int = typer.Option(
         10,
@@ -242,7 +244,7 @@ def stop(
     console.print("[green]TensorFlight server stopped (forced)[/green]")
 
 
-@tensor_server_app.command("restart")
+@server_app.command("restart")
 def restart(
     config: Path = typer.Option(
         DEFAULT_CONFIG,
@@ -254,6 +256,27 @@ def restart(
         DEFAULT_WEBAPP,
         "--static-dir",
         help="Directory containing static webapp files",
+    ),
+    web_port: int = typer.Option(
+        8814,
+        "--web-port",
+        help="HTTP server port",
+    ),
+    web_host: str = typer.Option(
+        "127.0.0.1",
+        "--web-host",
+        help="HTTP server bind address",
+    ),
+    log_level: str = typer.Option(
+        "INFO",
+        "--log-level",
+        "-l",
+        help="Log level: DEBUG, INFO, WARNING, ERROR",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Access token (auto-generated if not provided)",
     ),
     timeout: int = typer.Option(
         10,
@@ -287,10 +310,10 @@ def restart(
         time.sleep(1)
 
     # Start with same options
-    start(config=config, static_dir=static_dir, web_port=8814, web_host="127.0.0.1", log_level="INFO")
+    start(config=config, static_dir=static_dir, web_port=web_port, web_host=web_host, log_level=log_level, token=token)
 
 
-@tensor_server_app.command("status")
+@server_app.command("status")
 def status():
     """Check TensorFlight server daemon status."""
     pid = _read_pid()

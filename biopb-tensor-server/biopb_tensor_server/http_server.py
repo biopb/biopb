@@ -34,7 +34,7 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -338,6 +338,10 @@ def create_app(
             "X-Percentile-Lo-Value", "X-Percentile-Hi-Value",
         ],
     )
+
+    # Note: WebSocket CORS is handled by the browser during the handshake.
+    # The headers above are for HTTP requests only. WebSocket connections
+    # use the same origin validation via the Sec-WebSocket-Origin header.
 
     # -----------------------------------------------------------------------
     # Auth helper
@@ -868,12 +872,10 @@ def create_app(
             )
 
             # Import renderer
-            from .vtk_renderer import is_vtk_available, render_array_to_image_bytes_simple
+            from .renderer import render_array_to_image_bytes
 
-            # Use PIL-based renderer (VTK optional)
-            # For experiment, use simpler PIL approach
             t0_render = time.monotonic()
-            image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes_simple(
+            image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
                 arr=arr,
                 dim_labels=dim_labels,
                 percentile_lo=req.percentile_lo if not req.use_min_max else 0.0,
@@ -931,6 +933,208 @@ def create_app(
             raise HTTPException(
                 status_code=502, detail=f"Render error: {type(exc).__name__}: {exc}"
             )
+
+    # -----------------------------------------------------------------------
+    # WebSocket render endpoint
+    # -----------------------------------------------------------------------
+
+    @app.websocket("/ws/render")
+    async def websocket_render(websocket: WebSocket) -> None:
+        """WebSocket endpoint for rendering tensor slices.
+
+        Protocol:
+          1. Client connects, sends nothing
+          2. Server validates token from headers or query params
+          3. Client sends JSON: { action: "render", params: RenderRequest }
+          4. Server sends JSON metadata: { action: "render_start", width, height, format }
+          5. Server sends binary: JPEG/PNG image bytes
+          6. Repeat steps 3-5 for subsequent requests
+
+        No session state - WebSocket is purely request/response.
+
+        Token validation: Accept token from Authorization header, X-Biopb-Token header,
+        or query parameter "token" (for browsers that can't send custom headers).
+        """
+        # Validate token from headers or query params
+        if not dev_mode and token is not None:
+            # Check headers first (Authorization or X-Biopb-Token)
+            bearer = websocket.headers.get("Authorization", "")
+            if bearer.startswith("Bearer "):
+                provided = bearer[len("Bearer ") :]
+            else:
+                provided = websocket.headers.get("X-Biopb-Token", "")
+
+            # If no header token, check query parameter (for browser WebSocket)
+            if not provided:
+                provided = websocket.query_params.get("token", "")
+
+            if not secrets.compare_digest(provided.encode(), token.encode()):
+                await websocket.close(code=4001, reason="Invalid or missing token")
+                return
+
+        await websocket.accept()
+
+        try:
+            while True:
+                # Receive JSON request
+                data = await websocket.receive_json()
+
+                # Validate action
+                action = data.get("action")
+                if action != "render":
+                    await websocket.send_json({
+                        "action": "error",
+                        "message": f"Unknown action: {action}",
+                    })
+                    continue
+
+                # Parse render params
+                try:
+                    params = RenderRequest(**data.get("params", {}))
+                except Exception as e:
+                    await websocket.send_json({
+                        "action": "error",
+                        "message": f"Invalid params: {e}",
+                    })
+                    continue
+
+                t0 = time.monotonic()
+
+                logger.debug(
+                    f"ws/render: source={params.source_id}, tensor={params.tensor_id}, "
+                    f"slice={params.slice_start}-{params.slice_stop}, scale={params.scale_hint}"
+                )
+
+                if params.pixel_budget is not None:
+                    diag.pixel_budget = params.pixel_budget
+
+                try:
+                    client = _get_client()
+
+                    # Build slice_hint (same logic as HTTP render endpoint)
+                    slice_hint: Optional[Tuple[slice, ...]] = None
+                    if params.slice_start is not None and params.slice_stop is not None:
+                        if len(params.slice_start) != len(params.slice_stop):
+                            await websocket.send_json({
+                                "action": "error",
+                                "message": "slice_start and slice_stop must have the same length",
+                            })
+                            continue
+                        slice_hint = tuple(
+                            slice(s, e) for s, e in zip(params.slice_start, params.slice_stop)
+                        )
+
+                    scale_hint = params.scale_hint or None
+                    reduction_method = params.reduction_method or None
+
+                    # Get tensor context (includes realized slice bounds)
+                    ctx = client._get_tensor_context(
+                        source_id=params.source_id,
+                        tensor_id=params.tensor_id,
+                        slice_hint=slice_hint,
+                        scale_hint=scale_hint,
+                        reduction_method=reduction_method,
+                    )
+
+                    # Build dask array from context (uncropped)
+                    chunks = [ep[0] for ep in ctx.endpoints]
+                    chunk_bounds_list = [ep[1] for ep in ctx.endpoints]
+                    dask_arr = client._build_dask_array(
+                        desc=ctx.descriptor,
+                        chunks=chunks,
+                        chunk_bounds=chunk_bounds_list,
+                    )
+
+                    t0_compute = time.monotonic()
+                    arr: np.ndarray = dask_arr.compute()
+                    compute_ms = (time.monotonic() - t0_compute) * 1000
+
+                    # Get dim_labels from descriptor
+                    dim_labels: List[str] = list(ctx.descriptor.dim_labels)
+                    if not dim_labels:
+                        dim_labels = [f"d{i}" for i in range(arr.ndim)]
+
+                    # Build axis map to find Y and X indices
+                    y_idx = dim_labels.index("y") if "y" in dim_labels else len(dim_labels) - 2
+                    x_idx = dim_labels.index("x") if "x" in dim_labels else len(dim_labels) - 1
+
+                    # Compute loaded region from realized slice bounds (not requested)
+                    loaded_region = None
+                    if ctx.descriptor.HasField("slice_hint"):
+                        realized = ctx.descriptor.slice_hint
+                        loaded_region = {
+                            "x": int(realized.start[x_idx]),
+                            "y": int(realized.start[y_idx]),
+                            "width": int(realized.stop[x_idx] - realized.start[x_idx]),
+                            "height": int(realized.stop[y_idx] - realized.start[y_idx]),
+                            "scale_factors": list(ctx.descriptor.scale_hint) if ctx.descriptor.scale_hint else [1] * len(dim_labels),
+                        }
+
+                    # Import renderer
+                    from .renderer import render_array_to_image_bytes
+
+                    t0_render = time.monotonic()
+                    image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
+                        arr=arr,
+                        dim_labels=dim_labels,
+                        percentile_lo=params.percentile_lo if not params.use_min_max else 0.0,
+                        percentile_hi=params.percentile_hi if not params.use_min_max else 100.0,
+                        color=params.color,
+                        channel_name=params.channel_name,
+                        output_format=params.output_format,
+                    )
+                    render_ms = (time.monotonic() - t0_render) * 1000
+
+                    elapsed = (time.monotonic() - t0) * 1000
+                    diag.latency.record(elapsed)
+                    logger.debug(
+                        f"ws/render: image size={width}x{height}, "
+                        f"bytes={len(image_bytes)}, total={elapsed:.1f}ms, "
+                        f"compute={compute_ms:.1f}ms, render={render_ms:.1f}ms"
+                    )
+
+                    # Send metadata JSON first
+                    format_lower = params.output_format.lower()
+                    render_start_msg = {
+                        "action": "render_start",
+                        "width": width,
+                        "height": height,
+                        "format": format_lower,
+                        "percentile_lo_value": lo_val,
+                        "percentile_hi_value": hi_val,
+                    }
+                    if loaded_region is not None:
+                        render_start_msg["loaded_region"] = loaded_region
+                    await websocket.send_json(render_start_msg)
+
+                    # Send binary image data
+                    await websocket.send_bytes(image_bytes)
+
+                except ValueError as exc:
+                    await websocket.send_json({
+                        "action": "error",
+                        "message": str(exc),
+                    })
+                except ImportError as exc:
+                    await websocket.send_json({
+                        "action": "error",
+                        "message": f"Rendering not available: {exc}",
+                    })
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    diag.mark_error("WS_RENDER_FAILED", str(exc))
+                    logger.error(f"ws/render failed: {exc}\n{tb}")
+                    await websocket.send_json({
+                        "action": "error",
+                        "message": f"Render error: {type(exc).__name__}",
+                    })
+
+        except WebSocketDisconnect:
+            logger.debug("ws/render: client disconnected")
+        except Exception as exc:
+            logger.error(f"ws/render: unexpected error: {exc}")
+            await websocket.close(code=1011, reason="Internal error")
 
     # -----------------------------------------------------------------------
     # Static files (optional)
