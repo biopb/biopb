@@ -14,6 +14,7 @@ import logging
 import importlib.metadata
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +44,182 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
+# SHM Transfer Optimization Constants and Helpers
+# ==============================================================================
+
+_SHM_TRANSFER_MIN_VERSION = (0, 3, 0)  # First version with shm_transfer action
+
+
+def _is_shm_disabled_by_env() -> bool:
+    """Check if SHM optimization is explicitly disabled via environment variable."""
+    return os.environ.get("BIOPB_SHM_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
+
+
+def _server_supports_shm(schema_metadata: Optional[Dict[str, str]]) -> bool:
+    """Check if server version supports shm_transfer action.
+
+    Args:
+        schema_metadata: Schema metadata dict from GetFlightInfo, or None
+
+    Returns:
+        True if server version >= 0.4.0 (first version with shm_transfer)
+    """
+    if schema_metadata is None:
+        return False
+
+    version_str = schema_metadata.get("tensor_schema_version")
+    if not version_str:
+        return False
+
+    try:
+        parsed = _parse_version(version_str)
+        return parsed >= _SHM_TRANSFER_MIN_VERSION
+    except Exception:
+        return False
+
+
+def _is_posix_shm_available() -> bool:
+    """Check if POSIX shared memory is available on this platform.
+
+    Returns:
+        True on Linux/Darwin (POSIX systems), False on Windows
+    """
+    return sys.platform in ("linux", "darwin") or sys.platform.startswith("freebsd")
+
+
+def _is_localhost_location(location: str) -> bool:
+    """Check if location points to localhost.
+
+    Parses location URI and checks hostname against localhost variants.
+    Uses socket.getaddrinfo() to resolve hostname to loopback.
+
+    Args:
+        location: Flight server location string (e.g., "grpc://localhost:8815")
+
+    Returns:
+        True if location resolves to loopback address
+    """
+    import socket
+    import re
+
+    # Parse location URI - handle various formats
+    # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
+    # IPv6 format: grpc://[::1]:port
+    match = re.match(r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location)
+    if not match:
+        return False
+
+    # IPv6 bracketed or regular hostname
+    hostname = match.group(1) or match.group(2)
+
+    # Direct localhost matches
+    localhost_names = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    if hostname.lower() in localhost_names or hostname in localhost_names:
+        return True
+
+    # Resolve hostname via getaddrinfo
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+        for family, _, _, _, sockaddr in addrinfo:
+            # Check if address is loopback
+            if family == socket.AF_INET:
+                if sockaddr[0] == "127.0.0.1":
+                    return True
+            elif family == socket.AF_INET6:
+                if sockaddr[0] == "::1":
+                    return True
+    except socket.gaierror:
+        # Hostname resolution failed, not localhost
+        pass
+
+    return False
+
+
+def _should_try_shm_transfer(
+    location: str,
+    schema_metadata: Optional[Dict[str, str]]
+) -> bool:
+    """Check all conditions for attempting SHM transfer.
+
+    Args:
+        location: Flight server location string
+        schema_metadata: Schema metadata dict from GetFlightInfo, or None
+
+    Returns:
+        True if all conditions met for SHM transfer attempt
+    """
+    return (
+        not _is_shm_disabled_by_env()
+        and _is_posix_shm_available()
+        and _is_localhost_location(location)
+        and _server_supports_shm(schema_metadata)
+    )
+
+
+def _try_shm_transfer(
+    client: flight.FlightClient,
+    location: str,
+    token: Optional[str],
+    chunk_id: bytes,
+    call_options: flight.FlightCallOptions,
+) -> Optional[np.ndarray]:
+    """Attempt SHM transfer for a chunk.
+
+    Args:
+        client: FlightClient for this thread
+        location: Flight server location (for logging)
+        token: Auth token (unused, call_options already has it)
+        chunk_id: Chunk identifier bytes
+        call_options: Flight call options with auth headers
+
+    Returns:
+        Numpy array with chunk data if SHM transfer succeeded, None otherwise
+    """
+    from multiprocessing import shared_memory
+
+    ticket = TensorTicket(chunk_id=chunk_id)
+    action = flight.Action("shm_transfer", ticket.SerializeToString())
+
+    shm_name = None
+    try:
+        results = client.do_action(action, options=call_options)
+        shm_name = next(results).body.to_pybytes().decode("utf-8")
+
+        logger.debug(f"_try_shm_transfer: attached to {shm_name}")
+
+        # Attach to SHM and read Arrow IPC bytes
+        shm = shared_memory.SharedMemory(name=shm_name)
+        ipc_bytes = bytes(shm.buf)
+
+        # Parse RecordBatch (same as from do_get)
+        reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
+        table = reader.read_all()
+
+        arr = table.column("data").to_numpy()[0]
+        shape = tuple(table.column("shape").to_pylist()[0])
+        arr = arr.reshape(shape)
+
+        # Cleanup: close and unlink SHM
+        shm.close()
+        shm.unlink()
+
+        logger.debug(f"_try_shm_transfer: read {arr.nbytes} bytes from SHM")
+        return arr
+
+    except Exception as e:
+        logger.warning(f"shm_transfer failed, falling back to do_get: {e}")
+        # Cleanup on failure
+        if shm_name is not None:
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+        return None
+
+
+# ==============================================================================
 # Internal context for tensor flight info
 # ==============================================================================
 
@@ -57,6 +234,7 @@ class _TensorContext:
     endpoints: List[Tuple[bytes, ChunkBounds]]  # (chunk_id, bounds) pairs
     read_opt: TensorReadOption
     original_slice_hint: Optional[SliceHint]
+    schema_metadata: Optional[Dict[str, str]] = None  # For SHM transfer feature detection
 
 
 # ==============================================================================
@@ -262,12 +440,16 @@ def _fetch_chunk_distributed(
     bounds_start: Tuple[int, ...],
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
 
     This function is pickle-safe because it has no closure references to
     non-serializable objects (FlightClient). Connection and cache are
     obtained from module-level pools at runtime.
+
+    For localhost connections with server version >= 0.3.0, attempts SHM
+    transfer optimization first before falling back to do_get().
 
     Args:
         location: Flight server location string
@@ -276,6 +458,7 @@ def _fetch_chunk_distributed(
         bounds_start: Chunk start coordinates as tuple
         bounds_stop: Chunk stop coordinates as tuple
         cache_bytes: Cache size for worker-local cache
+        schema_metadata: Optional schema metadata dict for SHM feature detection
 
     Returns:
         numpy array with chunk data
@@ -291,17 +474,24 @@ def _fetch_chunk_distributed(
 
     logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
 
-    # Fetch from server
-    ticket = TensorTicket(chunk_id=chunk_id)
-    reader = client.do_get(
-        flight.Ticket(ticket.SerializeToString()), options=call_options
-    )
-    table = reader.read_all()
-    arr = table.column("data").to_numpy()[0]  # First row's data list
+    arr = None
 
-    # Get shape from shape column (list<int64>)
-    shape = tuple(table.column("shape").to_pylist()[0])
-    arr = arr.reshape(shape)
+    # Try SHM transfer if all conditions met
+    if _should_try_shm_transfer(location, schema_metadata):
+        arr = _try_shm_transfer(client, location, token, chunk_id, call_options)
+
+    # Fallback to do_get if SHM not attempted or failed
+    if arr is None:
+        ticket = TensorTicket(chunk_id=chunk_id)
+        reader = client.do_get(
+            flight.Ticket(ticket.SerializeToString()), options=call_options
+        )
+        table = reader.read_all()
+        arr = table.column("data").to_numpy()[0]  # First row's data list
+
+        # Get shape from shape column (list<int64>)
+        shape = tuple(table.column("shape").to_pylist()[0])
+        arr = arr.reshape(shape)
 
     # Cache the result
     cache.put(cache_key, arr, cost=arr.nbytes)
@@ -372,6 +562,24 @@ def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[byt
     logger.debug(f"_fetch_endpoints_via_get_flight_info: got {len(chunks)} endpoints")
 
     return chunks, chunk_bounds_list
+
+
+def _extract_schema_metadata(schema: pa.Schema) -> Optional[Dict[str, str]]:
+    """Extract schema metadata as Python dict for feature detection.
+
+    Args:
+        schema: PyArrow Schema from FlightInfo
+
+    Returns:
+        Dict with metadata key-value pairs, or None if no metadata
+    """
+    if schema.metadata is None:
+        return None
+
+    return {
+        key.decode("utf-8"): value.decode("utf-8")
+        for key, value in schema.metadata.items()
+    }
 
 
 def _parse_version(version_str: str) -> Tuple[int, int, int]:
@@ -769,6 +977,9 @@ class TensorFlightClient:
         # Check schema version compatibility
         _check_schema_version(info.schema)
 
+        # Extract schema metadata for SHM transfer feature detection
+        schema_metadata = _extract_schema_metadata(info.schema)
+
         # Cache the response descriptor
         self._descriptors[response_desc.array_id] = response_desc
 
@@ -784,6 +995,7 @@ class TensorFlightClient:
             endpoints=endpoints,
             read_opt=read_opt,
             original_slice_hint=slice_hint_proto,
+            schema_metadata=schema_metadata,
         )
 
     def get_tensor(
@@ -828,6 +1040,7 @@ class TensorFlightClient:
             desc=ctx.descriptor,
             chunks=chunks,
             chunk_bounds=chunk_bounds_list,
+            schema_metadata=ctx.schema_metadata,
         )
 
         # Crop to the originally requested region.
@@ -911,6 +1124,10 @@ class TensorFlightClient:
         if ctx.original_slice_hint is not None:
             serialized_tensor.original_slice_hint.CopyFrom(ctx.original_slice_hint)
 
+        # Add schema metadata for SHM transfer feature detection
+        if ctx.schema_metadata is not None:
+            serialized_tensor.schema_metadata.update(ctx.schema_metadata)
+
         return serialized_tensor
 
     @staticmethod
@@ -984,6 +1201,9 @@ class TensorFlightClient:
             max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
         )
 
+        # Extract schema_metadata from pb for SHM transfer
+        schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
+
         blocks = np.empty(grid_shape, dtype=object)
         for chunk_idx, (chunk_id, bounds) in chunk_map.items():
             chunk_shape = tuple(
@@ -997,6 +1217,7 @@ class TensorFlightClient:
                     tuple(bounds.start),
                     tuple(bounds.stop),
                     cache_bytes,
+                    schema_metadata,
                 ),
                 shape=chunk_shape,
                 dtype=dtype,
@@ -1036,6 +1257,7 @@ class TensorFlightClient:
         desc: TensorDescriptor,
         chunks: List[bytes],
         chunk_bounds: List[ChunkBounds],
+        schema_metadata: Optional[Dict[str, str]] = None,
     ) -> da.Array:
         """Build a dask array from chunk info.
 
@@ -1043,6 +1265,7 @@ class TensorFlightClient:
             desc: Tensor descriptor
             chunks: List of chunk IDs
             chunk_bounds: List of chunk bounds
+            schema_metadata: Optional schema metadata for SHM transfer feature detection
 
         Returns:
             dask.array with lazy chunk loading
@@ -1088,6 +1311,7 @@ class TensorFlightClient:
                     tuple(bounds.start),
                     tuple(bounds.stop),
                     self._cache_bytes,
+                    schema_metadata,
                 ),
                 shape=chunk_shape,
                 dtype=dtype,

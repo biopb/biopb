@@ -28,8 +28,12 @@ message SerializedTensor {
   // Should call GetFlightInfo on the server to rebuild endpoint list.
   repeated SerializedEndpoint endpoints = 5;
 
+  // Schema metadata from GetFlightInfo for SHM transfer feature detection.
+  // Populated by get_tensor_pb() when schema has metadata.
+  map<string, string> schema_metadata = 6;
+
   // A python-only debugging field carrying pickeled stream of da.array, allowing
-  // integration tests to bypass the Flight server and directly reconstruct the 
+  // integration tests to bypass the Flight server and directly reconstruct the
   // tensor on the client side.
   bytes debug_pickled_array = 100;
 }

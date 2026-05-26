@@ -20,12 +20,10 @@ Caching behavior depends on the configured CacheManager backend:
 from __future__ import annotations
 
 import logging
-from abc import ABC, ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 from math import lcm
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -39,10 +37,10 @@ from biopb_tensor_server.chunk import (
     ChunkEndpoint,
     compute_safe_chunk_size,
     decode_chunk_id,
+    decode_scale_info,
     encode_chunk_id,
     encode_chunk_id_with_scale,
     is_scaled_chunk,
-    decode_scale_info,
     needs_splitting,
     normalized_scale_hint,
     normalized_slice_bounds,
@@ -50,8 +48,8 @@ from biopb_tensor_server.chunk import (
 from biopb_tensor_server.downsample import (
     ceil_div,
     downsample_block,
-    normalize_reduction_method,
     get_output_dtype,
+    normalize_reduction_method,
 )
 
 logger = logging.getLogger(__name__)
@@ -307,9 +305,9 @@ class TensorAdapter(ABC):
         shape_field = pa.field("shape", pa.list_(pa.int64()))
         dtype_field = pa.field("dtype", pa.string())
 
-        # Schema metadata: biopb version for compatibility tracking
+        # Schema metadata: server version for compatibility tracking and feature detection
         metadata = {
-            "tensor_schema_version": importlib.metadata.version("biopb"),
+            "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
         }
 
         return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)

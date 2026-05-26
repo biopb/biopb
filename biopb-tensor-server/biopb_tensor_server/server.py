@@ -142,6 +142,9 @@ class TensorFlightServer(flight.FlightServerBase):
         self._start_time: float = time.time()
         self._upload_state_lock = threading.RLock()
         self._upload_states: Dict[str, Dict[str, Any]] = {}
+        self._shm_cleanup_thread: Optional[threading.Thread] = None
+        self._shm_cleanup_stop = threading.Event()
+        self._start_shm_cleanup_thread()
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -302,6 +305,7 @@ class TensorFlightServer(flight.FlightServerBase):
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
             flight.ActionType("upload_status", "Upload status for a writable source"),
+            flight.ActionType("shm_transfer", "Transfer chunk via POSIX shared memory for localhost clients"),
         ]
 
     def do_action(
@@ -338,6 +342,10 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "upload_status":
             source_id = action.body.to_pybytes().decode("utf-8")
             yield json.dumps(self.get_upload_status(source_id)).encode("utf-8")
+        elif action.type == "shm_transfer":
+            ticket_bytes = action.body.to_pybytes()
+            shm_name = self._handle_shm_transfer(ticket_bytes)
+            yield shm_name.encode("utf-8")
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -592,6 +600,109 @@ class TensorFlightServer(flight.FlightServerBase):
         # zoer copy wrapper - do _not_ convert to pa.Table!
         reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
         return flight.RecordBatchStream(reader)
+
+    def _handle_shm_transfer(self, ticket_bytes: bytes) -> str:
+        """Transfer chunk via POSIX shared memory.
+
+        Takes serialized TensorTicket (same as do_get), writes RecordBatch to SHM,
+        returns SHM name for client to read.
+
+        This bypasses gRPC serialization for localhost clients, providing
+        potentially significant throughput improvements on large chunks.
+
+        Args:
+            ticket_bytes: Serialized TensorTicket protobuf
+
+        Returns:
+            SHM name string for client to attach and read
+
+        Raises:
+            FlightServerError: If adapter not found or SHM creation fails
+        """
+        from multiprocessing import shared_memory
+
+        # Parse ticket (same as do_get)
+        ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
+        chunk_id = ticket.chunk_id
+
+        # Get adapter and resolve chunk (same as do_get)
+        adapter = self._get_adapter_for_chunk(chunk_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Adapter not found for chunk_id")
+
+        cache_manager = CacheManager.get_instance()
+        record_batch = adapter.resolve_chunk_data(chunk_id, cache_manager)
+
+        # Serialize RecordBatch to Arrow IPC bytes
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, record_batch.schema)
+        writer.write_batch(record_batch)
+        writer.close()
+        ipc_bytes = sink.getvalue().to_pybytes()
+
+        # Create SHM and write Arrow IPC bytes
+        shm_name = f"/biopb_chunk_{hashlib.sha256(chunk_id).hexdigest()[:16]}"
+        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=len(ipc_bytes))
+        shm.buf[:] = ipc_bytes
+        shm.close()
+
+        logger.debug(f"_handle_shm_transfer: wrote {len(ipc_bytes)} bytes to {shm_name}")
+        return shm_name
+
+    def _start_shm_cleanup_thread(self) -> None:
+        """Start background thread to clean up stale SHM segments."""
+        # Only start on POSIX systems where /dev/shm exists
+        shm_path = Path("/dev/shm")
+        if not shm_path.exists():
+            logger.debug("SHM cleanup: /dev/shm not found, skipping cleanup thread")
+            return
+
+        self._shm_cleanup_thread = threading.Thread(
+            target=self._shm_cleanup_loop,
+            daemon=True,
+            name="shm-cleanup",
+        )
+        self._shm_cleanup_thread.start()
+        logger.debug("SHM cleanup thread started")
+
+    def _shm_cleanup_loop(self) -> None:
+        """Background loop that cleans up stale SHM segments.
+
+        Cleans /dev/shm/biopb_chunk_* files older than 30 seconds every 10 seconds.
+        """
+        from multiprocessing import shared_memory
+
+        shm_path = Path("/dev/shm")
+        cleanup_interval = 10  # seconds
+        stale_age = 30  # seconds
+
+        while not self._shm_cleanup_stop.wait(cleanup_interval):
+            try:
+                current_time = time.time()
+                for shm_file in shm_path.glob("biopb_chunk_*"):
+                    # Check file age
+                    file_age = current_time - shm_file.stat().st_mtime
+                    if file_age > stale_age:
+                        shm_name = shm_file.name
+                        try:
+                            shm = shared_memory.SharedMemory(name=f"/{shm_name}")
+                            shm.close()
+                            shm.unlink()
+                            logger.debug(f"SHM cleanup: removed stale {shm_name}")
+                        except FileNotFoundError:
+                            # Already cleaned up by client
+                            pass
+                        except Exception as e:
+                            logger.warning(f"SHM cleanup: failed to remove {shm_name}: {e}")
+            except Exception as e:
+                logger.warning(f"SHM cleanup loop error: {e}")
+
+    def _stop_shm_cleanup_thread(self) -> None:
+        """Stop the SHM cleanup thread."""
+        if self._shm_cleanup_thread is not None:
+            self._shm_cleanup_stop.set()
+            self._shm_cleanup_thread.join(timeout=5)
+            self._shm_cleanup_thread = None
 
     def do_put(
         self,
