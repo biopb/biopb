@@ -140,6 +140,46 @@ class TestCachedSourceAdapter:
         CacheManager.get_instance().release(chunk_id)
         CacheManager.reset()
 
+    def test_resolve_chunk_data_memory_backend(self):
+        """Regression test: resolve_chunk_data must work for memory-backed CachedSourceAdapter.
+
+        Bug: Base class resolve_chunk_data only caches for scaled chunks or ArrowFileBackend.
+        CachedSourceAdapter has no backend data source - all data is in cache.
+        Without override, retrieval would call get_data() which raises error.
+
+        This tests the resolve_chunk_data override in CachedSourceAdapter.
+        """
+        CacheManager.reset()
+        config = CacheConfig(backend="memory", memory_max_entries=10)
+        CacheManager.initialize(config)
+
+        adapter = CachedSourceAdapter(
+            source_id="test_resolve",
+            shape=[100, 100],
+            dtype="uint16",
+            chunk_shape=[50, 50],
+        )
+
+        # Write test data
+        test_data = np.arange(50 * 50, dtype=np.uint16).reshape(50, 50)
+        bounds = ChunkBounds(start=[0, 0], stop=[50, 50])
+        adapter.write_chunk(bounds, test_data)
+
+        # Retrieve via resolve_chunk_data (not direct cache access)
+        chunk_id = encode_chunk_id("test_resolve", bounds)
+        batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
+
+        # Verify data matches - data column is list<uint16>
+        data_col = batch.column("data")
+        # Extract values from list array
+        arr = data_col.values.to_numpy()
+        shape = tuple(batch.column("shape").to_pylist()[0])
+        arr = arr.reshape(shape)
+
+        np.testing.assert_array_equal(arr, test_data)
+
+        CacheManager.reset()
+
     def test_write_chunk_arbitrary_bounds(self):
         """Cache sources accept arbitrary chunk bounds."""
         CacheManager.reset()

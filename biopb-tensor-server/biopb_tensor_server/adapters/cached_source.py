@@ -203,3 +203,53 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             f"write_chunk_arrow: stored {size_bytes} bytes at bounds "
             f"{list(bounds.start)} to {list(bounds.stop)}"
         )
+
+    def resolve_chunk_data(
+        self,
+        chunk_id: bytes,
+        cache_manager: Optional[CacheManager] = None,
+    ) -> pa.RecordBatch:
+        """Resolve chunk data from cache manager.
+
+        Cache-backed sources have no backend data - all data is stored in
+        the cache manager via write_chunk/write_chunk_arrow.
+
+        Args:
+            chunk_id: Chunk identifier bytes
+            cache_manager: CacheManager instance (required for cache-backed sources)
+
+        Returns:
+            RecordBatch with chunk data
+
+        Raises:
+            FlightServerError: If cache_manager is None or chunk not in cache
+        """
+        if cache_manager is None:
+            raise flight.FlightServerError(
+                f"CacheManager required for cache-backed source {self.source_id}"
+            )
+
+        # Check if chunk was written
+        if chunk_id not in self._written_chunks:
+            raise flight.FlightServerError(
+                f"Chunk not found in cache-backed source {self.source_id}"
+            )
+
+        # Retrieve from cache manager directly
+        entry = cache_manager.get_or_acquire(
+            chunk_id,
+            lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
+            metadata={'array_id': self.source_id}
+        )
+        data = entry.data
+        cache_manager.release(chunk_id)
+
+        return data
+
+
+def _raise_no_backend(source_id: str):
+    """Helper function that raises when called."""
+    raise flight.FlightServerError(
+        f"Cannot compute data for cache-backed source {source_id}. "
+        f"Data must be written via write_chunk first."
+    )
