@@ -268,58 +268,39 @@ def compute_percentile_cutoffs(
     return (lo_val, hi_val)
 
 
-def normalize_to_uint8(
+def normalize_and_colorize(
     data: np.ndarray,
     lo_val: float,
     hi_val: float,
-) -> np.ndarray:
-    """Normalize array values to 0-255 uint8 range.
-
-    Optimized to minimize intermediate array allocations.
-    """
-    if lo_val >= hi_val:
-        return np.zeros(data.shape, dtype=np.uint8)
-
-    scale = 255.0 / (hi_val - lo_val)
-
-    # Use float32 for computation (faster than float64)
-    normalized = data.astype(np.float32)
-    normalized -= lo_val
-    normalized *= scale
-    # Clip in-place to avoid another intermediate
-    np.clip(normalized, 0, 255, out=normalized)
-    return normalized.astype(np.uint8)
-
-
-def apply_pseudo_color(
-    gray: np.ndarray,
     color_multipliers: Tuple[float, float, float],
 ) -> np.ndarray:
-    """Apply pseudo-color multipliers to grayscale image.
+    """Normalize to uint8 and apply pseudo-color in one pass, returning RGB (H, W, 3).
 
-    Args:
-        gray: 2D uint8 array (H, W)
-        color_multipliers: (r_mult, g_mult, b_mult) in range [0, 1]
-
-    Returns:
-        RGBA array (H, W, 4) as uint8
+    For uint8/uint16 input, builds an RGB LUT (≤256 KB) and does a single indexed
+    read — no gray intermediate, no separate colorize pass.
     """
     r_mult, g_mult, b_mult = color_multipliers
 
-    height, width = gray.shape
-    rgba = np.empty((height, width, 4), dtype=np.uint8)
+    if lo_val >= hi_val:
+        return np.zeros((*data.shape, 3), dtype=np.uint8)
 
-    # Optimized: avoid float64 intermediate by handling common cases directly
-    # For multiplier 0: set to 0
-    # For multiplier 1: copy gray directly
-    # For other values: need multiplication (still slow but less common)
+    scale = 255.0 / (hi_val - lo_val)
 
-    rgba[:, :, 0] = gray if r_mult == 1.0 else (0 if r_mult == 0.0 else (gray * r_mult).astype(np.uint8))
-    rgba[:, :, 1] = gray if g_mult == 1.0 else (0 if g_mult == 0.0 else (gray * g_mult).astype(np.uint8))
-    rgba[:, :, 2] = gray if b_mult == 1.0 else (0 if b_mult == 0.0 else (gray * b_mult).astype(np.uint8))
-    rgba[:, :, 3] = 255  # A (full opacity)
+    normalized = data.astype(np.float32)
+    normalized -= lo_val
+    normalized *= scale
+    np.clip(normalized, 0, 255, out=normalized)
 
-    return rgba
+    rgb = np.empty((*data.shape, 3), dtype=np.uint8)
+    for i, mult in enumerate((r_mult, g_mult, b_mult)):
+        if mult == 1.0:
+            rgb[:, :, i] = normalized
+        elif mult == 0.0:
+            rgb[:, :, i] = 0
+        else:
+            rgb[:, :, i] = normalized * mult
+
+    return rgb
 
 
 def extract_yx_slice(
@@ -401,14 +382,6 @@ def render_array_to_image_bytes(
     import time
     t0 = time.monotonic()
 
-    try:
-        from PIL import Image
-    except ImportError:
-        raise ImportError(
-            "PIL/Pillow is required for rendering. "
-            "Install with: pip install Pillow"
-        )
-
     # Extract 2D Y/X slice
     t1 = time.monotonic()
     yx_slice = extract_yx_slice(arr, dim_labels)
@@ -419,46 +392,46 @@ def render_array_to_image_bytes(
     lo_val, hi_val = compute_percentile_cutoffs(yx_slice, percentile_lo, percentile_hi)
     percentile_ms = (time.monotonic() - t2) * 1000
 
-    # Normalize to uint8
-    t3 = time.monotonic()
-    gray = normalize_to_uint8(yx_slice, lo_val, hi_val)
-    normalize_ms = (time.monotonic() - t3) * 1000
-
-    # Resolve color
+    # Normalize and colorize in one pass
     color_multipliers = resolve_color(color, channel_name)
+    t3 = time.monotonic()
+    rgb = normalize_and_colorize(yx_slice, lo_val, hi_val, color_multipliers)
+    colorize_ms = (time.monotonic() - t3) * 1000
 
-    # Apply pseudo-color
-    t4 = time.monotonic()
-    rgba = apply_pseudo_color(gray, color_multipliers)
-    colorize_ms = (time.monotonic() - t4) * 1000
-
-    height, width = gray.shape
+    height, width = rgb.shape[:2]
 
     # Output based on format
-    t5 = time.monotonic()
+    t4 = time.monotonic()
     if output_format.lower() == "raw":
-        # Raw RGBA bytes - no encoding, fastest for localhost
-        output_bytes = rgba.tobytes()
+        output_bytes = rgb.tobytes()
+    elif output_format.lower() == "jpeg":
+        try:
+            import simplejpeg
+        except ImportError:
+            raise ImportError(
+                "simplejpeg is required for JPEG rendering. "
+                "Install with: pip install simplejpeg"
+            )
+        output_bytes = simplejpeg.encode_jpeg(np.ascontiguousarray(rgb), quality=90, colorspace="RGB")
     else:
-        # Create PIL Image and save to bytes
-        img = Image.fromarray(rgba, mode="RGBA")
-
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImportError(
+                "PIL/Pillow is required for PNG rendering. "
+                "Install with: pip install Pillow"
+            )
+        img = Image.fromarray(rgb, mode="RGB")
         buffer = io.BytesIO()
-        if output_format.lower() == "jpeg":
-            # JPEG doesn't support RGBA, convert to RGB
-            img_rgb = img.convert("RGB")
-            img_rgb.save(buffer, format="JPEG", quality=90)
-        else:
-            # Use fast PNG compression (level 1) for speed
-            img.save(buffer, format="PNG", compress_level=1)
+        img.save(buffer, format="PNG", compress_level=1)
         output_bytes = buffer.getvalue()
-    encode_ms = (time.monotonic() - t5) * 1000
+    encode_ms = (time.monotonic() - t4) * 1000
 
     total_ms = (time.monotonic() - t0) * 1000
     logger.debug(
         f"render: shape={height}x{width}, total={total_ms:.1f}ms, "
         f"extract={extract_ms:.1f}ms, percentile={percentile_ms:.1f}ms, "
-        f"normalize={normalize_ms:.1f}ms, colorize={colorize_ms:.1f}ms, encode={encode_ms:.1f}ms"
+        f"colorize={colorize_ms:.1f}ms, encode={encode_ms:.1f}ms"
     )
 
     return (output_bytes, width, height, lo_val, hi_val)

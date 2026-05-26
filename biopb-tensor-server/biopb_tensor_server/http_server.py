@@ -34,7 +34,14 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -1045,10 +1052,6 @@ def create_app(
                         chunk_bounds=chunk_bounds_list,
                     )
 
-                    t0_compute = time.monotonic()
-                    arr: np.ndarray = dask_arr.compute()
-                    compute_ms = (time.monotonic() - t0_compute) * 1000
-
                     # Get dim_labels from descriptor
                     dim_labels: List[str] = list(ctx.descriptor.dim_labels)
                     if not dim_labels:
@@ -1057,6 +1060,29 @@ def create_app(
                     # Build axis map to find Y and X indices
                     y_idx = dim_labels.index("y") if "y" in dim_labels else len(dim_labels) - 2
                     x_idx = dim_labels.index("x") if "x" in dim_labels else len(dim_labels) - 1
+
+                    # Slice dask array to the originally requested bounds (except y/x) before computing.
+                    if ctx.original_slice_hint is not None and ctx.descriptor.HasField("slice_hint"):
+                        realized = ctx.descriptor.slice_hint
+                        ndim = len(ctx.descriptor.shape)
+                        scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
+                        crop = []
+                        for ax in range(ndim):
+                            if ax in (y_idx, x_idx):
+                                crop.append(slice(None))  # keep full range for y/x
+                            else:
+                                req_start = int(ctx.original_slice_hint.start[ax])
+                                req_stop = int(ctx.original_slice_hint.stop[ax])
+                                ret_start = int(realized.start[ax])
+                                s = int(scale[ax]) if scale and ax < len(scale) else 1
+                                logical_start = (req_start - ret_start) // s
+                                logical_stop = (req_stop - ret_start + s - 1) // s
+                                crop.append(slice(logical_start, logical_stop))
+                        dask_arr = dask_arr[tuple(crop)]
+
+                    t0_compute = time.monotonic()
+                    arr: np.ndarray = dask_arr.compute()
+                    compute_ms = (time.monotonic() - t0_compute) * 1000
 
                     # Compute loaded region from realized slice bounds (not requested)
                     loaded_region = None

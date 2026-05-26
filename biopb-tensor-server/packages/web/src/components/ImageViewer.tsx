@@ -35,7 +35,7 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
   const sources = useAppStore((s) => s.sources);
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
-  const getChannelColor = useAppStore((s) => s.getChannelColor);
+  const channelColors = useAppStore((s) => s.channelColors);
   const apiBase = useAppStore((s) => s.apiBase);
   const devMode = useAppStore((s) => s.devMode);
 
@@ -55,8 +55,8 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     return names?.[slice.c] ?? undefined;
   }, [channelNames, sourceId, slice.c]);
 
-  // Get current color
-  const color = getChannelColor(sourceId, slice.c);
+  // Get current color - subscribe to channelColors directly so color changes trigger re-renders
+  const color: ColorValue = channelColors[sourceId]?.[slice.c] ?? "auto";
 
   // Get token for WebSocket auth
   const token = useMemo(() => {
@@ -269,6 +269,16 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
       }
     }, RELOAD_DEBOUNCE_MS);
   }, [fullWidth, fullHeight, requestRender]);
+
+  // Reset WebSocket state and transition refs when source changes
+  useEffect(() => {
+    wsRef.current.reset();
+    prevImageUrlRef.current = null;
+    prevLoadedRegionRef.current = null;
+    currentImageUrlRef.current = null;
+    currentLoadedRegionRef.current = null;
+    prevSliceRef.current = { ...prevSliceRef.current, t: -1 };
+  }, [sourceId, tensorId]);
 
   // Initialize viewport and request initial render when descriptor changes
   useEffect(() => {

@@ -39,7 +39,6 @@ export function HomePage() {
             <div className="viewer-column">
               <div className="viewer-canvas-wrap">
                 <ImageViewer
-                  key={`${activeSourceId}:${activeTensorId}`}
                   sourceId={activeSourceId}
                   tensorId={activeTensorId}
                 />

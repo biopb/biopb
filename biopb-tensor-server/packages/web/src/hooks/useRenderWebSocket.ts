@@ -57,6 +57,7 @@ export interface UseRenderWebSocketOptions {
 export interface UseRenderWebSocketResult extends WebSocketState {
   requestRender: (params: RenderParams) => void;
   reconnect: () => void;
+  reset: () => void;
 }
 
 /**
@@ -81,6 +82,9 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
   const pendingRequestRef = useRef<RenderParams | null>(null);
   const pendingMetadataRef = useRef<RenderMetadata | null>(null);  // Store metadata from render_start
   const pendingLoadedRegionRef = useRef<LoadedRegionInfo | null>(null);  // Store region from render_start
+  const renderGenerationRef = useRef(0);  // Incremented on each render request, used to discard stale responses
+  const pendingRenderGenerationRef = useRef<number | null>(null);  // Generation at time of render_start
+  const currentSourceTensorRef = useRef<{ source_id: string; tensor_id: string } | null>(null);  // Current source/tensor being displayed
   const enabledRef = useRef(enabled);
   const tokenRef = useRef(token);
   const apiBaseRef = useRef(apiBase);
@@ -182,6 +186,8 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
           const msg = JSON.parse(event.data);
 
           if (msg.action === "render_start") {
+            // Store the current render generation - will be checked when binary blob arrives
+            pendingRenderGenerationRef.current = renderGenerationRef.current;
             // Store metadata and loaded_region in refs - will be set with binary blob
             pendingMetadataRef.current = {
               width: msg.width,
@@ -208,6 +214,18 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
         }
       } else if (event.data instanceof Blob) {
         // Handle binary image data
+        // Check if this blob belongs to the current render generation
+        const blobGeneration = pendingRenderGenerationRef.current;
+        const currentGeneration = renderGenerationRef.current;
+
+        // Discard stale responses (blob from an older render request)
+        if (blobGeneration !== null && blobGeneration !== currentGeneration) {
+          // Stale response - discard and don't update state
+          pendingMetadataRef.current = null;
+          pendingLoadedRegionRef.current = null;
+          pendingRenderGenerationRef.current = null;
+          return;
+        }
 
         // Keep old URL - ImageViewer will revoke it after new image loads
         const imageUrl = URL.createObjectURL(event.data);
@@ -218,6 +236,7 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
         const loadedRegion = pendingLoadedRegionRef.current;
         pendingMetadataRef.current = null;
         pendingLoadedRegionRef.current = null;
+        pendingRenderGenerationRef.current = null;
 
         // Single setState with all info from this render cycle
         setState((s) => ({
@@ -259,6 +278,15 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
     connect();
   }, [connect]);
 
+  // Reset state (clear image and loadedRegion) without disconnecting
+  const reset = useCallback(() => {
+    cleanupUrl();
+    pendingMetadataRef.current = null;
+    pendingLoadedRegionRef.current = null;
+    pendingRenderGenerationRef.current = null;
+    setState((s) => ({ ...s, imageUrl: null, loadedRegion: null, metadata: null }));
+  }, [cleanupUrl]);
+
   // Connect on mount when enabled, disconnect on unmount
   useEffect(() => {
     if (enabled) {
@@ -282,5 +310,6 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
     ...state,
     requestRender,
     reconnect,
+    reset,
   };
 }

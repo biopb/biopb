@@ -148,7 +148,13 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
       {/* Key info section */}
       {source && (
         <div style={{ marginBottom: 12, padding: 8, background: "#1e2435", borderRadius: 4 }}>
-          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Source URL</div>
+          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Array</div>
+          <div style={{ fontSize: 12, wordBreak: "break-all" }}>
+            {source.tensors.length === 1
+              ? source.source_id
+              : `${source.source_id}/${activeTensorId ?? ""}`}
+          </div>
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
           <div style={{ fontSize: 12, wordBreak: "break-all" }}>{source.source_url || source.source_id}</div>
 
           {tensor && (

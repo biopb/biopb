@@ -29,6 +29,7 @@ dependencies = [
     "fastapi >= 0.111.0",
     "uvicorn[standard] >= 0.30.0",
     "pillow >= 9.0.0",
+    "simplejpeg >= 1.6.0",
   ]
   test = [
     "pytest >= 7.0.0",
