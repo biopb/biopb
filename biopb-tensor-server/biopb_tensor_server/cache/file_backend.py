@@ -264,6 +264,9 @@ class ArrowFileBackend(CacheBackend):
         lock_path = self._config.cache_dir / "lock"
         self._process_lock = ProcessLock(lock_path)
 
+        # Capture staleness BEFORE acquire() removes the stale lock file
+        was_stale = self._process_lock.is_stale()
+
         if not self._process_lock.acquire():
             raise RuntimeError(
                 f"Cannot acquire cache lock at {lock_path}. "
@@ -275,7 +278,7 @@ class ArrowFileBackend(CacheBackend):
         self._wal = WriteAheadLog(wal_path)
 
         # Check for crash recovery
-        if self._process_lock.is_stale() or self._wal.has_pending():
+        if was_stale or self._wal.has_pending():
             logger.info("Cache recovery: stale lock or pending WAL entries detected")
             self._recovery_status = self._recover()
 

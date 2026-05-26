@@ -151,7 +151,23 @@ def _setup_flight_server(
     # Resolve and separate sources
     sources = resolve_all_sources(server_config)
     monitored_sources = [s for s in server_config.sources if s.monitor]
-    static_sources = sources  # all expanded static entries; DiscoveryState deduplicates
+
+    # Get monitored directory paths to filter out sources discovered from them
+    # Sources under monitored dirs will be discovered via rescan, not static registration
+    monitored_dirs = {
+        ms.local_path
+        for ms in monitored_sources
+        if not ms.is_remote and ms.local_path
+    }
+
+    # Static sources: those NOT under monitored directories (or remote sources)
+    # Remote sources are always static (no filesystem monitoring)
+    static_sources = [
+        s for s in sources
+        if s.is_remote or (s.local_path and not any(
+            s.local_path.is_relative_to(md) for md in monitored_dirs
+        ))
+    ]
 
     if not static_sources and not monitored_sources:
         console.print("[yellow]Warning: No data sources configured[/yellow]")

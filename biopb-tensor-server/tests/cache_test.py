@@ -691,6 +691,39 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_stale_lock_triggers_recovery_without_wal_entries(self):
+        """Stale lock alone (no WAL entries) triggers recovery on restart."""
+        import json
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+
+        # First instance: write a complete entry (WAL is cleared after commit)
+        backend1 = ArrowFileBackend(config)
+        entry1, _ = backend1.start_compute(b"key1")
+        data = self._make_data([1, 2, 3])
+        backend1.complete_entry(b"key1", data, 24)
+        backend1.release(b"key1")
+
+        # Simulate crash: overwrite lock with a dead PID (no pending WAL entries)
+        lock_path = cache_dir / "lock"
+        fake_data = {"pid": 99999, "acquired_at": time.time()}
+        with open(lock_path, 'w') as f:
+            json.dump(fake_data, f)
+
+        # Verify WAL has no pending entries (so recovery must be triggered by stale lock)
+        from biopb_tensor_server.cache.recovery import WriteAheadLog
+        wal = WriteAheadLog(cache_dir / "wal.json")
+        assert not wal.has_pending(), "Test requires no pending WAL entries"
+
+        # Reinitialize: recovery should trigger due to stale lock
+        backend2 = ArrowFileBackend(config)
+        assert backend2.get_recovery_status() is not None, (
+            "Recovery should be triggered by stale lock even without pending WAL entries"
+        )
+
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
 
 class TestBackendSelection:
     """Tests for CacheManager backend selection."""
