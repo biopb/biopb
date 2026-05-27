@@ -12,10 +12,12 @@ Public API::
 """
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
 _started = False
+_lock = threading.Lock()
 
 
 def start_mcp_server(viewer, port=None):
@@ -26,31 +28,33 @@ def start_mcp_server(viewer, port=None):
         port: HTTP port (default: from config, fallback 8765).
     """
     global _started
-    if _started:
-        logger.debug("MCP server already running")
-        return
+    with _lock:
+        if _started:
+            logger.debug("MCP server already running")
+            return
 
-    from .._config import load_config
-    from ._bridge import ThreadBridge
-    from ._server import launch_server
+        from .._config import load_config
+        from ._bridge import ThreadBridge
+        from ._server import launch_server
 
-    config = load_config()
-    mcp_config = config.get("mcp", {})
-    if port is None:
-        port = mcp_config.get("port", 8765)
+        config = load_config()
+        mcp_config = config.get("mcp", {})
+        if port is None:
+            port = mcp_config.get("port", 8765)
 
-    bridge = ThreadBridge(viewer)
-    launch_server(bridge, port=port, mcp_config=mcp_config)
-    _started = True
+        bridge = ThreadBridge(viewer)
+        launch_server(bridge, port=port, mcp_config=mcp_config)
+        _started = True
 
 
 def stop_mcp_server():
     """Stop the MCP bridge timer."""
     global _started
-    from ._server import shutdown_server
+    with _lock:
+        from ._server import shutdown_server
 
-    shutdown_server()
-    _started = False
+        shutdown_server()
+        _started = False
 
 
 # ---------------------------------------------------------------------------

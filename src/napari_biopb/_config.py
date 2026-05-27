@@ -53,6 +53,8 @@ DEFAULT_CONFIG = {
         "dask_scheduler": "threads",
         "dask_num_workers": 0,
         "dask_distributed_address": "",
+        "max_sessions": 16,
+        "session_ttl_seconds": 3600,
     },
 }
 

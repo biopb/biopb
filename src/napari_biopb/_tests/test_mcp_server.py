@@ -16,6 +16,7 @@ def reset_server_state():
     old_bridge = _server._bridge
     yield
     _server._bridge = old_bridge
+    _server._sessions.clear()
 
 
 @pytest.fixture
@@ -26,6 +27,14 @@ def mock_bridge():
     bridge.tensor_client = None
     bridge.tensor_sources = {}
     return bridge
+
+
+@pytest.fixture
+def mock_ctx():
+    """Create a mock MCP Context with a stable session identity."""
+    ctx = MagicMock()
+    ctx.session = MagicMock()
+    return ctx
 
 
 @pytest.fixture
@@ -106,47 +115,47 @@ class TestTakeScreenshot:
 
 
 class TestExecuteCode:
-    def test_returns_error_when_no_bridge(self):
+    def test_returns_error_when_no_bridge(self, mock_ctx):
         _server._bridge = None
-        result = _server.execute_code("print('hi')")
+        result = _server.execute_code("print('hi')", mock_ctx)
         assert "not initialized" in result
 
-    def test_executes_print_statement(self, server_with_bridge):
-        result = _server.execute_code("print('hello world')")
+    def test_executes_print_statement(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("print('hello world')", mock_ctx)
         assert "hello world" in result
 
-    def test_returns_expression_repr(self, server_with_bridge):
-        result = _server.execute_code("1 + 2")
+    def test_returns_expression_repr(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("1 + 2", mock_ctx)
         assert "3" in result
 
-    def test_multi_line_code(self, server_with_bridge):
+    def test_multi_line_code(self, server_with_bridge, mock_ctx):
         code = "x = 5\nprint(x * 2)"
-        result = _server.execute_code(code)
+        result = _server.execute_code(code, mock_ctx)
         assert "10" in result
 
-    def test_reports_errors(self, server_with_bridge):
-        result = _server.execute_code("1 / 0")
+    def test_reports_errors(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("1 / 0", mock_ctx)
         assert "Error" in result
         assert "division by zero" in result
 
-    def test_namespace_has_numpy(self, server_with_bridge):
-        result = _server.execute_code("print(type(np).__name__)")
+    def test_namespace_has_numpy(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("print(type(np).__name__)", mock_ctx)
         assert "module" in result
 
-    def test_namespace_has_viewer(self, server_with_bridge):
-        result = _server.execute_code("print(type(viewer))")
+    def test_namespace_has_viewer(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("print(type(viewer))", mock_ctx)
         assert "Mock" in result or "Viewer" in result
 
-    def test_import_blocked(self, server_with_bridge):
-        result = _server.execute_code("import os")
+    def test_import_blocked(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("import os", mock_ctx)
         assert "Error" in result
 
-    def test_open_blocked(self, server_with_bridge):
-        result = _server.execute_code("open('/etc/passwd')")
+    def test_open_blocked(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("open('/etc/passwd')", mock_ctx)
         assert "Error" in result
 
-    def test_no_output_message(self, server_with_bridge):
-        result = _server.execute_code("x = 42")
+    def test_no_output_message(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("x = 42", mock_ctx)
         assert result == "(no output)"
 
 
@@ -156,21 +165,21 @@ class TestExecuteCode:
 
 
 class TestInspectObject:
-    def test_returns_error_when_no_bridge(self):
+    def test_returns_error_when_no_bridge(self, mock_ctx):
         _server._bridge = None
-        result = _server.inspect_object("viewer")
+        result = _server.inspect_object("viewer", mock_ctx)
         assert "not initialized" in result
 
-    def test_inspects_viewer(self, server_with_bridge):
-        result = _server.inspect_object("viewer")
+    def test_inspects_viewer(self, server_with_bridge, mock_ctx):
+        result = _server.inspect_object("viewer", mock_ctx)
         assert "Type:" in result
 
-    def test_inspects_numpy(self, server_with_bridge):
-        result = _server.inspect_object("np")
+    def test_inspects_numpy(self, server_with_bridge, mock_ctx):
+        result = _server.inspect_object("np", mock_ctx)
         assert "module" in result.lower() or "Type:" in result
 
-    def test_invalid_path_returns_error(self, server_with_bridge):
-        result = _server.inspect_object("nonexistent_object_xyz")
+    def test_invalid_path_returns_error(self, server_with_bridge, mock_ctx):
+        result = _server.inspect_object("nonexistent_object_xyz", mock_ctx)
         assert "Error" in result
         assert "nonexistent_object_xyz" in result
 
@@ -181,26 +190,121 @@ class TestInspectObject:
 
 
 class TestSafeBuiltins:
-    def test_safe_builtins_allow_basic_operations(self, server_with_bridge):
+    def test_safe_builtins_allow_basic_operations(
+        self, server_with_bridge, mock_ctx
+    ):
         result = _server.execute_code(
-            "print(len([1,2,3]), max(1,2), min(1,2))"
+            "print(len([1,2,3]), max(1,2), min(1,2))", mock_ctx
         )
         assert "3" in result
         assert "2" in result
         assert "1" in result
 
-    def test_safe_builtins_allow_type_conversions(self, server_with_bridge):
-        result = _server.execute_code("print(int('42'), float('3.14'))")
+    def test_safe_builtins_allow_type_conversions(
+        self, server_with_bridge, mock_ctx
+    ):
+        result = _server.execute_code(
+            "print(int('42'), float('3.14'))", mock_ctx
+        )
         assert "42" in result
         assert "3.14" in result
 
-    def test_eval_blocked(self, server_with_bridge):
-        result = _server.execute_code("eval('1+1')")
+    def test_eval_blocked(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("eval('1+1')", mock_ctx)
         assert "Error" in result
 
-    def test_exec_blocked(self, server_with_bridge):
-        result = _server.execute_code("exec('x=1')")
+    def test_exec_blocked(self, server_with_bridge, mock_ctx):
+        result = _server.execute_code("exec('x=1')", mock_ctx)
         assert "Error" in result
+
+
+# -----------------------------------------------------------------------
+# Session-scoped namespaces
+# -----------------------------------------------------------------------
+
+
+class TestSessionNamespace:
+    def test_variables_persist_across_calls(
+        self, server_with_bridge, mock_ctx
+    ):
+        _server.execute_code("my_var = 42", mock_ctx)
+        result = _server.execute_code("print(my_var)", mock_ctx)
+        assert "42" in result
+
+    def test_different_sessions_are_isolated(self, server_with_bridge):
+        ctx_a = MagicMock()
+        ctx_a.session = MagicMock()
+        ctx_b = MagicMock()
+        ctx_b.session = MagicMock()
+
+        _server.execute_code("shared_name = 'session_a'", ctx_a)
+        _server.execute_code("shared_name = 'session_b'", ctx_b)
+
+        result_a = _server.execute_code("print(shared_name)", ctx_a)
+        result_b = _server.execute_code("print(shared_name)", ctx_b)
+        assert "session_a" in result_a
+        assert "session_b" in result_b
+
+    def test_inspect_sees_session_variables(
+        self, server_with_bridge, mock_ctx
+    ):
+        _server.execute_code("my_obj = [1, 2, 3]", mock_ctx)
+        result = _server.inspect_object("my_obj", mock_ctx)
+        assert "list" in result
+
+    def test_client_refreshed_each_call(self, server_with_bridge, mock_ctx):
+        _server.execute_code("x = 1", mock_ctx)
+        new_client = MagicMock()
+        server_with_bridge.tensor_client = new_client
+        result = _server.execute_code("print(client is not None)", mock_ctx)
+        assert "True" in result
+
+
+# -----------------------------------------------------------------------
+# Session GC
+# -----------------------------------------------------------------------
+
+
+class TestSessionGC:
+    def test_ttl_evicts_stale_sessions(self, server_with_bridge):
+        store = _server._SessionStore(ttl_seconds=0.1)
+        ctx = MagicMock()
+        ctx.session = MagicMock()
+        skey = str(id(ctx.session))
+
+        store.get_or_create(skey, server_with_bridge)
+        assert skey in store._namespaces
+
+        time.sleep(0.15)
+        store._gc()
+        assert skey not in store._namespaces
+
+    def test_max_cap_evicts_oldest(self, server_with_bridge):
+        store = _server._SessionStore(max_sessions=2, ttl_seconds=3600)
+
+        keys = []
+        for i in range(3):
+            k = f"session_{i}"
+            store.get_or_create(k, server_with_bridge)
+            keys.append(k)
+            time.sleep(0.01)
+
+        assert len(store._namespaces) <= 2
+        assert keys[0] not in store._namespaces
+        assert keys[2] in store._namespaces
+
+    def test_clear_removes_all(self, server_with_bridge):
+        store = _server._SessionStore()
+        store.get_or_create("s1", server_with_bridge)
+        store.get_or_create("s2", server_with_bridge)
+        store.clear()
+        assert len(store._namespaces) == 0
+
+    def test_shutdown_clears_sessions(self, server_with_bridge, mock_ctx):
+        _server.execute_code("x = 1", mock_ctx)
+        assert len(_server._sessions._namespaces) > 0
+        _server.shutdown_server()
+        assert len(_server._sessions._namespaces) == 0
 
 
 # -----------------------------------------------------------------------

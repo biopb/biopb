@@ -66,7 +66,7 @@ class ThreadBridge:
 
     def process_pending(self):
         """Drain the command queue — called by QTimer on the Qt thread."""
-        while not self._cmd_queue.empty():
+        while True:
             try:
                 fn, args, result_queue = self._cmd_queue.get_nowait()
             except queue.Empty:
@@ -90,4 +90,5 @@ class ThreadBridge:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
-            logger.debug("Bridge timer stopped")
+        self.process_pending()
+        logger.debug("Bridge timer stopped")

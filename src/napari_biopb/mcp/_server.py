@@ -6,17 +6,18 @@ ThreadBridge so they execute on the Qt main thread.
 """
 
 import base64
+import builtins as _builtins
 import inspect
 import io
 import logging
-import sys
 import threading
-from typing import Optional
+import time
+from typing import Dict, Optional
 
 import dask
 import dask.array as da
 import numpy as np
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ImageContent, TextContent
 
 from . import _resources
@@ -58,10 +59,70 @@ _SAFE_BUILTINS = {
     "None": None,
 }
 
+
+class _SessionStore:
+    """Per-session namespace store with TTL and max-cap GC."""
+
+    def __init__(self, max_sessions: int = 16, ttl_seconds: float = 3600):
+        self._namespaces: Dict[str, dict] = {}
+        self._last_access: Dict[str, float] = {}
+        self._max_sessions = max_sessions
+        self._ttl = ttl_seconds
+
+    def get_or_create(self, session_key: str, bridge: ThreadBridge) -> dict:
+        self._gc()
+        ns = self._namespaces.get(session_key)
+        if ns is None:
+            ns = {
+                "viewer": bridge.viewer,
+                "np": np,
+                "da": da,
+            }
+            self._namespaces[session_key] = ns
+            logger.debug("Created namespace for session %s", session_key)
+            self._enforce_cap()
+        ns["client"] = bridge.tensor_client
+        ns["sources"] = bridge.tensor_sources
+        self._last_access[session_key] = time.monotonic()
+        return ns
+
+    def _gc(self):
+        now = time.monotonic()
+        expired = [
+            k for k, t in self._last_access.items() if now - t > self._ttl
+        ]
+        for k in expired:
+            self._namespaces.pop(k, None)
+            self._last_access.pop(k, None)
+            logger.debug("GC: expired session %s", k)
+        self._enforce_cap()
+
+    def _enforce_cap(self):
+        while len(self._namespaces) > self._max_sessions:
+            oldest = min(self._last_access, key=self._last_access.get)
+            self._namespaces.pop(oldest, None)
+            self._last_access.pop(oldest, None)
+            logger.debug("GC: evicted oldest session %s", oldest)
+
+    def clear(self):
+        self._namespaces.clear()
+        self._last_access.clear()
+
+
 _bridge: Optional[ThreadBridge] = None
 _server_thread: Optional[threading.Thread] = None
+_sessions = _SessionStore()
 
 mcp = FastMCP("napari-biopb")
+
+
+def _configure_sessions(mcp_config: dict):
+    """Apply session GC settings from config."""
+    global _sessions
+    _sessions = _SessionStore(
+        max_sessions=mcp_config.get("max_sessions", 16),
+        ttl_seconds=mcp_config.get("session_ttl_seconds", 3600),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,15 +159,9 @@ def get_annotations_guide() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_namespace(bridge: ThreadBridge) -> dict:
-    return {
-        "viewer": bridge.viewer,
-        "np": np,
-        "da": da,
-        "client": bridge.tensor_client,
-        "sources": bridge.tensor_sources,
-        "__builtins__": _SAFE_BUILTINS,
-    }
+def _session_key(ctx: Context) -> str:
+    """Derive a stable key for the MCP session."""
+    return str(id(ctx.session))
 
 
 @mcp.tool()
@@ -119,55 +174,55 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
-    if _bridge is None:
+    bridge = _bridge
+    if bridge is None:
         return [TextContent(type="text", text="MCP bridge not initialized")]
 
-    try:
-        from PIL import Image
-    except ImportError:
-        return [
-            TextContent(
-                type="text",
-                text="Pillow is not installed. "
-                "Install with: pip install 'napari-biopb[mcp]'",
-            )
-        ]
+    import cv2
 
     def _capture(canvas_only=canvas_only):
-        return _bridge.viewer.screenshot(canvas_only=canvas_only)
+        return bridge.viewer.screenshot(canvas_only=canvas_only)
 
-    arr = _bridge.run_on_gui_thread(_capture)
+    arr = bridge.run_on_gui_thread(_capture)
 
-    img = Image.fromarray(arr)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    data = base64.b64encode(buf.getvalue()).decode()
+    # napari returns RGBA; cv2.imencode expects BGR(A)
+    arr_bgra = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+    ok, buf = cv2.imencode(".png", arr_bgra)
+    data = base64.b64encode(buf.tobytes()).decode()
 
     return [ImageContent(type="image", mimeType="image/png", data=data)]
 
 
 @mcp.tool()
-def execute_code(python_code: str) -> str:
+def execute_code(python_code: str, ctx: Context) -> str:
     """Execute Python code in the napari namespace.
 
     The namespace includes: viewer (with load_tensor method), np, da,
     client, sources. Use print() to produce output. The last expression's
     repr is appended if it is not None.
 
+    Variables you define persist across calls within the same session.
+
     Read the napari://guide resource for details on available objects and
     helpers.  Read napari://viewer, napari://tensor, or napari://annotations
     for domain-specific patterns.
     """
-    if _bridge is None:
+    bridge = _bridge
+    if bridge is None:
         return "Error: MCP bridge not initialized"
 
+    skey = _session_key(ctx)
+
     def _exec(code=python_code):
-        namespace = _build_namespace(_bridge)
-        old_stdout = sys.stdout
         captured = io.StringIO()
-        sys.stdout = captured
+        namespace = _sessions.get_or_create(skey, bridge)
+        namespace["__builtins__"] = {
+            **_SAFE_BUILTINS,
+            "print": lambda *a, **kw: _builtins.print(
+                *a, **{**kw, "file": captured}
+            ),
+        }
         try:
-            # Try as expression first for implicit return
             try:
                 result = eval(code, namespace)
                 output = captured.getvalue()
@@ -183,24 +238,26 @@ def execute_code(python_code: str) -> str:
         except Exception as exc:
             output = captured.getvalue()
             return f"{output}Error: {exc}"
-        finally:
-            sys.stdout = old_stdout
 
-    return _bridge.run_on_gui_thread(_exec)
+    return bridge.run_on_gui_thread(_exec)
 
 
 @mcp.tool()
-def inspect_object(object_path: str) -> str:
+def inspect_object(object_path: str, ctx: Context) -> str:
     """Inspect a live object in the napari namespace.
 
     Returns the type, docstring, and public methods/attributes.
+    Can inspect user-defined variables from the same session.
     Example: inspect_object("viewer.layers") or inspect_object("viewer.camera")
     """
-    if _bridge is None:
+    bridge = _bridge
+    if bridge is None:
         return "Error: MCP bridge not initialized"
 
+    skey = _session_key(ctx)
+
     def _inspect(path=object_path):
-        namespace = _build_namespace(_bridge)
+        namespace = _sessions.get_or_create(skey, bridge)
         safe_globals = {"__builtins__": {}}
         try:
             obj = eval(path, safe_globals, namespace)
@@ -236,7 +293,7 @@ def inspect_object(object_path: str) -> str:
 
         return "\n".join(lines)
 
-    return _bridge.run_on_gui_thread(_inspect)
+    return bridge.run_on_gui_thread(_inspect)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +333,7 @@ def launch_server(
     if mcp_config is None:
         mcp_config = {}
     _configure_dask(mcp_config)
+    _configure_sessions(mcp_config)
 
     _bridge = bridge
     patch_viewer_load_tensor(bridge)
@@ -300,6 +358,7 @@ def launch_server(
 def shutdown_server():
     """Stop the bridge timer (the daemon thread dies with the process)."""
     global _bridge
+    _sessions.clear()
     if _bridge is not None:
         _bridge.stop_timer()
         _bridge = None
