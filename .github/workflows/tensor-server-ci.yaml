@@ -5,9 +5,14 @@ on:
     tags:
       - 'server-v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 1.4.2)'
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -15,11 +20,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Extract version from tag
         id: version
         run: |
-          VERSION=${GITHUB_REF_NAME#server-v}
+          # 1. Check if a manual input was provided
+          MANUAL_VERSION="${{ inputs.version }}"
+          
+          if [ -n "$MANUAL_VERSION" ]; then
+            VERSION="$MANUAL_VERSION"
+          else
+            VERSION=${GITHUB_REF_NAME#server-v}
+          fi
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm
@@ -45,6 +59,9 @@ jobs:
       - name: Build webapp
         run: VITE_TENSOR_API="" pnpm --filter @biopb/web build
 
+      - name: Create webapp tarball
+        run: tar -czf webapp.tar.gz -C biopb-tensor-server/packages/web dist
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -62,6 +79,27 @@ jobs:
       - name: Build biopb_tensor_server wheel
         run: pip wheel ./biopb-tensor-server --no-deps -w wheels/
 
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Tensor Server ${{ steps.version.outputs.VERSION }}
+          files: |
+            webapp.tar.gz
+            wheels/biopb*.whl
+            biopb-tensor-server/install.sh
+          body: |
+            ## biopb-tensor-server ${{ steps.version.outputs.VERSION }}
+
+            ### Docker
+            ```bash
+            docker run -d -p 8814:8814 -p 8815:8815 \
+                -v /data:/data \
+                ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.version.outputs.VERSION }}
+            ```
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -70,7 +108,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
