@@ -24,7 +24,11 @@ On client side, the data can be accessed in any langugae supported by arrow flig
 | zero-copy | ✗ | ✗ | ✓ |
 
 ## Quick Start
+```bash
+curl -fsSL https://biopb.org/install.sh | bash
+```
 
+## Deploy to data server
 ```bash
 docker run -d --rm \
     --name biopb-tensor \

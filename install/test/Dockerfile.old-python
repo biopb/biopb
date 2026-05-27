@@ -1,0 +1,13 @@
+# Scenario: system Python present but too old (3.7)
+# Verifies the version check rejects it and falls back to uv-managed 3.11.
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates python3.7 \
+    && ln -sf /usr/bin/python3.7 /usr/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ../install.sh /install.sh
+
+CMD ["/bin/bash"]

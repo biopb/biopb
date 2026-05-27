@@ -5,13 +5,13 @@ import signal
 import subprocess
 import sys
 import time
-
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 from typing import Optional
 
 import typer
+
 from biopb.tensor.cli import app as tensor_app
 from biopb.image.cli import app as image_app
 
@@ -21,7 +21,12 @@ app = typer.Typer(
     name="biopb",
     help="BioPB: open protobuf/gRPC protocols for biomedical image processing",
 )
+console = Console()
+
+# TensorFlight client diagnostics
 app.add_typer(tensor_app, name="tensor", help="TensorFlight client diagnostics")
+
+# ProcessImage client operations
 app.add_typer(image_app, name="image", help="ProcessImage client operations")
 
 # Tensor server daemon management

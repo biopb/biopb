@@ -17,17 +17,10 @@ A blazing-fast microscopy data server for sharing your lab's petabyte-scale data
 
 ### Quick Start
 ```sh
-# Ports: 8814 (browser), 8815 (data)
-# Dev mode with localhost-only access (no token required)
-docker run --rm \
-  --name tensor-server \
-  -e BIOPB_WEB_DEV_BYPASS=1 \
-  -p 127.0.0.1:8814:8814 \
-  -p 127.0.0.1:8815:8815 \
-  -v ${DIR_YOUR_DATA}:/data \
-  jiyuuchc/biopb-tensor-server:latest
+curl -fsSL https://biopb.org/install.sh | bash
+biopb server start
 ```
-Point your browser to http://localhost:8814
+Point your browser to the url printed in log
 
 ## Biopb-Image
 
