@@ -219,6 +219,62 @@ class TestSafeBuiltins:
 
 
 # -----------------------------------------------------------------------
+# server_status
+# -----------------------------------------------------------------------
+
+
+class TestServerStatus:
+    def test_returns_error_when_no_bridge(self):
+        _server._bridge = None
+        result = _server.server_status()
+        assert "System" in result
+        assert "not initialized" in result
+
+    def test_reports_system_info(self, server_with_bridge):
+        result = _server.server_status()
+        assert "cpu_usage" in result
+        assert "memory_total" in result
+        assert "process_rss" in result
+
+    def test_reports_dask_info(self, server_with_bridge):
+        result = _server.server_status()
+        assert "Dask" in result
+        assert "scheduler" in result
+
+    def test_reports_tensor_server_not_connected(self, server_with_bridge):
+        server_with_bridge.tensor_client = None
+        result = _server.server_status()
+        assert "connected: false" in result
+
+    def test_reports_tensor_server_connected(self, server_with_bridge):
+        mock_client = MagicMock()
+        mock_client.health_check.return_value = "OK"
+        server_with_bridge.tensor_client = mock_client
+        server_with_bridge.tensor_sources = {"a": MagicMock()}
+        result = _server.server_status()
+        assert "connected: true" in result
+        assert "sources_cached: 1" in result
+
+    def test_reports_viewer_layers(self, server_with_bridge):
+        layer = MagicMock()
+        layer.name = "test_layer"
+        layer.data.shape = (256, 256)
+        server_with_bridge.viewer.layers = [layer]
+        result = _server.server_status()
+        assert "layers: 1" in result
+        assert "test_layer" in result
+
+    def test_reports_session_count(self, server_with_bridge, mock_ctx):
+        _server.execute_code("x = 1", mock_ctx)
+        result = _server.server_status()
+        assert "active: 1" in result
+
+    def test_reports_bridge_queue(self, server_with_bridge):
+        result = _server.server_status()
+        assert "pending_commands" in result
+
+
+# -----------------------------------------------------------------------
 # Session-scoped namespaces
 # -----------------------------------------------------------------------
 

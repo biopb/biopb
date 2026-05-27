@@ -10,6 +10,7 @@ GUIDE = """\
 - `take_screenshot(canvas_only=True)` — capture viewer as PNG image
 - `execute_code(python_code)` — run Python with the namespace below
 - `inspect_object(object_path)` — reflect on any object (e.g. "viewer.layers")
+- `server_status()` — system load, memory, dask, tensor server, sessions
 
 ## Namespace (available in execute_code)
 | Name | Type | Description |

@@ -10,6 +10,7 @@ import builtins as _builtins
 import inspect
 import io
 import logging
+import os
 import threading
 import time
 from typing import Dict, Optional
@@ -294,6 +295,125 @@ def inspect_object(object_path: str, ctx: Context) -> str:
         return "\n".join(lines)
 
     return bridge.run_on_gui_thread(_inspect)
+
+
+@mcp.tool()
+def server_status() -> str:
+    """Report server health, system load, and resource usage.
+
+    Returns CPU/memory usage, dask scheduler info, tensor server
+    connectivity, viewer layer count, active sessions, and bridge
+    queue depth.  Use before heavy computation to check capacity.
+    """
+    import psutil
+
+    bridge = _bridge
+
+    # --- system ---
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory()
+    process = psutil.Process(os.getpid())
+    proc_mem = process.memory_info()
+
+    lines = [
+        "## System",
+        f"  cpu_usage: {cpu_percent}%",
+        f"  cpu_count: {os.cpu_count()}",
+        f"  memory_total: {mem.total / (1024 ** 3):.1f} GB",
+        f"  memory_available: {mem.available / (1024 ** 3):.1f} GB",
+        f"  memory_used_percent: {mem.percent}%",
+        f"  process_rss: {proc_mem.rss / (1024 ** 2):.0f} MB",
+    ]
+
+    # --- dask ---
+    sched = dask.config.get("scheduler", default="unknown")
+    lines += [
+        "",
+        "## Dask",
+        f"  scheduler: {sched}",
+    ]
+    try:
+        from distributed import get_client
+
+        client = get_client()
+        info = client.scheduler_info()
+        n_workers = len(info.get("workers", {}))
+        lines.append(f"  distributed_workers: {n_workers}")
+        lines.append(f"  dashboard: {client.dashboard_link}")
+    except Exception:
+        lines.append("  distributed: not active")
+
+    # --- tensor server ---
+    if bridge is not None:
+        tc = bridge.tensor_client
+        if tc is not None:
+            try:
+                health = tc.health_check()
+                lines += [
+                    "",
+                    "## Tensor Server",
+                    f"  connected: true",
+                    f"  health: {health}",
+                    f"  sources_cached: {len(bridge.tensor_sources)}",
+                ]
+            except Exception as exc:
+                lines += [
+                    "",
+                    "## Tensor Server",
+                    f"  connected: true",
+                    f"  health_error: {exc}",
+                ]
+        else:
+            lines += ["", "## Tensor Server", "  connected: false"]
+    else:
+        lines += ["", "## Tensor Server", "  bridge: not initialized"]
+
+    # --- viewer ---
+    if bridge is not None:
+
+        def _viewer_info():
+            v = bridge.viewer
+            n_layers = len(v.layers)
+            layer_summary = []
+            for layer in v.layers:
+                shape = getattr(layer.data, "shape", "?")
+                layer_summary.append(f"{layer.name} ({shape})")
+            return n_layers, layer_summary
+
+        try:
+            n_layers, layer_summary = bridge.run_on_gui_thread(_viewer_info)
+            lines += [
+                "",
+                "## Viewer",
+                f"  layers: {n_layers}",
+            ]
+            for s in layer_summary[:10]:
+                lines.append(f"    - {s}")
+            if n_layers > 10:
+                lines.append(f"    ... and {n_layers - 10} more")
+        except Exception:
+            lines += ["", "## Viewer", "  error: could not query"]
+
+    # --- sessions ---
+    active = len(_sessions._namespaces)
+    lines += [
+        "",
+        "## Sessions",
+        f"  active: {active}",
+        f"  max: {_sessions._max_sessions}",
+        f"  ttl: {_sessions._ttl}s",
+    ]
+
+    # --- bridge queue ---
+    if bridge is not None:
+        qsize = bridge._cmd_queue.qsize()
+        lines += [
+            "",
+            "## Bridge",
+            f"  pending_commands: {qsize}",
+        ]
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
