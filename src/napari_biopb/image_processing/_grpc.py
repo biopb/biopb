@@ -19,9 +19,9 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from napari.qt.threading import thread_worker
 
 from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
-from ._config import load_config
+from .._config import load_config
 from ._render import _adjust_response_offset, _generate_label
-from ._typing import napari_data
+from .._typing import napari_data
 
 logger = logging.getLogger(__name__)
 

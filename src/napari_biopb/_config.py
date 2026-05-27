@@ -48,6 +48,12 @@ DEFAULT_CONFIG = {
         "warn_threshold_mb": 500,  # Log warning if chunk > 500MB
         "error_threshold_mb": 2000,  # Raise MemoryError if chunk > 2GB
     },
+    "mcp": {
+        "port": 8765,
+        "dask_scheduler": "threads",
+        "dask_num_workers": 0,
+        "dask_distributed_address": "",
+    },
 }
 
 

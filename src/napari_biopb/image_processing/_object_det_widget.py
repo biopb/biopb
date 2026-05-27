@@ -5,7 +5,7 @@ import numpy as np
 from magicgui.widgets import ComboBox, create_widget
 
 from .._config import get_grid_params, save_config
-from .._widget_base import _make_full_width, _WidgetBase
+from ._widget_base import _make_full_width, _WidgetBase
 
 if TYPE_CHECKING:
     import napari
@@ -158,7 +158,7 @@ class ObjectDetectionWidget(_WidgetBase):
         save_config(self._config)
 
     def run(self):
-        from .._grpc import CALL_START, grpc_object_detection
+        from ._grpc import CALL_START, grpc_object_detection
 
         self.n_results = 0
 

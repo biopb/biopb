@@ -13,7 +13,7 @@ from magicgui.widgets import (
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QSizePolicy
 
-from ._config import load_config, save_config
+from .._config import load_config, save_config
 
 if TYPE_CHECKING:
     import napari

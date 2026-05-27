@@ -9,6 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
@@ -32,6 +33,7 @@ from qtpy.QtWidgets import (
 )
 
 from .._config import load_config, save_config
+from .._tensor_utils import build_pyramid_levels
 
 if TYPE_CHECKING:
     import napari
@@ -40,9 +42,6 @@ logger = logging.getLogger(__name__)
 
 # Threshold for switching to server-side SQL query
 SERVER_QUERY_THRESHOLD = 1000
-
-# Threshold for building pyramid (x-y dimensions must exceed this)
-PYRAMID_THRESHOLD = 4096
 
 
 # ==============================================================================
@@ -248,90 +247,6 @@ def _filter_empty_metadata(metadata: Dict) -> Dict:
     return filtered
 
 
-def _get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
-    """Get indices of x and y dimensions from tensor descriptor.
-
-    Uses dim_labels as primary source (looks for 'x', 'y').
-    Falls back to last two dimensions if dim_labels not available.
-
-    Returns:
-        Tuple of (y_index, x_index) - y first for row/col convention
-    """
-    ndim = len(tensor_desc.shape)
-
-    if tensor_desc.dim_labels:
-        # Find x and y from dim_labels
-        labels_lower = [l.lower() for l in tensor_desc.dim_labels]
-        try:
-            x_idx = labels_lower.index("x")
-            y_idx = labels_lower.index("y")
-            return (y_idx, x_idx)
-        except ValueError:
-            pass
-
-    # Fall back to last two dimensions (common convention: ...x, y)
-    if ndim >= 2:
-        return (ndim - 1, ndim - 2)  # (y, x)
-
-    return (0, 1) if ndim == 2 else (0, 0)
-
-
-def _build_pyramid_levels(
-    client: TensorFlightClient,
-    source_id: str,
-    tensor_id: str,
-    tensor_desc,
-) -> List:
-    """Build pyramid levels for large x-y datasets.
-
-    Args:
-        client: TensorFlightClient instance
-        source_id: Source identifier
-        tensor_id: Tensor identifier
-        tensor_desc: TensorDescriptor with shape info
-
-    Returns:
-        List of dask arrays at different resolution levels (pyramid)
-    """
-    shape = tensor_desc.shape
-    ndim = len(shape)
-
-    y_idx, x_idx = _get_xy_dim_indices(tensor_desc)
-
-    x_size = shape[x_idx]
-    y_size = shape[y_idx]
-
-    # Check if x-y dimensions exceed threshold
-    if x_size <= PYRAMID_THRESHOLD and y_size <= PYRAMID_THRESHOLD:
-        # No pyramid needed
-        return [client.get_tensor(source_id, tensor_id)]
-
-    # Build pyramid levels: 1x, 2x, 4x, 8x, ... until smallest >= 256
-    levels = []
-    scale = 1
-    min_size = 256
-
-    while True:
-        # Build scale_hint: downsample only x-y dimensions
-        scale_hint = [1] * ndim
-        scale_hint[y_idx] = scale
-        scale_hint[x_idx] = scale
-
-        arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
-        levels.append(arr)
-
-        # Check if we've reached minimum size
-        scaled_x = x_size // scale
-        scaled_y = y_size // scale
-        if scaled_x < min_size or scaled_y < min_size:
-            break
-
-        # Double downsampling for next level
-        scale *= 2
-
-    return levels
-
-
 class MetadataDialog(QDialog):
     """Dialog to display source and tensor metadata."""
 
@@ -411,6 +326,23 @@ class MetadataDialog(QDialog):
         layout.addWidget(close_btn)
 
 
+_DEFAULT_URL = "grpc://localhost:8815"
+
+
+def _resolve_connection(config: dict) -> Tuple[str, Optional[str]]:
+    """Resolve tensor server URL and token.
+
+    Fallback order: environment variables -> config file -> default.
+    """
+    url = (
+        os.environ.get("BIOPB_TENSOR_URL")
+        or config.get("tensor_browser", {}).get("server_url")
+        or _DEFAULT_URL
+    )
+    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
+    return url, token
+
+
 # ==============================================================================
 # Tensor Browser Widget (Pure Qt)
 # ==============================================================================
@@ -432,9 +364,17 @@ class TensorBrowserWidget(QWidget):
         # Load persisted config
         self._config = load_config()
 
+        # Resolve connection params: env -> config -> default
+        self._resolved_url, self._resolved_token = _resolve_connection(
+            self._config
+        )
+
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._setup_ui()
+
+        # Auto-connect on next event loop tick
+        QTimer.singleShot(0, self._auto_connect)
 
     def _setup_ui(self):
         """Build the UI layout."""
@@ -446,10 +386,7 @@ class TensorBrowserWidget(QWidget):
         server_layout = QHBoxLayout()
         server_layout.addWidget(QLabel("Server:"))
         self._server_input = QLineEdit()
-        saved_url = self._config.get("tensor_browser", {}).get(
-            "server_url", "grpc://localhost:8815"
-        )
-        self._server_input.setText(saved_url)
+        self._server_input.setText(self._resolved_url)
         self._server_input.setPlaceholderText("Flight server URL")
         server_layout.addWidget(self._server_input)
         layout.addLayout(server_layout)
@@ -458,6 +395,8 @@ class TensorBrowserWidget(QWidget):
         token_layout = QHBoxLayout()
         token_layout.addWidget(QLabel("Token:"))
         self._token_input = QLineEdit()
+        if self._resolved_token:
+            self._token_input.setText(self._resolved_token)
         self._token_input.setPlaceholderText("optional")
         self._token_input.setEchoMode(QLineEdit.Password)
         self._show_token_btn = QPushButton("Show")
@@ -521,6 +460,13 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setStyleSheet("color: #d32f2f;")
         self._error_label.setVisible(False)
         layout.addWidget(self._error_label)
+
+    def _auto_connect(self):
+        """Attempt to connect using resolved URL/token. Fails silently."""
+        try:
+            self._connect()
+        except Exception:
+            logger.debug("Auto-connect failed", exc_info=True)
 
     def _toggle_token_visibility(self):
         """Toggle token field visibility between password and normal mode."""
@@ -848,7 +794,7 @@ class TensorBrowserWidget(QWidget):
             for tensor in src.tensors:
                 try:
                     # Build pyramid levels if needed
-                    levels = _build_pyramid_levels(
+                    levels = build_pyramid_levels(
                         self._client, source_id, tensor.array_id, tensor
                     )
                     tensor_name = _tensor_short_name(tensor.array_id)
@@ -1019,7 +965,7 @@ class TensorBrowserWidget(QWidget):
             QApplication.setOverrideCursor(Qt.BusyCursor)
 
             # Build pyramid levels if x-y dimensions are large
-            levels = _build_pyramid_levels(
+            levels = build_pyramid_levels(
                 self._client,
                 self._selected_source_id,
                 self._selected_tensor_id,

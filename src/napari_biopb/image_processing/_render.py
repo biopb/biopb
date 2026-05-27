@@ -3,7 +3,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from ._utils import _filter_boxes
+from .._utils import _filter_boxes
 
 
 def _render_meshes(

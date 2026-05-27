@@ -5,7 +5,7 @@ import sys
 import time
 import pytest
 from qtpy.QtCore import QTimer
-from napari_biopb._grpc import CALL_START
+from napari_biopb.image_processing._grpc import CALL_START
 
 
 # Skip on macOS CI due to OpenGL/vispy headless issues
@@ -19,7 +19,7 @@ class TestProgressTimer:
     def test_timer_ticks_when_started(self, qtbot, make_napari_viewer):
         """Timer ticks and updates progress bar value when started."""
         from qtpy.QtWidgets import QApplication
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -62,7 +62,7 @@ class TestProgressTimer:
     def test_on_call_starting_starts_timer(self, qtbot, make_napari_viewer):
         """_on_call_starting() increments pending calls and starts the timer."""
         from qtpy.QtWidgets import QApplication
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -93,7 +93,7 @@ class TestProgressTimer:
 
     def test_on_call_completed_stops_timer(self, qtbot, make_napari_viewer):
         """_on_call_completed() decrements pending calls and stops timer when no pending."""
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -116,7 +116,7 @@ class TestProgressTimer:
 
     def test_timer_parent_is_widget_native(self, qtbot, make_napari_viewer):
         """Timer is parented to the widget's native Qt widget."""
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -126,7 +126,7 @@ class TestProgressTimer:
     def test_progress_uses_scaled_integers(self, qtbot, make_napari_viewer):
         """Progress increments proportionally based on completed/total ratio."""
         from qtpy.QtWidgets import QApplication
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -166,7 +166,7 @@ class TestProgressTimer:
     ):
         """Timer ticks while a thread worker is blocked."""
         from qtpy.QtWidgets import QApplication
-        from napari_biopb._widget_base import _WidgetBase
+        from napari_biopb.image_processing._widget_base import _WidgetBase
         from napari.qt.threading import thread_worker
 
         viewer = make_napari_viewer()

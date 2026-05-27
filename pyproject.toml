@@ -50,6 +50,7 @@ testing = [
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
 ]
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "Pillow"]
 3d = ["vedo"] # 3d rendering from mesh
 
 [project.entry-points."napari.manifest"]

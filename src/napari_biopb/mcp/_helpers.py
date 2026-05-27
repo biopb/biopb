@@ -1,0 +1,101 @@
+"""Helper functions injected into the execute_code namespace.
+
+``load_tensor`` is monkey-patched onto the viewer instance so the agent
+calls ``viewer.load_tensor("source_id")``.
+"""
+
+import logging
+from typing import Optional
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+
+def _get_url_stem(url: str) -> str:
+    """Extract last path component from a URL."""
+    try:
+        parts = [p for p in urlparse(url).path.split("/") if p]
+        return parts[-1] if parts else url
+    except Exception:
+        return url
+
+
+def _tensor_short_name(array_id: str) -> str:
+    parts = [p for p in array_id.split("/") if p]
+    return parts[-1] if parts else array_id
+
+
+def patch_viewer_load_tensor(bridge):
+    """Monkey-patch ``load_tensor`` onto ``bridge.viewer``."""
+
+    def load_tensor(
+        source_id: str,
+        tensor_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> str:
+        """Load a tensor dataset into the viewer.
+
+        Args:
+            source_id: Source identifier on the tensor server.
+            tensor_id: Tensor array_id within the source.  If *None* and the
+                source has exactly one tensor, it is selected automatically.
+            name: Layer name.  Auto-generated from source URL if *None*.
+
+        Returns:
+            The name of the created viewer layer.
+        """
+        from .._tensor_utils import build_pyramid_levels
+
+        client = bridge.tensor_client
+        if client is None:
+            raise RuntimeError(
+                "No tensor server connected. "
+                "Open the Tensor Browser widget and connect first."
+            )
+
+        sources = bridge.tensor_sources
+        src = sources.get(source_id)
+        if src is None:
+            raise ValueError(
+                f"Source '{source_id}' not found. "
+                f"Available: {list(sources.keys())[:20]}"
+            )
+
+        if tensor_id is None:
+            if len(src.tensors) == 1 and src.tensors[0]:
+                tensor_id = src.tensors[0].array_id
+            else:
+                ids = [t.array_id for t in src.tensors]
+                raise ValueError(
+                    f"Source has {len(src.tensors)} tensors — "
+                    f"specify tensor_id. Available: {ids}"
+                )
+
+        tensor_desc = next(
+            (t for t in src.tensors if t.array_id == tensor_id), None
+        )
+        if tensor_desc is None:
+            raise ValueError(
+                f"Tensor '{tensor_id}' not found in source '{source_id}'"
+            )
+
+        levels = build_pyramid_levels(
+            client, source_id, tensor_id, tensor_desc
+        )
+
+        viewer = bridge.viewer
+        if name is None:
+            stem = _get_url_stem(src.source_url) or source_id
+            if len(src.tensors) > 1:
+                name = f"{stem}/{_tensor_short_name(tensor_id)}"
+            else:
+                name = stem
+
+        if len(levels) > 1:
+            viewer.add_image(levels, name=name, multiscale=True)
+        else:
+            viewer.add_image(levels[0], name=name)
+
+        return name
+
+    bridge.viewer.load_tensor = load_tensor
