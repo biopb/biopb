@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import numpy as np
 
 if TYPE_CHECKING:
-    import napari
     import biopb.image as proto
+    import napari
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,9 @@ FULL_ORDER = "TZCYX"
 
 
 class IterationSpec(NamedTuple):
-    iter_dims: set[str]  # Axis names to iterate (e.g., {"T", "Z"}, empty set if no iteration)
+    iter_dims: set[
+        str
+    ]  # Axis names to iterate (e.g., {"T", "Z"}, empty set if no iteration)
     axis_order: str  # Full axis order for serialization (e.g., "TZYXC")
 
 

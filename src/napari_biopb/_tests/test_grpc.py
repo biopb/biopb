@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from napari_biopb._grpc import (
     _encode_image,
+    _estimate_chunk_memory_mb,
+    _check_chunk_memory,
     _get_detection_settings,
     _get_grpc_channel,
     _get_label_filter,
@@ -524,3 +526,120 @@ class TestParseAnnotationTsv:
         tsv = "# Only comments\n# No data"
         result = _parse_annotation_tsv(tsv)
         assert result.empty
+
+
+class TestEstimateChunkMemory:
+    """Tests for _estimate_chunk_memory_mb function."""
+
+    def test_small_chunk(self):
+        """Small chunk estimates correctly."""
+        chunk = np.zeros((100, 100, 3), dtype=np.uint8)
+        mb = _estimate_chunk_memory_mb(chunk)
+        # 100 * 100 * 3 * 1 byte = 30,000 bytes ≈ 0.03 MB
+        assert mb < 0.1
+        assert mb > 0
+
+    def test_medium_chunk(self):
+        """Medium chunk estimates correctly."""
+        chunk = np.zeros((512, 512, 3), dtype=np.uint8)
+        mb = _estimate_chunk_memory_mb(chunk)
+        # 512 * 512 * 3 * 1 byte = 786,432 bytes ≈ 0.75 MB
+        assert mb > 0.5
+        assert mb < 1.0
+
+    def test_large_chunk_float32(self):
+        """Large float32 chunk estimates correctly."""
+        chunk = np.zeros((1024, 1024, 64, 3), dtype=np.float32)
+        mb = _estimate_chunk_memory_mb(chunk)
+        # 1024 * 1024 * 64 * 3 * 4 bytes = 805,306,368 bytes ≈ 768 MB
+        assert mb > 700
+        assert mb < 900
+
+    def test_large_chunk_float64(self):
+        """Large float64 chunk estimates correctly."""
+        chunk = np.zeros((512, 512, 10), dtype=np.float64)
+        mb = _estimate_chunk_memory_mb(chunk)
+        # 512 * 512 * 10 * 8 bytes = 20,971,520 bytes ≈ 20 MB
+        assert mb > 15
+        assert mb < 25
+
+    def test_chunk_without_dtype(self):
+        """Chunk without dtype attribute uses float32 default."""
+        # Create a mock object without dtype
+        mock_chunk = MagicMock()
+        mock_chunk.shape = (1000, 1000, 3)
+        del mock_chunk.dtype  # Remove dtype attribute
+
+        mb = _estimate_chunk_memory_mb(mock_chunk)
+        # Should use float32 default: 1000 * 1000 * 3 * 4 = 12 MB
+        assert mb > 10
+        assert mb < 15
+
+    def test_empty_chunk(self):
+        """Empty chunk returns 0 MB."""
+        mock_chunk = MagicMock()
+        mock_chunk.shape = ()
+        mb = _estimate_chunk_memory_mb(mock_chunk)
+        assert mb == 0.0
+
+
+class TestCheckChunkMemory:
+    """Tests for _check_chunk_memory function."""
+
+    def test_small_chunk_passes(self):
+        """Small chunk passes without error."""
+        chunk = np.zeros((100, 100, 3), dtype=np.uint8)
+        # Should not raise
+        _check_chunk_memory(chunk)
+
+    def test_medium_chunk_passes_with_warning(self):
+        """Medium chunk passes but may log warning."""
+        # Create a chunk larger than warn threshold but under error threshold
+        # Using default config: warn=500MB, error=2000MB
+        chunk = np.zeros((512, 512, 200, 3), dtype=np.float32)
+        # 512 * 512 * 200 * 3 * 4 ≈ 629 MB (over warn threshold)
+        # Should not raise, may log warning (we don't check warning here)
+        _check_chunk_memory(chunk)
+
+    def test_huge_chunk_raises_memory_error(self):
+        """Huge chunk raises MemoryError."""
+        # Mock a chunk that exceeds error threshold
+        mock_chunk = MagicMock()
+        mock_chunk.shape = (4096, 4096, 256, 3)  # Very large
+        mock_chunk.dtype = np.dtype(np.float32)
+        # 4096 * 4096 * 256 * 3 * 4 ≈ 50 GB (way over error threshold)
+
+        with pytest.raises(MemoryError, match="exceeds memory limit"):
+            _check_chunk_memory(mock_chunk)
+
+    @patch("napari_biopb._grpc.load_config")
+    def test_custom_threshold(self, mock_load_config):
+        """Custom thresholds from config are respected."""
+        mock_load_config.return_value = {
+            "memory": {
+                "warn_threshold_mb": 10,
+                "error_threshold_mb": 50,
+            }
+        }
+
+        chunk = np.zeros((1024, 1024, 10), dtype=np.float32)
+        # 1024 * 1024 * 10 * 4 ≈ 40 MB (over warn=10, under error=50)
+
+        # Should not raise, but would warn
+        _check_chunk_memory(chunk)
+
+    @patch("napari_biopb._grpc.load_config")
+    def test_custom_error_threshold_raises(self, mock_load_config):
+        """Custom error threshold from config raises MemoryError."""
+        mock_load_config.return_value = {
+            "memory": {
+                "warn_threshold_mb": 10,
+                "error_threshold_mb": 20,
+            }
+        }
+
+        chunk = np.zeros((1024, 1024, 10), dtype=np.float32)
+        # 1024 * 1024 * 10 * 4 ≈ 40 MB (over error=20)
+
+        with pytest.raises(MemoryError, match="exceeds memory limit"):
+            _check_chunk_memory(chunk)

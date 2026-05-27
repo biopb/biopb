@@ -31,7 +31,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ._config import load_config, save_config
+from .._config import load_config, save_config
 
 if TYPE_CHECKING:
     import napari

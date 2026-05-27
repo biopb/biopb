@@ -19,7 +19,6 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from napari.qt.threading import thread_worker
 
 from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
-
 from ._config import load_config
 from ._render import _adjust_response_offset, _generate_label
 from ._typing import napari_data
@@ -38,6 +37,63 @@ _URL_PATTERN = re.compile(
 _HOST_PORT_PATTERN = re.compile(
     r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?:(\d+)$"
 )
+
+
+def _estimate_chunk_memory_mb(chunk) -> float:
+    """Estimate memory size in MB for a chunk before numpy conversion.
+
+    Args:
+        chunk: Array-like object (dask, zarr, numpy slice view, or numpy array)
+
+    Returns:
+        Estimated memory in MB for the chunk when converted to numpy array.
+    """
+    # Get dtype from chunk, default to float32 (4 bytes) for unknown types
+    dtype = getattr(chunk, "dtype", np.dtype("float32"))
+
+    # Get shape from chunk
+    shape = getattr(chunk, "shape", ())
+    if not shape:
+        return 0.0
+
+    # Calculate element count
+    n_elements = np.prod(shape)
+
+    # Memory = elements * bytes per element
+    bytes_per_element = dtype.itemsize
+    total_bytes = n_elements * bytes_per_element
+
+    return total_bytes / (1024 * 1024)  # Convert to MB
+
+
+def _check_chunk_memory(chunk) -> None:
+    """Check chunk memory size and warn/error if too large.
+
+    Args:
+        chunk: Array-like object to check
+
+    Raises:
+        MemoryError: If chunk size exceeds error_threshold_mb from config
+    """
+    config = load_config()
+    memory_config = config.get("memory", {})
+    warn_mb = memory_config.get("warn_threshold_mb", 500)
+    error_mb = memory_config.get("error_threshold_mb", 2000)
+
+    estimated_mb = _estimate_chunk_memory_mb(chunk)
+
+    if estimated_mb > error_mb:
+        raise MemoryError(
+            f"Chunk size ({estimated_mb:.1f}MB) exceeds memory limit ({error_mb}MB). "
+            "Reduce grid size or increase stride in config to process smaller chunks."
+        )
+
+    if estimated_mb > warn_mb:
+        logger.warning(
+            "Large chunk detected: %.1fMB (threshold: %dMB). Processing may be slow.",
+            estimated_mb,
+            warn_mb,
+        )
 
 
 def _parse_server_url(
@@ -405,7 +461,12 @@ def grpc_object_detection(
 
                 logger.debug("Processing patch %s", grid)
 
-                patch = np.array(image.__getitem__(grid))
+                patch_slice = image.__getitem__(grid)
+
+                # Check memory before numpy conversion
+                _check_chunk_memory(patch_slice)
+
+                patch = np.array(patch_slice)
 
                 request = _object_detection_build_request(patch, settings)
 
@@ -592,6 +653,9 @@ def grpc_process_image(
                     for f in futures:
                         f.cancel()
                     return
+
+                # Check memory before numpy conversion
+                _check_chunk_memory(chunk)
 
                 chunk = np.array(chunk)
 

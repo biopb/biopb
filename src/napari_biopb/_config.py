@@ -44,6 +44,10 @@ DEFAULT_CONFIG = {
         "max_message_size_mb": 512,
         "max_concurrent_calls": 4,
     },
+    "memory": {
+        "warn_threshold_mb": 500,  # Log warning if chunk > 500MB
+        "error_threshold_mb": 2000,  # Raise MemoryError if chunk > 2GB
+    },
 }
 
 

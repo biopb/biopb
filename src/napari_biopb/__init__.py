@@ -7,9 +7,9 @@ except ImportError:
 except Exception:
     __version__ = "unknown"
 
-from ._object_detection import ObjectDetectionWidget
-from ._image_processing import ImageProcessingWidget
-from ._tensor_browser import TensorBrowserWidget
+from .image_processing import ImageProcessingWidget
+from .object_detection import ObjectDetectionWidget
+from .tensor_browser import TensorBrowserWidget
 
 __all__ = (
     "ObjectDetectionWidget",

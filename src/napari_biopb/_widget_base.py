@@ -10,7 +10,6 @@ from magicgui.widgets import (
     ProgressBar,
     create_widget,
 )
-from napari.qt.threading import thread_worker
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QSizePolicy
 

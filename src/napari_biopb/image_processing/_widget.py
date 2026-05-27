@@ -11,18 +11,17 @@ from magicgui.widgets import (
     LineEdit,
     SpinBox,
 )
+from napari.qt.threading import thread_worker
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QSizePolicy
-from napari.qt.threading import thread_worker
 
-from ._chunking import (
-    FULL_ORDER,
+from .._chunking import (
     ResultBuilder,
     _get_axis_mapping,
     _get_iter_spec,
     _validate_data_shape,
 )
-from ._widget_base import _PersistentComboBox, _WidgetBase, _make_full_width
+from .._widget_base import _make_full_width, _PersistentComboBox, _WidgetBase
 
 if TYPE_CHECKING:
     import napari
@@ -116,7 +115,7 @@ class ImageProcessingWidget(_WidgetBase):
 
     def _fetch_ops(self):
         """Fetch available operations from server asynchronously."""
-        from ._grpc import get_op_names, _get_label_filter
+        from .._grpc import get_op_names, _get_label_filter
 
         self._ops_status.value = "Ops: Fetching..."
         self._op_selector.visible = False
@@ -277,7 +276,7 @@ class ImageProcessingWidget(_WidgetBase):
         return widget
 
     def run(self):
-        from ._grpc import CALL_START, grpc_process_image
+        from .._grpc import CALL_START, grpc_process_image
 
         settings = self._snapshot()
         image_layer = settings["Image"]

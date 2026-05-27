@@ -1,6 +1,7 @@
+from typing import Tuple
+
 import cv2
 import numpy as np
-from typing import Tuple
 
 from ._utils import _filter_boxes
 
@@ -18,7 +19,12 @@ def _render_meshes(
     Returns:
         label array with rendered meshes
     """
-    from vedo import Mesh
+    try:
+        from vedo import Mesh
+    except ImportError:
+        raise ImportError(
+            "vedo is required for 3D mesh rendering. Please install with `pip install napari-biopb[3d]`"
+        ) from None
 
     if post_process:
         bboxes = []

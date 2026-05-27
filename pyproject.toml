@@ -30,11 +30,10 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
-    "biopb[tensor] >= 0.5.0",
+    "biopb[tensor] >= 0.5.1",
     "opencv-python-headless",
     "grpcio_tools",
     "grpcio-health-checking",
-    "vedo",
     "platformdirs",
 ]
 
@@ -51,6 +50,7 @@ testing = [
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
 ]
+3d = ["vedo"] # 3d rendering from mesh
 
 [project.entry-points."napari.manifest"]
 napari-biopb = "napari_biopb:napari.yaml"
