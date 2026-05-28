@@ -337,8 +337,14 @@ class _WidgetBase(Container):
         self._total_calls = 0
 
     def _save_config(self):
-        """Save current widget settings to config file."""
+        """Save current widget settings to config file.
+
+        Reloads from disk first so keys this widget does not own (e.g.
+        mcp.process_image_servers) are not clobbered by a stale snapshot.
+        """
         settings = self._snapshot()
-        self._config["server"]["url"] = settings["Server"]
-        self._config["3D"] = settings["3D"]
-        save_config(self._config)
+        config = load_config()
+        config["server"]["url"] = settings["Server"]
+        config["3D"] = settings["3D"]
+        save_config(config)
+        self._config = config

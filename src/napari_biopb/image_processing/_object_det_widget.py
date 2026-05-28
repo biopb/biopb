@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import numpy as np
 from magicgui.widgets import ComboBox, create_widget
 
-from .._config import get_grid_params, save_config
+from .._config import get_grid_params, load_config, save_config
 from ._widget_base import _make_full_width, _WidgetBase
 
 if TYPE_CHECKING:
@@ -145,17 +145,21 @@ class ObjectDetectionWidget(_WidgetBase):
         return grids
 
     def _save_config(self):
-        """Save current widget settings to config file."""
+        """Save current widget settings to config file.
+
+        Reloads from disk first so keys this widget does not own (e.g.
+        mcp.process_image_servers) are not clobbered by a stale snapshot.
+        """
         settings = self._snapshot()
-        self._config["server"]["url"] = settings["Server"]
-        self._config["3D"] = settings["3D"]
-        self._config["detection"]["min_score"] = settings["Min Score"]
-        self._config["detection"]["size_hint"] = settings["Size Hint"]
-        self._config["detection"]["nms"] = settings["NMS"]
-        self._config["detection"]["z_aspect_ratio"] = settings[
-            "Z Aspect Ratio"
-        ]
-        save_config(self._config)
+        config = load_config()
+        config["server"]["url"] = settings["Server"]
+        config["3D"] = settings["3D"]
+        config["detection"]["min_score"] = settings["Min Score"]
+        config["detection"]["size_hint"] = settings["Size Hint"]
+        config["detection"]["nms"] = settings["NMS"]
+        config["detection"]["z_aspect_ratio"] = settings["Z Aspect Ratio"]
+        save_config(config)
+        self._config = config
 
     def run(self):
         from ._grpc import CALL_START, grpc_object_detection

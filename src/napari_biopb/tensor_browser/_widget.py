@@ -488,12 +488,18 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setText("")
 
     def _save_config(self):
-        """Save current server URL to config file."""
-        self._config["tensor_browser"] = self._config.get("tensor_browser", {})
-        self._config["tensor_browser"][
+        """Save current server URL to config file.
+
+        Reloads from disk first so keys this widget does not own (e.g.
+        mcp.process_image_servers) are not clobbered by a stale snapshot.
+        """
+        config = load_config()
+        config.setdefault("tensor_browser", {})
+        config["tensor_browser"][
             "server_url"
         ] = self._server_input.text().strip()
-        save_config(self._config)
+        save_config(config)
+        self._config = config
 
     def _connect(self):
         """Connect to server and list available sources."""
