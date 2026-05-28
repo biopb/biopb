@@ -277,7 +277,18 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     prevLoadedRegionRef.current = null;
     currentImageUrlRef.current = null;
     currentLoadedRegionRef.current = null;
-    prevSliceRef.current = { ...prevSliceRef.current, t: -1 };
+    // Sync prevSliceRef so the slice-change effect doesn't misfire on loadedRegion change
+    const s = useAppStore.getState();
+    prevSliceRef.current = {
+      t: s.slice.t, z: s.slice.z, c: s.slice.c,
+      reductionMethod: s.slice.reductionMethod,
+      useMinMax: s.slice.useMinMax,
+      percentileScale: s.slice.percentileScale,
+      color: s.getChannelColor(sourceId, s.slice.c),
+      currentChannelName: s.channelNames[sourceId]?.[s.slice.c] ?? undefined,
+      percentileLo: s.slice.useMinMax ? 0 : s.slice.percentileScale / 100,
+      percentileHi: s.slice.useMinMax ? 1 : 1 - s.slice.percentileScale / 100,
+    };
   }, [sourceId, tensorId]);
 
   // Initialize viewport and request initial render when descriptor changes
@@ -298,12 +309,22 @@ export function ImageViewer({ sourceId, tensorId }: ImageViewerProps) {
     setViewportState(initial);
     viewportStateRef.current = initial;
 
-    // Request initial render (full tensor)
-    requestRender(
-      { y: [0, fullHeight], x: [0, fullWidth] },
-      desc.shape.map(() => 1),
+    const viewportW = Math.max(1, Math.floor(wrapper.clientWidth * window.devicePixelRatio));
+    const viewportH = Math.max(1, Math.floor(wrapper.clientHeight * window.devicePixelRatio));
+    const scaleResult = computeScaleFactors(
+      desc.shape, axisMapRef.current, viewportW, viewportH, 1_000_000, initial.scale,
     );
+
+    requestRender({ y: [0, fullHeight], x: [0, fullWidth] }, scaleResult.factors);
   }, [descriptor, fullWidth, fullHeight, requestRender]);
+
+  // Keep prevSliceRef.currentChannelName in sync so the slice-change effect below doesn't
+  // misfire when channel names load asynchronously after the initial render. This effect
+  // runs first (effects run in declaration order), so by the time the slice-change effect
+  // evaluates, prev.currentChannelName already matches.
+  useEffect(() => {
+    prevSliceRef.current.currentChannelName = currentChannelName;
+  }, [currentChannelName]);
 
   // Detect slice changes and request render - compare with previous values
   useEffect(() => {
