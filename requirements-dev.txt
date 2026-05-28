@@ -1,3 +1,0 @@
-# Override biopb to use local development version
--e ../biopb[tensor]
--e .[testing]
