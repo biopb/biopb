@@ -538,6 +538,7 @@ class TensorBrowserWidget(QWidget):
             self._show_error("Connection failed")
             logger.exception("Failed to connect to TensorFlight server")
             self._tree_widget.clear()
+            self._client = None
             self._sources = {}
             self._refresh_button.setEnabled(False)
 

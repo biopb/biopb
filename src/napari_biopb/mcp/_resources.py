@@ -10,40 +10,54 @@ GUIDE = """\
 - `take_screenshot(canvas_only=True)` — capture viewer as PNG image
 - `execute_code(python_code)` — run Python with the namespace below
 - `inspect_object(object_path)` — reflect on any object (e.g. "viewer.layers")
-- `server_status()` — system load, memory, dask, tensor server, sessions
+- `server_status()` — system load, memory, dask, tensor server, kernel state
+- `interrupt_kernel()` — SIGINT the running execution (best-effort stop)
+- `restart_kernel()` — kill + respawn the kernel (guaranteed stop; rebuilds viewer)
 
 ## Namespace (available in execute_code)
 | Name | Type | Description |
 |------|------|-------------|
-| `sources` | dict | Cached {source_id: DataSourceDescriptor} data catalog |
-| `client` | TensorFlightClient or None | Client instance (None if not connected to data server) for retrieving catalog data |
+| `client` | TensorFlightClient or None | Client instance (None if not connected to data server) for browsing/retrieving catalog data |
 | `viewer` | napari.Viewer | The active viewer instance that user sees |
 | `np` | module | numpy |
 | `da` | module | dask.array |
 
-## Threading & dask
-Code runs on the Qt main thread, with a preconfigured dask scheduler for background computation.
-Avoid long-running non-dask operations to prevent UI blocking.
+Browse the catalog through `client` — `client.query_sources(sql)` (server-side
+DuckDB, complete) or `client.list_sources()` (capped by the server for large
+catalogs).
 
-Data from `TensorFlightClient` is always returned as thread-safe, serializable
-dask arrays — safe to use with any scheduler including distributed clusters.
-Prefer lazy dask operations and only `.compute()` the final result. If compute final results would
-OOM, directly upload array to server with `client.upload_array()` with a ephemeral destination (e.g.
-`"cache:my_result"`), instead of running `arr.compute()`.
+## Execution environment
+Code runs in a child Jupyter kernel (a real IPython kernel) with napari
+integrated via `%gui qt`. Imports are allowed and variables persist across
+`execute_code` calls until the kernel is restarted.
+
+* The viewer is a live desktop window; mutations show up immediately.
+* Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
+* Prefer lazy dask operations and only `.compute()` the final result.
+* If computing the final result would OOM, upload directly to the server with
+  `client.upload_array()` instead of `arr.compute()`.
+
+## Stopping runaway code
+* `interrupt_kernel()` sends SIGINT — it frees pure-Python loops, but blocking
+  C calls (gRPC tensor fetches, native dask compute) ignore it.
+* `restart_kernel()` is the guaranteed stop: it kills the kernel process group
+  and respawns a fresh kernel + viewer. All previously defined variables are
+  lost. A long execution returns a `timeout` message after `execute_timeout`
+  seconds and is auto-interrupted.
 
 ## Domain Guides
 Read these resources for detailed operations:
 - `napari://tensor` — dataset access and upload
 - `napari://viewer` — layers, camera, dims, display
-- `napari://annotations` — points, shapes, labels
+- `napari://annotations` — segmentations, points, shapes, labels
 
 ## Quick Examples
 ```python
-# List layers
-print([(l.name, type(l).__name__, l.data.shape) for l in viewer.layers])
+# Check what data is on the viewer
+print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers])
 
-# Load a tensor dataset (connect in Tensor Browser widget first)
-viewer.load_tensor("my_source_id")
+# Get data from the catalog
+np_arr = client.get_tensor("my_source_id").compute()
 
 # Take action then screenshot to verify
 viewer.dims.ndisplay = 3
@@ -57,7 +71,7 @@ arr = client.get_tensor("raw_data_id")
 # 2. Process
 mask_arr = arr > 0.5
 
-# 3. Upload for next step. Will call compute chunk by chunk under the hood.
+# 3. Upload Will call compute() chunk by chunk under the hood.
 source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
 # 4. Display in viewer for user inspection and approval before next step
@@ -80,7 +94,8 @@ layer = viewer.layers["image_name"]
 # Remove layer
 viewer.layers.remove(viewer.layers["name"])
 
-# Load data from catalog to viewer; auto-handles pyramid for large images
+# Load data to viewer; auto-handles pyramid. Accepts any source_id, including
+# those beyond the list_sources() cap (fetched from the server on demand).
 layer_name = viewer.load_tensor(source_id="source_id", tensor_id=None, name=None)
 
 # Layer properties
@@ -118,19 +133,32 @@ else:
 ```
 
 ## Browse Sources
+For large catalogs the server caps `list_sources()`, so prefer the SQL query
+to discover source_ids; there is no pre-built `sources` dict in the namespace.
 ```python
-# List all sources
-for sid, src in sources.items():
+# Preferred: server-side DuckDB query (complete, not truncated).
+# The sources table has columns: source_id, source_url, source_type, metadata_json
+arrow_table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+print(arrow_table.to_pandas())
+
+# Convenience listing (NOTE: capped by the server for large catalogs)
+for sid, src in client.list_sources().items():
     tensors = [(t.array_id, list(t.shape), t.dtype) for t in src.tensors]
     print(f"{sid}: {src.source_url} ({src.source_type}) tensors={tensors}")
 
-# Detailed metadata (OME_JSON)
+# Detailed metadata (OME_JSON) for one source
 meta = client.get_source_metadata("source_id")
 print(meta)
+```
 
-# Query metadata with DuckDB SQL. The sources table has columns: source_id, source_url, source_type, metadata_json
-arrow_table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
-print(arrow_table.to_pandas())
+## Load into Viewer
+```python
+# Auto-handles the multiscale pyramid for large images.
+layer_name = viewer.load_tensor("source_id")                   # single-tensor source
+layer_name = viewer.load_tensor("source_id", tensor_id="t1")   # multi-tensor source
+
+# Or get a lazy dask array directly, without adding a layer:
+arr = client.get_tensor("source_id", tensor_id=None)           # tensor_id optional if single
 ```
 
 ## Upload to Server

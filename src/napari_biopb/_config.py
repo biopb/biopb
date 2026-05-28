@@ -53,8 +53,10 @@ DEFAULT_CONFIG = {
         "dask_scheduler": "threads",
         "dask_num_workers": 0,
         "dask_distributed_address": "",
-        "max_sessions": 16,
-        "session_ttl_seconds": 3600,
+        "kernel_name": "python3",
+        "kernel_startup_timeout": 60.0,
+        "execute_timeout": 120.0,
+        "busy_lock_timeout": 5.0,
     },
 }
 

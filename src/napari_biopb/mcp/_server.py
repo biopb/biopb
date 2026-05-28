@@ -1,129 +1,148 @@
-"""FastMCP server with 3 tools and 4 resources for napari-biopb.
+"""FastMCP server exposing the napari viewer through a child Jupyter kernel.
 
-The server runs on a daemon thread via uvicorn, serving streamable-http
-on 127.0.0.1:<port>/mcp. All viewer mutations are dispatched through the
-ThreadBridge so they execute on the Qt main thread.
+The server runs in the foreground (uvicorn, streamable-http on
+127.0.0.1:<port>/mcp) and owns a :class:`~napari_biopb.mcp._kernel.KernelHost`.
+Every tool call is a round-trip into that kernel, where the napari viewer,
+dask, and the TensorFlightClient live.  The kernel can be interrupted or
+hard-restarted independently of this process.
 """
 
-import base64
-import builtins as _builtins
-import inspect
-import io
 import logging
 import os
-import threading
-import time
-from typing import Dict, Optional
+from typing import Optional
 
-import dask
-import dask.array as da
-import numpy as np
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from . import _resources
-from ._bridge import ThreadBridge
-from ._helpers import patch_viewer_load_tensor
+from ._kernel import KernelHost
 
 logger = logging.getLogger(__name__)
 
-_SAFE_BUILTINS = {
-    "print": print,
-    "len": len,
-    "range": range,
-    "list": list,
-    "dict": dict,
-    "tuple": tuple,
-    "set": set,
-    "zip": zip,
-    "enumerate": enumerate,
-    "sorted": sorted,
-    "min": min,
-    "max": max,
-    "sum": sum,
-    "abs": abs,
-    "round": round,
-    "isinstance": isinstance,
-    "type": type,
-    "str": str,
-    "int": int,
-    "float": float,
-    "bool": bool,
-    "slice": slice,
-    "getattr": getattr,
-    "setattr": setattr,
-    "hasattr": hasattr,
-    "dir": dir,
-    "repr": repr,
-    "True": True,
-    "False": False,
-    "None": None,
-}
-
-
-class _SessionStore:
-    """Per-session namespace store with TTL and max-cap GC."""
-
-    def __init__(self, max_sessions: int = 16, ttl_seconds: float = 3600):
-        self._namespaces: Dict[str, dict] = {}
-        self._last_access: Dict[str, float] = {}
-        self._max_sessions = max_sessions
-        self._ttl = ttl_seconds
-
-    def get_or_create(self, session_key: str, bridge: ThreadBridge) -> dict:
-        self._gc()
-        ns = self._namespaces.get(session_key)
-        if ns is None:
-            ns = {
-                "viewer": bridge.viewer,
-                "np": np,
-                "da": da,
-            }
-            self._namespaces[session_key] = ns
-            logger.debug("Created namespace for session %s", session_key)
-            self._enforce_cap()
-        ns["client"] = bridge.tensor_client
-        ns["sources"] = bridge.tensor_sources
-        self._last_access[session_key] = time.monotonic()
-        return ns
-
-    def _gc(self):
-        now = time.monotonic()
-        expired = [
-            k for k, t in self._last_access.items() if now - t > self._ttl
-        ]
-        for k in expired:
-            self._namespaces.pop(k, None)
-            self._last_access.pop(k, None)
-            logger.debug("GC: expired session %s", k)
-        self._enforce_cap()
-
-    def _enforce_cap(self):
-        while len(self._namespaces) > self._max_sessions:
-            oldest = min(self._last_access, key=self._last_access.get)
-            self._namespaces.pop(oldest, None)
-            self._last_access.pop(oldest, None)
-            logger.debug("GC: evicted oldest session %s", oldest)
-
-    def clear(self):
-        self._namespaces.clear()
-        self._last_access.clear()
-
-
-_bridge: Optional[ThreadBridge] = None
-_server_thread: Optional[threading.Thread] = None
-_sessions = _SessionStore()
+_kernel_host: Optional[KernelHost] = None
 
 mcp = FastMCP("napari-biopb")
 
+# Prepended to every execute_code call so client tracks the
+# asynchronously-connecting Tensor Browser widget.
+_REFRESH_PREFIX = "client = _tbw._client\n"
 
-def _configure_sessions(mcp_config: dict):
-    """Apply session GC settings from config."""
-    global _sessions
-    _sessions = _SessionStore(
-        max_sessions=mcp_config.get("max_sessions", 16),
-        ttl_seconds=mcp_config.get("session_ttl_seconds", 3600),
-    )
+_PNG_DELIM = "<<PNG_B64>>"
+
+_SCREENSHOT_SNIPPET = (
+    "import base64 as _b64, cv2 as _cv2\n"
+    "_arr = viewer.screenshot(canvas_only={canvas_only})\n"
+    "_bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
+    "_ok, _buf = _cv2.imencode('.png', _bgra)\n"
+    "print('" + _PNG_DELIM + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
+)
+
+# Self-contained inspection snippet.  Built by string concatenation (no
+# f-strings/format) so the object path is the only injected value.
+_INSPECT_TEMPLATE = """
+import inspect as _inspect
+__path = __PATH__
+try:
+    __obj = eval(__path)
+except Exception as __exc:
+    print("Error resolving " + repr(__path) + ": " + str(__exc))
+else:
+    __lines = [
+        "Type: " + type(__obj).__name__,
+        "Docstring: " + (_inspect.getdoc(__obj) or "No documentation."),
+        "",
+        "Attributes:",
+    ]
+    for __name in sorted(dir(__obj)):
+        if __name.startswith("_"):
+            continue
+        try:
+            __attr = getattr(__obj, __name)
+        except Exception:
+            continue
+        if _inspect.ismethod(__attr) or _inspect.isfunction(__attr):
+            try:
+                __sig = str(_inspect.signature(__attr))
+                __short = (_inspect.getdoc(__attr) or "").split(chr(10))[0]
+                __lines.append("  ." + __name + __sig + "  -- " + __short)
+            except (ValueError, TypeError):
+                __lines.append("  ." + __name + "(...)")
+        else:
+            __lines.append("  ." + __name + " [" + type(__attr).__name__ + "]")
+    print(chr(10).join(__lines))
+"""
+
+_STATUS_SNIPPET = """
+print("## Dask")
+try:
+    import dask as _dask
+    print("  scheduler: " + str(_dask.config.get("scheduler", default="unknown")))
+except Exception as _e:
+    print("  error: " + str(_e))
+try:
+    if _dask_client is not None:
+        _info = _dask_client.scheduler_info()
+        print("  distributed_workers: " + str(len(_info.get("workers", {}))))
+        print("  dashboard: " + str(_dask_client.dashboard_link))
+    else:
+        print("  distributed: not active")
+except Exception:
+    print("  distributed: not active")
+
+print("")
+print("## Tensor Server")
+_tc = _tbw._client
+if _tc is not None:
+    try:
+        print("  connected: true")
+        print("  health: " + str(_tc.health_check()))
+        print("  sources_cached: " + str(len(_tbw._sources or {})))
+    except Exception as _e:
+        print("  connected: true")
+        print("  health_error: " + str(_e))
+else:
+    print("  connected: false")
+
+print("")
+print("## Viewer")
+print("  layers: " + str(len(viewer.layers)))
+for _layer in list(viewer.layers)[:10]:
+    _shape = getattr(_layer.data, "shape", "?")
+    print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+"""
+
+
+def set_kernel_host(host: KernelHost):
+    """Register the kernel host the tools dispatch to."""
+    global _kernel_host
+    _kernel_host = host
+
+
+def _format_execute_result(res: dict) -> str:
+    status = res.get("status")
+    stdout = res.get("stdout", "")
+    result_text = res.get("result_text", "")
+    error_text = res.get("error_text", "")
+
+    if status == "ok":
+        out = stdout
+        if result_text:
+            out += result_text
+        return out or "(no output)"
+
+    parts = []
+    if stdout:
+        parts.append(stdout)
+    if error_text:
+        parts.append(error_text)
+    return "\n".join(parts) if parts else f"(status: {status})"
+
+
+def _extract_delimited(text: str, delimiter: str) -> Optional[str]:
+    for line in text.splitlines():
+        if line.startswith(delimiter):
+            return line[len(delimiter) :]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +179,6 @@ def get_annotations_guide() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _session_key(ctx: Context) -> str:
-    """Derive a stable key for the MCP session."""
-    return str(id(ctx.session))
-
-
 @mcp.tool()
 def take_screenshot(canvas_only: bool = True) -> list:
     """Capture the napari viewer as a PNG image.
@@ -175,141 +189,107 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
-    bridge = _bridge
-    if bridge is None:
-        return [TextContent(type="text", text="MCP bridge not initialized")]
+    host = _kernel_host
+    if host is None:
+        return [TextContent(type="text", text="Kernel host not initialized")]
 
-    import cv2
-
-    def _capture(canvas_only=canvas_only):
-        return bridge.viewer.screenshot(canvas_only=canvas_only)
-
-    arr = bridge.run_on_gui_thread(_capture)
-
-    # napari returns RGBA; cv2.imencode expects BGR(A)
-    arr_bgra = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
-    ok, buf = cv2.imencode(".png", arr_bgra)
-    data = base64.b64encode(buf.tobytes()).decode()
-
+    snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
+    res = host.execute(snippet)
+    data = _extract_delimited(res.get("stdout", ""), _PNG_DELIM)
+    if data is None:
+        detail = (
+            res.get("error_text") or res.get("stdout") or res.get("status")
+        )
+        return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
     return [ImageContent(type="image", mimeType="image/png", data=data)]
 
 
 @mcp.tool()
-def execute_code(python_code: str, ctx: Context) -> str:
-    """Execute Python code in the napari namespace.
+def execute_code(python_code: str) -> str:
+    """Execute Python code in the napari kernel.
 
-    The namespace includes: viewer (with load_tensor method), np, da,
-    client, sources. Use print() to produce output. The last expression's
-    repr is appended if it is not None.
+    The kernel is a full Jupyter/IPython kernel (imports allowed) with the
+    namespace: viewer (with a load_tensor method), np, da, client, sources.
+    Use print() to produce output; the last expression's repr is also
+    returned. Variables persist across calls until the kernel is restarted.
 
-    Variables you define persist across calls within the same session.
-
-    Read the napari://guide resource for details on available objects and
-    helpers.  Read napari://viewer, napari://tensor, or napari://annotations
-    for domain-specific patterns.
+    Long or runaway executions can be stopped with interrupt_kernel (SIGINT,
+    best-effort) or restart_kernel (guaranteed). Read napari://guide for the
+    namespace details, and napari://viewer / napari://tensor /
+    napari://annotations for domain-specific patterns.
     """
-    bridge = _bridge
-    if bridge is None:
-        return "Error: MCP bridge not initialized"
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
 
-    skey = _session_key(ctx)
-
-    def _exec(code=python_code):
-        captured = io.StringIO()
-        namespace = _sessions.get_or_create(skey, bridge)
-        namespace["__builtins__"] = {
-            **_SAFE_BUILTINS,
-            "print": lambda *a, **kw: _builtins.print(
-                *a, **{**kw, "file": captured}
-            ),
-        }
-        try:
-            try:
-                result = eval(code, namespace)
-                output = captured.getvalue()
-                if result is not None:
-                    output += repr(result)
-                return output or "(no output)"
-            except SyntaxError:
-                pass
-
-            exec(code, namespace)
-            output = captured.getvalue()
-            return output or "(no output)"
-        except Exception as exc:
-            output = captured.getvalue()
-            return f"{output}Error: {exc}"
-
-    return bridge.run_on_gui_thread(_exec)
+    res = host.execute(_REFRESH_PREFIX + python_code)
+    return _format_execute_result(res)
 
 
 @mcp.tool()
-def inspect_object(object_path: str, ctx: Context) -> str:
-    """Inspect a live object in the napari namespace.
+def inspect_object(object_path: str) -> str:
+    """Inspect a live object in the napari kernel namespace.
 
     Returns the type, docstring, and public methods/attributes.
-    Can inspect user-defined variables from the same session.
     Example: inspect_object("viewer.layers") or inspect_object("viewer.camera")
     """
-    bridge = _bridge
-    if bridge is None:
-        return "Error: MCP bridge not initialized"
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
 
-    skey = _session_key(ctx)
+    snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
+    res = host.execute(snippet)
+    if res.get("status") == "ok":
+        return res.get("stdout", "").rstrip() or "(no output)"
+    return res.get("error_text") or f"(status: {res.get('status')})"
 
-    def _inspect(path=object_path):
-        namespace = _sessions.get_or_create(skey, bridge)
-        safe_globals = {"__builtins__": {}}
-        try:
-            obj = eval(path, safe_globals, namespace)
-        except Exception as exc:
-            return f"Error resolving '{path}': {exc}"
 
-        obj_type = type(obj).__name__
-        obj_doc = inspect.getdoc(obj) or "No documentation."
+@mcp.tool()
+def interrupt_kernel() -> str:
+    """Interrupt the current kernel execution by sending SIGINT.
 
-        lines = [
-            f"Type: {obj_type}",
-            f"Docstring: {obj_doc}",
-            "",
-            "Attributes:",
-        ]
+    Best-effort: pure-Python loops stop with KeyboardInterrupt, but blocking
+    C-level calls (gRPC tensor fetches, native dask compute) ignore SIGINT.
+    If the kernel stays unresponsive, use restart_kernel — the guaranteed stop.
+    """
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
+    host.interrupt()
+    return "Interrupt signal (SIGINT) sent to kernel."
 
-        for name in sorted(dir(obj)):
-            if name.startswith("_"):
-                continue
-            try:
-                attr = getattr(obj, name)
-            except Exception:
-                continue
-            if inspect.ismethod(attr) or inspect.isfunction(attr):
-                try:
-                    sig = inspect.signature(attr)
-                    short_doc = (inspect.getdoc(attr) or "").split("\n")[0]
-                    lines.append(f"  .{name}{sig}  -- {short_doc}")
-                except (ValueError, TypeError):
-                    lines.append(f"  .{name}(...)")
-            else:
-                lines.append(f"  .{name} [{type(attr).__name__}]")
 
-        return "\n".join(lines)
+@mcp.tool()
+def restart_kernel() -> str:
+    """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
-    return bridge.run_on_gui_thread(_inspect)
+    Kills the kernel process group (reaping any dask child processes) and
+    respawns a fresh kernel, rebuilding the napari viewer and tensor client.
+    All variables defined in previous execute_code calls are lost, and a new
+    desktop viewer window replaces the old one.
+    """
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
+    try:
+        host.restart()
+    except Exception as exc:
+        return f"Kernel restart failed: {exc}"
+    return "Kernel restarted. Viewer rebuilt; previous variables are gone."
 
 
 @mcp.tool()
 def server_status() -> str:
     """Report server health, system load, and resource usage.
 
-    Returns CPU/memory usage, dask scheduler info, tensor server
-    connectivity, viewer layer count, active sessions, and bridge
-    queue depth.  Use before heavy computation to check capacity.
+    Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
+    queried from the kernel — dask scheduler info, tensor server
+    connectivity, and viewer layer count. Use before heavy computation.
     """
     import psutil
 
-    bridge = _bridge
+    host = _kernel_host
 
-    # --- system ---
     cpu_percent = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
     process = psutil.Process(os.getpid())
@@ -323,95 +303,29 @@ def server_status() -> str:
         f"  memory_available: {mem.available / (1024 ** 3):.1f} GB",
         f"  memory_used_percent: {mem.percent}%",
         f"  process_rss: {proc_mem.rss / (1024 ** 2):.0f} MB",
-    ]
-
-    # --- dask ---
-    sched = dask.config.get("scheduler", default="unknown")
-    lines += [
         "",
-        "## Dask",
-        f"  scheduler: {sched}",
+        "## Kernel",
     ]
-    try:
-        from distributed import get_client
 
-        client = get_client()
-        info = client.scheduler_info()
-        n_workers = len(info.get("workers", {}))
-        lines.append(f"  distributed_workers: {n_workers}")
-        lines.append(f"  dashboard: {client.dashboard_link}")
-    except Exception:
-        lines.append("  distributed: not active")
+    if host is None:
+        lines.append("  state: not initialized")
+        return "\n".join(lines)
 
-    # --- tensor server ---
-    if bridge is not None:
-        tc = bridge.tensor_client
-        if tc is not None:
-            try:
-                health = tc.health_check()
-                lines += [
-                    "",
-                    "## Tensor Server",
-                    f"  connected: true",
-                    f"  health: {health}",
-                    f"  sources_cached: {len(bridge.tensor_sources)}",
-                ]
-            except Exception as exc:
-                lines += [
-                    "",
-                    "## Tensor Server",
-                    f"  connected: true",
-                    f"  health_error: {exc}",
-                ]
-        else:
-            lines += ["", "## Tensor Server", "  connected: false"]
+    lines.append(f"  alive: {host.is_alive()}")
+    lines.append(f"  busy: {host.is_busy()}")
+
+    res = host.execute(_STATUS_SNIPPET, timeout=15.0)
+    if res.get("status") == "ok":
+        lines.append("")
+        lines.append(res.get("stdout", "").rstrip())
+    elif res.get("status") == "busy":
+        lines.append("  (kernel busy — dask/tensor/viewer status unavailable)")
     else:
-        lines += ["", "## Tensor Server", "  bridge: not initialized"]
-
-    # --- viewer ---
-    if bridge is not None:
-
-        def _viewer_info():
-            v = bridge.viewer
-            n_layers = len(v.layers)
-            layer_summary = []
-            for layer in v.layers:
-                shape = getattr(layer.data, "shape", "?")
-                layer_summary.append(f"{layer.name} ({shape})")
-            return n_layers, layer_summary
-
-        try:
-            n_layers, layer_summary = bridge.run_on_gui_thread(_viewer_info)
-            lines += [
-                "",
-                "## Viewer",
-                f"  layers: {n_layers}",
-            ]
-            for s in layer_summary[:10]:
-                lines.append(f"    - {s}")
-            if n_layers > 10:
-                lines.append(f"    ... and {n_layers - 10} more")
-        except Exception:
-            lines += ["", "## Viewer", "  error: could not query"]
-
-    # --- sessions ---
-    active = len(_sessions._namespaces)
-    lines += [
-        "",
-        "## Sessions",
-        f"  active: {active}",
-        f"  max: {_sessions._max_sessions}",
-        f"  ttl: {_sessions._ttl}s",
-    ]
-
-    # --- bridge queue ---
-    if bridge is not None:
-        qsize = bridge._cmd_queue.qsize()
-        lines += [
-            "",
-            "## Bridge",
-            f"  pending_commands: {qsize}",
-        ]
+        lines.append("")
+        lines.append(
+            "  kernel query error: "
+            + (res.get("error_text") or str(res.get("status")))
+        )
 
     return "\n".join(lines)
 
@@ -421,65 +335,9 @@ def server_status() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _configure_dask(mcp_config: dict):
-    """Set up the dask environment from MCP config."""
-    scheduler = mcp_config.get("dask_scheduler", "threads")
-    num_workers = mcp_config.get("dask_num_workers", 0) or None
-    address = mcp_config.get("dask_distributed_address", "")
-
-    if scheduler == "distributed" and address:
-        from distributed import Client
-
-        client = Client(address)
-        logger.info("Dask using distributed scheduler at %s", address)
-        return client
-
-    dask.config.set(scheduler=scheduler, num_workers=num_workers)
-    logger.info("Dask scheduler: %s, num_workers: %s", scheduler, num_workers)
-    return None
-
-
-def launch_server(
-    bridge: ThreadBridge, port: int = 8765, mcp_config: dict = None
-):
-    """Start the MCP server on a daemon thread.
-
-    Must be called from the Qt main thread (so the bridge timer starts
-    on the right thread).
-    """
-    global _bridge, _server_thread
-    import uvicorn
-
-    if mcp_config is None:
-        mcp_config = {}
-    _configure_dask(mcp_config)
-    _configure_sessions(mcp_config)
-
-    _bridge = bridge
-    patch_viewer_load_tensor(bridge)
-    bridge.start_timer()
-
-    app = mcp.streamable_http_app()
-
-    _server_thread = threading.Thread(
-        target=uvicorn.run,
-        args=(app,),
-        kwargs={
-            "host": "127.0.0.1",
-            "port": port,
-            "log_level": "warning",
-        },
-        daemon=True,
-    )
-    _server_thread.start()
+def run(port: int = 8765):
+    """Run the MCP server in the foreground (streamable-http)."""
+    mcp.settings.host = "127.0.0.1"
+    mcp.settings.port = port
     logger.info("MCP server listening on http://127.0.0.1:%d/mcp", port)
-
-
-def shutdown_server():
-    """Stop the bridge timer (the daemon thread dies with the process)."""
-    global _bridge
-    _sessions.clear()
-    if _bridge is not None:
-        _bridge.stop_timer()
-        _bridge = None
-        logger.info("MCP bridge stopped")
+    mcp.run(transport="streamable-http")

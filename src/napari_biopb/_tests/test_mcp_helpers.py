@@ -8,12 +8,16 @@ from napari_biopb.mcp._helpers import patch_viewer_load_tensor
 
 
 @pytest.fixture
-def mock_bridge():
-    bridge = MagicMock()
-    bridge.tensor_client = None
-    bridge.tensor_sources = {}
-    bridge.viewer = MagicMock()
-    return bridge
+def viewer():
+    return MagicMock()
+
+
+@pytest.fixture
+def widget():
+    w = MagicMock()
+    w._client = None
+    w._sources = {}
+    return w
 
 
 def _make_source(source_url, tensors):
@@ -36,100 +40,135 @@ def _make_tensor(array_id, shape, dtype="float32"):
 class TestPatchViewerLoadTensor:
     """Tests for the monkey-patched viewer.load_tensor."""
 
-    def test_patches_method_on_viewer(self, mock_bridge):
-        patch_viewer_load_tensor(mock_bridge)
-        assert hasattr(mock_bridge.viewer, "load_tensor")
-        assert callable(mock_bridge.viewer.load_tensor)
+    def test_patches_method_on_viewer(self, viewer, widget):
+        patch_viewer_load_tensor(viewer, widget)
+        assert hasattr(viewer, "load_tensor")
+        assert callable(viewer.load_tensor)
 
-    def test_raises_when_no_client(self, mock_bridge):
-        patch_viewer_load_tensor(mock_bridge)
+    def test_raises_when_no_client(self, viewer, widget):
+        patch_viewer_load_tensor(viewer, widget)
         with pytest.raises(RuntimeError, match="No tensor server connected"):
-            mock_bridge.viewer.load_tensor("some_source")
+            viewer.load_tensor("some_source")
 
-    def test_raises_when_source_not_found(self, mock_bridge):
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"a": MagicMock()}
-        patch_viewer_load_tensor(mock_bridge)
+    def test_raises_when_source_not_found_without_get_source(
+        self, viewer, widget
+    ):
+        client = MagicMock()
+        del client.get_source  # simulate biopb without the direct-fetch method
+        widget._client = client
+        widget._sources = {"a": MagicMock()}
+        patch_viewer_load_tensor(viewer, widget)
 
         with pytest.raises(ValueError, match="not found"):
-            mock_bridge.viewer.load_tensor("nonexistent")
+            viewer.load_tensor("nonexistent")
 
-    def test_auto_selects_single_tensor(self, mock_bridge):
+    def test_fallback_to_get_source_when_uncached(self, viewer, widget):
+        tensor = _make_tensor("t1", [256, 256])
+        src = _make_source("http://server/data/remote_img", [tensor])
+        client = MagicMock()
+        client.get_source.return_value = src
+        widget._client = client
+        widget._sources = {}  # source absent from the cached catalog
+
+        mock_arr = MagicMock()
+        with patch(
+            "napari_biopb._tensor_utils.build_pyramid_levels",
+            return_value=[mock_arr],
+        ):
+            patch_viewer_load_tensor(viewer, widget)
+            name = viewer.load_tensor("remote_src")
+
+        client.get_source.assert_called_once_with("remote_src", None)
+        assert name == "remote_img"
+        viewer.add_image.assert_called_once_with(mock_arr, name="remote_img")
+
+    def test_fallback_forwards_tensor_id(self, viewer, widget):
+        t2 = _make_tensor("t2", [128, 128])
+        src = _make_source("", [t2])  # synthesized descriptor: no source_url
+        client = MagicMock()
+        client.get_source.return_value = src
+        widget._client = client
+        widget._sources = {}
+
+        with patch(
+            "napari_biopb._tensor_utils.build_pyramid_levels",
+            return_value=[MagicMock()],
+        ):
+            patch_viewer_load_tensor(viewer, widget)
+            viewer.load_tensor("remote_src", tensor_id="t2", name="x")
+
+        client.get_source.assert_called_once_with("remote_src", "t2")
+
+    def test_auto_selects_single_tensor(self, viewer, widget):
         tensor = _make_tensor("t1", [256, 256])
         src = _make_source("http://server/data/my_image", [tensor])
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"src1": src}
+        widget._client = MagicMock()
+        widget._sources = {"src1": src}
 
         mock_arr = MagicMock()
         with patch(
             "napari_biopb._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_load_tensor(mock_bridge)
-            name = mock_bridge.viewer.load_tensor("src1")
+            patch_viewer_load_tensor(viewer, widget)
+            name = viewer.load_tensor("src1")
 
         assert name == "my_image"
-        mock_bridge.viewer.add_image.assert_called_once_with(
-            mock_arr, name="my_image"
-        )
+        viewer.add_image.assert_called_once_with(mock_arr, name="my_image")
 
-    def test_requires_tensor_id_for_multi_tensor(self, mock_bridge):
+    def test_requires_tensor_id_for_multi_tensor(self, viewer, widget):
         t1 = _make_tensor("t1", [256, 256])
         t2 = _make_tensor("t2", [128, 128])
         src = _make_source("http://server/data/multi", [t1, t2])
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"src1": src}
-        patch_viewer_load_tensor(mock_bridge)
+        widget._client = MagicMock()
+        widget._sources = {"src1": src}
+        patch_viewer_load_tensor(viewer, widget)
 
         with pytest.raises(ValueError, match="specify tensor_id"):
-            mock_bridge.viewer.load_tensor("src1")
+            viewer.load_tensor("src1")
 
-    def test_explicit_tensor_id_and_name(self, mock_bridge):
+    def test_explicit_tensor_id_and_name(self, viewer, widget):
         t1 = _make_tensor("t1", [256, 256])
         t2 = _make_tensor("t2", [128, 128])
         src = _make_source("http://server/data/multi", [t1, t2])
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"src1": src}
+        widget._client = MagicMock()
+        widget._sources = {"src1": src}
 
         mock_arr = MagicMock()
         with patch(
             "napari_biopb._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_load_tensor(mock_bridge)
-            name = mock_bridge.viewer.load_tensor(
-                "src1", tensor_id="t2", name="custom"
-            )
+            patch_viewer_load_tensor(viewer, widget)
+            name = viewer.load_tensor("src1", tensor_id="t2", name="custom")
 
         assert name == "custom"
-        mock_bridge.viewer.add_image.assert_called_once_with(
-            mock_arr, name="custom"
-        )
+        viewer.add_image.assert_called_once_with(mock_arr, name="custom")
 
-    def test_multiscale_pyramid(self, mock_bridge):
+    def test_multiscale_pyramid(self, viewer, widget):
         tensor = _make_tensor("t1", [8192, 8192])
         src = _make_source("http://server/big", [tensor])
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"src1": src}
+        widget._client = MagicMock()
+        widget._sources = {"src1": src}
 
         levels = [MagicMock(), MagicMock()]
         with patch(
             "napari_biopb._tensor_utils.build_pyramid_levels",
             return_value=levels,
         ):
-            patch_viewer_load_tensor(mock_bridge)
-            name = mock_bridge.viewer.load_tensor("src1")
+            patch_viewer_load_tensor(viewer, widget)
+            name = viewer.load_tensor("src1")
 
-        mock_bridge.viewer.add_image.assert_called_once_with(
+        viewer.add_image.assert_called_once_with(
             levels, name="big", multiscale=True
         )
 
-    def test_raises_for_invalid_tensor_id(self, mock_bridge):
+    def test_raises_for_invalid_tensor_id(self, viewer, widget):
         tensor = _make_tensor("t1", [256, 256])
         src = _make_source("http://server/data/img", [tensor])
-        mock_bridge.tensor_client = MagicMock()
-        mock_bridge.tensor_sources = {"src1": src}
-        patch_viewer_load_tensor(mock_bridge)
+        widget._client = MagicMock()
+        widget._sources = {"src1": src}
+        patch_viewer_load_tensor(viewer, widget)
 
         with pytest.raises(ValueError, match="Tensor 'wrong' not found"):
-            mock_bridge.viewer.load_tensor("src1", tensor_id="wrong")
+            viewer.load_tensor("src1", tensor_id="wrong")

@@ -14,12 +14,6 @@ contributions:
     - id: napari-biopb.make_image_processing_widget
       python_name: napari_biopb:ImageProcessingWidget
       title: Image Processing
-    - id: napari-biopb.start_mcp_server
-      python_name: napari_biopb.mcp:start_mcp_server
-      title: Start MCP Server
-    - id: napari-biopb.stop_mcp_server
-      python_name: napari_biopb.mcp:stop_mcp_server
-      title: Stop MCP Server
   widgets:
     - command: napari-biopb.make_tensor_browser_widget
       display_name: Tensor Browser

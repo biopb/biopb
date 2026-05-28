@@ -30,7 +30,7 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
-    "biopb[tensor] >= 0.5.1",
+    "biopb[tensor] >= 0.5.4",
     "opencv-python-headless",
     "grpcio_tools",
     "grpcio-health-checking",
@@ -46,12 +46,18 @@ testing = [
     "pytest-env",  # https://github.com/qwertyquerty/pytest-env
     "napari",
     "pyqt6",
+    "mcp>=1.20",
+    "jupyter_client",
+    "ipykernel",
 ]
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
 ]
-mcp = ["mcp>=1.20", "uvicorn>=0.29"]
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel"]
 3d = ["vedo"] # 3d rendering from mesh
+
+[project.scripts]
+biopb-mcp = "napari_biopb.mcp.__main__:main"
 
 [project.entry-points."napari.manifest"]
 napari-biopb = "napari_biopb:napari.yaml"

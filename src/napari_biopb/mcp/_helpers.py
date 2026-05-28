@@ -25,8 +25,9 @@ def _tensor_short_name(array_id: str) -> str:
     return parts[-1] if parts else array_id
 
 
-def patch_viewer_load_tensor(bridge):
-    """Monkey-patch ``load_tensor`` onto ``bridge.viewer``."""
+def patch_viewer_load_tensor(viewer, widget):
+    """Monkey-patch ``load_tensor`` onto *viewer*, reading client/sources from
+    the live ``TensorBrowserWidget`` *widget*."""
 
     def load_tensor(
         source_id: str,
@@ -46,20 +47,28 @@ def patch_viewer_load_tensor(bridge):
         """
         from .._tensor_utils import build_pyramid_levels
 
-        client = bridge.tensor_client
+        client = widget._client
         if client is None:
             raise RuntimeError(
                 "No tensor server connected. "
                 "Open the Tensor Browser widget and connect first."
             )
 
-        sources = bridge.tensor_sources
+        sources = widget._sources or {}
         src = sources.get(source_id)
         if src is None:
-            raise ValueError(
-                f"Source '{source_id}' not found. "
-                f"Available: {list(sources.keys())[:20]}"
-            )
+            # Not in the (possibly truncated) cached catalog — fetch the
+            # descriptor directly from the server.  Requires
+            # TensorFlightClient.get_source (added to biopb separately); until
+            # that ships this stays a no-op and we raise as before.
+            get_source = getattr(client, "get_source", None)
+            if get_source is not None:
+                src = get_source(source_id, tensor_id)
+            else:
+                raise ValueError(
+                    f"Source '{source_id}' not found. "
+                    f"Available: {list(sources.keys())[:20]}"
+                )
 
         if tensor_id is None:
             if len(src.tensors) == 1 and src.tensors[0]:
@@ -83,7 +92,6 @@ def patch_viewer_load_tensor(bridge):
             client, source_id, tensor_id, tensor_desc
         )
 
-        viewer = bridge.viewer
         if name is None:
             stem = _get_url_stem(src.source_url) or source_id
             if len(src.tensors) > 1:
@@ -98,4 +106,7 @@ def patch_viewer_load_tensor(bridge):
 
         return name
 
-    bridge.viewer.load_tensor = load_tensor
+    # napari.Viewer is a pydantic evented model with validate_assignment, so a
+    # plain ``viewer.load_tensor = ...`` is rejected.  Write through to the
+    # instance dict to bypass field validation.
+    object.__setattr__(viewer, "load_tensor", load_tensor)
