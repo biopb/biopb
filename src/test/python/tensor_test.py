@@ -13,7 +13,16 @@ from biopb.tensor import (
 )
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
-from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+
+try:
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    _server_available = True
+except ImportError:
+    _server_available = False
+
+_needs_server = pytest.mark.skipif(
+    not _server_available, reason="biopb-tensor-server not installed"
+)
 
 
 def _zarr_available() -> bool:
@@ -32,6 +41,8 @@ class TestTensorFlightClient:
     @pytest.fixture
     def server_client(self):
         """Start server and create client."""
+        if not _server_available:
+            pytest.skip("biopb-tensor-server not installed")
         if not _zarr_available():
             pytest.skip("zarr not available")
 
@@ -202,6 +213,7 @@ class TestTensorFlightClient:
         assert data[32:, :32].mean() == 30.0
         assert data[32:, 32:].mean() == 40.0
 
+    @_needs_server
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_mean_preserves_dtype_with_rounding(self):
         """Test mean downsampling preserves dtype with integer-safe rounding."""
@@ -242,6 +254,7 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @_needs_server
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_linear_view(self):
         """Test linear interpolation downsampling."""
@@ -282,6 +295,7 @@ class TestTensorFlightClient:
             finally:
                 server.shutdown()
 
+    @_needs_server
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_non_divisible_scaled_nearest_view(self):
         """Test nearest downsampling returns ceil-sized output for edge chunks."""
