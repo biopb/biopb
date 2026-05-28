@@ -80,6 +80,7 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
   const imageUrlRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingRequestRef = useRef<RenderParams | null>(null);
+  const lastSentParamsRef = useRef<RenderParams | null>(null);  // Last request sent (for reconnect retry)
   const pendingMetadataRef = useRef<RenderMetadata | null>(null);  // Store metadata from render_start
   const pendingLoadedRegionRef = useRef<LoadedRegionInfo | null>(null);  // Store region from render_start
   const renderGenerationRef = useRef(0);  // Incremented on each render request, used to discard stale responses
@@ -142,13 +143,15 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
       wsRef.current = ws;
       setState((s) => ({ ...s, connected: true, error: null }));
 
-      // Send pending request if any (small delay to ensure connection is stable)
-      if (pendingRequestRef.current) {
+      // Send pending request if any, or retry last request if no image loaded yet
+      const toSend = pendingRequestRef.current ??
+        (imageUrlRef.current === null ? lastSentParamsRef.current : null);
+      if (toSend) {
         setTimeout(() => {
           if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               action: "render",
-              params: pendingRequestRef.current,
+              params: toSend,
             }));
             pendingRequestRef.current = null;
           }
@@ -255,6 +258,7 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
 
   // Request render action (stable)
   const requestRender = useCallback((params: RenderParams) => {
+    lastSentParamsRef.current = params;
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
@@ -284,6 +288,7 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
     pendingMetadataRef.current = null;
     pendingLoadedRegionRef.current = null;
     pendingRenderGenerationRef.current = null;
+    lastSentParamsRef.current = null;
     setState((s) => ({ ...s, imageUrl: null, loadedRegion: null, metadata: null }));
   }, [cleanupUrl]);
 

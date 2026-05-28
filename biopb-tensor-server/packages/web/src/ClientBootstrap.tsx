@@ -63,7 +63,7 @@ export function ClientBootstrap() {
     }
 
     const apiBase =
-      import.meta.env.VITE_TENSOR_API ?? "http://localhost:8816";
+      import.meta.env.VITE_TENSOR_API ?? "http://localhost:8814";
 
     (async () => {
       try {

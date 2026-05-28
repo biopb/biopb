@@ -114,7 +114,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: jiyuuchc
-          password: ${{ secrets.DOCKER_HUB_AUTH }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6

@@ -711,13 +711,36 @@ def launch(
     if cors_origins:
         effective_cors = list(cors_origins)
     else:
-        # Derive from web_url: add both host variants
+        # Derive CORS origins, expanding loopback aliases for any local hostname
         from urllib.parse import urlparse as _urlparse
 
-        parsed = _urlparse(web_url)
-        base = f"{parsed.scheme}://{parsed.hostname}"
-        p = parsed.port
-        effective_cors = [f"{base}:{p}"] if p else [base]
+        _loopback_aliases: dict = {
+            "localhost": ["127.0.0.1", "[::1]"],
+            "127.0.0.1": ["localhost", "[::1]"],
+            "::1": ["localhost", "127.0.0.1"],
+            "[::1]": ["localhost", "127.0.0.1"],
+        }
+
+        def _expand_origin(url: str) -> list:
+            parsed = _urlparse(url)
+            p = parsed.port
+            port_suffix = f":{p}" if p else ""
+            scheme = parsed.scheme
+            hostname = parsed.hostname or "localhost"
+            origins = [f"{scheme}://{hostname}{port_suffix}"]
+            for alias in _loopback_aliases.get(hostname, []):
+                origins.append(f"{scheme}://{alias}{port_suffix}")
+            return origins
+
+        effective_cors = _expand_origin(web_url)
+
+        # When serving the webapp from this same server (--static-dir), also
+        # allow all loopback variants of the server's own address so users
+        # can reach it via localhost or 127.0.0.1 interchangeably.
+        if static_dir:
+            for origin in _expand_origin(f"http://{web_host}:{web_port}"):
+                if origin not in effective_cors:
+                    effective_cors.append(origin)
 
     # --- Start HTTP sidecar (blocks) ---
     console.print(

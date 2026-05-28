@@ -90,7 +90,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   connectionState: "idle",
   connectionError: null,
   devMode: false,
-  apiBase: "http://localhost:8816",
+  apiBase: "http://localhost:8814",
 
   sources: [],
   sourcesLoading: false,

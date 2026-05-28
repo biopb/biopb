@@ -21,6 +21,7 @@ Authentication:
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import re
@@ -980,6 +981,7 @@ def create_app(
                 return
 
         await websocket.accept()
+        logger.info("ws/render: client connected")
 
         try:
             while True:
@@ -1007,7 +1009,7 @@ def create_app(
 
                 t0 = time.monotonic()
 
-                logger.debug(
+                logger.info(
                     f"ws/render: source={params.source_id}, tensor={params.tensor_id}, "
                     f"slice={params.slice_start}-{params.slice_stop}, scale={params.scale_hint}"
                 )
@@ -1081,7 +1083,7 @@ def create_app(
                         dask_arr = dask_arr[tuple(crop)]
 
                     t0_compute = time.monotonic()
-                    arr: np.ndarray = dask_arr.compute()
+                    arr: np.ndarray = await asyncio.get_event_loop().run_in_executor(None, dask_arr.compute)
                     compute_ms = (time.monotonic() - t0_compute) * 1000
 
                     # Compute loaded region from realized slice bounds (not requested)
@@ -1111,16 +1113,15 @@ def create_app(
                     )
                     render_ms = (time.monotonic() - t0_render) * 1000
 
+                    format_lower = params.output_format.lower()
                     elapsed = (time.monotonic() - t0) * 1000
                     diag.latency.record(elapsed)
-                    logger.debug(
-                        f"ws/render: image size={width}x{height}, "
-                        f"bytes={len(image_bytes)}, total={elapsed:.1f}ms, "
-                        f"compute={compute_ms:.1f}ms, render={render_ms:.1f}ms"
+                    logger.info(
+                        f"ws/render: done {width}x{height} {format_lower} "
+                        f"total={elapsed:.0f}ms compute={compute_ms:.0f}ms render={render_ms:.0f}ms"
                     )
 
                     # Send metadata JSON first
-                    format_lower = params.output_format.lower()
                     render_start_msg = {
                         "action": "render_start",
                         "width": width,
@@ -1157,7 +1158,7 @@ def create_app(
                     })
 
         except WebSocketDisconnect:
-            logger.debug("ws/render: client disconnected")
+            logger.info("ws/render: client disconnected")
         except Exception as exc:
             logger.error(f"ws/render: unexpected error: {exc}")
             await websocket.close(code=1011, reason="Internal error")
