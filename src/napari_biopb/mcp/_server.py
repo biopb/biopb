@@ -209,9 +209,10 @@ def execute_code(python_code: str) -> str:
     """Execute Python code in the napari kernel.
 
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
-    namespace: viewer (with a load_tensor method), np, da, client, sources.
-    Use print() to produce output; the last expression's repr is also
-    returned. Variables persist across calls until the kernel is restarted.
+    namespace: viewer (with a load_tensor method), np, da, client, and ops (a
+    dict of biopb.image ProcessImage operations). Use print() to produce
+    output; the last expression's repr is also returned. Variables persist
+    across calls until the kernel is restarted.
 
     Long or runaway executions can be stopped with interrupt_kernel (SIGINT,
     best-effort) or restart_kernel (guaranteed). Read napari://guide for the

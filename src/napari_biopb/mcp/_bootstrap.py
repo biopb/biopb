@@ -57,6 +57,7 @@ def _bootstrap_impl():
     from .._config import load_config
     from ..tensor_browser import TensorBrowserWidget
     from ._helpers import patch_viewer_load_tensor
+    from ._process_ops import build_ops
 
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
@@ -74,7 +75,29 @@ def _bootstrap_impl():
     tbw = TensorBrowserWidget(viewer)
     viewer.window.add_dock_widget(tbw, name="Tensor Browser")
 
-    # 4. Namespace for execute_code.  client is refreshed per-call by the
+    # 4. ProcessImage ops: thin Run() callables for each configured servicer.
+    #    client_getter reads tbw._client lazily so the async-connecting tensor
+    #    client is picked up at call time.
+    timeout_config = config.get("timeout", {})
+    grpc_config = config.get("grpc", {})
+    max_msg_bytes = grpc_config.get("max_message_size_mb", 512) * 1024 * 1024
+    channel_options = [
+        ("grpc.max_receive_message_length", max_msg_bytes),
+        ("grpc.max_send_message_length", max_msg_bytes),
+    ]
+    try:
+        ops = build_ops(
+            client_getter=lambda: tbw._client,
+            server_urls=mcp_config.get("process_image_servers", []),
+            op_names_timeout=timeout_config.get("get_op_names", 10.0),
+            run_timeout=timeout_config.get("process_image", 300.0),
+            channel_options=channel_options,
+        )
+    except Exception:
+        logger.exception("Failed to build ProcessImage ops")
+        ops = {}
+
+    # 5. Namespace for execute_code.  client is refreshed per-call by the
     #    server (the widget connects asynchronously).
     patch_viewer_load_tensor(viewer, tbw)
     ip.user_ns.update(
@@ -83,6 +106,7 @@ def _bootstrap_impl():
             "np": np,
             "da": da,
             "client": None,
+            "ops": ops,
             "_tbw": tbw,
             "_dask_client": dask_client,
         }

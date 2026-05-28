@@ -21,10 +21,32 @@ GUIDE = """\
 | `viewer` | napari.Viewer | The active viewer instance that user sees |
 | `np` | module | numpy |
 | `da` | module | dask.array |
+| `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 
 Browse the catalog through `client` — `client.query_sources(sql)` (server-side
 DuckDB, complete) or `client.list_sources()` (capped by the server for large
 catalogs).
+
+## Image Processing Ops (`ops`)
+`ops` maps op name -> a thin callable that runs one `biopb.image.ProcessImage`
+op (segmentation, denoising, etc.) on a configured server. Discover and
+inspect them before use — each carries a docstring with its server, labels,
+input-shape hints, and default kwargs:
+```python
+list(ops)                          # available op names
+inspect_object("ops['op_name']")   # docstring, default kwargs, server
+```
+Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
+* `image` as an `np.ndarray` -> sent inline (eager) -> returns an `np.ndarray`.
+* `image` as a tensor-server **source_id str** -> sent as a lazy reference (the
+  op server pulls pixels straight from the tensor server, no kernel
+  round-trip) -> the result is uploaded back to the tensor server and a new
+  **source_id str** is returned, so ops chain lazily on large data:
+```python
+labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
+seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
+viewer.load_tensor(seg_id)                    # view the result
+```
 
 ## Execution environment
 Code runs in a child Jupyter kernel (a real IPython kernel) with napari

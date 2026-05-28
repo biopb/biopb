@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
         "get_op_names": 10.0,
         "detection_2d": 15,
         "detection_3d": 300,
+        "process_image": 300,
     },
     "grpc": {
         "max_message_size_mb": 512,
@@ -57,6 +58,10 @@ DEFAULT_CONFIG = {
         "kernel_startup_timeout": 60.0,
         "execute_timeout": 120.0,
         "busy_lock_timeout": 5.0,
+        # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).
+        # Each is queried via GetOpNames and exposed as callables in the
+        # agent kernel's `ops` dict.
+        "process_image_servers": [],
     },
 }
 
