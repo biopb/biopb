@@ -47,7 +47,6 @@ console = Console()
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
 
-
 def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
@@ -604,6 +603,11 @@ def launch(
         "--static-dir",
         help="Directory containing static webapp files. If empty, serves API only.",
     ),
+    log_file: Optional[str] = typer.Option(
+        None,
+        "--log-file",
+        help="Path to rotating log file (e.g. /var/log/biopb.log). Rotates at 10MB by default.",
+    ),
 ):
     """Launch the full BioPB Tensor stack (Flight server + HTTP sidecar).
 
@@ -628,7 +632,7 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb)
+    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file)
 
     # --- Determine dev mode ---
     env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")

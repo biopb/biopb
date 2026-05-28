@@ -95,6 +95,18 @@ def _get_log_file() -> Path:
     return LOG_DIR / "tensor-server.log"
 
 
+def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
+    """Rotate log file if it exceeds max_bytes, keeping up to backup_count backups."""
+    if not log_file.exists() or log_file.stat().st_size < max_bytes:
+        return
+    for i in range(backup_count - 1, 0, -1):
+        src = log_file.parent / f"{log_file.name}.{i}"
+        dst = log_file.parent / f"{log_file.name}.{i + 1}"
+        if src.exists():
+            src.rename(dst)
+    log_file.rename(log_file.parent / f"{log_file.name}.1")
+
+
 @server_app.command("start")
 def start(
     config: Path = typer.Option(
@@ -131,8 +143,6 @@ def start(
     ),
 ):
     """Start TensorFlight server as a background daemon."""
-    import secrets
-
     _ensure_dirs()
 
     # Check if already running
@@ -146,12 +156,35 @@ def start(
         console.print(f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]")
         _remove_pid()
 
-    # Generate token if not provided
+    # Token: skip only when both web and gRPC are bound to localhost
+    _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
     if not token:
         token = os.environ.get("BIOPB_TENSOR_TOKEN")
-    if not token:
-        token = secrets.token_urlsafe(32)
+
+    grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
+    if config.exists():
+        try:
+            from biopb_tensor_server.config import load_config as _load_server_config
+            grpc_host = _load_server_config(config).host
+        except Exception:
+            pass
+
+    local_only = not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    if not token and not local_only:
+        import secrets as _secrets
+        token = _secrets.token_urlsafe(32)
         console.print(f"[bold green]Generated access token:[/bold green] {token}")
+
+    log_file = _get_log_file()
+    _rotate_log(log_file)
+
+    # Build subprocess environment
+    env = os.environ.copy()
+    if local_only:
+        # No token: tell launch to skip token enforcement without prompting
+        env["BIOPB_WEB_DEV_BYPASS"] = "1"
+    elif token:
+        env["BIOPB_TENSOR_TOKEN"] = token
 
     # Build command
     cmd = [
@@ -163,12 +196,9 @@ def start(
         "--web-port", str(web_port),
         "--web-host", str(web_host),
         "--log-level", str(log_level),
-        "--token", str(token),
     ]
     if static_dir and static_dir.exists():
         cmd.extend(["--static-dir", str(static_dir)])
-
-    log_file = _get_log_file()
 
     # Start subprocess
     console.print(f"[green]Starting TensorFlight server...[/green]")
@@ -180,6 +210,7 @@ def start(
             cmd,
             stdout=log,
             stderr=log,
+            env=env,
             start_new_session=True,  # Detach from current process group
         )
 
@@ -194,7 +225,8 @@ def start(
         raise typer.Exit(1)
 
     console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
-    console.print(f"  HTTP: http://{web_host}:{web_port}/?token={str(token)}")
+    url = f"http://{web_host}:{web_port}/" + (f"?token={token}" if token else "")
+    console.print(f"  HTTP: {url}")
     console.print(f"  gRPC: grpc://127.0.0.1:8815")
     console.print(f"  Logs: {log_file}")
 
