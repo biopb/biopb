@@ -2,7 +2,7 @@ name: napari-biopb
 display_name: BioPB
 visibility: public
 # see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
-categories: ["AI", "Agentic", "Image Processing"]
+categories: ["Utilities", "Image Processing"]
 contributions:
   commands:
     - id: napari-biopb.make_tensor_browser_widget
