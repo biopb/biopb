@@ -228,16 +228,22 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/5] Ensuring Python..."
 
+    # napari-biopb requires Python >= 3.10; otherwise 3.8 is sufficient.
+    MIN_MINOR=8
+    if [ "$INSTALL_NAPARI" = "1" ]; then
+        MIN_MINOR=10
+    fi
+
     PYTHON_VERSION=""
     if command -v python3 &>/dev/null; then
         PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info[:2])" 2>/dev/null || echo "")
         if [ -n "$PYTHON_VERSION" ]; then
             MAJOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f1)
             MINOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f2)
-            if [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 8 ]; }; then
+            if [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ]; }; then
                 _ok "Using system Python: $(python3 --version)"
             else
-                _warn "System Python too old ($(python3 --version)), need >= 3.8"
+                _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"
                 PYTHON_VERSION=""
             fi
         fi
@@ -361,8 +367,8 @@ EOF
     echo ""
 
     if [ "$INSTALL_NAPARI" = "1" ]; then
-        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch napari-biopb:${RESET}"
-        _cmd "napari -w napari-biopb"
+        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch napari-biopb:${RESET} as an MCP server:"
+        _cmd "biopb-mcp"
         echo ""
     fi
 
