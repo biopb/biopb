@@ -879,6 +879,37 @@ class TensorFlightClient:
             return wrapped.get("metadata", {})
         return {}
 
+    def get_source(
+        self,
+        source_id: str,
+        tensor_id: Optional[str] = None,
+    ) -> "DataSourceDescriptor":
+        """Fetch one source's descriptor directly from the server.
+
+        Works even when the source is beyond the (truncatable) list_sources()
+        cap. Result is cached in self._sources/_descriptors.
+
+        Args:
+            source_id: Data source identifier
+            tensor_id: Optional tensor to anchor the lookup. When None the
+                server returns the descriptor for its default (usually first)
+                tensor.
+
+        Returns:
+            DataSourceDescriptor with at least one TensorDescriptor populated.
+        """
+        read_opt = TensorReadOption(with_metadata=True)
+        if tensor_id:
+            read_opt.tensor_id = tensor_id
+        cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
+        fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        info = self._client.get_flight_info(fd, options=self._call_options)
+        tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
+        source_desc = DataSourceDescriptor(source_id=source_id, tensors=[tensor_desc])
+        self._sources[source_id] = source_desc
+        self._descriptors[tensor_desc.array_id] = tensor_desc
+        return source_desc
+
     def _get_tensor_context(
         self,
         source_id: str,
@@ -909,9 +940,18 @@ class TensorFlightClient:
         """
         logger.debug(f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}")
 
-        # Ensure sources are loaded
+        # Ensure sources are loaded; fall back to direct server fetch if list_sources
+        # didn't return this source (e.g. truncated result set).
         if source_id not in self._sources:
             self.list_sources()
+        if source_id not in self._sources:
+            logger.debug(
+                f"Source '{source_id}' not in list_sources() result, fetching directly"
+            )
+            try:
+                self.get_source(source_id, tensor_id)
+            except Exception:
+                pass  # let the ValueError below surface the clean message
 
         source_desc = self._sources.get(source_id)
         if source_desc is None:
@@ -929,12 +969,24 @@ class TensorFlightClient:
                     f"tensor_id must be specified"
                 )
 
-        # Find tensor descriptor to get shape for slice validation
+        # Find tensor descriptor to get shape for slice validation; fall back to a
+        # direct server fetch when the cached source descriptor is stale or partial.
         tensor_desc = None
         for desc in source_desc.tensors:
             if desc.array_id == tensor_id:
                 tensor_desc = desc
                 break
+
+        if tensor_desc is None:
+            logger.debug(
+                f"Tensor '{tensor_id}' not in local catalog for source '{source_id}', "
+                f"fetching descriptor from server"
+            )
+            try:
+                self.get_source(source_id, tensor_id)
+            except Exception:
+                pass  # let the ValueError below surface the clean message
+            tensor_desc = self._descriptors.get(tensor_id)
 
         if tensor_desc is None:
             raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
