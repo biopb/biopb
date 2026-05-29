@@ -1,13 +1,13 @@
 # biopb-mcp
 
-[![License MIT](https://img.shields.io/pypi/l/biopb-mcp.svg?color=green)](https://github.com/biopb/biopb-mcp/raw/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/biopb-mcp.svg?color=green)](https://pypi.org/project/biopb-mcp)
-[![Python Version](https://img.shields.io/pypi/pyversions/biopb-mcp.svg?color=green)](https://python.org)
-[![tests](https://github.com/biopb/biopb-mcp/workflows/tests/badge.svg)](https://github.com/jiyuuchc/biopb-mcp/actions)
-[![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/biopb-mcp)](https://napari-hub.org/plugins/biopb-mcp)
+[![License MIT](https://img.shields.io/pypi/l/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://github.com/biopb/biopb-mcp/raw/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://pypi.org/project/biopb-mcp)
+[![Python Version](https://img.shields.io/pypi/pyversions/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://python.org)
+[![tests](https://github.com/biopb/biopb-mcp/workflows/tests/badge.svg)](https://github.com/biopb/biopb-mcp/actions)
+[![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/biopb-mcp&cacheSeconds=3600)](https://napari-hub.org/plugins/biopb-mcp)
 
 
-**biopb-mcp** is the MCP component of the **[BioPB](https://github.com/jiyuuchc/biopb)** project
+**biopb-mcp** is the MCP component of the **[BioPB](https://github.com/biopb/biopb)** project
 
 
 ## Installation - recommended
@@ -18,11 +18,11 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 ## Alternative methods
 
-These methods only install the mcp component without the rest of **[biopb](https://github.com/jiyuuchc/biopb)**  system.
+These methods only install the mcp component without the rest of **[biopb](https://github.com/biopb/biopb)**  system.
 
 ### Bundled Installers
 
-Pre-built standalone installers are available from the [Releases](https://github.com/jiyuuchc/biopb-mcp/releases) page. These include napari with the biopb-mcp plugin pre-installed—no Python setup required.
+Pre-built standalone installers are available from the [Releases](https://github.com/biopb/biopb-mcp/releases) page. These include napari with the biopb-mcp plugin pre-installed—no Python setup required.
 
 | Platform | Download |
 |----------|----------|
