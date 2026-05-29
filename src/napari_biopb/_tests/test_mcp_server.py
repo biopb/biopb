@@ -53,7 +53,7 @@ def server_with_host(mock_kernel_host):
 class TestResources:
     def test_guide_resource_returns_string(self):
         content = _server.get_guide()
-        assert "napari-biopb" in content
+        assert "biopb-mcp" in content
         assert "execute_code" in content
 
     def test_viewer_resource_mentions_layers(self):
