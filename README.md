@@ -1,4 +1,4 @@
-# napari-biopb
+# biopb-mcp
 
 [![License MIT](https://img.shields.io/pypi/l/napari-biopb.svg?color=green)](https://github.com/jiyuuchc/napari-biopb/raw/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/napari-biopb.svg?color=green)](https://pypi.org/project/napari-biopb)
@@ -17,15 +17,15 @@ Pre-built standalone installers are available from the [Releases](https://github
 
 | Platform | Download |
 |----------|----------|
-| Windows | `napari-biopb-windows.zip` |
-| macOS (Intel) | `napari-biopb-macos-intel.tar.gz` |
-| macOS (Apple Silicon) | `napari-biopb-macos-arm.tar.gz` |
-| Linux | `napari-biopb-linux.tar.gz` |
+| Windows | `biopb-mcp-windows.zip` |
+| macOS (Intel) | `biopb-mcp-macos-intel.tar.gz` |
+| macOS (Apple Silicon) | `biopb-mcp-macos-arm.tar.gz` |
+| Linux | `biopb-mcp-linux.tar.gz` |
 
 **Usage:**
-- **Windows**: Extract the zip and run `napari-biopb.exe`
-- **macOS**: Extract and open `napari-biopb.app` (right-click → "Open" to bypass Gatekeeper for unsigned apps)
-- **Linux**: Extract and run `./napari-biopb`
+- **Windows**: Extract the zip and run `biopb-mcp.exe`
+- **macOS**: Extract and open `biopb-mcp.app` (right-click → "Open" to bypass Gatekeeper for unsigned apps)
+- **Linux**: Extract and run `./biopb-mcp`
 
 ### From PyPI
 
@@ -48,7 +48,7 @@ the coverage at least stays the same before you submit a pull request.
 ## License
 
 Distributed under the terms of the [MIT] license,
-"napari-biopb" is free and open source software
+"biopb-mcp" is free and open source software
 
 ## Issues
 

@@ -4,7 +4,7 @@ Each constant is served as an MCP resource that the agent reads on demand.
 """
 
 GUIDE = """\
-# napari-biopb MCP Automation Guide
+# biopb-mcp Automation Guide
 
 ## Tools
 - `take_screenshot(canvas_only=True)` — capture viewer as PNG image

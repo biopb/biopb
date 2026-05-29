@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 _kernel_host: Optional[KernelHost] = None
 
-mcp = FastMCP("napari-biopb")
+mcp = FastMCP("biopb-mcp")
 
 # Prepended to every execute_code call so client tracks the
 # asynchronously-connecting Tensor Browser widget.

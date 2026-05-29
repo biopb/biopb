@@ -52,29 +52,29 @@ jobs:
           qt: true
 
       - name: Build with PyInstaller
-        run: pyinstaller --noconfirm --clean napari-biopb.spec
+        run: pyinstaller --noconfirm --clean biopb-mcp.spec
 
       - name: Create archive (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           cd dist
-          if [ -d "napari-biopb.app" ]; then
-            tar -czvf napari-biopb-${{ matrix.platform }}.tar.gz napari-biopb.app
+          if [ -d "biopb-mcp.app" ]; then
+            tar -czvf biopb-mcp-${{ matrix.platform }}.tar.gz biopb-mcp.app
           else
-            tar -czvf napari-biopb-${{ matrix.platform }}.tar.gz napari-biopb
+            tar -czvf biopb-mcp-${{ matrix.platform }}.tar.gz biopb-mcp
           fi
 
       - name: Create archive (Windows)
         if: runner.os == 'Windows'
         run: |
           cd dist
-          7z a napari-biopb-${{ matrix.platform }}.zip napari-biopb
+          7z a biopb-mcp-${{ matrix.platform }}.zip biopb-mcp
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: napari-biopb-${{ matrix.platform }}
-          path: dist/napari-biopb-${{ matrix.platform }}.*
+          name: biopb-mcp-${{ matrix.platform }}
+          path: dist/biopb-mcp-${{ matrix.platform }}.*
           retention-days: 7
 
   release:
@@ -90,7 +90,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: napari-biopb-*
+          pattern: biopb-mcp-*
           merge-multiple: true
 
       - name: Get version from tag
@@ -100,20 +100,20 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: napari-biopb ${{ steps.version.outputs.VERSION }}
+          name: biopb-mcp ${{ steps.version.outputs.VERSION }}
           body: |
             ## Installation
 
             Download the appropriate installer for your platform:
 
-            - **Windows**: Download `napari-biopb-windows.zip`, extract, and run `napari-biopb.exe`
-            - **macOS (Intel)**: Download `napari-biopb-macos-intel.tar.gz`, extract `napari-biopb.app`, and open it
-            - **macOS (Apple Silicon)**: Download `napari-biopb-macos-arm.tar.gz`, extract `napari-biopb.app`, and open it
-            - **Linux**: Download `napari-biopb-linux.tar.gz`, extract, and run `./napari-biopb`
+            - **Windows**: Download `biopb-mcp-windows.zip`, extract, and run `biopb-mcp.exe`
+            - **macOS (Intel)**: Download `biopb-mcp-macos-intel.tar.gz`, extract `biopb-mcp.app`, and open it
+            - **macOS (Apple Silicon)**: Download `biopb-mcp-macos-arm.tar.gz`, extract `biopb-mcp.app`, and open it
+            - **Linux**: Download `biopb-mcp-linux.tar.gz`, extract, and run `./biopb-mcp`
 
             **Note**: These are unsigned installers. On macOS, right-click and select "Open" to bypass Gatekeeper. On Windows, click "Run anyway" when prompted.
 
-            This bundle includes napari with the napari-biopb plugin pre-installed.
+            This bundle includes napari with the biopb-mcp plugin pre-installed.
           files: artifacts/*
           draft: false
           prerelease: false
