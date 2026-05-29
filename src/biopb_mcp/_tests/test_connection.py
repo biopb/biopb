@@ -176,3 +176,126 @@ def test_health_delegates(monkeypatch):
     assert conn.health() is None  # not connected yet
     conn.connect("grpc://host:9")
     assert conn.health() == "SERVING"
+
+
+# ---------------------------------------------------------------------------
+# local-server autostart fallback
+# ---------------------------------------------------------------------------
+
+
+class TestIsLocalUrl:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "grpc://localhost:8815",
+            "grpc://127.0.0.1:8815",
+            "grpc://[::1]:8815",
+            "grpc://:8815",
+        ],
+    )
+    def test_local(self, url):
+        assert _connection.is_local_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        ["grpc://example.com:8815", "grpc://10.0.0.5:8815"],
+    )
+    def test_remote(self, url):
+        assert _connection.is_local_url(url) is False
+
+
+class TestCanAutostart:
+    def test_true_when_local_and_cli_present(self, monkeypatch):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        conn = TensorConnection(config={})  # default URL is localhost
+        assert conn.can_autostart_server() is True
+
+    def test_false_without_cli(self, monkeypatch):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
+        conn = TensorConnection(config={})
+        assert conn.can_autostart_server() is False
+
+    def test_false_for_remote(self, monkeypatch):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        cfg = {"tensor_browser": {"server_url": "grpc://example.com:8815"}}
+        conn = TensorConnection(config=cfg)
+        assert conn.can_autostart_server() is False
+
+
+class TestStartLocalServer:
+    def test_starts_and_connects_without_token(self, monkeypatch, tmp_path):
+        sources = {"a": MagicMock()}
+        client = _fake_client(sources)
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        # No real config file -> --config omitted.
+        monkeypatch.setattr(
+            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
+        )
+
+        calls = {}
+
+        def fake_run(cmd, **kwargs):
+            calls["cmd"] = cmd
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
+
+        conn = TensorConnection(config={})
+        assert conn.token is None
+        result = conn.start_local_server()
+
+        assert result is sources
+        assert conn.is_connected is True
+        # Token logic is left to the CLI; we never fabricate one.
+        assert conn.token is None
+        assert calls["cmd"][:3] == ["biopb", "server", "start"]
+        assert "--token" not in calls["cmd"]
+        assert "--config" not in calls["cmd"]  # missing file
+
+    def test_passes_existing_config(self, monkeypatch, tmp_path):
+        cfg_file = tmp_path / "biopb.toml"
+        cfg_file.write_text("")
+        client = _fake_client({"a": MagicMock()})
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        monkeypatch.setattr(_connection, "DEFAULT_SERVER_CONFIG", cfg_file)
+
+        calls = {}
+
+        def fake_run(cmd, **kwargs):
+            calls["cmd"] = cmd
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
+
+        conn = TensorConnection(config={})
+        conn.start_local_server()
+        assert "--config" in calls["cmd"]
+        assert str(cfg_file) in calls["cmd"]
+
+    def test_raises_without_cli(self, monkeypatch):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="biopb CLI not found"):
+            conn.start_local_server()
+
+    def test_raises_when_cli_fails(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        monkeypatch.setattr(
+            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
+        )
+        monkeypatch.setattr(
+            _connection.subprocess,
+            "run",
+            lambda cmd, **kw: MagicMock(returncode=1),
+        )
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="failed"):
+            conn.start_local_server()

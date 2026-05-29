@@ -16,7 +16,12 @@ no locking is used. A future off-thread connect would need synchronization.
 
 import logging
 import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
 from typing import Dict, Tuple
+from urllib.parse import urlparse
 
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
@@ -30,6 +35,27 @@ _DEFAULT_URL = "grpc://localhost:8815"
 
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
+
+# Default location of the biopb server's TOML config (matches the
+# `biopb server start` CLI default).
+DEFAULT_SERVER_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
+
+# Hosts considered "local" — auto-starting a server only makes sense for these.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def biopb_cli_available() -> bool:
+    """Return True if the ``biopb`` command-line tool is on PATH."""
+    return shutil.which("biopb") is not None
+
+
+def is_local_url(url: str) -> bool:
+    """Return True if *url* points at the local machine."""
+    try:
+        host = urlparse(url).hostname
+    except Exception:
+        return False
+    return host is None or host in _LOCAL_HOSTS
 
 
 class TensorConnection:
@@ -114,3 +140,60 @@ class TensorConnection:
     def health(self):
         """Return the server health check result, or ``None`` if not connected."""
         return self.client.health_check() if self.client else None
+
+    def can_autostart_server(self) -> bool:
+        """Whether a local biopb server could be auto-started for this URL.
+
+        True only when the configured URL is local *and* the ``biopb`` CLI is
+        installed. Used as a last-resort fallback when the initial connect
+        fails — see :meth:`start_local_server`.
+        """
+        return is_local_url(self.url) and biopb_cli_available()
+
+    def start_local_server(
+        self,
+        config_path: str | None = None,
+        startup_timeout: float = 20.0,
+    ) -> Dict[str, DataSourceDescriptor]:
+        """Start a local biopb server daemon, then connect to it.
+
+        Runs ``biopb server start`` (with ``--config`` when the file exists),
+        then polls :meth:`connect` until the server accepts connections or
+        *startup_timeout* elapses. Returns the source catalog on success;
+        raises on failure.
+
+        Token handling is left entirely to the CLI: a default local server
+        (localhost flight + web host) needs none, and if the user's config
+        enables token generation the CLI prints it to the console. We connect
+        with whatever token was already resolved from env/config (often
+        ``None`` locally) and do not fabricate one. Output is not captured so
+        any such printed token reaches the console.
+        """
+        if not biopb_cli_available():
+            raise RuntimeError("biopb CLI not found on PATH")
+
+        config = Path(config_path) if config_path else DEFAULT_SERVER_CONFIG
+        cmd = ["biopb", "server", "start"]
+        if config.exists():
+            cmd += ["--config", str(config)]
+
+        logger.info("Starting local biopb server: %s", " ".join(cmd))
+        result = subprocess.run(cmd, timeout=startup_timeout)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "`biopb server start` failed (exit "
+                f"{result.returncode}); see the console and server logs"
+            )
+
+        # The daemon detaches immediately; poll until gRPC is reachable.
+        deadline = time.monotonic() + startup_timeout
+        last_exc: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                return self.connect(self.url, self.token)
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.5)
+        raise RuntimeError(
+            "biopb server started but did not become reachable in time"
+        ) from last_exc

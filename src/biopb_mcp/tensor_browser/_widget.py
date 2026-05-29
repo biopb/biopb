@@ -21,6 +21,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -450,11 +451,64 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._error_label)
 
     def _auto_connect(self):
-        """Attempt to connect using resolved URL/token. Fails silently."""
+        """Attempt to connect using resolved URL/token. Fails silently.
+
+        If the initial connect leaves us unconnected, offer to start a local
+        biopb server as a last resort (see ``_maybe_offer_start_server``).
+        """
         try:
             self._connect()
         except Exception:
             logger.debug("Auto-connect failed", exc_info=True)
+
+        if not self._conn.is_connected:
+            self._maybe_offer_start_server()
+
+    def _maybe_offer_start_server(self):
+        """Offer to start a local biopb server when startup connect failed.
+
+        Last-resort fallback: if the configured URL is local and the ``biopb``
+        CLI is installed, ask the user whether to launch a server for them and,
+        if so, start it and reconnect. Skipped in headless/offscreen sessions
+        (CI, tests) where there is no one to answer the prompt.
+        """
+        if QApplication.platformName() == "offscreen":
+            return
+        if not self._conn.can_autostart_server():
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Start biopb server?",
+            f"Could not connect to {self._conn.url}.\n\n"
+            "The 'biopb' command-line tool is installed. Start a local "
+            "tensor server now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._clear_error()
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        try:
+            self._conn.start_local_server()
+        except Exception:
+            logger.exception("Failed to start local biopb server")
+            self._show_error("Failed to start local biopb server")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Connected: reflect the live connection in the UI.
+        self._server_input.setText(self._conn.url)
+        if self._conn.token:
+            self._token_input.setText(self._conn.token)
+        if not self._sources:
+            self._show_error("No sources found on server")
+            return
+        self._build_and_display_tree()
+        self._refresh_button.setEnabled(True)
 
     def _toggle_token_visibility(self):
         """Toggle token field visibility between password and normal mode."""

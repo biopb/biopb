@@ -1,4 +1,4 @@
-# biopb-mcp : agentic workflow of bio-image analysis
+# biopb-mcp
 
 [![License MIT](https://img.shields.io/pypi/l/biopb-mcp.svg?color=green)](https://github.com/biopb/biopb-mcp/raw/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/biopb-mcp.svg?color=green)](https://pypi.org/project/biopb-mcp)
