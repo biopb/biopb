@@ -571,7 +571,7 @@ def deserialize_image_data(
 
 def normalize_array_dims(
     arr: Union[np.ndarray, da.Array],
-    dim_labels: Optional[Sequence[str]],
+    dim_labels: Sequence[str],
     target_dim_labels: Sequence[str],
 ) -> Union[np.ndarray, da.Array]:
     """Normalize array dimensions to match target dimension labels.
@@ -596,8 +596,8 @@ def normalize_array_dims(
             or if a dimension exists in dim_labels but not target_dim_labels
             with size > 1 (cannot squeeze non-singleton dimension).
     """
-    if dim_labels is None:
-        raise ValueError("dim_labels is None, cannot normalize array dimensions")
+    if not dim_labels:
+        raise ValueError("no dim_labels, cannot normalize array dimensions")
 
     dim_labels = list(dim_labels)
     target_dim_labels = list(target_dim_labels)

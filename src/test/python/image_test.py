@@ -727,7 +727,7 @@ def test_normalize_array_dims_none_raises():
     """Test that None dim_labels raises ValueError."""
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
-    with pytest.raises(ValueError, match="dim_labels is None"):
+    with pytest.raises(ValueError, match="no dim_labels"):
         normalize_array_dims(arr, None, ['Y', 'X', 'C'])
 
 
