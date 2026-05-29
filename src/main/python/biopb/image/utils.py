@@ -5,8 +5,11 @@ import dask.array as da
 from typing import Optional, Sequence, Tuple, Union
 
 from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData, Tensor
-from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.serialized_pb2 import SerializedTensor
+# NOTE: TensorFlightClient is imported lazily inside the lazy_data branch below.
+# It pulls in pyarrow, whose compiled SSE4.2 baseline SIGILLs on pre-SSE4.2 CPUs
+# (e.g. old AMD Opterons). Keeping it out of the module top lets eager/pixels
+# data paths work on such hardware.
 
 
 def _canonicalize_dtype(dtype_str: str) -> str:
@@ -550,6 +553,7 @@ def deserialize_image_data(
     if data_type == 'eager_data':
         return _np_from_pb(image_data.eager_data)
     elif data_type == 'lazy_data':
+        from biopb.tensor.client import TensorFlightClient
         return TensorFlightClient.tensor_from_pb(
             image_data.lazy_data,
             cache_bytes=cache_bytes,

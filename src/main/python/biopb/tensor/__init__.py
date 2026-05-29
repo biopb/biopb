@@ -30,8 +30,22 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
-# Import client
-from biopb.tensor.client import TensorFlightClient, make_debug_serialized_tensor
+# Import client lazily. biopb.tensor.client imports pyarrow at module load, and
+# pyarrow's compiled SSE4.2 baseline raises SIGILL on pre-SSE4.2 CPUs (e.g. old
+# AMD Opterons). PEP 562 module __getattr__ keeps `from biopb.tensor import
+# TensorFlightClient` working while deferring the pyarrow import until the client
+# (i.e. the lazy/Flight data path) is actually used.
+_LAZY_CLIENT_EXPORTS = ("TensorFlightClient", "make_debug_serialized_tensor")
+
+
+def __getattr__(name):
+    if name in _LAZY_CLIENT_EXPORTS:
+        from biopb.tensor import client
+
+        for attr in _LAZY_CLIENT_EXPORTS:
+            globals()[attr] = getattr(client, attr)
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Proto messages

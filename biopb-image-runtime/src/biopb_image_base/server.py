@@ -542,6 +542,20 @@ def create_server(
     return server, token_str, health_servicer
 
 
+def _pyarrow_available() -> bool:
+    """True if pyarrow can be imported.
+
+    The tensor cache (lazy data side channel) is built on Arrow Flight and needs
+    pyarrow. On builds for old CPUs without SSE4.2/AVX, pyarrow is removed (its
+    wheels SIGILL on import there -- see cellpose/BUILD_NO_SSE42.md), so the side
+    channel must not be started. find_spec only locates the module; it does not
+    import it, so this is safe even on a CPU that cannot run pyarrow.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("pyarrow") is not None
+
+
 def run_server(
     servicer,
     port: int = 50051,
@@ -600,7 +614,18 @@ def run_server(
 
     tensor_cache = None
     external_tensor_server = os.environ.get(_TENSOR_SERVER_URL_ENV)
-    if external_tensor_server:
+    if (external_tensor_server or cache_dir is not None) and not _pyarrow_available():
+        # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
+        # unavailable. Do not start the tensor server -- it would crash. Lazy
+        # (dask) requests will be cleanly rejected by the servicer instead.
+        logger.warning(
+            "Tensor cache (lazy data side channel) was requested "
+            f"({'env ' + _TENSOR_SERVER_URL_ENV if external_tensor_server else 'cache_dir'}) "
+            "but pyarrow is not available -- this looks like a build for a CPU "
+            "without SSE4.2/AVX. Disabling the tensor server; only eager image "
+            "data is supported and lazy (dask) input/output will be rejected."
+        )
+    elif external_tensor_server:
         tensor_cache = ExternalTensorCache(external_tensor_server)
         logger.info(f"Using external tensor server for lazy uploads: {external_tensor_server}")
     elif cache_dir is not None:

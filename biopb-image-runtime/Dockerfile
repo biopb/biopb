@@ -1,6 +1,7 @@
 # Dockerfile for biopb.image gRPC services
 # Build context: repo root
-# Requires: wheels/biopb-*.whl (build wheel first with: pip wheel . --no-deps -w wheels/)
+# Requires: wheels/biopb-*.whl and wheels/biopb_tensor_server-*.whl
+#   Build them with: biopb-image-runtime/scripts/build.sh (builds from latest git tags by default)
 #
 # The image is a base image for derived biopb.image services.
 # It does not define a default entrypoint; derived images must provide one.
@@ -30,15 +31,12 @@ ENV PATH="$PATH:$HOME/.local/bin"
 COPY biopb-image-runtime/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt && rm requirements.txt
 
-# Install biopb wheel with tensor extras (must be pre-built in wheels/ directory)
-COPY wheels/biopb-*.whl /tmp/
-RUN WHL_PATH=$(ls /tmp/biopb-*.whl) && \
-    pip install --no-cache-dir "${WHL_PATH}[tensor]" && rm /tmp/*.whl
-
-# Install tensor-server (for embedded cache support)
-COPY wheels/biopb_tensor_server-*.whl /tmp/
-RUN WHL_PATH=$(ls /tmp/biopb_tensor_server-*.whl) && \
-    pip install --no-cache-dir "${WHL_PATH}[tensor]" && rm /tmp/*.whl
+# Install biopb and biopb-tensor-server from pre-built wheels
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir \
+        "$(ls /tmp/wheels/biopb-*.whl)[tensor]" \
+        "$(ls /tmp/wheels/biopb_tensor_server-*.whl)[tensor]" \
+    && rm -rf /tmp/wheels
 
 WORKDIR /app
 

@@ -440,7 +440,7 @@ def test_deserialize_image_data_lazy_data():
     mock_dask_arr.shape = (64, 64)
     mock_dask_arr.dtype = np.uint8
 
-    with patch("biopb.image.utils.TensorFlightClient.tensor_from_pb", return_value=mock_dask_arr):
+    with patch("biopb.tensor.client.TensorFlightClient.tensor_from_pb", return_value=mock_dask_arr):
         result = deserialize_image_data(image_data)
 
         # Should return the mocked dask array
@@ -614,7 +614,7 @@ def test_deserialize_image_data_cache_bytes_parameter():
 
     mock_dask_arr = MagicMock()
 
-    with patch("biopb.image.utils.TensorFlightClient.tensor_from_pb") as mock_tensor_from_pb:
+    with patch("biopb.tensor.client.TensorFlightClient.tensor_from_pb") as mock_tensor_from_pb:
         mock_tensor_from_pb.return_value = mock_dask_arr
 
         # Call with custom cache_bytes
