@@ -36,12 +36,10 @@ RUN WHL_PATH=$(ls /tmp/biopb-*.whl) && \
     pip install --no-cache-dir "${WHL_PATH}[tensor]" && rm /tmp/*.whl
 
 # Install tensor-server (for embedded cache support)
-COPY biopb-tensor-server/pyproject.toml ./tensor-server/pyproject.toml
-COPY biopb-tensor-server/VERSION ./tensor-server/VERSION
-COPY biopb-tensor-server/build_version.py ./tensor-server/build_version.py
-COPY biopb-tensor-server/biopb_tensor_server ./tensor-server/biopb_tensor_server
-WORKDIR /app/tensor-server
-RUN pip install --no-cache-dir "."
+COPY wheels/biopb_tensor_server-*.whl /tmp/
+RUN WHL_PATH=$(ls /tmp/biopb_tensor_server-*.whl) && \
+    pip install --no-cache-dir "${WHL_PATH}[tensor]" && rm /tmp/*.whl
+
 WORKDIR /app
 
 # Copy base utilities (includes mock_servicer for tests and explicit dev use)

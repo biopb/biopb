@@ -23,8 +23,11 @@ from biopb.image.roi_pb2 import ROI, Rectangle, Mask, Mesh, Polygon, Point
 
 # Utility functions for image data serialization/deserialization
 from biopb.image.utils import (
-    deserialize_to_numpy,
-    serialize_from_numpy,
+    deserialize_to_numpy, # deprecated, use deserialize_image_data_to_numpy instead
+    serialize_from_numpy, # deprecated, use serialize_from_numpy_to_image_data instead
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
+    get_image_data_shape,
+    get_image_data_dim_labels,
+    normalize_array_dims,
 )

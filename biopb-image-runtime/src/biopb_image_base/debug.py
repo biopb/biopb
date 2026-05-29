@@ -10,9 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 import threading
 
-
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class ServiceStats:

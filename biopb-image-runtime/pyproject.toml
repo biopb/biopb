@@ -11,6 +11,7 @@ description = "Base utilities for biopb.image gRPC services"
 readme = "README.md"
 license = "MIT"
 dependencies = [
+  "biopb[tensor]",
   "grpcio",
   "grpcio-health-checking",
   "protobuf",
