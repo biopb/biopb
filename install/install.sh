@@ -123,6 +123,136 @@ _pick_data_dir() {
     fi
 }
 
+# Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
+# Cursor, …). Uses jq to merge when present; otherwise creates the file if absent,
+# or leaves an existing one untouched and tells the user to add biopb by hand.
+# Usage: _mcp_json_merge <config-file> <command> <label>
+_mcp_json_merge() {
+    local file="$1" cmd="$2" label="$3"
+    mkdir -p "$(dirname "$file")"
+
+    if [ -f "$file" ]; then
+        if command -v jq &>/dev/null; then
+            local tmp="$file.biopb.tmp"
+            if jq --arg c "$cmd" '.mcpServers.biopb = {command: $c, args: []}' "$file" > "$tmp" 2>/dev/null; then
+                mv "$tmp" "$file"
+                _ok "$label: registered biopb (merged into $file)"
+            else
+                rm -f "$tmp"
+                _warn "$label: could not merge $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
+            fi
+        else
+            _warn "$label: $file already exists and jq is not installed"
+            _info "Add the biopb entry manually (see $CONFIG_DIR/mcp.json)"
+        fi
+        return
+    fi
+
+    cat > "$file" << EOF
+{
+  "mcpServers": {
+    "biopb": {
+      "command": "$cmd",
+      "args": []
+    }
+  }
+}
+EOF
+    _ok "$label: created $file"
+}
+
+# Detect installed agent systems and register the biopb MCP server with each.
+# Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
+# If nothing is detected, prints guidance so the user can wire it up themselves.
+_setup_mcp() {
+    local mcp_cmd
+    mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
+
+    # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
+    # Preserved if it already exists so the user's tweaks survive a rerun.
+    local mcp_config_dir="$HOME/.config/biopb-mcp"
+    local mcp_config="$mcp_config_dir/config.json"
+    mkdir -p "$mcp_config_dir"
+    if [ -f "$mcp_config" ]; then
+        _ok "biopb-mcp config exists at $mcp_config (preserved)"
+    else
+        cat > "$mcp_config" << 'EOF'
+{
+  "mcp": {
+    "process_image_servers": [
+      "grpcs://cellpose.biopb.org:443"
+    ]
+  }
+}
+EOF
+        _ok "Created biopb-mcp config: $mcp_config"
+    fi
+
+    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
+    cat > "$CONFIG_DIR/mcp.json" << EOF
+{
+  "mcpServers": {
+    "biopb": {
+      "command": "$mcp_cmd",
+      "args": []
+    }
+  }
+}
+EOF
+    _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+
+    local detected=0
+
+    # --- Claude Code (managed through the `claude` CLI) ---
+    if command -v claude &>/dev/null; then
+        detected=1
+        if claude mcp get biopb &>/dev/null; then
+            _ok "Claude Code: biopb already registered"
+        elif claude mcp add --scope user biopb -- "$mcp_cmd" &>/dev/null; then
+            _ok "Claude Code: registered biopb (user scope)"
+        else
+            _warn "Claude Code detected but registration failed — add it manually:"
+            _cmd "claude mcp add --scope user biopb -- $mcp_cmd"
+        fi
+    fi
+
+    # --- Hermes (NousResearch) — YAML config at ~/.hermes/config.yaml ---
+    if [ -d "$HOME/.hermes" ]; then
+        detected=1
+        if [ -f "$HOME/.hermes/config.yaml" ] && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
+            _ok "Hermes: biopb already present in config.yaml"
+        else
+            _ok "Hermes detected"
+            _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
+            printf "    %sbiopb:\n      command: \"%s\"\n      args: []%s\n" "$DIM" "$mcp_cmd" "$RESET"
+        fi
+    fi
+
+    # --- Claude Desktop ---
+    local cd_cfg=""
+    case "$PLATFORM" in
+        macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
+        Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
+    esac
+    if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
+        detected=1
+        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop"
+    fi
+
+    # --- Cursor ---
+    if [ -d "$HOME/.cursor" ]; then
+        detected=1
+        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor"
+    fi
+
+    if [ "$detected" = "0" ]; then
+        _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes)."
+        _info "To use biopb, point your MCP client at this command:"
+        _cmd "$mcp_cmd"
+        _info "A ready-to-use definition is at: $CONFIG_DIR/mcp.json"
+    fi
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -143,7 +273,7 @@ install_biopb() {
     echo ""
 
     # ===== 0. System Check =====
-    _step "[0/5] Checking system..."
+    _step "[0/6] Checking system..."
 
     OS=$(uname -s)
     ARCH=$(uname -m)
@@ -195,11 +325,11 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    read -r INSTALL_WEBAPP INSTALL_NAPARI <<< "$(_checkbox "Built-in data browser" "napari-biopb")"
+    read -r INSTALL_WEBAPP INSTALL_MCP <<< "$(_checkbox "Built-in data browser" "biopb-mcp (MCP server)")"
     echo ""
 
     # ===== 1. Install uv + buf (if needed) =====
-    _step "[1/5] Ensuring build tools..."
+    _step "[1/6] Ensuring build tools..."
 
     export PATH="$HOME/.local/bin:$PATH"
     if ! command -v uv &>/dev/null; then
@@ -226,11 +356,11 @@ install_biopb() {
     unset BUF_VERSION BUF_BIN
 
     # ===== 2. Python =====
-    _step "[2/5] Ensuring Python..."
+    _step "[2/6] Ensuring Python..."
 
-    # napari-biopb requires Python >= 3.10; otherwise 3.8 is sufficient.
+    # biopb-mcp requires Python >= 3.10; otherwise 3.8 is sufficient.
     MIN_MINOR=8
-    if [ "$INSTALL_NAPARI" = "1" ]; then
+    if [ "$INSTALL_MCP" = "1" ]; then
         MIN_MINOR=10
     fi
 
@@ -256,7 +386,7 @@ install_biopb() {
     fi
 
     # ===== 3. Install biopb packages =====
-    _step "[3/5] Installing biopb packages..."
+    _step "[3/6] Installing biopb packages..."
 
     _info "Installing biopb SDK..."
     uv tool install --upgrade \
@@ -266,21 +396,21 @@ install_biopb() {
     uv tool install --upgrade \
         "biopb-tensor-server[web,ome-zarr,aics,medical,ndtiff] @ $REPO#subdirectory=biopb-tensor-server"
 
-    if [ "$INSTALL_NAPARI" = "1" ]; then
-        _info "Installing napari-biopb..."
+    if [ "$INSTALL_MCP" = "1" ]; then
+        _info "Installing biopb-mcp..."
         if command -v napari &>/dev/null; then
-            uv tool install --upgrade napari --with napari-biopb
+            uv tool install --upgrade napari --with biopb-mcp
         else
-            uv tool install "napari[all]" --with napari-biopb
+            uv tool install "napari[all]" --with biopb-mcp
         fi
-        _ok "napari-biopb installed"
+        _ok "biopb-mcp installed"
     fi
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
 
     # ===== 4. Webapp =====
-    _step "[4/5] Installing data browser..."
+    _step "[4/6] Installing data browser..."
 
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
@@ -318,7 +448,7 @@ install_biopb() {
     fi
 
     # ===== 5. Config =====
-    _step "[5/5] Config..."
+    _step "[5/6] Config..."
 
     mkdir -p "$CONFIG_DIR"
     CONFIG_FILE="$CONFIG_DIR/biopb.toml"
@@ -346,11 +476,15 @@ install_biopb() {
 [server]
 host = "127.0.0.1"
 port = 8815
+aggressive_dir_pruning = true
 
 [cache]
 backend = "file"
 file_max_segment_mb = 256
 file_max_total_gb = 128
+
+[metadata_db]
+enabled = true
 
 [[sources]]
 url = "$TOML_DATA_DIR"
@@ -359,35 +493,54 @@ EOF
         _ok "Created: $CONFIG_FILE"
     fi
 
+    # ===== 6. Wire biopb-mcp into the user's agent system =====
+    _step "[6/6] Configuring MCP client..."
+
+    if [ "$INSTALL_MCP" = "1" ]; then
+        _setup_mcp
+    else
+        _info "Skipped (biopb-mcp not installed)"
+    fi
+
     # ===== Summary =====
     printf "\n%s%s%s\n" "${BOLD}" "${YELLOW}" "=== Installation Complete ===${YELLOW}"
 
-    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch:${RESET}"
-    _cmd "biopb server start"
-    echo ""
-
-    if [ "$INSTALL_NAPARI" = "1" ]; then
-        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch napari-biopb:${RESET} as an MCP server:"
+    if [ "$INSTALL_MCP" = "1" ]; then
+        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch biopb-mcp as an MCP server directly:${RESET}"
         _cmd "biopb-mcp"
         echo ""
     fi
 
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_NAPARI" = "0" ]; then
+    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch the data server only without other components:${RESET}"
+    _cmd "biopb server start"
+    echo ""
+
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ]; then
         printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Optional components:${RESET}"
-        if [ "$INSTALL_WEBAPP" = "0" ]; then
-            _note "Data browser not installed — rerun this script to install"
-        fi
-        if [ "$INSTALL_NAPARI" = "0" ]; then
-            _note "napari-biopb not installed"
-            _note "to install separately:"
-            _cmd "         uv tool install \"napari[all]\" --with napari-biopb"
-            _note "or into an existing napari env:"
-            _cmd "         pip install napari-biopb"
-        fi
+    fi
+    if [ "$INSTALL_WEBAPP" = "0" ]; then
+        _note "Data browser not installed — rerun this script to install"
+    else
+        _ok "Data browser available at http://localhost:8815"
+    fi
+    if [ "$INSTALL_MCP" = "0" ]; then
+        _note "biopb-mcp not installed"
+        _note "to install separately:"
+        _cmd "         uv tool install \"napari[all]\" --with biopb-mcp"
+        _note "or into an existing biopb env:"
+        _cmd "         pip install biopb-mcp"
+    fi
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ]; then
         echo ""
     fi
 
-    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Configuration file available at:${RESET}"
+    if [ "$INSTALL_MCP" = "1" ]; then
+        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "biopb-mcp configuration file at:${RESET}"
+        _cmd "         $HOME/.config/biopb-mcp/config.json"
+        echo ""
+    fi
+
+    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Data server configuration file at:${RESET}"
     _cmd "         $CONFIG_FILE"
     echo ""
 

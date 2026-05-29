@@ -1,12 +1,21 @@
-# BioPB
+# BioPB - AI-assisted bio-image analysis
 
-_Distributed computing for bio-imaging data._
+[![License MIT](https://img.shields.io/pypi/l/biopb.svg?color=green)](https://github.com/biopb/biopb/raw/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/biopb.svg?color=green)](https://pypi.org/project/biopb)
+[![Sonatype Central](https://maven-badges.sml.io/sonatype-central/io.github.jiyuuchc/biopb/badge.svg)](https://maven-badges.sml.io/sonatype-central/io.github.jiyuuchc/biopb/)
+[![Python Tests](https://github.com/biopb/biopb/actions/workflows/python-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
+[![Java Tests](https://github.com/biopb/biopb/actions/workflows/java-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
 
-BioPB provides a standardized way to share multi-dimensional microscopy datasets, analysis algorithms, and computational results in a network-transparent and language-agnostic manner. 
+The repo provides the core harness framework of the biopb project, providing a standardized way to serve multi-dimensional image datasets, analysis algorithms, and computational results in a network-transparent and language-agnostic manner. 
 
-## Biopb-Tensor
+## Quick Start
+```sh
+curl -fsSL https://biopb.org/install.sh | bash
+```
 
-A blazing-fast microscopy data server for sharing your lab's petabyte-scale datasets to team members and/or collaborators. [Read More...](biopb-tensor-server/README.md)
+## biopb-tensor
+
+A blazing-fast imaging data server for sharing your lab's petabyte-scale datasets to LLM agents and human team members alike. [Read More...](biopb-tensor-server/README.md)
 
   - **Uniform Representation**: all source data mapped to a _multi-resolution_ and _lazy-read_ array for client access
   - **Multi-language**: dask array for Python and ImgLib2.CellImg for Java
@@ -15,20 +24,10 @@ A blazing-fast microscopy data server for sharing your lab's petabyte-scale data
   - **On-the-fly Build**: keep your data in original format (.zvi, ndtiff etc). No staging or on-boarding process needed
   - **Built-in Viewer**: browse all your data with any browser (e.g., on an ipad)
 
-### Quick Start
-```sh
-curl -fsSL https://biopb.org/install.sh | bash
-biopb server start
-```
-Point your browser to the url printed in log
 
-## Biopb-Image
+## biopb-image-runtime
 
-Deploy complex image processing algorithms (e.g., large deep-learning models) on the network as services, including pre-built containers for popular algorithms (e.g., segmentation). [Read More...](https://github.com/biopb/biopb-server)
-
-## Napari-Biopb
-
-GUI app for the end-users. The power of biopb in a familiar interface. [Read More...](https://github.com/biopb/napari-biopb)
+Deploy complex image processing algorithms (e.g., large deep-learning models) on the network as services. [Read More...](biopb-image-runtime/README.md)
 
 ## SDK
 
@@ -49,3 +48,13 @@ pip install biopb[tensor]
   <version>CURRENT_VERSION</version>
 </dependency>
 ```
+
+## Related Projects in BioPB
+
+### biopb-mcp
+
+The MCP component that talks to the LLM agent directly and orchastrate the cooperation between the data/alogorthm servers, the LLM agent, the user, and napari display surface. [Read More...](https://github.com/biopb/biopb-mcp)
+
+### biopb-servers
+
+Specific implementations of biopb-image-runtimes. [Read More...](https://github.com/biopb/biopb-server)
