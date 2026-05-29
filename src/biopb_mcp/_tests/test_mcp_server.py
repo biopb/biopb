@@ -127,7 +127,7 @@ class TestExecuteCode:
     def test_prepends_refresh_prefix(self, server_with_host):
         _server.execute_code("print('hi')")
         code = server_with_host.execute.call_args[0][0]
-        assert code.startswith("client = _tbw._client")
+        assert code.startswith("client = _conn.client")
         assert "print('hi')" in code
 
     def test_formats_stdout_and_result(self, server_with_host):

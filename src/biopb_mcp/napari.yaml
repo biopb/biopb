@@ -6,13 +6,13 @@ categories: ["Utilities", "Image Processing"]
 contributions:
   commands:
     - id: biopb-mcp.make_tensor_browser_widget
-      python_name: biopb_mcp:TensorBrowserWidget
+      python_name: biopb_mcp.tensor_browser:TensorBrowserWidget
       title: Tensor Browser
     - id: biopb-mcp.make_object_detection_widget
-      python_name: biopb_mcp:ObjectDetectionWidget
+      python_name: biopb_mcp.image_processing:ObjectDetectionWidget
       title: Object Detection
     - id: biopb-mcp.make_image_processing_widget
-      python_name: biopb_mcp:ImageProcessingWidget
+      python_name: biopb_mcp.image_processing:ImageProcessingWidget
       title: Image Processing
   widgets:
     - command: biopb-mcp.make_tensor_browser_widget

@@ -55,6 +55,7 @@ def _bootstrap_impl():
     from IPython import get_ipython
 
     from .._config import load_config
+    from .._connection import TensorConnection
     from ..tensor_browser import TensorBrowserWidget
     from ._helpers import patch_viewer_load_tensor
     from ._process_ops import build_ops
@@ -70,13 +71,16 @@ def _bootstrap_impl():
     # 2. Configure dask in the compute process.
     dask_client = _configure_dask(mcp_config)
 
-    # 3. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
+    # 3. Data-access service, shared by the widget and the agent namespace.
+    conn = TensorConnection(config)
+
+    # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
     viewer = napari.Viewer()
-    tbw = TensorBrowserWidget(viewer)
+    tbw = TensorBrowserWidget(viewer, connection=conn)
     viewer.window.add_dock_widget(tbw, name="Tensor Browser")
 
-    # 4. ProcessImage ops: thin Run() callables for each configured servicer.
-    #    client_getter reads tbw._client lazily so the async-connecting tensor
+    # 5. ProcessImage ops: thin Run() callables for each configured servicer.
+    #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
     timeout_config = config.get("timeout", {})
     grpc_config = config.get("grpc", {})
@@ -87,7 +91,7 @@ def _bootstrap_impl():
     ]
     try:
         ops = build_ops(
-            client_getter=lambda: tbw._client,
+            client_getter=lambda: conn.client,
             server_urls=mcp_config.get("process_image_servers", []),
             op_names_timeout=timeout_config.get("get_op_names", 10.0),
             run_timeout=timeout_config.get("process_image", 300.0),
@@ -97,9 +101,9 @@ def _bootstrap_impl():
         logger.exception("Failed to build ProcessImage ops")
         ops = {}
 
-    # 5. Namespace for execute_code.  client is refreshed per-call by the
-    #    server (the widget connects asynchronously).
-    patch_viewer_load_tensor(viewer, tbw)
+    # 6. Namespace for execute_code.  client is refreshed per-call by the
+    #    server (the connection service connects asynchronously).
+    patch_viewer_load_tensor(viewer, conn)
     ip.user_ns.update(
         {
             "viewer": viewer,
@@ -107,7 +111,7 @@ def _bootstrap_impl():
             "da": da,
             "client": None,
             "ops": ops,
-            "_tbw": tbw,
+            "_conn": conn,
             "_dask_client": dask_client,
         }
     )

@@ -4,7 +4,7 @@ import sys
 import pytest
 import numpy as np
 
-from biopb_mcp import ObjectDetectionWidget
+from biopb_mcp.image_processing import ObjectDetectionWidget
 
 
 # Skip on macOS CI due to OpenGL/vispy headless issues
@@ -25,7 +25,10 @@ def test_widget_instantiation(make_napari_viewer, request):
 def test_widget_basic():
     """Basic test that doesn't require a viewer (runs on all platforms)."""
     # Test that the widget module can be imported
-    from biopb_mcp import ObjectDetectionWidget, ImageProcessingWidget
+    from biopb_mcp.image_processing import (
+        ImageProcessingWidget,
+        ObjectDetectionWidget,
+    )
 
     assert ObjectDetectionWidget is not None
     assert ImageProcessingWidget is not None

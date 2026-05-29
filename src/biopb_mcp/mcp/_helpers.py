@@ -5,7 +5,6 @@ calls ``viewer.load_tensor("source_id")``.
 """
 
 import logging
-from typing import Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -25,14 +24,14 @@ def _tensor_short_name(array_id: str) -> str:
     return parts[-1] if parts else array_id
 
 
-def patch_viewer_load_tensor(viewer, widget):
+def patch_viewer_load_tensor(viewer, connection):
     """Monkey-patch ``load_tensor`` onto *viewer*, reading client/sources from
-    the live ``TensorBrowserWidget`` *widget*."""
+    the live ``TensorConnection`` *connection*."""
 
     def load_tensor(
         source_id: str,
-        tensor_id: Optional[str] = None,
-        name: Optional[str] = None,
+        tensor_id: str | None = None,
+        name: str | None = None,
     ) -> str:
         """Load a tensor dataset into the viewer.
 
@@ -47,14 +46,14 @@ def patch_viewer_load_tensor(viewer, widget):
         """
         from .._tensor_utils import build_pyramid_levels
 
-        client = widget._client
+        client = connection.client
         if client is None:
             raise RuntimeError(
                 "No tensor server connected. "
                 "Open the Tensor Browser widget and connect first."
             )
 
-        sources = widget._sources or {}
+        sources = connection.sources or {}
         src = sources.get(source_id)
         if src is None:
             # Not in the (possibly truncated) cached catalog — fetch the

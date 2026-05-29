@@ -9,11 +9,9 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
-import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
-from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
@@ -32,16 +30,13 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .._config import load_config, save_config
+from .._connection import TensorConnection
 from .._tensor_utils import build_pyramid_levels
 
 if TYPE_CHECKING:
     import napari
 
 logger = logging.getLogger(__name__)
-
-# Threshold for switching to server-side SQL query
-SERVER_QUERY_THRESHOLD = 1000
 
 
 # ==============================================================================
@@ -58,7 +53,7 @@ class _TreeNode:
         name: str,
         node_type: str,  # "folder" or "source"
         depth: int,
-        source: Optional[DataSourceDescriptor] = None,
+        source: DataSourceDescriptor | None = None,
     ):
         self.node_id = node_id
         self.name = name
@@ -179,7 +174,7 @@ def _filter_tree(
     node: _TreeNode,
     matching_ids: Set[str],
     expanded_folders: Set[str],
-) -> Optional[_TreeNode]:
+) -> _TreeNode | None:
     """Filter tree to show only matching sources, auto-expand folders."""
     if node.node_type == "source":
         if node.node_id in matching_ids:
@@ -254,8 +249,8 @@ class MetadataDialog(QDialog):
         self,
         parent: QWidget,
         source: DataSourceDescriptor,
-        tensor_id: Optional[str] = None,
-        metadata: Optional[Dict] = None,
+        tensor_id: str | None = None,
+        metadata: Dict | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Metadata")
@@ -326,23 +321,6 @@ class MetadataDialog(QDialog):
         layout.addWidget(close_btn)
 
 
-_DEFAULT_URL = "grpc://localhost:8815"
-
-
-def _resolve_connection(config: dict) -> Tuple[str, Optional[str]]:
-    """Resolve tensor server URL and token.
-
-    Fallback order: environment variables -> config file -> default.
-    """
-    url = (
-        os.environ.get("BIOPB_TENSOR_URL")
-        or config.get("tensor_browser", {}).get("server_url")
-        or _DEFAULT_URL
-    )
-    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
-    return url, token
-
-
 # ==============================================================================
 # Tensor Browser Widget (Pure Qt)
 # ==============================================================================
@@ -351,23 +329,19 @@ def _resolve_connection(config: dict) -> Tuple[str, Optional[str]]:
 class TensorBrowserWidget(QWidget):
     """Widget to browse and load tensors from a TensorFlight server."""
 
-    def __init__(self, viewer: "napari.viewer.Viewer"):
+    def __init__(
+        self,
+        viewer: "napari.viewer.Viewer",
+        connection: TensorConnection | None = None,
+    ):
         super().__init__()
         self._viewer = viewer
-        self._client: Optional[TensorFlightClient] = None
-        self._sources: Dict[str, DataSourceDescriptor] = {}
-        self._selected_source_id: Optional[str] = None
-        self._selected_tensor_id: Optional[str] = None
-        self._use_server_query = False
+        # The data layer is owned by a TensorConnection service that this
+        # widget consumes. When constructed standalone (no MCP), build our own.
+        self._conn = connection or TensorConnection()
+        self._selected_source_id: str | None = None
+        self._selected_tensor_id: str | None = None
         self._expanded_folders: Set[str] = set()
-
-        # Load persisted config
-        self._config = load_config()
-
-        # Resolve connection params: env -> config -> default
-        self._resolved_url, self._resolved_token = _resolve_connection(
-            self._config
-        )
 
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -375,6 +349,20 @@ class TensorBrowserWidget(QWidget):
 
         # Auto-connect on next event loop tick
         QTimer.singleShot(0, self._auto_connect)
+
+    # The client and source catalog live on the connection service; expose them
+    # read-only so the widget's internal read sites stay unchanged.
+    @property
+    def _client(self):
+        return self._conn.client
+
+    @property
+    def _sources(self):
+        return self._conn.sources
+
+    @property
+    def _use_server_query(self):
+        return self._conn.use_server_query
 
     def _setup_ui(self):
         """Build the UI layout."""
@@ -386,7 +374,7 @@ class TensorBrowserWidget(QWidget):
         server_layout = QHBoxLayout()
         server_layout.addWidget(QLabel("Server:"))
         self._server_input = QLineEdit()
-        self._server_input.setText(self._resolved_url)
+        self._server_input.setText(self._conn.url)
         self._server_input.setPlaceholderText("Flight server URL")
         server_layout.addWidget(self._server_input)
         layout.addLayout(server_layout)
@@ -395,8 +383,8 @@ class TensorBrowserWidget(QWidget):
         token_layout = QHBoxLayout()
         token_layout.addWidget(QLabel("Token:"))
         self._token_input = QLineEdit()
-        if self._resolved_token:
-            self._token_input.setText(self._resolved_token)
+        if self._conn.token:
+            self._token_input.setText(self._conn.token)
         self._token_input.setPlaceholderText("optional")
         self._token_input.setEchoMode(QLineEdit.Password)
         self._show_token_btn = QPushButton("Show")
@@ -487,20 +475,6 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setVisible(False)
         self._error_label.setText("")
 
-    def _save_config(self):
-        """Save current server URL to config file.
-
-        Reloads from disk first so keys this widget does not own (e.g.
-        mcp.process_image_servers) are not clobbered by a stale snapshot.
-        """
-        config = load_config()
-        config.setdefault("tensor_browser", {})
-        config["tensor_browser"][
-            "server_url"
-        ] = self._server_input.text().strip()
-        save_config(config)
-        self._config = config
-
     def _connect(self):
         """Connect to server and list available sources."""
         self._clear_error()
@@ -512,11 +486,8 @@ class TensorBrowserWidget(QWidget):
         try:
             location = self._server_input.text().strip()
             token = self._token_input.text().strip() or None
-            self._client = TensorFlightClient(location, token=token)
-            sources = self._client.list_sources()
-
-            self._sources = sources
-            self._use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
+            # Connection service owns the client/sources and persists the URL.
+            sources = self._conn.connect(location, token)
 
             if self._use_server_query:
                 self._filter_input.setPlaceholderText("Search (SQL filter)")
@@ -531,9 +502,6 @@ class TensorBrowserWidget(QWidget):
             self._build_and_display_tree()
             self._refresh_button.setEnabled(True)
 
-            # Save server URL to config
-            self._save_config()
-
             if self._use_server_query:
                 logger.info(
                     "Large catalog (%d sources), server-side SQL filter enabled",
@@ -541,25 +509,22 @@ class TensorBrowserWidget(QWidget):
                 )
 
         except Exception:
+            # The connection service has already reset its client/sources.
             self._show_error("Connection failed")
             logger.exception("Failed to connect to TensorFlight server")
             self._tree_widget.clear()
-            self._client = None
-            self._sources = {}
             self._refresh_button.setEnabled(False)
 
     def _refresh(self):
         """Refresh the source list from server."""
         self._clear_error()
 
-        if self._client is None:
+        if not self._conn.is_connected:
             self._show_error("Not connected")
             return
 
         try:
-            sources = self._client.list_sources()
-            self._sources = sources
-            self._use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
+            sources = self._conn.refresh()
 
             if not sources:
                 self._show_error("No sources found on server")
@@ -577,7 +542,7 @@ class TensorBrowserWidget(QWidget):
             self._show_error("Refresh failed")
             logger.exception("Failed to refresh source list")
 
-    def _build_and_display_tree(self, filtered_ids: Optional[Set[str]] = None):
+    def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
         """Build tree from sources and display in widget."""
         self._tree_widget.clear()
 
@@ -833,7 +798,7 @@ class TensorBrowserWidget(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def _show_metadata_dialog(self, source_id: str, tensor_id: Optional[str]):
+    def _show_metadata_dialog(self, source_id: str, tensor_id: str | None):
         """Show metadata dialog for source/tensor."""
         src = self._sources.get(source_id)
         if not src:

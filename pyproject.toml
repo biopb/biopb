@@ -80,10 +80,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
 
-
 [tool.setuptools_scm]
 version_file = "src/biopb_mcp/_version.py"
-
 
 [tool.pytest.ini_options]
 qt_api = "pyqt6"

@@ -9,7 +9,6 @@ hard-restarted independently of this process.
 
 import logging
 import os
-from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
@@ -19,13 +18,13 @@ from ._kernel import KernelHost
 
 logger = logging.getLogger(__name__)
 
-_kernel_host: Optional[KernelHost] = None
+_kernel_host: KernelHost | None = None
 
 mcp = FastMCP("biopb-mcp")
 
 # Prepended to every execute_code call so client tracks the
-# asynchronously-connecting Tensor Browser widget.
-_REFRESH_PREFIX = "client = _tbw._client\n"
+# asynchronously-connecting tensor connection service.
+_REFRESH_PREFIX = "client = _conn.client\n"
 
 _PNG_DELIM = "<<PNG_B64>>"
 
@@ -91,12 +90,12 @@ except Exception:
 
 print("")
 print("## Tensor Server")
-_tc = _tbw._client
+_tc = _conn.client
 if _tc is not None:
     try:
         print("  connected: true")
         print("  health: " + str(_tc.health_check()))
-        print("  sources_cached: " + str(len(_tbw._sources or {})))
+        print("  sources_cached: " + str(len(_conn.sources or {})))
     except Exception as _e:
         print("  connected: true")
         print("  health_error: " + str(_e))
@@ -138,7 +137,7 @@ def _format_execute_result(res: dict) -> str:
     return "\n".join(parts) if parts else f"(status: {status})"
 
 
-def _extract_delimited(text: str, delimiter: str) -> Optional[str]:
+def _extract_delimited(text: str, delimiter: str) -> str | None:
     for line in text.splitlines():
         if line.startswith(delimiter):
             return line[len(delimiter) :]
