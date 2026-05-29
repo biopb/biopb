@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from napari_biopb.mcp import _server
+from biopb_mcp.mcp import _server
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):

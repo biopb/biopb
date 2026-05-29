@@ -23,7 +23,7 @@ def _render_meshes(
         from vedo import Mesh
     except ImportError:
         raise ImportError(
-            "vedo is required for 3D mesh rendering. Please install with `pip install napari-biopb[3d]`"
+            "vedo is required for 3D mesh rendering. Please install with `pip install biopb-mcp[3d]`"
         ) from None
 
     if post_process:

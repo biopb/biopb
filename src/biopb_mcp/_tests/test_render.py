@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from typing import List
 
-from napari_biopb.image_processing._render import (
+from biopb_mcp.image_processing._render import (
     _adjust_response_offset,
     _generate_label,
     _render_meshes,

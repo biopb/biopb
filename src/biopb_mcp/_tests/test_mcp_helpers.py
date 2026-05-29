@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from napari_biopb.mcp._helpers import patch_viewer_load_tensor
+from biopb_mcp.mcp._helpers import patch_viewer_load_tensor
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ class TestPatchViewerLoadTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "napari_biopb._tensor_utils.build_pyramid_levels",
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_load_tensor(viewer, widget)
@@ -91,7 +91,7 @@ class TestPatchViewerLoadTensor:
         widget._sources = {}
 
         with patch(
-            "napari_biopb._tensor_utils.build_pyramid_levels",
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[MagicMock()],
         ):
             patch_viewer_load_tensor(viewer, widget)
@@ -107,7 +107,7 @@ class TestPatchViewerLoadTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "napari_biopb._tensor_utils.build_pyramid_levels",
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_load_tensor(viewer, widget)
@@ -136,7 +136,7 @@ class TestPatchViewerLoadTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "napari_biopb._tensor_utils.build_pyramid_levels",
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_load_tensor(viewer, widget)
@@ -153,7 +153,7 @@ class TestPatchViewerLoadTensor:
 
         levels = [MagicMock(), MagicMock()]
         with patch(
-            "napari_biopb._tensor_utils.build_pyramid_levels",
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=levels,
         ):
             patch_viewer_load_tensor(viewer, widget)

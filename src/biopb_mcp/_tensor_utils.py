@@ -1,4 +1,4 @@
-"""Shared tensor utilities for napari-biopb.
+"""Shared tensor utilities for biopb-mcp.
 
 Functions for building pyramid levels and determining dimension indices,
 used by both the tensor browser widget and the MCP server.

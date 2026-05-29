@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
 
-from napari_biopb.image_processing._grpc import (
+from biopb_mcp.image_processing._grpc import (
     _encode_image,
     _estimate_chunk_memory_mb,
     _check_chunk_memory,
@@ -372,7 +372,7 @@ class TestGrpcObjectDetection:
         """Wrong dimensions for 2D mode raises ValueError."""
         # The function is wrapped in thread_worker, so we test the validation
         # by calling the underlying logic
-        from napari_biopb.image_processing._grpc import grpc_object_detection
+        from biopb_mcp.image_processing._grpc import grpc_object_detection
 
         # Create test data with wrong dimensions (3D data when expecting 2D)
         image_data = np.random.rand(2, 10, 100, 100, 1)  # 5D (3D mode) data
@@ -393,8 +393,8 @@ class TestGrpcObjectDetection:
         # Similar to above - documenting expected behavior
         pass
 
-    @patch("napari_biopb.image_processing._grpc._get_grpc_channel")
-    @patch("napari_biopb.image_processing._grpc.proto.ObjectDetectionStub")
+    @patch("biopb_mcp.image_processing._grpc._get_grpc_channel")
+    @patch("biopb_mcp.image_processing._grpc.proto.ObjectDetectionStub")
     def test_generator_yields_progress(
         self, mock_stub_class, mock_channel_func
     ):
@@ -612,7 +612,7 @@ class TestCheckChunkMemory:
         with pytest.raises(MemoryError, match="exceeds memory limit"):
             _check_chunk_memory(mock_chunk)
 
-    @patch("napari_biopb.image_processing._grpc.load_config")
+    @patch("biopb_mcp.image_processing._grpc.load_config")
     def test_custom_threshold(self, mock_load_config):
         """Custom thresholds from config are respected."""
         mock_load_config.return_value = {
@@ -628,7 +628,7 @@ class TestCheckChunkMemory:
         # Should not raise, but would warn
         _check_chunk_memory(chunk)
 
-    @patch("napari_biopb.image_processing._grpc.load_config")
+    @patch("biopb_mcp.image_processing._grpc.load_config")
     def test_custom_error_threshold_raises(self, mock_load_config):
         """Custom error threshold from config raises MemoryError."""
         mock_load_config.return_value = {

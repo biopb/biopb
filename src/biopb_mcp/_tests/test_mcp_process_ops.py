@@ -17,8 +17,8 @@ from biopb.image.utils import (
 )
 from biopb.tensor import SerializedTensor
 
-from napari_biopb.mcp import _process_ops
-from napari_biopb.mcp._process_ops import (
+from biopb_mcp.mcp import _process_ops
+from biopb_mcp.mcp._process_ops import (
     _build_op,
     _infer_dim_labels,
     _make_channel,

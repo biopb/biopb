@@ -20,7 +20,7 @@ METADATA_DATAS = []
 for pkg in [
     "imageio",
     "napari",
-    "napari-biopb",
+    "biopb-mcp",
     "biopb",
     "magicgui",
     "scikit-image",

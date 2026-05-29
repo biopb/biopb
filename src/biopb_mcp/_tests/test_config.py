@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from napari_biopb._config import (
+from biopb_mcp._config import (
     DEFAULT_CONFIG,
     get_default_config,
     get_grid_params,
@@ -24,7 +24,7 @@ def mock_config_dir(monkeypatch, tmp_path):
     import platformdirs
 
     monkeypatch.setattr(platformdirs, "user_config_dir", mock_user_config_dir)
-    return tmp_path / "napari-biopb"
+    return tmp_path / "biopb-mcp"
 
 
 class TestLoadConfig:

@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from napari_biopb._utils import _box_intersection, _filter_boxes
+from biopb_mcp._utils import _box_intersection, _filter_boxes
 
 
 class TestBoxIntersection:

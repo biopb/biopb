@@ -1,7 +1,7 @@
 """FastMCP server exposing the napari viewer through a child Jupyter kernel.
 
 The server runs in the foreground (uvicorn, streamable-http on
-127.0.0.1:<port>/mcp) and owns a :class:`~napari_biopb.mcp._kernel.KernelHost`.
+127.0.0.1:<port>/mcp) and owns a :class:`~biopb_mcp.mcp._kernel.KernelHost`.
 Every tool call is a round-trip into that kernel, where the napari viewer,
 dask, and the TensorFlightClient live.  The kernel can be interrupted or
 hard-restarted independently of this process.

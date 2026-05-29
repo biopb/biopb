@@ -1,0 +1,23 @@
+name: biopb-mcp
+display_name: BioPB
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+categories: ["Utilities", "Image Processing"]
+contributions:
+  commands:
+    - id: biopb-mcp.make_tensor_browser_widget
+      python_name: biopb_mcp:TensorBrowserWidget
+      title: Tensor Browser
+    - id: biopb-mcp.make_object_detection_widget
+      python_name: biopb_mcp:ObjectDetectionWidget
+      title: Object Detection
+    - id: biopb-mcp.make_image_processing_widget
+      python_name: biopb_mcp:ImageProcessingWidget
+      title: Image Processing
+  widgets:
+    - command: biopb-mcp.make_tensor_browser_widget
+      display_name: Tensor Browser
+    - command: biopb-mcp.make_object_detection_widget
+      display_name: Object Detection
+    - command: biopb-mcp.make_image_processing_widget
+      display_name: Image Processing

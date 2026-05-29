@@ -1,5 +1,5 @@
 [project]
-name = "napari-biopb"
+name = "biopb-mcp"
 dynamic = ["version"]
 description = "Performing image analysis by visiting biopb endpoints"
 readme = "README.md"
@@ -56,16 +56,16 @@ mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel"]
 3d = ["vedo"] # 3d rendering from mesh
 
 [project.scripts]
-biopb-mcp = "napari_biopb.mcp.__main__:main"
+biopb-mcp = "biopb_mcp.mcp.__main__:main"
 
 [project.entry-points."napari.manifest"]
-napari-biopb = "napari_biopb:napari.yaml"
+biopb-mcp = "biopb_mcp:napari.yaml"
 
 [project.urls]
-"Bug Tracker" = "https://github.com/jiyuuchc/napari-biopb/issues"
-"Documentation" = "https://github.com/jiyuuchc/napari-biopb#README.md"
-"Source Code" = "https://github.com/jiyuuchc/napari-biopb"
-"User Support" = "https://github.com/jiyuuchc/napari-biopb/issues"
+"Bug Tracker" = "https://github.com/jiyuuchc/biopb-mcp/issues"
+"Documentation" = "https://github.com/jiyuuchc/biopb-mcp#README.md"
+"Source Code" = "https://github.com/jiyuuchc/biopb-mcp"
+"User Support" = "https://github.com/jiyuuchc/biopb-mcp/issues"
 
 [build-system]
 requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
@@ -82,7 +82,7 @@ where = ["src"]
 
 
 [tool.setuptools_scm]
-version_file = "src/napari_biopb/_version.py"
+version_file = "src/biopb_mcp/_version.py"
 
 
 [tool.pytest.ini_options]

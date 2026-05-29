@@ -5,7 +5,7 @@ try:
 except ImportError:
     import importlib.metadata
 
-    __version__ = importlib.metadata.version("napari-biopb")
+    __version__ = importlib.metadata.version("biopb-mcp")
 except Exception:
     __version__ = "unknown"
 

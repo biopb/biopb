@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from napari_biopb._tensor_utils import (
+from biopb_mcp._tensor_utils import (
     PYRAMID_THRESHOLD,
     build_pyramid_levels,
     get_xy_dim_indices,

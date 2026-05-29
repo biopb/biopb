@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from unittest.mock import MagicMock
 
-from napari_biopb.image_processing._chunking import (
+from biopb_mcp.image_processing._chunking import (
     IterationSpec,
     ResultBuilder,
     _data_iterator,

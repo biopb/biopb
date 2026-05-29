@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
-from napari_biopb.mcp._kernel import KernelHost  # noqa: E402
+from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
 @pytest.fixture
@@ -136,7 +136,7 @@ class TestKernelLifecycle:
 class TestNapariBootstrap:
     @pytest.fixture
     def napari_kernel(self):
-        line = "import napari_biopb.mcp._bootstrap as _b; _b.bootstrap()"
+        line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
         host = KernelHost(
             extra_arguments=[f"--IPKernelApp.exec_lines={line}"],
             startup_timeout=120.0,

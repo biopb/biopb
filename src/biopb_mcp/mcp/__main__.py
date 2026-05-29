@@ -1,12 +1,12 @@
-"""Launcher for the napari-biopb MCP server.
+"""Launcher for the biopb-mcp MCP server.
 
 This process *is* the MCP server: it owns a child Jupyter kernel that hosts a
 visible napari viewer (requires ``$DISPLAY``).  Run it with::
 
-    napari-biopb-mcp        # console script
-    python -m napari_biopb.mcp
+    biopb-mcp        # console script
+    python -m biopb_mcp.mcp
 
-Install the optional dependencies first: ``pip install napari-biopb[mcp]``.
+Install the optional dependencies first: ``pip install biopb-mcp[mcp]``.
 """
 
 import atexit
@@ -28,7 +28,7 @@ def main():
     mcp_config = config.get("mcp", {})
     port = mcp_config.get("port", 8765)
 
-    bootstrap_line = "import napari_biopb.mcp._bootstrap as _b; _b.bootstrap()"
+    bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
 
     host = KernelHost(

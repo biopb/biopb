@@ -22,8 +22,8 @@ done
 import logging
 import napari
 
-# Always enable debug for napari-biopb plugin
-logging.getLogger('napari_biopb').setLevel(logging.DEBUG)
+# Always enable debug for biopb-mcp plugin
+logging.getLogger('biopb_mcp').setLevel(logging.DEBUG)
 
 # Optionally enable debug for rest of code
 if '$DEBUG' == 'yes':

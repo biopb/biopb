@@ -1,7 +1,7 @@
-"""Entry point for bundled napari-biopb application."""
+"""Entry point for bundled biopb-mcp application."""
 
 import napari
-from napari_biopb import TensorBrowserWidget
+from biopb_mcp import TensorBrowserWidget
 
 viewer = napari.Viewer()
 

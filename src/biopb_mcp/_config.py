@@ -1,4 +1,4 @@
-"""Configuration management for napari-biopb plugin.
+"""Configuration management for biopb-mcp plugin.
 
 Provides persistent storage of user settings and configurable parameters.
 Uses platformdirs for cross-platform config directory location.
@@ -79,11 +79,11 @@ def get_config_dir() -> Path:
     """Get the platform-appropriate config directory.
 
     Returns:
-        Path to the config directory for napari-biopb.
+        Path to the config directory for biopb-mcp.
     """
     from platformdirs import user_config_dir
 
-    config_dir = Path(user_config_dir("napari-biopb"))
+    config_dir = Path(user_config_dir("biopb-mcp"))
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
