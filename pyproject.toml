@@ -48,11 +48,12 @@ testing = [
     "mcp>=1.20",
     "jupyter_client",
     "ipykernel",
+    "psutil",
 ]
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
 ]
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel"]
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil"]
 3d = ["vedo"] # 3d rendering from mesh
 
 [project.scripts]
