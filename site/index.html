@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>biopb — bioimage analysis, driven by your agent</title>
+  <meta name="description" content="biopb is an open protocol and toolchain for bioimage analysis: stream microscopy images larger than memory and let an AI agent run real analysis in napari." />
+  <link rel="icon" href="assets/favicon.ico" sizes="any" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ===== Top nav ===== -->
+  <header class="nav" id="top">
+    <div class="container nav__inner">
+      <a class="brand" href="#top" aria-label="biopb home">
+        <img class="brand__logo" src="assets/logo.png" alt="" width="32" height="32" />
+        <span class="brand__name">biopb</span>
+      </a>
+      <button class="nav__toggle" aria-label="Toggle menu" aria-expanded="false">≡</button>
+      <nav class="nav__links">
+        <a href="#components">Components</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/biopb/biopb#readme">Docs</a>
+        <a href="https://github.com/biopb/biopb/issues">Issues</a>
+        <a href="https://forum.image.sc/">Community</a>
+        <a class="nav__gh" href="https://github.com/biopb">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <!-- ===== Hero ===== -->
+    <section class="hero">
+      <div class="container hero__inner">
+        <h1 class="hero__title">Bioimage analysis,<br />driven by your agent.</h1>
+        <p class="hero__sub">
+          biopb is an open protocol and toolchain for AI-assisted bioimage analysis. Stream
+          microscopy images far larger than memory, and let an AI agent run real
+          analysis in a live napari session — results in the viewer, answers in chat.
+        </p>
+
+        <!-- terminal install window -->
+        <div class="term" id="install" aria-label="Install command">
+          <div class="term__bar">
+            <span class="term__dot"></span><span class="term__dot"></span><span class="term__dot"></span>
+            <span class="term__title">install</span>
+          </div>
+          <div class="term__body">
+            <code id="install-cmd"><span class="term__prompt">$</span> curl -fsSL https://biopb.org/install.sh | bash</code>
+            <button class="term__copy" id="copy-btn" type="button" data-cmd="curl -fsSL https://biopb.org/install.sh | bash">Copy</button>
+          </div>
+        </div>
+
+        <p class="hero__note">One command. Sets up the data server and wires the agent into Claude Code, Claude Desktop, or Cursor.</p>
+      </div>
+    </section>
+
+    <!-- ===== Components ===== -->
+    <section class="components" id="components">
+      <div class="container">
+        <h2 class="section__title">What you get</h2>
+
+        <!-- (1) user-facing: the agent in napari -->
+        <article class="row">
+          <figure class="shot">
+            <img src="assets/agent-napari.gif" width="960" height="584" loading="lazy"
+                 alt="An AI-agent chat session driving a live napari viewer: the agent runs code in py kernel while a time-lapse of cells plays back in napri viewer window." />
+          </figure>
+          <div class="row__text">
+            <span class="kicker">Your workspace</span>
+            <h3>Your AI agent, in napari</h3>
+            <p>
+              Drive a live napari viewer through an AI agent. One install command
+              registers biopb with Claude Code, Cursor or your favorite AI assistant — then ask
+              for the analysis you actually want. Intermediate results rendered in the viewer; counts,
+              measurements, and explanations come back in chat. You control the iteration.
+            </p>
+          </div>
+        </article>
+
+        <!-- (2) data server -->
+        <article class="row row--reverse">
+          <figure class="shot">
+            <img src="assets/data-browser.png" width="1278" height="687" loading="lazy"
+                 alt="The BioPB data browser: a source tree on the left, a microscopy image preview in the center, and a metadata and colormap panel on the right." />
+          </figure>
+          <div class="row__text">
+            <span class="kicker">Data plane</span>
+            <h3>A data server for any image</h3>
+            <p>
+              Point biopb at your files and it reads them — TIFF, OME-Zarr, and more —
+              and serves every dataset as a uniform, lazily-streamed array. Allow your 
+              agent to browse data catalog and work on multi-dimensional images that are
+              far larger than your machine's memory.
+            </p>
+          </div>
+        </article>
+
+        <!-- (3) algorithm servers -->
+        <article class="row">
+          <figure class="shot" role="img" aria-label="Screenshot placeholder: segmentation result">
+            <img src="assets/algorithm-servers.png" width="1278" height="687" loading="lazy"
+                 alt="The BioPB algorithm servers: a diagram showing the architecture and how algorithms are integrated." />
+          </figure>
+          <div class="row__text">
+            <span class="kicker">Compute plane</span>
+            <h3>Algorithm servers</h3>
+            <p>
+              Tool for your agent on problems they cannot solve out-of-the-box. Run as standalone
+              servers your agent can call. Use the hosted ones that ship preconfigured, or create 
+              your own on your metal. Adding a new algorithm is wrapping a model, not building a server.
+            </p>
+          </div>
+        </article>
+
+        <!-- (4) open & extensible -->
+        <article class="row row--reverse">
+          <figure class="shot">
+            <img src="assets/open-extensible.png" width="1070" height="651" loading="lazy"
+                alt="Open development model with extensible grpc protocol definition synced on buf.build" />
+          </figure>
+          <div class="row__text">
+            <span class="kicker">Open by design</span>
+            <h3>Open &amp; extensible</h3>
+            <p>
+              biopb is an open protocol with client libraries for Python, Java, and
+              JavaScript. Bring your own data sources, algorithm servers, and agent
+              tools for your lab's own problems — nothing is locked to a vendor or a
+              single application.
+            </p>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container footer__inner">
+      <div class="footer__brand">
+        <a class="brand" href="#top" aria-label="biopb home">
+          <img class="brand__logo" src="assets/logo.png" alt="" width="28" height="28" />
+          <span class="brand__name">biopb</span>
+        </a>
+        <p class="footer__tag">Open bioimage analysis, driven by your agent.</p>
+      </div>
+      <nav class="footer__cols">
+        <div class="footer__col">
+          <h4>Project</h4>
+          <a href="https://github.com/biopb">GitHub</a>
+          <a href="https://github.com/biopb/biopb#readme">Documentation</a>
+          <a href="https://github.com/biopb/biopb-mcp/issues">Issues</a>
+        </div>
+        <div class="footer__col">
+          <h4>Install</h4>
+          <a href="https://pypi.org/project/biopb-mcp">PyPI</a>
+          <a href="https://napari-hub.org/plugins/biopb-mcp">napari hub</a>
+          <a href="https://github.com/biopb/biopb-mcp/releases">Releases</a>
+        </div>
+      </nav>
+    </div>
+    <div class="container footer__bar">
+      <span>© <span id="year">2026</span> the biopb project</span>
+      <span>MIT licensed · open source</span>
+    </div>
+  </footer>
+
+  <script>
+    // Copy install command to clipboard.
+    (function () {
+      var btn = document.getElementById('copy-btn');
+      if (btn) {
+        btn.addEventListener('click', function () {
+          var cmd = btn.getAttribute('data-cmd');
+          var done = function () {
+            var old = btn.textContent;
+            btn.textContent = 'Copied!';
+            btn.classList.add('is-copied');
+            setTimeout(function () { btn.textContent = old; btn.classList.remove('is-copied'); }, 1600);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(cmd).then(done, done);
+          } else {
+            var ta = document.createElement('textarea');
+            ta.value = cmd; document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta); done();
+          }
+        });
+      }
+      // Mobile nav toggle.
+      var toggle = document.querySelector('.nav__toggle');
+      var links = document.querySelector('.nav__links');
+      if (toggle && links) {
+        toggle.addEventListener('click', function () {
+          var open = links.classList.toggle('is-open');
+          toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+        links.addEventListener('click', function (e) {
+          if (e.target.tagName === 'A') { links.classList.remove('is-open'); toggle.setAttribute('aria-expanded', 'false'); }
+        });
+      }
+      // Current year.
+      var y = document.getElementById('year');
+      if (y) y.textContent = new Date().getFullYear();
+    })();
+  </script>
+</body>
+</html>
