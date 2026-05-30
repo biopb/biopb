@@ -7,6 +7,11 @@
 #   uv-preinstalled  uv already on PATH before installer runs
 #   old-python       System Python 3.7 present (too old, should fall back)
 #   rerun            Pre-staged env simulating a prior install (idempotency)
+#   bioformats       Bio-Formats/ZVI end-to-end (tick Bio-Formats at install,
+#                    then run /verify_bioformats.sh; no system Java present)
+#
+# Mount a ZVI sample for the bioformats scenario:
+#   BIOPB_TEST_DATA=/dir/with/zvi ./run.sh bioformats
 
 set -euo pipefail
 
@@ -18,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "$SCRIPT_DIR/$DOCKERFILE" ]; then
     echo "ERROR: Unknown scenario '$SCENARIO'"
-    echo "Available: clean  uv-preinstalled  old-python  rerun"
+    echo "Available: clean  uv-preinstalled  old-python  rerun  bioformats"
     exit 1
 fi
 
@@ -31,5 +36,15 @@ docker build \
 echo ""
 echo "Launching — run the installer with:"
 echo "  bash /install.sh"
+if [ "$SCENARIO" = "bioformats" ]; then
+    echo "then verify Bio-Formats/ZVI support with:"
+    echo "  /verify_bioformats.sh"
+fi
 echo ""
-docker run --rm -it "$IMAGE"
+
+DOCKER_RUN_ARGS=(--rm -it)
+if [ -n "${BIOPB_TEST_DATA:-}" ]; then
+    echo "Mounting $BIOPB_TEST_DATA -> /data (read-only)"
+    DOCKER_RUN_ARGS+=(-v "$BIOPB_TEST_DATA:/data:ro")
+fi
+docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"

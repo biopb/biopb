@@ -325,7 +325,10 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    read -r INSTALL_WEBAPP INSTALL_MCP <<< "$(_checkbox "Built-in data browser" "biopb-mcp (MCP server)")"
+    read -r INSTALL_WEBAPP INSTALL_MCP INSTALL_BIOFORMATS <<< "$(_checkbox \
+        "Built-in data browser" \
+        "biopb-mcp (MCP server)" \
+        "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)")"
     echo ""
 
     # ===== 1. Install uv + buf (if needed) =====
@@ -393,8 +396,13 @@ install_biopb() {
         "biopb[tensor] @ $REPO"
 
     _info "Installing biopb-tensor-server..."
+    TENSOR_EXTRAS="web,ome-zarr,aics,medical,ndtiff"
+    if [ "$INSTALL_BIOFORMATS" = "1" ]; then
+        TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
+        _info "  including Bio-Formats (Java fetched on first use, not now)"
+    fi
     uv tool install --upgrade \
-        "biopb-tensor-server[web,ome-zarr,aics,medical,ndtiff] @ $REPO#subdirectory=biopb-tensor-server"
+        "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
 
     if [ "$INSTALL_MCP" = "1" ]; then
         _info "Installing biopb-mcp..."
@@ -515,7 +523,7 @@ EOF
     _cmd "biopb server start"
     echo ""
 
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ]; then
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
         printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Optional components:${RESET}"
     fi
     if [ "$INSTALL_WEBAPP" = "0" ]; then
@@ -530,7 +538,12 @@ EOF
         _note "or into an existing biopb env:"
         _cmd "         pip install biopb-mcp"
     fi
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ]; then
+    if [ "$INSTALL_BIOFORMATS" = "0" ]; then
+        _note "Bio-Formats not installed — ZVI/OIB/OIF and similar legacy formats unsupported"
+        _note "to add later, rerun this script and enable Bio-Formats, or:"
+        _cmd "         pip install \"biopb-tensor-server[bioformats]\""
+    fi
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
         echo ""
     fi
 

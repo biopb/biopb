@@ -707,6 +707,64 @@ class OlympusAdapter(_AicsImageIoAdapterBase):
         return None
 
 
+class BioformatsAdapter(_AicsImageIoAdapterBase):
+    """Bio-Formats fallback for legacy formats with no pure-Python reader.
+
+    Handles proprietary/legacy formats that only the Java Bio-Formats library
+    can read -- ZVI (Zeiss AxioVision) being the headline case. Claims a file
+    only when ``bioformats_jar`` is importable, so installs without the optional
+    ``bioformats`` component skip these files (with a warning) instead of
+    failing later at read time.
+
+    Reading goes through AICSImage's BioformatsReader, which is auto-selected
+    once bioformats_jar is present. A Java runtime is fetched lazily by
+    scyjava/cjdk on first read; it is not a build or system dependency.
+
+    Only claims extensions not already handled by a more specific adapter
+    (.oib/.oif -> OlympusAdapter, .ims -> AicsImageIoAdapter).
+    """
+
+    SOURCE_TYPE = "bioformats"
+
+    # Bio-Formats-only formats lacking a pure-Python reader and not claimed by
+    # another adapter. ZVI is the one users actually lost.
+    BIOFORMATS_ONLY_EXTENSIONS = (".zvi", ".lei", ".vsi")
+
+    @classmethod
+    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+        """Claim legacy Bio-Formats-only files when Bio-Formats is available."""
+        if not ctx.is_file():
+            return None
+
+        name = ctx.name.lower()
+        if not any(name.endswith(ext) for ext in cls.BIOFORMATS_ONLY_EXTENSIONS):
+            return None
+
+        # Gate on the Bio-Formats jar (importing it does NOT start a JVM).
+        # Without it, skip the file loudly rather than claiming and failing
+        # later at read time.
+        try:
+            import bioformats_jar  # noqa: F401
+        except ImportError:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Skipping %s: it requires Bio-Formats, which is not installed. "
+                "Install the optional component with "
+                "`pip install biopb-tensor-server[bioformats]` to enable it "
+                "(a Java runtime is downloaded automatically on first use).",
+                ctx.path_str,
+            )
+            return None
+
+        state.try_claim_path(ctx.path_str)
+        return SourceClaim(
+            source_type=cls.SOURCE_TYPE,
+            primary_path=ctx.path_str,
+            is_remote=ctx.is_remote,
+        )
+
+
 class AicsImageIoAdapter(_AicsImageIoAdapterBase):
     """Fallback adapter for remaining aicsimageio-supported formats.
 

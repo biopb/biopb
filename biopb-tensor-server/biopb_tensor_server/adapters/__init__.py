@@ -35,6 +35,7 @@ try:
         NikonAdapter,
         DvAdapter,
         OlympusAdapter,
+        BioformatsAdapter,
         AicsImageIoAdapter,
     )
 except ImportError:
@@ -44,6 +45,7 @@ except ImportError:
     NikonAdapter = None  # type: ignore
     DvAdapter = None  # type: ignore
     OlympusAdapter = None  # type: ignore
+    BioformatsAdapter = None  # type: ignore
     AicsImageIoAdapter = None  # type: ignore
 
 # Optional medical imaging adapters
@@ -76,6 +78,7 @@ __all__ = [
     "NikonAdapter",
     "DvAdapter",
     "OlympusAdapter",
+    "BioformatsAdapter",
     "AicsImageIoAdapter",
     "DicomAdapter",
     "DicomSeriesAdapter",
@@ -93,6 +96,8 @@ def get_default_registry() -> AdapterRegistry:
     - NikonAdapter - Nikon ND2 files
     - DvAdapter - DeltaVision DV files
     - OlympusAdapter - Olympus OIF/OIB files
+    - BioformatsAdapter - Legacy Bio-Formats-only formats (ZVI, ...; requires the
+      optional bioformats component)
     - AicsImageIoAdapter - Fallback for other aicsimageio-supported formats
     - OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
     - ZarrAdapter - Generic Zarr fallback
@@ -122,6 +127,8 @@ def get_default_registry() -> AdapterRegistry:
         registry.register_with_type("dv", DvAdapter)
     if OlympusAdapter is not None:
         registry.register_with_type("olympus", OlympusAdapter)
+    if BioformatsAdapter is not None:
+        registry.register_with_type("bioformats", BioformatsAdapter)
     if AicsImageIoAdapter is not None:
         registry.register_with_type("aics", AicsImageIoAdapter)
 
