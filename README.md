@@ -6,7 +6,7 @@
 [![Python Tests](https://github.com/biopb/biopb/actions/workflows/python-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
 [![Java Tests](https://github.com/biopb/biopb/actions/workflows/java-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
 
-The repo provides the core harness framework of the biopb project, providing a standardized way to serve multi-dimensional image datasets, analysis algorithms, and computational results in a network-transparent and language-agnostic manner. 
+The repo provides the core harness framework of the biopb project. The goal is to estabish a standardized way to serve multi-dimensional image datasets, analysis algorithms, and computational results in a network-transparent and language-agnostic manner. 
 
 ## Quick Start
 ```sh
@@ -58,3 +58,19 @@ The MCP component that talks to the LLM agent directly and orchastrate the coope
 ### biopb-servers
 
 Specific implementations of biopb-image-runtimes. [Read More...](https://github.com/biopb/biopb-server)
+
+## Contributing
+
+Contributions are very welcome. Read the [developement document](development.md) first to understand the overall design architecture.
+
+## License
+
+Distributed under the terms of the [MIT](https://github.com/biopb/biopb/raw/main/LICENSE) license,
+
+## Issues
+
+If you encounter any problems, please [file an issue] along with a detailed description.
+
+[file an issue]: https://github.com/biopb/biopb/issues
+
+
