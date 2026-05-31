@@ -431,6 +431,45 @@ class TestSQLValidation:
         with pytest.raises(ValueError, match="disallowed table"):
             db._validate_query("SELECT * FROM other_table")
 
+    def test_external_file_access_blocked(self, tmp_path):
+        """File-reading SQL is blocked at the engine (A3).
+
+        A comma-join slips a file-reading table function past the FROM-only
+        keyword/table denylist, so the real defense is the connection's
+        enable_external_access=False: the query must fail rather than read the
+        file.
+        """
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "z1",
+            MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
+        )
+
+        secret = tmp_path / "secret.txt"
+        secret.write_text("TOP-SECRET")
+
+        # Bypasses the denylist validator (FROM only sees `sources`)...
+        db._validate_query(
+            f"SELECT * FROM sources, read_text('{secret}')"
+        )
+        # ...but execution is blocked by enable_external_access=False.
+        with pytest.raises(ValueError, match="file system operations are disabled"):
+            db.handle_query(
+                f"SELECT content FROM sources, read_text('{secret}')"
+            )
+
+    def test_set_external_access_cannot_be_reenabled(self):
+        """An attacker can't turn external access back on mid-query."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "z1",
+            MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
+        )
+        with pytest.raises(ValueError):
+            db.handle_query(
+                "SET enable_external_access=true; SELECT * FROM sources"
+            )
+
 
 class TestFlightInfo:
     """Test FlightInfo generation."""

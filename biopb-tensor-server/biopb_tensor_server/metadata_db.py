@@ -9,7 +9,10 @@ Database Schema:
 - Shape summary column for quick size estimates
 
 Security Model:
-- Only 'sources' table accessible
+- DuckDB connection runs with enable_external_access=False, so all file/network
+  access (read_csv, read_text, glob, COPY, ATTACH, extension loading) is blocked
+  at the engine level. This is the primary defense against file exfiltration.
+- Only 'sources' table accessible (keyword/table denylist; defense in depth)
 - Forbidden keywords: INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXECUTE
 - No subqueries referencing external tables
 - Query timeout enforced
@@ -143,7 +146,19 @@ class MetadataDatabase:
         if self._conn is None:
             with self._write_lock:
                 if self._conn is None:
-                    self._conn = duckdb.connect(":memory:")
+                    # Disable all external file/network access. This is the
+                    # real defense against file exfiltration via read_csv /
+                    # read_text / glob / COPY / ATTACH etc., which the keyword
+                    # denylist in _validate_query cannot reliably cover (e.g.
+                    # comma-joins like `FROM sources, read_text('/etc/passwd')`
+                    # slip past the FROM-only table check). Once disabled it
+                    # cannot be re-enabled within a running instance, so a
+                    # `SET enable_external_access=true` in a query is rejected.
+                    # The server itself needs no external access: it only does
+                    # parameterized INSERT/DELETE and JSON-operator SELECTs.
+                    self._conn = duckdb.connect(
+                        ":memory:", config={"enable_external_access": False}
+                    )
                     self._create_schema()
                     self._initialized = True
                     logger.info("MetadataDatabase initialized with in-memory DuckDB")
