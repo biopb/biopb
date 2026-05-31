@@ -58,6 +58,12 @@ DEFAULT_CONFIG = {
         "kernel_startup_timeout": 60.0,
         "execute_timeout": 120.0,
         "busy_lock_timeout": 5.0,
+        # Extra Host/Origin header values appended to the loopback allowlist
+        # that guards the server against DNS-rebinding / cross-origin browser
+        # requests. Set these only when fronting the server with a reverse
+        # proxy that needs its own Host/Origin permitted.
+        "allowed_origins": [],
+        "allowed_hosts": [],
         # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).
         # Each is queried via GetOpNames and exposed as callables in the
         # agent kernel's `ops` dict.

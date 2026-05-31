@@ -264,3 +264,42 @@ class TestServerStatus:
         result = _server.server_status()
         assert "Sessions" not in result
         assert "Bridge" not in result
+
+
+# -----------------------------------------------------------------------
+# Transport security (DNS-rebinding / Origin allowlist — review finding A2)
+# -----------------------------------------------------------------------
+
+
+class TestTransportSecurity:
+    def test_protection_enabled_with_loopback_allowlist(self):
+        ts = _server.mcp.settings.transport_security
+        assert ts is not None
+        assert ts.enable_dns_rebinding_protection is True
+        assert "127.0.0.1:*" in ts.allowed_hosts
+        assert "http://127.0.0.1:*" in ts.allowed_origins
+
+    def test_middleware_rejects_forged_headers(self):
+        from mcp.server.transport_security import (
+            TransportSecurityMiddleware,
+        )
+
+        mw = TransportSecurityMiddleware(
+            _server.mcp.settings.transport_security
+        )
+        assert mw._validate_origin("http://evil.com") is False
+        assert mw._validate_origin("http://127.0.0.1:8765") is True
+        assert mw._validate_host("evil.com") is False
+        assert mw._validate_host("127.0.0.1:8765") is True
+
+    def test_build_merges_extra_allowlist(self):
+        ts = _server.build_transport_security(
+            extra_origins=["https://proxy.example"],
+            extra_hosts=["proxy.example"],
+        )
+        # extras present...
+        assert "https://proxy.example" in ts.allowed_origins
+        assert "proxy.example" in ts.allowed_hosts
+        # ...without dropping the loopback defaults.
+        assert "http://127.0.0.1:*" in ts.allowed_origins
+        assert "127.0.0.1:*" in ts.allowed_hosts

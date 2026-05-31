@@ -54,7 +54,11 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    _server.run(port)
+    _server.run(
+        port,
+        allowed_origins=mcp_config.get("allowed_origins", []),
+        allowed_hosts=mcp_config.get("allowed_hosts", []),
+    )
 
 
 if __name__ == "__main__":

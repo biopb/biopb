@@ -11,6 +11,7 @@ import logging
 import os
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
 
 from . import _resources
@@ -20,7 +21,37 @@ logger = logging.getLogger(__name__)
 
 _kernel_host: KernelHost | None = None
 
-mcp = FastMCP("biopb-mcp")
+# DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
+# a full kernel (RCE by design), so the only thing standing between a malicious
+# page in the user's own browser and the loopback port is Host/Origin
+# validation.  The MCP SDK enforces these lists; we set them explicitly rather
+# than relying on its implicit loopback auto-enable so the control can't
+# silently regress.  Wildcard ports mean the configured port never matters.
+_LOOPBACK_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+_LOOPBACK_ORIGINS = [
+    "http://127.0.0.1:*",
+    "http://localhost:*",
+    "http://[::1]:*",
+]
+
+
+def build_transport_security(
+    extra_origins=(), extra_hosts=()
+) -> TransportSecuritySettings:
+    """Build DNS-rebinding protection settings for the loopback server.
+
+    The loopback allowlists are always enforced; ``extra_origins`` /
+    ``extra_hosts`` (from ``config['mcp']``) are appended so an admin fronting
+    the server with a reverse proxy can permit the proxy's Host/Origin.
+    """
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_LOOPBACK_HOSTS + list(extra_hosts),
+        allowed_origins=_LOOPBACK_ORIGINS + list(extra_origins),
+    )
+
+
+mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
 # Prepended to every execute_code call so client tracks the
 # asynchronously-connecting tensor connection service.
@@ -335,8 +366,16 @@ def server_status() -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(port: int = 8765):
-    """Run the MCP server in the foreground (streamable-http)."""
+def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
+    """Run the MCP server in the foreground (streamable-http).
+
+    ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
+    allowlist (see :func:`build_transport_security`).  They are applied before
+    serving, when the streamable-http app reads ``transport_security``.
+    """
+    mcp.settings.transport_security = build_transport_security(
+        allowed_origins, allowed_hosts
+    )
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = port
     logger.info("MCP server listening on http://127.0.0.1:%d/mcp", port)
