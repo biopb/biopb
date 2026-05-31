@@ -2,8 +2,23 @@ name: Tensor Server CI/CD
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'server-v*'
+    paths:
+      - 'biopb-tensor-server/**'
+      - 'proto/**'
+      - 'src/main/python/**'
+      - 'pyproject.toml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'biopb-tensor-server/**'
+      - 'proto/**'
+      - 'src/main/python/**'
+      - 'pyproject.toml'
   workflow_dispatch:
     inputs:
       version:
@@ -16,7 +31,57 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      # --- JS / TS suite ---
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install JS dependencies
+        run: pnpm install
+
+      - name: Run JS tests
+        run: pnpm -r run test
+
+      # --- Python suite ---
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install -e .[tensor]
+          pip install -e ./biopb-tensor-server[test]
+
+      - name: Run Python tests
+        run: pytest biopb-tensor-server/tests/
+
   build:
+    needs: [test]
+    # only build/release on a tag push or manual dispatch
+    if: startsWith(github.ref, 'refs/tags/server-v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -28,7 +93,7 @@ jobs:
         run: |
           # 1. Check if a manual input was provided
           MANUAL_VERSION="${{ inputs.version }}"
-          
+
           if [ -n "$MANUAL_VERSION" ]; then
             VERSION="$MANUAL_VERSION"
           else
@@ -52,7 +117,7 @@ jobs:
 
       - name: Sync JS versions
         run: pnpm sync-version
-        
+
       - name: Build packages
         run: pnpm --filter @biopb/tensor-flight-client build
 
