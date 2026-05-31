@@ -689,6 +689,12 @@ class TensorFlightServer(flight.FlightServerBase):
         # Create SHM and write Arrow IPC bytes
         shm_name = f"/biopb_chunk_{hashlib.sha256(chunk_id).hexdigest()[:16]}"
         shm = shared_memory.SharedMemory(name=shm_name, create=True, size=len(ipc_bytes))
+        # Restrict to owner-only (A4): chunk payloads must not be readable by
+        # other users on a shared host. CPython already creates SHM with 0o600,
+        # but that default is undocumented; set it explicitly on the fd before
+        # writing so the guarantee doesn't depend on it (no-op on Windows).
+        if hasattr(os, "fchmod") and getattr(shm, "_fd", -1) >= 0:
+            os.fchmod(shm._fd, 0o600)
         shm.buf[:] = ipc_bytes
         shm.close()
 

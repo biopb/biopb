@@ -8,6 +8,7 @@ Tests cover:
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -111,6 +112,46 @@ class TestShmTransferHandler:
             # Cleanup
             shm.close()
             shm.unlink()
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="POSIX /dev/shm permissions only"
+    )
+    def test_handle_shm_transfer_is_owner_only(self):
+        """SHM chunks must be owner-only, not group/world readable (A4)."""
+        adapter = CachedSourceAdapter(
+            source_id="test_shm_perm",
+            shape=[64, 64],
+            dtype="uint16",
+            chunk_shape=[32, 32],
+        )
+        CacheManager.initialize(
+            CacheConfig(backend="memory", memory_max_bytes=10_000_000)
+        )
+        test_data = np.random.randint(0, 1000, (32, 32), dtype=np.uint16)
+        bounds = ChunkBounds(start=[0, 0], stop=[32, 32])
+        adapter.write_chunk(bounds, test_data)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = TensorFlightServer(
+                location="grpc://localhost:8821",
+                write_dir=Path(tmpdir),
+            )
+            server.register_source("test_shm_perm", adapter)
+
+            from biopb_tensor_server.chunk import encode_chunk_id
+            chunk_id = encode_chunk_id("test_shm_perm", bounds)
+            ticket = TensorTicket(chunk_id=chunk_id)
+            shm_name = server._handle_shm_transfer(ticket.SerializeToString())
+
+            try:
+                shm_path = Path("/dev/shm") / shm_name.lstrip("/")
+                mode = stat.S_IMODE(shm_path.stat().st_mode)
+                assert not (mode & stat.S_IRGRP), f"group-readable: {oct(mode)}"
+                assert not (mode & stat.S_IROTH), f"world-readable: {oct(mode)}"
+            finally:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shm.close()
+                shm.unlink()
 
     def test_handle_shm_transfer_nonexistent_chunk_raises(self):
         """_handle_shm_transfer should raise for nonexistent chunk."""
