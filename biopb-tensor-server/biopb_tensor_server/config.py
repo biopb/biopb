@@ -65,6 +65,7 @@ credentials_profile = "aws-prod"
 from __future__ import annotations
 
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -94,6 +95,12 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
+
+# Default on-disk cache location for the file backend. Uses the system temp dir
+# (node-local fast scratch on HPC, honoring $TMPDIR/$TEMP/$TMP) rather than home,
+# which is often slow/quota-bound NFS. Resolves correctly on every platform
+# (on Windows this lands under %TEMP%\biopb-cache).
+DEFAULT_FILE_CACHE_DIR = Path(tempfile.gettempdir()) / "biopb-cache"
 
 
 @dataclass
@@ -185,7 +192,7 @@ class CacheConfig:
         backend: Cache backend type - "memory" or "file"
         memory_max_entries: Maximum number of cached entries (memory backend)
         memory_max_bytes: Maximum total bytes to cache (memory backend, default 512 MB)
-        file_cache_dir: Directory for cache files (file backend, default /tmp/biopb-cache)
+        file_cache_dir: Directory for cache files (file backend, default: system temp dir/biopb-cache)
         file_max_segment_bytes: Maximum bytes per segment file (file backend, default 64 MB)
         file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
     """
@@ -193,7 +200,7 @@ class CacheConfig:
     backend: str = "memory"
     memory_max_entries: int = 1024
     memory_max_bytes: int = 512 * 1024 * 1024  # 512 MB
-    file_cache_dir: Path = Path("/tmp/biopb-cache")
+    file_cache_dir: Path = DEFAULT_FILE_CACHE_DIR
     file_max_segment_bytes: int = 64 * 1024 * 1024  # 64 MB per segment
     file_max_total_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GB total
 
@@ -354,7 +361,10 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     memory_max_bytes = cache_data.get("max_bytes", 512 * 1024 * 1024)
 
     # Parse file backend settings (convert MB/GB to bytes if specified)
-    file_cache_dir = Path(cache_data.get("file_cache_dir", "/tmp/biopb-cache"))
+    file_cache_dir_raw = cache_data.get("file_cache_dir")
+    file_cache_dir = (
+        Path(file_cache_dir_raw) if file_cache_dir_raw else DEFAULT_FILE_CACHE_DIR
+    )
     file_max_segment_mb = cache_data.get("file_max_segment_mb", 64)
     file_max_segment_bytes = int(file_max_segment_mb) * 1024 * 1024
     file_max_total_gb = cache_data.get("file_max_total_gb", 4)
