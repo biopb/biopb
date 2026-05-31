@@ -141,6 +141,37 @@ print(viewer.dims.point)    # tuple of current positions
 ## Layer types
 Image, Labels, Points, Shapes, Vectors, Surface, Tracks
 Use `inspect_object("viewer.add_image")` for full signatures.
+
+## Canvas mouse events
+You can detect user clicks/drags/moves on the canvas — this works reliably in
+this kernel (verified end to end). Use napari's viewer-model API, not the raw Qt
+widget or vispy canvas. You cannot see the cursor live: install a callback, let
+the user interact, then read back what you captured.
+
+```python
+# Also: mouse_move_callbacks, mouse_double_click_callbacks. The event has
+# .button, .modifiers, .position (world coords), and .pos (canvas pixels).
+def on_click(viewer, event):
+    layer = viewer.layers.selection.active
+    if layer is not None:
+        coord = layer.world_to_data(event.position)  # full-ndim data coords (…,z,y,x)
+        print(event.button, list(event.modifiers), coord)
+
+viewer.mouse_drag_callbacks.append(on_click)   # mutate in place (see below)
+```
+
+If a callback "doesn't fire", it is one of these — NOT a session/setup bug, and
+do **not** instrument vispy to investigate (that is the trap, see point 2):
+
+1. **Reassigning instead of mutating the list.** It is an evented pydantic
+   field; `viewer.mouse_drag_callbacks = [...]` raises `"Viewer" object has no
+   field`. Use `.append()` / `.remove()`.
+2. **Tapping the vispy emitter** (`canvas._scene_canvas.events.*`). napari runs
+   it with `ignore_callback_errors=False` and vispy `connect()` defaults to
+   `position='first'`, so a tap landing ahead of napari's handler that raises
+   halts the chain and suppresses napari's callbacks — a working setup looks
+   broken. Stay on `viewer.*_callbacks`; if you must, use `position='last'` + try/except.
+3. **Window not focused** — click once to focus it, then interact.
 """
 
 TENSOR = """\
