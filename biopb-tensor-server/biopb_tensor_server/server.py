@@ -46,8 +46,15 @@ def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
     return count
 
 
-class _NoopMiddleware(flight.ServerMiddleware):
-    """Middleware instance that does nothing after a successful auth check."""
+class _AuthMiddleware(flight.ServerMiddleware):
+    """Per-call middleware that carries the caller's presented Bearer token.
+
+    Handlers retrieve it via ``context.get_middleware("auth")`` to enforce
+    per-source capability tokens (see ``_authorize_source``).
+    """
+
+    def __init__(self, token: Optional[str]) -> None:
+        self.token = token
 
     def sending_headers(self) -> dict:
         return {}
@@ -57,10 +64,12 @@ class _NoopMiddleware(flight.ServerMiddleware):
 
 
 class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
-    """Reject calls whose Authorization header does not match the Bearer token.
+    """Validate the server-wide Bearer token and expose the presented token.
 
     Header value must be exactly ``Bearer <token>`` (case-sensitive).
-    When *token* is ``None`` or empty the factory is a no-op (auth disabled).
+    When *token* is ``None`` or empty the server-wide check is disabled (the
+    factory becomes a no-op for it), but the presented token is still captured
+    so per-source capability tokens can be enforced in the handlers.
     """
 
     def __init__(self, token: Optional[str]) -> None:
@@ -71,14 +80,13 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         info: flight.CallInfo,
         headers: dict,
     ) -> Optional[flight.ServerMiddleware]:
-        if self._expected is None:
-            return _NoopMiddleware()
         # Header values are lists; gRPC lowercases header names.
         values: List[str] = headers.get("authorization", [])
         bearer = values[0] if values else ""
-        if bearer != self._expected:
+        if self._expected is not None and bearer != self._expected:
             raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
-        return _NoopMiddleware()
+        provided = bearer[len("Bearer ") :] if bearer.startswith("Bearer ") else None
+        return _AuthMiddleware(provided)
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -228,6 +236,31 @@ class TensorFlightServer(flight.FlightServerBase):
         with self._sources_lock:
             return list(self._sources.items())
 
+    def _authorize_source(
+        self, context: flight.ServerCallContext, source_id: str
+    ) -> None:
+        """Enforce a per-source capability token when the source carries one.
+
+        Sources created with a ``token`` attribute (e.g. embedded result caches)
+        are readable only by callers presenting the matching Bearer token. This
+        binds the result to the requester that received its ``SerializedTensor``,
+        without relying on the server-wide token.
+
+        Sources without a token fall back to the server-wide auth performed by
+        ``BearerAuthMiddlewareFactory``, so this is backward compatible with the
+        standalone tensor server.
+        """
+        adapter = self._get_source_adapter(source_id)
+        expected = getattr(adapter, "token", None)
+        if not expected:
+            return
+        mw = context.get_middleware("auth")
+        provided = getattr(mw, "token", None) if mw is not None else None
+        if provided != expected:
+            raise flight.FlightUnauthenticatedError(
+                "Invalid or missing source token"
+            )
+
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
 
@@ -344,6 +377,9 @@ class TensorFlightServer(flight.FlightServerBase):
             yield json.dumps(self.get_upload_status(source_id)).encode("utf-8")
         elif action.type == "shm_transfer":
             ticket_bytes = action.body.to_pybytes()
+            ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
+            source_id = decode_chunk_id(ticket.chunk_id)[0].split("/")[0]
+            self._authorize_source(context, source_id)
             shm_name = self._handle_shm_transfer(ticket_bytes)
             yield shm_name.encode("utf-8")
         else:
@@ -389,6 +425,11 @@ class TensorFlightServer(flight.FlightServerBase):
         for source_id, adapter in source_items:
             if count >= max_sources:
                 break
+
+            # Token-protected sources (per-source capabilities) are not
+            # enumerable: knowing the source_id must not be enough to list them.
+            if getattr(adapter, "token", None):
+                continue
 
             source_desc = adapter.get_source_descriptor()
 
@@ -462,6 +503,8 @@ class TensorFlightServer(flight.FlightServerBase):
         read_opt = cmd.tensor_read
         source_id = cmd.source_id
         tensor_id = read_opt.tensor_id
+
+        self._authorize_source(context, source_id)
 
         logger.debug(
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}"
@@ -573,6 +616,9 @@ class TensorFlightServer(flight.FlightServerBase):
 
         tensor_ticket = self._parse_ticket(ticket)
         logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
+
+        source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
+        self._authorize_source(context, source_id)
 
         adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
         if adapter is None:

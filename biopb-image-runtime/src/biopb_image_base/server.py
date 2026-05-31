@@ -30,7 +30,6 @@ from biopb_image_base.debug import get_system_info
 
 logger = logging.getLogger(__name__)
 
-_TENSOR_SERVER_URL_ENV = "TENSOR_SERVER_URL"
 _NON_UNIFORM_CHUNKS_ERROR = (
     "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
 )
@@ -178,6 +177,11 @@ class EmbeddedTensorCache:
             chunk_shape=list(chunk_shape),
             dim_labels=list(dim_labels) if dim_labels is not None else None,
         )
+        # Per-source capability token: the result is readable only by the caller
+        # that receives this SerializedTensor (carried in its auth_token). The
+        # embedded server runs writable=False and writes happen in-process, so
+        # this token gates read-back without a server-wide secret.
+        adapter.token = secrets.token_urlsafe(32)
         self._server.register_source(source_id, adapter)
         self._server.initialize_upload(source_id, array_template.shape, chunk_shape)
         return source_id, array_template, chunk_shape
@@ -200,6 +204,7 @@ class EmbeddedTensorCache:
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             location=self._external_location,
+            auth_token=self._server._get_source_adapter(source_id).token,
         )
 
     def upload_array_chunks(
@@ -284,108 +289,16 @@ class EmbeddedTensorCache:
             ep = SerializedEndpoint(ticket=ticket, chunk_bounds=bounds)
             endpoints.append(ep)
 
-        # Build SerializedTensor with external location
+        # Build SerializedTensor with external location. auth_token carries the
+        # per-source capability token so only this caller can read the result.
         serialized = SerializedTensor(
             tensor_descriptor=descriptor,
             location=self._external_location,
-            auth_token="",  # No auth for embedded cache
+            auth_token=adapter.token or "",
             endpoints=endpoints,
         )
 
         return serialized
-
-
-class ExternalTensorCache:
-    """Upload lazy results to an existing writable tensor server."""
-
-    def __init__(self, location: str):
-        from biopb.tensor import TensorFlightClient
-
-        self._location = location
-        self._client = TensorFlightClient(location)
-
-    def _register_array_template(
-        self,
-        array_template: da.Array,
-        source_name: Optional[str] = None,
-        dim_labels: Optional[Sequence[str]] = None,
-    ) -> tuple[str, da.Array, tuple[int, ...]]:
-        import uuid
-
-        normalized_name = _normalize_cache_source_name(source_name)
-        if not normalized_name:
-            normalized_name = f"upload-{uuid.uuid4().hex}"
-
-        chunk_shape = _uniform_chunk_shape(array_template)
-        upload_name = f"cache:{normalized_name}"
-        source_id = self._client.create_source(
-            source_name=upload_name,
-            shape=array_template.shape,
-            dtype=array_template.dtype.str,
-            chunk_shape=chunk_shape,
-            dim_labels=dim_labels,
-        )
-        return source_id, array_template, chunk_shape
-
-    def create_array(
-        self,
-        source_name: Optional[str],
-        dim_labels: Optional[list],
-        array_template: da.Array,
-    ) -> tensor_proto.SerializedTensor:
-        source_id, normalized_array, chunk_shape = self._register_array_template(
-            array_template=array_template,
-            source_name=source_name,
-            dim_labels=dim_labels,
-        )
-        return _build_registration_tensor(
-            source_id=source_id,
-            shape=normalized_array.shape,
-            dtype=normalized_array.dtype.str,
-            chunk_shape=chunk_shape,
-            dim_labels=dim_labels,
-            location=self._location,
-        )
-
-    def upload_array_chunks(
-        self,
-        source_id: str,
-        endpoint: ChunkBounds,
-        chunk: np.ndarray,
-    ) -> None:
-        self._client.upload_chunk(source_id, endpoint, chunk)
-
-    def get_upload_status(self, source_id: str) -> dict:
-        return self._client.get_upload_status(source_id)
-
-    def create_source(
-        self,
-        array: Union[np.ndarray, da.Array],
-        source_name: Optional[str] = None,
-        dim_labels: Optional[list] = None,
-    ) -> str:
-        dask_array = _as_dask_array(array)
-        source_id, normalized_array, chunk_shape = self._register_array_template(
-            array_template=dask_array,
-            source_name=source_name,
-            dim_labels=dim_labels,
-        )
-
-        for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
-            chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
-            self.upload_array_chunks(source_id, bounds, chunk_data)
-
-        return source_id
-
-    def to_serialized_tensor(
-        self,
-        source_id: str,
-        tensor_id: Optional[str] = None,
-    ) -> tensor_proto.SerializedTensor:
-        return self._client.get_tensor_pb(source_id, tensor_id=tensor_id)
-
-    def close(self) -> None:
-        self._client.close()
 
 
 def _start_embedded_tensor_cache(
@@ -432,10 +345,12 @@ def _start_embedded_tensor_cache(
     # Bind to specified host (0.0.0.0 for external access)
     location = f"grpc://{tensor_host}:{tensor_port}"
 
-    # Create server with writable mode (cache already initialized)
+    # Read-only over Flight: results are written in-process (adapter.write_chunk),
+    # so the Flight write path (do_put / create_source) is pure attack surface here.
+    # Read-back is gated by per-source capability tokens (adapter.token).
     tensor_server = TensorFlightServer(
         location,
-        writable=True,
+        writable=False,
     )
 
     # Start in background thread
@@ -460,7 +375,7 @@ def create_server(
     compression: bool = True,
     health_check: bool = True,
     readiness_check: Optional[callable] = None,
-    tensor_cache: Optional[EmbeddedTensorCache | ExternalTensorCache] = None,
+    tensor_cache: Optional[EmbeddedTensorCache] = None,
 ) -> tuple[grpc.Server, Optional[str], Optional[HealthServicer]]:
     """Create a configured gRPC server with standard features.
 
@@ -613,21 +528,16 @@ def run_server(
                     f"{gpu['free_mb']:.0f}MB free")
 
     tensor_cache = None
-    external_tensor_server = os.environ.get(_TENSOR_SERVER_URL_ENV)
-    if (external_tensor_server or cache_dir is not None) and not _pyarrow_available():
+    if cache_dir is not None and not _pyarrow_available():
         # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
         # unavailable. Do not start the tensor server -- it would crash. Lazy
         # (dask) requests will be cleanly rejected by the servicer instead.
         logger.warning(
-            "Tensor cache (lazy data side channel) was requested "
-            f"({'env ' + _TENSOR_SERVER_URL_ENV if external_tensor_server else 'cache_dir'}) "
+            "Tensor cache (lazy data side channel) was requested (cache_dir) "
             "but pyarrow is not available -- this looks like a build for a CPU "
             "without SSE4.2/AVX. Disabling the tensor server; only eager image "
             "data is supported and lazy (dask) input/output will be rejected."
         )
-    elif external_tensor_server:
-        tensor_cache = ExternalTensorCache(external_tensor_server)
-        logger.info(f"Using external tensor server for lazy uploads: {external_tensor_server}")
     elif cache_dir is not None:
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)

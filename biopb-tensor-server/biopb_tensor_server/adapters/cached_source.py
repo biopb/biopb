@@ -80,6 +80,11 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             ome_metadata: Optional OME metadata dict
         """
         self.source_id = source_id
+        # Optional per-source capability token. When set, the Flight server
+        # requires callers to present a matching Bearer token to read this
+        # source (see TensorFlightServer._authorize_source). None = no per-source
+        # gate (falls back to the server-wide token, if any).
+        self.token: Optional[str] = None
         self._shape = tuple(shape)
         self._dtype = dtype
         self._chunk_shape = tuple(chunk_shape)

@@ -171,7 +171,6 @@ pytest tests/ -v
 
 | Variable | Description |
 |----------|-------------|
-| `TENSOR_SERVER_URL` | External writable tensor server used for lazy-data uploads instead of the embedded cache server |
 | `BIOPB_LOG_LEVEL` | Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 
 ## Python API
@@ -225,9 +224,6 @@ run_server(
 
 # Or without cache (eager data only)
 run_server(servicer, port=50051)
-
-# Or upload lazy data to an external writable tensor server
-run_server(servicer, port=50051)  # Set TENSOR_SERVER_URL env var
 ```
 
 ## Dockerfile for Derived Services

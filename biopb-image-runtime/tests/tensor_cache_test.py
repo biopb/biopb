@@ -13,7 +13,7 @@ import pytest
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_image_base.server import EmbeddedTensorCache, ExternalTensorCache
+from biopb_image_base.server import EmbeddedTensorCache
 
 
 def _free_tcp_port() -> int:
@@ -50,7 +50,8 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
 
 
 @pytest.fixture
-def external_cache(tmp_path: Path) -> ExternalTensorCache:
+def served_embedded_cache(tmp_path: Path):
+    """An embedded cache backed by a real served (read-only) Flight server."""
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import CacheConfig
     from biopb_tensor_server.server import TensorFlightServer
@@ -66,7 +67,8 @@ def external_cache(tmp_path: Path) -> ExternalTensorCache:
 
     port = _free_tcp_port()
     location = f"grpc://127.0.0.1:{port}"
-    tensor_server = TensorFlightServer(location=location, writable=True)
+    # Mirror the production embedded server: read-only over Flight.
+    tensor_server = TensorFlightServer(location=location, writable=False)
     thread = threading.Thread(target=tensor_server.serve, daemon=True)
     thread.start()
 
@@ -83,7 +85,10 @@ def external_cache(tmp_path: Path) -> ExternalTensorCache:
         raise RuntimeError("Timed out waiting for tensor server to start")
 
     try:
-        yield ExternalTensorCache(location)
+        yield EmbeddedTensorCache(
+            tensor_server=tensor_server,
+            external_location=location,
+        )
     finally:
         tensor_server.shutdown()
         CacheManager.reset()
@@ -95,17 +100,6 @@ def _uniform_template() -> da.Array:
 
 def _non_uniform_template() -> da.Array:
     return da.zeros((4, 4), chunks=((2, 2), (1, 3)), dtype=np.float32)
-
-
-def _upload_all_chunks(cache, source_id: str) -> None:
-    chunks = [
-        (ChunkBounds(start=[0, 0], stop=[2, 2]), np.ones((2, 2), dtype=np.float32)),
-        (ChunkBounds(start=[0, 2], stop=[2, 4]), np.full((2, 2), 2.0, dtype=np.float32)),
-        (ChunkBounds(start=[2, 0], stop=[4, 2]), np.full((2, 2), 3.0, dtype=np.float32)),
-        (ChunkBounds(start=[2, 2], stop=[4, 4]), np.full((2, 2), 4.0, dtype=np.float32)),
-    ]
-    for bounds, chunk in chunks:
-        cache.upload_array_chunks(source_id, bounds, chunk)
 
 
 def test_embedded_create_array_tracks_upload_status(embedded_cache: EmbeddedTensorCache):
@@ -133,40 +127,6 @@ def test_embedded_create_array_tracks_upload_status(embedded_cache: EmbeddedTens
     assert status["uploaded_chunks"] == 1
 
 
-def test_external_create_array_and_chunk_uploads_are_fetchable(
-    external_cache: ExternalTensorCache,
-):
-    serialized = external_cache.create_array("cache:", ["Y", "X"], _uniform_template())
-
-    source_id = serialized.tensor_descriptor.array_id
-    assert serialized.location == external_cache._location
-    assert len(serialized.endpoints) == 0
-
-    status = external_cache.get_upload_status(source_id)
-    assert status["state"] == "PENDING"
-    assert status["expected_chunks"] == 4
-    assert status["uploaded_chunks"] == 0
-
-    _upload_all_chunks(external_cache, source_id)
-
-    status = external_cache.get_upload_status(source_id)
-    assert status == {
-        "source_id": source_id,
-        "state": "READY",
-        "expected_chunks": 4,
-        "uploaded_chunks": 4,
-    }
-
-    result = TensorFlightClient.tensor_from_pb(serialized).compute()
-    expected = np.block(
-        [
-            [np.ones((2, 2), dtype=np.float32), np.full((2, 2), 2.0, dtype=np.float32)],
-            [np.full((2, 2), 3.0, dtype=np.float32), np.full((2, 2), 4.0, dtype=np.float32)],
-        ]
-    )
-    np.testing.assert_array_equal(result, expected)
-
-
 @pytest.mark.parametrize("method_name", ["create_array", "create_source"])
 def test_embedded_cache_rejects_non_uniform_chunks(
     embedded_cache: EmbeddedTensorCache,
@@ -179,13 +139,29 @@ def test_embedded_cache_rejects_non_uniform_chunks(
             embedded_cache.create_source(_non_uniform_template(), "cache:", ["Y", "X"])
 
 
-@pytest.mark.parametrize("method_name", ["create_array", "create_source"])
-def test_external_cache_rejects_non_uniform_chunks(
-    external_cache: ExternalTensorCache,
-    method_name: str,
-):
-    with pytest.raises(ValueError, match="Non-uniform dask chunks"):
-        if method_name == "create_array":
-            external_cache.create_array("cache:", ["Y", "X"], _non_uniform_template())
-        else:
-            external_cache.create_source(_non_uniform_template(), "cache:", ["Y", "X"])
+def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCache):
+    """A result carries a per-source token; reads need it and it isn't enumerable."""
+    import pyarrow.flight as flight
+
+    data = np.arange(16, dtype=np.float32).reshape(4, 4)
+    source_id = served_embedded_cache.create_source(data, "cache:", ["Y", "X"])
+    serialized = served_embedded_cache.to_serialized_tensor(source_id)
+
+    # The result advertises a non-empty per-source capability token.
+    assert serialized.auth_token
+
+    # With the token (carried in the SerializedTensor) the read-back succeeds.
+    result = TensorFlightClient.tensor_from_pb(serialized).compute()
+    np.testing.assert_array_equal(result, data)
+
+    # Stripping the token must make the identical read fail closed.
+    no_token = type(serialized)()
+    no_token.CopyFrom(serialized)
+    no_token.auth_token = ""
+    with pytest.raises(flight.FlightError):
+        TensorFlightClient.tensor_from_pb(no_token).compute()
+
+    # The token-protected source is not enumerable via list_flights.
+    location = served_embedded_cache._external_location
+    listed = TensorFlightClient(location).list_sources()
+    assert source_id not in listed
