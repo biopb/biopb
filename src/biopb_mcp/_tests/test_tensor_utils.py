@@ -1,11 +1,13 @@
 """Tests for _tensor_utils shared utilities."""
 
+import types
 from unittest.mock import MagicMock, call
 
 import pytest
 
 from biopb_mcp._tensor_utils import (
     PYRAMID_THRESHOLD,
+    build_layer_scale,
     build_pyramid_levels,
     get_xy_dim_indices,
 )
@@ -99,3 +101,64 @@ class TestBuildPyramidLevels:
         assert second_hint[0] == 1  # z
         assert second_hint[1] == 2  # y
         assert second_hint[2] == 2  # x
+
+
+def _make_metadata_client(
+    psx=None, psy=None, psz=None, unit="µm", raises=False
+):
+    """Mock TensorFlightClient whose get_source_metadata returns an OME-like
+    object exposing physical pixel sizes."""
+    client = MagicMock()
+    if raises:
+        client.get_source_metadata.side_effect = RuntimeError("boom")
+        return client
+    pixels = types.SimpleNamespace(
+        physical_size_x=psx,
+        physical_size_y=psy,
+        physical_size_z=psz,
+        physical_size_x_unit=unit,
+        physical_size_y_unit=unit,
+        physical_size_z_unit=unit,
+    )
+    image = types.SimpleNamespace(pixels=pixels)
+    metadata = types.SimpleNamespace(images=[image])
+    client.get_source_metadata.return_value = metadata
+    return client
+
+
+def test_build_layer_scale_maps_labeled_dims():
+    client = _make_metadata_client(psx=0.325, psy=0.325, psz=2.0)
+    desc = _make_tensor_desc((3, 10, 512, 512), ["c", "z", "y", "x"])
+    scale, info = build_layer_scale(client, "src", desc)
+    assert scale == [1.0, 2.0, 0.325, 0.325]
+    assert info["physical_size_x"] == 0.325
+    assert info["physical_size_x_unit"] == "µm"
+
+
+def test_build_layer_scale_positional_fallback_without_labels():
+    client = _make_metadata_client(psx=0.5, psy=0.25)
+    desc = _make_tensor_desc((512, 256), None)
+    scale, _ = build_layer_scale(client, "src", desc)
+    # trailing (..., y, x): scale[-2] is y, scale[-1] is x
+    assert scale == [0.25, 0.5]
+
+
+def test_build_layer_scale_none_when_no_physical_sizes():
+    client = _make_metadata_client()
+    desc = _make_tensor_desc((512, 512), ["y", "x"])
+    assert build_layer_scale(client, "src", desc) == (None, None)
+
+
+def test_build_layer_scale_none_on_metadata_error():
+    client = _make_metadata_client(raises=True)
+    desc = _make_tensor_desc((512, 512), ["y", "x"])
+    assert build_layer_scale(client, "src", desc) == (None, None)
+
+
+def test_build_layer_scale_falls_back_to_source_dim_labels():
+    client = _make_metadata_client(psx=0.5, psy=0.5, psz=3.0)
+    # Per-tensor labels missing; source descriptor supplies them.
+    desc = _make_tensor_desc((10, 256, 256), None)
+    source_desc = types.SimpleNamespace(dim_labels=["z", "y", "x"])
+    scale, _ = build_layer_scale(client, "src", desc, source_desc=source_desc)
+    assert scale == [3.0, 0.5, 0.5]

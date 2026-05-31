@@ -67,6 +67,7 @@ class TestPatchViewerLoadTensor:
         src = _make_source("http://server/data/remote_img", [tensor])
         client = MagicMock()
         client.get_source.return_value = src
+        client.get_source_metadata.return_value.images = []
         connection.client = client
         connection.sources = {}  # source absent from the cached catalog
 
@@ -103,6 +104,7 @@ class TestPatchViewerLoadTensor:
         tensor = _make_tensor("t1", [256, 256])
         src = _make_source("http://server/data/my_image", [tensor])
         connection.client = MagicMock()
+        connection.client.get_source_metadata.return_value.images = []
         connection.sources = {"src1": src}
 
         mock_arr = MagicMock()
@@ -132,6 +134,7 @@ class TestPatchViewerLoadTensor:
         t2 = _make_tensor("t2", [128, 128])
         src = _make_source("http://server/data/multi", [t1, t2])
         connection.client = MagicMock()
+        connection.client.get_source_metadata.return_value.images = []
         connection.sources = {"src1": src}
 
         mock_arr = MagicMock()
@@ -149,6 +152,7 @@ class TestPatchViewerLoadTensor:
         tensor = _make_tensor("t1", [8192, 8192])
         src = _make_source("http://server/big", [tensor])
         connection.client = MagicMock()
+        connection.client.get_source_metadata.return_value.images = []
         connection.sources = {"src1": src}
 
         levels = [MagicMock(), MagicMock()]
@@ -172,3 +176,38 @@ class TestPatchViewerLoadTensor:
 
         with pytest.raises(ValueError, match="Tensor 'wrong' not found"):
             viewer.load_tensor("src1", tensor_id="wrong")
+
+    def test_applies_ome_scale_and_metadata(self, viewer, connection):
+        import types
+
+        tensor = _make_tensor("t1", [256, 256])
+        tensor.dim_labels = ["y", "x"]
+        src = _make_source("http://server/data/cal", [tensor])
+        client = MagicMock()
+        pixels = types.SimpleNamespace(
+            physical_size_x=0.5,
+            physical_size_y=0.25,
+            physical_size_z=None,
+            physical_size_x_unit="µm",
+            physical_size_y_unit="µm",
+            physical_size_z_unit=None,
+        )
+        client.get_source_metadata.return_value = types.SimpleNamespace(
+            images=[types.SimpleNamespace(pixels=pixels)]
+        )
+        connection.client = client
+        connection.sources = {"src1": src}
+
+        mock_arr = MagicMock()
+        with patch(
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            return_value=[mock_arr],
+        ):
+            patch_viewer_load_tensor(viewer, connection)
+            viewer.load_tensor("src1")
+
+        _, kwargs = viewer.add_image.call_args
+        assert kwargs["scale"] == [0.25, 0.5]
+        phys = kwargs["metadata"]["ome_physical_size"]
+        assert phys["physical_size_x"] == 0.5
+        assert phys["physical_size_y"] == 0.25

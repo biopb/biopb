@@ -44,7 +44,7 @@ def patch_viewer_load_tensor(viewer, connection):
         Returns:
             The name of the created viewer layer.
         """
-        from .._tensor_utils import build_pyramid_levels
+        from .._tensor_utils import build_layer_scale, build_pyramid_levels
 
         client = connection.client
         if client is None:
@@ -98,10 +98,21 @@ def patch_viewer_load_tensor(viewer, connection):
             else:
                 name = stem
 
+        # Pull OME physical pixel size so the agent's areas/volumes come out
+        # in physical units (e.g. µm²) rather than pixels (review finding B3).
+        scale, phys = build_layer_scale(
+            client, source_id, tensor_desc, source_desc=src
+        )
+        add_kwargs = {"name": name}
+        if scale is not None:
+            add_kwargs["scale"] = scale
+        if phys is not None:
+            add_kwargs["metadata"] = {"ome_physical_size": phys}
+
         if len(levels) > 1:
-            viewer.add_image(levels, name=name, multiscale=True)
+            viewer.add_image(levels, multiscale=True, **add_kwargs)
         else:
-            viewer.add_image(levels[0], name=name)
+            viewer.add_image(levels[0], **add_kwargs)
 
         return name
 

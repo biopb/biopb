@@ -32,7 +32,7 @@ from qtpy.QtWidgets import (
 )
 
 from .._connection import TensorConnection
-from .._tensor_utils import build_pyramid_levels
+from .._tensor_utils import build_layer_scale, build_pyramid_levels
 
 if TYPE_CHECKING:
     import napari
@@ -826,10 +826,21 @@ class TensorBrowserWidget(QWidget):
                     tensor_name = _tensor_short_name(tensor.array_id)
                     layer_name = f"{stem}/{tensor_name}"
 
+                    # OME physical pixel size → layer.scale (B3).
+                    scale, _ = build_layer_scale(
+                        self._client, source_id, tensor, source_desc=src
+                    )
+                    scale_kwargs = (
+                        {"scale": scale} if scale is not None else {}
+                    )
+
                     # Add as multiscale pyramid if multiple levels
                     if len(levels) > 1:
                         self._viewer.add_image(
-                            levels, name=layer_name, multiscale=True
+                            levels,
+                            name=layer_name,
+                            multiscale=True,
+                            **scale_kwargs,
                         )
                         logger.info(
                             "Added multiscale pyramid '%s' (%d levels) from source '%s'",
@@ -838,7 +849,9 @@ class TensorBrowserWidget(QWidget):
                             source_id,
                         )
                     else:
-                        self._viewer.add_image(levels[0], name=layer_name)
+                        self._viewer.add_image(
+                            levels[0], name=layer_name, **scale_kwargs
+                        )
                         logger.info(
                             "Added tensor '%s' from source '%s' to viewer as '%s'",
                             tensor.array_id,
@@ -1008,10 +1021,22 @@ class TensorBrowserWidget(QWidget):
                 tensor_name = _tensor_short_name(self._selected_tensor_id)
                 layer_name = f"{stem}/{tensor_name}"
 
+            # OME physical pixel size → layer.scale (review finding B3).
+            scale, _ = build_layer_scale(
+                self._client,
+                self._selected_source_id,
+                tensor_desc,
+                source_desc=src,
+            )
+            scale_kwargs = {"scale": scale} if scale is not None else {}
+
             # Add as multiscale pyramid if multiple levels, otherwise single array
             if len(levels) > 1:
                 self._viewer.add_image(
-                    levels, name=layer_name, multiscale=True
+                    levels,
+                    name=layer_name,
+                    multiscale=True,
+                    **scale_kwargs,
                 )
                 logger.info(
                     "Added multiscale pyramid '%s' (%d levels) from source '%s'",
@@ -1020,7 +1045,9 @@ class TensorBrowserWidget(QWidget):
                     self._selected_source_id,
                 )
             else:
-                self._viewer.add_image(levels[0], name=layer_name)
+                self._viewer.add_image(
+                    levels[0], name=layer_name, **scale_kwargs
+                )
                 logger.info(
                     "Added tensor '%s' from source '%s' to viewer as '%s'",
                     self._selected_tensor_id,
