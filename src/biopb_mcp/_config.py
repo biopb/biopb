@@ -1,7 +1,8 @@
 """Configuration management for biopb-mcp plugin.
 
 Provides persistent storage of user settings and configurable parameters.
-Uses platformdirs for cross-platform config directory location.
+Config lives under the home-relative XDG path ~/.config/biopb-mcp, matching the
+biopb server (~/.config/biopb) and the installer across all platforms.
 """
 
 import copy
@@ -82,14 +83,12 @@ def get_default_config() -> dict:
 
 
 def get_config_dir() -> Path:
-    """Get the platform-appropriate config directory.
+    """Get the config directory (~/.config/biopb-mcp on all platforms).
 
     Returns:
         Path to the config directory for biopb-mcp.
     """
-    from platformdirs import user_config_dir
-
-    config_dir = Path(user_config_dir("biopb-mcp"))
+    config_dir = Path.home() / ".config" / "biopb-mcp"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 

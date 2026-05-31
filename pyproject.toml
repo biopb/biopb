@@ -33,7 +33,6 @@ dependencies = [
     "opencv-python-headless",
     "grpcio_tools",
     "grpcio-health-checking",
-    "platformdirs",
 ]
 
 [project.optional-dependencies]

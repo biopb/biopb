@@ -16,15 +16,13 @@ from biopb_mcp._config import (
 
 @pytest.fixture
 def mock_config_dir(monkeypatch, tmp_path):
-    """Mock the config directory to use a temporary path."""
+    """Redirect the home-relative config dir (~/.config/biopb-mcp) to a tmp path."""
+    import pathlib
 
-    def mock_user_config_dir(app_name):
-        return str(tmp_path / app_name)
-
-    import platformdirs
-
-    monkeypatch.setattr(platformdirs, "user_config_dir", mock_user_config_dir)
-    return tmp_path / "biopb-mcp"
+    monkeypatch.setattr(
+        pathlib.Path, "home", classmethod(lambda cls: tmp_path)
+    )
+    return tmp_path / ".config" / "biopb-mcp"
 
 
 class TestLoadConfig:
