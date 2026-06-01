@@ -406,29 +406,45 @@ function Install-Biopb {
     # ===== 3. Install biopb packages =====
     Write-Step "[3/6] Installing biopb packages..."
 
-    Write-Inf "Installing biopb SDK..."
-    uv tool install --upgrade "biopb[tensor] @ $Repo"
-    Assert-LastExit "biopb SDK install"
-
-    Write-Inf "Installing biopb-tensor-server..."
     $tensorExtras = "web,ome-zarr,aics,medical,ndtiff"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
         Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"
     }
-    uv tool install --upgrade "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server"
-    Assert-LastExit "biopb-tensor-server install"
 
+    # Install everything into ONE uv tool environment so the components can
+    # import and drive each other at runtime:
+    #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
+    #     so the server must be importable from biopb's interpreter;
+    #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
+    #     server and runs a napari viewer in this same env.
+    # biopb is the primary tool (exposes the `biopb` command); --with adds the
+    # siblings to the same env and --with-executables-from also links their
+    # console scripts onto PATH (plain --with does not expose executables).
+    #
+    # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client,
+    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.5.4:
+    # that release drops biopb-mcp's stray, unpinned grpcio-tools dependency,
+    # which otherwise collapses the shared solve to an unbuildable
+    # grpcio-tools==1.30.0.
+    $installArgs = @(
+        "tool", "install", "--upgrade",
+        "biopb[tensor] @ $Repo",
+        "--with", "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server",
+        "--with-executables-from", "biopb-tensor-server"
+    )
     if ($InstallMcp) {
-        Write-Inf "Installing biopb-mcp..."
-        if (Get-Command napari -ErrorAction SilentlyContinue) {
-            uv tool install --upgrade napari --with biopb-mcp
-        } else {
-            uv tool install "napari[all]" --with biopb-mcp
-        }
-        Assert-LastExit "biopb-mcp install"
-        Write-Ok "biopb-mcp installed"
+        Write-Inf "  including biopb-mcp + napari"
+        $installArgs += @(
+            "--with", "biopb-mcp[mcp]>=0.5.4",
+            "--with", "napari[all]",
+            "--with-executables-from", "biopb-mcp"
+        )
     }
+
+    Write-Inf "Installing biopb into one shared environment..."
+    uv @installArgs
+    Assert-LastExit "biopb install"
 
     # Refresh PATH so freshly installed tool shims are visible this session.
     Add-ToUserPath $LocalBin
@@ -552,10 +568,7 @@ monitor = true
     }
     if (-not $InstallMcp) {
         Write-Note "biopb-mcp not installed"
-        Write-Note "to install separately:"
-        Write-Cmd "         uv tool install `"napari[all]`" --with biopb-mcp"
-        Write-Note "or into an existing biopb env:"
-        Write-Cmd "         pip install biopb-mcp"
+        Write-Note "to add it into the shared environment, rerun this script and enable it"
     }
     if (-not $InstallBioformats) {
         Write-Note "Bio-Formats not installed - ZVI/OIB/OIF and similar legacy formats unsupported"
