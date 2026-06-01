@@ -52,7 +52,7 @@ dependencies = [
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
   # download a small, user-cached JDK on first read.
   bioformats = [
-    "aicsimageio[bioformats]",
+    "bioformats_jar",
     "scyjava >= 1.9.0",
     "cjdk >= 0.5.0",
   ]

@@ -469,6 +469,7 @@ install_biopb() {
     # collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
     local install_args=(
         --upgrade
+        --force
         "biopb[tensor] @ $REPO"
         --with "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
         --with-executables-from biopb-tensor-server

@@ -428,7 +428,7 @@ function Install-Biopb {
     # which otherwise collapses the shared solve to an unbuildable
     # grpcio-tools==1.30.0.
     $installArgs = @(
-        "tool", "install", "--upgrade",
+        "tool", "install", "--upgrade", "--force",
         "biopb[tensor] @ $Repo",
         "--with", "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server",
         "--with-executables-from", "biopb-tensor-server"
