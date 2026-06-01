@@ -64,6 +64,8 @@ credentials_profile = "aws-prod"
 
 from __future__ import annotations
 
+import getpass
+import os
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -98,9 +100,24 @@ else:
 
 # Default on-disk cache location for the file backend. Uses the system temp dir
 # (node-local fast scratch on HPC, honoring $TMPDIR/$TEMP/$TMP) rather than home,
-# which is often slow/quota-bound NFS. Resolves correctly on every platform
-# (on Windows this lands under %TEMP%\biopb-cache).
-DEFAULT_FILE_CACHE_DIR = Path(tempfile.gettempdir()) / "biopb-cache"
+# which is often slow/quota-bound NFS. The directory is scoped per user so that
+# multiple users sharing one node (HPC/Singularity) don't collide on a single
+# /tmp/biopb-cache and its process lock. Resolves correctly on every platform
+# (on Windows this lands under %TEMP%\biopb-cache-<username>).
+def _default_file_cache_dir() -> Path:
+    # Prefer the POSIX uid (always present, no env dependency); fall back to the
+    # username on platforms without getuid (Windows), then to a fixed label.
+    try:
+        ident = str(os.getuid())
+    except AttributeError:
+        try:
+            ident = getpass.getuser()
+        except Exception:
+            ident = "default"
+    return Path(tempfile.gettempdir()) / f"biopb-cache-{ident}"
+
+
+DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 
 
 @dataclass
@@ -192,7 +209,7 @@ class CacheConfig:
         backend: Cache backend type - "memory" or "file"
         memory_max_entries: Maximum number of cached entries (memory backend)
         memory_max_bytes: Maximum total bytes to cache (memory backend, default 512 MB)
-        file_cache_dir: Directory for cache files (file backend, default: system temp dir/biopb-cache)
+        file_cache_dir: Directory for cache files (file backend, default: system temp dir/biopb-cache-<uid>, scoped per user)
         file_max_segment_bytes: Maximum bytes per segment file (file backend, default 64 MB)
         file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
     """
