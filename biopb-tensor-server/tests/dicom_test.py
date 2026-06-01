@@ -15,6 +15,10 @@ from biopb_tensor_server.adapters.dicom import (
 )
 from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
+# Every test here builds/reads DICOM via pydicom (the [dicom]/[medical] extra);
+# skip the whole module when it is not installed rather than erroring.
+pytest.importorskip("pydicom")
+
 
 def create_synthetic_dicom(
     path: Path,

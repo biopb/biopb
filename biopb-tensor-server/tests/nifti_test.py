@@ -10,6 +10,10 @@ import pytest
 from biopb_tensor_server.adapters.nifti import NiftiAdapter
 from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
+# Every test here builds/reads NIfTI via nibabel (the [nifti]/[medical] extra);
+# skip the whole module when it is not installed rather than erroring.
+pytest.importorskip("nibabel")
+
 
 def create_synthetic_nifti(
     path: Path,
