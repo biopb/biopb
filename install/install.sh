@@ -253,6 +253,52 @@ EOF
     fi
 }
 
+# Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
+# Persists it for FUTURE shells via uv's own mechanism, plus prints explicit
+# guidance for the CURRENT session (uv tool update-shell can't affect the
+# running shell, so we never rely on it alone).
+#
+# Critical: judge against the user's ORIGINAL PATH ($1), not our process PATH —
+# install.sh prepends ~/.local/bin for its own use, which would otherwise make
+# both this check and `uv tool update-shell` believe the dir is already set up
+# (uv prints "already in PATH" and edits no rc file).
+_ensure_local_bin_on_path() {
+    local bin_dir="$HOME/.local/bin"
+    local original_path="${1:-$PATH}"
+
+    # Already persistently on the user's PATH? Nothing to do.
+    case ":$original_path:" in
+        *":$bin_dir:"*) return 0 ;;
+    esac
+
+    # Persist for future shells. Run uv by absolute path with the original PATH
+    # so it sees the dir as missing and updates the shell rc (idempotent; tolerate
+    # old uv lacking the subcommand).
+    local persisted=0
+    local uv_bin; uv_bin=$(command -v uv 2>/dev/null || true)
+    if [ -n "$uv_bin" ] && PATH="$original_path" "$uv_bin" tool update-shell &>/dev/null; then
+        persisted=1
+    fi
+
+    local future_msg
+    if [ "$persisted" = "1" ]; then
+        future_msg="New shells are set up automatically. For THIS terminal, run:"
+    else
+        future_msg="Add it to your shell profile, and run it now for THIS terminal:"
+    fi
+
+    # Full-width rules (no right border) so the banner is prominent but never
+    # misaligns, regardless of how long $HOME / the path is.
+    local rule="──────────────────────────────────────────────────────────────────"
+    printf "\n${YELLOW}${BOLD}  %s${RESET}\n" "$rule"
+    printf   "${YELLOW}${BOLD}  ⚠  ACTION REQUIRED — PATH not configured${RESET}\n"
+    printf   "${YELLOW}${BOLD}  %s${RESET}\n" "$rule"
+    printf   "  %s is not on your PATH; biopb commands live there.\n" "$bin_dir"
+    printf   "  %s\n" "$future_msg"
+    printf   "      ${CYAN}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}\n"
+    printf   "${YELLOW}${BOLD}  %s${RESET}\n\n" "$rule"
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -334,6 +380,10 @@ install_biopb() {
     # ===== 1. Install uv + buf (if needed) =====
     _step "[1/6] Ensuring build tools..."
 
+    # Remember the user's real shell PATH before we prepend ~/.local/bin for our
+    # own process — _ensure_local_bin_on_path needs it to tell whether the dir is
+    # *persistently* on PATH (our transient export must not mask that).
+    ORIGINAL_PATH="$PATH"
     export PATH="$HOME/.local/bin:$PATH"
     if ! command -v uv &>/dev/null; then
         _info "Installing uv..."
@@ -344,9 +394,14 @@ install_biopb() {
     fi
 
     BUF_VERSION="1.70.0"
-    BUF_BIN="/usr/local/bin"
+    # Install into the user's ~/.local/bin (already prepended to PATH above), not
+    # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
+    # there fails with "failed to write to destination". Keeps buf user-local and
+    # consistent with uv's tool bin dir and the Windows installer.
+    BUF_BIN="$HOME/.local/bin"
     if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
         _info "Installing buf $BUF_VERSION..."
+        mkdir -p "$BUF_BIN"
         rm -f "$BUF_BIN/buf"
         curl -sSL \
             "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
@@ -391,28 +446,44 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/6] Installing biopb packages..."
 
-    _info "Installing biopb SDK..."
-    uv tool install --upgrade \
-        "biopb[tensor] @ $REPO"
-
-    _info "Installing biopb-tensor-server..."
     TENSOR_EXTRAS="web,ome-zarr,aics,medical,ndtiff"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
-    uv tool install --upgrade \
-        "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
 
+    # Install everything into ONE uv tool environment so the components can import
+    # and drive each other at runtime:
+    #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
+    #     so the server must be importable from biopb's interpreter (this also
+    #     restores `from biopb_tensor_server.config import load_config`);
+    #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
+    #     server and runs a napari viewer in this same env.
+    # biopb is the primary tool (exposes the `biopb` command); --with adds the
+    # siblings to the same env and --with-executables-from also links their
+    # console scripts onto PATH (plain --with does not expose executables).
+    #
+    # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
+    # psutil) — without it `import mcp` fails. We require >=0.5.4: that release
+    # drops biopb-mcp's stray, unpinned grpcio-tools dependency, which otherwise
+    # collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
+    local install_args=(
+        --upgrade
+        "biopb[tensor] @ $REPO"
+        --with "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+        --with-executables-from biopb-tensor-server
+    )
     if [ "$INSTALL_MCP" = "1" ]; then
-        _info "Installing biopb-mcp..."
-        if command -v napari &>/dev/null; then
-            uv tool install --upgrade napari --with biopb-mcp
-        else
-            uv tool install "napari[all]" --with biopb-mcp
-        fi
-        _ok "biopb-mcp installed"
+        _info "  including biopb-mcp + napari"
+        install_args+=(
+            --with "biopb-mcp[mcp]>=0.5.4"
+            --with "napari[all]"
+            --with-executables-from biopb-mcp
+        )
     fi
+
+    _info "Installing biopb into one shared environment..."
+    uv tool install "${install_args[@]}"
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
@@ -513,6 +584,9 @@ EOF
     # ===== Summary =====
     printf "\n%s%s%s\n" "${BOLD}" "${YELLOW}" "=== Installation Complete ===${YELLOW}"
 
+    # Make sure the user can actually invoke the freshly installed commands.
+    _ensure_local_bin_on_path "$ORIGINAL_PATH"
+
     if [ "$INSTALL_MCP" = "1" ]; then
         printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch biopb-mcp as an MCP server directly:${RESET}"
         _cmd "biopb-mcp"
@@ -533,10 +607,7 @@ EOF
     fi
     if [ "$INSTALL_MCP" = "0" ]; then
         _note "biopb-mcp not installed"
-        _note "to install separately:"
-        _cmd "         uv tool install \"napari[all]\" --with biopb-mcp"
-        _note "or into an existing biopb env:"
-        _cmd "         pip install biopb-mcp"
+        _note "to add it into the shared environment, rerun this script and enable it"
     fi
     if [ "$INSTALL_BIOFORMATS" = "0" ]; then
         _note "Bio-Formats not installed — ZVI/OIB/OIF and similar legacy formats unsupported"
