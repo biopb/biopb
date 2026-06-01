@@ -31,7 +31,11 @@ dependencies = [
     "scikit-image",
     "biopb[tensor] >= 0.5.4",
     "opencv-python-headless",
-    "grpcio_tools",
+    # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
+    # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
+    # NOT depend on grpcio-tools: it is a build-time codegen plugin, is never
+    # imported at runtime, and being unpinned it drags resolvers down to an
+    # ancient, unbuildable grpcio-tools when co-installed with biopb.
     "grpcio-health-checking",
 ]
 
