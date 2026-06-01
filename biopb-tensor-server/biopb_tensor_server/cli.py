@@ -9,6 +9,7 @@ Commands:
 
 import os
 import secrets
+import signal
 import threading
 import webbrowser
 from pathlib import Path
@@ -46,6 +47,55 @@ console = Console()
 
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
+
+
+def _install_sigterm_handler() -> None:
+    """Make SIGTERM behave like Ctrl+C (KeyboardInterrupt).
+
+    `biopb server stop`, `docker/singularity stop`, and SLURM all terminate the
+    server with SIGTERM, which Python ignores (default disposition) for a
+    blocking call like the Flight server's serve(). Translating it into a
+    KeyboardInterrupt lets the same graceful-shutdown path run, so the file
+    cache process lock is released instead of being left behind as a stale lock.
+
+    Must be called from the main thread; no-op if that's not possible.
+    """
+    def _handler(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        # Not on the main thread (e.g. under some test runners) - skip.
+        pass
+
+
+def _graceful_shutdown(source_manager, watcher, flight_server) -> None:
+    """Best-effort orderly shutdown.
+
+    Stops source discovery and the filesystem watcher, shuts down the Flight
+    server, and closes the cache manager so the file-backend process lock is
+    released. Each step is isolated so a failure in one still lets the cache
+    lock be released (the important part for clean restarts).
+    """
+    for label, action in (
+        ("source manager", lambda: source_manager and source_manager.stop()),
+        ("watcher", lambda: watcher and watcher.stop()),
+        ("flight server", lambda: flight_server and flight_server.shutdown()),
+    ):
+        try:
+            action()
+        except Exception as e:  # noqa: BLE001 - shutdown must not raise
+            console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
+
+    # Release the file cache process lock (no-op for the memory backend).
+    manager = CacheManager.get_instance()
+    if manager is not None:
+        try:
+            manager.close()
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]Error closing cache: {e}[/yellow]")
+
 
 def _setup_flight_server(
     server_config: ServerConfig,
@@ -403,15 +453,15 @@ def serve(
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
+    # Treat SIGTERM (e.g. `biopb server stop`) like Ctrl+C so shutdown is clean.
+    _install_sigterm_handler()
+
     try:
         server.serve()
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
-        if source_manager:
-            source_manager.stop()
-        if watcher:
-            watcher.stop()
-        server.shutdown()
+    finally:
+        _graceful_shutdown(source_manager, watcher, server)
 
 
 @app.command()
@@ -747,6 +797,9 @@ def launch(
         f"[green]Starting HTTP sidecar at http://{web_host}:{web_port}[/green]"
     )
     console.print("Press Ctrl+C to stop\n")
+    # uvicorn installs its own SIGINT/SIGTERM handlers and returns normally on
+    # shutdown (it does not re-raise), so cleanup must run in `finally` rather
+    # than an except block - otherwise the cache lock is never released.
     try:
         run_http_server(
             flight_location=flight_location,
@@ -759,11 +812,8 @@ def launch(
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
-        if source_manager:
-            source_manager.stop()
-        if watcher:
-            watcher.stop()
-        flight_server.shutdown()
+    finally:
+        _graceful_shutdown(source_manager, watcher, flight_server)
 
     try:
         from biopb_tensor_server import __version__
