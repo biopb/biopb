@@ -16,9 +16,9 @@
 curl -fsSL https://biopb.org/install.sh | bash
 ```
 
-## Alternative methods
+## Installation - alternative methods
 
-These methods only install the mcp component without the rest of **[biopb](https://github.com/biopb/biopb)**  system.
+These methods only install the mcp component without the rest of **[BioPB](https://github.com/biopb/biopb)**  system.
 
 ### Bundled Installers
 
@@ -36,18 +36,17 @@ Pre-built standalone installers are available from the [Releases](https://github
 - **macOS**: Extract and open `biopb-mcp.app` (right-click → "Open" to bypass Gatekeeper for unsigned apps)
 - **Linux**: Extract and run `./biopb-mcp`
 
-### From PyPI
-
-For users with existing virtual environement setup for napari: install `biopb-mcp` via [pip]:
-
-    pip install biopb-mcp
-
 ### Development Version
 
 To install latest development version:
 
     pip install git+https://github.com/biopb/biopb-mcp.git
 
+
+## Troubleshooting
+
+For URL resolution, the auto-start fallback, and how to resolve startup failures (e.g.
+a port already in use on a shared node), see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Contributing
 

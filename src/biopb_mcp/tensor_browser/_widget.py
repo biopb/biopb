@@ -493,9 +493,13 @@ class TensorBrowserWidget(QWidget):
         QApplication.setOverrideCursor(Qt.BusyCursor)
         try:
             self._conn.start_local_server()
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to start local biopb server")
-            self._show_error("Failed to start local biopb server")
+            # Surface the underlying cause (e.g. port already in use, startup
+            # timeout) instead of a generic message — the root cause is
+            # otherwise only visible in the server logs. See
+            # docs/troubleshooting.md for remedies.
+            self._show_error(f"Failed to start local biopb server: {exc}")
             return
         finally:
             QApplication.restoreOverrideCursor()
