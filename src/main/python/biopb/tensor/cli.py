@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 import dask
 import typer
-import zarr
 from rich.console import Console
 from rich.table import Table
 
@@ -389,7 +388,16 @@ def get(
                 stderr_console.print(f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)")
 
         elif fmt == "zarr":
-            # Zarr format: realized array
+            # Zarr format: realized array. Import lazily so that a missing or
+            # broken zarr/numcodecs install only affects this output format
+            # rather than the whole CLI.
+            try:
+                import zarr
+            except ImportError as exc:
+                raise typer.BadParameter(
+                    f"zarr output requires the 'zarr' package (install biopb[tensor]): {exc}"
+                )
+
             arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
             result = arr.compute()
 

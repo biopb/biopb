@@ -12,9 +12,6 @@ from typing import Optional
 
 import typer
 
-from biopb.tensor.cli import app as tensor_app
-from biopb.image.cli import app as image_app
-
 console = Console()
 
 app = typer.Typer(
@@ -23,11 +20,45 @@ app = typer.Typer(
 )
 console = Console()
 
+
+def _add_optional_typer(name: str, import_path: str, help: str) -> None:
+    """Register a subcommand whose imports may fail.
+
+    The tensor/image subcommands pull in optional dependencies (installed via
+    biopb[tensor]) that may be absent or broken (e.g. a transient
+    numcodecs/zarr ImportError). When that happens we still want the rest of
+    the CLI (version, server management) to work, so we register a stub that
+    surfaces the error only when the subcommand is actually invoked.
+    """
+    import importlib
+    from typing import List
+
+    try:
+        module = importlib.import_module(import_path)
+        app.add_typer(getattr(module, "app"), name=name, help=help)
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
+        error = exc
+
+        # Register a catch-all command so that any `biopb <name> ...` invocation
+        # surfaces the import error instead of a confusing crash or usage error.
+        @app.command(
+            name=name,
+            help=f"{help} (unavailable - optional dependencies missing)",
+            context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+        )
+        def _unavailable(args: List[str] = typer.Argument(None)) -> None:
+            console.print(
+                f"[red]The '{name}' commands are unavailable:[/red] {error}\n"
+                r"[yellow]Install optional dependencies with: pip install 'biopb\[tensor]'[/yellow]"
+            )
+            raise typer.Exit(1)
+
+
 # TensorFlight client diagnostics
-app.add_typer(tensor_app, name="tensor", help="TensorFlight client diagnostics")
+_add_optional_typer("tensor", "biopb.tensor.cli", "TensorFlight client diagnostics")
 
 # ProcessImage client operations
-app.add_typer(image_app, name="image", help="ProcessImage client operations")
+_add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations")
 
 # Tensor server daemon management
 server_app = typer.Typer(
