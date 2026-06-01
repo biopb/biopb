@@ -34,6 +34,11 @@ dependencies = [
   test = [
     "pytest >= 7.0.0",
     "httpx >= 0.25.0",
+    # The test suite imports the web stack at collection time (cli_test.py pulls
+    # in cli -> http_server -> fastapi; http_server_test.py uses TestClient), so
+    # the web extra is required to run `pytest tests/`. Kept as a self-reference
+    # so the dependency list stays defined once, in [web].
+    "biopb-tensor-server[web]",
   ]
   ome-zarr = [
     "ome-zarr >= 0.6.1",
@@ -94,3 +99,8 @@ select = [
 # Optional: customize isort behavior
 combine-as-imports = true
 force-single-line = false
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests that require external services or network access",
+]
