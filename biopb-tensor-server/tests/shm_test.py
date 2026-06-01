@@ -40,7 +40,7 @@ class TestShmTransferActionListing:
         """shm_transfer should be in list_actions."""
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:8815",
+                location="grpc://localhost:0",
                 write_dir=Path(tmpdir),
             )
 
@@ -77,7 +77,7 @@ class TestShmTransferHandler:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:8816",
+                location="grpc://localhost:0",
                 write_dir=Path(tmpdir),
             )
             server.register_source("test_shm", adapter)
@@ -133,7 +133,7 @@ class TestShmTransferHandler:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:8821",
+                location="grpc://localhost:0",
                 write_dir=Path(tmpdir),
             )
             server.register_source("test_shm_perm", adapter)
@@ -159,7 +159,7 @@ class TestShmTransferHandler:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:8817",
+                location="grpc://localhost:0",
                 write_dir=Path(tmpdir),
             )
 
@@ -185,7 +185,7 @@ class TestShmCleanupThread:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:8818",
+                location="grpc://localhost:0",
                 write_dir=Path(tmpdir),
             )
 
@@ -203,7 +203,7 @@ class TestShmCleanupThread:
         with patch.object(Path, 'exists', return_value=False):
             with tempfile.TemporaryDirectory() as tmpdir:
                 server = TensorFlightServer(
-                    location="grpc://localhost:8819",
+                    location="grpc://localhost:0",
                     write_dir=Path(tmpdir),
                 )
 
@@ -473,16 +473,6 @@ class TestShmTransferIntegration:
 
     def test_shm_transfer_roundtrip(self):
         """Full roundtrip: client requests tensor, data is correct."""
-        import socket
-
-        # Find free port
-        sock = socket.socket()
-        sock.bind(("", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-
-        location = f"grpc://localhost:{port}"
-
         # Create test data
         test_data = np.random.randint(0, 1000, (32, 32), dtype=np.uint16)
 
@@ -501,7 +491,10 @@ class TestShmTransferIntegration:
             bounds = ChunkBounds(start=[0, 0], stop=[32, 32])
             adapter.write_chunk(bounds, test_data)
 
-            server = TensorFlightServer(location=location, write_dir=Path(tmpdir))
+            # Bind to port 0 so the OS assigns a free port (avoids flaky
+            # "Address already in use" collisions); read it back for the client.
+            server = TensorFlightServer(location="grpc://localhost:0", write_dir=Path(tmpdir))
+            location = f"grpc://localhost:{server.port}"
             server.register_source("shm_test", adapter)
 
             # Start server in thread
@@ -529,16 +522,6 @@ class TestShmTransferIntegration:
 
     def test_shm_transfer_action_via_flight(self):
         """Test shm_transfer action directly via Flight protocol."""
-        import socket
-
-        # Find free port
-        sock = socket.socket()
-        sock.bind(("", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-
-        location = f"grpc://localhost:{port}"
-
         # Create test data
         test_data = np.arange(256, dtype=np.uint16).reshape(16, 16)
 
@@ -555,7 +538,10 @@ class TestShmTransferIntegration:
             bounds = ChunkBounds(start=[0, 0], stop=[16, 16])
             adapter.write_chunk(bounds, test_data)
 
-            server = TensorFlightServer(location=location, write_dir=Path(tmpdir))
+            # Bind to port 0 so the OS assigns a free port (avoids flaky
+            # "Address already in use" collisions); read it back for the client.
+            server = TensorFlightServer(location="grpc://localhost:0", write_dir=Path(tmpdir))
+            location = f"grpc://localhost:{server.port}"
             server.register_source("shm_action_test", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)

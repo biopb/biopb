@@ -456,13 +456,13 @@ class TestServerDoPutHandler:
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
-            location="grpc://127.0.0.1:8825",
+            location="grpc://127.0.0.1:0",
             writable=True,
         )
         thread = threading.Thread(target=server.serve, daemon=True)
         thread.start()
 
-        client = TensorFlightClient("grpc://127.0.0.1:8825")
+        client = TensorFlightClient(f"grpc://127.0.0.1:{server.port}")
         try:
             source_id = client.create_source(
                 "cache:test-action",

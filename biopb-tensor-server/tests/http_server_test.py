@@ -590,9 +590,9 @@ class TestIntegration:
 
         adapter = ZarrAdapter(z, "int-tensor", ["z", "y", "x"])
 
-        # Pick an ephemeral-ish port for the Flight server
-        port = 48816
-        server = TensorFlightServer(f"grpc://127.0.0.1:{port}")
+        # Bind to port 0 so the OS assigns a free port, avoiding flaky
+        # "Address already in use" collisions when the suite runs back-to-back.
+        server = TensorFlightServer("grpc://127.0.0.1:0")
         # Register under the same name as the adapter's array_id so that
         # the source_id returned by the server matches the tensor_id.
         server.register_source("int-tensor", adapter)
@@ -601,7 +601,7 @@ class TestIntegration:
         t.start()
         time.sleep(0.5)  # allow server to bind
 
-        self._flight_loc = f"grpc://localhost:{port}"
+        self._flight_loc = f"grpc://localhost:{server.port}"
         self._shape = shape
         self._data = data
         self._server = server

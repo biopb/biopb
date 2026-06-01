@@ -268,7 +268,7 @@ class TestNdTiffServerClient:
         )
 
         # Start server
-        server = TensorFlightServer("grpc://localhost:8866")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ndtiff-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -276,7 +276,7 @@ class TestNdTiffServerClient:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8866")
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Get tensor - for single-tensor source, tensor_id = source_id
             arr = client.get_tensor("ndtiff-test", "ndtiff-test")

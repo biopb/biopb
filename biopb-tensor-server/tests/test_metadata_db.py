@@ -566,11 +566,13 @@ class TestListFlightsTruncation:
         """Test that list_flights includes truncation metadata in schema."""
         from biopb_tensor_server.server import TensorFlightServer
         import pyarrow.flight as flight
-        import random
 
-        port = random.randint(8900, 8999)
+        # Bind to port 0: the OS assigns a free port and this test never connects
+        # a client (it calls list_flights in-process), so the value is irrelevant.
+        # Fixed-range random ports caused flaky "Address already in use" failures
+        # under the full suite.
         server = TensorFlightServer(
-            f"grpc://localhost:{port}",
+            "grpc://localhost:0",
             max_list_flights_results=5,
         )
 
@@ -597,11 +599,13 @@ class TestListFlightsTruncation:
         """Test that list_flights truncates and signals via metadata."""
         from biopb_tensor_server.server import TensorFlightServer
         import pyarrow.flight as flight
-        import random
 
-        port = random.randint(8900, 8999)
+        # Bind to port 0: the OS assigns a free port and this test never connects
+        # a client (it calls list_flights in-process), so the value is irrelevant.
+        # Fixed-range random ports caused flaky "Address already in use" failures
+        # under the full suite.
         server = TensorFlightServer(
-            f"grpc://localhost:{port}",
+            "grpc://localhost:0",
             max_list_flights_results=3,
         )
 
@@ -628,11 +632,13 @@ class TestListFlightsTruncation:
     def test_list_flights_uses_stable_snapshot_during_mutation(self):
         """list_flights should not fail if sources mutate mid-iteration."""
         from biopb_tensor_server.server import TensorFlightServer
-        import random
 
-        port = random.randint(8900, 8999)
+        # Bind to port 0: the OS assigns a free port and this test never connects
+        # a client (it calls list_flights in-process), so the value is irrelevant.
+        # Fixed-range random ports caused flaky "Address already in use" failures
+        # under the full suite.
         server = TensorFlightServer(
-            f"grpc://localhost:{port}",
+            "grpc://localhost:0",
             max_list_flights_results=10,
         )
 

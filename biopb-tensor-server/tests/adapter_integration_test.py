@@ -63,7 +63,7 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = TensorFlightServer("grpc://localhost:8899")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -72,7 +72,7 @@ class TestZarrIntegration:
 
         try:
             # Connect client and compute
-            client = TensorFlightClient("grpc://localhost:8899", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # List sources
             sources = client.list_sources()
@@ -103,7 +103,7 @@ class TestZarrIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "zarr-scaled", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:8898")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("zarr-scaled", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -111,7 +111,7 @@ class TestZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8898", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # Test stride downsampling
             darr = client.get_tensor(
@@ -148,7 +148,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-integration")
 
-        server = TensorFlightServer("grpc://localhost:8897")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ome-zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -156,7 +156,7 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8897", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # Test precompute method for scale 2
             darr = client.get_tensor(
@@ -195,7 +195,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-virtual")
 
-        server = TensorFlightServer("grpc://localhost:8896")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ome-zarr-virtual", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -203,7 +203,7 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8896", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # Request scale 3 - no matching level, should use virtual scaling
             darr = client.get_tensor(
@@ -244,7 +244,7 @@ class TestOmeTiffIntegration:
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:8895")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ome-tiff-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -252,7 +252,7 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8895", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-integration", scene_id)
@@ -287,7 +287,7 @@ class TestOmeTiffIntegration:
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:8894")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ome-tiff-channels", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -295,7 +295,7 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8894", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-channels", scene_id)
@@ -366,7 +366,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-server")
 
-        server = TensorFlightServer("grpc://localhost:8877")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -374,7 +374,7 @@ class TestMultiSeriesOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8877", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             # List sources
             sources = client.list_sources()
@@ -497,7 +497,7 @@ class TestHdf5Integration:
             dataset = f["data"]
             adapter = Hdf5Adapter(dataset, "hdf5-integration")
 
-            server = TensorFlightServer("grpc://localhost:8891")
+            server = TensorFlightServer("grpc://localhost:0")
             server.register_source("hdf5-integration", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -506,7 +506,7 @@ class TestHdf5Integration:
 
             try:
                 client = TensorFlightClient(
-                    "grpc://localhost:8891", cache_bytes=10_000_000
+                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                 )
 
                 darr = client.get_tensor("hdf5-integration", "hdf5-integration")
@@ -535,7 +535,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:8890")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("cache-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -543,7 +543,7 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             darr = client.get_tensor("cache-test", "cache-test")
 
@@ -580,7 +580,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-regions", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:8889")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("cache-regions", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -588,7 +588,7 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8889", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
 
             darr = client.get_tensor("cache-regions", "cache-regions")
 
@@ -625,7 +625,7 @@ class TestConcurrentAccess:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "concurrent-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:8888")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("concurrent-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -635,7 +635,7 @@ class TestConcurrentAccess:
         results = []
 
         def read_region(client_id):
-            client = TensorFlightClient("grpc://localhost:8888", cache_bytes=10_000_000)
+            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
             darr = client.get_tensor("concurrent-test", "concurrent-test")
             data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))

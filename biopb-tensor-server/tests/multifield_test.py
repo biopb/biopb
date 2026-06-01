@@ -214,7 +214,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-test", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:8877")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multifield-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -222,7 +222,7 @@ class TestMultifieldServerClient:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8877")
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             sources = client.list_sources()
 
@@ -245,7 +245,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-access", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:8876")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multifield-access", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -253,7 +253,7 @@ class TestMultifieldServerClient:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8876")
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             # Access first tensor
             arr0 = client.get_tensor("multifield-access", "pos_0")
@@ -278,7 +278,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("single-source", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:8875")
+        server = TensorFlightServer("grpc://localhost:0")
         server.register_source("single-source", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -286,7 +286,7 @@ class TestMultifieldServerClient:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient("grpc://localhost:8875")
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
             sources = client.list_sources()
             assert len(sources["single-source"].tensors) == 1
