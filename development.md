@@ -289,4 +289,4 @@ editing the code.
 - **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`.
 - **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
   service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`). See this repo's `CLAUDE.md` for the MCP module specifics.
+  `_server.py`).
