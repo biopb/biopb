@@ -155,12 +155,13 @@ function Add-ToUserPath {
 
 # Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
 # Cursor, ...). Uses native JSON (ConvertFrom/ConvertTo-Json) in place of jq.
+# biopb-mcp is a streamable-http server, so clients connect to its URL.
 function Merge-McpJson {
-    param([string]$File, [string]$Cmd, [string]$Label, [string]$ConfigDir)
+    param([string]$File, [string]$Url, [string]$Label, [string]$ConfigDir)
     $dir = Split-Path -Parent $File
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
-    $entry = [pscustomobject]@{ command = $Cmd; args = @() }
+    $entry = [pscustomobject]@{ type = "http"; url = $Url }
 
     if (Test-Path -LiteralPath $File) {
         try {
@@ -193,6 +194,11 @@ function Set-McpClients {
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
+    # biopb-mcp is a long-running streamable-http server (it owns the shared napari
+    # window); clients connect to its URL rather than spawning it over stdio. This
+    # must match the default port in config.json below - change both if you set mcp.port.
+    $mcpUrl = "http://127.0.0.1:8765/mcp"
+
     # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved
     # if it already exists so the user's tweaks survive a rerun.
     $mcpConfigDir = Join-Path $BiopbHome ".config\biopb-mcp"
@@ -216,7 +222,7 @@ function Set-McpClients {
 
     # Canonical standalone definition (standard mcpServers JSON).
     $canonical = [pscustomobject]@{
-        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ command = $mcpCmd; args = @() } }
+        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ type = "http"; url = $mcpUrl } }
     }
     Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
     Write-Ok "MCP definition written: $ConfigDir\mcp.json"
@@ -230,12 +236,12 @@ function Set-McpClients {
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Claude Code: biopb already registered"
         } else {
-            & claude mcp add --scope user biopb -- $mcpCmd *> $null
+            & claude mcp add --scope user --transport http biopb $mcpUrl *> $null
             if ($LASTEXITCODE -eq 0) {
                 Write-Ok "Claude Code: registered biopb (user scope)"
             } else {
                 Write-Warn2 "Claude Code detected but registration failed - add it manually:"
-                Write-Cmd "claude mcp add --scope user biopb -- $mcpCmd"
+                Write-Cmd "claude mcp add --scope user --transport http biopb $mcpUrl"
             }
         }
     }
@@ -244,14 +250,14 @@ function Set-McpClients {
     $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
     if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
         $detected = $true
-        Merge-McpJson -File $cdCfg -Cmd $mcpCmd -Label "Claude Desktop" -ConfigDir $ConfigDir
+        Merge-McpJson -File $cdCfg -Url $mcpUrl -Label "Claude Desktop" -ConfigDir $ConfigDir
     }
 
     # --- Cursor ---
     $cursorDir = Join-Path $BiopbHome ".cursor"
     if (Test-Path -LiteralPath $cursorDir) {
         $detected = $true
-        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Cmd $mcpCmd -Label "Cursor" -ConfigDir $ConfigDir
+        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Url $mcpUrl -Label "Cursor" -ConfigDir $ConfigDir
     }
 
     # --- opencode ---
@@ -262,10 +268,9 @@ function Set-McpClients {
         if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
 
         $opencodeEntry = [pscustomobject]@{
-            type = "local"
-            command = @($mcpCmd)
+            type = "remote"
+            url = $mcpUrl
             enabled = $true
-            env = [pscustomobject]@{}
         }
 
         if (Test-Path -LiteralPath $opencodeCfg) {
@@ -284,7 +289,7 @@ function Set-McpClients {
             } catch {
                 Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
                 Write-Inf "Add under 'mcp' in $opencodeCfg :"
-                Write-Host ("    `"biopb`": {{ `"type`": `"local`", `"command`": [`"$mcpCmd`"], `"enabled`": true, `"env`": {{}} }}") -ForegroundColor DarkGray
+                Write-Host ("    `"biopb`": {{ `"type`": `"remote`", `"url`": `"$mcpUrl`", `"enabled`": true }}") -ForegroundColor DarkGray
             }
         } else {
             $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
@@ -295,10 +300,15 @@ function Set-McpClients {
 
     if (-not $detected) {
         Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor, opencode)."
-        Write-Inf "To use biopb, point your MCP client at this command:"
-        Write-Cmd $mcpCmd
+        Write-Inf "To use biopb, point your MCP client at this streamable-http endpoint:"
+        Write-Cmd $mcpUrl
         Write-Inf "A ready-to-use definition is at: $ConfigDir\mcp.json"
     }
+
+    # biopb-mcp must be running for clients to connect - it is the shared napari session.
+    Write-Inf "Start the shared session first by running:"
+    Write-Cmd $mcpCmd
+    Write-Inf "A napari window opens; your agent then connects to $mcpUrl"
 }
 
 $ISSUE_URL = "https://github.com/biopb/biopb/issues/new"
