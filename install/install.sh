@@ -539,6 +539,11 @@ install_biopb() {
         MIN_MINOR=10
     fi
 
+    # PYTHON_SPEC is the interpreter we hand to `uv tool install` below via --python.
+    # We MUST pin it: without --python, uv auto-discovers an interpreter and may pick
+    # an old system python3 (e.g. macOS 3.9) that satisfies a loose lower bound,
+    # then fails the build — even though we just installed 3.11 via uv.
+    PYTHON_SPEC=""
     PYTHON_VERSION=""
     if command -v python3 &>/dev/null; then
         PYTHON_VERSION=$(python3 -c "import sys; print(sys.version_info[:2])" 2>/dev/null || echo "")
@@ -547,6 +552,7 @@ install_biopb() {
             MINOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f2)
             if [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ]; }; then
                 _ok "Using system Python: $(python3 --version)"
+                PYTHON_SPEC=$(command -v python3)
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"
                 PYTHON_VERSION=""
@@ -558,6 +564,7 @@ install_biopb() {
         _info "Installing Python 3.11 via uv..."
         uv python install 3.11
         _ok "Python 3.11 ready"
+        PYTHON_SPEC="3.11"
     fi
 
     # ===== 3. Install biopb packages =====
@@ -587,6 +594,7 @@ install_biopb() {
     local install_args=(
         --upgrade
         --force
+        --python "$PYTHON_SPEC"
         "biopb[tensor] @ $REPO"
         --with "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
         --with-executables-from biopb-tensor-server
