@@ -43,6 +43,18 @@ function Assert-LastExit {
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
 }
 
+# Pause before the script ends so the final message stays readable. On Windows
+# the host often closes the instant the script returns (double-click, or a window
+# spawned just to run the installer), taking any goodbye or error text with it.
+# Skipped when input is non-interactive (CI, piped stdin) so automation does not
+# hang waiting on a keypress.
+function Wait-ForExit {
+    if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        Write-Host ""
+        Read-Host "  Press Enter to exit" | Out-Null
+    }
+}
+
 # Simplified component selector (replaces the bash in-place ANSI checkbox).
 # All components default ON; user types a number to toggle, Enter to confirm.
 # Returns a bool[] aligned with $Labels.
@@ -277,6 +289,7 @@ function Invoke-Preflight {
     if ($go -notmatch '^(y|yes)$') {
         Write-Host ""
         Write-Host "  Wise. We'll be right here once it's more house-trained. Cheers!" -ForegroundColor Cyan
+        Wait-ForExit
         exit 0
     }
 
@@ -312,6 +325,7 @@ function Install-Biopb {
         default {
             Write-Err2 "Unsupported architecture: $arch"
             Write-Inf "Supported: x86_64 (AMD64), arm64 (ARM64)"
+            Wait-ForExit
             exit 1
         }
     }
@@ -325,6 +339,7 @@ function Install-Biopb {
                 "git"  { Write-Inf "Install: winget install Git.Git  (then reopen PowerShell)" }
                 "tar"  { Write-Inf "tar ships with Windows 10 1803+; please update Windows" }
             }
+            Wait-ForExit
             exit 1
         }
         Write-Ok "${tool}: found"
@@ -345,6 +360,20 @@ function Install-Biopb {
     # ===== 1. Install uv + buf (if needed) =====
     Write-Step "[1/6] Ensuring build tools..."
 
+    # uv's installer (piped in below) voluntarily aborts unless the effective
+    # execution policy is one of Unrestricted/RemoteSigned/Bypass -- even though
+    # code piped through `iex` is otherwise exempt from policy enforcement. Set
+    # the Process scope so that self-check passes: it is session-only (gone when
+    # this window closes), needs no admin, and -- importantly -- cannot override
+    # a GPO-enforced policy, so a genuinely locked-down machine still wins, which
+    # is the correct outcome. We only touch it when the current policy would
+    # block uv, and never fail the install if even that is disallowed.
+    $allowedPolicy = @('Unrestricted', 'RemoteSigned', 'Bypass')
+    if ((Get-ExecutionPolicy).ToString() -notin $allowedPolicy) {
+        Write-Note "Temporarily allowing scripts for this session (execution policy -> RemoteSigned, Process scope) so the uv installer can run."
+        Set-ExecutionPolicy RemoteSigned -Scope Process -Force -ErrorAction SilentlyContinue
+    }
+
     Add-ToUserPath $LocalBin
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         Write-Inf "Installing uv..."
@@ -353,6 +382,7 @@ function Install-Biopb {
         Add-ToUserPath $LocalBin
         if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
             Write-Err2 "uv installation did not land on PATH - reopen PowerShell and rerun"
+            Wait-ForExit
             exit 1
         }
         Write-Ok "uv installed"
@@ -596,6 +626,7 @@ $reportOnFailure = Invoke-Preflight
 
 try {
     Install-Biopb
+    Wait-ForExit
 } catch {
     Write-Host ""
     Write-Err2 "Well, that didn't go to plan: $($_.Exception.Message)"
@@ -609,5 +640,6 @@ try {
         Write-Cmd $ISSUE_URL
     }
     Write-Host ""
+    Wait-ForExit
     exit 1
 }
