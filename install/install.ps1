@@ -254,8 +254,47 @@ function Set-McpClients {
         Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Cmd $mcpCmd -Label "Cursor" -ConfigDir $ConfigDir
     }
 
+    # --- opencode ---
+    $opencodeCfgDir = Join-Path $BiopbHome ".config\opencode"
+    if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $opencodeCfgDir)) {
+        $detected = $true
+        $opencodeCfg = Join-Path $opencodeCfgDir "opencode.json"
+        if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
+
+        $opencodeEntry = [pscustomobject]@{
+            type = "local"
+            command = @($mcpCmd)
+            enabled = $true
+            env = [pscustomobject]@{}
+        }
+
+        if (Test-Path -LiteralPath $opencodeCfg) {
+            try {
+                $json = Get-Content -Raw -LiteralPath $opencodeCfg | ConvertFrom-Json
+                if ($null -eq $json.mcp) {
+                    $json | Add-Member -NotePropertyName mcp -NotePropertyValue ([pscustomobject]@{}) -Force
+                }
+                if ($json.mcp.PSObject.Properties.Name -contains 'biopb') {
+                    $json.mcp.biopb = $opencodeEntry
+                } else {
+                    $json.mcp | Add-Member -NotePropertyName biopb -NotePropertyValue $opencodeEntry -Force
+                }
+                Set-FileUtf8NoBom -Path $opencodeCfg -Content ($json | ConvertTo-Json -Depth 20)
+                Write-Ok "opencode: registered biopb (merged into $opencodeCfg)"
+            } catch {
+                Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
+                Write-Inf "Add under 'mcp' in $opencodeCfg :"
+                Write-Host ("    `"biopb`": {{ `"type`": `"local`", `"command`": [`"$mcpCmd`"], `"enabled`": true, `"env`": {{}} }}") -ForegroundColor DarkGray
+            }
+        } else {
+            $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
+            Set-FileUtf8NoBom -Path $opencodeCfg -Content ($opencodeObj | ConvertTo-Json -Depth 20)
+            Write-Ok "opencode: created $opencodeCfg"
+        }
+    }
+
     if (-not $detected) {
-        Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor)."
+        Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor, opencode)."
         Write-Inf "To use biopb, point your MCP client at this command:"
         Write-Cmd $mcpCmd
         Write-Inf "A ready-to-use definition is at: $ConfigDir\mcp.json"

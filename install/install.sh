@@ -245,8 +245,48 @@ EOF
         _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor"
     fi
 
+    # --- opencode ---
+    local opencode_cfg_dir="$HOME/.config/opencode"
+    if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
+        detected=1
+        local opencode_cfg="$opencode_cfg_dir/opencode.json"
+        mkdir -p "$opencode_cfg_dir"
+        if [ -f "$opencode_cfg" ]; then
+            if command -v jq &>/dev/null; then
+                local tmp="$opencode_cfg.biopb.tmp"
+                if jq --arg c "$mcp_cmd" '.mcp.biopb = {type: "local", command: [$c], enabled: true, env: {}}' "$opencode_cfg" > "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$opencode_cfg"
+                    _ok "opencode: registered biopb (merged into $opencode_cfg)"
+                else
+                    rm -f "$tmp"
+                    _warn "opencode: could not merge $opencode_cfg — add biopb manually"
+                    _info "Add under 'mcp' in $opencode_cfg:"
+                    printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\"], \"enabled\": true, \"env\": {}}%s\n" "$DIM" "$mcp_cmd" "$RESET"
+                fi
+            else
+                _warn "opencode: $opencode_cfg already exists and jq is not installed"
+                _info "Add under 'mcp' in $opencode_cfg:"
+                printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\"], \"enabled\": true, \"env\": {}}%s\n" "$DIM" "$mcp_cmd" "$RESET"
+            fi
+        else
+            cat > "$opencode_cfg" << EOF
+{
+  "mcp": {
+    "biopb": {
+      "type": "local",
+      "command": ["$mcp_cmd"],
+      "enabled": true,
+      "env": {}
+    }
+  }
+}
+EOF
+            _ok "opencode: created $opencode_cfg"
+        fi
+    fi
+
     if [ "$detected" = "0" ]; then
-        _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes)."
+        _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes, opencode)."
         _info "To use biopb, point your MCP client at this command:"
         _cmd "$mcp_cmd"
         _info "A ready-to-use definition is at: $CONFIG_DIR/mcp.json"
