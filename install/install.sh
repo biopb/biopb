@@ -79,7 +79,10 @@ _checkbox() {
 # Usage: _pick_data_dir <varname>  — writes result into caller's variable (no subshell).
 # All prompts go to /dev/tty. Requires PLATFORM to be set before calling.
 _pick_data_dir() {
-    local -n _retvar=$1
+    # Caller passes the name of a variable to receive the result. We assign into
+    # it with `printf -v` rather than a `local -n` nameref, because namerefs need
+    # bash >= 4.3 and macOS ships bash 3.2.
+    local _retvar_name=$1
     local candidates=() seen=()
 
     for dir in \
@@ -126,12 +129,12 @@ _pick_data_dir() {
         printf "  Path [%s]: " "$default_dir" >/dev/tty
         read -r manual </dev/tty
         manual="${manual%$'\r'}"
-        _retvar="${manual:-$default_dir}"
+        printf -v "$_retvar_name" '%s' "${manual:-$default_dir}"
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-        _retvar="${candidates[$((choice - 1))]}"
+        printf -v "$_retvar_name" '%s' "${candidates[$((choice - 1))]}"
     else
         printf "  Invalid choice, using default\n" >/dev/tty
-        _retvar="$default_dir"
+        printf -v "$_retvar_name" '%s' "$default_dir"
     fi
 }
 
