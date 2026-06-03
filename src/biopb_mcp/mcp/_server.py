@@ -180,28 +180,34 @@ def _extract_delimited(text: str, delimiter: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-@mcp.resource("napari://guide")
+@mcp.resource("guide://main")
 def get_guide() -> str:
     """Overview: available namespaces, helper functions, resource URIs."""
     return _resources.GUIDE
 
 
-@mcp.resource("napari://viewer")
+@mcp.resource("guide://viewer")
 def get_viewer_guide() -> str:
     """Viewer operations: layers, camera, dims, display."""
     return _resources.VIEWER
 
 
-@mcp.resource("napari://tensor")
+@mcp.resource("guide://tensor")
 def get_tensor_guide() -> str:
     """Tensor data: listing sources, loading, uploading."""
     return _resources.TENSOR
 
 
-@mcp.resource("napari://annotations")
+@mcp.resource("guide://annotations")
 def get_annotations_guide() -> str:
     """Annotation: points, shapes, labels creation/editing."""
     return _resources.ANNOTATIONS
+
+
+@mcp.resource("guide://ops")
+def get_ops_guide() -> str:
+    """Image processing operations: segmentation, feature extraction, super-resolution."""
+    return _resources.OPS
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +244,8 @@ def take_screenshot(canvas_only: bool = True) -> list:
 def execute_code(python_code: str) -> str:
     """Execute Python code in the napari kernel.
 
+    **READ THE `guide://main` RESOURCE FOR EXECUTION GUARDRAILS BEFORE USE.**
+
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
     namespace: viewer (with a load_tensor method), np, da, client, and ops (a
     dict of biopb.image ProcessImage operations). Use print() to produce
@@ -245,9 +253,9 @@ def execute_code(python_code: str) -> str:
     across calls until the kernel is restarted.
 
     Long or runaway executions can be stopped with interrupt_kernel (SIGINT,
-    best-effort) or restart_kernel (guaranteed). Read napari://guide for the
-    namespace details, and napari://viewer / napari://tensor /
-    napari://annotations for domain-specific patterns.
+    best-effort) or restart_kernel (guaranteed). Read guide://main for the
+    namespace details, and guide://viewer / guide://tensor /
+    guide://annotations for domain-specific patterns.
     """
     host = _kernel_host
     if host is None:

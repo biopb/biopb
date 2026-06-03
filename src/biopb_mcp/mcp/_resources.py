@@ -6,15 +6,19 @@ Each constant is served as an MCP resource that the agent reads on demand.
 GUIDE = """\
 # biopb-mcp Automation Guide
 
-## Tools
-- `take_screenshot(canvas_only=True)` — capture viewer as PNG image
-- `execute_code(python_code)` — run Python with the namespace below
-- `inspect_object(object_path)` — reflect on any object (e.g. "viewer.layers")
-- `server_status()` — system load, memory, dask, tensor server, kernel state
-- `interrupt_kernel()` — SIGINT the running execution (best-effort stop)
-- `restart_kernel()` — kill + respawn the kernel (guaranteed stop; rebuilds viewer)
+## Domain Guides
+Read these resources for detailed operations:
+- `guide://tensor` — dataset access and upload
+- `guide://viewer` — layers, camera, dims, display
+- `guide://annotations` — segmentations, points, shapes, labels
+- `guide://ops` — server-side image processing operations
 
-## Namespace (available in execute_code)
+## Execution environment
+Code submitted via `execute_code` runs in a child Jupyter kernel (a real IPython kernel)
+with napari integrated via `%gui qt`. Imports are allowed and variables persist across
+`execute_code` calls until the kernel is restarted.
+
+### Namespace (available in execute_code)
 | Name | Type | Description |
 |------|------|-------------|
 | `client` | TensorFlightClient or None | Client instance (None if not connected to data server) for browsing/retrieving catalog data |
@@ -23,53 +27,17 @@ GUIDE = """\
 | `da` | module | dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
 
-Browse the catalog through `client` — `client.query_sources(sql)` (server-side
-DuckDB, complete) or `client.list_sources()` (capped by the server for large
-catalogs).
-
-## Image Processing Ops (`ops`)
-`ops` maps op name -> a thin callable that runs one `biopb.image.ProcessImage`
-op (segmentation, denoising, etc.) on a configured server. Discover and
-inspect them before use — each carries a docstring with its server, labels,
-input-shape hints, and default kwargs:
-```python
-list(ops)                          # available op names
-inspect_object("ops['op_name']")   # docstring, default kwargs, server
-```
-Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
-* `image` as an `np.ndarray` -> sent inline (eager) -> returns an `np.ndarray`.
-* `image` as a tensor-server **source_id str** -> sent as a lazy reference (the
-  op server pulls pixels straight from the tensor server, no kernel
-  round-trip) -> the result is uploaded back to the tensor server and a new
-  **source_id str** is returned, so ops chain lazily on large data:
-```python
-labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
-seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
-viewer.load_tensor(seg_id)                    # view the result
-```
-
-## Execution environment
-Code runs in a child Jupyter kernel (a real IPython kernel) with napari
-integrated via `%gui qt`. Imports are allowed and variables persist across
-`execute_code` calls until the kernel is restarted.
-
 * The viewer is a live desktop window; mutations show up immediately.
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
-* Prefer lazy dask operations and only `.compute()` the final result.
-* If computing the final result would OOM, upload directly to the server with
-  `client.upload_array()` instead of `arr.compute()`.
+* `ops` maps op name -> a inspectable callable that runs dedicated image processing logics.
 
-## Operation Gaurdrails
+## Operation Guardrails
 * All data are from `client` or `viewer`. Avoid direct accessing file systems unless specifically requested by user.
+* Prefer browsing the catalog through `client.query_sources(sql)` (server-side DuckDB, complete) rather than `client.list_sources()` (capped by the server for large catalogs).
+* Prefer lazy dask operations and only `.compute()` the final result.
 * Intermediate results should be put back on viewer to be validated by user before next step.
 * Do _not_ assume. Ask the user to clarify uncertainties - they know the data best.
 * After accomplishing a task, ask the user if a skill should be added to the agent's toolbox for future use.
-
-## Domain Guides
-Read these resources for detailed operations:
-- `napari://tensor` — dataset access and upload
-- `napari://viewer` — layers, camera, dims, display
-- `napari://annotations` — segmentations, points, shapes, labels
 
 ## Quick Examples
 ```python
@@ -241,5 +209,27 @@ the full API:
 ```python
 inspect_object("viewer.add_points")
 inspect_object("viewer.add_shapes")
+```
+"""
+
+OPS = """\
+## Image Processing Ops (`ops`)
+`ops` maps op name -> a thin callable that runs one `biopb.image.ProcessImage`
+Discover and inspect them before use — each carries a docstring with its server, labels,
+input-shape hints, and default kwargs:
+```python
+list(ops)                          # available op names
+inspect_object("ops['op_name']")   # docstring, default kwargs, server
+```
+Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
+* `image` as an `np.ndarray` -> sent inline (eager) -> returns an `np.ndarray`.
+* `image` as a tensor-server **source_id str** -> sent as a lazy reference (the
+  op server pulls pixels straight from the tensor server, no kernel
+  round-trip) -> the result is uploaded back to the tensor server and a new
+  **source_id str** is returned, so ops chain lazily on large data:
+```python
+labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
+seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
+viewer.load_tensor(seg_id)                    # view the result
 ```
 """
