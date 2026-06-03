@@ -31,12 +31,25 @@ def main():
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
 
+    # Pin BLAS/OpenMP to one thread in the kernel.  numpy's OpenBLAS parallel
+    # LU path (dgetrf_parallel, reached via np.linalg.inv) allocates a large
+    # working buffer on the *caller's* stack; napari's StatusChecker QThread —
+    # which inverts the layer affine on every cursor move — has only a ~512 KB
+    # stack, so that buffer overruns the guard page and segfaults the viewer
+    # (observed on Intel macOS).  These matrices are tiny, so single-threaded
+    # BLAS costs nothing here.  Must be set before numpy is imported in the
+    # child; setdefault leaves any explicit user override intact.
+    kernel_env = os.environ.copy()
+    kernel_env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    kernel_env.setdefault("OMP_NUM_THREADS", "1")
+
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=mcp_config.get("kernel_name", "python3"),
         startup_timeout=mcp_config.get("kernel_startup_timeout", 60.0),
         execute_timeout=mcp_config.get("execute_timeout", 120.0),
         busy_lock_timeout=mcp_config.get("busy_lock_timeout", 5.0),
+        env=kernel_env,
     )
     _server.set_kernel_host(host)
 
