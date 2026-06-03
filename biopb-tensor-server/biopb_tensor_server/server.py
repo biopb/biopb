@@ -422,6 +422,7 @@ class TensorFlightServer(flight.FlightServerBase):
         }
 
         count = 0
+        skipped = 0
         for source_id, adapter in source_items:
             if count >= max_sources:
                 break
@@ -431,30 +432,51 @@ class TensorFlightServer(flight.FlightServerBase):
             if getattr(adapter, "token", None):
                 continue
 
-            source_desc = adapter.get_source_descriptor()
+            # Building a source's descriptor can fail (e.g. an aicsimageio
+            # source whose scene-switching fallback raises). A single bad source
+            # must not abort the whole listing, so skip it and continue — the
+            # FlightInfo is built fully inside the try and only yielded on
+            # success, so a partial flight is never emitted.
+            try:
+                source_desc = adapter.get_source_descriptor()
 
-            # Build schema with truncation metadata
-            schema = pa.schema([], metadata=base_metadata)
+                # Build schema with truncation metadata
+                schema = pa.schema([], metadata=base_metadata)
 
-            # Create a FlightDescriptor for this source
-            flight_descriptor = flight.FlightDescriptor.for_command(
-                source_desc.SerializeToString()
-            )
+                # Create a FlightDescriptor for this source
+                flight_descriptor = flight.FlightDescriptor.for_command(
+                    source_desc.SerializeToString()
+                )
 
-            # Create a single endpoint for listing (no specific tensor selected)
-            endpoint = flight.FlightEndpoint(
-                ticket=flight.Ticket(b""),  # Empty ticket for listing
-                locations=[],
-            )
+                # Create a single endpoint for listing (no specific tensor selected)
+                endpoint = flight.FlightEndpoint(
+                    ticket=flight.Ticket(b""),  # Empty ticket for listing
+                    locations=[],
+                )
 
-            yield flight.FlightInfo(
-                schema=schema,
-                descriptor=flight_descriptor,
-                endpoints=[endpoint],
-                total_records=-1,
-                total_bytes=-1,
-            )
+                info = flight.FlightInfo(
+                    schema=schema,
+                    descriptor=flight_descriptor,
+                    endpoints=[endpoint],
+                    total_records=-1,
+                    total_bytes=-1,
+                )
+            except Exception as e:
+                logger.error(
+                    f"list_flights: skipping source {source_id} due to "
+                    f"descriptor build failure: {e}",
+                    exc_info=True,
+                )
+                skipped += 1
+                continue
+
+            yield info
             count += 1
+
+        if skipped:
+            logger.warning(
+                f"list_flights: skipped {skipped} source(s) that failed to build descriptors"
+            )
 
     def get_flight_info(
         self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
