@@ -184,6 +184,34 @@ os.replace(tmp, path)
 PY
 }
 
+# Write the opencode zen API key into opencode's credential store
+# (~/.local/share/opencode/auth.json) under provider id "opencode" (the id zen
+# uses). Merges into any existing auth.json so other providers survive; writes
+# atomically with 0600 perms. Returns non-zero on any error.
+_opencode_write_auth() {
+    local key="$1"
+    local auth_file="$HOME/.local/share/opencode/auth.json"
+    mkdir -p "$(dirname "$auth_file")"
+    _py - "$auth_file" "$key" 2>/dev/null <<'PY'
+import json, os, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except FileNotFoundError:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data["opencode"] = {"type": "api", "key": key}
+tmp = path + ".biopb.tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, path)
+PY
+}
+
 # Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
 # Cursor, …). biopb-mcp is a streamable-http server, so clients connect to its URL —
 # not spawn it over stdio. Usage: _mcp_json_merge <config-file> <url> <label>
@@ -241,18 +269,36 @@ _install_opencode() {
     # (not this process), so expose it here for the auth + registration steps that follow.
     export PATH="$HOME/.opencode/bin:$PATH"
 
-    echo ""
-    _info "opencode needs an API key to talk to a LLM model:"
-    _info "  1. Open ${BOLD}https://opencode.ai/zen${RESET}, sign in, and copy the API key."
-    _info "  2. The opencode configurater will start and ask you for a provider - select the default."
-    _info "  2. Paste the API key when you are prompted."
-    printf "  ${DIM}Press Enter when you are ready (or Ctrl-C to skip)...${RESET} " >/dev/tty
-    read -r _ </dev/tty || true
+    # opencode's installer only appends to ~/.bashrc, so on macOS (zsh) and other
+    # non-bash shells ~/.opencode/bin never lands on PATH and `opencode` is missing
+    # from new terminals. Symlink it into ~/.local/bin, which uv keeps on PATH for
+    # every shell (see _ensure_local_bin_on_path), so the command is always found.
+    if [ -x "$HOME/.opencode/bin/opencode" ]; then
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode"
+    fi
 
-    if command -v opencode &>/dev/null; then
-        opencode auth login </dev/tty || _warn "Login didn't complete — run it later with: opencode auth login"
+    # We prompt for the key and write opencode's credential file ourselves rather
+    # than running `opencode auth login`: that command is a full-screen TUI which
+    # does not receive keyboard input when driven from a piped (curl|bash)
+    # installer, so the user could never finish it.
+    echo ""
+    _info "opencode needs an API key to talk to an LLM (free with opencode zen):"
+    _info "  1. Open ${BOLD}https://opencode.ai/auth${RESET}, sign in, create a new API key, and copy it."
+    printf "  ${DIM}Paste the API key (or press Enter to skip): ${RESET}" >/dev/tty
+    local _key=""
+    read -rs _key </dev/tty || _key=""
+    _key="${_key%$'\r'}"
+    printf "\n" >/dev/tty   # read -s ate the user's newline
+
+    if [ -n "$_key" ]; then
+        if _opencode_write_auth "$_key"; then
+            _ok "opencode authenticated (opencode zen)"
+        else
+            _warn "Couldn't write opencode credentials — run later: opencode auth login"
+        fi
     else
-        _warn "opencode isn't on this shell's PATH yet — open a new terminal and run: opencode auth login"
+        _info "No key entered — authenticate later with: opencode auth login"
     fi
 }
 
@@ -474,6 +520,20 @@ install_biopb() {
     esac
 
     _ok "Platform: $PLATFORM ($ARCH)"
+
+    # On a fresh Mac /usr/bin/git is only a stub that triggers (or fails to trigger)
+    # the Command Line Tools install; it passes `command -v git` below but real
+    # git/cc are absent, so the later `uv tool install … @ git+…` dies with a
+    # cryptic `xcrun: error: invalid active developer path`. Check for the actual
+    # toolchain up front and give an actionable message instead.
+    if [ "$PLATFORM" = "macOS" ] && ! xcode-select -p &>/dev/null; then
+        _err "Xcode Command Line Tools not found."
+        _info "biopb needs them for git and the C compiler/headers used to build packages."
+        _info "Install them, then rerun this script:"
+        _cmd "xcode-select --install"
+        _info "A system dialog will appear — click Install, wait for it to finish, then rerun."
+        exit 1
+    fi
 
     # Check required tools
     for tool in curl git tar; do
@@ -781,7 +841,7 @@ EOF
         printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
         printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
 
-        printf "  %s1. Start the shared session.%s Run:\n" "${BOLD}" "${RESET}"
+        printf "  %s1. Start a new shell session.%s Run:\n" "${BOLD}" "${RESET}"
         _cmd "biopb-mcp"
         _info "This starts the biopb stack and opens a napari window. Keep it"
         _info "running while you use the system."
