@@ -59,13 +59,11 @@ integrated via `%gui qt`. Imports are allowed and variables persist across
 * If computing the final result would OOM, upload directly to the server with
   `client.upload_array()` instead of `arr.compute()`.
 
-## Stopping runaway code
-* `interrupt_kernel()` sends SIGINT — it frees pure-Python loops, but blocking
-  C calls (gRPC tensor fetches, native dask compute) ignore it.
-* `restart_kernel()` is the guaranteed stop: it kills the kernel process group
-  and respawns a fresh kernel + viewer. All previously defined variables are
-  lost. A long execution returns a `timeout` message after `execute_timeout`
-  seconds and is auto-interrupted.
+## Operation Gaurdrails
+* All data are from `client` or `viewer`. Avoid direct accessing file systems unless specifically requested by user.
+* Intermediate results should be put back on viewer to be validated by user before next step.
+* Do _not_ assume. Ask the user to clarify uncertainties - they know the data best.
+* After accomplishing a task, ask the user if a skill should be added to the agent's toolbox for future use.
 
 ## Domain Guides
 Read these resources for detailed operations:
@@ -78,7 +76,7 @@ Read these resources for detailed operations:
 # Check what data is on the viewer
 print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers])
 
-# Get data from the catalog
+# Get data from the catalog and convert to np.ndarray
 np_arr = client.get_tensor("my_source_id").compute()
 
 # Take action then screenshot to verify
