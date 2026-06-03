@@ -97,25 +97,20 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
 
   // Build WebSocket URL (stable - uses refs)
   const buildWsUrl = useCallback(() => {
-    // In dev mode with vite proxy, use relative URL
-    // In production, use full URL from apiBase
-    const isDev = import.meta.env.DEV;
-    if (isDev) {
-      // Use relative URL - vite proxy will forward to backend
-      const url = "/ws/render";
-      if (tokenRef.current) {
-        return `${url}?token=${tokenRef.current}`;
-      }
-      return url;
-    } else {
-      // Production: convert HTTP base to WS
-      const httpBase = apiBaseRef.current.replace(/^http/, "ws");
-      const url = `${httpBase}/ws/render`;
-      if (tokenRef.current) {
-        return `${url}?token=${tokenRef.current}`;
-      }
-      return url;
-    }
+    // The socket needs an absolute ws/wss URL. Older Safari does NOT coerce a
+    // relative or http(s) URL to ws in the WebSocket constructor — it throws
+    // "The string did not match the expected pattern" — so build the scheme
+    // ourselves instead of passing a relative path. Base origin:
+    //  - dev: the page origin, so the vite proxy forwards /ws to the backend.
+    //  - prod: the configured apiBase, or the page origin when the webapp is
+    //    served same-origin by FastAPI (built with VITE_TENSOR_API="", which
+    //    left apiBase empty and produced a relative URL — the bug this fixes).
+    const base = import.meta.env.DEV
+      ? window.location.origin
+      : apiBaseRef.current || window.location.origin;
+    const wsBase = base.replace(/^http/, "ws"); // http->ws, https->wss
+    const url = `${wsBase}/ws/render`;
+    return tokenRef.current ? `${url}?token=${tokenRef.current}` : url;
   }, []); // No dependencies - uses refs
 
   // Clean up blob URL
