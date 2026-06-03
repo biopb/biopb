@@ -11,8 +11,8 @@ Install the optional dependencies first: ``pip install biopb-mcp[mcp]``.
 
 import atexit
 import logging
+import os
 import signal
-import sys
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,12 @@ def main():
     def _handle_signal(signum, frame):
         logger.info("Received signal %s, shutting down.", signum)
         host.shutdown()
-        sys.exit(0)
+        # Skip Python finalization: this process still has a live asyncio/epoll
+        # event-loop thread and the numpy OpenBLAS worker pool running, and
+        # tearing down the interpreter on top of them segfaults inside
+        # Py_FinalizeEx (refcount write into a read-only static-type page).
+        # The launcher's only remaining job is to exit, so exit immediately.
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -59,6 +64,12 @@ def main():
         allowed_origins=mcp_config.get("allowed_origins", []),
         allowed_hosts=mcp_config.get("allowed_hosts", []),
     )
+
+    # If the server loop returns on its own, exit the same way: shut down the
+    # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
+    # os._exit, so shut down explicitly here).
+    host.shutdown()
+    os._exit(0)
 
 
 if __name__ == "__main__":
