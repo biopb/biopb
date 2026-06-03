@@ -81,6 +81,14 @@ UNIFIED_SCHEMA = pa.schema([
     pa.field("dtype", pa.string()),
 ])
 
+# Name of the per-batch column carrying the entry's cache key. The key MUST
+# travel as a column value, not as schema metadata: an Arrow IPC stream
+# serializes the schema exactly once (taken from the first batch written to the
+# segment), so per-batch schema metadata is lost on read-back and every batch
+# would report the first entry's key. A column value is stored per row and
+# round-trips correctly. See _rebuild_index_from_segments.
+CACHE_KEY_FIELD = "__biopb_cache_key__"
+
 
 def _cast_to_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
     """Cast typed batch to unified binary schema for caching.
@@ -355,13 +363,28 @@ class ArrowFileBackend(CacheBackend):
                 pool_key: Optional[Tuple[str, SizeClass]] = None
                 schema_key = "unified"  # Default for unified schema
 
+                # Segments written before the per-batch key-column fix stored
+                # the key only in schema metadata, which an IPC stream collapses
+                # to the first entry's key on read-back. Such segments cannot be
+                # indexed correctly, so drop them rather than serve wrong data.
+                if CACHE_KEY_FIELD not in reader.schema.names:
+                    logger.warning(
+                        f"Discarding legacy/corrupt cache segment without "
+                        f"per-batch key column: {seg_file}"
+                    )
+                    self._segment_mmaps.pop(segment_id, None)
+                    mmap.close()
+                    seg_file.unlink()
+                    continue
+
                 for batch in reader:
-                    # Extract cache key from schema metadata
-                    schema_meta = batch.schema.metadata or {}
-                    key_hex = schema_meta.get(b'cache_key', None)
-                    if key_hex:
-                        key = bytes.fromhex(key_hex.decode('utf-8'))
-                        batch_size = sum(col.nbytes for col in batch.columns)
+                    # Extract cache key from the per-batch column.
+                    key = batch.column(CACHE_KEY_FIELD)[0].as_py()
+                    if key is not None:
+                        batch_size = sum(
+                            batch.column(name).nbytes
+                            for name in ("data", "shape", "dtype")
+                        )
 
                         # Determine pool key for this entry
                         size_class = _get_size_class(batch_size)
@@ -911,11 +934,14 @@ class ArrowFileBackend(CacheBackend):
             # Cast to unified schema for caching (all dtypes share same pool)
             unified_batch = _cast_to_unified_schema(data)
 
-            # Add cache key to batch schema metadata
-            key_hex = key.hex()
-            schema_meta = {b'cache_key': key_hex.encode('utf-8')}
-            new_schema = unified_batch.schema.with_metadata(schema_meta)
-            batch_with_key = unified_batch.cast(new_schema)
+            # Attach the cache key as a per-row column (NOT schema metadata).
+            # Arrow IPC streams persist the schema only once per segment, so
+            # schema metadata cannot identify individual batches on rebuild.
+            key_col = pa.array([key], type=pa.binary())
+            batch_with_key = pa.RecordBatch.from_arrays(
+                list(unified_batch.columns) + [key_col],
+                names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
+            )
 
             # Use unified schema for pool_key (all dtypes now share same pool per size_class)
             schema_key = "unified"

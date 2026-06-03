@@ -504,6 +504,54 @@ class TestArrowFileBackend:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_multi_entry_segment_persist_keys_not_crosswired(self):
+        """Each key returns its OWN data after a restart when several entries
+        share one segment.
+
+        Regression test for the file-cache index-rebuild bug: the per-entry
+        cache key was stored in Arrow IPC *schema metadata*, but a stream
+        serializes the schema only once (from the first batch), so on rebuild
+        every batch reported the first entry's key. All keys collapsed onto the
+        first one and pointed at the last batch, so e.g. requesting the first
+        cached source's chunk returned a different source's data.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        # Large segment cap so all entries land in a single segment.
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=1024 * 1024,
+            max_total_bytes=10 * 1024 * 1024,
+        )
+
+        entries = {
+            b"source-A/chunk0": [10, 11, 12],
+            b"source-B/chunk0": [20, 21, 22],
+            b"source-C/chunk0": [30, 31, 32],
+        }
+
+        backend1 = ArrowFileBackend(config)
+        for key, values in entries.items():
+            backend1.start_compute(key)
+            backend1.complete_entry(key, self._make_data(values), 24)
+            backend1.release(key)
+        # Sanity: all entries share one segment.
+        seg_files = list((cache_dir / "segments").glob("seg_*.arrow"))
+        assert len(seg_files) == 1
+        backend1.close()
+
+        # Restart -> index is rebuilt from the segment file on disk.
+        backend2 = ArrowFileBackend(config)
+        for key, values in entries.items():
+            entry, is_owner = backend2.start_compute(key)
+            assert is_owner is False, f"{key!r} should be a cache hit after restart"
+            assert entry.state == EntryState.READY
+            assert entry.data.column(0).to_pylist() == [values], (
+                f"{key!r} returned wrong data after rebuild"
+            )
+            backend2.release(key)
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
     def test_segment_file_creation(self):
         """Segment files are created with correct naming."""
         cache_dir = self._make_temp_cache_dir()
