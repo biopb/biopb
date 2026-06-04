@@ -17,6 +17,61 @@ pytest.importorskip("jupyter_client")
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
+class TestConfigureDask:
+    """Unit tests for _configure_dask (no kernel / no display needed)."""
+
+    def test_in_process_scheduler_returns_no_client(self):
+        """threads/synchronous schedulers yield no client and no cluster."""
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask({"dask_scheduler": "threads"})
+        assert client is None
+        assert cluster is None
+
+    def test_external_address_connects_without_cluster(self, monkeypatch):
+        """distributed + an explicit address attaches a Client, no cluster."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        created = {}
+
+        class _FakeClient:
+            def __init__(self, address):
+                created["address"] = address
+
+        monkeypatch.setattr(dd, "Client", _FakeClient)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {
+                "dask_scheduler": "distributed",
+                "dask_distributed_address": "tcp://1.2.3.4:8786",
+            }
+        )
+        assert isinstance(client, _FakeClient)
+        assert created["address"] == "tcp://1.2.3.4:8786"
+        assert cluster is None
+
+    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
+        """A LocalCluster spawn failure degrades to in-process, not a crash."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("no cluster for you")
+
+        monkeypatch.setattr(dd, "LocalCluster", _boom)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {"dask_scheduler": "distributed", "dask_distributed_address": ""}
+        )
+        assert client is None
+        assert cluster is None
+
+
 @pytest.fixture
 def kernel():
     """A bare kernel with no bootstrap and no health probe."""

@@ -52,6 +52,7 @@ def main():
         env=kernel_env,
     )
     _server.set_kernel_host(host)
+    _server.set_promote_after(mcp_config.get("promote_after", 10.0))
 
     logger.info("Starting napari kernel (a viewer window will appear)...")
     host.start()

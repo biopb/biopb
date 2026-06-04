@@ -6,7 +6,7 @@ exercise the server-side formatting/extraction without a real kernel.
 """
 
 import base64
-
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,11 +23,38 @@ def _result(stdout="", result_text="", error_text="", status="ok"):
     }
 
 
+def _job_reply(**payload):
+    """A kernel ``execute`` result whose stdout carries the job runner's
+    single-line ``<<JOB_JSON>>`` payload (what submit/poll/cancel/list print).
+    """
+    return _result(stdout=_server._JOB_DELIM + json.dumps(payload) + "\n")
+
+
+def _snapshot(
+    job_id="job-1",
+    status="ok",
+    stdout="",
+    result_text="",
+    error_text="",
+    elapsed=0.1,
+):
+    return {
+        "job_id": job_id,
+        "status": status,
+        "stdout": stdout,
+        "result_text": result_text,
+        "error_text": error_text,
+        "elapsed": elapsed,
+    }
+
+
 @pytest.fixture(autouse=True)
 def reset_server_state():
     old_host = _server._kernel_host
+    old_promote = _server._promote_after
     yield
     _server._kernel_host = old_host
+    _server._promote_after = old_promote
 
 
 @pytest.fixture
@@ -119,45 +146,120 @@ class TestTakeScreenshot:
 
 
 class TestExecuteCode:
+    @pytest.fixture(autouse=True)
+    def _fast_sleep(self, monkeypatch):
+        # Skip the inter-poll sleep so tests don't wait real seconds.
+        monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+
     def test_returns_error_when_no_host(self):
         _server._kernel_host = None
         result = _server.execute_code("print('hi')")
         assert "not initialized" in result
 
-    def test_prepends_refresh_prefix(self, server_with_host):
-        _server.execute_code("print('hi')")
-        code = server_with_host.execute.call_args[0][0]
-        assert code.startswith("client = _conn.client")
-        assert "print('hi')" in code
-
-    def test_formats_stdout_and_result(self, server_with_host):
-        server_with_host.execute.return_value = _result(
-            stdout="hello\n", result_text="3"
+    def test_submits_code_via_job_runner(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-1", status="running"
         )
+        _server.set_promote_after(0.0)  # return a handle immediately
+        result = _server.execute_code("print('hi')")
+        snippet = server_with_host.execute.call_args_list[0][0][0]
+        assert "_jobs.submit(" in snippet
+        assert "print('hi')" in snippet  # code embedded via repr
+        assert "job-1" in result  # job handle returned
+
+    def test_inline_result_when_job_finishes_fast(self, server_with_host):
+        # submit -> running, first poll -> terminal ok with output.
+        server_with_host.execute.side_effect = [
+            _job_reply(job_id="job-1", status="running"),
+            _job_reply(**_snapshot(stdout="hello\n", result_text="3")),
+        ]
         result = _server.execute_code("print('hello'); 1 + 2")
         assert "hello" in result
         assert "3" in result
 
     def test_no_output_message(self, server_with_host):
-        server_with_host.execute.return_value = _result()
+        server_with_host.execute.side_effect = [
+            _job_reply(job_id="job-1", status="running"),
+            _job_reply(**_snapshot(stdout="", result_text="")),
+        ]
         result = _server.execute_code("x = 42")
         assert result == "(no output)"
 
     def test_error_path_includes_traceback(self, server_with_host):
-        server_with_host.execute.return_value = _result(
-            error_text="Traceback...\nZeroDivisionError: division by zero",
-            status="error",
-        )
+        server_with_host.execute.side_effect = [
+            _job_reply(job_id="job-1", status="running"),
+            _job_reply(
+                **_snapshot(
+                    status="error",
+                    error_text="Traceback...\nZeroDivisionError: division "
+                    "by zero",
+                )
+            ),
+        ]
         result = _server.execute_code("1 / 0")
         assert "division by zero" in result
 
-    def test_timeout_status_returned(self, server_with_host):
+    def test_promotes_to_job_handle_when_slow(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-7", status="running"
+        )
+        _server.set_promote_after(0.0)
+        result = _server.execute_code("while True: pass")
+        assert "job-7" in result
+        assert "still running" in result
+        assert "poll_job" in result
+
+    def test_busy_rejects_second_job(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            error="busy", running_job_id="job-3"
+        )
+        result = _server.execute_code("x = 1")
+        assert "already running" in result
+        assert "job-3" in result
+
+    def test_submit_timeout_surfaces_error(self, server_with_host):
+        # The quick submit snippet itself timed out (kernel main thread wedged).
         server_with_host.execute.return_value = _result(
             error_text="Execution exceeded 0.5s and was interrupted.",
             status="timeout",
         )
-        result = _server.execute_code("while True: pass")
+        result = _server.execute_code("x = 1")
         assert "interrupted" in result
+
+
+class TestJobTools:
+    def test_poll_job_formats_status(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
+        )
+        result = _server.poll_job("job-1")
+        assert "job-1: running" in result
+        assert "step 1" in result
+
+    def test_poll_job_unknown(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-9", status="unknown", error_text=""
+        )
+        assert "No such job" in _server.poll_job("job-9")
+
+    def test_cancel_job_requests_cancellation(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-1", cancelled=True, status="running"
+        )
+        result = _server.cancel_job("job-1")
+        assert "Cancellation requested" in result
+        assert "restart_kernel" in result
+
+    def test_cancel_job_nothing_to_cancel(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-1", cancelled=False, status="ok"
+        )
+        assert "nothing to cancel" in _server.cancel_job("job-1")
+
+    def test_job_tools_no_host(self):
+        _server._kernel_host = None
+        assert "not initialized" in _server.poll_job("job-1")
+        assert "not initialized" in _server.cancel_job("job-1")
 
 
 # -----------------------------------------------------------------------

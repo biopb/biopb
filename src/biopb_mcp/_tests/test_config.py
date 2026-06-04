@@ -214,3 +214,21 @@ class TestDefaultConfig:
         ]
         for key in required:
             assert key in DEFAULT_CONFIG["timeout"]
+
+    def test_mcp_dask_defaults(self):
+        """MCP dask defaults to a kernel-local distributed cluster."""
+        mcp = DEFAULT_CONFIG["mcp"]
+        # "distributed" + empty address -> auto-spun LocalCluster, the only
+        # mode where cancel_job can stop an in-flight compute().
+        assert mcp["dask_scheduler"] == "distributed"
+        assert mcp["dask_distributed_address"] == ""
+        # LocalCluster sizing knobs are present so they can be tuned.
+        for key in (
+            "dask_num_workers",
+            "dask_threads_per_worker",
+            "dask_memory_limit",
+            "dask_dashboard_address",
+        ):
+            assert key in mcp
+        # Dashboard binds loopback only, matching the server security model.
+        assert mcp["dask_dashboard_address"].startswith("127.0.0.1")

@@ -52,13 +52,46 @@ DEFAULT_CONFIG = {
     },
     "mcp": {
         "port": 8765,
-        "dask_scheduler": "threads",
+        # Dask defaults to a kernel-local multi-process distributed cluster
+        # (LocalCluster). This is the only configuration where cancel_job can
+        # stop an in-flight .compute() mid-execution, and it gives real
+        # (non-GIL) CPU parallelism. Set dask_scheduler to "threads" /
+        # "synchronous" for a low-overhead in-process scheduler (no
+        # mid-compute cancel), or set dask_distributed_address to attach to an
+        # external scheduler instead of spinning a local one.
+        "dask_scheduler": "distributed",
+        # n_workers for the auto-spun LocalCluster (0 -> let dask pick, ~n_cores).
+        # When connecting to an external scheduler this is ignored.
         "dask_num_workers": 0,
+        # Non-empty -> connect to this external scheduler address; empty -> spin
+        # a kernel-local LocalCluster.
         "dask_distributed_address": "",
+        # LocalCluster sizing (used only when spinning a local cluster).
+        "dask_threads_per_worker": 1,
+        "dask_memory_limit": "auto",
+        # Cluster-wide chunk-cache budget for the data-plane client, split
+        # evenly across dask workers (each worker caches budget // n_workers).
+        # Bounds aggregate cache regardless of worker count -- the per-process
+        # client cache is otherwise replicated in every worker. Accepts a
+        # human-readable size ("1G", "512M", "2GiB") or an int (bytes), parsed
+        # with dask.utils.parse_bytes. Localhost servers cache nothing
+        # regardless (the tensor server already caches); this applies to remote.
+        "dask_cache_budget": "1G",
+        # Bokeh dashboard bind address; loopback-only to match the server's
+        # loopback-only security model. ":0" picks a free port.
+        "dask_dashboard_address": "127.0.0.1:0",
         "kernel_name": "python3",
         "kernel_startup_timeout": 60.0,
+        # execute_timeout now bounds only the *quick* in-band kernel snippets
+        # (screenshot / status / inspect / job submit+poll), not long jobs:
+        # execute_code runs agent code in a background thread that may run
+        # indefinitely (stop it with cancel_job / restart_kernel).
         "execute_timeout": 120.0,
         "busy_lock_timeout": 5.0,
+        # Seconds execute_code waits for a job to finish before "promoting" it:
+        # if it completes within this window the result is returned inline,
+        # otherwise a job handle (job_id) is returned and it keeps running.
+        "promote_after": 10.0,
         # Extra Host/Origin header values appended to the loopback allowlist
         # that guards the server against DNS-rebinding / cross-origin browser
         # requests. Set these only when fronting the server with a reverse

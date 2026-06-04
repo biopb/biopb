@@ -29,7 +29,9 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
-    "biopb[tensor] >= 0.5.4",
+    # 0.5.8: localhost cache disable + configure_cache/worker-init cache plugin
+    # (data-plane chunk-cache budget used by mcp/_bootstrap._register_cache_plugin)
+    "biopb[tensor] >= 0.5.8",
     "opencv-python-headless",
     # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
     # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
@@ -48,10 +50,7 @@ testing = [
     "pytest-env",  # https://github.com/qwertyquerty/pytest-env
     "napari",
     "pyqt6",
-    "mcp>=1.20",
-    "jupyter_client",
-    "ipykernel",
-    "psutil",
+    "biopb-mcp[mcp]",  # pull the MCP server deps so tests cover that path
 ]
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
@@ -61,7 +60,7 @@ tables = [
 # must bring napari and a real Qt binding itself — qtpy in the core deps is only
 # a shim. napari>=0.7 keeps the resolver off the older napari 0.6.x line, which
 # pins vispy<0.16 and fails to init a GL canvas under Qt 6.11.
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "napari>=0.7", "pyqt6"]
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed", "napari>=0.7", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 
 [project.scripts]

@@ -21,13 +21,20 @@ logger = logging.getLogger(__name__)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Best-effort snippet run before a restart so dask releases child processes /
-# cluster keys cleanly.  ``_dask_client`` is set by the bootstrap (None for the
-# in-process scheduler, a distributed Client otherwise).
+# cluster keys cleanly.  ``_dask_client`` / ``_dask_cluster`` are set by the
+# bootstrap (both None for the in-process scheduler; for an auto-spun
+# LocalCluster the cluster is closed after the client so workers don't orphan).
 _DASK_RELEASE_SNIPPET = (
     "try:\n"
     "    _dc = globals().get('_dask_client')\n"
     "    if _dc is not None:\n"
     "        _dc.close()\n"
+    "except Exception:\n"
+    "    pass\n"
+    "try:\n"
+    "    _dk = globals().get('_dask_cluster')\n"
+    "    if _dk is not None:\n"
+    "        _dk.close()\n"
     "except Exception:\n"
     "    pass\n"
 )

@@ -7,8 +7,10 @@ dask, and the TensorFlightClient live.  The kernel can be interrupted or
 hard-restarted independently of this process.
 """
 
+import json
 import logging
 import os
+import time
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -20,6 +22,10 @@ from ._kernel import KernelHost
 logger = logging.getLogger(__name__)
 
 _kernel_host: KernelHost | None = None
+
+# Seconds execute_code waits for a job to finish before returning a job handle
+# instead of an inline result (set from config by the launcher).
+_promote_after: float = 10.0
 
 # DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
 # a full kernel (RCE by design), so the only thing standing between a malicious
@@ -53,11 +59,25 @@ def build_transport_security(
 
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
 
-# Prepended to every execute_code call so client tracks the
-# asynchronously-connecting tensor connection service.
-_REFRESH_PREFIX = "client = _conn.client\n"
-
 _PNG_DELIM = "<<PNG_B64>>"
+
+# Delimiter for the single-line JSON payload the in-kernel job runner prints in
+# reply to a submit/poll/cancel/list snippet (mirrors the _PNG_DELIM pattern).
+_JOB_DELIM = "<<JOB_JSON>>"
+
+
+def _job_snippet(call: str) -> str:
+    """Build a snippet that prints ``_jobs.<call>``'s result as delimited JSON.
+
+    ``call`` is a fully-formed call expression with arguments already embedded
+    via ``repr`` by the caller (agent code is RCE by design, but embedding via
+    ``repr`` keeps the payload a valid literal regardless of its contents).
+    """
+    return (
+        "import json as _json\n"
+        "print('" + _JOB_DELIM + "' + _json.dumps(_jobs." + call + "))\n"
+    )
+
 
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
@@ -139,6 +159,22 @@ print("  layers: " + str(len(viewer.layers)))
 for _layer in list(viewer.layers)[:10]:
     _shape = getattr(_layer.data, "shape", "?")
     print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+
+print("")
+print("## Jobs")
+try:
+    _js = _jobs.jobs_summary()
+    if _js:
+        for _j in _js:
+            print(
+                "  - " + _j["job_id"] + ": " + _j["status"]
+                + " (" + str(_j["elapsed"]) + "s, stdout "
+                + str(_j["stdout_len"]) + "b)"
+            )
+    else:
+        print("  (none)")
+except Exception as _e:
+    print("  error: " + str(_e))
 """
 
 
@@ -146,6 +182,12 @@ def set_kernel_host(host: KernelHost):
     """Register the kernel host the tools dispatch to."""
     global _kernel_host
     _kernel_host = host
+
+
+def set_promote_after(seconds: float):
+    """Set how long execute_code waits inline before returning a job handle."""
+    global _promote_after
+    _promote_after = float(seconds)
 
 
 def _format_execute_result(res: dict) -> str:
@@ -173,6 +215,36 @@ def _extract_delimited(text: str, delimiter: str) -> str | None:
         if line.startswith(delimiter):
             return line[len(delimiter) :]
     return None
+
+
+def _extract_json(text: str):
+    """Parse the single-line ``<<JOB_JSON>>`` payload from a job snippet."""
+    payload = _extract_delimited(text, _JOB_DELIM)
+    if payload is None:
+        return None
+    try:
+        return json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+
+
+def _run_job_call(host, call: str):
+    """Run a ``_jobs.<call>`` snippet; return (parsed_json, raw_result)."""
+    res = host.execute(_job_snippet(call))
+    if res.get("status") != "ok":
+        return None, res
+    return _extract_json(res.get("stdout", "")), res
+
+
+def _format_job_status(snap: dict) -> str:
+    """Render a job snapshot (poll_job output)."""
+    job_id = snap.get("job_id", "?")
+    status = snap.get("status")
+    header = f"{job_id}: {status} ({snap.get('elapsed', '?')}s)"
+    body = _format_execute_result(snap)
+    if status == "running":
+        return header + "\nPartial output:\n" + (body or "(none yet)")
+    return header + "\n" + body
 
 
 # ---------------------------------------------------------------------------
@@ -252,17 +324,99 @@ def execute_code(python_code: str) -> str:
     output; the last expression's repr is also returned. Variables persist
     across calls until the kernel is restarted.
 
-    Long or runaway executions can be stopped with interrupt_kernel (SIGINT,
-    best-effort) or restart_kernel (guaranteed). Read guide://main for the
-    namespace details, and guide://viewer / guide://tensor /
+    Code runs in a background thread, so a long job does NOT block the viewer:
+    if it finishes quickly the result is returned inline; otherwise this returns
+    a job handle (job-N) and the code keeps running. Poll it with poll_job,
+    watch it with take_screenshot / server_status, and stop it with cancel_job
+    (cooperative) or restart_kernel (guaranteed). Only one job runs at a time.
+
+    Inside a long job, mutate the viewer via the auto-wrapped load_tensor /
+    add_* methods or run_on_main(fn) (GUI calls must reach the main thread);
+    note rich IPython display() output is not captured (use print). Read
+    guide://main for namespace details and guide://viewer / guide://tensor /
     guide://annotations for domain-specific patterns.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
 
-    res = host.execute(_REFRESH_PREFIX + python_code)
-    return _format_execute_result(res)
+    submitted, res = _run_job_call(host, "submit(" + repr(python_code) + ")")
+    if submitted is None:
+        return _format_execute_result(res)
+    if submitted.get("error") == "busy":
+        running = submitted.get("running_job_id")
+        return (
+            f"A job ({running}) is already running. Poll it with "
+            f"poll_job('{running}'), or stop it with cancel_job('{running}') / "
+            "restart_kernel before starting another."
+        )
+
+    job_id = submitted["job_id"]
+    deadline = time.monotonic() + _promote_after
+    snap = submitted
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        snap, res = _run_job_call(host, "poll(" + repr(job_id) + ")")
+        if snap is None:
+            return _format_execute_result(res)
+        if snap.get("status") != "running":
+            return _format_execute_result(snap)  # terminal: inline result
+
+    # Still running after promote_after: hand back a job handle.
+    partial = snap.get("stdout", "") if snap else ""
+    return (
+        f"Job {job_id} is still running after {_promote_after:.0f}s. "
+        f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
+        f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
+        "Partial output:\n" + (partial or "(none yet)")
+    )
+
+
+@mcp.tool()
+def poll_job(job_id: str) -> str:
+    """Get the status and output of a job started by execute_code.
+
+    Returns the job's status (running/ok/error/cancelled), elapsed time, and
+    output so far (full output once terminal). Job records persist until the
+    kernel is restarted (older terminal jobs are eventually evicted).
+    """
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
+
+    snap, res = _run_job_call(host, "poll(" + repr(job_id) + ")")
+    if snap is None:
+        return _format_execute_result(res)
+    if snap.get("status") == "unknown":
+        return f"No such job '{job_id}'."
+    return _format_job_status(snap)
+
+
+@mcp.tool()
+def cancel_job(job_id: str) -> str:
+    """Request cancellation of a running job (cooperative; best-effort).
+
+    Sets a flag the job's code can poll via cancelled(), and—if a distributed
+    dask cluster is in use—cancels its in-flight futures. Pure-Python loops that
+    don't check cancelled(), in-process dask, and native gRPC calls won't stop
+    this way; use restart_kernel for a guaranteed stop.
+    """
+    host = _kernel_host
+    if host is None:
+        return "Error: kernel host not initialized"
+
+    data, res = _run_job_call(host, "cancel(" + repr(job_id) + ")")
+    if data is None:
+        return _format_execute_result(res)
+    status = data.get("status")
+    if data.get("cancelled"):
+        return (
+            f"Cancellation requested for {job_id} (cooperative). If it does not "
+            "stop, use restart_kernel for a guaranteed stop."
+        )
+    if status == "unknown":
+        return f"No such job '{job_id}'."
+    return f"Job {job_id}: {status} (nothing to cancel)."
 
 
 @mcp.tool()

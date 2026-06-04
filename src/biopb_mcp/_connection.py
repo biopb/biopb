@@ -69,6 +69,13 @@ class TensorConnection:
         cfg = config if config is not None else load_config()
         self.url, self.token = self.resolve_from_config(cfg)
 
+        # Optional callback invoked after every successful connect with the
+        # final (url, token). Lets a caller react once the connection params are
+        # settled -- e.g. the MCP bootstrap registers the dask chunk-cache
+        # plugin here, since the token is only known after connect. Kept as a
+        # plain callable so this service stays GUI/dask-free.
+        self.on_connect = None
+
     @staticmethod
     def resolve_from_config(config: dict) -> Tuple[str, str | None]:
         """Resolve tensor server URL and token.
@@ -104,6 +111,11 @@ class TensorConnection:
             self.sources = sources
             self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
             self.persist_url()
+            if self.on_connect is not None:
+                try:
+                    self.on_connect(self.url, self.token)
+                except Exception:  # noqa: BLE001 - hook is best-effort
+                    logger.exception("on_connect hook failed")
             return sources
         except Exception:
             self.client = None

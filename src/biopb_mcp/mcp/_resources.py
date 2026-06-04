@@ -26,17 +26,41 @@ with napari integrated via `%gui qt`. Imports are allowed and variables persist 
 | `np` | module | numpy |
 | `da` | module | dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
+| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result; required for viewer mutations from a job thread (no-op on the main thread) |
+| `cancelled` | callable | `cancelled()` -> True if the running job has been asked to cancel; poll it in long loops for cooperative cancellation |
 
-* The viewer is a live desktop window; mutations show up immediately.
+* The viewer is a live desktop window. Reads are safe from a job thread, but mutations must run on the main thread — wrap them in `run_on_main()`. `viewer.load_tensor()` and the `viewer.add_*()` family are already wrapped; everything else (layer properties, `viewer.dims`, `viewer.camera`, callback registration) is not.
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
-* `ops` maps op name -> a inspectable callable that runs dedicated image processing logics.
+* `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
-## Operation Guardrails
-* All data are from `client` or `viewer`. Avoid direct accessing file systems unless specifically requested by user.
-* Prefer browsing the catalog through `client.query_sources(sql)` (server-side DuckDB, complete) rather than `client.list_sources()` (capped by the server for large catalogs).
+## Long-running jobs & cancellation
+A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
+watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `cancel_job`
+(graceful) or `restart_kernel` (guaranteed, kills the kernel). To stay stoppable:
+* **A blocking `.compute()` is interruptible** — `cancel_job` cancels the in-flight dask
+  tasks, so the `.compute()` raises and the job ends. No special pattern needed.
+* **Your own long loops** (per-chunk / per-file) have no dask futures to cancel, so poll
+  `cancelled()` and `break` yourself.
+* **Progress + responsive cancel on a big graph:** submit with the distributed client
+  (`_dask_client`, present only under the distributed scheduler) and consume results as
+  they land — this also gives a live processed count via `poll_job`:
+  ```python
+  from dask.distributed import as_completed
+  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
+  done = []
+  for fut in as_completed(futs):
+      if cancelled():
+          _dask_client.cancel(futs); break
+      done.append(fut.result())
+      print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
+  ```
+
+## Operation Guardrails **IMPORTANT**
+* All data should be from `client` or `viewer`. Avoid directly accessing the file system unless specifically requested by the user.
+* Prefer browsing the catalog through `client.query_sources(sql)` (server-side DuckDB, complete) than `client.list_sources()` (capped by the server for large catalogs).
 * Prefer lazy dask operations and only `.compute()` the final result.
-* Intermediate results should be put back on viewer to be validated by user before next step.
-* Do _not_ assume. Ask the user to clarify uncertainties - they know the data best.
+* Intermediate results should be put back on `viewer` to be validated by user at each step.
+* Do _not_ assume. Ask the user to clarify uncertainties - they know the data better than you do.
 * After accomplishing a task, ask the user if a skill should be added to the agent's toolbox for future use.
 
 ## Quick Examples
@@ -45,10 +69,11 @@ with napari integrated via `%gui qt`. Imports are allowed and variables persist 
 print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers])
 
 # Get data from the catalog and convert to np.ndarray
-np_arr = client.get_tensor("my_source_id").compute()
+dask_arr = client.get_tensor("my_source_id") # lazy, thread-safe, picklable
+np_arr = dask_arr.compute() # in memory
 
 # Take action then screenshot to verify
-viewer.dims.ndisplay = 3
+run_on_main(lambda: setattr(viewer.dims, "ndisplay", 3))
 ```
 
 ## Iterative Workflow for _very_ large data
@@ -59,7 +84,7 @@ arr = client.get_tensor("raw_data_id")
 # 2. Process
 mask_arr = arr > 0.5
 
-# 3. Upload Will call compute() chunk by chunk under the hood.
+# 3. Upload. Calls compute() chunk by chunk under the hood.
 source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
 # 4. Display in viewer for user inspection and approval before next step
@@ -70,37 +95,46 @@ layer_name = viewer.load_tensor(source_id)
 VIEWER = """\
 # Viewer Operations
 
+**Threading:** reads are safe from a job thread, but every *mutation* must run on
+the Qt main thread. `viewer.load_tensor()` and the `viewer.add_*()` family are
+already wrapped for you. For anything else — layer properties, `viewer.dims`,
+`viewer.layers.remove()`, `viewer.camera`, registering callbacks — wrap the
+mutation in `run_on_main()` (a no-op when already on the main thread). Batch
+related mutations into one `run_on_main()` call.
+
 ## Layers
 ```python
-# List all layers
+# List all layers (read — no run_on_main needed)
 for layer in viewer.layers:
     print(f"{layer.name}: {type(layer).__name__} {layer.data.shape} {layer.data.dtype}")
 
-# Get specific layer
+# Get specific layer (read)
 layer = viewer.layers["image_name"]
 
-# Remove layer
-viewer.layers.remove(viewer.layers["name"])
+# Remove layer (mutation — wrap it)
+run_on_main(lambda: viewer.layers.remove(viewer.layers["name"]))
 
-# Load data to viewer; auto-handles pyramid. Accepts any source_id, including
-# those beyond the list_sources() cap (fetched from the server on demand).
+# Load data to viewer; auto-handles pyramid. Accepts any valid source_id.
+# (already wrapped — call directly)
 layer_name = viewer.load_tensor(source_id="source_id", tensor_id=None, name=None)
 
-# Layer properties
-layer = viewer.layers["name"]
-layer.visible = False
-layer.opacity = 0.7
-layer.colormap = "viridis"
-layer.contrast_limits = [0, 255]
-layer.blending = "additive"         # "translucent", "additive", "minimum", "opaque"
+# Layer properties (mutations — batch into one run_on_main call)
+def _style():
+    layer = viewer.layers["name"]
+    layer.visible = False
+    layer.opacity = 0.7
+    layer.colormap = "viridis"
+    layer.contrast_limits = [0, 255]
+    layer.blending = "additive"     # "translucent", "additive", "minimum", "opaque"
+run_on_main(_style)
 ```
 
 ## Dimensions (sliders)
 ```python
-# Set slider position (e.g. time axis=0 to frame 50)
-viewer.dims.set_point(axis=0, value=50)
+# Set slider position (mutation — wrap it; e.g. time axis=0 to frame 50)
+run_on_main(lambda: viewer.dims.set_point(axis=0, value=50))
 
-# Get current position
+# Get current position (read)
 print(viewer.dims.point)    # tuple of current positions
 ```
 
@@ -123,7 +157,8 @@ def on_click(viewer, event):
         coord = layer.world_to_data(event.position)  # full-ndim data coords (…,z,y,x)
         print(event.button, list(event.modifiers), coord)
 
-viewer.mouse_drag_callbacks.append(on_click)   # mutate in place (see below)
+# Register from the main thread (mutation), and mutate the list in place (below)
+run_on_main(lambda: viewer.mouse_drag_callbacks.append(on_click))
 ```
 
 If a callback "doesn't fire", it is one of these — NOT a session/setup bug, and
@@ -152,8 +187,6 @@ else:
 ```
 
 ## Browse Sources
-For large catalogs the server caps `list_sources()`, so prefer the SQL query
-to discover source_ids; there is no pre-built `sources` dict in the namespace.
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table has columns: source_id, source_url, source_type, metadata_json
@@ -177,7 +210,7 @@ layer_name = viewer.load_tensor("source_id")                   # single-tensor s
 layer_name = viewer.load_tensor("source_id", tensor_id="t1")   # multi-tensor source
 
 # Or get a lazy dask array directly, without adding a layer:
-arr = client.get_tensor("source_id", tensor_id=None)           # tensor_id optional if single
+arr = client.get_tensor("source_id", tensor_id="t1")           # tensor_id optional if single
 ```
 
 ## Upload to Server
@@ -214,7 +247,7 @@ inspect_object("viewer.add_shapes")
 
 OPS = """\
 ## Image Processing Ops (`ops`)
-`ops` maps op name -> a thin callable that runs one `biopb.image.ProcessImage`
+`ops` maps op name -> a thin callable that runs one `biopb.image.ProcessImage` op.
 Discover and inspect them before use — each carries a docstring with its server, labels,
 input-shape hints, and default kwargs:
 ```python
