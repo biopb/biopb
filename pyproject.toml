@@ -56,7 +56,12 @@ testing = [
 tables = [
     "napari-skimage-regionprops",  # For annotation table display
 ]
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil"]
+# The MCP server is a standalone process (not a plugin loaded inside a running
+# napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
+# must bring napari and a real Qt binding itself — qtpy in the core deps is only
+# a shim. napari>=0.7 keeps the resolver off the older napari 0.6.x line, which
+# pins vispy<0.16 and fails to init a GL canvas under Qt 6.11.
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "napari>=0.7", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 
 [project.scripts]
