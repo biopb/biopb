@@ -192,6 +192,81 @@ class TestCachePolicy:
         assert client_module._is_localhost_location("grpc://localhost:8815") is True
 
 
+class TestConfigureCache:
+    """Tests for configure_cache() -- authoritative, idempotent cache pinning."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_pool(self):
+        client_module._CACHE_POOL.clear()
+        yield
+        client_module._CACHE_POOL.clear()
+
+    def test_pins_size_for_remote(self):
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            eff = client_module.configure_cache("grpc://remote:8815", None, 1000)
+        assert eff == 1000
+        cache = client_module._CACHE_POOL[("grpc://remote:8815", None)][1]
+        assert cache.available_bytes == 1000
+
+    def test_resizes_in_place(self):
+        loc = "grpc://remote:8815"
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            client_module.configure_cache(loc, None, 1000)
+            client_module.configure_cache(loc, None, 2000)
+        assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 2000
+
+    def test_localhost_pins_off_and_removes(self):
+        loc = "grpc://srv:8815"
+        # first create a real cache as if remote, then re-resolve as localhost
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            client_module.configure_cache(loc, None, 1000)
+        with patch.object(client_module, "_is_localhost_location", return_value=True):
+            eff = client_module.configure_cache(loc, None, 1000)
+        assert eff == 0
+        assert (loc, None) not in client_module._CACHE_POOL
+
+    def test_zero_removes(self):
+        loc = "grpc://remote:8815"
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            client_module.configure_cache(loc, None, 1000)
+            assert client_module.configure_cache(loc, None, 0) == 0
+        assert (loc, None) not in client_module._CACHE_POOL
+
+    def test_get_shared_cache_honors_configured_size(self):
+        loc = "grpc://remote:8815"
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            client_module.configure_cache(loc, None, 500)
+            # a later fetch requesting a different size must get the pinned cache
+            cache = client_module._get_shared_cache(loc, None, 999_999_999)
+        assert cache is not None and cache.available_bytes == 500
+
+
+class TestCachePlugin:
+    """Tests for make_cache_plugin() (the worker-init hook, piece 3)."""
+
+    def test_returns_none_without_distributed_or_plugin_with_name(self):
+        plugin = client_module.make_cache_plugin("grpc://remote:8815", None, 1000)
+        try:
+            import distributed  # noqa: F401
+        except Exception:
+            assert plugin is None  # graceful no-op when distributed absent
+            return
+        assert plugin is not None
+        assert plugin.name == "biopb-cache-config"
+
+    def test_setup_pins_cache(self):
+        pytest.importorskip("distributed")
+        client_module._CACHE_POOL.clear()
+        loc = "grpc://remote:8815"
+        plugin = client_module.make_cache_plugin(loc, None, 777)
+        try:
+            with patch.object(client_module, "_is_localhost_location", return_value=False):
+                plugin.setup(worker=None)  # what dask calls on each worker
+            assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 777
+        finally:
+            client_module._CACHE_POOL.clear()
+
+
 class TestCleanupConnectionPool:
     """Tests for atexit cleanup."""
 

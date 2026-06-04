@@ -403,25 +403,27 @@ def _get_shared_cache(
     Returns:
         Cache instance shared across threads, or None when caching is disabled.
     """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    # An already-pooled cache wins: it may have been pinned by configure_cache()
+    # at worker startup, in which case the per-fetch cache_bytes is irrelevant.
+    with _POOL_LOCK:
+        if key in _CACHE_POOL:
+            pool_pid, cache = _CACHE_POOL[key]
+            if pool_pid == current_pid:
+                return cache
+            del _CACHE_POOL[key]  # fork-safety: inherited stale cache
+
+    # Not pooled yet: resolve the requested size and create lazily (or skip).
     effective = _resolve_cache_bytes(location, cache_bytes)
     if effective <= 0:
         return None
 
-    key = (location, token)
-    current_pid = os.getpid()
-
     with _POOL_LOCK:
-        # Fork-safety: detect and clean up inherited stale cache
-        if key in _CACHE_POOL:
-            pool_pid, cache = _CACHE_POOL[key]
-            if pool_pid != current_pid:
-                del _CACHE_POOL[key]
-
-        # Create fresh cache for current process if needed
         if key not in _CACHE_POOL:
             _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
-
-    return _CACHE_POOL[key][1]
+        return _CACHE_POOL[key][1]
 
 
 def _get_shared_call_options(location: str, token: Optional[str]) -> flight.FlightCallOptions:
@@ -473,6 +475,84 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
     call_options = _get_shared_call_options(location, token)
 
     return (client, cache, call_options)
+
+
+def configure_cache(
+    location: str, token: Optional[str], cache_bytes: int
+) -> int:
+    """Pin this process's chunk-cache budget for a connection namespace.
+
+    Authoritative and idempotent, unlike the lazy first-touch creation in
+    ``_get_shared_cache``: it (re)sizes the pooled cache to the *resolved*
+    ``cache_bytes`` and is honored by every later fetch, regardless of what
+    those fetch calls request. Call it once per worker process (e.g. from a
+    dask worker-init plugin, see :func:`make_cache_plugin`) to fix the budget
+    deterministically across a dynamically-sized cluster.
+
+    The size is run through :func:`_resolve_cache_bytes`, so a localhost server
+    (default) or ``cache_bytes <= 0`` removes any existing cache and pins it off.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Requested per-process cache size in bytes
+
+    Returns:
+        The effective (resolved) cache size that was pinned, in bytes.
+    """
+    effective = _resolve_cache_bytes(location, cache_bytes)
+    key = (location, token)
+    current_pid = os.getpid()
+
+    with _POOL_LOCK:
+        existing = _CACHE_POOL.get(key)
+        if effective <= 0:
+            if existing is not None:
+                del _CACHE_POOL[key]
+            return 0
+        # (Re)create when absent, inherited from a fork, or a different size.
+        if (
+            existing is None
+            or existing[0] != current_pid
+            or existing[1].available_bytes != effective
+        ):
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+
+    return effective
+
+
+def make_cache_plugin(location: str, token: Optional[str], cache_bytes: int):
+    """Build a dask ``WorkerPlugin`` that pins the chunk-cache budget on workers.
+
+    Registering the returned plugin with ``client.register_plugin(...)`` runs
+    :func:`configure_cache` on every worker -- current *and* future -- so the
+    per-process budget stays correct across cluster restarts / autoscaling
+    without re-plumbing. The plugin is ``name``-tagged so re-registration
+    replaces rather than stacks.
+
+    ``cache_bytes`` is the desired *per-worker* size; the caller (which knows the
+    cluster size) is responsible for any total-budget split. Localhost still
+    resolves to 0 via :func:`configure_cache`.
+
+    Returns:
+        A WorkerPlugin instance, or None if ``distributed`` is not importable
+        (so callers can no-op gracefully on non-distributed setups).
+    """
+    try:
+        from distributed.diagnostics.plugin import WorkerPlugin
+    except Exception:
+        return None
+
+    class _CacheConfigPlugin(WorkerPlugin):
+        name = "biopb-cache-config"  # named -> idempotent re-registration
+
+        def __init__(self, location, token, cache_bytes):
+            self._args = (location, token, cache_bytes)
+
+        def setup(self, worker):
+            configure_cache(*self._args)
+
+    return _CacheConfigPlugin(location, token, cache_bytes)
 
 
 def _fetch_chunk_distributed(
