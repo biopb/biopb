@@ -151,6 +151,47 @@ class TestSharedCache:
         pass  # Requires cachey installation
 
 
+class TestCachePolicy:
+    """Tests for the localhost-aware cache-size resolver (piece 1)."""
+
+    def test_resolve_zero_or_negative_request_disables(self):
+        assert client_module._resolve_cache_bytes("grpc://remote:8815", 0) == 0
+        assert client_module._resolve_cache_bytes("grpc://remote:8815", -5) == 0
+
+    def test_resolve_remote_keeps_requested_size(self):
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            assert client_module._resolve_cache_bytes("grpc://remote:8815", 1000) == 1000
+
+    def test_resolve_localhost_disables_by_default(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
+        with patch.object(client_module, "_is_localhost_location", return_value=True):
+            assert client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 0
+
+    def test_resolve_localhost_opt_in_via_env(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
+        with patch.object(client_module, "_is_localhost_location", return_value=True):
+            assert client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 1000
+
+    def test_shared_cache_is_none_for_localhost(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
+        with patch.object(client_module, "_is_localhost_location", return_value=True):
+            assert client_module._get_shared_cache("grpc://localhost:8815", None, 1000) is None
+
+    def test_shared_cache_created_for_remote(self):
+        loc = "grpc://remote-cache-test:9999"
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            cache = client_module._get_shared_cache(loc, None, 1000)
+            try:
+                assert cache is not None
+                assert cache.available_bytes == 1000
+            finally:
+                client_module._CACHE_POOL.pop((loc, None), None)
+
+    def test_localhost_detection_loopback_literals(self):
+        assert client_module._is_localhost_location("grpc://127.0.0.1:8815") is True
+        assert client_module._is_localhost_location("grpc://localhost:8815") is True
+
+
 class TestCleanupConnectionPool:
     """Tests for atexit cleanup."""
 
