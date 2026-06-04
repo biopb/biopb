@@ -215,7 +215,7 @@ class TestConfigureCache:
             client_module.configure_cache(loc, None, 2000)
         assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 2000
 
-    def test_localhost_pins_off_and_removes(self):
+    def test_localhost_pins_off(self):
         loc = "grpc://srv:8815"
         # first create a real cache as if remote, then re-resolve as localhost
         with patch.object(client_module, "_is_localhost_location", return_value=False):
@@ -223,14 +223,26 @@ class TestConfigureCache:
         with patch.object(client_module, "_is_localhost_location", return_value=True):
             eff = client_module.configure_cache(loc, None, 1000)
         assert eff == 0
-        assert (loc, None) not in client_module._CACHE_POOL
+        # pinned off -> entry present with a None-cache sentinel (not deleted)
+        assert client_module._CACHE_POOL[(loc, None)][1] is None
 
-    def test_zero_removes(self):
+    def test_zero_pins_off(self):
         loc = "grpc://remote:8815"
         with patch.object(client_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
             assert client_module.configure_cache(loc, None, 0) == 0
-        assert (loc, None) not in client_module._CACHE_POOL
+        assert client_module._CACHE_POOL[(loc, None)][1] is None
+
+    def test_pinned_off_survives_later_fetch_request(self):
+        """configure_cache(.., 0) must not be undone by a later nonzero fetch."""
+        loc = "grpc://remote:8815"
+        with patch.object(client_module, "_is_localhost_location", return_value=False):
+            assert client_module.configure_cache(loc, None, 0) == 0
+            # a later fetch carrying the default 1GB must NOT recreate a cache
+            assert (
+                client_module._get_shared_cache(loc, None, 1_000_000_000)
+                is None
+            )
 
     def test_get_shared_cache_honors_configured_size(self):
         loc = "grpc://remote:8815"

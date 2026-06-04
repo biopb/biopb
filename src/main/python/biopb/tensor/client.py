@@ -289,7 +289,13 @@ _CONNECTION_REGISTRY: Dict[int, Dict[Tuple[str, Optional[str]], flight.FlightCli
 _REGISTRY_LOCK = threading.Lock()
 
 # Shared pools for cache and call options (cross-thread cache hits enabled)
-_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Cache]] = {}
+#
+# Cache pool value is tri-state per (location, token):
+#   - absent          -> never configured; first fetch creates a default cache
+#   - (pid, Cache)    -> pinned/created with that budget
+#   - (pid, None)     -> deliberately pinned OFF by configure_cache(); a later
+#                        fetch must honor this and NOT recreate a cache.
+_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Optional[Cache]]] = {}
 _CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
 
@@ -406,14 +412,16 @@ def _get_shared_cache(
     key = (location, token)
     current_pid = os.getpid()
 
-    # An already-pooled cache wins: it may have been pinned by configure_cache()
+    # An already-pooled entry wins: it may have been pinned by configure_cache()
     # at worker startup, in which case the per-fetch cache_bytes is irrelevant.
+    # The stored cache may be None -- a sentinel meaning "pinned OFF" -- which we
+    # return as-is so the decision is not undone by this fetch's cache_bytes.
     with _POOL_LOCK:
         if key in _CACHE_POOL:
             pool_pid, cache = _CACHE_POOL[key]
             if pool_pid == current_pid:
                 return cache
-            del _CACHE_POOL[key]  # fork-safety: inherited stale cache
+            del _CACHE_POOL[key]  # fork-safety: inherited stale entry
 
     # Not pooled yet: resolve the requested size and create lazily (or skip).
     effective = _resolve_cache_bytes(location, cache_bytes)
@@ -490,7 +498,9 @@ def configure_cache(
     deterministically across a dynamically-sized cluster.
 
     The size is run through :func:`_resolve_cache_bytes`, so a localhost server
-    (default) or ``cache_bytes <= 0`` removes any existing cache and pins it off.
+    (default) or ``cache_bytes <= 0`` pins the cache OFF: it records a sentinel
+    so later fetches skip caching instead of recreating one from their own
+    ``cache_bytes``.
 
     Args:
         location: Flight server location string
@@ -507,8 +517,10 @@ def configure_cache(
     with _POOL_LOCK:
         existing = _CACHE_POOL.get(key)
         if effective <= 0:
-            if existing is not None:
-                del _CACHE_POOL[key]
+            # Pin OFF authoritatively: store a None-cache sentinel instead of
+            # deleting, so a later fetch's _get_shared_cache honors the decision
+            # rather than recreating a cache from its own cache_bytes.
+            _CACHE_POOL[key] = (current_pid, None)
             return 0
         # (Re)create when absent, inherited from a fork, or a different size.
         if (
@@ -1833,6 +1845,9 @@ class TensorFlightClient:
             resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
             return {"size_bytes": 0, "max_bytes": resolved, "item_count": 0}
         cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
+        if cache is None:
+            # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
+            return {"size_bytes": 0, "max_bytes": 0, "item_count": 0}
         return {
             "size_bytes": cache.total_bytes,
             "max_bytes": cache.available_bytes,
@@ -1843,9 +1858,8 @@ class TensorFlightClient:
         """Clear the pooled cache for this connection namespace."""
         key = (self._location, self._token)
         pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is not None:
-            cache = pool_entry[1]
-            cache.clear()
+        if pool_entry is not None and pool_entry[1] is not None:
+            pool_entry[1].clear()
 
     def __enter__(self):
         return self
