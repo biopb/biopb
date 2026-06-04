@@ -523,6 +523,13 @@ class TestHdf5Integration:
 class TestCacheIntegration:
     """Integration tests for cache behavior across adapters."""
 
+    @pytest.fixture(autouse=True)
+    def _enable_local_cache(self, monkeypatch):
+        # The client disables its per-process chunk cache for localhost servers
+        # by default (the server already caches its data). These tests exercise
+        # the client cache directly against a localhost server, so opt back in.
+        monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
+
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_cache_hit_multiple_reads(self, simple_zarr_array):
         """Test that repeated reads hit cache."""
