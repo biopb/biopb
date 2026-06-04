@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import threading
@@ -55,6 +56,32 @@ def _is_shm_disabled_by_env() -> bool:
     return os.environ.get("BIOPB_SHM_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
 
 
+def _cache_local_enabled() -> bool:
+    """Whether to keep a client-side chunk cache for a *localhost* server.
+
+    Default ``False``: on localhost the tensor server already caches its data
+    (and the shm fast-path makes a re-fetch cheap), so a per-process client
+    cache is mostly a redundant second copy -- and under a multi-process dask
+    cluster it is replicated in every worker, multiplying memory use. Set
+    ``BIOPB_CACHE_LOCAL=1`` to opt back in (e.g. a slow loopback proxy).
+    """
+    return os.environ.get("BIOPB_CACHE_LOCAL", "").lower() in ("1", "true", "yes")
+
+
+def _resolve_cache_bytes(location: str, requested: int) -> int:
+    """Effective per-process chunk-cache size for a connection.
+
+    Single point that decides whether (and how big) a client-side cache is.
+    Folds in the localhost rule: a localhost server gets no cache (returns 0)
+    unless explicitly re-enabled; otherwise the requested size is honored.
+    """
+    if requested <= 0:
+        return 0
+    if not _cache_local_enabled() and _is_localhost_location(location):
+        return 0
+    return requested
+
+
 def _server_supports_shm(schema_metadata: Optional[Dict[str, str]]) -> bool:
     """Check if server version supports shm_transfer action.
 
@@ -87,11 +114,16 @@ def _is_posix_shm_available() -> bool:
     return sys.platform in ("linux", "darwin") or sys.platform.startswith("freebsd")
 
 
+@lru_cache(maxsize=None)
 def _is_localhost_location(location: str) -> bool:
     """Check if location points to localhost.
 
     Parses location URI and checks hostname against localhost variants.
     Uses socket.getaddrinfo() to resolve hostname to loopback.
+
+    Memoized: this is called on every chunk fetch (cache-policy + shm checks)
+    and may do a DNS lookup, so the per-location result is cached for the life
+    of the process.
 
     Args:
         location: Flight server location string (e.g., "grpc://localhost:8815")
@@ -257,7 +289,13 @@ _CONNECTION_REGISTRY: Dict[int, Dict[Tuple[str, Optional[str]], flight.FlightCli
 _REGISTRY_LOCK = threading.Lock()
 
 # Shared pools for cache and call options (cross-thread cache hits enabled)
-_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Cache]] = {}
+#
+# Cache pool value is tri-state per (location, token):
+#   - absent          -> never configured; first fetch creates a default cache
+#   - (pid, Cache)    -> pinned/created with that budget
+#   - (pid, None)     -> deliberately pinned OFF by configure_cache(); a later
+#                        fetch must honor this and NOT recreate a cache.
+_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Optional[Cache]]] = {}
 _CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
 
@@ -355,32 +393,45 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
     return client
 
 
-def _get_shared_cache(location: str, token: Optional[str], cache_bytes: int) -> Cache:
-    """Get shared Cache for cross-thread cache hits.
+def _get_shared_cache(
+    location: str, token: Optional[str], cache_bytes: int
+) -> Optional[Cache]:
+    """Get shared Cache for cross-thread cache hits, or None if caching is off.
+
+    The requested size is run through :func:`_resolve_cache_bytes`, so a
+    localhost server (default) yields ``None`` and no Cache is ever allocated.
 
     Args:
         location: Flight server location string
         token: Bearer token (or None for no auth)
-        cache_bytes: Cache size for worker-local cache
+        cache_bytes: Requested cache size for worker-local cache
 
     Returns:
-        Cache instance shared across threads
+        Cache instance shared across threads, or None when caching is disabled.
     """
     key = (location, token)
     current_pid = os.getpid()
 
+    # An already-pooled entry wins: it may have been pinned by configure_cache()
+    # at worker startup, in which case the per-fetch cache_bytes is irrelevant.
+    # The stored cache may be None -- a sentinel meaning "pinned OFF" -- which we
+    # return as-is so the decision is not undone by this fetch's cache_bytes.
     with _POOL_LOCK:
-        # Fork-safety: detect and clean up inherited stale cache
         if key in _CACHE_POOL:
             pool_pid, cache = _CACHE_POOL[key]
-            if pool_pid != current_pid:
-                del _CACHE_POOL[key]
+            if pool_pid == current_pid:
+                return cache
+            del _CACHE_POOL[key]  # fork-safety: inherited stale entry
 
-        # Create fresh cache for current process if needed
+    # Not pooled yet: resolve the requested size and create lazily (or skip).
+    effective = _resolve_cache_bytes(location, cache_bytes)
+    if effective <= 0:
+        return None
+
+    with _POOL_LOCK:
         if key not in _CACHE_POOL:
-            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=cache_bytes))
-
-    return _CACHE_POOL[key][1]
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+        return _CACHE_POOL[key][1]
 
 
 def _get_shared_call_options(location: str, token: Optional[str]) -> flight.FlightCallOptions:
@@ -424,13 +475,96 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
         cache_bytes: Cache size for worker-local cache
 
     Returns:
-        Tuple of (FlightClient, Cache, FlightCallOptions)
+        Tuple of (FlightClient, Optional[Cache], FlightCallOptions). The cache
+        is None when caching is disabled for this connection (e.g. localhost).
     """
     client = _get_thread_client(location, token)
     cache = _get_shared_cache(location, token, cache_bytes)
     call_options = _get_shared_call_options(location, token)
 
     return (client, cache, call_options)
+
+
+def configure_cache(
+    location: str, token: Optional[str], cache_bytes: int
+) -> int:
+    """Pin this process's chunk-cache budget for a connection namespace.
+
+    Authoritative and idempotent, unlike the lazy first-touch creation in
+    ``_get_shared_cache``: it (re)sizes the pooled cache to the *resolved*
+    ``cache_bytes`` and is honored by every later fetch, regardless of what
+    those fetch calls request. Call it once per worker process (e.g. from a
+    dask worker-init plugin, see :func:`make_cache_plugin`) to fix the budget
+    deterministically across a dynamically-sized cluster.
+
+    The size is run through :func:`_resolve_cache_bytes`, so a localhost server
+    (default) or ``cache_bytes <= 0`` pins the cache OFF: it records a sentinel
+    so later fetches skip caching instead of recreating one from their own
+    ``cache_bytes``.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Requested per-process cache size in bytes
+
+    Returns:
+        The effective (resolved) cache size that was pinned, in bytes.
+    """
+    effective = _resolve_cache_bytes(location, cache_bytes)
+    key = (location, token)
+    current_pid = os.getpid()
+
+    with _POOL_LOCK:
+        existing = _CACHE_POOL.get(key)
+        if effective <= 0:
+            # Pin OFF authoritatively: store a None-cache sentinel instead of
+            # deleting, so a later fetch's _get_shared_cache honors the decision
+            # rather than recreating a cache from its own cache_bytes.
+            _CACHE_POOL[key] = (current_pid, None)
+            return 0
+        # (Re)create when absent, inherited from a fork, or a different size.
+        if (
+            existing is None
+            or existing[0] != current_pid
+            or existing[1].available_bytes != effective
+        ):
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+
+    return effective
+
+
+def make_cache_plugin(location: str, token: Optional[str], cache_bytes: int):
+    """Build a dask ``WorkerPlugin`` that pins the chunk-cache budget on workers.
+
+    Registering the returned plugin with ``client.register_plugin(...)`` runs
+    :func:`configure_cache` on every worker -- current *and* future -- so the
+    per-process budget stays correct across cluster restarts / autoscaling
+    without re-plumbing. The plugin is ``name``-tagged so re-registration
+    replaces rather than stacks.
+
+    ``cache_bytes`` is the desired *per-worker* size; the caller (which knows the
+    cluster size) is responsible for any total-budget split. Localhost still
+    resolves to 0 via :func:`configure_cache`.
+
+    Returns:
+        A WorkerPlugin instance, or None if ``distributed`` is not importable
+        (so callers can no-op gracefully on non-distributed setups).
+    """
+    try:
+        from distributed.diagnostics.plugin import WorkerPlugin
+    except Exception:
+        return None
+
+    class _CacheConfigPlugin(WorkerPlugin):
+        name = "biopb-cache-config"  # named -> idempotent re-registration
+
+        def __init__(self, location, token, cache_bytes):
+            self._args = (location, token, cache_bytes)
+
+        def setup(self, worker):
+            configure_cache(*self._args)
+
+    return _CacheConfigPlugin(location, token, cache_bytes)
 
 
 def _fetch_chunk_distributed(
@@ -465,12 +599,13 @@ def _fetch_chunk_distributed(
     """
     client, cache, call_options = _get_worker_resources(location, token, cache_bytes)
 
-    # Cache lookup
+    # Cache lookup (cache is None when caching is disabled, e.g. localhost)
     cache_key = chunk_id.hex()
-    cached = cache.get(cache_key)
-    if cached is not None:
-        logger.debug(f"fetch_chunk_distributed: cache hit for {cache_key[:16]}")
-        return cached
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"fetch_chunk_distributed: cache hit for {cache_key[:16]}")
+            return cached
 
     logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
 
@@ -493,8 +628,9 @@ def _fetch_chunk_distributed(
         shape = tuple(table.column("shape").to_pylist()[0])
         arr = arr.reshape(shape)
 
-    # Cache the result
-    cache.put(cache_key, arr, cost=arr.nbytes)
+    # Cache the result (skipped when caching is disabled)
+    if cache is not None:
+        cache.put(cache_key, arr, cost=arr.nbytes)
 
     return arr
 
@@ -1703,8 +1839,15 @@ class TensorFlightClient:
         key = (self._location, self._token)
         pool_entry = _CACHE_POOL.get(key)
         if pool_entry is None:
-            return {"size_bytes": 0, "max_bytes": self._cache_bytes, "item_count": 0}
+            # No cache allocated -- either nothing fetched yet, or caching is
+            # disabled for this connection (e.g. localhost). Report the resolved
+            # size so a disabled cache truthfully shows max_bytes == 0.
+            resolved = _resolve_cache_bytes(self._location, self._cache_bytes)
+            return {"size_bytes": 0, "max_bytes": resolved, "item_count": 0}
         cache = pool_entry[1]  # Extract cache from (pid, cache) tuple
+        if cache is None:
+            # Pinned off by configure_cache(): report max_bytes == 0 truthfully.
+            return {"size_bytes": 0, "max_bytes": 0, "item_count": 0}
         return {
             "size_bytes": cache.total_bytes,
             "max_bytes": cache.available_bytes,
@@ -1715,9 +1858,8 @@ class TensorFlightClient:
         """Clear the pooled cache for this connection namespace."""
         key = (self._location, self._token)
         pool_entry = _CACHE_POOL.get(key)
-        if pool_entry is not None:
-            cache = pool_entry[1]
-            cache.clear()
+        if pool_entry is not None and pool_entry[1] is not None:
+            pool_entry[1].clear()
 
     def __enter__(self):
         return self
