@@ -45,7 +45,17 @@ def bootstrap():
     try:
         _bootstrap_impl()
     except Exception:
-        print("BOOTSTRAP_ERROR: " + traceback.format_exc())
+        tb = traceback.format_exc()
+        # Stash the traceback in the kernel namespace so the host's health
+        # probe can fetch and surface it.  exec_lines output is otherwise
+        # swallowed by IPython, leaving the probe with only "viewer absent".
+        try:
+            from IPython import get_ipython
+
+            get_ipython().user_ns["_BOOTSTRAP_ERROR"] = tb
+        except Exception:
+            pass
+        print("BOOTSTRAP_ERROR: " + tb)
 
 
 def _bootstrap_impl():

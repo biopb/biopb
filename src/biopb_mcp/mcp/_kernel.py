@@ -109,7 +109,23 @@ class KernelHost:
                 "Kernel bootstrap health probe failed "
                 f"(status={res.get('status')!r}, stdout={res.get('stdout')!r}, "
                 f"error={res.get('error_text')!r})"
+                + self._bootstrap_error_detail()
             )
+
+    def _bootstrap_error_detail(self) -> str:
+        """Best-effort fetch of the traceback ``_bootstrap.bootstrap()`` stashes
+        in the kernel namespace, so a probe failure says *why* the viewer is
+        absent (a missing dep, a Qt/GL init error) instead of just ``False``.
+        """
+        try:
+            res = self.execute(
+                "print(globals().get('_BOOTSTRAP_ERROR', ''), end='')",
+                timeout=self._startup_timeout,
+            )
+        except Exception:  # best-effort; never mask the original failure
+            return ""
+        tb = res.get("stdout", "").strip()
+        return f"\n--- kernel bootstrap traceback ---\n{tb}" if tb else ""
 
     # -- execution ------------------------------------------------------
 
