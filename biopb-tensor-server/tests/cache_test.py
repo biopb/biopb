@@ -725,6 +725,22 @@ class TestArrowFileBackendRecovery:
     def _make_temp_cache_dir(self):
         return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
 
+    def _simulate_crash(self, backend):
+        """Release a backend's OS file handles the way a dying process would.
+
+        A real crash makes the OS reclaim every open writer/sink/mmap handle,
+        but leaves the lock file and WAL on disk (no clean shutdown). The test
+        process stays alive, so we must drop those handles explicitly -- on
+        Windows a lingering handle blocks the segment files from being deleted
+        (issue #5). Deliberately does NOT call backend.close(), which would
+        release the lock and clear the WAL and thus erase the crash state.
+        """
+        for seg_id in list(backend._pool_writers.keys() | backend._pool_sinks.keys()):
+            backend._close_writer(seg_id)
+        for mmap in backend._segment_mmaps.values():
+            mmap.close()
+        backend._segment_mmaps.clear()
+
     def test_stale_lock_detection(self):
         """Stale lock from dead process is detected."""
         cache_dir = self._make_temp_cache_dir()
@@ -777,6 +793,7 @@ class TestArrowFileBackendRecovery:
 
         # Simulate crash - don't call close(), just remove lock
         # (this simulates process dying without clean shutdown)
+        self._simulate_crash(backend1)
         lock_path = cache_dir / "lock"
         if lock_path.exists():
             lock_path.unlink()
@@ -808,6 +825,7 @@ class TestArrowFileBackendRecovery:
         backend1.release(b"key1")
 
         # Simulate crash: overwrite lock with a dead PID (no pending WAL entries)
+        self._simulate_crash(backend1)
         lock_path = cache_dir / "lock"
         fake_data = {"pid": 99999, "acquired_at": time.time()}
         with open(lock_path, 'w') as f:

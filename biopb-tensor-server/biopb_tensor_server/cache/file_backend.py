@@ -257,6 +257,11 @@ class ArrowFileBackend(CacheBackend):
         # Multiple active writers for pooling: segment_id -> writer
         # This allows keeping multiple segments open for different (schema, size_class) pools
         self._pool_writers: Dict[int, pa.RecordBatchStreamWriter] = {}
+        # The OSFile sink behind each writer. RecordBatchStreamWriter.close()
+        # does NOT close the sink it was handed, so we must track and close it
+        # ourselves -- otherwise the write handle lingers until GC and (on
+        # Windows) blocks segment unlink during eviction/cleanup. See issue #5.
+        self._pool_sinks: Dict[int, pa.OSFile] = {}
         self._pool_paths: Dict[int, Path] = {}
         self._pool_schemas: Dict[int, pa.Schema] = {}
 
@@ -511,17 +516,30 @@ class ArrowFileBackend(CacheBackend):
 
         # Register in pool tracking
         self._pool_writers[segment_id] = writer
+        self._pool_sinks[segment_id] = sink
         self._pool_paths[segment_id] = segment_path
         self._pool_schemas[segment_id] = schema
         self._open_pools[pool_key] = segment_id
 
         return segment_id
 
-    def _close_segment(self, segment_id: int) -> None:
-        """Close a specific segment's writer and open mmap for reading."""
+    def _close_writer(self, segment_id: int) -> None:
+        """Close and forget a segment's stream writer and its backing sink.
+
+        Both must be closed: RecordBatchStreamWriter.close() finalizes the IPC
+        stream but leaves the OSFile sink open, so the write handle would linger
+        and block unlink on Windows (issue #5).
+        """
         writer = self._pool_writers.pop(segment_id, None)
         if writer is not None:
             writer.close()
+        sink = self._pool_sinks.pop(segment_id, None)
+        if sink is not None:
+            sink.close()
+
+    def _close_segment(self, segment_id: int) -> None:
+        """Close a specific segment's writer and open mmap for reading."""
+        self._close_writer(segment_id)
 
         path = self._pool_paths.pop(segment_id, None)
         schema = self._pool_schemas.pop(segment_id, None)
@@ -582,10 +600,8 @@ class ArrowFileBackend(CacheBackend):
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
 
-        # Close any open writer for this segment
-        writer = self._pool_writers.pop(segment_id, None)
-        if writer:
-            writer.close()
+        # Close any open writer (and its sink) for this segment
+        self._close_writer(segment_id)
         self._pool_paths.pop(segment_id, None)
         self._pool_schemas.pop(segment_id, None)
         self._open_pools = {k: v for k, v in self._open_pools.items() if v != segment_id}
@@ -1013,6 +1029,7 @@ class ArrowFileBackend(CacheBackend):
                     sink = pa.OSFile(str(path), 'wb')
                     writer = pa.RecordBatchStreamWriter(sink, batch_with_key.schema)
                     self._pool_writers[segment_id] = writer
+                    self._pool_sinks[segment_id] = sink
 
             # Write batch (in unified schema)
             writer.write_batch(batch_with_key)
@@ -1082,10 +1099,9 @@ class ArrowFileBackend(CacheBackend):
     def clear(self) -> None:
         """Clear all evictable entries and delete all segments."""
         with self._lock:
-            # Close all pool writers
-            for writer in self._pool_writers.values():
-                writer.close()
-            self._pool_writers.clear()
+            # Close all pool writers (and their sinks)
+            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+                self._close_writer(segment_id)
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
@@ -1160,10 +1176,9 @@ class ArrowFileBackend(CacheBackend):
         Only releases locks and closes handles.
         """
         with self._lock:
-            # Close all pool writers
-            for writer in self._pool_writers.values():
-                writer.close()
-            self._pool_writers.clear()
+            # Close all pool writers (and their sinks)
+            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+                self._close_writer(segment_id)
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
