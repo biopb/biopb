@@ -149,6 +149,18 @@ class CacheManager:
         """Remove entry (only if evictable)."""
         return self._backend.remove(key)
 
+    def locate_entry(self, key: bytes):
+        """Return the on-disk ChunkLocation for a cached chunk, or None.
+
+        Only the file backend can locate entries on disk (issue #9); the memory
+        backend has no segment files, so this returns None there and the caller
+        falls back to do_get.
+        """
+        locate = getattr(self._backend, "locate_entry", None)
+        if locate is None:
+            return None
+        return locate(key)
+
     def clear(self) -> None:
         """Clear all evictable entries."""
         self._backend.clear()

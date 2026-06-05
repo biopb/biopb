@@ -10,6 +10,7 @@ Implements segmented storage with:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -89,6 +90,14 @@ UNIFIED_SCHEMA = pa.schema([
 # would report the first entry's key. A column value is stored per row and
 # round-trips correctly. See _rebuild_index_from_segments.
 CACHE_KEY_FIELD = "__biopb_cache_key__"
+
+# On-disk segment format version for the localhost cache-file handoff (issue
+# #9). The client mmaps and parses segment messages directly, so the layout is
+# a cross-process contract. Bump this whenever the segment message layout or the
+# data/shape/dtype/cache_key encoding changes in a way an older client can't
+# parse; the server reports it in chunk_locate and a client declines the fast
+# path (falls back to do_get) for any version it doesn't understand.
+CACHE_FILE_FORMAT_VERSION = 1
 
 
 def _cast_to_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -213,6 +222,22 @@ class ArrowFileConfig:
             self.cache_dir = Path(self.cache_dir)
 
 
+@dataclass
+class ChunkLocation:
+    """On-disk location of a cached chunk's Arrow IPC message.
+
+    Returned by ``locate_entry`` for the localhost cache-file handoff (issue
+    #9): a client on the same host mmaps ``segment_path`` and reads the single
+    record-batch message at ``[byte_offset, byte_offset + byte_length)``.
+    ``generation_id`` is the segment file's inode at locate time, so a client
+    can detect a segment that was evicted and recreated at the same path.
+    """
+    segment_path: str
+    byte_offset: int
+    byte_length: int
+    generation_id: int
+
+
 class ArrowFileBackend(CacheBackend):
     """Thread-safe persistent file cache with future/promise pattern.
 
@@ -299,9 +324,17 @@ class ArrowFileBackend(CacheBackend):
 
     def _initialize(self) -> None:
         """Initialize backend: create dirs, acquire lock, rebuild index."""
-        # Create directories
+        # Create directories. Restrict the cache root to the owner (0o700):
+        # segment files hold decoded chunk payloads and their paths are handed
+        # to localhost clients (issue #9), so other users on a shared host must
+        # not be able to read them. (mode is masked by umask; re-assert with
+        # chmod. No-op hardening on Windows, which ignores POSIX modes.)
         segments_dir = self._config.cache_dir / "segments"
         segments_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self._config.cache_dir, 0o700)
+        except OSError:
+            pass
 
         # Acquire process lock (detect stale lock for crash recovery)
         lock_path = self._config.cache_dir / "lock"
@@ -412,7 +445,24 @@ class ArrowFileBackend(CacheBackend):
                     seg_file.unlink()
                     continue
 
-                for batch in reader:
+                # Walk the IPC stream message-by-message so we can record the
+                # byte offset of each record batch (issue #9: the localhost
+                # cache-file handoff seeks straight to a single message). The
+                # StreamReader above only gives us the schema; reading messages
+                # directly off the mmap lets us bracket each batch with tell().
+                schema = reader.schema
+                mmap.seek(0)
+                pa.ipc.read_message(mmap)  # consume the leading schema message
+                while True:
+                    pos = mmap.tell()
+                    try:
+                        msg = pa.ipc.read_message(mmap)
+                    except (pa.ArrowInvalid, EOFError, StopIteration):
+                        break
+                    if msg is None:
+                        break
+                    msg_len = mmap.tell() - pos
+                    batch = pa.ipc.read_record_batch(msg, schema)
                     # Extract cache key from the per-batch column.
                     key = batch.column(CACHE_KEY_FIELD)[0].as_py()
                     if key is not None:
@@ -425,16 +475,15 @@ class ArrowFileBackend(CacheBackend):
                         size_class = _get_size_class(batch_size)
                         pool_key = (schema_key, size_class)
 
-                        # Update offset for next batch
-                        # Note: Arrow IPC stream format doesn't expose exact offsets easily
-                        # We use relative offsets within the segment for simplicity
                         entry_info = SegmentEntryInfo(
                             segment_id=segment_id,
-                            offset=entry_count,  # Use entry index as "offset"
+                            offset=entry_count,  # Entry index for the sequential reader
                             size_bytes=batch_size,
                             metadata={},
                             created_at=segment_created,
                             last_access_time=segment_created,  # Initialize with file mtime
+                            byte_offset=pos,
+                            byte_length=msg_len,
                         )
                         self._metadata[key] = entry_info
                         entry_count += 1
@@ -801,6 +850,96 @@ class ArrowFileBackend(CacheBackend):
 
         return None
 
+    def _fill_byte_offsets_for_segment(self, segment_id: int) -> None:
+        """Walk a segment file once and record each entry's IPC message range.
+
+        Offsets aren't captured at write time (the stream writer buffers the
+        schema until the first batch, so the live sink cursor can't bracket the
+        first message). Instead we derive them by walking the flushed file,
+        matching messages to keys via the per-batch cache_key column, and fill
+        ``byte_offset`` / ``byte_length`` on the existing metadata entries. The
+        caller holds ``self._lock`` (which also excludes concurrent writes to
+        the active segment, so the walk never races a torn append).
+        """
+        path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        try:
+            mm = pa.memory_map(str(path), 'r')
+        except (OSError, pa.ArrowInvalid):
+            return
+        # Always close the mapping: an open handle blocks segment deletion on
+        # Windows (biopb/biopb#5) and leaks fds elsewhere.
+        try:
+            try:
+                schema = pa.ipc.open_stream(mm).schema
+            except Exception:
+                return
+            if CACHE_KEY_FIELD not in schema.names:
+                return
+            mm.seek(0)
+            pa.ipc.read_message(mm)  # consume the leading schema message
+            while True:
+                pos = mm.tell()
+                try:
+                    msg = pa.ipc.read_message(mm)
+                except (pa.ArrowInvalid, EOFError, StopIteration):
+                    break
+                if msg is None:
+                    break
+                msg_len = mm.tell() - pos
+                try:
+                    batch = pa.ipc.read_record_batch(msg, schema)
+                except Exception:
+                    break
+                entry_key = batch.column(CACHE_KEY_FIELD)[0].as_py()
+                if entry_key is None:
+                    continue
+                info = self._metadata.get(entry_key)
+                if info is not None and info.segment_id == segment_id:
+                    info.byte_offset = pos
+                    info.byte_length = msg_len
+        finally:
+            mm.close()
+
+    def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
+        """Return the on-disk location of a cached chunk, or None.
+
+        Backs the localhost cache-file handoff (issue #9). Returns None when the
+        key isn't cached or its byte offset can't be resolved, signalling the
+        caller to fall back to do_get.
+        """
+        with self._lock:
+            entry_info = self._metadata.get(key)
+            if entry_info is None:
+                return None
+            # byte_offset == 0 is never a real entry — the schema message always
+            # occupies the start of the segment — so 0 means "not yet indexed".
+            # Derive offsets lazily by walking the flushed segment file.
+            if not entry_info.byte_offset:
+                self._fill_byte_offsets_for_segment(entry_info.segment_id)
+                entry_info = self._metadata.get(key)
+            if entry_info is None or not entry_info.byte_offset or not entry_info.byte_length:
+                return None
+
+            segment_path = (
+                self._config.cache_dir / "segments"
+                / f"seg_{entry_info.segment_id:04d}.arrow"
+            )
+            try:
+                generation_id = os.stat(segment_path).st_ino
+            except OSError:
+                return None
+
+            # The client is about to map this segment; treat the locate as a hit
+            # so Sieve-K doesn't evict it out from under the reader.
+            self._update_segment_frequency(entry_info.segment_id)
+
+            return ChunkLocation(
+                segment_path=str(segment_path),
+                byte_offset=entry_info.byte_offset,
+                byte_length=entry_info.byte_length,
+                generation_id=generation_id,
+            )
+
     def get_or_acquire(
         self,
         key: bytes,
@@ -1031,8 +1170,16 @@ class ArrowFileBackend(CacheBackend):
                     self._pool_writers[segment_id] = writer
                     self._pool_sinks[segment_id] = sink
 
-            # Write batch (in unified schema)
+            # Write batch (in unified schema) and flush so the bytes are durable
+            # in the page cache. The localhost cache-file handoff (issue #9)
+            # needs the entry's byte range, but the stream writer buffers the
+            # schema until the first batch so the live sink cursor can't bracket
+            # the first message; offsets are derived lazily by walking the
+            # flushed file in locate_entry() instead.
             writer.write_batch(batch_with_key)
+            sink = self._pool_sinks.get(segment_id)
+            if sink is not None:
+                sink.flush()
 
             # Update segment info in pool queue
             seg_info = pool_queue.segments.get(segment_id)

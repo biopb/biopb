@@ -598,13 +598,14 @@ host = "127.0.0.1"
 port = 8815
 aggressive_dir_pruning = true
 
-# The on-disk "file" cache backend is not reliable on Windows: it serves
-# chunks as zero-copy memory-mapped Arrow buffers, and Windows refuses to
-# delete a segment file while any such buffer is still referenced, so cache
-# eviction fails. Default Windows installs to the in-memory cache instead.
+# Cache decoded chunks on disk as Arrow IPC segments so repeat reads skip
+# re-decoding the raw format. The file backend is now Windows-safe -- it copies
+# batches off the segment mmap so eviction can unlink the file (copy-on-read,
+# biopb/biopb#5). Matches the POSIX installer.
 [cache]
-backend = "memory"
-max_bytes = 4294967296  # 4 GiB (in RAM)
+backend = "file"
+file_max_segment_mb = 256
+file_max_total_gb = 128
 
 [metadata_db]
 enabled = true
