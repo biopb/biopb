@@ -322,12 +322,17 @@ _setup_mcp() {
     if [ -f "$mcp_config" ]; then
         _ok "biopb-mcp config exists at $mcp_config (preserved)"
     else
+        # tensor_disable_shm: prefer the gRPC socket over the tensor server's
+        # /dev/shm fast-path (see biopb-mcp __main__.py). The shm path is
+        # ~2.4-3x slower than the socket for large localhost chunks; stopgap
+        # until it is fixed. No-op on Windows (no POSIX shm).
         cat > "$mcp_config" << 'EOF'
 {
   "mcp": {
     "process_image_servers": [
       "grpcs://cellpose.biopb.org:443"
-    ]
+    ],
+    "tensor_disable_shm": true
   }
 }
 EOF
