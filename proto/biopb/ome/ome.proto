@@ -6,6 +6,7 @@ import "biopb/ome/metadata.proto";
 import "biopb/ome/metadata_ref.proto";
 import "biopb/ome/rights.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -26,6 +27,7 @@ option java_package = "biopb.ome";
 // specification
 //
 message OME {
+  option deprecated = true;
   // copy rights information
   Rights rights = 1;
 

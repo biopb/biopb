@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 // Use a different outer class name to avoid conflict with the Rights message
 option java_outer_classname = "RightsProto";
@@ -10,6 +11,7 @@ option java_package = "biopb.ome";
 // The rights holder of this data and the rights held.
 //
 message Rights {
+  option deprecated = true;
   // The rights holder for this data. [plain-text multi-line string] e.g.
   // "Copyright (C) 2002 - 2016 Open Microscopy Environment"
   string rights_holder = 1;

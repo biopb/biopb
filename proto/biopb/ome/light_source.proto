@@ -4,6 +4,7 @@ package biopb.ome;
 
 import "biopb/ome/manufacturer_spec.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -11,8 +12,10 @@ option java_package = "biopb.ome";
 // LaserMedium.
 //
 message Laser {
+  option deprecated = true;
   // laser types
   enum Type {
+    option deprecated = true;
     UNSPECIFIED = 0;
     EXCIMER = 1;
     GAS = 2;
@@ -62,8 +65,10 @@ message Laser {
 // HgXe. The Power of the Arc is now stored in the LightSource.
 //
 message Arc {
+  option deprecated = true;
   // The type of Arc lamp.
   enum Type {
+    option deprecated = true;
     UNSPECIFIED = 0;
     HG = 1;
     XE = 2;
@@ -78,7 +83,9 @@ message Arc {
 // LightSource.
 //
 message Filament {
+  option deprecated = true;
   enum Type {
+    option deprecated = true;
     UNSPECIFIED = 0;
     INCANDESCENT = 1;
     HALOGEN = 2;
@@ -113,13 +120,16 @@ message Filament {
 //
 // Thanks to Paul Goodwin of Applied Precision of information about this topic.
 //
-message LightEmittingDiode {}
+message LightEmittingDiode {
+  option deprecated = true;
+}
 
 // The GenericExcitationSource element is used to represent a source as a
 // collection of key/value pairs, stored in a Map. The other lightsource objects
 // should always be used in preference to this if possible.
 //
 message GenericExcitationSource {
+  option deprecated = true;
   map<string, string> attributes = 2;
 }
 
@@ -130,6 +140,7 @@ message GenericExcitationSource {
 // light source (eg, Nd-YAG for Laser or Hg for Arc).
 //
 message LightSource {
+  option deprecated = true;
   ManufacturerSpec manufacturer_spec = 2;
 
   // The light-source power. Units are set by PowerUnit.

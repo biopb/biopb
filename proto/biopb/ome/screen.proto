@@ -4,6 +4,7 @@ package biopb.ome;
 
 import "biopb/ome/reagent.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -15,6 +16,7 @@ option java_package = "biopb.ome";
 // many-to-many relationship. Plates contain one or more ScreenRef elements to
 // specify what screens they belong to.
 message Screen {
+  option deprecated = true;
   // Screen name
   string name = 2;
 

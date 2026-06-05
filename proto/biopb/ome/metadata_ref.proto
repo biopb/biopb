@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -9,6 +10,7 @@ option java_package = "biopb.ome";
 // other metadata may be present in this file, i.e. this file is a place-holder
 //
 message MetadataRef {
+  option deprecated = true;
   // Filename of the OME-XML metadata file for this binary data. If the file
   // cannot be found, a search can be performed based on the UUID}
   string metadata_file = 1;

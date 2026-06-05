@@ -4,10 +4,12 @@ package biopb.ome;
 
 import "biopb/ome/light_source_setting.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
 enum ManipulationType {
+  option deprecated = true;
   UNSPECIFIED = 0;
   FRAP = 1;
   FLIP = 2;
@@ -19,6 +21,7 @@ enum ManipulationType {
 }
 
 message MicrobeamManipulation {
+  option deprecated = true;
   ManipulationType type = 2;
 
   // A description for the Microbeam Manipulation. [plain-text multi-line

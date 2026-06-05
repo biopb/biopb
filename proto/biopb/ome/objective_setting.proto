@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -9,6 +10,7 @@ option java_package = "biopb.ome";
 // objective. The ID is the objective used in this case.
 //
 message ObjectiveSetting {
+  option deprecated = true;
   string objective_id = 1; // required
 
   // The CorrectionCollar is normally an adjustable ring on the

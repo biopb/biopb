@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -11,6 +12,7 @@ option java_package = "biopb.ome";
 // groups which are specified using one or more ExperimenterGroupRef elements.
 //
 message Experimenter {
+  option deprecated = true;
   // First name, sometime called christian name or given name or forename.
   // [plain text string]
   string first_name = 2;

@@ -9,6 +9,7 @@ import "biopb/ome/light_source.proto";
 import "biopb/ome/microscope.proto";
 import "biopb/ome/objective.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -26,6 +27,7 @@ option java_package = "biopb.ome";
 // stack.
 //
 message Instrument {
+  option deprecated = true;
   Microscope microscope = 1;
 
   map<string, LightSource> light_sources = 2;

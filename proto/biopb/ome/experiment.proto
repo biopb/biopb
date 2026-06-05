@@ -4,12 +4,15 @@ package biopb.ome;
 
 import "biopb/ome/microbeam_manipulation.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
 // This element describes the type of experiment.
 message Experiment {
+  option deprecated = true;
   enum ExperimentType {
+    option deprecated = true;
     UNSPECIFIED = 0;
     FP = 1;
     FRET = 2;

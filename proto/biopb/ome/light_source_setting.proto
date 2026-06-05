@@ -2,10 +2,12 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
 message LightSourceSetting {
+  option deprecated = true;
   string light_source_id = 1; // required
 
   // The Attenuation of the light source [units:none] A fraction, as a value

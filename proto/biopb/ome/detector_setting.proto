@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -15,6 +16,7 @@ option java_package = "biopb.ome";
 // into sub-types.
 //
 message DetectorSetting {
+  option deprecated = true;
   string detector_id = 1;
 
   // The Offset of the detector. [units none] {used:CCD,EMCCD}

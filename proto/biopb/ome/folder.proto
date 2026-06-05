@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -11,6 +12,7 @@ option java_package = "biopb.ome";
 // other Folder.
 //
 message Folder {
+  option deprecated = true;
   //  A name for the folder that is suitable for presentation to the user.
   string name = 2;
 

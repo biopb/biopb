@@ -6,6 +6,7 @@ import "biopb/ome/objective_setting.proto";
 import "biopb/ome/pixel.proto";
 import "google/protobuf/timestamp.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -13,6 +14,7 @@ option java_package = "biopb.ome";
 // during the experiment.
 //
 message ImagingEnvironment {
+  option deprecated = true;
   // The Temperature is the define units.
   optional float temperature = 1;
 
@@ -37,6 +39,7 @@ message ImagingEnvironment {
 // The StageLabel is used to specify a name and position for a stage position in
 // the microscope's reference frame.
 message StageLabel {
+  option deprecated = true;
   string name = 2;
 
   // The X position of the stage label. Units are set by XUnit.
@@ -72,6 +75,7 @@ message StageLabel {
 // cases the name of the element instance. In this case, the name of the image,
 // not necessarily the filename. Physical size of pixels are microns[µm].
 message Image {
+  option deprecated = true;
   string name = 2;
 
   // A description for the image. [plain-text multi-line string]

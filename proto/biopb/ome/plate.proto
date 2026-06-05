@@ -4,6 +4,7 @@ package biopb.ome;
 
 import "google/protobuf/timestamp.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -13,6 +14,7 @@ option java_package = "biopb.ome";
 // through WellSample.
 //
 message PlateAcquisition {
+  option deprecated = true;
   // human readable name
   string name = 2;
 
@@ -40,6 +42,7 @@ message PlateAcquisition {
 // WellSample is an individual image that has been captured within a Well.
 //
 message WellSample {
+  option deprecated = true;
   // This is the main link to the core Image element
   string image_id = 2;
 
@@ -77,6 +80,7 @@ message WellSample {
 // zero. i.e The top left well of a plate is index (0,0)
 //
 message Well {
+  option deprecated = true;
   // Well samples in this well. We use a dictionary so that the keys (IDs) can
   // be referenced in other data structures, e.g. PlateAcquisition
   map<string, WellSample> well_samples = 2;
@@ -118,7 +122,9 @@ message Well {
 // zero. i.e. The top-left well of a plate is index (0,0)
 //
 message Plate {
+  option deprecated = true;
   enum NamingConvention {
+    option deprecated = true;
     UNSPECIFIED = 0;
 
     // While the label type 'number' has a clear meaning the 'letter'

@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -10,6 +11,7 @@ option java_package = "biopb.ome";
 // all of which are optional.
 //
 message ManufacturerSpec {
+  option deprecated = true;
   // The manufacturer of the component. [plain text string]
   string manufacturer = 2;
 

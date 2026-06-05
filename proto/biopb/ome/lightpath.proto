@@ -2,12 +2,14 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
 // A description of the light path
 //
 message LightPath {
+  option deprecated = true;
   // The Filters placed in the Excitation light path.
   repeated string excitation_filter_ids = 1;
 

@@ -4,6 +4,7 @@ package biopb.ome;
 
 import "google/protobuf/any.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -12,6 +13,7 @@ option java_package = "biopb.ome";
 // with any data structure understood by protobuf
 //
 message Annotation {
+  option deprecated = true;
   google.protobuf.Any annotation = 1;
 
   // A description for the annotation. [plain-text multi-line string]

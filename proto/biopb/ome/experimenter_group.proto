@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -10,6 +11,7 @@ option java_package = "biopb.ome";
 // themselves Experimenters.
 //
 message ExperimenterGroup {
+  option deprecated = true;
   string name = 2;
 
   // A description for the group. [plain-text multi-line string]

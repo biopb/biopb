@@ -4,6 +4,7 @@ package biopb.ome;
 
 import "biopb/ome/bindata.proto";
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -12,6 +13,7 @@ option java_package = "biopb.ome";
 // ⎢ A10, A11, A12 ⎥
 // ⎣ 0,   0,   1   ⎦
 message AffineTransform {
+  option deprecated = true;
   float a00 = 1;
   float a01 = 2;
   float a02 = 3;
@@ -24,6 +26,7 @@ message AffineTransform {
 // the Shape level.
 //
 message Rectangle {
+  option deprecated = true;
   // The X value of the left edge or the rectangle. [units pixels]
   float x = 1; // required
 
@@ -41,6 +44,7 @@ message Rectangle {
 // shape level.
 //
 message Mask {
+  option deprecated = true;
   // The X coordinate of the left side of the image. [units pixels]
   float x = 1;
 
@@ -55,6 +59,7 @@ message Mask {
 }
 
 message Point {
+  option deprecated = true;
   float x = 1;
   float y = 2;
 }
@@ -63,6 +68,7 @@ message Point {
 // the Shape level.
 //
 message Ellipse {
+  option deprecated = true;
   // The X coordinate of the center of the ellipse. [units pixels]
   float x = 1;
 
@@ -79,6 +85,7 @@ message Ellipse {
 //A straight line defined by it's end points.
 //
 message Line {
+  option deprecated = true;
   // The X coordinate of the start of the line. [units pixels]
   float x1 = 1;
 
@@ -96,11 +103,13 @@ message Line {
 // uses counterclockwise winding (this is the default OpenGL behavior)
 //
 message PolyLine {
+  option deprecated = true;
   // The points of the polyline
   // NOTE:OME-XML uses a string representation here
   repeated Point points = 1;
 
   enum Marker {
+    option deprecated = true;
     UNSPECIFIED = 0;
     ARROW = 1;
     OTHER = 2;
@@ -115,6 +124,7 @@ message PolyLine {
 // uses counterclockwise winding (this is the default OpenGL behavior)
 //
 message Polygon {
+  option deprecated = true;
   // The points of the polygon
   // NOTE:OME-XML uses a string representation here
   repeated Point points = 1;
@@ -124,6 +134,7 @@ message Polygon {
 // shape level.
 //
 message Label {
+  option deprecated = true;
   // This defines the X coordinate of the current text position of the first
   // character in the string. [units pixels]
   float x = 1; // required
@@ -138,6 +149,7 @@ message Label {
 // applied to the ROI shape.
 //
 message Shape {
+  option deprecated = true;
   // This is a matrix used to transform the shape. The element has 6 xsd:float
   // attributes. If the element is present then all 6 values must be included.
   AffineTransform transform = 2;
@@ -147,6 +159,7 @@ message Shape {
 
   // The rule used to decide which parts of the shape to fill. [enumeration]
   enum FillRule {
+    option deprecated = true;
     UNSPECIFIED = 0;
     EVENODD = 1;
     NONZERO = 2;
@@ -230,6 +243,7 @@ message Shape {
 // in the ROI. Multiple ROIs may be specified.
 //
 message ROI {
+  option deprecated = true;
   // The Name identifies the ROI to the user. [plain-text string]
   string name = 2;
 

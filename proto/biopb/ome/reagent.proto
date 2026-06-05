@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package biopb.ome;
 
+option deprecated = true;
 option java_multiple_files = true;
 option java_package = "biopb.ome";
 
@@ -9,6 +10,7 @@ option java_package = "biopb.ome";
 // parameter.
 //
 message Reagent {
+  option deprecated = true;
   // A short name for the reagent
   string name = 2;
 
