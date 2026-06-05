@@ -2,93 +2,90 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
-option java_multiple_files = true;
-
 import "biopb/ome/manufacturer_spec.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.ome";
 
 // Laser types are specified using two attributes - the Type and the
 // LaserMedium.
 //
 message Laser {
-    // laser types
-    enum Type {
-        UNSPECIFIED = 0;
-        EXCIMER = 1;
-        GAS = 2;
-        METAL_VAPOR = 3;
-        SOLID_STATE = 4;
-        DYE = 5;
-        SEMICONDUCTOR = 6;
-        FREE_ELECTRON = 7;
-        OTHER = 8;
-    }
+  // laser types
+  enum Type {
+    UNSPECIFIED = 0;
+    EXCIMER = 1;
+    GAS = 2;
+    METAL_VAPOR = 3;
+    SOLID_STATE = 4;
+    DYE = 5;
+    SEMICONDUCTOR = 6;
+    FREE_ELECTRON = 7;
+    OTHER = 8;
+  }
 
-    Type type = 2;
+  Type type = 2;
 
-    // The Medium attribute specifies the actual lasing medium
-    // for a given laser type.
-    // NOTE: OME-XML uses Enum here
-    string laser_medium = 3;
+  // The Medium attribute specifies the actual lasing medium
+  // for a given laser type.
+  // NOTE: OME-XML uses Enum here
+  string laser_medium = 3;
 
-    // The Wavelength of the laser. Units are set by WavelengthUnit.
-    optional float Wavelength = 4;
+  // The Wavelength of the laser. Units are set by WavelengthUnit.
+  optional float Wavelength = 4;
 
-    // default is "nm"
-    string wavelength_unit = 5;
+  // default is "nm"
+  string wavelength_unit = 5;
 
-    // FrequencyMultiplication that may be specified. [units:none]
-    optional int32 fequency_multiplication = 6;
+  // FrequencyMultiplication that may be specified. [units:none]
+  optional int32 fequency_multiplication = 6;
 
-    // Whether or not the laser is Tuneable [flag]
-    optional bool tunable = 7;
+  // Whether or not the laser is Tuneable [flag]
+  optional bool tunable = 7;
 
-    // The Pulse mode of the laser, e.g. "CW", "QSwitch"
-    // NOTE: OME-XML uses an Enum here
-    string pulse = 8;
+  // The Pulse mode of the laser, e.g. "CW", "QSwitch"
+  // NOTE: OME-XML uses an Enum here
+  string pulse = 8;
 
-    // If true the laser has a PockelCell to rotate the polarization of the
-    // beam. [flag]
-    optional bool pockel_cell = 9;
+  // If true the laser has a PockelCell to rotate the polarization of the
+  // beam. [flag]
+  optional bool pockel_cell = 9;
 
-    // The is the rate in Hz at which the laser pulses if the Pulse type is
-    // 'Repetitive'. hertz[Hz] Units are set by RepetitionRateUnit.
-    optional uint32 repetition_rate = 10;
+  // The is the rate in Hz at which the laser pulses if the Pulse type is
+  // 'Repetitive'. hertz[Hz] Units are set by RepetitionRateUnit.
+  optional uint32 repetition_rate = 10;
 
-    string repetition_rate_unit = 11;
+  string repetition_rate_unit = 11;
 }
-
 
 // The Arc element is used to describe various kinds of Arc lamps - Hg, Xe,
 // HgXe. The Power of the Arc is now stored in the LightSource.
 //
 message Arc {
-    // The type of Arc lamp.
-    enum Type {
-        UNSPECIFIED = 0;
-        HG = 1;
-        XE = 2;
-        HG_XE = 3;
-        OTHER = 4;
-    }
-    Type type = 2;
+  // The type of Arc lamp.
+  enum Type {
+    UNSPECIFIED = 0;
+    HG = 1;
+    XE = 2;
+    HG_XE = 3;
+    OTHER = 4;
+  }
+  Type type = 2;
 }
-
 
 // The Filament element is used to describe various kinds of filament bulbs such
 // as Incadescent or Halogen. The Power of the Filament is now stored in the
 // LightSource.
 //
 message Filament {
-    enum Type {
-        UNSPECIFIED = 0;
-        INCANDESCENT = 1;
-        HALOGEN = 2;
-        OTHER = 3;
-    }
-    Type type = 2;
+  enum Type {
+    UNSPECIFIED = 0;
+    INCANDESCENT = 1;
+    HALOGEN = 2;
+    OTHER = 3;
+  }
+  Type type = 2;
 }
-
 
 // The LightEmittingDiode element is used to describe various kinds of LED
 // lamps.
@@ -116,16 +113,14 @@ message Filament {
 //
 // Thanks to Paul Goodwin of Applied Precision of information about this topic.
 //
-message LightEmittingDiode {
-}
-
+message LightEmittingDiode {}
 
 // The GenericExcitationSource element is used to represent a source as a
 // collection of key/value pairs, stored in a Map. The other lightsource objects
 // should always be used in preference to this if possible.
 //
 message GenericExcitationSource {
-    map<string, string> attributes = 2;
+  map<string, string> attributes = 2;
 }
 
 // The lightsource for the instrument.  An instrument may have several light
@@ -135,22 +130,22 @@ message GenericExcitationSource {
 // light source (eg, Nd-YAG for Laser or Hg for Arc).
 //
 message LightSource {
-    ManufacturerSpec manufacturer_spec = 2;
+  ManufacturerSpec manufacturer_spec = 2;
 
-    // The light-source power. Units are set by PowerUnit.
-    optional float power = 3;
+  // The light-source power. Units are set by PowerUnit.
+  optional float power = 3;
 
-    // The units of the Power - default:milliwatts[mW]
-    string power_units = 4;
+  // The units of the Power - default:milliwatts[mW]
+  string power_units = 4;
 
-    // References
-    string annotation_ids = 5;
+  // References
+  string annotation_ids = 5;
 
-    oneof light_source {
-        Laser laser = 6;
-        Arc arc = 7;
-        Filament filament = 8;
-        LightEmittingDiode light_emitting_diode = 9;
-        GenericExcitationSource generic_excitation_source = 10;
-    }
+  oneof light_source {
+    Laser laser = 6;
+    Arc arc = 7;
+    Filament filament = 8;
+    LightEmittingDiode light_emitting_diode = 9;
+    GenericExcitationSource generic_excitation_source = 10;
+  }
 }

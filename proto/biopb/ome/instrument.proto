@@ -2,15 +2,15 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
-option java_multiple_files = true;
-
-import "biopb/ome/microscope.proto";
-import "biopb/ome/light_source.proto";
 import "biopb/ome/detector.proto";
-import "biopb/ome/objective.proto";
-import "biopb/ome/filter_set.proto";
 import "biopb/ome/filter.proto";
+import "biopb/ome/filter_set.proto";
+import "biopb/ome/light_source.proto";
+import "biopb/ome/microscope.proto";
+import "biopb/ome/objective.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.ome";
 
 // This element describes the instrument used to capture the Image. It is
 // primarily a container for manufacturer's model and catalog numbers for the
@@ -26,21 +26,19 @@ import "biopb/ome/filter.proto";
 // stack.
 //
 message Instrument {
+  Microscope microscope = 1;
 
-    Microscope microscope = 1;
+  map<string, LightSource> light_sources = 2;
 
-    map<string, LightSource> light_sources = 2;
+  map<string, Detector> detectors = 3;
 
-    map<string, Detector> detectors = 3;
+  map<string, Objective> objectives = 4;
 
-    map<string, Objective> objectives = 4;
+  map<string, FilterSet> filter_sets = 5;
 
-    map<string, FilterSet> filter_sets = 5;
+  map<string, Filter> filters = 6;
 
-    map<string, Filter> filters = 6;
+  map<string, Dichroic> dichroics = 7;
 
-    map<string, Dichroic> dichroics = 7;
-
-    repeated string annotation_ids = 8;
-
+  repeated string annotation_ids = 8;
 }

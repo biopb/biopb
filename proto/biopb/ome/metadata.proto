@@ -2,21 +2,21 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
-option java_multiple_files = true;
-
-import "biopb/ome/project.proto";
+import "biopb/ome/annotation.proto";
 import "biopb/ome/dataset.proto";
-import "biopb/ome/folder.proto";
 import "biopb/ome/experiment.proto";
-import "biopb/ome/plate.proto";
-import "biopb/ome/screen.proto";
 import "biopb/ome/experimenter.proto";
 import "biopb/ome/experimenter_group.proto";
-import "biopb/ome/instrument.proto";
+import "biopb/ome/folder.proto";
 import "biopb/ome/image.proto";
-import "biopb/ome/annotation.proto";
+import "biopb/ome/instrument.proto";
+import "biopb/ome/plate.proto";
+import "biopb/ome/project.proto";
 import "biopb/ome/roi.proto";
+import "biopb/ome/screen.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.ome";
 
 // Metadata is the main part of the OME specification
 //
@@ -26,32 +26,30 @@ import "biopb/ome/roi.proto";
 // simpler syntax -- we no longer define all the "reference" data types.
 //
 // The string keys used are equivalent to the IDs of the OME-XML design,
-// although here we do not enforce its format. 
+// although here we do not enforce its format.
 //
 message Metadata {
+  map<string, Project> projects = 1;
 
-    map<string, Project> projects = 1;
+  map<string, Dataset> datasets = 2;
 
-    map<string, Dataset> datasets = 2;
+  map<string, Folder> folders = 3;
 
-    map<string, Folder> folders = 3;
+  map<string, Experiment> experiments = 4;
 
-    map<string, Experiment> experiments = 4;
+  map<string, Plate> plates = 5;
 
-    map<string, Plate> plates = 5;
+  map<string, Screen> screens = 6;
 
-    map<string, Screen> screens = 6;
+  map<string, Experimenter> experimenter = 7;
 
-    map<string, Experimenter> experimenter = 7;
+  map<string, ExperimenterGroup> experimenter_groups = 8;
 
-    map<string, ExperimenterGroup> experimenter_groups = 8;
+  map<string, Instrument> instruments = 9;
 
-    map<string, Instrument> instruments = 9;
+  map<string, Image> images = 10;
 
-    map<string, Image> images = 10;
+  map<string, ROI> rois = 11;
 
-    map<string, ROI> rois = 11;
-
-    map<string, Annotation> annotations = 12;
-
+  map<string, Annotation> annotations = 12;
 }

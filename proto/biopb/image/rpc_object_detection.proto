@@ -2,53 +2,44 @@ syntax = "proto3";
 
 package biopb.image;
 
-option java_package = "biopb.image";
-option java_multiple_files = true;
-
-
-import "google/protobuf/any.proto";
-import "google/protobuf/empty.proto";
-
 import "biopb/image/detection_request.proto";
 import "biopb/image/detection_response.proto";
 import "biopb/image/op_schema.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/empty.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.image";
 
 service ObjectDetection {
+  // Implementing the `RunDetection` call is mandatory. The rest are optional.
 
-    // Implementing the `RunDetection` call is mandatory. The rest are optional. 
+  // Unitary call for computing cell detection / segmentation.
+  rpc RunDetection(DetectionRequest) returns (DetectionResponse);
 
-    // Unitary call for computing cell detection / segmentation. 
-    rpc RunDetection(DetectionRequest) returns (DetectionResponse) ;
+  // The streaming version allows dynamic updating of the DetectionRequest and
+  // getting updated results. For example, a client may request analyses at
+  // several different settings on the same image. After initial request, the
+  // following streaming requests no longer need to transmit the image pixel
+  // data anymore, but only the new parameter settings, which saves network
+  // bandwidth.
+  rpc RunDetectionStream(stream DetectionRequest) returns (stream DetectionResponse);
 
+  // Send the image dataset as a stream of (overlapping or non-overlapping) image
+  // patches, instead of one large chunk of binary data. There are two use
+  // cases for this call: (1) The image dataset is too large therefore sending
+  // all data in one message would exceed GRPC message size limit; (2) The
+  // original data were taken as a grid scan so it is convenient to read/write
+  // as patches.
+  rpc RunDetectionOnGrid(stream DetectionRequest) returns (DetectionResponse);
 
-    // The streaming version allows dynamic updating of the DetectionRequest and
-    // getting updated results. For example, a client may request analyses at
-    // several different settings on the same image. After initial request, the
-    // following streaming requests no longer need to transmit the image pixel
-    // data anymore, but only the new parameter settings, which saves network
-    // bandwidth.
-    rpc RunDetectionStream(stream DetectionRequest) returns (stream DetectionResponse) ;
+  // Run model adaptation based on the submitted stream of DetectionRequest,
+  // which may or may not contain ROI annotations. This call returns an opaque
+  // data structure representing the model configuration after model
+  // adaptation, which in turn should be included in future inference request
+  // as a DetectionSettings field.
+  rpc RunModelAdaptation(stream DetectionRequest) returns (google.protobuf.Any);
 
-
-    // Send the image dataset as a stream of (overlapping or non-overlapping) image
-    // patches, instead of one large chunk of binary data. There are two use
-    // cases for this call: (1) The image dataset is too large therefore sending
-    // all data in one message would exceed GRPC message size limit; (2) The
-    // original data were taken as a grid scan so it is convenient to read/write
-    // as patches.
-    rpc RunDetectionOnGrid(stream DetectionRequest) returns (DetectionResponse) ;
-
-
-    // Run model adaptation based on the submitted stream of DetectionRequest,
-    // which may or may not contain ROI annotations. This call returns an opaque
-    // data structure representing the model configuration after model
-    // adaptation, which in turn should be included in future inference request
-    // as a DetectionSettings field.
-    rpc RunModelAdaptation(stream DetectionRequest) returns (google.protobuf.Any) ;
-
-
-    // Query supported model names and their kwargs schemas.
-    rpc GetOpNames(google.protobuf.Empty) returns (OpNames) ;
-
+  // Query supported model names and their kwargs schemas.
+  rpc GetOpNames(google.protobuf.Empty) returns (OpNames);
 }
-
