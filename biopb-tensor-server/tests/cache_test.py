@@ -1,6 +1,7 @@
 """Thread-safety tests for cache module."""
 
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -8,6 +9,19 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
+
+# The ArrowFileBackend disk cache is not Windows-safe: it serves chunks as
+# zero-copy mmap-backed Arrow buffers, and Windows refuses to delete a segment
+# file while any such buffer is still referenced, so eviction/cleanup fails.
+# Tracked in https://github.com/biopb/biopb/issues/5. The default cache backend
+# is in-memory (and install.ps1 pins Windows installs to it), so this is an
+# opt-in, POSIX-only feature for now.
+_windows_file_cache_xfail = pytest.mark.xfail(
+    sys.platform == "win32",
+    reason="ArrowFileBackend file cache is POSIX-only (issue #5): Windows can't "
+    "unlink mmap-backed segment files while RecordBatch buffers reference them",
+    strict=False,
+)
 
 from biopb_tensor_server.cache import (
     MAX_ARROW_BATCH_BYTES,
@@ -708,6 +722,7 @@ class TestArrowFileBackendRecovery:
         wal.clear()
         shutil.rmtree(cache_dir)
 
+    @_windows_file_cache_xfail
     def test_recovery_after_simulated_crash(self):
         """Valid entries survive after simulated crash."""
         cache_dir = self._make_temp_cache_dir()
@@ -739,6 +754,7 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    @_windows_file_cache_xfail
     def test_stale_lock_triggers_recovery_without_wal_entries(self):
         """Stale lock alone (no WAL entries) triggers recovery on restart."""
         import json
@@ -1172,6 +1188,7 @@ class TestSieveKEviction:
         backend.close()
         shutil.rmtree(cache_dir)
 
+    @_windows_file_cache_xfail
     def test_pool_selection_by_hit_rate(self):
         """Pool with lowest hit rate is selected for eviction."""
         cache_dir = self._make_temp_cache_dir()

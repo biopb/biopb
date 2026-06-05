@@ -57,6 +57,12 @@ class TestShmTransferActionListing:
 class TestShmTransferHandler:
     """Tests for server shm_transfer handler."""
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="shm_transfer is POSIX-only; the client disables it on Windows "
+        "(named shm there is freed when the last handle closes, so the segment "
+        "is gone before a separate attach can read it)",
+    )
     def test_handle_shm_transfer_creates_shm(self):
         """_handle_shm_transfer should create SHM segment with correct data."""
         # Setup: create cached source with test data
