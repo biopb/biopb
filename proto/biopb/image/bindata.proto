@@ -4,6 +4,10 @@ package biopb.image;
 
 option java_package = "biopb.image";
 option java_multiple_files = true;
+// Name the outer class explicitly: the default ("Bindata") collides
+// case-insensitively with the BinData message, breaking the Java build on
+// macOS/Windows (case-insensitive) filesystems.
+option java_outer_classname = "BinDataProto";
 
 // A binary stream
 //
