@@ -531,8 +531,6 @@ class TestArrowFileBackend:
         backend1.close()
 
         backend2 = ArrowFileBackend(config)
-        # Read it back and keep holding `entry`: entry.data is backed by the
-        # segment file (zero-copy on POSIX, an off-mmap copy on Windows).
         entry, is_owner = backend2.start_compute(b"key1")
         assert is_owner is False
         assert entry.state == EntryState.READY
@@ -541,13 +539,22 @@ class TestArrowFileBackend:
         seg_file = cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         assert seg_file.exists()
 
-        # Evict the segment while we still hold `entry`. This must not raise
-        # (even on Windows) and must actually delete the file.
-        backend2._do_evict_segment(segment_id)
+        # Reproduce the real failure mode: keep a plain Python reference to the
+        # batch, then RELEASE the cache entry so the segment becomes evictable
+        # (ref_count -> 0). The cache now considers the segment free to delete,
+        # but the held batch's buffers still map the file (zero-copy on POSIX,
+        # an off-mmap copy on Windows).
+        held_batch = entry.data
+        backend2.release(b"key1")
+        assert backend2._segment_is_evictable(segment_id)
+
+        # Drive the real eviction path. This must not raise (even on Windows)
+        # and must actually delete the file.
+        assert backend2._evict_segment_sieve_k() is True
         assert not seg_file.exists()
 
         # The held batch is still valid after its backing file is gone.
-        assert entry.data.column(0).to_pylist() == [[1, 2, 3]]
+        assert held_batch.column(0).to_pylist() == [[1, 2, 3]]
 
         backend2.close()
         shutil.rmtree(cache_dir)
