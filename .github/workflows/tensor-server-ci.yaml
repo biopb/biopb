@@ -284,6 +284,7 @@ jobs:
     environment: pypi  # must match the environment on the PyPI trusted publisher
     permissions:
       id-token: write  # required for PyPI OIDC trusted publishing
+      contents: read   # actions/checkout (job perms replace the top-level block)
     steps:
       - uses: actions/checkout@v6
         with:
