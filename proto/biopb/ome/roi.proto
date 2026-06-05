@@ -179,7 +179,7 @@ message Shape {
   // e.g. "none", "10 20 30 10"
   string stoke_dash_array = 8;
 
-  // Text lable
+  // Text label
   string text = 9;
 
   // The font family used to draw the text.

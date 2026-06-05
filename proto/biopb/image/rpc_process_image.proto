@@ -15,7 +15,7 @@ message ProcessRequest {
   // Input image for processing
   ImageData image_data = 1;
 
-  // Specify a operator name because the server may implement multiple operations.
+  // Specify an operator name because the server may implement multiple operations.
   string op_name = 2;
 
   // A field_mask to indicate the requested fields in the reply. Default is to
@@ -31,7 +31,7 @@ message ProcessResponse {
   // Output image after processing
   ImageData image_data = 1;
 
-  // Additonal information the server may return as a text string
+  // Additional information the server may return as a text string
   string annotation = 2;
 }
 

@@ -26,11 +26,12 @@ jobs:
       - uses: actions/checkout@v6
       - uses: bufbuild/buf-action@v1
         with:
-          # lint, format, and breaking gates are all enabled (the buf-action
-          # defaults). The protos are now buf-formatted and buf.yaml relaxes the
-          # STANDARD lint rules the project intentionally does not follow
-          # (unversioned, OME-style names); see
-          # https://github.com/biopb/biopb/issues/7
+          # No explicit lint/format/breaking flags, so the buf-action uses its
+          # defaults: on pull_request it runs lint + format + breaking (the PR
+          # gate); on push to main it runs build + push to the BSR. The protos
+          # are now buf-formatted and buf.yaml relaxes the STANDARD lint rules
+          # the project intentionally does not follow (unversioned, OME-style
+          # names); see https://github.com/biopb/biopb/issues/7
           # Note: one-off intentional breaking changes are skipped per-PR via the
           # `buf skip breaking` label instead of disabling the breaking gate.
           # Publishing schema changes to the BSR requires a BSR authentication token.
