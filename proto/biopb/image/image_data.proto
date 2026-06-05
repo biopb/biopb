@@ -2,128 +2,122 @@ syntax = "proto3";
 
 package biopb.image;
 
-option java_package = "biopb.image";
-option java_multiple_files = true;
-
-
-import "biopb/image/roi.proto";
 import "biopb/image/bindata.proto";
+import "biopb/image/roi.proto";
 import "biopb/tensor/serialized.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.image";
 
 // The Pixels element represent generic 5D pixel data. The time axis is
 // currently not being utilized, but is defined here for futire extensibility.
 // This is modeled after OME-XML's Pixel structure.
 message Pixels {
+  // Pixel values
+  BinData bindata = 3;
 
-    // Pixel values
-    BinData bindata = 3;
+  // A string describing the dimension order of the pixel data, e.g. "XYZCT"
+  // The string must be a permutaion of these 5 letters even if some of the
+  // dimension doesn't exist in the data.
+  string dimension_order = 4;
 
-    // A string describing the dimension order of the pixel data, e.g. "XYZCT"
-    // The string must be a permutaion of these 5 letters even if some of the
-    // dimension doesn't exist in the data.
-    string dimension_order = 4;
+  // A string describing the data type using numpy's convention. E.g., 'i8'
+  // represent int64. Endianness indicator, e.g. '=i8', is allowed but will be
+  // ignored. Instead the endianness will be determined by the field within
+  // the Bindata structure.
+  string dtype = 5;
 
-    // A string describing the data type using numpy's convention. E.g., 'i8'
-    // represent int64. Endianness indicator, e.g. '=i8', is allowed but will be
-    // ignored. Instead the endianness will be determined by the field within
-    // the Bindata structure.
-    string dtype = 5;
+  // Dimensional size of pixel data array [units:none]
+  uint32 size_x = 9;
 
-    // Dimensional size of pixel data array [units:none]
-    uint32 size_x = 9;
+  uint32 size_y = 10;
 
-    uint32 size_y = 10;
+  uint32 size_z = 11;
 
-    uint32 size_z = 11;
+  uint32 size_c = 12;
 
-    uint32 size_c = 12;
+  uint32 size_t = 13;
 
-    uint32 size_t = 13;
+  // Physical size of a pixel.
+  optional float physical_size_x = 14;
 
-    // Physical size of a pixel. 
-    optional float physical_size_x = 14;
+  optional float physical_size_y = 15;
 
-    optional float physical_size_y = 15;
+  optional float physical_size_z = 16;
 
-    optional float physical_size_z = 16;
+  // physical size unit, default "µm"
+  string physical_size_unit = 17;
 
-    // physical size unit, default "µm"
-    string physical_size_unit = 17;
+  // time_increment is used for time series that have a global timing
+  // specification instead of per-timepoint timing info. For example in a
+  // video stream. Units are set by TimeIncrementUnit.
+  optional float time_increment = 18;
 
-    // time_increment is used for time series that have a global timing
-    // specification instead of per-timepoint timing info. For example in a
-    // video stream. Units are set by TimeIncrementUnit.
-    optional float time_increment = 18;
+  // time unit, default "s"
+  string time_increment_unit = 21;
 
-    // time unit, default "s"
-    string time_increment_unit = 21;
+  // for large image dataset, it is necessary to send a stream of image
+  // patches instead of one monolithic data structure of the whole dataset.
+  // The offset values allows one to specify the relative locations of each
+  // patch. These include spatial (x,y,z), channel (c), and time (t) offsets.
+  optional uint32 offset_x = 22;
 
-    // for large image dataset, it is necessary to send a stream of image
-    // patches instead of one monolithic data structure of the whole dataset.
-    // The offset values allows one to specify the relative locations of each
-    // patch. These include spatial (x,y,z), channel (c), and time (t) offsets.
-    optional uint32 offset_x = 22;
+  optional uint32 offset_y = 23;
 
-    optional uint32 offset_y = 23;
+  optional uint32 offset_z = 24;
 
-    optional uint32 offset_z = 24;
+  optional uint32 offset_t = 25;
 
-    optional uint32 offset_t = 25;
-
-    optional uint32 offset_c = 26;
-
+  optional uint32 offset_c = 26;
 }
 
 // Additional annotation of the image, which may be used for the analysis.
 //
 message ImageAnnotation {
+  // a list of region of interest
+  repeated ROI rois = 1;
 
-    // a list of region of interest 
-    repeated ROI rois = 1;
+  // additional text annotation
+  string annotation = 2;
 
-    // additional text annotation
-    string annotation = 2;
-
-    // physical size of a pixel. 
-    repeated float pixels_sizes = 4;
+  // physical size of a pixel.
+  repeated float pixels_sizes = 4;
 }
 
 // Generic nd tensor
 message Tensor {
-    // Pixel values
-    BinData bindata = 1;
+  // Pixel values
+  BinData bindata = 1;
 
-    // A string describing the data type using numpy's convention. E.g., 'i8'
-    // represent int64. Endianness indicator, e.g. '=i8', is allowed but will be
-    // ignored. Instead the endianness will be determined by the field within
-    // the Bindata structure.
-    string dtype = 2;
+  // A string describing the data type using numpy's convention. E.g., 'i8'
+  // represent int64. Endianness indicator, e.g. '=i8', is allowed but will be
+  // ignored. Instead the endianness will be determined by the field within
+  // the Bindata structure.
+  string dtype = 2;
 
-    // A list of Dimensional size of pixel data array, e.g. [10, 5, 512, 512, 3]
-    repeated uint32 dims = 3;
+  // A list of Dimensional size of pixel data array, e.g. [10, 5, 512, 512, 3]
+  repeated uint32 dims = 3;
 
-    // A list of strings describing the dimension order of the pixel data
-    // e.g. ['T', 'Z', 'Y', 'X', 'C']. The order of the list specifies the 
-    // order of dimensions in the bindata.
-    repeated string dim_labels = 4;
+  // A list of strings describing the dimension order of the pixel data
+  // e.g. ['T', 'Z', 'Y', 'X', 'C']. The order of the list specifies the
+  // order of dimensions in the bindata.
+  repeated string dim_labels = 4;
 }
 
-
 message ImageData {
-    // Legacy field - servers should check this for backward compatibility
-    Pixels pixels = 1 [deprecated = true];
+  // Legacy field - servers should check this for backward compatibility
+  Pixels pixels = 1 [deprecated = true];
 
-    // Optional additional information regarding the image that will be utilized
-    // by the RPC call. For example, some SegmentAnything type models may ask
-    // the user to provide a tentative bounding box for the objects that the
-    // users are interested in.
-    ImageAnnotation image_annotation = 2;
+  // Optional additional information regarding the image that will be utilized
+  // by the RPC call. For example, some SegmentAnything type models may ask
+  // the user to provide a tentative bounding box for the objects that the
+  // users are interested in.
+  ImageAnnotation image_annotation = 2;
 
-    oneof data {
-        // Inline pixel data
-        Tensor eager_data = 3;
-        // Lazy tensor reference for larger-than-memory datasets
-        biopb.tensor.SerializedTensor lazy_data = 4;
-    }
-
+  oneof data {
+    // Inline pixel data
+    Tensor eager_data = 3;
+    // Lazy tensor reference for larger-than-memory datasets
+    biopb.tensor.SerializedTensor lazy_data = 4;
+  }
 }

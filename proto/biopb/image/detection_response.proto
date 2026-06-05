@@ -2,21 +2,17 @@ syntax = "proto3";
 
 package biopb.image;
 
-option java_package = "biopb.image";
-option java_multiple_files = true;
-
-
 import "biopb/image/roi.proto";
 
-message ScoredROI {
+option java_multiple_files = true;
+option java_package = "biopb.image";
 
-    ROI roi = 1;
-    
-    float score = 2;
+message ScoredROI {
+  ROI roi = 1;
+
+  float score = 2;
 }
 
 message DetectionResponse {
-
-    repeated ScoredROI detections = 1;
-
+  repeated ScoredROI detections = 1;
 }

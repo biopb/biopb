@@ -2,10 +2,11 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
-option java_multiple_files = true;
-
 import "biopb/ome/manufacturer_spec.proto";
+
+option deprecated = true;
+option java_multiple_files = true;
+option java_package = "biopb.ome";
 
 // The type of detector used to capture the image. The Detector ID can be used
 // as a reference within the Channel element in the Image element. The values
@@ -17,49 +18,49 @@ import "biopb/ome/manufacturer_spec.proto";
 // into sub-types.
 //
 message Detector {
+  option deprecated = true;
+  ManufacturerSpec manufacturer_spec = 2;
 
-    ManufacturerSpec manufacturer_spec = 2;
+  enum Type {
+    option deprecated = true;
+    UNSPECIFIED = 0;
+    CCD = 1;
+    INTENSIFIED_CCD = 2;
+    ANALOG_VIDEO = 3;
+    PMT = 4;
+    PHOTODIODE = 5;
+    SPECTROSCOPY = 6;
+    LIFETIME_IMAGING = 7;
+    CORRELATION_SPECTROSCOPY = 8;
+    FTIR = 9;
+    EMCCD = 10;
+    APD = 11;
+    CMOD = 12;
+    EBCCD = 13;
+    OTHER = 14;
+  }
+  Type type = 3;
 
-    enum Type {
-        UNSPECIFIED = 0;
-        CCD = 1;
-        INTENSIFIED_CCD = 2;
-        ANALOG_VIDEO = 3;
-        PMT = 4;
-        PHOTODIODE = 5;
-        SPECTROSCOPY = 6;
-        LIFETIME_IMAGING = 7;
-        CORRELATION_SPECTROSCOPY = 8;
-        FTIR = 9;
-        EMCCD = 10;
-        APD = 11;
-        CMOD = 12;
-        EBCCD = 13;
-        OTHER = 14;
-    }
-    Type type = 3;
+  // The Detector Gain for this detector, as a float. [units:none] {used:CCD,EMCCD,PMT}
+  optional float gain = 4;
 
-    // The Detector Gain for this detector, as a float. [units:none] {used:CCD,EMCCD,PMT}
-    optional float gain = 4;
+  // The Voltage of the detector (e.g. PMT voltage) as a float. {used:PMT}
+  // Units are set by VoltageUnit.
+  optional float voltage = 5;
 
-    // The Voltage of the detector (e.g. PMT voltage) as a float. {used:PMT}
-    // Units are set by VoltageUnit.
-    optional float voltage = 5;
+  string voltage_unit = 6;
 
-    string voltage_unit = 6;
+  // The Detector Offset. [units:none] {used:CCD,EMCCD}
+  optional float offset = 7;
 
-    // The Detector Offset. [units:none] {used:CCD,EMCCD}
-    optional float offset = 7;
+  // The fixed Zoom for a detector. [units:none] {used:PMT}
+  optional float zoom = 8;
 
-    // The fixed Zoom for a detector. [units:none] {used:PMT}
-    optional float zoom = 8;
+  // Gain applied to the detector signal. This is the electronic gain (as
+  // apposed to the inherent gain) that is set for the detector. [units:none]
+  // {used:EMCCD#EMGain}
+  optional float amplification_gain = 9;
 
-    // Gain applied to the detector signal. This is the electronic gain (as
-    // apposed to the inherent gain) that is set for the detector. [units:none]
-    // {used:EMCCD#EMGain}
-    optional float amplification_gain = 9;
-
-    // references
-    repeated string annotation_ids = 10;
-
+  // references
+  repeated string annotation_ids = 10;
 }

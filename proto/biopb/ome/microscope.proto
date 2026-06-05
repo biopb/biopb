@@ -2,23 +2,25 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
-option java_multiple_files = true;
-
 import "biopb/ome/manufacturer_spec.proto";
 
+option deprecated = true;
+option java_multiple_files = true;
+option java_package = "biopb.ome";
+
 message Microscope {
+  option deprecated = true;
+  // The microscope's manufacturer specification
+  ManufacturerSpec manufacturer_spec = 2;
 
-    // The microscope's manufacturer specification
-    ManufacturerSpec manufacturer_spec = 2;
-
-    enum Type {
-        UNSPECIFIED = 0;
-        UPRIGHT = 1;
-        INVERTED = 2;
-        DISSECTION = 3;
-        ELECTROPHYSIOLOGY = 4;
-        OTHER = 5;
-    }
-    Type type = 3;
+  enum Type {
+    option deprecated = true;
+    UNSPECIFIED = 0;
+    UPRIGHT = 1;
+    INVERTED = 2;
+    DISSECTION = 3;
+    ELECTROPHYSIOLOGY = 4;
+    OTHER = 5;
+  }
+  Type type = 3;
 }

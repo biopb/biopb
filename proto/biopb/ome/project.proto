@@ -2,8 +2,9 @@ syntax = "proto3";
 
 package biopb.ome;
 
-option java_package = "biopb.ome";
+option deprecated = true;
 option java_multiple_files = true;
+option java_package = "biopb.ome";
 
 // The Project ID is required. Datasets can be grouped into projects using a
 // many-to-many relationship. A Dataset may belong to one or more Projects by
@@ -12,21 +13,19 @@ option java_multiple_files = true;
 // datasets, which themselves contain images.
 //
 message Project {
+  option deprecated = true;
+  // Name of the project
+  string name = 2;
 
-    // Name of the project
-    string name = 2;
+  // A description for the project. [plain-text multi-line string]
+  string descrption = 3;
 
-    // A description for the project. [plain-text multi-line string]
-    string descrption = 3;
+  // References to other metadata fields
+  string experimenter_id = 4;
 
+  string experimenter_group_id = 5;
 
-    // References to other metadata fields
-    string experimenter_id = 4;
+  repeated string dataset_ids = 6;
 
-    string experimenter_group_id = 5;
-
-    repeated string dataset_ids = 6;
-
-    repeated string annotation_ids = 7;
-
+  repeated string annotation_ids = 7;
 }

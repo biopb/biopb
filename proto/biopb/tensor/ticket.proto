@@ -2,8 +2,8 @@ syntax = "proto3";
 
 package biopb.tensor;
 
-option java_package = "biopb.tensor";
 option java_multiple_files = true;
+option java_package = "biopb.tensor";
 
 // Encoded into FlightEndpoint.ticket bytes
 // Opaque chunk identifier - server determines encoding based on backend
