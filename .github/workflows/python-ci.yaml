@@ -55,7 +55,7 @@ jobs:
           pip install -e ".[test,tensor]"
       - name: Test
         run: |
-          pytest src/test/python/
+          pytest --timeout=300 --timeout-method=thread src/test/python/
 
   deploy:
     # this will run when you have tagged a commit, starting with "v*"

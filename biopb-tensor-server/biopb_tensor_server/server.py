@@ -716,7 +716,14 @@ class TensorFlightServer(flight.FlightServerBase):
         # but that default is undocumented; set it explicitly on the fd before
         # writing so the guarantee doesn't depend on it (no-op on Windows).
         if hasattr(os, "fchmod") and getattr(shm, "_fd", -1) >= 0:
-            os.fchmod(shm._fd, 0o600)
+            try:
+                os.fchmod(shm._fd, 0o600)
+            except OSError:
+                # Best-effort hardening: some POSIX platforms (notably macOS)
+                # reject fchmod on a shm fd with EINVAL. CPython already creates
+                # the segment 0o600, so a failure here is non-fatal -- the
+                # guarantee still holds, we just couldn't re-assert it.
+                pass
         shm.buf[:] = ipc_bytes
         shm.close()
 

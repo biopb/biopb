@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
   test = [
     "pytest >= 7.0",
+    "pytest-timeout >= 2.1.0",
     "opencv-python-headless==4.10.0.84",
   ]
   tensor = [

@@ -102,7 +102,7 @@ jobs:
           pip install -e "./biopb-tensor-server[test]"
 
       - name: Run Python tests
-        run: pytest biopb-tensor-server/tests/
+        run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
 
   build:
     needs: [js-test, test]
