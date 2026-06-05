@@ -10,6 +10,7 @@ Implements segmented storage with:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -175,6 +176,30 @@ def _cast_from_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
     )
 
 
+def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Return a copy of `batch` whose buffers are owned in RAM, not a file mmap.
+
+    Reads from a segment are zero-copy: the returned batch's buffers (data,
+    shape and dtype columns alike) point straight into the segment file's
+    memory mapping. On POSIX that is harmless -- unlink() removes the directory
+    entry and the inode survives to last close, so a segment can be evicted
+    while a caller still holds the batch. On Windows an active mapping blocks
+    deletion (WinError 32), so eviction and cleanup fail as long as any caller
+    keeps the batch alive.
+
+    This materializes the batch into pyarrow-owned memory via an IPC round-trip
+    (which copies every column, not just the data buffer), severing the tie to
+    the mmap so the segment file can be unlinked. Used only where that matters;
+    see issue #5.
+    """
+    sink = pa.BufferOutputStream()
+    writer = pa.RecordBatchStreamWriter(sink, batch.schema)
+    writer.write_batch(batch)
+    writer.close()
+    reader = pa.RecordBatchStreamReader(pa.BufferReader(sink.getvalue()))
+    return reader.read_next_batch()
+
+
 @dataclass
 class ArrowFileConfig:
     """Configuration for Arrow file cache backend."""
@@ -232,6 +257,11 @@ class ArrowFileBackend(CacheBackend):
         # Multiple active writers for pooling: segment_id -> writer
         # This allows keeping multiple segments open for different (schema, size_class) pools
         self._pool_writers: Dict[int, pa.RecordBatchStreamWriter] = {}
+        # The OSFile sink behind each writer. RecordBatchStreamWriter.close()
+        # does NOT close the sink it was handed, so we must track and close it
+        # ourselves -- otherwise the write handle lingers until GC and (on
+        # Windows) blocks segment unlink during eviction/cleanup. See issue #5.
+        self._pool_sinks: Dict[int, pa.OSFile] = {}
         self._pool_paths: Dict[int, Path] = {}
         self._pool_schemas: Dict[int, pa.Schema] = {}
 
@@ -258,6 +288,11 @@ class ArrowFileBackend(CacheBackend):
 
         # Recovery status (if recovered from crash)
         self._recovery_status: Optional[RecoveryStatus] = None
+
+        # Copy batches off the segment mmap before returning them to callers.
+        # Only needed on Windows, where a live mapping blocks segment unlink
+        # during eviction/cleanup; POSIX keeps zero-copy reads (issue #5).
+        self._copy_on_read = sys.platform == "win32"
 
         # Initialize
         self._initialize()
@@ -481,17 +516,30 @@ class ArrowFileBackend(CacheBackend):
 
         # Register in pool tracking
         self._pool_writers[segment_id] = writer
+        self._pool_sinks[segment_id] = sink
         self._pool_paths[segment_id] = segment_path
         self._pool_schemas[segment_id] = schema
         self._open_pools[pool_key] = segment_id
 
         return segment_id
 
-    def _close_segment(self, segment_id: int) -> None:
-        """Close a specific segment's writer and open mmap for reading."""
+    def _close_writer(self, segment_id: int) -> None:
+        """Close and forget a segment's stream writer and its backing sink.
+
+        Both must be closed: RecordBatchStreamWriter.close() finalizes the IPC
+        stream but leaves the OSFile sink open, so the write handle would linger
+        and block unlink on Windows (issue #5).
+        """
         writer = self._pool_writers.pop(segment_id, None)
         if writer is not None:
             writer.close()
+        sink = self._pool_sinks.pop(segment_id, None)
+        if sink is not None:
+            sink.close()
+
+    def _close_segment(self, segment_id: int) -> None:
+        """Close a specific segment's writer and open mmap for reading."""
+        self._close_writer(segment_id)
 
         path = self._pool_paths.pop(segment_id, None)
         schema = self._pool_schemas.pop(segment_id, None)
@@ -552,10 +600,8 @@ class ArrowFileBackend(CacheBackend):
             # Also remove from in-memory entries if present
             self._entries.pop(key, None)
 
-        # Close any open writer for this segment
-        writer = self._pool_writers.pop(segment_id, None)
-        if writer:
-            writer.close()
+        # Close any open writer (and its sink) for this segment
+        self._close_writer(segment_id)
         self._pool_paths.pop(segment_id, None)
         self._pool_schemas.pop(segment_id, None)
         self._open_pools = {k: v for k, v in self._open_pools.items() if v != segment_id}
@@ -744,6 +790,11 @@ class ArrowFileBackend(CacheBackend):
         reader = pa.RecordBatchStreamReader(mmap)
         for i, batch in enumerate(reader):
             if i == entry_info.offset:
+                # Detach from the segment mmap on Windows so the file can be
+                # unlinked during eviction even while a caller holds the batch
+                # (issue #5). POSIX keeps the zero-copy mmap read.
+                if self._copy_on_read:
+                    batch = _copy_batch_off_mmap(batch)
                 # Cast from unified binary schema back to typed schema
                 typed_batch = _cast_from_unified_schema(batch)
                 return typed_batch
@@ -978,6 +1029,7 @@ class ArrowFileBackend(CacheBackend):
                     sink = pa.OSFile(str(path), 'wb')
                     writer = pa.RecordBatchStreamWriter(sink, batch_with_key.schema)
                     self._pool_writers[segment_id] = writer
+                    self._pool_sinks[segment_id] = sink
 
             # Write batch (in unified schema)
             writer.write_batch(batch_with_key)
@@ -1047,10 +1099,9 @@ class ArrowFileBackend(CacheBackend):
     def clear(self) -> None:
         """Clear all evictable entries and delete all segments."""
         with self._lock:
-            # Close all pool writers
-            for writer in self._pool_writers.values():
-                writer.close()
-            self._pool_writers.clear()
+            # Close all pool writers (and their sinks)
+            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+                self._close_writer(segment_id)
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
@@ -1125,10 +1176,9 @@ class ArrowFileBackend(CacheBackend):
         Only releases locks and closes handles.
         """
         with self._lock:
-            # Close all pool writers
-            for writer in self._pool_writers.values():
-                writer.close()
-            self._pool_writers.clear()
+            # Close all pool writers (and their sinks)
+            for segment_id in list(self._pool_writers.keys() | self._pool_sinks.keys()):
+                self._close_writer(segment_id)
             self._pool_paths.clear()
             self._pool_schemas.clear()
             self._open_pools.clear()
