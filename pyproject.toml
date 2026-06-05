@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb"
 dynamic = ["version"]
-requires-python = ">=3.8"
+requires-python = ">=3.10,<3.13"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
 readme = "README.md"
@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
   test = [
     "pytest >= 7.0",
+    "pytest-timeout >= 2.1.0",
     "opencv-python-headless==4.10.0.84",
   ]
   tensor = [

@@ -57,6 +57,12 @@ class TestShmTransferActionListing:
 class TestShmTransferHandler:
     """Tests for server shm_transfer handler."""
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="shm_transfer is POSIX-only; the client disables it on Windows "
+        "(named shm there is freed when the last handle closes, so the segment "
+        "is gone before a separate attach can read it)",
+    )
     def test_handle_shm_transfer_creates_shm(self):
         """_handle_shm_transfer should create SHM segment with correct data."""
         # Setup: create cached source with test data
@@ -114,7 +120,8 @@ class TestShmTransferHandler:
             shm.unlink()
 
     @pytest.mark.skipif(
-        os.name != "posix", reason="POSIX /dev/shm permissions only"
+        sys.platform != "linux",
+        reason="reads /dev/shm/<name> to check file mode; /dev/shm is Linux-only",
     )
     def test_handle_shm_transfer_is_owner_only(self):
         """SHM chunks must be owner-only, not group/world readable (A4)."""
@@ -179,9 +186,12 @@ class TestShmCleanupThread:
     """Tests for SHM cleanup thread."""
 
     def test_cleanup_thread_starts_on_posix(self):
-        """Cleanup thread should start on POSIX systems."""
-        if sys.platform not in ("linux", "darwin"):
-            pytest.skip("Only runs on POSIX systems")
+        """Cleanup thread should start where /dev/shm exists (Linux)."""
+        # The cleanup thread is gated on /dev/shm existing, which is Linux-only;
+        # macOS is POSIX but has no /dev/shm, so the thread legitimately does
+        # not start there.
+        if sys.platform != "linux":
+            pytest.skip("cleanup thread is /dev/shm-gated (Linux only)")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(

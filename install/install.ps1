@@ -598,10 +598,13 @@ host = "127.0.0.1"
 port = 8815
 aggressive_dir_pruning = true
 
+# The on-disk "file" cache backend is not reliable on Windows: it serves
+# chunks as zero-copy memory-mapped Arrow buffers, and Windows refuses to
+# delete a segment file while any such buffer is still referenced, so cache
+# eviction fails. Default Windows installs to the in-memory cache instead.
 [cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
+backend = "memory"
+max_bytes = 4294967296  # 4 GiB (in RAM)
 
 [metadata_db]
 enabled = true

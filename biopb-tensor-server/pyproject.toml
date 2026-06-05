@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb-tensor-server"
 dynamic = ["version"]
-requires-python = ">=3.8"
+requires-python = ">=3.10,<3.13"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "BioPB Tensor Arrow Flight server for multi-dimensional array storage"
 readme = "README.md"
@@ -33,6 +33,7 @@ dependencies = [
   ]
   test = [
     "pytest >= 7.0.0",
+    "pytest-timeout >= 2.1.0",
     "httpx >= 0.25.0",
     # The test suite imports the web stack at collection time (cli_test.py pulls
     # in cli -> http_server -> fastapi; http_server_test.py uses TestClient), so

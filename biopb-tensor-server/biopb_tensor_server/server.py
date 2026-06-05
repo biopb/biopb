@@ -716,8 +716,20 @@ class TensorFlightServer(flight.FlightServerBase):
         # but that default is undocumented; set it explicitly on the fd before
         # writing so the guarantee doesn't depend on it (no-op on Windows).
         if hasattr(os, "fchmod") and getattr(shm, "_fd", -1) >= 0:
-            os.fchmod(shm._fd, 0o600)
-        shm.buf[:] = ipc_bytes
+            try:
+                os.fchmod(shm._fd, 0o600)
+            except OSError:
+                # Best-effort hardening: some POSIX platforms (notably macOS)
+                # reject fchmod on a shm fd with EINVAL. CPython already creates
+                # the segment 0o600, so a failure here is non-fatal -- the
+                # guarantee still holds, we just couldn't re-assert it.
+                pass
+        # Assign to a bounded slice rather than shm.buf[:]: macOS rounds the
+        # segment up to the page size, so shm.buf is larger than ipc_bytes and a
+        # full-slice assignment raises ValueError (size mismatch). Readers parse
+        # the Arrow IPC stream, which is self-delimiting, so trailing padding is
+        # ignored. On Linux the sizes match exactly and this is equivalent.
+        shm.buf[:len(ipc_bytes)] = ipc_bytes
         shm.close()
 
         logger.debug(f"_handle_shm_transfer: wrote {len(ipc_bytes)} bytes to {shm_name}")
