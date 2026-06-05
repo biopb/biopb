@@ -24,10 +24,19 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
+      # All supported JDKs on Linux (where version issues surface), plus one JDK
+      # on macOS/Windows to smoke-test Arrow off-heap memory and netty transport
+      # on those platforms (ImageJ/Fiji consumers run on all three).
       matrix:
-        java-version: [11, 17]
+        include:
+          - { os: ubuntu-latest,  java-version: 11 }
+          - { os: ubuntu-latest,  java-version: 17 }
+          - { os: ubuntu-latest,  java-version: 21 }
+          - { os: macos-latest,   java-version: 17 }
+          - { os: windows-latest, java-version: 17 }
     steps:
       - uses: actions/checkout@v6
       - name: Set up Java ${{ matrix.java-version }}
