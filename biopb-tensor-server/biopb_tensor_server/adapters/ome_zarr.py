@@ -328,7 +328,7 @@ class OmeZarrAdapter(ZarrAdapter):
 
         # Navigate up to find .zattrs with plate metadata (HCS) or multiscales (single image)
         current_path = store_path.rstrip('/')
-        while current_path and current_path != '/':
+        while current_path:
             candidate_zattrs_path = os.path.join(current_path, '.zattrs')
             if os.path.exists(candidate_zattrs_path):
                 try:
@@ -352,8 +352,14 @@ class OmeZarrAdapter(ZarrAdapter):
                 except (json.JSONDecodeError, IOError):
                     pass
 
-            # Move up one level
-            current_path = os.path.dirname(current_path)
+            # Move up one level; stop at the filesystem root. Comparing against
+            # the parent (rather than against '/') terminates correctly on both
+            # POSIX ('/') and Windows drive roots ('C:\\'), where dirname() is a
+            # fixed point -- the old '/' check spun forever on Windows.
+            parent_path = os.path.dirname(current_path)
+            if parent_path == current_path:
+                break
+            current_path = parent_path
 
         if zattrs is not None:
             self.ome_metadata = zattrs

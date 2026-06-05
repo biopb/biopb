@@ -724,7 +724,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 # the segment 0o600, so a failure here is non-fatal -- the
                 # guarantee still holds, we just couldn't re-assert it.
                 pass
-        shm.buf[:] = ipc_bytes
+        # Assign to a bounded slice rather than shm.buf[:]: macOS rounds the
+        # segment up to the page size, so shm.buf is larger than ipc_bytes and a
+        # full-slice assignment raises ValueError (size mismatch). Readers parse
+        # the Arrow IPC stream, which is self-delimiting, so trailing padding is
+        # ignored. On Linux the sizes match exactly and this is equivalent.
+        shm.buf[:len(ipc_bytes)] = ipc_bytes
         shm.close()
 
         logger.debug(f"_handle_shm_transfer: wrote {len(ipc_bytes)} bytes to {shm_name}")
