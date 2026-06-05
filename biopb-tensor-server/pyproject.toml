@@ -11,7 +11,9 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  "biopb",
+  # Floor bumped whenever the server starts relying on a newer biopb (proto
+  # stubs / runtime API). CI gates this against PyPI before publishing.
+  "biopb >= 0.5.8",
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0",
   "dask[array] >= 2024.0.0",

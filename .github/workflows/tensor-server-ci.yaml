@@ -104,11 +104,63 @@ jobs:
       - name: Run Python tests
         run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
 
+  # Release gate: the published package runs against PyPI biopb (not the in-tree
+  # source), so before releasing, run the suite against the *declared floor* pulled
+  # from PyPI. Catches a floor set too low (server using an API newer than the floor).
+  # The matrix `test` job above keeps testing local biopb for normal PR/main dev.
+  test-released-floor:
+    needs: [js-test, test]
+    if: startsWith(github.ref, 'refs/tags/server-v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # No buf needed here: biopb comes prebuilt from PyPI (stubs included); only
+      # the server itself is built from source, and it carries no proto generation.
+      - name: Install server against the declared biopb floor from PyPI
+        run: |
+          python -m pip install --upgrade pip
+          FLOOR=$(python - <<'PY'
+          import tomllib, re
+          deps = tomllib.load(open('biopb-tensor-server/pyproject.toml', 'rb'))['project']['dependencies']
+          dep = next(d for d in deps if re.match(r'\s*biopb\b', d) and 'tensor-server' not in d)
+          print(re.search(r'>=\s*([0-9][^,\s]*)', dep).group(1))
+          PY
+          )
+          echo "Declared biopb floor: $FLOOR"
+          echo "biopb==$FLOOR" > /tmp/floor-constraint.txt
+          # Constraint pins biopb to exactly the floor through the server's resolve,
+          # so pip can't quietly pull a newer biopb that would mask a too-low floor.
+          pip install -c /tmp/floor-constraint.txt "./biopb-tensor-server[test]"
+          pip show biopb | grep -i '^Version:'
+
+      - name: Run tests against floor biopb
+        run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
+
+  # Docker image + GitHub release. Builds biopb from local source (via the
+  # Dockerfile / pip wheel), so it is independent of PyPI and is NOT gated on the
+  # floor test — that gate guards only the PyPI publish job below.
   build:
     needs: [js-test, test]
     # only build/release on a tag push or manual dispatch
     if: startsWith(github.ref, 'refs/tags/server-v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Job-level permissions override the top-level block, so restate the write
+    # scopes needed for the GitHub release / ghcr push.
+    permissions:
+      contents: write   # softprops/action-gh-release
+      packages: write   # ghcr.io push
     steps:
       - uses: actions/checkout@v6
         with:
@@ -220,3 +272,34 @@ jobs:
             docker.io/jiyuuchc/biopb-tensor-server:latest
           build-args: |
             MEMORY=4g
+
+  # PyPI publish via OIDC trusted publishing (no token). Separate from `build`:
+  # gated on the floor test (which already proves the biopb floor is on PyPI), and
+  # tag-only since re-uploading an existing version fails. The root `biopb`
+  # dependency is published separately by python-ci.yaml (v* tags).
+  publish-pypi:
+    needs: [test-released-floor]
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    runs-on: ubuntu-latest
+    environment: pypi  # must match the environment on the PyPI trusted publisher
+    permissions:
+      id-token: write  # required for PyPI OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build biopb_tensor_server distribution
+        run: |
+          python -m pip install --upgrade build
+          python -m build ./biopb-tensor-server --outdir pypi-dist/
+
+      - name: Publish biopb_tensor_server to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: pypi-dist/
