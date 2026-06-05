@@ -10,6 +10,7 @@ Implements segmented storage with:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -175,6 +176,30 @@ def _cast_from_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
     )
 
 
+def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Return a copy of `batch` whose buffers are owned in RAM, not a file mmap.
+
+    Reads from a segment are zero-copy: the returned batch's buffers (data,
+    shape and dtype columns alike) point straight into the segment file's
+    memory mapping. On POSIX that is harmless -- unlink() removes the directory
+    entry and the inode survives to last close, so a segment can be evicted
+    while a caller still holds the batch. On Windows an active mapping blocks
+    deletion (WinError 32), so eviction and cleanup fail as long as any caller
+    keeps the batch alive.
+
+    This materializes the batch into pyarrow-owned memory via an IPC round-trip
+    (which copies every column, not just the data buffer), severing the tie to
+    the mmap so the segment file can be unlinked. Used only where that matters;
+    see issue #5.
+    """
+    sink = pa.BufferOutputStream()
+    writer = pa.RecordBatchStreamWriter(sink, batch.schema)
+    writer.write_batch(batch)
+    writer.close()
+    reader = pa.RecordBatchStreamReader(pa.BufferReader(sink.getvalue()))
+    return reader.read_next_batch()
+
+
 @dataclass
 class ArrowFileConfig:
     """Configuration for Arrow file cache backend."""
@@ -258,6 +283,11 @@ class ArrowFileBackend(CacheBackend):
 
         # Recovery status (if recovered from crash)
         self._recovery_status: Optional[RecoveryStatus] = None
+
+        # Copy batches off the segment mmap before returning them to callers.
+        # Only needed on Windows, where a live mapping blocks segment unlink
+        # during eviction/cleanup; POSIX keeps zero-copy reads (issue #5).
+        self._copy_on_read = sys.platform == "win32"
 
         # Initialize
         self._initialize()
@@ -744,6 +774,11 @@ class ArrowFileBackend(CacheBackend):
         reader = pa.RecordBatchStreamReader(mmap)
         for i, batch in enumerate(reader):
             if i == entry_info.offset:
+                # Detach from the segment mmap on Windows so the file can be
+                # unlinked during eviction even while a caller holds the batch
+                # (issue #5). POSIX keeps the zero-copy mmap read.
+                if self._copy_on_read:
+                    batch = _copy_batch_off_mmap(batch)
                 # Cast from unified binary schema back to typed schema
                 typed_batch = _cast_from_unified_schema(batch)
                 return typed_batch

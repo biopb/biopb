@@ -1,7 +1,6 @@
 """Thread-safety tests for cache module."""
 
 import shutil
-import sys
 import tempfile
 import threading
 import time
@@ -9,19 +8,6 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-
-# The ArrowFileBackend disk cache is not Windows-safe: it serves chunks as
-# zero-copy mmap-backed Arrow buffers, and Windows refuses to delete a segment
-# file while any such buffer is still referenced, so eviction/cleanup fails.
-# Tracked in https://github.com/biopb/biopb/issues/5. The default cache backend
-# is in-memory (and install.ps1 pins Windows installs to it), so this is an
-# opt-in, POSIX-only feature for now.
-_windows_file_cache_xfail = pytest.mark.xfail(
-    sys.platform == "win32",
-    reason="ArrowFileBackend file cache is POSIX-only (issue #5): Windows can't "
-    "unlink mmap-backed segment files while RecordBatch buffers reference them",
-    strict=False,
-)
 
 from biopb_tensor_server.cache import (
     MAX_ARROW_BATCH_BYTES,
@@ -518,6 +504,54 @@ class TestArrowFileBackend:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_segment_unlink_while_caller_holds_batch(self):
+        """A segment can be evicted/unlinked while a caller still holds the
+        RecordBatch read from it.
+
+        Reads are zero-copy from the segment mmap, so the returned batch points
+        into the file's memory mapping. On Windows a live mapping blocks file
+        deletion (WinError 32), so eviction fails unless the batch is copied off
+        the mmap first; on POSIX unlink-while-mapped is harmless. Regression test
+        for issue #5: on POSIX this exercises the zero-copy path, on Windows the
+        copy-on-read path.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=1024 * 1024,
+            max_total_bytes=10 * 1024 * 1024,
+        )
+
+        # Store an entry, then restart so the segment is closed and the rebuild
+        # reopens it as a readable mmap.
+        backend1 = ArrowFileBackend(config)
+        backend1.start_compute(b"key1")
+        backend1.complete_entry(b"key1", self._make_data([1, 2, 3]), 24)
+        backend1.release(b"key1")
+        backend1.close()
+
+        backend2 = ArrowFileBackend(config)
+        # Read it back and keep holding `entry`: entry.data is backed by the
+        # segment file (zero-copy on POSIX, an off-mmap copy on Windows).
+        entry, is_owner = backend2.start_compute(b"key1")
+        assert is_owner is False
+        assert entry.state == EntryState.READY
+
+        segment_id = backend2._metadata[b"key1"].segment_id
+        seg_file = cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
+        assert seg_file.exists()
+
+        # Evict the segment while we still hold `entry`. This must not raise
+        # (even on Windows) and must actually delete the file.
+        backend2._do_evict_segment(segment_id)
+        assert not seg_file.exists()
+
+        # The held batch is still valid after its backing file is gone.
+        assert entry.data.column(0).to_pylist() == [[1, 2, 3]]
+
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
     def test_multi_entry_segment_persist_keys_not_crosswired(self):
         """Each key returns its OWN data after a restart when several entries
         share one segment.
@@ -722,7 +756,6 @@ class TestArrowFileBackendRecovery:
         wal.clear()
         shutil.rmtree(cache_dir)
 
-    @_windows_file_cache_xfail
     def test_recovery_after_simulated_crash(self):
         """Valid entries survive after simulated crash."""
         cache_dir = self._make_temp_cache_dir()
@@ -754,7 +787,6 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
-    @_windows_file_cache_xfail
     def test_stale_lock_triggers_recovery_without_wal_entries(self):
         """Stale lock alone (no WAL entries) triggers recovery on restart."""
         import json
@@ -1188,7 +1220,6 @@ class TestSieveKEviction:
         backend.close()
         shutil.rmtree(cache_dir)
 
-    @_windows_file_cache_xfail
     def test_pool_selection_by_hit_rate(self):
         """Pool with lowest hit rate is selected for eviction."""
         cache_dir = self._make_temp_cache_dir()
