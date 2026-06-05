@@ -43,6 +43,24 @@ def main():
     kernel_env.setdefault("OPENBLAS_NUM_THREADS", "1")
     kernel_env.setdefault("OMP_NUM_THREADS", "1")
 
+    # Prefer the gRPC socket over the tensor server's /dev/shm fast-path: the
+    # shm path creates+writes+unlinks a fresh POSIX segment per chunk, measured
+    # ~2.4-3x slower than the socket for large localhost chunks. Driven by
+    # config so the installer can seed it (no-op on Windows, no POSIX shm).
+    # setdefault leaves any explicit shell override intact. Inherited by the
+    # kernel and the dask LocalCluster workers it spawns.
+    if mcp_config.get("tensor_disable_shm"):
+        kernel_env.setdefault("BIOPB_SHM_TRANSFER_DISABLED", "1")
+
+    # Let the data-plane client cache chunks for a localhost tensor server
+    # (otherwise skipped as redundant with the server's own cache). Bridges
+    # interactive viewer responsiveness: repeated/overlapping plane reads
+    # within a chunk hit the cache instead of re-fetching the whole chunk.
+    # Inherited by the LocalCluster workers, where the bootstrap's cache plugin
+    # bounds each worker at dask_cache_budget // n_workers.
+    if mcp_config.get("tensor_cache_local"):
+        kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
+
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=mcp_config.get("kernel_name", "python3"),

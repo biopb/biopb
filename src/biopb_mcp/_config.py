@@ -102,6 +102,26 @@ DEFAULT_CONFIG = {
         # Each is queried via GetOpNames and exposed as callables in the
         # agent kernel's `ops` dict.
         "process_image_servers": [],
+        # Prefer the gRPC socket over the tensor server's /dev/shm fast-path.
+        # Translated into BIOPB_SHM_TRANSFER_DISABLED in the kernel env by
+        # __main__.py. The shm path creates+writes+unlinks a fresh POSIX
+        # segment per chunk, which measured ~2.4-3x slower than the socket for
+        # large localhost chunks; this is a stopgap until the shm path is fixed
+        # (biopb/biopb#9). No-op on Windows (no POSIX shm). Off by
+        # default to preserve current behavior; the installer seeds it on.
+        "tensor_disable_shm": False,
+        # Let the data-plane client cache chunks even for a *localhost* tensor
+        # server. Translated into BIOPB_CACHE_LOCAL in the kernel/worker env by
+        # __main__.py. By default the client skips a localhost cache (the
+        # server already caches), but that means an interactive viewer scrubbing
+        # planes re-fetches the whole enclosing chunk per plane; caching makes
+        # repeated/overlapping reads instant. Memory is bounded by the existing
+        # dask_cache_budget plugin (each worker caps at budget // n_workers), so
+        # this does not reintroduce the per-worker replication that the unbounded
+        # cache caused. A structural fix that removes the underlying read
+        # amplification (client-selectable read granularity) is tracked in
+        # biopb/biopb#8.
+        "tensor_cache_local": True,
     },
 }
 
