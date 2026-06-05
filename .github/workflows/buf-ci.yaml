@@ -26,11 +26,16 @@ jobs:
       - uses: actions/checkout@v6
       - uses: bufbuild/buf-action@v1
         with:
-          # Temporarily disable the format gate: the proto files predate buf's
-          # canonical formatting and have never been run through it (the PR gate
-          # only runs on pull_request; proto changes historically landed on main
-          # as pushes). Tracked in https://github.com/biopb/biopb/issues/7 --
-          # re-enable after running `buf format -w` across proto/**.
+          # The lint/format PR gate only runs on pull_request and had never
+          # executed (proto changes historically landed on main as pushes), so
+          # it surfaces repo-wide issues the project hasn't adopted: non-canonical
+          # formatting, and STANDARD lint rules (versioned packages, enum/service
+          # naming) whose adoption would be an ecosystem-wide breaking refactor.
+          # Disabled for now; tracked in https://github.com/biopb/biopb/issues/7
+          # (run `buf format -w` and relax buf.yaml lint rules, then re-enable).
+          # Note: `breaking` stays enabled here -- one-off intentional breaks are
+          # skipped per-PR via the `buf skip breaking` label instead.
+          lint: false
           format: false
           # Publishing schema changes to the BSR requires a BSR authentication token.
           token: ${{ secrets.BUF_TOKEN }}
