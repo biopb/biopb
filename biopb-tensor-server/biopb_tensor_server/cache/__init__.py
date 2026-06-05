@@ -26,7 +26,11 @@ from biopb_tensor_server.cache.base import (
     EntryState,
     PoolStats,
 )
-from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.file_backend import (
+    ArrowFileBackend,
+    ArrowFileConfig,
+    CACHE_FILE_FORMAT_VERSION,
+)
 from biopb_tensor_server.cache.manager import CacheManager
 from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheBackend,
@@ -44,6 +48,7 @@ __all__ = [
     "MemoryCacheConfig",
     "ArrowFileBackend",
     "ArrowFileConfig",
+    "CACHE_FILE_FORMAT_VERSION",
     "RecoveryStatus",
     "MAX_ARROW_BATCH_BYTES",
     "PoolStats",

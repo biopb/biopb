@@ -256,12 +256,54 @@ editing the code.
   the napari widget and the headless kernel and is unit-testable without a
   display.
 
-- **A `/dev/shm` (POSIX shared memory) fast path** exists for localhost clients
-  of the tensor server (`shm_transfer` Flight action) to avoid a socket copy of
-  large chunks.
+- **A cache-file mmap fast path** for localhost clients of the tensor server
+  (`chunk_locate` Flight action, `biopb/biopb#9`). The server's file cache
+  already holds every decoded chunk as an Arrow IPC message in a segment file,
+  so instead of re-sending those bytes through the loopback `do_get` socket the
+  client asks for the chunk's on-disk byte range (`locate_entry`), `mmap`s the
+  segment, reads just that message, copies it out, and releases the mapping.
+  This beats the socket because the bytes are already warm in the page cache
+  (the server wrote them for caching anyway) and it skips the loopback gRPC
+  overhead. Gated to **POSIX localhost** (Windows file-mmap blocks the server's
+  segment `unlink` — `biopb/biopb#5` — so Windows clients use `do_get`); the
+  client honors `BIOPB_CACHEFILE_TRANSFER_DISABLED=1` to force the socket, and
+  falls back to `do_get` whenever a chunk can't be located (memory backend, old
+  server, evicted segment). Replaces the old `/dev/shm` `shm_transfer` path,
+  which was *slower* than the socket because it allocated a fresh POSIX segment
+  per chunk. Byte offsets are derived by walking the flushed segment lazily in
+  `locate_entry` (the stream writer buffers the schema, so the live sink cursor
+  can't bracket the first message).
+
+- **Localhost read amplification — chunk size is conflated with access
+  granularity.** The server sizes chunks to a fixed transfer cap
+  (`MAX_ARROW_BATCH_BYTES = 64 MB` in `chunk.py`, splitting non-spatial axes first
+  and keeping the Y-X plane whole), and that same grid is the *access* unit the
+  client reads. A consumer reading a small sub-region — the napari viewer
+  scrubbing one Z plane (~2.75 MB) out of a ~63 MB chunk — transfers the whole
+  chunk, a ~23× amplification. The capability to read arbitrary sub-bounds cheaply
+  already exists (`adapter.get_data(bounds)` decodes only the requested planes);
+  only the chunk grid / `chunk_id` forces whole-chunk transfers. Decoupling the
+  read grid from the 64 MB transfer cap (client-selectable granularity) is the
+  structural fix — `biopb/biopb#8`.
+
+- **The localhost client chunk cache is off by default, and locality-sensitive
+  under distributed dask.** On localhost the per-process client cache
+  (`biopb.tensor.client`, gated by `_resolve_cache_bytes` / `BIOPB_CACHE_LOCAL`)
+  is disabled: the server already caches, and under `biopb-mcp`'s default
+  *multi-process distributed* dask a per-process cache is replicated per worker.
+  `biopb-mcp` bounds it with a cluster-wide `dask_cache_budget` (split
+  `budget // n_workers` by a worker-init plugin; localhost still resolves to 0
+  unless `mcp.tensor_cache_local` sets `BIOPB_CACHE_LOCAL=1`). **Caveat measured:**
+  even with the cache on, the viewer's *serial* plane reads scatter across workers
+  — dask's locality scheduler keys on tracked task *dependencies*, not the opaque
+  per-worker cache side-effect, so repeated reads of the same chunk round-robin
+  onto different workers (≈25% hit, N× redundant copies). The clean viewer fix is
+  to compute its slices on a single-process scheduler (one shared cache) —
+  `biopb/biopb-mcp#8`; the per-worker cache helps mainly when paired with that or
+  with deterministic chunk→home-worker sharding.
 
 - **The standard Flight verbs are extended with custom `do_action` types** on
-  the tensor server: `health`, `create_source`, `upload_status`, `shm_transfer`
+  the tensor server: `health`, `create_source`, `upload_status`, `chunk_locate`
   — alongside the normal `do_get`/`do_put`/`get_flight_info`/`list_flights`.
 
 - **`biopb/ome/*.proto` is vestigial.** It is a comprehensive OME metadata model

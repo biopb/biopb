@@ -169,16 +169,30 @@ def _setup_flight_server(
         )
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     elif cache_config.backend == "file":
-        manager = CacheManager.initialize(cache_config)
-        console.print(
-            "[green]Virtual chunk cache initialized:[/green] "
-            f"backend=file, "
-            f"cache_dir={cache_config.file_cache_dir}, "
-            f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
-            f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
-        )
-        # Check for recovery status
+        try:
+            manager = CacheManager.initialize(cache_config)
+        except OSError as e:
+            # Cache dir not writable (e.g. read-only HPC scratch). Fall back to
+            # the in-memory backend so the server still starts; the localhost
+            # cache-file fast path (issue #9) is simply unavailable.
+            console.print(
+                f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
+                f"({e}); falling back to in-memory cache.[/yellow]"
+            )
+            manager = CacheManager.initialize(CacheConfig(
+                backend="memory",
+                memory_max_entries=cache_config.memory_max_entries,
+                memory_max_bytes=cache_config.memory_max_bytes,
+            ))
         if isinstance(manager.backend, ArrowFileBackend):
+            console.print(
+                "[green]Virtual chunk cache initialized:[/green] "
+                f"backend=file, "
+                f"cache_dir={cache_config.file_cache_dir}, "
+                f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
+                f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
+            )
+            # Check for recovery status
             recovery_status = manager.backend.get_recovery_status()
             if recovery_status:
                 console.print(
@@ -190,6 +204,10 @@ def _setup_flight_server(
                 if recovery_status.errors:
                     for err in recovery_status.errors[:3]:
                         console.print(f"[red]  Error: {err}[/red]")
+        else:
+            console.print(
+                "[green]Virtual chunk cache initialized:[/green] backend=memory (fallback)"
+            )
         console.print("[green]Raw chunk cache: OS page cache[/green]")
     else:
         console.print(

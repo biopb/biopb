@@ -23,11 +23,17 @@ from typing import Dict, List, Optional, Tuple
 class SegmentEntryInfo:
     """Metadata for an entry stored in a segment."""
     segment_id: int
-    offset: int  # Byte offset within segment file
+    offset: int  # Entry index within segment (used by the sequential reader)
     size_bytes: int
     metadata: dict = field(default_factory=dict)
     created_at: float = 0.0
     last_access_time: float = 0.0  # Updated on each read
+    # Byte location of the entry's encapsulated Arrow IPC message within the
+    # segment file. Lets a localhost client mmap the segment and read just this
+    # message (issue #9). Defaults of 0 mean "unknown" (e.g. legacy index);
+    # locate_entry() returns unavailable in that case so the client uses do_get.
+    byte_offset: int = 0
+    byte_length: int = 0
 
 
 @dataclass

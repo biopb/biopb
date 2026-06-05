@@ -120,6 +120,22 @@ def _default_file_cache_dir() -> Path:
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 
 
+def _default_cache_backend() -> str:
+    """Default cache backend when a config doesn't specify one.
+
+    Always "file". The file backend caches *decoded* chunks as Arrow IPC
+    segments, so repeat reads skip re-decoding the raw format -- and decoding
+    TIFF/CZI/etc. is typically slower than an Arrow IPC read-back. It also
+    persists across restarts and powers the localhost cache-file fast path
+    (issue #9). Windows is safe now that the backend copies batches off the
+    segment mmap so eviction can unlink (copy-on-read, biopb/biopb#5). The
+    localhost cache-file *handoff* stays POSIX-only (a client's cross-process
+    mmap still blocks unlink on Windows), but that is a client-side gate,
+    independent of the server's choice of backend.
+    """
+    return "file"
+
+
 @dataclass
 class SourceConfig:
     """Configuration for a single data source.
@@ -214,7 +230,7 @@ class CacheConfig:
         file_max_total_bytes: Maximum total bytes across all segments (file backend, default 4 GB)
     """
 
-    backend: str = "memory"
+    backend: str = field(default_factory=_default_cache_backend)
     memory_max_entries: int = 1024
     memory_max_bytes: int = 512 * 1024 * 1024  # 512 MB
     file_cache_dir: Path = DEFAULT_FILE_CACHE_DIR
@@ -371,7 +387,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
     # Parse cache settings
     cache_data = data.get("cache", {})
-    cache_backend = cache_data.get("backend", "memory")
+    cache_backend = cache_data.get("backend", _default_cache_backend())
 
     # Parse memory backend settings
     memory_max_entries = cache_data.get("max_entries", 1024)

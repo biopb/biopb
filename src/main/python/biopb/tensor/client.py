@@ -45,22 +45,52 @@ logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# SHM Transfer Optimization Constants and Helpers
+# Cache-file transfer optimization (localhost fast path, issue #9)
 # ==============================================================================
+#
+# On localhost the tensor server's file cache already holds every decoded chunk
+# as an Arrow IPC message in a segment file. Instead of re-sending those bytes
+# through the loopback gRPC socket (do_get), the client asks the server to
+# locate the chunk (chunk_locate action), then mmaps the segment file and reads
+# just that message -- copying it out and releasing the mapping immediately so
+# it never holds a file lock across a server-side eviction. Gated to POSIX
+# (Windows file-mmap blocks segment unlink -- see biopb/biopb#5).
 
-_SHM_TRANSFER_MIN_VERSION = (0, 3, 0)  # First version with shm_transfer action
+# Highest on-disk segment format version this client can parse. The client
+# reads server-written segment bytes directly, so the layout is a cross-process
+# contract: chunk_locate reports the server's CACHE_FILE_FORMAT_VERSION, and we
+# decline the fast path (fall back to do_get) for anything newer than this
+# rather than risk misreading the mmap. Bump in lockstep with the server when
+# this client learns to parse a newer format.
+_CACHEFILE_SUPPORTED_FORMAT = 1
+
+# Per-location capability cache: dask workers are separate processes, so each
+# memoizes independently after its first probe. None = unknown, False = the
+# server doesn't support chunk_locate (old server) so don't retry.
+_cachefile_support: Dict[str, bool] = {}
+_cachefile_support_lock = threading.Lock()
 
 
-def _is_shm_disabled_by_env() -> bool:
-    """Check if SHM optimization is explicitly disabled via environment variable."""
-    return os.environ.get("BIOPB_SHM_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
+def _is_cachefile_disabled_by_env() -> bool:
+    """Whether the cache-file fast path is explicitly disabled via env var."""
+    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
+
+
+def _cachefile_supported(location: str) -> Optional[bool]:
+    with _cachefile_support_lock:
+        return _cachefile_support.get(location)
+
+
+def _set_cachefile_supported(location: str, supported: bool) -> None:
+    with _cachefile_support_lock:
+        _cachefile_support[location] = supported
 
 
 def _cache_local_enabled() -> bool:
     """Whether to keep a client-side chunk cache for a *localhost* server.
 
     Default ``False``: on localhost the tensor server already caches its data
-    (and the shm fast-path makes a re-fetch cheap), so a per-process client
+    (and the cache-file fast path makes a re-fetch cheap), so a per-process client
     cache is mostly a redundant second copy -- and under a multi-process dask
     cluster it is replicated in every worker, multiplying memory use. Set
     ``BIOPB_CACHE_LOCAL=1`` to opt back in (e.g. a slow loopback proxy).
@@ -82,38 +112,6 @@ def _resolve_cache_bytes(location: str, requested: int) -> int:
     return requested
 
 
-def _server_supports_shm(schema_metadata: Optional[Dict[str, str]]) -> bool:
-    """Check if server version supports shm_transfer action.
-
-    Args:
-        schema_metadata: Schema metadata dict from GetFlightInfo, or None
-
-    Returns:
-        True if server version >= 0.4.0 (first version with shm_transfer)
-    """
-    if schema_metadata is None:
-        return False
-
-    version_str = schema_metadata.get("tensor_schema_version")
-    if not version_str:
-        return False
-
-    try:
-        parsed = _parse_version(version_str)
-        return parsed >= _SHM_TRANSFER_MIN_VERSION
-    except Exception:
-        return False
-
-
-def _is_posix_shm_available() -> bool:
-    """Check if POSIX shared memory is available on this platform.
-
-    Returns:
-        True on Linux/Darwin (POSIX systems), False on Windows
-    """
-    return sys.platform in ("linux", "darwin") or sys.platform.startswith("freebsd")
-
-
 @lru_cache(maxsize=None)
 def _is_localhost_location(location: str) -> bool:
     """Check if location points to localhost.
@@ -121,7 +119,7 @@ def _is_localhost_location(location: str) -> bool:
     Parses location URI and checks hostname against localhost variants.
     Uses socket.getaddrinfo() to resolve hostname to loopback.
 
-    Memoized: this is called on every chunk fetch (cache-policy + shm checks)
+    Memoized: this is called on every chunk fetch (cache-policy + fast-path checks)
     and may do a DNS lookup, so the per-location result is cached for the life
     of the process.
 
@@ -167,87 +165,110 @@ def _is_localhost_location(location: str) -> bool:
     return False
 
 
-def _should_try_shm_transfer(
-    location: str,
-    schema_metadata: Optional[Dict[str, str]]
-) -> bool:
-    """Check all conditions for attempting SHM transfer.
+def _should_try_cachefile(location: str) -> bool:
+    """Whether to attempt the localhost cache-file fast path for this location.
 
-    Args:
-        location: Flight server location string
-        schema_metadata: Schema metadata dict from GetFlightInfo, or None
-
-    Returns:
-        True if all conditions met for SHM transfer attempt
+    Requires: not disabled by env, a POSIX host (Windows file-mmap blocks the
+    server's segment unlink -- biopb/biopb#5), a loopback server (shared
+    filesystem), and a server not already known to lack chunk_locate.
     """
-    return (
-        not _is_shm_disabled_by_env()
-        and _is_posix_shm_available()
-        and _is_localhost_location(location)
-        and _server_supports_shm(schema_metadata)
-    )
+    if _is_cachefile_disabled_by_env():
+        return False
+    if os.name != "posix":
+        return False
+    if not _is_localhost_location(location):
+        return False
+    return _cachefile_supported(location) is not False
 
 
-def _try_shm_transfer(
+def _array_from_unified_batch(batch: pa.RecordBatch) -> np.ndarray:
+    """Reconstruct a numpy array from the server's unified cache schema.
+
+    The file cache stores each chunk as ``[data: binary, shape: list<int64>,
+    dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
+    raveled array. Returns an owned copy so it stays valid after the segment
+    mmap is closed.
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    # binary array buffers = [validity, offsets, data]; data holds the blob.
+    data_buf = batch.column("data").buffers()[2]
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
+    return arr.reshape(shape).copy()
+
+
+def _try_cachefile_transfer(
     client: flight.FlightClient,
     location: str,
     token: Optional[str],
     chunk_id: bytes,
     call_options: flight.FlightCallOptions,
 ) -> Optional[np.ndarray]:
-    """Attempt SHM transfer for a chunk.
+    """Attempt the cache-file fast path for a chunk.
 
-    Args:
-        client: FlightClient for this thread
-        location: Flight server location (for logging)
-        token: Auth token (unused, call_options already has it)
-        chunk_id: Chunk identifier bytes
-        call_options: Flight call options with auth headers
-
-    Returns:
-        Numpy array with chunk data if SHM transfer succeeded, None otherwise
+    Asks the server to locate the chunk on disk (chunk_locate), then mmaps the
+    segment file, reads the single IPC message, copies it out, and releases the
+    mapping. Returns the array, or None to fall back to do_get (server too old,
+    chunk not cached/locatable, or any read failure).
     """
-    from multiprocessing import shared_memory
-
     ticket = TensorTicket(chunk_id=chunk_id)
-    action = flight.Action("shm_transfer", ticket.SerializeToString())
+    action = flight.Action("chunk_locate", ticket.SerializeToString())
 
-    shm_name = None
     try:
         results = client.do_action(action, options=call_options)
-        shm_name = next(results).body.to_pybytes().decode("utf-8")
-
-        logger.debug(f"_try_shm_transfer: attached to {shm_name}")
-
-        # Attach to SHM and read Arrow IPC bytes
-        shm = shared_memory.SharedMemory(name=shm_name)
-        ipc_bytes = bytes(shm.buf)
-
-        # Parse RecordBatch (same as from do_get)
-        reader = pa.ipc.open_stream(pa.BufferReader(ipc_bytes))
-        table = reader.read_all()
-
-        arr = table.column("data").to_numpy()[0]
-        shape = tuple(table.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
-
-        # Cleanup: close and unlink SHM
-        shm.close()
-        shm.unlink()
-
-        logger.debug(f"_try_shm_transfer: read {arr.nbytes} bytes from SHM")
-        return arr
-
+        payload = next(results).body.to_pybytes().decode("utf-8")
+    except flight.FlightError as e:
+        # An old server doesn't know the action -- stop probing this location.
+        if "Unknown action" in str(e):
+            _set_cachefile_supported(location, False)
+        else:
+            logger.debug(f"chunk_locate failed, falling back to do_get: {e}")
+        return None
     except Exception as e:
-        logger.warning(f"shm_transfer failed, falling back to do_get: {e}")
-        # Cleanup on failure
-        if shm_name is not None:
-            try:
-                shm = shared_memory.SharedMemory(name=shm_name)
-                shm.close()
-                shm.unlink()
-            except Exception:
-                pass
+        logger.debug(f"chunk_locate failed, falling back to do_get: {e}")
+        return None
+
+    _set_cachefile_supported(location, True)
+
+    try:
+        info = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not info.get("available"):
+        return None
+
+    # The segment layout is a cross-process contract; refuse to parse a format
+    # newer than we understand. The server's format won't change mid-session,
+    # so stop probing this location.
+    if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
+        logger.debug(
+            "chunk_locate reports segment format %s > supported %s; using do_get",
+            info.get("format_version"), _CACHEFILE_SUPPORTED_FORMAT,
+        )
+        _set_cachefile_supported(location, False)
+        return None
+
+    try:
+        segment_path = info["segment_path"]
+        byte_offset = int(info["byte_offset"])
+        generation_id = int(info["generation_id"])
+        # Detect a segment evicted and recreated at the same path before we map.
+        if os.stat(segment_path).st_ino != generation_id:
+            return None
+        mm = pa.memory_map(segment_path, "r")
+        try:
+            schema = pa.ipc.open_stream(mm).schema
+            mm.seek(byte_offset)
+            msg = pa.ipc.read_message(mm)
+            batch = pa.ipc.read_record_batch(msg, schema)
+            arr = _array_from_unified_batch(batch)
+        finally:
+            mm.close()
+        logger.debug(f"_try_cachefile_transfer: read {arr.nbytes} bytes via mmap")
+        return arr
+    except (OSError, ValueError, KeyError, pa.ArrowInvalid) as e:
+        logger.debug(f"cache-file read failed, falling back to do_get: {e}")
         return None
 
 
@@ -582,8 +603,8 @@ def _fetch_chunk_distributed(
     non-serializable objects (FlightClient). Connection and cache are
     obtained from module-level pools at runtime.
 
-    For localhost connections with server version >= 0.3.0, attempts SHM
-    transfer optimization first before falling back to do_get().
+    For POSIX localhost connections, attempts the cache-file fast path
+    (chunk_locate + mmap) first before falling back to do_get().
 
     Args:
         location: Flight server location string
@@ -592,7 +613,9 @@ def _fetch_chunk_distributed(
         bounds_start: Chunk start coordinates as tuple
         bounds_stop: Chunk stop coordinates as tuple
         cache_bytes: Cache size for worker-local cache
-        schema_metadata: Optional schema metadata dict for SHM feature detection
+        schema_metadata: Optional schema metadata dict. Not used by the
+            cache-file fast path (support is probed via chunk_locate); retained
+            for signature compatibility with the chunk-fetch call sites.
 
     Returns:
         numpy array with chunk data
@@ -611,11 +634,11 @@ def _fetch_chunk_distributed(
 
     arr = None
 
-    # Try SHM transfer if all conditions met
-    if _should_try_shm_transfer(location, schema_metadata):
-        arr = _try_shm_transfer(client, location, token, chunk_id, call_options)
+    # Try the localhost cache-file fast path if all conditions met (issue #9)
+    if _should_try_cachefile(location):
+        arr = _try_cachefile_transfer(client, location, token, chunk_id, call_options)
 
-    # Fallback to do_get if SHM not attempted or failed
+    # Fallback to do_get if the fast path wasn't attempted or failed
     if arr is None:
         ticket = TensorTicket(chunk_id=chunk_id)
         reader = client.do_get(

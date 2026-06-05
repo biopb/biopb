@@ -32,7 +32,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
-from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import encode_chunk_id
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
@@ -150,9 +150,6 @@ class TensorFlightServer(flight.FlightServerBase):
         self._start_time: float = time.time()
         self._upload_state_lock = threading.RLock()
         self._upload_states: Dict[str, Dict[str, Any]] = {}
-        self._shm_cleanup_thread: Optional[threading.Thread] = None
-        self._shm_cleanup_stop = threading.Event()
-        self._start_shm_cleanup_thread()
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -338,7 +335,7 @@ class TensorFlightServer(flight.FlightServerBase):
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
             flight.ActionType("upload_status", "Upload status for a writable source"),
-            flight.ActionType("shm_transfer", "Transfer chunk via POSIX shared memory for localhost clients"),
+            flight.ActionType("chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"),
         ]
 
     def do_action(
@@ -375,13 +372,12 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "upload_status":
             source_id = action.body.to_pybytes().decode("utf-8")
             yield json.dumps(self.get_upload_status(source_id)).encode("utf-8")
-        elif action.type == "shm_transfer":
+        elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
             source_id = decode_chunk_id(ticket.chunk_id)[0].split("/")[0]
             self._authorize_source(context, source_id)
-            shm_name = self._handle_shm_transfer(ticket_bytes)
-            yield shm_name.encode("utf-8")
+            yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -669,126 +665,52 @@ class TensorFlightServer(flight.FlightServerBase):
         reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
         return flight.RecordBatchStream(reader)
 
-    def _handle_shm_transfer(self, ticket_bytes: bytes) -> str:
-        """Transfer chunk via POSIX shared memory.
+    def _handle_chunk_locate(self, chunk_id: bytes) -> str:
+        """Locate a cached chunk on disk for the localhost cache-file handoff.
 
-        Takes serialized TensorTicket (same as do_get), writes RecordBatch to SHM,
-        returns SHM name for client to read.
-
-        This bypasses gRPC serialization for localhost clients, providing
-        potentially significant throughput improvements on large chunks.
-
-        Args:
-            ticket_bytes: Serialized TensorTicket protobuf
-
-        Returns:
-            SHM name string for client to attach and read
-
-        Raises:
-            FlightServerError: If adapter not found or SHM creation fails
+        Locates the chunk's Arrow IPC message in the file cache and returns its
+        on-disk byte range as JSON. If the chunk isn't cached yet, materializes
+        it first (same path as do_get) and retries the locate -- so a warm chunk
+        is answered without re-reading or re-decoding it. Returns
+        ``{"available": false}`` when the chunk can't be located (memory backend,
+        oversized/uncached chunk, or any resolve/locate failure) so the client
+        falls back to do_get. (issue #9)
         """
-        from multiprocessing import shared_memory
+        cache_manager = CacheManager.get_instance()
+        if cache_manager is None:
+            return json.dumps({"available": False})
 
-        # Parse ticket (same as do_get)
-        ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
-        chunk_id = ticket.chunk_id
-
-        # Get adapter and resolve chunk (same as do_get)
         adapter = self._get_adapter_for_chunk(chunk_id)
         if adapter is None:
-            raise flight.FlightServerError(f"Adapter not found for chunk_id")
+            raise flight.FlightServerError(
+                f"Adapter not found for chunk_id: {chunk_id[:16]}..."
+            )
 
-        cache_manager = CacheManager.get_instance()
-        record_batch = adapter.resolve_chunk_data(chunk_id, cache_manager)
+        try:
+            # If the chunk is already cached, just locate it. Resolving first
+            # would, on a chunk whose in-RAM entry has been trimmed, re-read the
+            # whole chunk from its segment server-side for nothing. Only
+            # materialize (same path as do_get) on a genuine cold miss.
+            location = cache_manager.locate_entry(chunk_id)
+            if location is None:
+                adapter.resolve_chunk_data(chunk_id, cache_manager)
+                location = cache_manager.locate_entry(chunk_id)
+        except (OSError, IOError, ValueError) as e:
+            raise flight.FlightInternalError(
+                f"I/O error locating chunk data: {e}"
+            ) from e
 
-        # Serialize RecordBatch to Arrow IPC bytes
-        sink = pa.BufferOutputStream()
-        writer = pa.ipc.new_stream(sink, record_batch.schema)
-        writer.write_batch(record_batch)
-        writer.close()
-        ipc_bytes = sink.getvalue().to_pybytes()
+        if location is None:
+            return json.dumps({"available": False})
 
-        # Create SHM and write Arrow IPC bytes
-        shm_name = f"/biopb_chunk_{hashlib.sha256(chunk_id).hexdigest()[:16]}"
-        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=len(ipc_bytes))
-        # Restrict to owner-only (A4): chunk payloads must not be readable by
-        # other users on a shared host. CPython already creates SHM with 0o600,
-        # but that default is undocumented; set it explicitly on the fd before
-        # writing so the guarantee doesn't depend on it (no-op on Windows).
-        if hasattr(os, "fchmod") and getattr(shm, "_fd", -1) >= 0:
-            try:
-                os.fchmod(shm._fd, 0o600)
-            except OSError:
-                # Best-effort hardening: some POSIX platforms (notably macOS)
-                # reject fchmod on a shm fd with EINVAL. CPython already creates
-                # the segment 0o600, so a failure here is non-fatal -- the
-                # guarantee still holds, we just couldn't re-assert it.
-                pass
-        # Assign to a bounded slice rather than shm.buf[:]: macOS rounds the
-        # segment up to the page size, so shm.buf is larger than ipc_bytes and a
-        # full-slice assignment raises ValueError (size mismatch). Readers parse
-        # the Arrow IPC stream, which is self-delimiting, so trailing padding is
-        # ignored. On Linux the sizes match exactly and this is equivalent.
-        shm.buf[:len(ipc_bytes)] = ipc_bytes
-        shm.close()
-
-        logger.debug(f"_handle_shm_transfer: wrote {len(ipc_bytes)} bytes to {shm_name}")
-        return shm_name
-
-    def _start_shm_cleanup_thread(self) -> None:
-        """Start background thread to clean up stale SHM segments."""
-        # Only start on POSIX systems where /dev/shm exists
-        shm_path = Path("/dev/shm")
-        if not shm_path.exists():
-            logger.debug("SHM cleanup: /dev/shm not found, skipping cleanup thread")
-            return
-
-        self._shm_cleanup_thread = threading.Thread(
-            target=self._shm_cleanup_loop,
-            daemon=True,
-            name="shm-cleanup",
-        )
-        self._shm_cleanup_thread.start()
-        logger.debug("SHM cleanup thread started")
-
-    def _shm_cleanup_loop(self) -> None:
-        """Background loop that cleans up stale SHM segments.
-
-        Cleans /dev/shm/biopb_chunk_* files older than 30 seconds every 10 seconds.
-        """
-        from multiprocessing import shared_memory
-
-        shm_path = Path("/dev/shm")
-        cleanup_interval = 10  # seconds
-        stale_age = 30  # seconds
-
-        while not self._shm_cleanup_stop.wait(cleanup_interval):
-            try:
-                current_time = time.time()
-                for shm_file in shm_path.glob("biopb_chunk_*"):
-                    # Check file age
-                    file_age = current_time - shm_file.stat().st_mtime
-                    if file_age > stale_age:
-                        shm_name = shm_file.name
-                        try:
-                            shm = shared_memory.SharedMemory(name=f"/{shm_name}")
-                            shm.close()
-                            shm.unlink()
-                            logger.debug(f"SHM cleanup: removed stale {shm_name}")
-                        except FileNotFoundError:
-                            # Already cleaned up by client
-                            pass
-                        except Exception as e:
-                            logger.warning(f"SHM cleanup: failed to remove {shm_name}: {e}")
-            except Exception as e:
-                logger.warning(f"SHM cleanup loop error: {e}")
-
-    def _stop_shm_cleanup_thread(self) -> None:
-        """Stop the SHM cleanup thread."""
-        if self._shm_cleanup_thread is not None:
-            self._shm_cleanup_stop.set()
-            self._shm_cleanup_thread.join(timeout=5)
-            self._shm_cleanup_thread = None
+        return json.dumps({
+            "available": True,
+            "format_version": CACHE_FILE_FORMAT_VERSION,
+            "segment_path": location.segment_path,
+            "byte_offset": location.byte_offset,
+            "byte_length": location.byte_length,
+            "generation_id": location.generation_id,
+        })
 
     def do_put(
         self,
