@@ -33,6 +33,7 @@ from qtpy.QtWidgets import (
 
 from .._connection import TensorConnection
 from .._tensor_utils import build_layer_scale, build_pyramid_levels
+from .._viewer_compute import wrap_levels
 
 if TYPE_CHECKING:
     import napari
@@ -334,12 +335,18 @@ class TensorBrowserWidget(QWidget):
         self,
         viewer: "napari.viewer.Viewer",
         connection: TensorConnection | None = None,
+        compute_scheduler: str | None = None,
     ):
         super().__init__()
         self._viewer = viewer
         # The data layer is owned by a TensorConnection service that this
         # widget consumes. When constructed standalone (no MCP), build our own.
         self._conn = connection or TensorConnection()
+        # When set (MCP context), pin loaded layers' slice reads to a
+        # single-process scheduler so the serial viewer shares the main-process
+        # chunk cache instead of scattering across the cluster (issue #8). None
+        # in the standalone napari plugin -> arrays passed through unchanged.
+        self._compute_scheduler = compute_scheduler
         self._selected_source_id: str | None = None
         self._selected_tensor_id: str | None = None
         self._expanded_folders: Set[str] = set()
@@ -827,6 +834,9 @@ class TensorBrowserWidget(QWidget):
                     levels = build_pyramid_levels(
                         self._client, source_id, tensor.array_id, tensor
                     )
+                    # Pin slice reads to a single-process scheduler in the MCP
+                    # context (no-op standalone); see issue #8.
+                    levels = wrap_levels(levels, self._compute_scheduler)
                     tensor_name = _tensor_short_name(tensor.array_id)
                     layer_name = f"{stem}/{tensor_name}"
 
@@ -1014,6 +1024,9 @@ class TensorBrowserWidget(QWidget):
                 self._selected_tensor_id,
                 tensor_desc,
             )
+            # Pin slice reads to a single-process scheduler in the MCP context
+            # (no-op standalone); see issue #8.
+            levels = wrap_levels(levels, self._compute_scheduler)
 
             # Build layer name: source_url.stem[/tensor_short_name]
             url_parts = _get_path_parts(src.source_url)

@@ -122,6 +122,19 @@ DEFAULT_CONFIG = {
         # amplification (client-selectable read granularity) is tracked in
         # biopb/biopb#8.
         "tensor_cache_local": True,
+        # Scheduler for the napari viewer's slice reads. The viewer scrubs
+        # planes one at a time (serial np.asarray(data[slices])), but the
+        # bootstrap makes a distributed LocalCluster the *default* scheduler, so
+        # each single-chunk slice fetch scatters across a rotating worker and the
+        # opaque per-worker chunk cache misses + replicates (issue #8). Pinning
+        # the viewer's arrays to a single-process scheduler runs every slice read
+        # in the kernel main process against the one shared conn.client cache:
+        # ~100% hit on revisit, 1x memory, no scatter -- and costs no
+        # parallelism because the viewer is serial. The agent's explicit `da`
+        # computes still use the distributed default. "threads" keeps parallel
+        # multi-chunk reads within a slice; "synchronous" is fully serial;
+        # "" disables wrapping (viewer slices compute on the global default).
+        "viewer_compute_scheduler": "threads",
     },
 }
 

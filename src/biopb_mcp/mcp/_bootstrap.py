@@ -193,8 +193,14 @@ def _bootstrap_impl():
     )
 
     # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
+    #    compute_scheduler pins the viewer's serial slice reads to a
+    #    single-process scheduler so they share the main-process chunk cache
+    #    instead of scattering across the distributed cluster (issue #8).
+    compute_scheduler = mcp_config.get("viewer_compute_scheduler", "threads")
     viewer = napari.Viewer()
-    tbw = TensorBrowserWidget(viewer, connection=conn)
+    tbw = TensorBrowserWidget(
+        viewer, connection=conn, compute_scheduler=compute_scheduler
+    )
     viewer.window.add_dock_widget(tbw, name="Tensor Browser")
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
@@ -224,7 +230,7 @@ def _bootstrap_impl():
     #    install() stores the shell, installs the thread-aware stdout streams,
     #    and clears any prior job state; wrap_viewer_for_threads marshals the
     #    common viewer-mutating methods to the Qt main thread.
-    patch_viewer_load_tensor(viewer, conn)
+    patch_viewer_load_tensor(viewer, conn, compute_scheduler=compute_scheduler)
     _jobs.install(ip)
     _jobs.wrap_viewer_for_threads(viewer)
 

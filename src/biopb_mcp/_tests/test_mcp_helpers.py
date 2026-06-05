@@ -118,6 +118,32 @@ class TestPatchViewerLoadTensor:
         assert name == "my_image"
         viewer.add_image.assert_called_once_with(mock_arr, name="my_image")
 
+    def test_compute_scheduler_wraps_layer_array(self, viewer, connection):
+        """With a scheduler set, the array passed to add_image is pinned to a
+        single-process scheduler (issue #8)."""
+        from biopb_mcp._viewer_compute import _ViewerArray
+
+        tensor = _make_tensor("t1", [256, 256])
+        src = _make_source("http://server/data/my_image", [tensor])
+        connection.client = MagicMock()
+        connection.client.get_source_metadata.return_value.images = []
+        connection.sources = {"src1": src}
+
+        mock_arr = MagicMock()
+        with patch(
+            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            return_value=[mock_arr],
+        ):
+            patch_viewer_load_tensor(
+                viewer, connection, compute_scheduler="threads"
+            )
+            viewer.load_tensor("src1")
+
+        (passed,), kwargs = viewer.add_image.call_args
+        assert isinstance(passed, _ViewerArray)
+        assert passed._arr is mock_arr
+        assert passed._scheduler == "threads"
+
     def test_requires_tensor_id_for_multi_tensor(self, viewer, connection):
         t1 = _make_tensor("t1", [256, 256])
         t2 = _make_tensor("t2", [128, 128])

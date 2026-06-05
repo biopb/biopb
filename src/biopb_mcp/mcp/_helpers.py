@@ -24,9 +24,14 @@ def _tensor_short_name(array_id: str) -> str:
     return parts[-1] if parts else array_id
 
 
-def patch_viewer_load_tensor(viewer, connection):
+def patch_viewer_load_tensor(viewer, connection, compute_scheduler=None):
     """Monkey-patch ``load_tensor`` onto *viewer*, reading client/sources from
-    the live ``TensorConnection`` *connection*."""
+    the live ``TensorConnection`` *connection*.
+
+    *compute_scheduler*, when set, pins the loaded layer's slice reads to a
+    single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
+    serial viewer hits the shared main-process chunk cache instead of scattering
+    across the distributed cluster (issue #8)."""
 
     def load_tensor(
         source_id: str,
@@ -45,6 +50,7 @@ def patch_viewer_load_tensor(viewer, connection):
             The name of the created viewer layer.
         """
         from .._tensor_utils import build_layer_scale, build_pyramid_levels
+        from .._viewer_compute import wrap_levels
 
         client = connection.client
         if client is None:
@@ -108,6 +114,10 @@ def patch_viewer_load_tensor(viewer, connection):
             add_kwargs["scale"] = scale
         if phys is not None:
             add_kwargs["metadata"] = {"ome_physical_size": phys}
+
+        # Pin the viewer's slice reads to a single-process scheduler so the
+        # serial viewer shares the main-process chunk cache (issue #8).
+        levels = wrap_levels(levels, compute_scheduler)
 
         if len(levels) > 1:
             viewer.add_image(levels, multiscale=True, **add_kwargs)
