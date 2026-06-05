@@ -602,6 +602,14 @@ install_biopb() {
         MIN_MINOR=10
     fi
 
+    # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
+    # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
+    # interpreter lxml is built from source — which fails on a fresh machine
+    # without libxml2/libxslt dev headers (the common WSL install failure).
+    # Cap at 3.12, the newest Python with a prebuilt lxml 4.x wheel; if the
+    # system Python is newer we fall back to a uv-managed 3.12 below.
+    MAX_MINOR=12
+
     # PYTHON_SPEC is the interpreter we hand to `uv tool install` below via --python.
     # We MUST pin it: without --python, uv auto-discovers an interpreter and may pick
     # an old system python3 (e.g. macOS 3.9) that satisfies a loose lower bound,
@@ -613,9 +621,12 @@ install_biopb() {
         if [ -n "$PYTHON_VERSION" ]; then
             MAJOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f1)
             MINOR=$(echo "$PYTHON_VERSION" | tr -d '(),' | cut -d' ' -f2)
-            if [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ]; }; then
+            if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge "$MIN_MINOR" ] && [ "$MINOR" -le "$MAX_MINOR" ]; then
                 _ok "Using system Python: $(python3 --version)"
                 PYTHON_SPEC=$(command -v python3)
+            elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (aicsimageio's lxml<5 has no wheel for 3.13+)"
+                PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"
                 PYTHON_VERSION=""
@@ -624,10 +635,10 @@ install_biopb() {
     fi
 
     if [ -z "$PYTHON_VERSION" ]; then
-        _info "Installing Python 3.11 via uv..."
-        uv python install 3.11
-        _ok "Python 3.11 ready"
-        PYTHON_SPEC="3.11"
+        _info "Installing Python 3.$MAX_MINOR via uv..."
+        uv python install "3.$MAX_MINOR"
+        _ok "Python 3.$MAX_MINOR ready"
+        PYTHON_SPEC="3.$MAX_MINOR"
     fi
 
     # ===== 3. Install biopb packages =====
