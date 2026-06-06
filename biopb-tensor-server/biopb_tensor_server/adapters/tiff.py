@@ -127,10 +127,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories containing plain TIFF file sequences.
 
-        A sequence is detected if:
-        1. Directory has 3+ TIFF files (excluding OME/MicroManager patterns)
-        2. Filenames contain sequential numbers
-        3. All files have the same file size (fastest validation)
+        A sequence is detected (see ``_group_tiff_sequence``) when, among 3+
+        TIFF files sharing a filename template (excluding OME/MicroManager
+        patterns), exactly one numeric field varies across the names; that field
+        orders the sequence and constant numeric tokens are ignored.
+
+        Claiming is intentionally metadata-free — no per-file reads, so discovery
+        scans stay cheap. Dimension consistency across the files is validated
+        lazily in ``__init__`` (where every file is opened anyway), not here.
 
         Args:
             ctx: ClaimContext for unified filesystem access
@@ -235,20 +239,33 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         spatial_shape = (first_page.shape[0], first_page.shape[1])
 
         # Build file index map: (file_path, n_pages). We open every file here
-        # anyway, so verify the spatial (Y, X) shape is consistent across the
-        # sequence at near-zero extra cost — this is the real dimension check
-        # that replaces the old (size-based) proxy in claim().
+        # anyway, so verify the sequence is uniform at near-zero extra cost —
+        # this is the real consistency check that replaces the old (size-based)
+        # proxy in claim(). The descriptor's dtype / pages-per-file and
+        # get_data()'s stacking all assume the first file is representative, so
+        # spatial shape, dtype, and page count must match across the sequence.
         self._file_ifd_map = []
         for file_path in self._tiff_files:
             with tifffile.TiffFile(str(file_path)) as tf:
                 page = tf.pages[0]
+                n_pages = len(tf.pages)
                 if (page.shape[0], page.shape[1]) != spatial_shape:
                     raise ValueError(
                         f"Inconsistent TIFF dimensions in {directory}: "
                         f"{file_path.name} is {page.shape[:2]}, expected "
                         f"{spatial_shape}"
                     )
-                n_pages = len(tf.pages)
+                if str(page.dtype) != self._dtype:
+                    raise ValueError(
+                        f"Inconsistent TIFF dtype in {directory}: "
+                        f"{file_path.name} is {page.dtype}, expected {self._dtype}"
+                    )
+                if n_pages != n_pages_per_file:
+                    raise ValueError(
+                        f"Inconsistent TIFF page count in {directory}: "
+                        f"{file_path.name} has {n_pages} pages, expected "
+                        f"{n_pages_per_file}"
+                    )
                 self._file_ifd_map.append((file_path, n_pages))
 
         # Determine shape and dim labels

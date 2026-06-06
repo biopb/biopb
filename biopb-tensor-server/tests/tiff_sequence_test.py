@@ -187,9 +187,39 @@ class TestTiffSequenceClaim:
 
 class TestTiffSequenceInit:
     def test_empty_directory_raises(self):
-        """No sequence -> __init__ raises ValueError (line 214 branch)."""
+        """A directory with no valid sequence -> __init__ raises ValueError."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ValueError, match="No TIFF sequence found"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
+
+    def test_inconsistent_dtype_raises(self):
+        """A file with a different dtype -> __init__ raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
+            # uint8 instead of the uint16 the others use
+            tifffile.imwrite(
+                str(Path(tmpdir) / "s1-0004_bf.tif"),
+                np.zeros((8, 8), dtype=np.uint8),
+            )
+            with pytest.raises(ValueError, match="Inconsistent TIFF dtype"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
+
+    def test_inconsistent_page_count_raises(self):
+        """A file with a different page count -> __init__ raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"),
+                    np.zeros((4, 8, 8), dtype=np.uint16),
+                    photometric="minisblack",
+                )
+            # single-page file among multi-page ones
+            tifffile.imwrite(
+                str(Path(tmpdir) / "s1-0004_bf.tif"),
+                np.zeros((8, 8), dtype=np.uint16),
+            )
+            with pytest.raises(ValueError, match="Inconsistent TIFF page count"):
                 TiffSequenceAdapter(str(tmpdir), "sid")
 
     def test_explicit_dim_labels_single_page(self):
