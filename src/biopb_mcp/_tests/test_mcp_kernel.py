@@ -190,6 +190,41 @@ class TestKernelLifecycle:
             f.close()
         assert b"NATIVE_FD1_MARKER" in log.read_bytes()
 
+    def test_shutdown_attempts_graceful_close_before_kill(self, monkeypatch):
+        # On shutdown the kernel should be asked to close the tensor client /
+        # dask *before* _shutdown_current() group-kills it, so the tensor
+        # server sees a clean Flight GOAWAY rather than an abrupt socket drop
+        # (which can hang a subsequent `biopb server stop`).
+        from biopb_mcp.mcp import _kernel
+
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        host.start()
+
+        calls = []
+        real_execute_locked = host._execute_locked
+        real_shutdown_current = host._shutdown_current
+
+        def _spy_execute(code, timeout):
+            calls.append(("execute", code, timeout))
+            return real_execute_locked(code, timeout)
+
+        def _spy_shutdown_current():
+            calls.append(("shutdown_current",))
+            return real_shutdown_current()
+
+        monkeypatch.setattr(host, "_execute_locked", _spy_execute)
+        monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
+
+        host.shutdown()
+
+        # The graceful-close snippet ran, bounded, before the group-kill.
+        assert calls[0][0] == "execute"
+        assert calls[0][1] is _kernel._GRACEFUL_CLOSE_SNIPPET
+        assert calls[0][2] == 2.0
+        assert ("shutdown_current",) in calls
+        assert calls.index(("shutdown_current",)) > 0
+        assert not host.is_alive()
+
     def test_health_probe_failure_raises(self):
         # Probe expects a name that does not exist in a bare kernel.
         host = KernelHost(

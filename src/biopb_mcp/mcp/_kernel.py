@@ -53,6 +53,23 @@ _DASK_RELEASE_SNIPPET = (
     "    pass\n"
 )
 
+# Best-effort snippet run *before* the group-SIGKILL on shutdown so the tensor
+# server sees a clean Flight GOAWAY (and cancels any in-flight do_get) instead of
+# discovering the dropped connection only via async socket teardown after the
+# kill. That teardown lag is what lets a `biopb server stop` issued right after
+# Ctrl-C block on its graceful drain (pyarrow FlightServerBase.shutdown waits for
+# in-flight requests to finish). Closes the tensor client, then releases dask.
+# Bounded + best-effort: a busy/wedged kernel just falls through to the SIGKILL,
+# so this never holds up Ctrl-C beyond the short timeout in shutdown().
+_GRACEFUL_CLOSE_SNIPPET = (
+    "try:\n"
+    "    _c = globals().get('_conn')\n"
+    "    if _c is not None and getattr(_c, 'client', None) is not None:\n"
+    "        _c.client.close()\n"
+    "except Exception:\n"
+    "    pass\n"
+) + _DASK_RELEASE_SNIPPET
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
@@ -365,6 +382,18 @@ class KernelHost:
         self._stopping = True
         self._stop_watchdog()
         with self._lock:
+            # Best-effort, bounded graceful close so the tensor server isn't left
+            # to discover SIGKILL'd connections via async socket teardown — which
+            # can make a `biopb server stop` right after Ctrl-C hang on its drain
+            # (see _GRACEFUL_CLOSE_SNIPPET). A busy/wedged kernel falls through to
+            # the SIGKILL below; the short timeout keeps this off the Ctrl-C path.
+            if self.is_alive():
+                try:
+                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
+                except Exception:
+                    logger.debug(
+                        "graceful close on shutdown failed", exc_info=True
+                    )
             self._shutdown_current()
 
     def _shutdown_current(self):
