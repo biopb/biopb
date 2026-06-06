@@ -62,6 +62,13 @@ def mock_kernel_host():
     host = MagicMock()
     host.is_alive.return_value = True
     host.is_busy.return_value = False
+    host.health.return_value = {
+        "alive": True,
+        "busy": False,
+        "dead": False,
+        "recent_respawns": 0,
+        "watchdog_running": True,
+    }
     host.execute.return_value = _result()
     return host
 

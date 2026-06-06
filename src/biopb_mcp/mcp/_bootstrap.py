@@ -11,6 +11,7 @@ host's health probe detects via the absence of ``viewer`` in the namespace.
 """
 
 import logging
+import os
 import traceback
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,12 @@ def _configure_dask(mcp_config: dict):
 
             from dask.distributed import LocalCluster
 
+            # Put worker spill dirs under a launcher-owned temp dir (when set)
+            # so the launcher can rmtree them on shutdown — a group-SIGKILL of
+            # the kernel leaves workers no chance to clean up after themselves
+            # (issue #13, secondary disk-leak note).
+            local_directory = os.environ.get("BIOPB_DASK_LOCAL_DIR") or None
+
             cluster = LocalCluster(
                 n_workers=num_workers,
                 processes=True,
@@ -58,6 +65,7 @@ def _configure_dask(mcp_config: dict):
                 dashboard_address=mcp_config.get(
                     "dask_dashboard_address", "127.0.0.1:0"
                 ),
+                local_directory=local_directory,
             )
             client = Client(cluster)
             logger.info(

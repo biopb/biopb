@@ -507,8 +507,16 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
-    lines.append(f"  alive: {host.is_alive()}")
-    lines.append(f"  busy: {host.is_busy()}")
+    health = host.health()
+    lines.append(f"  alive: {health['alive']}")
+    lines.append(f"  busy: {health['busy']}")
+    lines.append(f"  watchdog_running: {health['watchdog_running']}")
+    if health["recent_respawns"]:
+        lines.append(f"  recent_respawns: {health['recent_respawns']}")
+    if health["dead"]:
+        lines.append(
+            "  state: DEAD — respawn budget exhausted; call restart_kernel"
+        )
 
     res = host.execute(_STATUS_SNIPPET, timeout=15.0)
     if res.get("status") == "ok":

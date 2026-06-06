@@ -6,6 +6,7 @@ test runs the real napari bootstrap end-to-end.
 """
 
 import os
+import signal
 import sys
 import time
 
@@ -175,6 +176,225 @@ class TestKernelLifecycle:
         with pytest.raises(RuntimeError, match="health probe failed"):
             host.start()
         host.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Orphan hardening (issue #13)
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate, timeout=15.0, interval=0.2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+# pgid / killpg / SIGKILL are POSIX-only; the hardening they test degrades to a
+# no-op on Windows (guarded by os.name == "posix" / hasattr(os, "killpg")).
+posix_only = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX-only (pgid / killpg / SIGKILL)"
+)
+
+
+@posix_only
+class TestPgidCapture:
+    """Fix 3: pgid captured at launch, reaped via stored pgid."""
+
+    def test_pgid_captured_equals_kernel_group(self):
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0,
+            parent_death_pipe=False,
+        )
+        host.start()
+        try:
+            pid = host._kernel_pid()
+            assert host._pgid == os.getpgid(pid)
+        finally:
+            host.shutdown()
+        # pgid is cleared after shutdown so a recycled pid can't be re-killed.
+        assert host._pgid is None
+
+    def test_shutdown_never_kills_own_group(self, monkeypatch):
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0,
+            parent_death_pipe=False,
+        )
+        host.start()
+        # Simulate the captured pgid resolving to the launcher's own group:
+        # our group-kill must be skipped (never SIGKILL ourselves). The spy
+        # passes through so jupyter_client still reaps the real kernel group
+        # (and its own internal kill is recorded too, hence not asserting []).
+        host._pgid = os.getpgrp()
+        real_killpg = os.killpg
+        killed = []
+
+        def _spy(pg, sig):
+            killed.append(pg)
+            return real_killpg(pg, sig)
+
+        monkeypatch.setattr(os, "killpg", _spy)
+        host._shutdown_current()
+        assert os.getpgrp() not in killed
+
+
+@posix_only
+class TestWatchdog:
+    """Fix 2: liveness watchdog reaps + respawns, bounded."""
+
+    def test_respawns_unexpectedly_dead_kernel(self):
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0.3,
+            parent_death_pipe=False,
+        )
+        host.start()
+        try:
+            pid1 = host._kernel_pid()
+            os.kill(pid1, signal.SIGKILL)
+            assert _wait_until(
+                lambda: host.is_alive() and host._kernel_pid() != pid1
+            )
+            assert host.is_alive()
+            assert host._kernel_pid() != pid1
+            assert not host._dead
+        finally:
+            host.shutdown()
+
+    def test_respawn_bound_marks_host_dead(self):
+        # max_respawns=0 -> the first unexpected death exhausts the budget
+        # immediately, so the host is marked dead instead of respawning.
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0.3,
+            watchdog_max_respawns=0,
+            parent_death_pipe=False,
+        )
+        host.start()
+        try:
+            os.kill(host._kernel_pid(), signal.SIGKILL)
+            assert _wait_until(lambda: host._dead)
+            assert not host.is_alive()
+            assert host.health()["dead"] is True
+        finally:
+            host.shutdown()
+
+    def test_restart_does_not_trip_watchdog(self):
+        host = KernelHost(
+            health_probe_code=None,
+            watchdog_interval=0.3,
+            parent_death_pipe=False,
+        )
+        host.start()
+        try:
+            host.execute("survivor = 1")
+            host.restart()
+            # The intentional restart must not be treated as a death: the
+            # kernel is alive, not marked dead, and the namespace is cleared.
+            assert host.is_alive()
+            assert not host._dead
+            assert (
+                "False" in host.execute("print('survivor' in dir())")["stdout"]
+            )
+        finally:
+            host.shutdown()
+
+
+class TestHealth:
+    def test_health_fields(self):
+        host = KernelHost(health_probe_code=None, parent_death_pipe=False)
+        host.start()
+        try:
+            h = host.health()
+            assert set(h) == {
+                "alive",
+                "busy",
+                "dead",
+                "recent_respawns",
+                "watchdog_running",
+            }
+            assert h["alive"] is True
+            assert h["dead"] is False
+            assert h["watchdog_running"] is True
+        finally:
+            host.shutdown()
+        assert host.health()["watchdog_running"] is False
+
+
+class TestParentDeathPipe:
+    """Fix 1: kernel self-terminates when the launcher process dies."""
+
+    def test_deathwatch_install_noop_without_fd(self, monkeypatch):
+        from biopb_mcp.mcp import _deathwatch
+
+        monkeypatch.delenv(_deathwatch.ENV_FD, raising=False)
+        assert _deathwatch.install() is False
+
+    @posix_only
+    def test_deathwatch_self_terminates_on_pipe_eof(self, monkeypatch):
+        # In-process exercise of the watcher: install() on a real pipe, then
+        # close the write end (the launcher "dying"); the watcher thread should
+        # hit EOF and call the group-kill. killpg is stubbed so we record the
+        # call instead of killing the test process.
+        from biopb_mcp.mcp import _deathwatch
+
+        r, w = os.pipe()
+        monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
+        killed = []
+        monkeypatch.setattr(
+            os, "killpg", lambda pg, sig: killed.append((pg, sig))
+        )
+
+        assert _deathwatch.install() is True
+        os.close(w)  # launcher "dies" -> read end sees EOF
+        # The watcher closes the read end itself (in its finally), so we don't.
+        assert _wait_until(lambda: bool(killed), timeout=5.0, interval=0.05)
+        assert killed[0][1] == signal.SIGKILL
+
+    @posix_only
+    def test_kernel_dies_when_launcher_dies(self):
+        import subprocess
+        import textwrap
+
+        # A throwaway "launcher" that starts a kernel and then dies abruptly
+        # (os._exit, no shutdown). Its death closes the pipe write end, which
+        # the kernel's watcher sees as EOF and self-group-kills on.
+        script = textwrap.dedent(
+            """
+            import os, sys
+            from biopb_mcp.mcp._kernel import KernelHost
+            h = KernelHost(health_probe_code=None, watchdog_interval=0,
+                           parent_death_pipe=True)
+            h.start()
+            sys.stdout.write(str(h._kernel_pid()) + "\\n")
+            sys.stdout.flush()
+            os._exit(0)
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=dict(os.environ),
+        )
+        assert proc.stdout.strip(), proc.stderr
+        pid = int(proc.stdout.strip().splitlines()[-1])
+
+        def _gone():
+            try:
+                os.kill(pid, 0)
+                return False
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+
+        assert _wait_until(_gone), f"kernel {pid} survived launcher death"
 
 
 # ---------------------------------------------------------------------------

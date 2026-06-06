@@ -12,7 +12,9 @@ Install the optional dependencies first: ``pip install biopb-mcp[mcp]``.
 import atexit
 import logging
 import os
+import shutil
 import signal
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,21 @@ def main():
     if mcp_config.get("tensor_cache_local"):
         kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
 
+    # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
+    # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
+    # (which leaves workers no chance to clean up) doesn't leak spill dirs
+    # (issue #13, secondary disk-leak note).
+    dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
+    kernel_env["BIOPB_DASK_LOCAL_DIR"] = dask_local_dir
+
+    def _cleanup_dask_dir():
+        shutil.rmtree(dask_local_dir, ignore_errors=True)
+
+    # Register now (before host.start()) so the scratch dir is still removed on
+    # interpreter exit if start() raises. rmtree(ignore_errors) makes this and
+    # the explicit calls on the os._exit paths harmless if they both run.
+    atexit.register(_cleanup_dask_dir)
+
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=mcp_config.get("kernel_name", "python3"),
@@ -68,6 +85,12 @@ def main():
         execute_timeout=mcp_config.get("execute_timeout", 120.0),
         busy_lock_timeout=mcp_config.get("busy_lock_timeout", 5.0),
         env=kernel_env,
+        watchdog_interval=mcp_config.get("watchdog_interval", 5.0),
+        watchdog_max_respawns=mcp_config.get("watchdog_max_respawns", 3),
+        watchdog_respawn_window=mcp_config.get(
+            "watchdog_respawn_window", 60.0
+        ),
+        parent_death_pipe=mcp_config.get("parent_death_pipe", True),
     )
     _server.set_kernel_host(host)
     _server.set_promote_after(mcp_config.get("promote_after", 10.0))
@@ -81,6 +104,7 @@ def main():
     def _handle_signal(signum, frame):
         logger.info("Received signal %s, shutting down.", signum)
         host.shutdown()
+        _cleanup_dask_dir()
         # Skip Python finalization: this process still has a live asyncio/epoll
         # event-loop thread and the numpy OpenBLAS worker pool running, and
         # tearing down the interpreter on top of them segfaults inside
@@ -101,6 +125,7 @@ def main():
     # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
     # os._exit, so shut down explicitly here).
     host.shutdown()
+    _cleanup_dask_dir()
     os._exit(0)
 
 

@@ -14,11 +14,25 @@ import os
 import queue
 import re
 import signal
+import threading
+import time
 from typing import List, Optional
+
+from . import _deathwatch
 
 logger = logging.getLogger(__name__)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Prepended exec-line that installs the in-kernel parent-death watcher before
+# the (possibly slow) napari bootstrap runs. Paired with the inherited read-end
+# fd passed in BIOPB_PARENT_DEATH_FD; see _deathwatch and KernelHost._launch.
+# Repeated --IPKernelApp.exec_lines args append, so this composes with the
+# bootstrap line the launcher already passes.
+_DEATHWATCH_ARG = (
+    "--IPKernelApp.exec_lines="
+    "import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
+)
 
 # Best-effort snippet run before a restart so dask releases child processes /
 # cluster keys cleanly.  ``_dask_client`` / ``_dask_cluster`` are set by the
@@ -58,9 +72,11 @@ class KernelHost:
         health_probe_expect: str = "True",
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
+        watchdog_interval: float = 5.0,
+        watchdog_max_respawns: int = 3,
+        watchdog_respawn_window: float = 60.0,
+        parent_death_pipe: bool = True,
     ):
-        import threading
-
         self._extra_arguments = list(extra_arguments or [])
         self._kernel_name = kernel_name
         self._startup_timeout = startup_timeout
@@ -74,32 +90,95 @@ class KernelHost:
         self._kc = None
         self._lock = threading.RLock()
 
+        # -- orphan hardening (issue #13) -------------------------------
+        # pgid captured at launch so the group-kill never re-derives it from a
+        # possibly-dead / pid-recycled kernel pid.
+        self._pgid = None
+        # Launcher-held write end of the parent-death pipe; its closure (on
+        # launcher death) makes the kernel self-terminate (failure mode 1).
+        self._parent_death_pipe = parent_death_pipe and os.name == "posix"
+        self._death_w = None
+        # Liveness watchdog (failure mode 2): respawn an unexpectedly-dead
+        # kernel after reaping its orphaned dask group, bounded to avoid a
+        # crash-respawn thrash loop.
+        self._watchdog_interval = watchdog_interval
+        self._watchdog_max_respawns = watchdog_max_respawns
+        self._watchdog_respawn_window = watchdog_respawn_window
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
+        self._respawn_times = []  # monotonic timestamps of recent respawns
+        self._dead = False  # respawn budget exhausted -> manual restart needed
+        self._stopping = False  # an intentional restart/shutdown is in flight
+
     # -- lifecycle ------------------------------------------------------
 
     def start(self):
         """Launch the kernel, wait until ready, then run the health probe."""
         self._launch()
         self._run_health_probe()
+        self._start_watchdog()
 
     def _launch(self):
         from jupyter_client import KernelManager
 
+        env = self._env if self._env is not None else os.environ.copy()
+        extra_args = list(self._extra_arguments)
+        popen_kwargs = {}
+
+        # Parent-death pipe: the kernel inherits the read end and self-kills its
+        # process group when the launcher *process* dies (issue #13, mode 1).
+        death_r = None
+        if self._parent_death_pipe:
+            death_r, self._death_w = os.pipe()
+            env = dict(env)
+            env[_deathwatch.ENV_FD] = str(death_r)
+            popen_kwargs["pass_fds"] = (death_r,)
+            extra_args = [_DEATHWATCH_ARG] + extra_args
+
         self._km = KernelManager(kernel_name=self._kernel_name)
-        self._km.start_kernel(
-            extra_arguments=list(self._extra_arguments),
-            env=self._env if self._env is not None else os.environ.copy(),
-            cwd=self._cwd,
-            # Own process group so a hard restart can group-kill any dask
-            # child processes the kernel spawned.
-            start_new_session=True,
-        )
-        self._kc = self._km.client()
-        self._kc.start_channels()
         try:
+            try:
+                self._km.start_kernel(
+                    extra_arguments=extra_args,
+                    env=env,
+                    cwd=self._cwd,
+                    # Own session/process group so a hard restart — or the
+                    # kernel's own parent-death watcher — can group-kill the
+                    # dask children it spawned.
+                    start_new_session=True,
+                    **popen_kwargs,
+                )
+            finally:
+                # The child has its own copy of the read end; the launcher keeps
+                # only the write end so its closure reaches the kernel.
+                if death_r is not None:
+                    try:
+                        os.close(death_r)
+                    except OSError:
+                        pass
+            self._pgid = self._capture_pgid()
+            self._kc = self._km.client()
+            self._kc.start_channels()
             self._kc.wait_for_ready(timeout=self._startup_timeout)
-        except RuntimeError:
-            self._shutdown_current(self._kernel_pid())
+        except Exception:
+            self._shutdown_current()
             raise
+
+    def _capture_pgid(self):
+        """The kernel's process-group id, read once at launch time."""
+        try:
+            pgid = self._km.provisioner.pgid
+            if pgid:
+                return pgid
+        except Exception:
+            pass
+        pid = self._kernel_pid()
+        if pid is not None and hasattr(os, "getpgid"):
+            try:
+                return os.getpgid(pid)
+            except OSError:
+                pass
+        return None
 
     def _run_health_probe(self):
         if not self._health_probe_code:
@@ -240,33 +319,51 @@ class KernelHost:
     def restart(self):
         """Hard-restart: release dask, group-kill the kernel, respawn."""
         with self._lock:
+            # Tell the watchdog this alive->dead transition is intentional.
+            self._stopping = True
             try:
-                self._execute_locked(_DASK_RELEASE_SNIPPET, timeout=5.0)
-            except Exception:
-                logger.debug("dask release failed on restart", exc_info=True)
+                try:
+                    self._execute_locked(_DASK_RELEASE_SNIPPET, timeout=5.0)
+                except Exception:
+                    logger.debug(
+                        "dask release failed on restart", exc_info=True
+                    )
 
-            pid = self._kernel_pid()
-            self._shutdown_current(pid)
-            self._launch()
-            self._run_health_probe()
+                self._shutdown_current()
+                self._launch()
+                self._run_health_probe()
+                # A manual restart clears the dead state and respawn budget.
+                self._dead = False
+                self._respawn_times.clear()
+            finally:
+                self._stopping = False
+        # Re-arm the watchdog if it had stopped (e.g. respawn budget exhausted).
+        self._start_watchdog()
 
     def shutdown(self):
-        """Stop channels, shut down the kernel, remove the connection file."""
+        """Stop the watchdog, then group-kill the kernel and clean up."""
+        # Stop the watchdog *before* taking the lock: it may itself be holding
+        # the lock mid-respawn, and joining it while we hold the lock would
+        # deadlock. _stopping also suppresses any respawn it is about to start.
+        self._stopping = True
+        self._stop_watchdog()
         with self._lock:
-            self._shutdown_current(self._kernel_pid())
+            self._shutdown_current()
 
-    def _shutdown_current(self, pid):
+    def _shutdown_current(self):
         try:
             if self._kc is not None:
                 self._kc.stop_channels()
         except Exception:
             logger.debug("stop_channels failed", exc_info=True)
 
-        # Group-kill to reap the kernel and any dask child processes it
-        # spawned (an external cluster lives in another session and is spared).
-        if hasattr(os, "killpg") and pid is not None:
+        # Group-kill via the pgid captured at launch — not os.getpgid(pid) now:
+        # the kernel may already be dead (raising), and a recycled pid could
+        # resolve to an unrelated group. Never signal the launcher's own group.
+        pgid = self._pgid
+        if hasattr(os, "killpg") and pgid and pgid != os.getpgrp():
             try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 logger.debug("killpg failed", exc_info=True)
 
@@ -282,8 +379,107 @@ class KernelHost:
             logger.debug("cleanup_resources failed", exc_info=True)
 
         self._kc = None
+        self._pgid = None
+        self._close_death_pipe()
+
+    def _close_death_pipe(self):
+        if self._death_w is not None:
+            try:
+                os.close(self._death_w)
+            except OSError:
+                pass
+            self._death_w = None
+
+    # -- liveness watchdog (issue #13, failure mode 2) ------------------
+
+    def _start_watchdog(self):
+        """Start the liveness watchdog thread if enabled and not running."""
+        if self._watchdog_interval <= 0:
+            return
+        if (
+            self._watchdog_thread is not None
+            and self._watchdog_thread.is_alive()
+        ):
+            return
+        self._stopping = False
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_run, name="kernel-watchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+
+    def _stop_watchdog(self):
+        """Signal the watchdog to exit and (unless we *are* it) join it."""
+        self._watchdog_stop.set()
+        t = self._watchdog_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=self._watchdog_interval + 5.0)
+            self._watchdog_thread = None
+
+    def _watchdog_run(self):
+        # wait() returns True only when stop is set; False on each interval.
+        while not self._watchdog_stop.wait(self._watchdog_interval):
+            if self._stopping or self.is_alive():
+                continue
+            # Possible unexpected death: confirm and act under the lock so we
+            # never race an in-flight restart()/shutdown().
+            if not self._lock.acquire(timeout=self._watchdog_interval):
+                continue  # busy (likely a restart); re-check next tick
+            try:
+                if self._watchdog_stop.is_set() or self._stopping:
+                    continue
+                if self.is_alive():
+                    continue  # a restart finished while we waited — fine
+                self._handle_unexpected_death()
+            finally:
+                self._lock.release()
+
+    def _handle_unexpected_death(self):
+        """Reap the orphaned process group and respawn, bounded. Held lock."""
+        logger.warning(
+            "Kernel died unexpectedly; reaping orphans and respawning."
+        )
+        self._shutdown_current()  # killpg the captured pgid -> reap dask group
+
+        now = time.monotonic()
+        window = self._watchdog_respawn_window
+        self._respawn_times = [
+            t for t in self._respawn_times if now - t < window
+        ]
+        if len(self._respawn_times) >= self._watchdog_max_respawns:
+            logger.error(
+                "Kernel respawn limit reached (%d within %.0fs); marking the "
+                "host dead. Call restart_kernel to recover.",
+                self._watchdog_max_respawns,
+                window,
+            )
+            self._dead = True
+            self._watchdog_stop.set()
+            return
+        self._respawn_times.append(now)
+        try:
+            self._launch()
+            self._run_health_probe()
+            logger.info("Kernel respawned after unexpected death.")
+        except Exception:
+            logger.exception("Respawn after unexpected death failed.")
+            self._dead = True
+            self._watchdog_stop.set()
 
     # -- status ---------------------------------------------------------
+
+    def health(self) -> dict:
+        """Liveness summary for server_status (cheap; takes no lock)."""
+        return {
+            "alive": self.is_alive(),
+            "busy": self.is_busy(),
+            "dead": self._dead,
+            "recent_respawns": len(self._respawn_times),
+            "watchdog_running": (
+                self._watchdog_thread is not None
+                and self._watchdog_thread.is_alive()
+            ),
+        }
 
     def is_alive(self) -> bool:
         try:
