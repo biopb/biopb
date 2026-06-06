@@ -156,17 +156,21 @@ _py() {
     fi
 }
 
-# Merge the biopb MCP entry into JSON <file> under top-level key <parent> (e.g.
-# "mcpServers" or "mcp"), setting "url": <url> on the supplied <entry> object.
-# Preserves all other content, creates the file (and parents) if absent, and writes
-# atomically. Uses Python (always present) instead of jq, which labs may not have.
-# Returns non-zero and leaves the file untouched on any error.
-_mcp_merge_json() {
-    local file="$1" parent="$2" entry="$3" url="$4"
+# Merge a biopb stdio MCP entry into JSON <file> under top-level key <parent>
+# (e.g. "mcpServers" or "mcp"). <style> picks the entry shape: "stdio" for the
+# standard {type,command,args} form (Claude Desktop, Cursor, the canonical
+# mcp.json), "opencode" for opencode's {type:"local", command:[...]} form.
+# <command> and the trailing args are the `biopb-mcp` invocation the client
+# spawns. Preserves all other content, creates the file (and parents) if absent,
+# and writes atomically. JSON-escaping happens in Python, so a command path with
+# spaces is safe. Uses Python (always present) instead of jq, which labs may not
+# have. Returns non-zero and leaves the file untouched on any error.
+_mcp_merge() {
+    local file="$1" parent="$2" style="$3" command="$4"; shift 4
     mkdir -p "$(dirname "$file")"
-    _py - "$file" "$parent" "$entry" "$url" 2>/dev/null <<'PY'
+    _py - "$file" "$parent" "$style" "$command" "$@" 2>/dev/null <<'PY'
 import json, os, sys
-path, parent, entry_json, url = sys.argv[1:5]
+path, parent, style, command, *cmd_args = sys.argv[1:]
 try:
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
@@ -174,8 +178,13 @@ except FileNotFoundError:
     data = {}
 if not isinstance(data, dict):
     sys.exit("%s: top-level JSON is not an object" % path)
-entry = json.loads(entry_json)
-entry["url"] = url
+if style == "opencode":
+    entry = {"type": "local", "command": [command, *cmd_args], "enabled": True}
+else:
+    # Standard mcpServers stdio form (Claude Desktop, Cursor, the canonical
+    # mcp.json): bare command+args, no "type" — that is the form every
+    # mcpServers client accepts (a stray "type" trips stricter validators).
+    entry = {"command": command, "args": cmd_args}
 section = data.get(parent)
 if not isinstance(section, dict):
     section = data[parent] = {}
@@ -217,11 +226,11 @@ PY
 }
 
 # Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
-# Cursor, …). biopb-mcp is a streamable-http server, so clients connect to its URL —
-# not spawn it over stdio. Usage: _mcp_json_merge <config-file> <url> <label>
+# Cursor, …). biopb-mcp speaks stdio, so the client spawns the command itself.
+# Usage: _mcp_json_merge <config-file> <command> <label> [args...]
 _mcp_json_merge() {
-    local file="$1" url="$2" label="$3"
-    if _mcp_merge_json "$file" "mcpServers" '{"type": "http"}' "$url"; then
+    local file="$1" command="$2" label="$3"; shift 3
+    if _mcp_merge "$file" "mcpServers" "stdio" "$command" "$@"; then
         _ok "$label: registered biopb ($file)"
     else
         _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
@@ -313,10 +322,12 @@ _setup_mcp() {
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
-    # biopb-mcp is a long-running streamable-http server (it owns the shared napari
-    # window); clients connect to its URL rather than spawning it over stdio. This
-    # must match the default port in config.json below — change both if you set mcp.port.
-    local mcp_url="http://127.0.0.1:8765/mcp"
+    # biopb-mcp 0.6.0+ speaks MCP over stdio: the AI agent spawns it as a child
+    # process (`biopb-mcp --transport stdio`) rather than connecting to a
+    # long-running HTTP server. Each client therefore needs the *command* to run,
+    # not a URL — and we register the resolved absolute path so GUI agents (e.g.
+    # Claude Desktop), which don't inherit the shell PATH, can still find it.
+    local mcp_args=(--transport stdio)
 
     # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
     # Preserved if it already exists so the user's tweaks survive a rerun.
@@ -342,17 +353,11 @@ EOF
     fi
 
     # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
-    cat > "$CONFIG_DIR/mcp.json" << EOF
-{
-  "mcpServers": {
-    "biopb": {
-      "type": "http",
-      "url": "$mcp_url"
-    }
-  }
-}
-EOF
-    _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    if _mcp_merge "$CONFIG_DIR/mcp.json" "mcpServers" "stdio" "$mcp_cmd" "${mcp_args[@]}"; then
+        _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    else
+        _warn "Could not write $CONFIG_DIR/mcp.json"
+    fi
 
     local detected=0
 
@@ -361,11 +366,11 @@ EOF
         detected=1
         if claude mcp get biopb &>/dev/null; then
             _ok "Claude Code: biopb already registered"
-        elif claude mcp add --scope user --transport http biopb "$mcp_url" &>/dev/null; then
+        elif claude mcp add --scope user biopb -- "$mcp_cmd" "${mcp_args[@]}" &>/dev/null; then
             _ok "Claude Code: registered biopb (user scope)"
         else
             _warn "Claude Code detected but registration failed — add it manually:"
-            _cmd "claude mcp add --scope user --transport http biopb $mcp_url"
+            _cmd "claude mcp add --scope user biopb -- $mcp_cmd ${mcp_args[*]}"
         fi
     fi
 
@@ -377,7 +382,7 @@ EOF
         else
             _ok "Hermes detected"
             _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
-            printf "    %sbiopb:\n      transport: \"http\"\n      url: \"%s\"%s\n" "$DIM" "$mcp_url" "$RESET"
+            printf "    %sbiopb:\n      command: \"%s\"\n      args: [\"--transport\", \"stdio\"]%s\n" "$DIM" "$mcp_cmd" "$RESET"
         fi
     fi
 
@@ -389,13 +394,13 @@ EOF
     esac
     if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
         detected=1
-        _mcp_json_merge "$cd_cfg" "$mcp_url" "Claude Desktop"
+        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}"
     fi
 
     # --- Cursor ---
     if [ -d "$HOME/.cursor" ]; then
         detected=1
-        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_url" "Cursor"
+        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}"
     fi
 
     # --- opencode ---
@@ -403,26 +408,26 @@ EOF
     if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
         detected=1
         local opencode_cfg="$opencode_cfg_dir/opencode.json"
-        if _mcp_merge_json "$opencode_cfg" "mcp" '{"type": "remote", "enabled": true}' "$mcp_url"; then
+        if _mcp_merge "$opencode_cfg" "mcp" "opencode" "$mcp_cmd" "${mcp_args[@]}"; then
             _ok "opencode: registered biopb ($opencode_cfg)"
         else
             _warn "opencode: could not update $opencode_cfg — add biopb manually"
             _info "Add under 'mcp' in $opencode_cfg:"
-            printf "    %s\"biopb\": {\"type\": \"remote\", \"url\": \"%s\", \"enabled\": true}%s\n" "$DIM" "$mcp_url" "$RESET"
+            printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\", \"--transport\", \"stdio\"], \"enabled\": true}%s\n" "$DIM" "$mcp_cmd" "$RESET"
         fi
     fi
 
     if [ "$detected" = "0" ]; then
         _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes, opencode)."
-        _info "To use biopb, point your MCP client at this streamable-http endpoint:"
-        _cmd "$mcp_url"
+        _info "To use biopb, register this stdio command with your MCP client:"
+        _cmd "$mcp_cmd ${mcp_args[*]}"
         _info "A ready-to-use definition is at: $CONFIG_DIR/mcp.json"
     fi
 
-    # biopb-mcp must be running for clients to connect — it is the shared napari session.
-    _info "Start the shared session first by running:"
-    _cmd "$mcp_cmd"
-    _info "A napari window opens; your agent then connects to $mcp_url"
+    # There is no separate server to start: the agent spawns biopb-mcp over stdio
+    # on demand, which opens the napari window and brings up the data plane.
+    _info "Your AI agent launches biopb-mcp automatically; a napari window opens"
+    _info "when it does — no need to start it by hand."
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -767,10 +772,11 @@ install_biopb() {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
-    # psutil) — without it `import mcp` fails. We require >=0.5.4: that release
-    # drops biopb-mcp's stray, unpinned grpcio-tools dependency, which otherwise
-    # collapses the shared solve to an unbuildable grpcio-tools==1.30.0. It comes
-    # from PyPI in both modes (no biopb-mcp wheel ships in the release).
+    # psutil) — without it `import mcp` fails. We require >=0.6.0: that release makes
+    # stdio the default transport (matching the MCP client config this installer
+    # writes) and also drops biopb-mcp's stray, unpinned grpcio-tools dependency,
+    # which otherwise collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
+    # It comes from PyPI in both modes (no biopb-mcp wheel ships in the release).
     local install_args=(
         --upgrade
         --force
@@ -782,7 +788,7 @@ install_biopb() {
     if [ "$INSTALL_MCP" = "1" ]; then
         _info "  including biopb-mcp + napari"
         install_args+=(
-            --with "biopb-mcp[mcp]>=0.5.4"
+            --with "biopb-mcp[mcp]>=0.6.0"
             --with "napari[all]"
             --with-executables-from biopb-mcp
         )
@@ -954,21 +960,20 @@ EOF
         printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
         printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
 
-        printf "  %s1. Start a new shell session.%s Run:\n" "${BOLD}" "${RESET}"
-        _cmd "biopb-mcp"
-        _info "This starts the biopb stack and opens a napari window. Keep it"
-        _info "running while you use the system."
-        echo ""
-
-        printf "  %s2. Check your data.%s Confirm it appears in the napari panel on the right.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "  %s3. Connect an AI agent%s, then prompt away! Run:\n" "${BOLD}" "${RESET}"
+        printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
         if [ -n "$agent_cmd" ]; then
             _cmd "$agent_cmd"
         else
             _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
         fi
+        _info "The agent launches biopb-mcp for you and a napari window opens."
+        _info "Keep the agent session running while you work."
+        echo ""
+
+        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+        echo ""
+
+        printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
         echo ""
 
         printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"

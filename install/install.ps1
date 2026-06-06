@@ -161,13 +161,14 @@ function Add-ToUserPath {
 
 # Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
 # Cursor, ...). Uses native JSON (ConvertFrom/ConvertTo-Json) in place of jq.
-# biopb-mcp is a streamable-http server, so clients connect to its URL.
+# biopb-mcp speaks stdio, so the client spawns the command itself — a bare
+# command+args entry (no "type") is the form every mcpServers client accepts.
 function Merge-McpJson {
-    param([string]$File, [string]$Url, [string]$Label, [string]$ConfigDir)
+    param([string]$File, [string]$Command, [string[]]$CmdArgs, [string]$Label, [string]$ConfigDir)
     $dir = Split-Path -Parent $File
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
-    $entry = [pscustomobject]@{ type = "http"; url = $Url }
+    $entry = [pscustomobject]@{ command = $Command; args = @($CmdArgs) }
 
     if (Test-Path -LiteralPath $File) {
         try {
@@ -200,10 +201,12 @@ function Set-McpClients {
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
-    # biopb-mcp is a long-running streamable-http server (it owns the shared napari
-    # window); clients connect to its URL rather than spawning it over stdio. This
-    # must match the default port in config.json below - change both if you set mcp.port.
-    $mcpUrl = "http://127.0.0.1:8765/mcp"
+    # biopb-mcp 0.6.0+ speaks MCP over stdio: the AI agent spawns it as a child
+    # process (`biopb-mcp --transport stdio`) rather than connecting to a
+    # long-running HTTP server. Each client needs the *command* to run, not a URL;
+    # we register the resolved absolute path so GUI agents (e.g. Claude Desktop),
+    # which don't inherit the shell PATH, can still find it.
+    $mcpArgs = @("--transport", "stdio")
 
     # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved
     # if it already exists so the user's tweaks survive a rerun.
@@ -226,9 +229,9 @@ function Set-McpClients {
         Write-Ok "Created biopb-mcp config: $mcpConfig"
     }
 
-    # Canonical standalone definition (standard mcpServers JSON).
+    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
     $canonical = [pscustomobject]@{
-        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ type = "http"; url = $mcpUrl } }
+        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ command = $mcpCmd; args = $mcpArgs } }
     }
     Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
     Write-Ok "MCP definition written: $ConfigDir\mcp.json"
@@ -242,12 +245,12 @@ function Set-McpClients {
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Claude Code: biopb already registered"
         } else {
-            & claude mcp add --scope user --transport http biopb $mcpUrl *> $null
+            & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
             if ($LASTEXITCODE -eq 0) {
                 Write-Ok "Claude Code: registered biopb (user scope)"
             } else {
                 Write-Warn2 "Claude Code detected but registration failed - add it manually:"
-                Write-Cmd "claude mcp add --scope user --transport http biopb $mcpUrl"
+                Write-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
             }
         }
     }
@@ -256,14 +259,14 @@ function Set-McpClients {
     $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
     if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
         $detected = $true
-        Merge-McpJson -File $cdCfg -Url $mcpUrl -Label "Claude Desktop" -ConfigDir $ConfigDir
+        Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir
     }
 
     # --- Cursor ---
     $cursorDir = Join-Path $BiopbHome ".cursor"
     if (Test-Path -LiteralPath $cursorDir) {
         $detected = $true
-        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Url $mcpUrl -Label "Cursor" -ConfigDir $ConfigDir
+        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir
     }
 
     # --- opencode ---
@@ -274,8 +277,8 @@ function Set-McpClients {
         if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
 
         $opencodeEntry = [pscustomobject]@{
-            type = "remote"
-            url = $mcpUrl
+            type = "local"
+            command = @($mcpCmd) + $mcpArgs
             enabled = $true
         }
 
@@ -295,7 +298,7 @@ function Set-McpClients {
             } catch {
                 Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
                 Write-Inf "Add under 'mcp' in $opencodeCfg :"
-                Write-Host ("    `"biopb`": {{ `"type`": `"remote`", `"url`": `"$mcpUrl`", `"enabled`": true }}") -ForegroundColor DarkGray
+                Write-Host ("    `"biopb`": { `"type`": `"local`", `"command`": [`"$mcpCmd`", `"--transport`", `"stdio`"], `"enabled`": true }") -ForegroundColor DarkGray
             }
         } else {
             $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
@@ -306,15 +309,14 @@ function Set-McpClients {
 
     if (-not $detected) {
         Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor, opencode)."
-        Write-Inf "To use biopb, point your MCP client at this streamable-http endpoint:"
-        Write-Cmd $mcpUrl
+        Write-Inf "To use biopb, register this stdio command with your MCP client:"
+        Write-Cmd "$mcpCmd $($mcpArgs -join ' ')"
         Write-Inf "A ready-to-use definition is at: $ConfigDir\mcp.json"
     }
 
-    # biopb-mcp must be running for clients to connect - it is the shared napari session.
-    Write-Inf "Start the shared session first by running:"
-    Write-Cmd $mcpCmd
-    Write-Inf "A napari window opens; your agent then connects to $mcpUrl"
+    # There is no separate server to start: the agent spawns biopb-mcp over stdio
+    # on demand, which opens the napari window and brings up the data plane.
+    Write-Inf "Your AI agent launches biopb-mcp automatically; a napari window opens when it does."
 }
 
 $ISSUE_URL = "https://github.com/biopb/biopb/issues/new"
@@ -569,10 +571,11 @@ function Install-Biopb {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client,
-    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.5.4:
-    # that release drops biopb-mcp's stray, unpinned grpcio-tools dependency,
-    # which otherwise collapses the shared solve to an unbuildable
-    # grpcio-tools==1.30.0. It comes from PyPI in both modes.
+    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.6.0:
+    # that release makes stdio the default transport (matching the MCP client
+    # config this installer writes) and also drops biopb-mcp's stray, unpinned
+    # grpcio-tools dependency, which otherwise collapses the shared solve to an
+    # unbuildable grpcio-tools==1.30.0. It comes from PyPI in both modes.
     $installArgs = @(
         "tool", "install", "--upgrade", "--force",
         $biopbReq,
@@ -582,7 +585,7 @@ function Install-Biopb {
     if ($InstallMcp) {
         Write-Inf "  including biopb-mcp + napari"
         $installArgs += @(
-            "--with", "biopb-mcp[mcp]>=0.5.4",
+            "--with", "biopb-mcp[mcp]>=0.6.0",
             "--with", "napari[all]",
             "--with-executables-from", "biopb-mcp"
         )
@@ -708,8 +711,8 @@ monitor = true
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
 
     if ($InstallMcp) {
-        Write-Host "To launch biopb-mcp as an MCP server directly:" -ForegroundColor Green
-        Write-Cmd "biopb-mcp"
+        Write-Host "Your AI agent launches biopb-mcp over stdio - just start your agent" -ForegroundColor Green
+        Write-Host "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it." -ForegroundColor Green
         Write-Host ""
     }
 

@@ -52,7 +52,10 @@ proto stubs at build time); on macOS it also needs the Xcode Command Line Tools.
   unpacked to `~/.local/share/biopb/webapp`.
 - **biopb-mcp + napari** (optional) — from PyPI; the installer also registers the
   biopb MCP server with any detected agent (Claude Code/Desktop, Cursor,
-  opencode, Hermes) and can install opencode if none is found.
+  opencode, Hermes) and can install opencode if none is found. biopb-mcp speaks
+  MCP over **stdio**, so the agent spawns `biopb-mcp --transport stdio` itself
+  (which opens the napari window and brings up the data plane) — there is no
+  separate server to start by hand.
 
 ## Config & data locations
 
