@@ -743,6 +743,8 @@ install_biopb() {
         fi
         _info "Installing from release $RELEASE_TAG"
         WHEELS_DIR=$(mktemp -d)
+        # Remove the wheel download dir on any exit (success, error, or set -e).
+        trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
         local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
         local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
         curl -fsSL "$sdk_url" -o "$sdk_whl"
@@ -788,9 +790,7 @@ install_biopb() {
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
-
-    # Wheels are copied into the tool env at install time; drop the download temp.
-    [ -n "${WHEELS_DIR:-}" ] && rm -rf "$WHEELS_DIR"
+    # The wheel download dir (if any) is removed by the EXIT trap set above.
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"

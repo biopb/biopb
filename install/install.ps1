@@ -589,8 +589,16 @@ function Install-Biopb {
     }
 
     Write-Inf "Installing biopb into one shared environment..."
-    uv @installArgs
-    Assert-LastExit "biopb install"
+    try {
+        uv @installArgs
+        Assert-LastExit "biopb install"
+    } finally {
+        # Remove the temporary wheel download dir on success or failure.
+        # $wheelsDir is only set in release mode; $null (source mode) is a no-op.
+        if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
+            Remove-Item -LiteralPath $wheelsDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # Refresh PATH so freshly installed tool shims are visible this session.
     Add-ToUserPath $LocalBin
