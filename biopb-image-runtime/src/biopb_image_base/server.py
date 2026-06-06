@@ -353,6 +353,17 @@ def _start_embedded_tensor_cache(
         writable=False,
     )
 
+    # This embedded server is a *bypass* of the normal tensor-server lifecycle:
+    # it hijacks a TensorFlightServer purely as scratch-pad storage for op
+    # results and has no data-folder scan / source-registration stage at all
+    # (sources appear in-process via adapter.write_chunk). It is therefore ready
+    # to serve the instant its Flight port binds. The CLI launcher is the
+    # authoritative path that defers mark_ready() until after its scan; here
+    # there is nothing to wait for, so mark ready immediately -- otherwise the
+    # health action would report STARTING forever and readiness-gating clients
+    # (e.g. biopb-mcp) would wait indefinitely.
+    tensor_server.mark_ready()
+
     # Start in background thread
     def _run_tensor_server():
         logger.info(f"Embedded tensor cache server started at {location}")

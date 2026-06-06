@@ -40,8 +40,14 @@ The FastAPI server handles both API requests and serves the static React webapp.
 ```python
 server = TensorFlightServer("grpc://0.0.0.0:8815")
 server.register_source("my-zarr", ZarrAdapter(arr, "t0", ["z", "y", "x"]))
+server.mark_ready()  # registration done -> health reports SERVING (else STARTING forever)
 server.serve()  # blocking
 ```
+
+The `biopb-tensor-server` CLI launcher is the authoritative entry point: it
+scans the configured data folders and calls `mark_ready()` after registration
+completes. Code that drives `TensorFlightServer` directly (as above) is
+responsible for calling `mark_ready()` itself once its sources are registered.
 
 Sources are keyed by `source_id`. Each source maps to one `BackendAdapter`
 which may expose multiple tensors (e.g., multi-field).

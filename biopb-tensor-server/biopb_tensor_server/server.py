@@ -98,6 +98,13 @@ class TensorFlightServer(flight.FlightServerBase):
     Supports multifield acquisitions where tensors within a data source
     have different shapes (e.g., MicroManager multi-position datasets).
 
+    The normal entry point is the ``biopb-tensor-server`` CLI
+    (``launch`` / ``serve``), which scans the data folder and calls
+    ``mark_ready()`` for you once registration completes. The low-level usage
+    below drives the server directly and must therefore mark itself ready after
+    registering its sources, or the ``health`` action reports ``STARTING``
+    forever.
+
     Usage:
         # Create an adapter for your data
         import zarr
@@ -107,6 +114,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Start the server
         server = TensorFlightServer('grpc://0.0.0.0:8815')
         server.register_source('my-tensor', adapter)
+        server.mark_ready()  # registration done -> health reports SERVING
         server.serve()
     """
 
@@ -150,6 +158,28 @@ class TensorFlightServer(flight.FlightServerBase):
         self._start_time: float = time.time()
         self._upload_state_lock = threading.RLock()
         self._upload_states: Dict[str, Dict[str, Any]] = {}
+        # Readiness gate: the Flight port binds (and gRPC starts serving) in the
+        # base __init__ above, *before* the caller scans/registers the data
+        # folder -- a scan that can be slow for large catalogs. Until the caller
+        # finishes that scan and calls ``mark_ready()``, the ``health`` action
+        # reports ``STARTING`` so a connecting client can tell "booting" apart
+        # from "down" and wait instead of timing out. Set on the main thread,
+        # read from gRPC handler threads, hence an Event.
+        self._ready = threading.Event()
+
+    def mark_ready(self) -> None:
+        """Signal that initial source registration is complete.
+
+        Flips the ``health`` action's status from ``STARTING`` to ``SERVING``.
+        Called once by the startup path after the data folder has been scanned
+        and all sources registered.
+        """
+        self._ready.set()
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether initial source registration has completed."""
+        return self._ready.is_set()
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -355,7 +385,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if action.type == "health":
             uptime_seconds = int(time.time() - self._start_time)
             health_status = {
-                "status": "SERVING",
+                "status": "SERVING" if self._ready.is_set() else "STARTING",
                 "source_count": len(self._get_sources_snapshot()),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
@@ -979,6 +1009,8 @@ def serve(
     server = TensorFlightServer(location, **kwargs)
     for source_id, adapter in adapters.items():
         server.register_source(source_id, adapter)
+    # All sources registered up front -> ready immediately (health: SERVING).
+    server.mark_ready()
 
     print(f"Starting Flight server at {location}")
     server.serve()
