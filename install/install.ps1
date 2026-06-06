@@ -7,7 +7,13 @@
     Usage: irm https://biopb.org/install.ps1 | iex
 
     Idempotent: rerun to upgrade to latest version.
-    Requirements: PowerShell 5.1+, git, tar (bundled on Windows 10 1803+).
+
+    By default this installs prebuilt wheels from the latest GitHub release.
+    Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to instead build HEAD from a git
+    checkout (the development fast path); that mode additionally needs git.
+
+    Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+);
+                  git is needed only for BIOPB_INSTALL_FROM_SOURCE=1.
 
     Paths follow the same home-relative XDG layout the Python packages read
     (config under ~/.config, data under ~/.local/share); on Windows these
@@ -56,13 +62,16 @@ function Wait-ForExit {
 }
 
 # Simplified component selector (replaces the bash in-place ANSI checkbox).
-# All components default ON; user types a number to toggle, Enter to confirm.
-# Returns a bool[] aligned with $Labels.
+# Components default ON unless -Defaults supplies a per-label initial state;
+# user types a number to toggle, Enter to confirm. Returns a bool[] aligned
+# with $Labels.
 function Select-Components {
-    param([string[]]$Labels)
+    param([string[]]$Labels, [bool[]]$Defaults)
     $n = $Labels.Count
     $sel = New-Object bool[] $n
-    for ($i = 0; $i -lt $n; $i++) { $sel[$i] = $true }
+    for ($i = 0; $i -lt $n; $i++) {
+        $sel[$i] = if ($Defaults -and $i -lt $Defaults.Count) { $Defaults[$i] } else { $true }
+    }
 
     while ($true) {
         Write-Host ""
@@ -155,13 +164,14 @@ function Add-ToUserPath {
 
 # Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
 # Cursor, ...). Uses native JSON (ConvertFrom/ConvertTo-Json) in place of jq.
-# biopb-mcp is a streamable-http server, so clients connect to its URL.
+# biopb-mcp speaks stdio, so the client spawns the command itself — a bare
+# command+args entry (no "type") is the form every mcpServers client accepts.
 function Merge-McpJson {
-    param([string]$File, [string]$Url, [string]$Label, [string]$ConfigDir)
+    param([string]$File, [string]$Command, [string[]]$CmdArgs, [string]$Label, [string]$ConfigDir)
     $dir = Split-Path -Parent $File
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
-    $entry = [pscustomobject]@{ type = "http"; url = $Url }
+    $entry = [pscustomobject]@{ command = $Command; args = @($CmdArgs) }
 
     if (Test-Path -LiteralPath $File) {
         try {
@@ -194,10 +204,12 @@ function Set-McpClients {
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
-    # biopb-mcp is a long-running streamable-http server (it owns the shared napari
-    # window); clients connect to its URL rather than spawning it over stdio. This
-    # must match the default port in config.json below - change both if you set mcp.port.
-    $mcpUrl = "http://127.0.0.1:8765/mcp"
+    # biopb-mcp 0.6.0+ speaks MCP over stdio: the AI agent spawns it as a child
+    # process (`biopb-mcp --transport stdio`) rather than connecting to a
+    # long-running HTTP server. Each client needs the *command* to run, not a URL;
+    # we register the resolved absolute path so GUI agents (e.g. Claude Desktop),
+    # which don't inherit the shell PATH, can still find it.
+    $mcpArgs = @("--transport", "stdio")
 
     # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved
     # if it already exists so the user's tweaks survive a rerun.
@@ -220,9 +232,9 @@ function Set-McpClients {
         Write-Ok "Created biopb-mcp config: $mcpConfig"
     }
 
-    # Canonical standalone definition (standard mcpServers JSON).
+    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
     $canonical = [pscustomobject]@{
-        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ type = "http"; url = $mcpUrl } }
+        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ command = $mcpCmd; args = $mcpArgs } }
     }
     Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
     Write-Ok "MCP definition written: $ConfigDir\mcp.json"
@@ -236,12 +248,12 @@ function Set-McpClients {
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Claude Code: biopb already registered"
         } else {
-            & claude mcp add --scope user --transport http biopb $mcpUrl *> $null
+            & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
             if ($LASTEXITCODE -eq 0) {
                 Write-Ok "Claude Code: registered biopb (user scope)"
             } else {
                 Write-Warn2 "Claude Code detected but registration failed - add it manually:"
-                Write-Cmd "claude mcp add --scope user --transport http biopb $mcpUrl"
+                Write-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
             }
         }
     }
@@ -250,14 +262,14 @@ function Set-McpClients {
     $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
     if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
         $detected = $true
-        Merge-McpJson -File $cdCfg -Url $mcpUrl -Label "Claude Desktop" -ConfigDir $ConfigDir
+        Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir
     }
 
     # --- Cursor ---
     $cursorDir = Join-Path $BiopbHome ".cursor"
     if (Test-Path -LiteralPath $cursorDir) {
         $detected = $true
-        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Url $mcpUrl -Label "Cursor" -ConfigDir $ConfigDir
+        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir
     }
 
     # --- opencode ---
@@ -268,8 +280,8 @@ function Set-McpClients {
         if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
 
         $opencodeEntry = [pscustomobject]@{
-            type = "remote"
-            url = $mcpUrl
+            type = "local"
+            command = @($mcpCmd) + $mcpArgs
             enabled = $true
         }
 
@@ -289,7 +301,7 @@ function Set-McpClients {
             } catch {
                 Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
                 Write-Inf "Add under 'mcp' in $opencodeCfg :"
-                Write-Host ("    `"biopb`": {{ `"type`": `"remote`", `"url`": `"$mcpUrl`", `"enabled`": true }}") -ForegroundColor DarkGray
+                Write-Host ("    `"biopb`": { `"type`": `"local`", `"command`": [`"$mcpCmd`", `"--transport`", `"stdio`"], `"enabled`": true }") -ForegroundColor DarkGray
             }
         } else {
             $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
@@ -300,15 +312,14 @@ function Set-McpClients {
 
     if (-not $detected) {
         Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor, opencode)."
-        Write-Inf "To use biopb, point your MCP client at this streamable-http endpoint:"
-        Write-Cmd $mcpUrl
+        Write-Inf "To use biopb, register this stdio command with your MCP client:"
+        Write-Cmd "$mcpCmd $($mcpArgs -join ' ')"
         Write-Inf "A ready-to-use definition is at: $ConfigDir\mcp.json"
     }
 
-    # biopb-mcp must be running for clients to connect - it is the shared napari session.
-    Write-Inf "Start the shared session first by running:"
-    Write-Cmd $mcpCmd
-    Write-Inf "A napari window opens; your agent then connects to $mcpUrl"
+    # There is no separate server to start: the agent spawns biopb-mcp over stdio
+    # on demand, which opens the napari window and brings up the data plane.
+    Write-Inf "Your AI agent launches biopb-mcp automatically; a napari window opens when it does."
 }
 
 $ISSUE_URL = "https://github.com/biopb/biopb/issues/new"
@@ -356,13 +367,28 @@ function Invoke-Preflight {
     return $reportOnFailure
 }
 
+# Fetch the latest GitHub release metadata (a parsed object with .tag_name and
+# .assets[].name / .browser_download_url). One call serves both the wheels and
+# the data browser. Throws on network/HTTP error; callers catch and fall back.
+function Get-LatestRelease {
+    param([string]$Repo)
+    return Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+        -Headers @{ "User-Agent" = "biopb-installer" }
+}
+
 function Install-Biopb {
-    $RepoUrl    = "https://github.com/biopb/biopb"
-    $Repo       = "git+$RepoUrl"
-    $BiopbHome  = $env:USERPROFILE          # matches Python Path.home() on Windows
-    $WebappDir  = Join-Path $BiopbHome ".local\share\biopb\webapp"
-    $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
-    $LocalBin   = Join-Path $BiopbHome ".local\bin"
+    $RepoUrl     = "https://github.com/biopb/biopb"
+    $Repo        = "git+$RepoUrl"
+    $ReleaseRepo = "biopb/biopb"             # owner/name for the GitHub Releases API
+    $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
+    $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
+    $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
+    $LocalBin    = Join-Path $BiopbHome ".local\bin"
+
+    # Default: install prebuilt wheels from the latest GitHub release (no git/buf
+    # build). Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to build HEAD from git.
+    $InstallFromSource = ($env:BIOPB_INSTALL_FROM_SOURCE) -and ($env:BIOPB_INSTALL_FROM_SOURCE -ne '0')
+    $release = $null   # cached release metadata, fetched on demand below
 
     # ===== 0. System Check =====
     Write-Step "[0/6] Checking system..."
@@ -380,8 +406,11 @@ function Install-Biopb {
     }
     Write-Ok "Platform: Windows ($arch)"
 
-    # Required tools. curl/Invoke-WebRequest is built in; we need git and tar.
-    foreach ($tool in @("git", "tar")) {
+    # Required tools. curl/Invoke-WebRequest is built in; we always need tar, and
+    # git only when building from a source checkout.
+    $requiredTools = @("tar")
+    if ($InstallFromSource) { $requiredTools += "git" }
+    foreach ($tool in $requiredTools) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
             Write-Err2 "$tool not found"
             switch ($tool) {
@@ -396,11 +425,13 @@ function Install-Biopb {
     Write-Ok "System check passed"
 
     # ===== Optional components =====
+    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
+    # most labs don't need (only legacy/proprietary formats require it).
     $sel = Select-Components -Labels @(
         "Built-in data browser",
         "biopb-mcp (MCP server)",
         "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)"
-    )
+    ) -Defaults @($true, $true, $false)
     $InstallWebapp     = $sel[0]
     $InstallMcp        = $sel[1]
     $InstallBioformats = $sel[2]
@@ -439,19 +470,23 @@ function Install-Biopb {
         Write-Ok "uv already installed ($(uv --version))"
     }
 
-    $bufVersion = "1.70.0"
-    $bufPath = Join-Path $LocalBin "buf.exe"
-    $bufCurrent = ""
-    if (Get-Command buf -ErrorAction SilentlyContinue) { $bufCurrent = (buf --version 2>$null) }
-    if ($bufCurrent -ne $bufVersion) {
-        Write-Inf "Installing buf $bufVersion..."
-        if (-not (Test-Path -LiteralPath $LocalBin)) { New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null }
-        if (Test-Path -LiteralPath $bufPath) { Remove-Item -LiteralPath $bufPath -Force }
-        $bufUrl = "https://github.com/bufbuild/buf/releases/download/v$bufVersion/buf-Windows-$bufArch.exe"
-        Invoke-WebRequest -Uri $bufUrl -OutFile $bufPath
-        Write-Ok "buf $bufVersion installed"
-    } else {
-        Write-Ok "buf already installed ($bufCurrent)"
+    # buf generates the protobuf/Flight stubs at build time, so it is only needed
+    # when building from a source checkout. Release wheels ship the stubs prebuilt.
+    if ($InstallFromSource) {
+        $bufVersion = "1.70.0"
+        $bufPath = Join-Path $LocalBin "buf.exe"
+        $bufCurrent = ""
+        if (Get-Command buf -ErrorAction SilentlyContinue) { $bufCurrent = (buf --version 2>$null) }
+        if ($bufCurrent -ne $bufVersion) {
+            Write-Inf "Installing buf $bufVersion..."
+            if (-not (Test-Path -LiteralPath $LocalBin)) { New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null }
+            if (Test-Path -LiteralPath $bufPath) { Remove-Item -LiteralPath $bufPath -Force }
+            $bufUrl = "https://github.com/bufbuild/buf/releases/download/v$bufVersion/buf-Windows-$bufArch.exe"
+            Invoke-WebRequest -Uri $bufUrl -OutFile $bufPath
+            Write-Ok "buf $bufVersion installed"
+        } else {
+            Write-Ok "buf already installed ($bufCurrent)"
+        }
     }
 
     # ===== 2. Python =====
@@ -491,6 +526,45 @@ function Install-Biopb {
         Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"
     }
 
+    # Resolve where biopb + biopb-tensor-server come from. They must be installed
+    # as a matched pair from a single build: the tensor server is self-contained
+    # and may use proto fields newer than any biopb on PyPI, so biopb is pinned to
+    # the sibling artifact (a git ref in source mode, a local wheel in release
+    # mode) and the resolver is never allowed to pull it from PyPI.
+    if ($InstallFromSource) {
+        Write-Inf "Building from source (HEAD of $RepoUrl)"
+        $biopbReq  = "biopb[tensor] @ $Repo"
+        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server"
+    } else {
+        try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null }
+        if (-not $release) {
+            Write-Err2 "Could not fetch the latest biopb release from $ReleaseRepo."
+            Write-Inf "Check your network, or build from source by setting:"
+            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
+            throw "release fetch failed"
+        }
+        $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
+        $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
+        if (-not $sdkAsset -or -not $tensorAsset) {
+            Write-Err2 "Release $($release.tag_name) has no biopb wheels attached."
+            Write-Inf "Build from source by setting:"
+            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
+            throw "release wheels missing"
+        }
+        Write-Inf "Installing from release $($release.tag_name)"
+        $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
+        if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+        $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
+        $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
+        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
+        Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
+        # Direct file:// references pin biopb to this exact wheel, so uv resolves
+        # the server's biopb dependency to it rather than to PyPI.
+        $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
+        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
+    }
+
     # Install everything into ONE uv tool environment so the components can
     # import and drive each other at runtime:
     #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
@@ -502,28 +576,37 @@ function Install-Biopb {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client,
-    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.5.4:
-    # that release drops biopb-mcp's stray, unpinned grpcio-tools dependency,
-    # which otherwise collapses the shared solve to an unbuildable
-    # grpcio-tools==1.30.0.
+    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.6.0:
+    # that release makes stdio the default transport (matching the MCP client
+    # config this installer writes) and also drops biopb-mcp's stray, unpinned
+    # grpcio-tools dependency, which otherwise collapses the shared solve to an
+    # unbuildable grpcio-tools==1.30.0. It comes from PyPI in both modes.
     $installArgs = @(
         "tool", "install", "--upgrade", "--force",
-        "biopb[tensor] @ $Repo",
-        "--with", "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server",
+        $biopbReq,
+        "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
     if ($InstallMcp) {
         Write-Inf "  including biopb-mcp + napari"
         $installArgs += @(
-            "--with", "biopb-mcp[mcp]>=0.5.4",
+            "--with", "biopb-mcp[mcp]>=0.6.0",
             "--with", "napari[all]",
             "--with-executables-from", "biopb-mcp"
         )
     }
 
     Write-Inf "Installing biopb into one shared environment..."
-    uv @installArgs
-    Assert-LastExit "biopb install"
+    try {
+        uv @installArgs
+        Assert-LastExit "biopb install"
+    } finally {
+        # Remove the temporary wheel download dir on success or failure.
+        # $wheelsDir is only set in release mode; $null (source mode) is a no-op.
+        if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
+            Remove-Item -LiteralPath $wheelsDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # Refresh PATH so freshly installed tool shims are visible this session.
     Add-ToUserPath $LocalBin
@@ -537,11 +620,10 @@ function Install-Biopb {
     if ($InstallWebapp) {
         if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
 
-        $latestTag = ""
-        try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/jiyuuchc/biopb/releases/latest" -Headers @{ "User-Agent" = "biopb-installer" }
-            $latestTag = $release.tag_name
-        } catch { $latestTag = "" }
+        # Reuse the release metadata already fetched for the wheels; in source
+        # mode this is the first (and only) fetch.
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null } }
+        $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
             Write-Warn2 "Unexpected tag format, skipping data browser install"
@@ -557,8 +639,10 @@ function Install-Biopb {
                 Write-Inf "Downloading $latestTag..."
                 Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
                 New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null
+                $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
+                $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
                 $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
-                Invoke-WebRequest -Uri "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" -OutFile $tarball
+                Invoke-WebRequest -Uri $webUrl -OutFile $tarball
                 tar -xzf $tarball -C $WebappDir --strip-components=1
                 Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
                 Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
@@ -632,8 +716,8 @@ monitor = true
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
 
     if ($InstallMcp) {
-        Write-Host "To launch biopb-mcp as an MCP server directly:" -ForegroundColor Green
-        Write-Cmd "biopb-mcp"
+        Write-Host "Your AI agent launches biopb-mcp over stdio - just start your agent" -ForegroundColor Green
+        Write-Host "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it." -ForegroundColor Green
         Write-Host ""
     }
 

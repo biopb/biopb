@@ -5,7 +5,11 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
-# Requirements: curl, git, tar
+# By default this installs prebuilt wheels from the latest GitHub release.
+# Set BIOPB_INSTALL_FROM_SOURCE=1 to instead build HEAD from a git checkout
+# (the fast path for development); that mode additionally needs git + a compiler.
+#
+# Requirements: curl, tar (+ git for BIOPB_INSTALL_FROM_SOURCE=1)
 #
 
 # ANSI colors — suppressed when stdout is not a terminal
@@ -39,10 +43,15 @@ _confirm() {
 # Interactive checkbox menu. Redraws in place; all output goes to /dev/tty.
 # Usage: _checkbox "Label one" "Label two" ...
 # Prints space-separated 1/0 values (one per label) to stdout.
+# Items default to checked; set the global CHECKBOX_DEFAULTS array (one 1/0 per
+# label) before calling to override individual initial states.
 _checkbox() {
     local labels=("$@")
     local n=${#labels[@]}
-    local sel=(); for ((i=0; i<n; i++)); do sel+=(1); done
+    local sel=()
+    for ((i=0; i<n; i++)); do
+        sel+=("${CHECKBOX_DEFAULTS[$i]:-1}")
+    done
     local first=1
 
     while true; do
@@ -152,17 +161,21 @@ _py() {
     fi
 }
 
-# Merge the biopb MCP entry into JSON <file> under top-level key <parent> (e.g.
-# "mcpServers" or "mcp"), setting "url": <url> on the supplied <entry> object.
-# Preserves all other content, creates the file (and parents) if absent, and writes
-# atomically. Uses Python (always present) instead of jq, which labs may not have.
-# Returns non-zero and leaves the file untouched on any error.
-_mcp_merge_json() {
-    local file="$1" parent="$2" entry="$3" url="$4"
+# Merge a biopb stdio MCP entry into JSON <file> under top-level key <parent>
+# (e.g. "mcpServers" or "mcp"). <style> picks the entry shape: "stdio" for the
+# standard {command,args} form — no "type" (Claude Desktop, Cursor, the canonical
+# mcp.json) — and "opencode" for opencode's {type:"local", command:[...]} form.
+# <command> and the trailing args are the `biopb-mcp` invocation the client
+# spawns. Preserves all other content, creates the file (and parents) if absent,
+# and writes atomically. JSON-escaping happens in Python, so a command path with
+# spaces is safe. Uses Python (always present) instead of jq, which labs may not
+# have. Returns non-zero and leaves the file untouched on any error.
+_mcp_merge() {
+    local file="$1" parent="$2" style="$3" command="$4"; shift 4
     mkdir -p "$(dirname "$file")"
-    _py - "$file" "$parent" "$entry" "$url" 2>/dev/null <<'PY'
+    _py - "$file" "$parent" "$style" "$command" "$@" 2>/dev/null <<'PY'
 import json, os, sys
-path, parent, entry_json, url = sys.argv[1:5]
+path, parent, style, command, *cmd_args = sys.argv[1:]
 try:
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
@@ -170,8 +183,13 @@ except FileNotFoundError:
     data = {}
 if not isinstance(data, dict):
     sys.exit("%s: top-level JSON is not an object" % path)
-entry = json.loads(entry_json)
-entry["url"] = url
+if style == "opencode":
+    entry = {"type": "local", "command": [command, *cmd_args], "enabled": True}
+else:
+    # Standard mcpServers stdio form (Claude Desktop, Cursor, the canonical
+    # mcp.json): bare command+args, no "type" — that is the form every
+    # mcpServers client accepts (a stray "type" trips stricter validators).
+    entry = {"command": command, "args": cmd_args}
 section = data.get(parent)
 if not isinstance(section, dict):
     section = data[parent] = {}
@@ -213,11 +231,11 @@ PY
 }
 
 # Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
-# Cursor, …). biopb-mcp is a streamable-http server, so clients connect to its URL —
-# not spawn it over stdio. Usage: _mcp_json_merge <config-file> <url> <label>
+# Cursor, …). biopb-mcp speaks stdio, so the client spawns the command itself.
+# Usage: _mcp_json_merge <config-file> <command> <label> [args...]
 _mcp_json_merge() {
-    local file="$1" url="$2" label="$3"
-    if _mcp_merge_json "$file" "mcpServers" '{"type": "http"}' "$url"; then
+    local file="$1" command="$2" label="$3"; shift 3
+    if _mcp_merge "$file" "mcpServers" "stdio" "$command" "$@"; then
         _ok "$label: registered biopb ($file)"
     else
         _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
@@ -309,10 +327,12 @@ _setup_mcp() {
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
-    # biopb-mcp is a long-running streamable-http server (it owns the shared napari
-    # window); clients connect to its URL rather than spawning it over stdio. This
-    # must match the default port in config.json below — change both if you set mcp.port.
-    local mcp_url="http://127.0.0.1:8765/mcp"
+    # biopb-mcp 0.6.0+ speaks MCP over stdio: the AI agent spawns it as a child
+    # process (`biopb-mcp --transport stdio`) rather than connecting to a
+    # long-running HTTP server. Each client therefore needs the *command* to run,
+    # not a URL — and we register the resolved absolute path so GUI agents (e.g.
+    # Claude Desktop), which don't inherit the shell PATH, can still find it.
+    local mcp_args=(--transport stdio)
 
     # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
     # Preserved if it already exists so the user's tweaks survive a rerun.
@@ -338,17 +358,11 @@ EOF
     fi
 
     # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
-    cat > "$CONFIG_DIR/mcp.json" << EOF
-{
-  "mcpServers": {
-    "biopb": {
-      "type": "http",
-      "url": "$mcp_url"
-    }
-  }
-}
-EOF
-    _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    if _mcp_merge "$CONFIG_DIR/mcp.json" "mcpServers" "stdio" "$mcp_cmd" "${mcp_args[@]}"; then
+        _ok "MCP definition written: $CONFIG_DIR/mcp.json"
+    else
+        _warn "Could not write $CONFIG_DIR/mcp.json"
+    fi
 
     local detected=0
 
@@ -357,11 +371,11 @@ EOF
         detected=1
         if claude mcp get biopb &>/dev/null; then
             _ok "Claude Code: biopb already registered"
-        elif claude mcp add --scope user --transport http biopb "$mcp_url" &>/dev/null; then
+        elif claude mcp add --scope user biopb -- "$mcp_cmd" "${mcp_args[@]}" &>/dev/null; then
             _ok "Claude Code: registered biopb (user scope)"
         else
             _warn "Claude Code detected but registration failed — add it manually:"
-            _cmd "claude mcp add --scope user --transport http biopb $mcp_url"
+            _cmd "claude mcp add --scope user biopb -- $mcp_cmd ${mcp_args[*]}"
         fi
     fi
 
@@ -373,7 +387,7 @@ EOF
         else
             _ok "Hermes detected"
             _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
-            printf "    %sbiopb:\n      transport: \"http\"\n      url: \"%s\"%s\n" "$DIM" "$mcp_url" "$RESET"
+            printf "    %sbiopb:\n      command: \"%s\"\n      args: [\"--transport\", \"stdio\"]%s\n" "$DIM" "$mcp_cmd" "$RESET"
         fi
     fi
 
@@ -385,13 +399,13 @@ EOF
     esac
     if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
         detected=1
-        _mcp_json_merge "$cd_cfg" "$mcp_url" "Claude Desktop"
+        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}"
     fi
 
     # --- Cursor ---
     if [ -d "$HOME/.cursor" ]; then
         detected=1
-        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_url" "Cursor"
+        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}"
     fi
 
     # --- opencode ---
@@ -399,26 +413,26 @@ EOF
     if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
         detected=1
         local opencode_cfg="$opencode_cfg_dir/opencode.json"
-        if _mcp_merge_json "$opencode_cfg" "mcp" '{"type": "remote", "enabled": true}' "$mcp_url"; then
+        if _mcp_merge "$opencode_cfg" "mcp" "opencode" "$mcp_cmd" "${mcp_args[@]}"; then
             _ok "opencode: registered biopb ($opencode_cfg)"
         else
             _warn "opencode: could not update $opencode_cfg — add biopb manually"
             _info "Add under 'mcp' in $opencode_cfg:"
-            printf "    %s\"biopb\": {\"type\": \"remote\", \"url\": \"%s\", \"enabled\": true}%s\n" "$DIM" "$mcp_url" "$RESET"
+            printf "    %s\"biopb\": {\"type\": \"local\", \"command\": [\"%s\", \"--transport\", \"stdio\"], \"enabled\": true}%s\n" "$DIM" "$mcp_cmd" "$RESET"
         fi
     fi
 
     if [ "$detected" = "0" ]; then
         _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes, opencode)."
-        _info "To use biopb, point your MCP client at this streamable-http endpoint:"
-        _cmd "$mcp_url"
+        _info "To use biopb, register this stdio command with your MCP client:"
+        _cmd "$mcp_cmd ${mcp_args[*]}"
         _info "A ready-to-use definition is at: $CONFIG_DIR/mcp.json"
     fi
 
-    # biopb-mcp must be running for clients to connect — it is the shared napari session.
-    _info "Start the shared session first by running:"
-    _cmd "$mcp_cmd"
-    _info "A napari window opens; your agent then connects to $mcp_url"
+    # There is no separate server to start: the agent spawns biopb-mcp over stdio
+    # on demand, which opens the napari window and brings up the data plane.
+    _info "Your AI agent launches biopb-mcp automatically; a napari window opens"
+    _info "when it does — no need to start it by hand."
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -468,13 +482,72 @@ _ensure_local_bin_on_path() {
     # printf   "${YELLOW}${BOLD}  %s${RESET}\n\n" "$rule"
 }
 
+# --- Release-based install helpers -------------------------------------------
+# The default install path pulls prebuilt wheels (and the data browser) from the
+# most recent GitHub release rather than building HEAD from git. That drops the
+# git/buf/proto-generation step and keeps the self-contained server wheel paired
+# with the exact biopb wheel it was built against (no PyPI version-coupling).
+
+# Fetch the latest release metadata once and cache it in RELEASE_JSON / RELEASE_TAG.
+# One API call serves both the wheels and the data browser, keeping us under the
+# unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
+_fetch_latest_release() {
+    [ -n "${RELEASE_JSON:-}" ] && return 0
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null) || return 1
+    # `|| true`: a missing/error API response (no "tag_name") makes grep exit 1,
+    # which under `set -euo pipefail` would otherwise abort the whole installer
+    # from inside this command substitution. We want to return 1 and let the
+    # caller print a friendly message, so the empty-tag check below handles it.
+    RELEASE_TAG=$(printf '%s' "$RELEASE_JSON" \
+        | grep '"tag_name"' | head -1 \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/') || true
+    [ -n "${RELEASE_TAG:-}" ] || return 1
+    if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
+        _warn "Unexpected release tag format: $RELEASE_TAG"
+        RELEASE_TAG=""
+        return 1
+    fi
+    return 0
+}
+
+# Percent-decode a URL path component (e.g. %2B -> +). GitHub encodes the '+' in
+# a wheel's local version segment as %2B in the asset URL, but the on-disk file
+# must carry the literal '+' or pip/uv reject the wheel (its filename version no
+# longer matches the metadata). Used to recover the real wheel name from the URL.
+_urldecode() { printf '%b' "${1//%/\\x}"; }
+
+# Print the download URL of the first release asset whose filename matches the
+# given extended-regex (anchored at the end of the URL). Empty if none matches.
+# Requires _fetch_latest_release to have populated RELEASE_JSON first.
+# `|| true`: no match makes grep exit 1, which under `set -euo pipefail` would
+# abort the whole installer from inside the caller's command substitution.
+# Callers rely on an empty string to fall back / show a friendly error, so we
+# stay tolerant and return 0 with no output instead.
+_release_asset_url() {
+    printf '%s' "${RELEASE_JSON:-}" \
+        | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | sed -E 's/.*"(https[^"]+)".*/\1/' \
+        | grep -E "/$1\$" | head -1 || true
+}
+
 install_biopb() {
     set -euo pipefail
 
     REPO_URL="https://github.com/biopb/biopb"
     REPO="git+$REPO_URL"
+    RELEASE_REPO="biopb/biopb"   # owner/name for the GitHub Releases API
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
+
+    # Install path: default is prebuilt wheels from the latest GitHub release
+    # (no git checkout, no buf/proto build). BIOPB_INSTALL_FROM_SOURCE=1 switches
+    # to building HEAD from git — the fast path for development/testing.
+    if [ -n "${BIOPB_INSTALL_FROM_SOURCE:-}" ] && [ "${BIOPB_INSTALL_FROM_SOURCE}" != "0" ]; then
+        INSTALL_FROM_SOURCE=1
+    else
+        INSTALL_FROM_SOURCE=0
+    fi
 
     printf "\n%s" "${CYAN}"
     echo "    ____  _       ____  ____  "
@@ -529,7 +602,7 @@ install_biopb() {
     # git/cc are absent, so the later `uv tool install … @ git+…` dies with a
     # cryptic `xcrun: error: invalid active developer path`. Check for the actual
     # toolchain up front and give an actionable message instead.
-    if [ "$PLATFORM" = "macOS" ] && ! xcode-select -p &>/dev/null; then
+    if [ "$PLATFORM" = "macOS" ] && [ "$INSTALL_FROM_SOURCE" = "1" ] && ! xcode-select -p &>/dev/null; then
         _err "Xcode Command Line Tools not found."
         _info "biopb needs them for git and the C compiler/headers used to build packages."
         _info "Install them, then rerun this script:"
@@ -538,8 +611,11 @@ install_biopb() {
         exit 1
     fi
 
-    # Check required tools
-    for tool in curl git tar; do
+    # Check required tools. git is only needed to build from a source checkout;
+    # the default release install just downloads prebuilt wheels (curl + tar).
+    required_tools=(curl tar)
+    [ "$INSTALL_FROM_SOURCE" = "1" ] && required_tools+=(git)
+    for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
             _err "$tool not found"
             case "$PLATFORM" in
@@ -554,10 +630,14 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
+    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
+    # most labs don't need (only legacy/proprietary formats require it).
+    CHECKBOX_DEFAULTS=(1 1 0)
     read -r INSTALL_WEBAPP INSTALL_MCP INSTALL_BIOFORMATS <<< "$(_checkbox \
         "Built-in data browser" \
         "biopb-mcp (MCP server)" \
         "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)")"
+    unset CHECKBOX_DEFAULTS
     echo ""
 
     # ===== 1. Install uv + buf (if needed) =====
@@ -576,25 +656,29 @@ install_biopb() {
         _ok "uv already installed ($(uv --version))"
     fi
 
-    BUF_VERSION="1.70.0"
-    # Install into the user's ~/.local/bin (already prepended to PATH above), not
-    # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
-    # there fails with "failed to write to destination". Keeps buf user-local and
-    # consistent with uv's tool bin dir and the Windows installer.
-    BUF_BIN="$HOME/.local/bin"
-    if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
-        _info "Installing buf $BUF_VERSION..."
-        mkdir -p "$BUF_BIN"
-        rm -f "$BUF_BIN/buf"
-        curl -sSL \
-            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
-            -o "$BUF_BIN/buf"
-        chmod +x "$BUF_BIN/buf"
-        _ok "buf $BUF_VERSION installed"
-    else
-        _ok "buf already installed ($(buf --version))"
+    # buf generates the protobuf/Flight stubs at build time, so it is only needed
+    # when building from a source checkout. Release wheels ship the stubs prebuilt.
+    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
+        BUF_VERSION="1.70.0"
+        # Install into the user's ~/.local/bin (already prepended to PATH above), not
+        # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
+        # there fails with "failed to write to destination". Keeps buf user-local and
+        # consistent with uv's tool bin dir and the Windows installer.
+        BUF_BIN="$HOME/.local/bin"
+        if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
+            _info "Installing buf $BUF_VERSION..."
+            mkdir -p "$BUF_BIN"
+            rm -f "$BUF_BIN/buf"
+            curl -sSL \
+                "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
+                -o "$BUF_BIN/buf"
+            chmod +x "$BUF_BIN/buf"
+            _ok "buf $BUF_VERSION installed"
+        else
+            _ok "buf already installed ($(buf --version))"
+        fi
+        unset BUF_VERSION BUF_BIN
     fi
-    unset BUF_VERSION BUF_BIN
 
     # ===== 2. Python =====
     _step "[2/6] Ensuring Python..."
@@ -653,6 +737,46 @@ install_biopb() {
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
 
+    # Resolve where biopb + biopb-tensor-server come from. They must be installed
+    # as a matched pair from a single build: the tensor server is self-contained
+    # and may use proto fields newer than any biopb published on PyPI, so biopb is
+    # always pinned to the sibling artifact (a git ref in source mode, a local
+    # wheel in release mode) and the resolver is never allowed to pull it from PyPI.
+    local biopb_req tensor_req
+    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
+        _info "Building from source (HEAD of $REPO_URL)"
+        biopb_req="biopb[tensor] @ $REPO"
+        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+    else
+        if ! _fetch_latest_release; then
+            _err "Could not fetch the latest biopb release from $RELEASE_REPO."
+            _info "Check your network, or build from source instead:"
+            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
+            exit 1
+        fi
+        local sdk_url tensor_url
+        sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
+        tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
+        if [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
+            _err "Release $RELEASE_TAG has no biopb wheels attached."
+            _info "Build from source instead:"
+            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
+            exit 1
+        fi
+        _info "Installing from release $RELEASE_TAG"
+        WHEELS_DIR=$(mktemp -d)
+        # Remove the wheel download dir on any exit (success, error, or set -e).
+        trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
+        local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+        local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+        curl -fsSL "$sdk_url" -o "$sdk_whl"
+        curl -fsSL "$tensor_url" -o "$tensor_whl"
+        # Direct file:// references pin biopb to this exact wheel, so uv resolves
+        # the server's `biopb` dependency to it rather than to PyPI.
+        biopb_req="biopb[tensor] @ file://$sdk_whl"
+        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
+    fi
+
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
     #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
@@ -665,21 +789,23 @@ install_biopb() {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
-    # psutil) — without it `import mcp` fails. We require >=0.5.4: that release
-    # drops biopb-mcp's stray, unpinned grpcio-tools dependency, which otherwise
-    # collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
+    # psutil) — without it `import mcp` fails. We require >=0.6.0: that release makes
+    # stdio the default transport (matching the MCP client config this installer
+    # writes) and also drops biopb-mcp's stray, unpinned grpcio-tools dependency,
+    # which otherwise collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
+    # It comes from PyPI in both modes (no biopb-mcp wheel ships in the release).
     local install_args=(
         --upgrade
         --force
         --python "$PYTHON_SPEC"
-        "biopb[tensor] @ $REPO"
-        --with "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+        "$biopb_req"
+        --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
     if [ "$INSTALL_MCP" = "1" ]; then
         _info "  including biopb-mcp + napari"
         install_args+=(
-            --with "biopb-mcp[mcp]>=0.5.4"
+            --with "biopb-mcp[mcp]>=0.6.0"
             --with "napari[all]"
             --with-executables-from biopb-mcp
         )
@@ -687,6 +813,7 @@ install_biopb() {
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
+    # The wheel download dir (if any) is removed by the EXIT trap set above.
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
@@ -697,28 +824,23 @@ install_biopb() {
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
 
-        LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/jiyuuchc/biopb/releases/latest" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"([^"]+)".*/\1/' \
-            || echo "")
-
-        if [ -n "$LATEST_TAG" ] && ! printf '%s' "$LATEST_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
-            _warn "Unexpected tag format, skipping data browser install"
-            LATEST_TAG=""
-        fi
-
-        if [ -n "$LATEST_TAG" ]; then
+        # Reuses the release metadata already fetched for the wheels (cached);
+        # in source mode this is the first and only call.
+        if _fetch_latest_release; then
             INSTALLED_TAG=""
             [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
-            if [ "$INSTALLED_TAG" = "$LATEST_TAG" ]; then
-                _ok "Data browser already up to date ($LATEST_TAG)"
+            if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
+                _ok "Data browser already up to date ($RELEASE_TAG)"
             else
-                _info "Downloading $LATEST_TAG..."
+                _info "Downloading $RELEASE_TAG..."
                 rm -rf "${WEBAPP_DIR:?}"
                 mkdir -p "$WEBAPP_DIR"
-                curl -fsSL "$REPO_URL/releases/download/$LATEST_TAG/webapp.tar.gz" \
+                local webapp_url
+                webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
+                webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
+                curl -fsSL "$webapp_url" \
                     | tar -xzf - -C "$WEBAPP_DIR" --strip-components=1
-                printf '%s' "$LATEST_TAG" > "$WEBAPP_DIR/.version"
+                printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
                 _ok "Data browser installed to: $WEBAPP_DIR"
             fi
         else
@@ -855,21 +977,20 @@ EOF
         printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
         printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
 
-        printf "  %s1. Start a new shell session.%s Run:\n" "${BOLD}" "${RESET}"
-        _cmd "biopb-mcp"
-        _info "This starts the biopb stack and opens a napari window. Keep it"
-        _info "running while you use the system."
-        echo ""
-
-        printf "  %s2. Check your data.%s Confirm it appears in the napari panel on the right.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "  %s3. Connect an AI agent%s, then prompt away! Run:\n" "${BOLD}" "${RESET}"
+        printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
         if [ -n "$agent_cmd" ]; then
             _cmd "$agent_cmd"
         else
             _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
         fi
+        _info "The agent launches biopb-mcp for you and a napari window opens."
+        _info "Keep the agent session running while you work."
+        echo ""
+
+        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+        echo ""
+
+        printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
         echo ""
 
         printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
