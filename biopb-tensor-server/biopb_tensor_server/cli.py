@@ -342,6 +342,10 @@ def _setup_flight_server(
             watcher.stop()
             watcher = None
 
+    # Initial scan/registration is complete: flip the health action from
+    # STARTING to SERVING so clients waiting through startup can proceed.
+    server.mark_ready()
+
     console.print(f"[green]Flight server ready at {location}[/green]")
 
     return server, source_manager, watcher
