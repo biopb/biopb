@@ -46,9 +46,10 @@ jobs:
           distribution: 'temurin'
           cache: maven
       - name: Build and test with Maven
-        # `verify` runs compile -> test -> package -> verify once; the previous
-        # `package` + `test` ran the unit-test suite twice per matrix job.
-        run: mvn -B verify --file pom.xml
+        # `package` runs compile -> test -> package, so the unit-test suite runs
+        # exactly once. The previous `package` + `test` ran it twice; `verify`
+        # would over-reach into the gpg sign-artifacts goal (no key in CI).
+        run: mvn -B package --file pom.xml
 
   deploy:
     needs: build
