@@ -9,6 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
@@ -31,7 +32,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .._connection import TensorConnection
+from .._connection import ServerStarting, TensorConnection
 from .._tensor_utils import build_layer_scale, build_pyramid_levels
 from .._viewer_compute import wrap_levels
 
@@ -351,6 +352,23 @@ class TensorBrowserWidget(QWidget):
         self._selected_tensor_id: str | None = None
         self._expanded_folders: Set[str] = set()
 
+        # Non-blocking connect poller state (issue #12). The connect runs on the
+        # Qt main thread, so a STARTING (booting) server is polled via a
+        # self-rescheduling single-shot timer with capped exponential backoff
+        # rather than a blocking wait that would freeze the viewer.
+        self._connect_url: str = ""
+        self._connect_token: str | None = None
+        self._offer_autostart_on_fail: bool = False
+        self._connect_backoff_ms: int = 500
+        # Monotonic deadline until which a *connection failure* is tolerated as
+        # "still booting" (set only while waiting on a server we just launched);
+        # None means a down server fails fast.
+        self._connect_boot_deadline: float | None = None
+        # Supersession token: each new connect bumps it so any in-flight poll
+        # chain (e.g. an autostart boot wait) stops when the user retargets a
+        # different server. The old local server is left running.
+        self._connect_gen: int = 0
+
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._setup_ui()
@@ -405,7 +423,7 @@ class TensorBrowserWidget(QWidget):
         # Connect and Refresh buttons
         btn_layout = QHBoxLayout()
         self._connect_button = QPushButton("Connect")
-        self._connect_button.clicked.connect(self._connect)
+        self._connect_button.clicked.connect(self._on_connect_clicked)
         self._refresh_button = QPushButton("Refresh")
         self._refresh_button.clicked.connect(self._refresh)
         self._refresh_button.setEnabled(False)
@@ -450,6 +468,14 @@ class TensorBrowserWidget(QWidget):
         self._metadata_label.setVisible(False)
         layout.addWidget(self._metadata_label)
 
+        # Status/progress display (e.g. "server starting — scanning…"); grey,
+        # distinct from the red error label below.
+        self._status_label = QLabel()
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #888;")
+        self._status_label.setVisible(False)
+        layout.addWidget(self._status_label)
+
         # Error display
         self._error_label = QLabel()
         self._error_label.setWordWrap(True)
@@ -457,19 +483,20 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setVisible(False)
         layout.addWidget(self._error_label)
 
-    def _auto_connect(self):
-        """Attempt to connect using resolved URL/token. Fails silently.
+    def _on_connect_clicked(self, *args):
+        """Connect button handler: connect without offering autostart on fail."""
+        self._offer_autostart_on_fail = False
+        self._connect()
 
-        If the initial connect leaves us unconnected, offer to start a local
+    def _auto_connect(self):
+        """Attempt to connect using resolved URL/token.
+
+        Connect runs as a non-blocking poller (see :meth:`_connect`); if it
+        ends up unreachable, the terminal "down" branch offers to start a local
         biopb server as a last resort (see ``_maybe_offer_start_server``).
         """
-        try:
-            self._connect()
-        except Exception:
-            logger.debug("Auto-connect failed", exc_info=True)
-
-        if not self._conn.is_connected:
-            self._maybe_offer_start_server()
+        self._offer_autostart_on_fail = True
+        self._connect()
 
     def _maybe_offer_start_server(self):
         """Offer to start a local biopb server when startup connect failed.
@@ -496,30 +523,32 @@ class TensorBrowserWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        # Launch the daemon (quick — it detaches immediately), then hand off to
+        # the non-blocking poller so the viewer stays responsive while the
+        # server binds and scans its data folder. The user may type a different
+        # server URL and click Connect during the wait; that supersedes this
+        # poll (the local server is left running). See issue #12.
         self._clear_error()
-        QApplication.setOverrideCursor(Qt.BusyCursor)
+        timeout = self._conn.server_start_timeout()
         try:
-            self._conn.start_local_server()
+            self._conn.launch_local_server(startup_timeout=timeout)
         except Exception as exc:
-            logger.exception("Failed to start local biopb server")
-            # Surface the underlying cause (e.g. port already in use, startup
-            # timeout) instead of a generic message — the root cause is
-            # otherwise only visible in the server logs. See
+            # Launching a server we were asked to start failing is unexpected:
+            # show the underlying cause (e.g. port already in use) inline and
+            # also let it propagate to napari's notification_manager. See
             # docs/troubleshooting.md for remedies.
             self._show_error(f"Failed to start local biopb server: {exc}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
+            raise
 
-        # Connected: reflect the live connection in the UI.
         self._server_input.setText(self._conn.url)
-        if self._conn.token:
-            self._token_input.setText(self._conn.token)
-        if not self._sources:
-            self._show_error("No sources found on server")
-            return
-        self._build_and_display_tree()
-        self._refresh_button.setEnabled(True)
+        self._connect_url = self._conn.url
+        self._connect_token = self._conn.token
+        # Tolerate connection-refused as "still booting" until this deadline.
+        self._connect_boot_deadline = time.monotonic() + timeout
+        # Don't re-offer autostart from inside the boot poll.
+        self._offer_autostart_on_fail = False
+        self._show_status("Starting local biopb server…")
+        self._begin_poll()
 
     def _toggle_token_visibility(self):
         """Toggle token field visibility between password and normal mode."""
@@ -540,45 +569,123 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setVisible(False)
         self._error_label.setText("")
 
+    def _show_status(self, msg: str):
+        """Display a transient status/progress message (grey, non-error)."""
+        self._status_label.setText(msg)
+        self._status_label.setVisible(True)
+
+    def _clear_status(self):
+        """Clear the status/progress message."""
+        self._status_label.setVisible(False)
+        self._status_label.setText("")
+
     def _connect(self):
-        """Connect to server and list available sources."""
+        """Begin connecting to the server in the input field (non-blocking).
+
+        Wired (via :meth:`_on_connect_clicked`) to the Connect button and called
+        by :meth:`_auto_connect`. Reads the URL/token from the fields, drops out
+        of any boot wait (a down server fails fast here), and starts a fresh
+        poll chain — superseding any in-flight one, so the user can retarget a
+        different server mid-wait (issue #12).
+        """
         self._clear_error()
+        self._clear_status()
         self._tree_widget.clear()
         self._metadata_label.setVisible(False)
         self._selected_source_id = None
         self._selected_tensor_id = None
 
+        self._connect_url = self._server_input.text().strip()
+        self._connect_token = self._token_input.text().strip() or None
+        self._connect_boot_deadline = None
+        self._begin_poll()
+
+    def _begin_poll(self):
+        """(Re)start the poll chain, superseding any in-flight one."""
+        self._connect_gen += 1
+        # Reset backoff so a fresh connect/retry starts snappy.
+        self._connect_backoff_ms = 500
+        self._connect_tick(self._connect_gen)
+
+    def _rearm(self, gen: int):
+        """Schedule the next poll tick with capped exponential backoff."""
+        QTimer.singleShot(
+            self._connect_backoff_ms, lambda: self._connect_tick(gen)
+        )
+        self._connect_backoff_ms = min(self._connect_backoff_ms * 2, 5000)
+
+    def _connect_tick(self, gen: int):
+        """One connect attempt; re-arms itself while the server is starting."""
+        if gen != self._connect_gen:
+            # Superseded by a newer connect (e.g. the user retargeted a
+            # different server). Stop this stale chain.
+            return
         try:
-            location = self._server_input.text().strip()
-            token = self._token_input.text().strip() or None
             # Connection service owns the client/sources and persists the URL.
-            sources = self._conn.connect(location, token)
-
-            if self._use_server_query:
-                self._filter_input.setPlaceholderText("Search (SQL filter)")
-            else:
-                self._filter_input.setPlaceholderText("Search sources...")
-
-            if not sources:
-                self._show_error("No sources found on server")
-                self._refresh_button.setEnabled(False)
-                return
-
-            self._build_and_display_tree()
-            self._refresh_button.setEnabled(True)
-
-            if self._use_server_query:
-                logger.info(
-                    "Large catalog (%d sources), server-side SQL filter enabled",
-                    len(sources),
+            sources = self._conn.connect(
+                self._connect_url, self._connect_token
+            )
+        except ServerStarting:
+            # Server is up but still scanning its data folder: keep waiting
+            # with progress feedback and capped exponential backoff.
+            self._show_status(self._conn.last_message)
+            self._rearm(gen)
+            return
+        except Exception as exc:
+            # Connection failed. While waiting on a server we just launched,
+            # tolerate this (the daemon may not have bound its port yet) until
+            # the boot deadline, then give up. Otherwise fail fast.
+            if self._connect_boot_deadline is not None:
+                if time.monotonic() < self._connect_boot_deadline:
+                    self._show_status("Starting local biopb server…")
+                    self._rearm(gen)
+                    return
+                # Boot timed out: this is unexpected (we launched it
+                # ourselves), so surface the underlying cause and let napari's
+                # notification_manager show it.
+                self._connect_boot_deadline = None
+                self._clear_status()
+                self._show_error(
+                    f"Local biopb server did not become ready in time: {exc}"
                 )
-
-        except Exception:
-            # The connection service has already reset its client/sources.
-            self._show_error("Connection failed")
-            logger.exception("Failed to connect to TensorFlight server")
+                self._tree_widget.clear()
+                self._refresh_button.setEnabled(False)
+                raise
+            # An ordinary unreachable server is an expected condition, not an
+            # error to surface to napari: show a friendly inline hint instead.
+            self._clear_status()
+            self._show_error(
+                f"Cannot reach tensor server at {self._connect_url} — "
+                "is it running?"
+            )
+            logger.info("Tensor server unreachable at %s", self._connect_url)
             self._tree_widget.clear()
             self._refresh_button.setEnabled(False)
+            if self._offer_autostart_on_fail:
+                self._maybe_offer_start_server()
+            return
+
+        # Connected.
+        self._connect_boot_deadline = None
+        self._clear_status()
+        if self._use_server_query:
+            self._filter_input.setPlaceholderText("Search (SQL filter)")
+        else:
+            self._filter_input.setPlaceholderText("Search sources...")
+
+        if not sources:
+            self._show_error("No sources found on server")
+            self._refresh_button.setEnabled(False)
+            return
+
+        self._build_and_display_tree()
+        self._refresh_button.setEnabled(True)
+
+        if self._use_server_query:
+            logger.info(
+                "Large catalog (%d sources), server-side SQL filter enabled",
+                len(sources),
+            )
 
     def _refresh(self):
         """Refresh the source list from server."""

@@ -82,6 +82,12 @@ class TestLoadConfig:
         assert "timeout" in config
         assert "grpc" in config
 
+    def test_mcp_has_server_start_timeout(self):
+        """The mcp section exposes the autostart boot-wait budget (issue #12)."""
+        defaults = get_default_config()
+        assert "server_start_timeout" in defaults["mcp"]
+        assert defaults["mcp"]["server_start_timeout"] == 60.0
+
 
 class TestSaveConfig:
     """Tests for save_config function."""

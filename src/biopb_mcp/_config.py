@@ -82,6 +82,12 @@ DEFAULT_CONFIG = {
         "dask_dashboard_address": "127.0.0.1:0",
         "kernel_name": "python3",
         "kernel_startup_timeout": 60.0,
+        # Give-up budget (seconds) for start_local_server's just-launched boot
+        # wait, where connection-refused is tolerated while the server binds and
+        # scans its data folder. The normal auto-connect path has no timeout: it
+        # fails fast on a down server and polls a STARTING (scanning) server
+        # indefinitely with progress feedback (issue #12).
+        "server_start_timeout": 60.0,
         # execute_timeout now bounds only the *quick* in-band kernel snippets
         # (screenshot / status / inspect / job submit+poll), not long jobs:
         # execute_code runs agent code in a background thread that may run

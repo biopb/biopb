@@ -44,6 +44,42 @@ DEFAULT_SERVER_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+class ServerStarting(Exception):
+    """Raised by :meth:`TensorConnection.connect` when the server's health
+    action reports a non-``SERVING`` status (e.g. ``STARTING`` while it scans
+    its data folder; see biopb#17).
+
+    Distinct from a connection failure: the server is up and will become ready,
+    so callers should keep waiting with feedback rather than fail fast (issue
+    #12). The catalog is *not* committed while this is raised.
+    """
+
+    def __init__(self, status, health=None) -> None:
+        self.status = status
+        self.health = health
+        super().__init__(f"tensor server starting (status={status})")
+
+
+def _starting_message(health) -> str:
+    """Friendly 'server is starting' message, enriched with progress from the
+    health payload (``source_count`` / ``uptime_seconds``) when available."""
+    msg = (
+        "Tensor server is starting — scanning its data folder; this can take "
+        "a while for large catalogs."
+    )
+    if isinstance(health, dict):
+        bits = []
+        count = health.get("source_count")
+        if count is not None:
+            bits.append(f"{count} sources registered so far")
+        uptime = health.get("uptime_seconds")
+        if uptime is not None:
+            bits.append(f"up {int(uptime)}s")
+        if bits:
+            msg += " (" + ", ".join(bits) + ")"
+    return msg
+
+
 def biopb_cli_available() -> bool:
     """Return True if the ``biopb`` command-line tool is on PATH."""
     return shutil.which("biopb") is not None
@@ -65,6 +101,12 @@ class TensorConnection:
         self.client: TensorFlightClient | None = None
         self.sources: Dict[str, DataSourceDescriptor] = {}
         self.use_server_query: bool = False
+
+        # Last connect outcome, read by the widget status label and the MCP
+        # server_status tool: "disconnected" | "starting" | "connected" |
+        # "error". last_message carries the friendly "starting…" detail.
+        self.last_status: str = "disconnected"
+        self.last_message: str = ""
 
         cfg = config if config is not None else load_config()
         self.url, self.token = self.resolve_from_config(cfg)
@@ -102,14 +144,48 @@ class TensorConnection:
         Updates ``client``/``sources``/``url``/``token``/``use_server_query`` and
         persists the URL to config. On failure, resets ``client``/``sources`` and
         re-raises so the caller can drive its own error display.
+
+        Before trusting the catalog, a best-effort health probe gates on the
+        server being ready: the server binds its port *before* finishing its
+        data-folder scan, so a mid-scan ``list_sources()`` can return a partial
+        catalog that looks complete. If the server reports a non-``SERVING``
+        status (biopb#17), this raises :class:`ServerStarting` so the caller can
+        keep waiting with feedback instead of failing or trusting a half-built
+        catalog. The probe is *advisory*: a server with no health action (older
+        servers) or a transient probe error falls through to ``list_sources()``,
+        which stays the authoritative connectivity test — so older servers
+        behave exactly as before (issue #12).
         """
         try:
-            self.client = TensorFlightClient(url, token=token)
-            sources = self.client.list_sources()
+            client = TensorFlightClient(url, token=token)
+
+            # Advisory probe: any failure falls through to list_sources(),
+            # which stays the authoritative connectivity test.
+            try:
+                health = client.health_check()
+                status = (
+                    health.get("status", "SERVING")
+                    if isinstance(health, dict)
+                    else "SERVING"
+                )
+            except Exception:  # noqa: BLE001
+                health, status = None, "SERVING"
+            if status != "SERVING":
+                self.client = None
+                self.sources = {}
+                self.use_server_query = False
+                self.last_status = "starting"
+                self.last_message = _starting_message(health)
+                raise ServerStarting(status, health)
+
+            sources = client.list_sources()
+            self.client = client
             self.url = url
             self.token = token
             self.sources = sources
             self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
+            self.last_status = "connected"
+            self.last_message = ""
             self.persist_url()
             if self.on_connect is not None:
                 try:
@@ -117,10 +193,14 @@ class TensorConnection:
                 except Exception:  # noqa: BLE001 - hook is best-effort
                     logger.exception("on_connect hook failed")
             return sources
+        except ServerStarting:
+            raise
         except Exception:
             self.client = None
             self.sources = {}
             self.use_server_query = False
+            self.last_status = "error"
+            self.last_message = ""
             raise
 
     def refresh(self) -> Dict[str, DataSourceDescriptor]:
@@ -162,27 +242,70 @@ class TensorConnection:
         """
         return is_local_url(self.url) and biopb_cli_available()
 
-    def start_local_server(
+    def connect_when_booted(
+        self,
+        url: str,
+        token: str | None = None,
+        timeout: float = 60.0,
+        poll_interval: float = 0.5,
+        max_interval: float = 5.0,
+    ) -> Dict[str, DataSourceDescriptor]:
+        """Connect to a server we just launched, waiting it through boot.
+
+        Polls :meth:`connect` with capped exponential backoff until it returns
+        sources (``SERVING``) or *timeout* elapses. Unlike the normal connect
+        path, a connection failure is *tolerated* here (the freshly-launched
+        daemon may not have bound its port yet) and a ``STARTING`` status is
+        kept waiting on — both just retry. Raises ``RuntimeError`` on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        interval = poll_interval
+        last_exc: Exception | None = None
+        while True:
+            try:
+                return self.connect(url, token)
+            except ServerStarting as exc:
+                last_exc = exc
+            # Just-launched server: tolerate connection failures and keep
+            # waiting until the deadline.
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"biopb server did not become ready in {timeout:.0f}s"
+                ) from last_exc
+            time.sleep(interval)
+            interval = min(interval * 2, max_interval)
+
+    def server_start_timeout(self) -> float:
+        """The configured ``mcp.server_start_timeout`` boot-wait budget (s)."""
+        return load_config().get("mcp", {}).get("server_start_timeout", 60.0)
+
+    def launch_local_server(
         self,
         config_path: str | None = None,
-        startup_timeout: float = 20.0,
-    ) -> Dict[str, DataSourceDescriptor]:
-        """Start a local biopb server daemon, then connect to it.
+        startup_timeout: float | None = None,
+    ) -> None:
+        """Spawn ``biopb server start`` and return as soon as it is launched.
 
-        Runs ``biopb server start`` (with ``--config`` when the file exists),
-        then polls :meth:`connect` until the server accepts connections or
-        *startup_timeout* elapses. Returns the source catalog on success;
-        raises on failure.
+        Runs ``biopb server start`` (with ``--config`` when the file exists).
+        The daemon detaches immediately, so this returns quickly *without*
+        waiting for the server to become reachable — callers poll for readiness
+        themselves (the GUI does so non-blockingly; see
+        :meth:`connect_when_booted` for the blocking equivalent). Raises on a
+        non-zero exit. *startup_timeout* (defaulting to
+        ``mcp.server_start_timeout``) bounds only the launch subprocess.
 
         Token handling is left entirely to the CLI: a default local server
-        (localhost flight + web host) needs none, and if the user's config
-        enables token generation the CLI prints it to the console. We connect
-        with whatever token was already resolved from env/config (often
-        ``None`` locally) and do not fabricate one. Output is not captured so
-        any such printed token reaches the console.
+        needs none, and if the user's config enables token generation the CLI
+        prints it to the console. Output is not captured so any such printed
+        token reaches the console.
         """
         if not biopb_cli_available():
             raise RuntimeError("biopb CLI not found on PATH")
+
+        if startup_timeout is None:
+            startup_timeout = self.server_start_timeout()
 
         config = Path(config_path) if config_path else DEFAULT_SERVER_CONFIG
         cmd = ["biopb", "server", "start"]
@@ -197,15 +320,25 @@ class TensorConnection:
                 f"{result.returncode}); see the console and server logs"
             )
 
-        # The daemon detaches immediately; poll until gRPC is reachable.
-        deadline = time.monotonic() + startup_timeout
-        last_exc: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                return self.connect(self.url, self.token)
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(0.5)
-        raise RuntimeError(
-            "biopb server started but did not become reachable in time"
-        ) from last_exc
+    def start_local_server(
+        self,
+        config_path: str | None = None,
+        startup_timeout: float | None = None,
+    ) -> Dict[str, DataSourceDescriptor]:
+        """Launch a local biopb server daemon and block until it is ready.
+
+        Convenience for headless/programmatic use: :meth:`launch_local_server`
+        followed by :meth:`connect_when_booted`. The GUI uses the two steps
+        separately so it can poll without freezing. Returns the source catalog
+        on success; raises on failure.
+        """
+        if startup_timeout is None:
+            startup_timeout = self.server_start_timeout()
+        self.launch_local_server(
+            config_path=config_path, startup_timeout=startup_timeout
+        )
+        # The daemon detaches immediately; poll until it is reachable AND past
+        # its data-folder scan (SERVING), tolerating refused/STARTING meanwhile.
+        return self.connect_when_booted(
+            self.url, self.token, timeout=startup_timeout
+        )

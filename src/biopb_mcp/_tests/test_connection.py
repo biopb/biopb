@@ -27,6 +27,7 @@ def _clear_env(monkeypatch):
 def _fake_client(sources):
     client = MagicMock()
     client.list_sources.return_value = sources
+    client.health_check.return_value = {"status": "SERVING"}
     return client
 
 
@@ -167,6 +168,121 @@ class TestConnect:
 
 
 # ---------------------------------------------------------------------------
+# readiness gating (issue #12): STARTING vs SERVING vs down
+# ---------------------------------------------------------------------------
+
+
+class TestConnectReadiness:
+    def test_starting_raises_server_starting(self, monkeypatch):
+        client = _fake_client({"a": MagicMock()})
+        client.health_check.return_value = {
+            "status": "STARTING",
+            "source_count": 3,
+        }
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        with pytest.raises(_connection.ServerStarting):
+            conn.connect("grpc://host:9")
+
+        # The half-built catalog is never trusted while starting.
+        assert conn.is_connected is False
+        assert conn.last_status == "starting"
+        assert "scanning" in conn.last_message
+        client.list_sources.assert_not_called()
+
+    def test_health_probe_error_falls_through(self, monkeypatch):
+        # Older server with no health action: the advisory probe raises, but
+        # list_sources() still works -> connect succeeds (backward compatible).
+        sources = {"a": MagicMock()}
+        client = _fake_client(sources)
+        client.health_check.side_effect = RuntimeError("no health action")
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        result = conn.connect("grpc://host:9")
+
+        assert result is sources
+        assert conn.is_connected is True
+        assert conn.last_status == "connected"
+
+    def test_down_fails_fast(self, monkeypatch):
+        client = _fake_client({})
+        client.list_sources.side_effect = RuntimeError("unavailable")
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+
+        conn = TensorConnection(config={})
+        # A stale STARTING message from a prior attempt must not linger.
+        conn.last_status = "starting"
+        conn.last_message = "scanning…"
+        with pytest.raises(RuntimeError, match="unavailable"):
+            conn.connect("grpc://host:9")
+        assert conn.is_connected is False
+        assert conn.last_status == "error"
+        assert conn.last_message == ""
+
+    def test_starting_message_includes_zero_counts(self):
+        # source_count=0 is meaningful (just started) and must not be dropped.
+        msg = _connection._starting_message(
+            {"status": "STARTING", "source_count": 0, "uptime_seconds": 0}
+        )
+        assert "0 sources registered so far" in msg
+        assert "up 0s" in msg
+
+
+class TestConnectWhenBooted:
+    def test_waits_through_refused_and_starting(self, monkeypatch):
+        conn = TensorConnection(config={})
+        sources = {"a": MagicMock()}
+        outcomes = [
+            RuntimeError("connection refused"),  # pre-bind window
+            _connection.ServerStarting("STARTING"),  # scanning
+            sources,  # ready
+        ]
+
+        def fake_connect(url, token=None):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(conn, "connect", fake_connect)
+        monkeypatch.setattr(_connection.time, "sleep", lambda s: None)
+
+        result = conn.connect_when_booted("grpc://host:9", timeout=30.0)
+        assert result is sources
+        assert outcomes == []  # all three attempts consumed
+
+    def test_timeout_raises(self, monkeypatch):
+        conn = TensorConnection(config={})
+
+        def always_starting(url, token=None):
+            raise _connection.ServerStarting("STARTING")
+
+        monkeypatch.setattr(conn, "connect", always_starting)
+        monkeypatch.setattr(_connection.time, "sleep", lambda s: None)
+        # Fake clock that jumps past the deadline on the first check.
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        monkeypatch.setattr(_connection.time, "monotonic", fake_monotonic)
+
+        with pytest.raises(RuntimeError, match="did not become ready"):
+            conn.connect_when_booted("grpc://host:9", timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
 # persist_url
 # ---------------------------------------------------------------------------
 
@@ -253,6 +369,48 @@ class TestCanAutostart:
         cfg = {"tensor_browser": {"server_url": "grpc://example.com:8815"}}
         conn = TensorConnection(config=cfg)
         assert conn.can_autostart_server() is False
+
+
+class TestLaunchLocalServer:
+    def test_launches_without_connecting(self, monkeypatch, tmp_path):
+        # launch_local_server only spawns the daemon; it must not connect.
+        client = _fake_client({"a": MagicMock()})
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: True)
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(
+            _connection, "DEFAULT_SERVER_CONFIG", tmp_path / "missing.toml"
+        )
+        calls = {}
+
+        def fake_run(cmd, **kwargs):
+            calls["cmd"] = cmd
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_connection.subprocess, "run", fake_run)
+
+        conn = TensorConnection(config={})
+        assert conn.launch_local_server() is None
+        assert calls["cmd"][:3] == ["biopb", "server", "start"]
+        # No connection attempted by the launch step.
+        client.list_sources.assert_not_called()
+        assert conn.is_connected is False
+
+    def test_raises_without_cli(self, monkeypatch):
+        monkeypatch.setattr(_connection, "biopb_cli_available", lambda: False)
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="biopb CLI not found"):
+            conn.launch_local_server()
+
+    def test_server_start_timeout_from_config(self, monkeypatch):
+        monkeypatch.setattr(
+            _connection,
+            "load_config",
+            lambda: {"mcp": {"server_start_timeout": 12.5}},
+        )
+        conn = TensorConnection(config={})
+        assert conn.server_start_timeout() == 12.5
 
 
 class TestStartLocalServer:

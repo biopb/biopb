@@ -150,6 +150,9 @@ if _tc is not None:
     except Exception as _e:
         print("  connected: true")
         print("  health_error: " + str(_e))
+elif getattr(_conn, "last_status", "") == "starting":
+    print("  connected: false")
+    print("  state: starting — " + str(getattr(_conn, "last_message", "")))
 else:
     print("  connected: false")
 
