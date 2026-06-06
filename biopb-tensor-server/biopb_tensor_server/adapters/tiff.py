@@ -22,6 +22,81 @@ if TYPE_CHECKING:
     from biopb_tensor_server.discovery import DiscoveryState
 
 
+# Known OME / MicroManager naming patterns handled by other adapters.
+_TIFF_EXCLUDE_PATTERNS = {
+    "*.ome.tif",
+    "*.ome.tiff",
+    "img_*.tif",
+    "img_*.tiff",
+    "img_channel*.tif",
+    "img_channel*.tiff",
+}
+
+
+def _filter_tiff_candidates(files: List[Path]) -> List[Path]:
+    """Drop files matching known OME / MicroManager naming patterns."""
+    return [f for f in files if not any(f.match(p) for p in _TIFF_EXCLUDE_PATTERNS)]
+
+
+def _mask_and_digits(name: str) -> Tuple[str, List[int]]:
+    """Split a filename into its structural mask and its numeric fields.
+
+    Each run of digits is replaced by ``#`` to form a *mask* (so files that
+    belong to the same sequence share a mask), and the integer value of each
+    run is returned in order.
+
+    ``"s1-0001_bf.tif"`` -> ``("s#-#_bf.tif", [1, 1])``
+    """
+    digits = [int(m.group()) for m in re.finditer(r"\d+", name)]
+    mask = re.sub(r"\d+", "#", name)
+    return mask, digits
+
+
+def _group_tiff_sequence(files: List[Path]) -> Optional[List[Path]]:
+    """Group plain-TIFF files into one ordered sequence by a single varying field.
+
+    Files are bucketed by their digit-run mask; the dominant (largest) bucket is
+    inspected for exactly one numeric field that varies across its members (all
+    other numeric tokens, e.g. the ``s1`` in ``s1-0001_bf.tif``, must be
+    constant). The bucket is sorted by that varying field.
+
+    Returns the sorted file list, or ``None`` if no valid single-varying-field
+    sequence of at least three files exists. Never returns an empty list.
+    """
+    candidates = _filter_tiff_candidates(files)
+    if len(candidates) < 3:
+        return None
+
+    # Bucket files by structural mask. Files with no digit runs get their own
+    # singleton masks and fall out below (they can never form a varying field).
+    groups: Dict[str, List[Tuple[Path, List[int]]]] = {}
+    for f in candidates:
+        mask, digits = _mask_and_digits(f.name)
+        groups.setdefault(mask, []).append((f, digits))
+
+    # Dominant bucket: most files, tie-broken by mask string for determinism.
+    best_mask = max(groups, key=lambda m: (len(groups[m]), m))
+    members = groups[best_mask]
+    if len(members) < 3:
+        return None
+
+    n_fields = len(members[0][1])  # all members share the mask -> same count
+    if n_fields == 0:
+        return None
+
+    varying = [
+        pos
+        for pos in range(n_fields)
+        if len({digits[pos] for _, digits in members}) > 1
+    ]
+    if len(varying) != 1:
+        return None
+
+    vpos = varying[0]
+    members.sort(key=lambda fd: fd[1][vpos])
+    return [f for f, _ in members]
+
+
 # =============================================================================
 # TiffSequenceAdapter - Plain TIFF sequences (no metadata)
 # =============================================================================
@@ -52,10 +127,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
         """Claim directories containing plain TIFF file sequences.
 
-        A sequence is detected if:
-        1. Directory has 3+ TIFF files (excluding OME/MicroManager patterns)
-        2. Filenames contain sequential numbers
-        3. All files have the same file size (fastest validation)
+        A sequence is detected (see ``_group_tiff_sequence``) when, among 3+
+        TIFF files sharing a filename template (excluding OME/MicroManager
+        patterns), exactly one numeric field varies across the names; that field
+        orders the sequence and constant numeric tokens are ignored.
+
+        Claiming is intentionally metadata-free — no per-file reads, so discovery
+        scans stay cheap. Dimension consistency across the files is validated
+        lazily in ``__init__`` (where every file is opened anyway), not here.
 
         Args:
             ctx: ClaimContext for unified filesystem access
@@ -68,33 +147,9 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         if ctx.is_remote or not ctx.is_dir():
             return None
 
-        # Gather all TIFF files (excluding OME/MicroManager patterns)
+        # Gather all TIFF files
         all_tiffs = list(ctx.glob("*.tif")) + list(ctx.glob("*.tiff"))
         tiff_files = [t._path for t in all_tiffs]  # Extract underlying Path objects
-
-        # Filter out known OME and MicroManager patterns
-        exclude_patterns = {
-            "*.ome.tif",
-            "*.ome.tiff",
-            "img_*.tif",
-            "img_*.tiff",
-            "img_channel*.tif",
-            "img_channel*.tiff",
-        }
-
-        filtered_files = []
-        for f in tiff_files:
-            excluded = False
-            for pattern in exclude_patterns:
-                if f.match(pattern):
-                    excluded = True
-                    break
-            if not excluded:
-                filtered_files.append(f)
-
-        # Need at least 3 files to consider it a sequence
-        if len(filtered_files) < 3:
-            return None
 
         # Check for metadata files - if present, don't claim (let other adapters handle)
         metadata_patterns = [
@@ -107,28 +162,12 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             if list(ctx._path.glob(pattern)):
                 return None
 
-        # Extract numbers from filenames to verify sequence
-        numbers = []
-        for f in filtered_files:
-            nums = re.findall(r"\d+", f.name)
-            if nums:
-                numbers.append((int(nums[-1]), f))
-            else:
-                return None
-
-        if not numbers:
-            return None
-
-        # Sort by extracted number
-        numbers.sort(key=lambda x: x[0])
-        sorted_files = [f for _, f in numbers]
-
-        # Validate: all files should have the same size (proxy for same dimensions)
-        try:
-            file_sizes = [f.stat().st_size for f in sorted_files]
-            if len(set(file_sizes)) > 1:
-                return None
-        except OSError:
+        # Group into a single ordered sequence by the one varying numeric field.
+        # Filename-template based: no per-file metadata reads, so discovery scans
+        # stay cheap. Dimension consistency is verified lazily in __init__, where
+        # every file is opened anyway.
+        sorted_files = _group_tiff_sequence(tiff_files)
+        if sorted_files is None:
             return None
 
         # Claim directory + all TIFF files
@@ -161,8 +200,6 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (if None, inferred from file count)
         """
-        import re
-
         import tifffile
 
         self.directory = Path(directory)
@@ -171,41 +208,15 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         self._source_type = "tiff-sequence"
         self._io_lock = threading.Lock()
 
-        # Discover TIFF files (excluding OME/MicroManager patterns)
+        # Discover and order the sequence with the same helper claim() uses, so
+        # the runtime file list always matches the claimed member set / order.
         all_tiffs = list(self.directory.glob("*.tif")) + list(
             self.directory.glob("*.tiff")
         )
-
-        exclude_patterns = {
-            "*.ome.tif",
-            "*.ome.tiff",
-            "img_*.tif",
-            "img_*.tiff",
-            "img_channel*.tif",
-            "img_channel*.tiff",
-        }
-
-        tiff_files = []
-        for f in all_tiffs:
-            excluded = False
-            for pattern in exclude_patterns:
-                if f.match(pattern):
-                    excluded = True
-                    break
-            if not excluded:
-                tiff_files.append(f)
-
-        # Sort by numeric part of filename
-        numbers = []
-        for f in tiff_files:
-            nums = re.findall(r"\d+", f.name)
-            if nums:
-                numbers.append((int(nums[-1]), f))
-        numbers.sort(key=lambda x: x[0])
-        self._tiff_files = [f for _, f in numbers]
-
-        if not self._tiff_files:
-            raise ValueError(f"No TIFF sequence files found in {directory}")
+        sorted_files = _group_tiff_sequence(all_tiffs)
+        if sorted_files is None:
+            raise ValueError(f"No TIFF sequence found in {directory}")
+        self._tiff_files = sorted_files
 
         # Open first file to get shape and tile info
         with tifffile.TiffFile(str(self._tiff_files[0])) as tf:
@@ -225,11 +236,36 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             # Pages per file
             n_pages_per_file = len(tf.pages)
 
-        # Build file index map: (file_path, n_pages)
+        spatial_shape = (first_page.shape[0], first_page.shape[1])
+
+        # Build file index map: (file_path, n_pages). We open every file here
+        # anyway, so verify the sequence is uniform at near-zero extra cost —
+        # this is the real consistency check that replaces the old (size-based)
+        # proxy in claim(). The descriptor's dtype / pages-per-file and
+        # get_data()'s stacking all assume the first file is representative, so
+        # spatial shape, dtype, and page count must match across the sequence.
         self._file_ifd_map = []
         for file_path in self._tiff_files:
             with tifffile.TiffFile(str(file_path)) as tf:
+                page = tf.pages[0]
                 n_pages = len(tf.pages)
+                if (page.shape[0], page.shape[1]) != spatial_shape:
+                    raise ValueError(
+                        f"Inconsistent TIFF dimensions in {directory}: "
+                        f"{file_path.name} is {page.shape[:2]}, expected "
+                        f"{spatial_shape}"
+                    )
+                if str(page.dtype) != self._dtype:
+                    raise ValueError(
+                        f"Inconsistent TIFF dtype in {directory}: "
+                        f"{file_path.name} is {page.dtype}, expected {self._dtype}"
+                    )
+                if n_pages != n_pages_per_file:
+                    raise ValueError(
+                        f"Inconsistent TIFF page count in {directory}: "
+                        f"{file_path.name} has {n_pages} pages, expected "
+                        f"{n_pages_per_file}"
+                    )
                 self._file_ifd_map.append((file_path, n_pages))
 
         # Determine shape and dim labels
