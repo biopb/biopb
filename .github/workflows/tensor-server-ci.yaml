@@ -200,6 +200,13 @@ jobs:
         with:
           name: release-artifacts
 
+      # The Docker build (below) COPYs biopb-tensor-server/packages/web/dist and
+      # wheels/ from the build context. The publish job never builds the webapp,
+      # so restore dist/ from the tarball produced by the build job. (wheels/ is
+      # already in place from the downloaded artifact.)
+      - name: Restore webapp build output
+        run: tar -xzf webapp.tar.gz -C biopb-tensor-server/packages/web
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
