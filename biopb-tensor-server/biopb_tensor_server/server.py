@@ -98,6 +98,13 @@ class TensorFlightServer(flight.FlightServerBase):
     Supports multifield acquisitions where tensors within a data source
     have different shapes (e.g., MicroManager multi-position datasets).
 
+    The normal entry point is the ``biopb-tensor-server`` CLI
+    (``launch`` / ``serve``), which scans the data folder and calls
+    ``mark_ready()`` for you once registration completes. The low-level usage
+    below drives the server directly and must therefore mark itself ready after
+    registering its sources, or the ``health`` action reports ``STARTING``
+    forever.
+
     Usage:
         # Create an adapter for your data
         import zarr
@@ -107,6 +114,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Start the server
         server = TensorFlightServer('grpc://0.0.0.0:8815')
         server.register_source('my-tensor', adapter)
+        server.mark_ready()  # registration done -> health reports SERVING
         server.serve()
     """
 

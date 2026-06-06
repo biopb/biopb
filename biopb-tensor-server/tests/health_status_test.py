@@ -60,16 +60,24 @@ def test_health_starting_over_the_wire_before_ready():
     """
     server = TensorFlightServer("grpc://localhost:0")
     threading.Thread(target=server.serve, daemon=True).start()
-    time.sleep(0.8)
     try:
-        client = flight.FlightClient(f"grpc://localhost:{server.port}")
+        with flight.FlightClient(f"grpc://localhost:{server.port}") as client:
+            # Poll until the port is reachable instead of sleeping a fixed
+            # interval: faster on a warm machine, more robust under CI load.
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    (raw,) = list(client.do_action(flight.Action("health", b"")))
+                    break
+                except flight.FlightUnavailableError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
+            assert json.loads(raw.body.to_pybytes())["status"] == "STARTING"
 
-        (raw,) = list(client.do_action(flight.Action("health", b"")))
-        assert json.loads(raw.body.to_pybytes())["status"] == "STARTING"
+            server.mark_ready()
 
-        server.mark_ready()
-
-        (raw,) = list(client.do_action(flight.Action("health", b"")))
-        assert json.loads(raw.body.to_pybytes())["status"] == "SERVING"
+            (raw,) = list(client.do_action(flight.Action("health", b"")))
+            assert json.loads(raw.body.to_pybytes())["status"] == "SERVING"
     finally:
         server.shutdown()

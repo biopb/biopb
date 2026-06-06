@@ -94,6 +94,41 @@ def served_embedded_cache(tmp_path: Path):
         CacheManager.reset()
 
 
+def test_embedded_cache_reports_serving(tmp_path: Path):
+    """_start_embedded_tensor_cache marks itself ready (no scan stage).
+
+    The embedded cache bypasses the CLI's scan/mark_ready lifecycle, so it must
+    self-mark-ready immediately -- otherwise health would report STARTING
+    forever and readiness-gating clients would wait indefinitely.
+    """
+    from biopb_tensor_server.cache import CacheManager
+    from biopb_image_base.server import _start_embedded_tensor_cache
+
+    CacheManager.reset()
+    port = _free_tcp_port()
+    tensor_server, location = _start_embedded_tensor_cache(
+        cache_dir=tmp_path,
+        cache_size=128 * 1024 * 1024,
+        tensor_port=port,
+        tensor_host="127.0.0.1",
+    )
+    try:
+        assert tensor_server.is_ready is True
+        client = TensorFlightClient(location)
+        for _ in range(20):
+            try:
+                health = client.health_check()
+                break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Timed out waiting for embedded cache to start")
+        assert health["status"] == "SERVING"
+    finally:
+        tensor_server.shutdown()
+        CacheManager.reset()
+
+
 def _uniform_template() -> da.Array:
     return da.zeros((4, 4), chunks=(2, 2), dtype=np.float32)
 
