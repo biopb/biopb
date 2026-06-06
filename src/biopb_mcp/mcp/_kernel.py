@@ -72,6 +72,8 @@ class KernelHost:
         health_probe_expect: str = "True",
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
+        kernel_stdout=None,
+        kernel_stderr=None,
         watchdog_interval: float = 5.0,
         watchdog_max_respawns: int = 3,
         watchdog_respawn_window: float = 60.0,
@@ -86,6 +88,12 @@ class KernelHost:
         self._health_probe_expect = health_probe_expect
         self._cwd = cwd
         self._env = env
+        # Where the kernel subprocess' native stdout/stderr fds go. None ->
+        # inherit the launcher's fds (http mode). In stdio mode the launcher
+        # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
+        # lands on fd 1, which there *is* the JSON-RPC protocol channel.
+        self._kernel_stdout = kernel_stdout
+        self._kernel_stderr = kernel_stderr
         self._km = None
         self._kc = None
         self._lock = threading.RLock()
@@ -124,6 +132,15 @@ class KernelHost:
         env = self._env if self._env is not None else os.environ.copy()
         extra_args = list(self._extra_arguments)
         popen_kwargs = {}
+
+        # Redirect the kernel subprocess' native stdout/stderr fds. None ->
+        # inherit the launcher's fds (http mode). In stdio mode the launcher
+        # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
+        # lands on fd 1, which there *is* the JSON-RPC protocol channel.
+        if self._kernel_stdout is not None:
+            popen_kwargs["stdout"] = self._kernel_stdout
+        if self._kernel_stderr is not None:
+            popen_kwargs["stderr"] = self._kernel_stderr
 
         # Parent-death pipe: the kernel inherits the read end and self-kills its
         # process group when the launcher *process* dies (issue #13, mode 1).

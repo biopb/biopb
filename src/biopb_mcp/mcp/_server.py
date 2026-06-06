@@ -27,6 +27,26 @@ _kernel_host: KernelHost | None = None
 # instead of an inline result (set from config by the launcher).
 _promote_after: float = 10.0
 
+# Compute-only mode: no display, so the kernel has no napari viewer. Set by the
+# launcher (set_headless) before serving. Viewer-dependent tools return a clear
+# message and the agent is told via the initialize `instructions` field.
+_headless: bool = False
+
+# Handed to the client in the initialize handshake (the only handshake-time
+# carrier MCP defines). Clients that honor it inject it into the model's
+# context from the first turn; phrased to fire only when the user actually
+# reaches for the viewer (compliance is up to the client/agent).
+_HEADLESS_INSTRUCTIONS = (
+    "This biopb-mcp session is running HEADLESS: it was started without a "
+    "display, so there is NO napari viewer window and screenshots are not "
+    "available. If the user asks to access, open, view, or look at the biopb "
+    "viewer/napari (or asks for a screenshot), alert them plainly that no "
+    "viewer is available in this session because it started without a display. "
+    "You can still load data, run image-processing ops, and compute results "
+    "via execute_code (using client and ops); offer results as values/arrays. "
+    "Do not call take_screenshot or use viewer.* methods."
+)
+
 # DNS-rebinding / cross-origin protection (review finding A2).  execute_code is
 # a full kernel (RCE by design), so the only thing standing between a malicious
 # page in the user's own browser and the loopback port is Host/Origin
@@ -158,10 +178,13 @@ else:
 
 print("")
 print("## Viewer")
-print("  layers: " + str(len(viewer.layers)))
-for _layer in list(viewer.layers)[:10]:
-    _shape = getattr(_layer.data, "shape", "?")
-    print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+if viewer:
+    print("  layers: " + str(len(viewer.layers)))
+    for _layer in list(viewer.layers)[:10]:
+        _shape = getattr(_layer.data, "shape", "?")
+        print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+else:
+    print("  headless: no viewer (no display)")
 
 print("")
 print("## Jobs")
@@ -191,6 +214,23 @@ def set_promote_after(seconds: float):
     """Set how long execute_code waits inline before returning a job handle."""
     global _promote_after
     _promote_after = float(seconds)
+
+
+def set_headless(headless: bool):
+    """Mark the session compute-only (no viewer) and advertise it to the agent
+    via the initialize ``instructions`` field.
+
+    Owns that field in both directions (idempotent): set the headless directive
+    when headless, clear it otherwise, so a flip back to visible can't leave a
+    stale HEADLESS directive in the handshake. The low-level Server holds the
+    `instructions` returned in the handshake; FastMCP built it at import with
+    None, so set it here.
+    """
+    global _headless
+    _headless = bool(headless)
+    mcp._mcp_server.instructions = (
+        _HEADLESS_INSTRUCTIONS if _headless else None
+    )
 
 
 def _format_execute_result(res: dict) -> str:
@@ -300,6 +340,19 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     Returns a PNG screenshot as an image content block.
     """
+    if _headless:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "No screenshot available: this session is running headless "
+                    "(started without a display), so there is no viewer window "
+                    "to capture. Data loading and compute via execute_code/ops "
+                    "still work — tell the user the viewer is unavailable here."
+                ),
+            )
+        ]
+
     host = _kernel_host
     if host is None:
         return [TextContent(type="text", text="Kernel host not initialized")]
@@ -507,6 +560,9 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
+    lines.append(
+        f"  display: {'headless (no viewer)' if _headless else 'visible'}"
+    )
     health = host.health()
     lines.append(f"  alive: {health['alive']}")
     lines.append(f"  busy: {health['busy']}")
@@ -553,3 +609,17 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
     mcp.settings.port = port
     logger.info("MCP server listening on http://127.0.0.1:%d/mcp", port)
     mcp.run(transport="streamable-http")
+
+
+def run_stdio():
+    """Run the MCP server over stdio (JSON-RPC on stdin/stdout).
+
+    The alternative to :func:`run`: a client spawns biopb-mcp as a subprocess
+    and speaks JSON-RPC over the pipe. There is no listening socket, so the
+    Host/Origin allowlist (:func:`build_transport_security`) is irrelevant and
+    not applied. fd 1 *is* the protocol channel, so the launcher must keep its
+    own stdout pristine (logging -> stderr) and the kernel's native output must
+    be redirected away from fd 1 (the launcher passes a kernel log file).
+    """
+    logger.info("MCP server speaking stdio (JSON-RPC on stdin/stdout)")
+    mcp.run(transport="stdio")

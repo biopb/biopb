@@ -51,7 +51,29 @@ DEFAULT_CONFIG = {
         "error_threshold_mb": 2000,  # Raise MemoryError if chunk > 2GB
     },
     "mcp": {
+        # Front-end transport: "stdio" (JSON-RPC on stdin/stdout, for a client
+        # that spawns biopb-mcp as a subprocess, the default) or "http"
+        # (loopback streamable-http on `port`). The kernel/viewer/dask stack is
+        # identical either way. Overridable per-launch with `--transport`.
+        "transport": "stdio",
         "port": 8765,
+        # Whether the kernel opens a visible napari viewer:
+        #   "auto"    -> visible if a display is present ($DISPLAY/$WAYLAND_DISPLAY
+        #                on Linux; always present on macOS/Windows), else headless.
+        #   "visible" -> require a display; fail fast at startup if none (preserves
+        #                the shared-viewer contract — see docs/biopb-architecture.md).
+        #   "headless"-> never open a viewer (compute-only: client/ops/execute_code
+        #                work, take_screenshot and viewer.* do not).
+        # Headless avoids a hard Qt abort when launched from a CLI with no display
+        # (e.g. an MCP client over stdio on a remote box). The agent is told via
+        # the initialize `instructions` field, and viewer-dependent tools return a
+        # clear message; the `viewer` namespace object self-describes on access.
+        "display_mode": "auto",
+        # Where the child kernel's *native* (C-level) stdout/stderr is written
+        # in stdio mode, so it never corrupts the JSON-RPC stream on fd 1.
+        # Empty -> ~/.config/biopb-mcp/kernel.log. Ignored in http mode (the
+        # kernel inherits the launcher's fds, which are not a protocol channel).
+        "kernel_log": "",
         # Dask defaults to a kernel-local multi-process distributed cluster
         # (LocalCluster). This is the only configuration where cancel_job can
         # stop an in-flight .compute() mid-execution, and it gives real
@@ -116,7 +138,8 @@ DEFAULT_CONFIG = {
         # Extra Host/Origin header values appended to the loopback allowlist
         # that guards the server against DNS-rebinding / cross-origin browser
         # requests. Set these only when fronting the server with a reverse
-        # proxy that needs its own Host/Origin permitted.
+        # proxy that needs its own Host/Origin permitted. http transport only;
+        # ignored in stdio mode (no network surface).
         "allowed_origins": [],
         "allowed_hosts": [],
         # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).

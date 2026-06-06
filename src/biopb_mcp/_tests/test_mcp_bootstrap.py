@@ -73,3 +73,23 @@ class TestRegisterCachePlugin:
             )
         mk.assert_called_once()
         dc.register_plugin.assert_not_called()
+
+
+class TestHeadlessViewer:
+    """The sentinel bound to ``viewer`` when the kernel runs without a display."""
+
+    def test_attribute_access_raises_descriptive_error(self):
+        v = _bootstrap._HeadlessViewer()
+        import pytest
+
+        with pytest.raises(RuntimeError) as exc:
+            v.add_image(None)
+        assert "headless" in str(exc.value).lower()
+        assert "no display" in str(exc.value).lower()
+
+    def test_is_falsy_for_if_viewer_guards(self):
+        # Kernel snippets guard the viewer section with `if viewer:`.
+        assert not _bootstrap._HeadlessViewer()
+
+    def test_repr_is_self_describing(self):
+        assert "headless" in repr(_bootstrap._HeadlessViewer()).lower()

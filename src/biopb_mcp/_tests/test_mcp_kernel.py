@@ -166,6 +166,30 @@ class TestKernelLifecycle:
         assert not host.is_alive()
         assert not os.path.exists(conn_file)
 
+    def test_kernel_native_stdout_redirected_to_file(self, tmp_path):
+        """stdio mode passes the kernel a log file for its native fds so
+        Qt/GL/dask/gRPC output never lands on fd 1 (the JSON-RPC channel).
+
+        A raw ``os.write(1, ...)`` bypasses IPython's ZMQ stdout capture, so
+        it must NOT appear in the execute result but MUST land in the file.
+        """
+        log = tmp_path / "kernel.log"
+        f = open(log, "ab", buffering=0)
+        try:
+            host = KernelHost(
+                health_probe_code=None,
+                startup_timeout=60.0,
+                kernel_stdout=f,
+                kernel_stderr=f,
+            )
+            host.start()
+            res = host.execute("import os; os.write(1, b'NATIVE_FD1_MARKER')")
+            assert "NATIVE_FD1_MARKER" not in res["stdout"]
+            host.shutdown()
+        finally:
+            f.close()
+        assert b"NATIVE_FD1_MARKER" in log.read_bytes()
+
     def test_health_probe_failure_raises(self):
         # Probe expects a name that does not exist in a bare kernel.
         host = KernelHost(

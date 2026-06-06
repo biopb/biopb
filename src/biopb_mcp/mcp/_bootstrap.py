@@ -17,6 +17,32 @@ import traceback
 logger = logging.getLogger(__name__)
 
 
+class _HeadlessViewer:
+    """Stand-in bound to ``viewer`` when the kernel runs without a display.
+
+    Any attribute access raises a clear, quotable error so agent code that
+    reaches for the viewer (``viewer.add_image(...)``, ``viewer.layers`` …)
+    surfaces a self-describing message — relayed to the user by the model —
+    instead of a cryptic ``AttributeError`` on ``None``.  Falsy so kernel
+    snippets can guard with ``if viewer:``.
+    """
+
+    _MSG = (
+        "napari viewer unavailable: this biopb-mcp kernel started headless "
+        "(no display). Data access (client), compute (ops), and execute_code "
+        "still work — there is just no viewer window or screenshot."
+    )
+
+    def __getattr__(self, name):
+        raise RuntimeError(self._MSG)
+
+    def __repr__(self):
+        return "<headless: no napari viewer (no display)>"
+
+    def __bool__(self):
+        return False
+
+
 def _configure_dask(mcp_config: dict):
     """Set up dask in the kernel process.
 
@@ -157,24 +183,28 @@ def bootstrap():
 
 def _bootstrap_impl():
     import dask.array as da
-    import napari
     import numpy as np
     from IPython import get_ipython
 
     from .._config import load_config
     from .._connection import TensorConnection
-    from ..tensor_browser import TensorBrowserWidget
     from . import _jobs
-    from ._helpers import patch_viewer_load_tensor
     from ._process_ops import build_ops
+
+    ip = get_ipython()
+    config = load_config()
+    mcp_config = config.get("mcp", {})
+
+    # Headless (compute-only) mode: the launcher sets BIOPB_HEADLESS when no
+    # display is available (or display_mode forces it), so we skip Qt/napari
+    # entirely rather than crash on a missing display.  client/ops/execute_code
+    # still work; `viewer` is a self-describing sentinel.
+    headless = bool(os.environ.get("BIOPB_HEADLESS"))
 
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
-    ip = get_ipython()
-    ip.enable_gui("qt")
-
-    config = load_config()
-    mcp_config = config.get("mcp", {})
+    if not headless:
+        ip.enable_gui("qt")
 
     # 2. Configure dask in the compute process.
     dask_client, dask_cluster = _configure_dask(mcp_config)
@@ -204,12 +234,21 @@ def _bootstrap_impl():
     #    compute_scheduler pins the viewer's serial slice reads to a
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
+    #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
     compute_scheduler = mcp_config.get("viewer_compute_scheduler", "threads")
-    viewer = napari.Viewer()
-    tbw = TensorBrowserWidget(
-        viewer, connection=conn, compute_scheduler=compute_scheduler
-    )
-    viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+    if headless:
+        viewer = _HeadlessViewer()
+        logger.info("Headless mode: no napari viewer (no display).")
+    else:
+        import napari
+
+        from ..tensor_browser import TensorBrowserWidget
+
+        viewer = napari.Viewer()
+        tbw = TensorBrowserWidget(
+            viewer, connection=conn, compute_scheduler=compute_scheduler
+        )
+        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
@@ -238,9 +277,14 @@ def _bootstrap_impl():
     #    install() stores the shell, installs the thread-aware stdout streams,
     #    and clears any prior job state; wrap_viewer_for_threads marshals the
     #    common viewer-mutating methods to the Qt main thread.
-    patch_viewer_load_tensor(viewer, conn, compute_scheduler=compute_scheduler)
     _jobs.install(ip)
-    _jobs.wrap_viewer_for_threads(viewer)
+    if not headless:
+        from ._helpers import patch_viewer_load_tensor
+
+        patch_viewer_load_tensor(
+            viewer, conn, compute_scheduler=compute_scheduler
+        )
+        _jobs.wrap_viewer_for_threads(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
