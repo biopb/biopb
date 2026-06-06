@@ -41,14 +41,11 @@
 		</repository>
 	</repositories>
 
-  	<distributionManagement>
-		<repository>
-		<id>ossrh</id>
-		<name>Central Repository OSSRH</name>
-		<url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
-		</repository>
-	</distributionManagement>
-		
+	<!-- No distributionManagement: deployment is handled entirely by the
+	     central-publishing-maven-plugin (extensions=true) below, which posts to
+	     the Sonatype Central Portal. The legacy oss.sonatype.org staging endpoint
+	     it used to name was decommissioned and is not used. -->
+
 	<properties>
         <revision>0.0.0-SNAPSHOT</revision>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -185,6 +182,13 @@
 				<extensions>true</extensions>
 				<configuration>
 					<publishingServerId>ossrh</publishingServerId>
+					<!-- Publish straight to Maven Central on `mvn deploy`. Without this
+					     the plugin only uploads a VALIDATED deployment that waits for a
+					     manual click; those pile up and eventually make new uploads fail
+					     with 403. waitUntil=published makes the build block (and fail)
+					     until the release is actually live on Central. -->
+					<autoPublish>true</autoPublish>
+					<waitUntil>published</waitUntil>
 				</configuration>
 			</plugin>
 			<plugin>
