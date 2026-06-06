@@ -5,7 +5,11 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
-# Requirements: curl, git, tar
+# By default this installs prebuilt wheels from the latest GitHub release.
+# Set BIOPB_INSTALL_FROM_SOURCE=1 to instead build HEAD from a git checkout
+# (the fast path for development); that mode additionally needs git + a compiler.
+#
+# Requirements: curl, tar (+ git for BIOPB_INSTALL_FROM_SOURCE=1)
 #
 
 # ANSI colors — suppressed when stdout is not a terminal
@@ -468,13 +472,64 @@ _ensure_local_bin_on_path() {
     # printf   "${YELLOW}${BOLD}  %s${RESET}\n\n" "$rule"
 }
 
+# --- Release-based install helpers -------------------------------------------
+# The default install path pulls prebuilt wheels (and the data browser) from the
+# most recent GitHub release rather than building HEAD from git. That drops the
+# git/buf/proto-generation step and keeps the self-contained server wheel paired
+# with the exact biopb wheel it was built against (no PyPI version-coupling).
+
+# Fetch the latest release metadata once and cache it in RELEASE_JSON / RELEASE_TAG.
+# One API call serves both the wheels and the data browser, keeping us under the
+# unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
+_fetch_latest_release() {
+    [ -n "${RELEASE_JSON:-}" ] && return 0
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null) || return 1
+    RELEASE_TAG=$(printf '%s' "$RELEASE_JSON" \
+        | grep '"tag_name"' | head -1 \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    [ -n "${RELEASE_TAG:-}" ] || return 1
+    if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
+        _warn "Unexpected release tag format: $RELEASE_TAG"
+        RELEASE_TAG=""
+        return 1
+    fi
+    return 0
+}
+
+# Percent-decode a URL path component (e.g. %2B -> +). GitHub encodes the '+' in
+# a wheel's local version segment as %2B in the asset URL, but the on-disk file
+# must carry the literal '+' or pip/uv reject the wheel (its filename version no
+# longer matches the metadata). Used to recover the real wheel name from the URL.
+_urldecode() { printf '%b' "${1//%/\\x}"; }
+
+# Print the download URL of the first release asset whose filename matches the
+# given extended-regex (anchored at the end of the URL). Empty if none matches.
+# Requires _fetch_latest_release to have populated RELEASE_JSON first.
+_release_asset_url() {
+    printf '%s' "${RELEASE_JSON:-}" \
+        | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | sed -E 's/.*"(https[^"]+)".*/\1/' \
+        | grep -E "/$1\$" | head -1
+}
+
 install_biopb() {
     set -euo pipefail
 
     REPO_URL="https://github.com/biopb/biopb"
     REPO="git+$REPO_URL"
+    RELEASE_REPO="biopb/biopb"   # owner/name for the GitHub Releases API
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
+
+    # Install path: default is prebuilt wheels from the latest GitHub release
+    # (no git checkout, no buf/proto build). BIOPB_INSTALL_FROM_SOURCE=1 switches
+    # to building HEAD from git — the fast path for development/testing.
+    if [ -n "${BIOPB_INSTALL_FROM_SOURCE:-}" ] && [ "${BIOPB_INSTALL_FROM_SOURCE}" != "0" ]; then
+        INSTALL_FROM_SOURCE=1
+    else
+        INSTALL_FROM_SOURCE=0
+    fi
 
     printf "\n%s" "${CYAN}"
     echo "    ____  _       ____  ____  "
@@ -529,7 +584,7 @@ install_biopb() {
     # git/cc are absent, so the later `uv tool install … @ git+…` dies with a
     # cryptic `xcrun: error: invalid active developer path`. Check for the actual
     # toolchain up front and give an actionable message instead.
-    if [ "$PLATFORM" = "macOS" ] && ! xcode-select -p &>/dev/null; then
+    if [ "$PLATFORM" = "macOS" ] && [ "$INSTALL_FROM_SOURCE" = "1" ] && ! xcode-select -p &>/dev/null; then
         _err "Xcode Command Line Tools not found."
         _info "biopb needs them for git and the C compiler/headers used to build packages."
         _info "Install them, then rerun this script:"
@@ -538,8 +593,11 @@ install_biopb() {
         exit 1
     fi
 
-    # Check required tools
-    for tool in curl git tar; do
+    # Check required tools. git is only needed to build from a source checkout;
+    # the default release install just downloads prebuilt wheels (curl + tar).
+    required_tools=(curl tar)
+    [ "$INSTALL_FROM_SOURCE" = "1" ] && required_tools+=(git)
+    for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
             _err "$tool not found"
             case "$PLATFORM" in
@@ -576,25 +634,29 @@ install_biopb() {
         _ok "uv already installed ($(uv --version))"
     fi
 
-    BUF_VERSION="1.70.0"
-    # Install into the user's ~/.local/bin (already prepended to PATH above), not
-    # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
-    # there fails with "failed to write to destination". Keeps buf user-local and
-    # consistent with uv's tool bin dir and the Windows installer.
-    BUF_BIN="$HOME/.local/bin"
-    if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
-        _info "Installing buf $BUF_VERSION..."
-        mkdir -p "$BUF_BIN"
-        rm -f "$BUF_BIN/buf"
-        curl -sSL \
-            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
-            -o "$BUF_BIN/buf"
-        chmod +x "$BUF_BIN/buf"
-        _ok "buf $BUF_VERSION installed"
-    else
-        _ok "buf already installed ($(buf --version))"
+    # buf generates the protobuf/Flight stubs at build time, so it is only needed
+    # when building from a source checkout. Release wheels ship the stubs prebuilt.
+    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
+        BUF_VERSION="1.70.0"
+        # Install into the user's ~/.local/bin (already prepended to PATH above), not
+        # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
+        # there fails with "failed to write to destination". Keeps buf user-local and
+        # consistent with uv's tool bin dir and the Windows installer.
+        BUF_BIN="$HOME/.local/bin"
+        if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
+            _info "Installing buf $BUF_VERSION..."
+            mkdir -p "$BUF_BIN"
+            rm -f "$BUF_BIN/buf"
+            curl -sSL \
+                "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
+                -o "$BUF_BIN/buf"
+            chmod +x "$BUF_BIN/buf"
+            _ok "buf $BUF_VERSION installed"
+        else
+            _ok "buf already installed ($(buf --version))"
+        fi
+        unset BUF_VERSION BUF_BIN
     fi
-    unset BUF_VERSION BUF_BIN
 
     # ===== 2. Python =====
     _step "[2/6] Ensuring Python..."
@@ -653,6 +715,44 @@ install_biopb() {
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
 
+    # Resolve where biopb + biopb-tensor-server come from. They must be installed
+    # as a matched pair from a single build: the tensor server is self-contained
+    # and may use proto fields newer than any biopb published on PyPI, so biopb is
+    # always pinned to the sibling artifact (a git ref in source mode, a local
+    # wheel in release mode) and the resolver is never allowed to pull it from PyPI.
+    local biopb_req tensor_req
+    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
+        _info "Building from source (HEAD of $REPO_URL)"
+        biopb_req="biopb[tensor] @ $REPO"
+        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+    else
+        if ! _fetch_latest_release; then
+            _err "Could not fetch the latest biopb release from $RELEASE_REPO."
+            _info "Check your network, or build from source instead:"
+            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
+            exit 1
+        fi
+        local sdk_url tensor_url
+        sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
+        tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
+        if [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
+            _err "Release $RELEASE_TAG has no biopb wheels attached."
+            _info "Build from source instead:"
+            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
+            exit 1
+        fi
+        _info "Installing from release $RELEASE_TAG"
+        WHEELS_DIR=$(mktemp -d)
+        local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+        local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+        curl -fsSL "$sdk_url" -o "$sdk_whl"
+        curl -fsSL "$tensor_url" -o "$tensor_whl"
+        # Direct file:// references pin biopb to this exact wheel, so uv resolves
+        # the server's `biopb` dependency to it rather than to PyPI.
+        biopb_req="biopb[tensor] @ file://$sdk_whl"
+        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
+    fi
+
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
     #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
@@ -667,13 +767,14 @@ install_biopb() {
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
     # psutil) — without it `import mcp` fails. We require >=0.5.4: that release
     # drops biopb-mcp's stray, unpinned grpcio-tools dependency, which otherwise
-    # collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
+    # collapses the shared solve to an unbuildable grpcio-tools==1.30.0. It comes
+    # from PyPI in both modes (no biopb-mcp wheel ships in the release).
     local install_args=(
         --upgrade
         --force
         --python "$PYTHON_SPEC"
-        "biopb[tensor] @ $REPO"
-        --with "biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+        "$biopb_req"
+        --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
     if [ "$INSTALL_MCP" = "1" ]; then
@@ -688,6 +789,9 @@ install_biopb() {
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
 
+    # Wheels are copied into the tool env at install time; drop the download temp.
+    [ -n "${WHEELS_DIR:-}" ] && rm -rf "$WHEELS_DIR"
+
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
 
@@ -697,28 +801,23 @@ install_biopb() {
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
 
-        LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/jiyuuchc/biopb/releases/latest" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"([^"]+)".*/\1/' \
-            || echo "")
-
-        if [ -n "$LATEST_TAG" ] && ! printf '%s' "$LATEST_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
-            _warn "Unexpected tag format, skipping data browser install"
-            LATEST_TAG=""
-        fi
-
-        if [ -n "$LATEST_TAG" ]; then
+        # Reuses the release metadata already fetched for the wheels (cached);
+        # in source mode this is the first and only call.
+        if _fetch_latest_release; then
             INSTALLED_TAG=""
             [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
-            if [ "$INSTALLED_TAG" = "$LATEST_TAG" ]; then
-                _ok "Data browser already up to date ($LATEST_TAG)"
+            if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
+                _ok "Data browser already up to date ($RELEASE_TAG)"
             else
-                _info "Downloading $LATEST_TAG..."
+                _info "Downloading $RELEASE_TAG..."
                 rm -rf "${WEBAPP_DIR:?}"
                 mkdir -p "$WEBAPP_DIR"
-                curl -fsSL "$REPO_URL/releases/download/$LATEST_TAG/webapp.tar.gz" \
+                local webapp_url
+                webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
+                webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
+                curl -fsSL "$webapp_url" \
                     | tar -xzf - -C "$WEBAPP_DIR" --strip-components=1
-                printf '%s' "$LATEST_TAG" > "$WEBAPP_DIR/.version"
+                printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
                 _ok "Data browser installed to: $WEBAPP_DIR"
             fi
         else

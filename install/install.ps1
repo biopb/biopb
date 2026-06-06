@@ -7,7 +7,13 @@
     Usage: irm https://biopb.org/install.ps1 | iex
 
     Idempotent: rerun to upgrade to latest version.
-    Requirements: PowerShell 5.1+, git, tar (bundled on Windows 10 1803+).
+
+    By default this installs prebuilt wheels from the latest GitHub release.
+    Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to instead build HEAD from a git
+    checkout (the development fast path); that mode additionally needs git.
+
+    Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+);
+                  git is needed only for BIOPB_INSTALL_FROM_SOURCE=1.
 
     Paths follow the same home-relative XDG layout the Python packages read
     (config under ~/.config, data under ~/.local/share); on Windows these
@@ -356,13 +362,28 @@ function Invoke-Preflight {
     return $reportOnFailure
 }
 
+# Fetch the latest GitHub release metadata (a parsed object with .tag_name and
+# .assets[].name / .browser_download_url). One call serves both the wheels and
+# the data browser. Throws on network/HTTP error; callers catch and fall back.
+function Get-LatestRelease {
+    param([string]$Repo)
+    return Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+        -Headers @{ "User-Agent" = "biopb-installer" }
+}
+
 function Install-Biopb {
-    $RepoUrl    = "https://github.com/biopb/biopb"
-    $Repo       = "git+$RepoUrl"
-    $BiopbHome  = $env:USERPROFILE          # matches Python Path.home() on Windows
-    $WebappDir  = Join-Path $BiopbHome ".local\share\biopb\webapp"
-    $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
-    $LocalBin   = Join-Path $BiopbHome ".local\bin"
+    $RepoUrl     = "https://github.com/biopb/biopb"
+    $Repo        = "git+$RepoUrl"
+    $ReleaseRepo = "biopb/biopb"             # owner/name for the GitHub Releases API
+    $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
+    $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
+    $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
+    $LocalBin    = Join-Path $BiopbHome ".local\bin"
+
+    # Default: install prebuilt wheels from the latest GitHub release (no git/buf
+    # build). Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to build HEAD from git.
+    $InstallFromSource = ($env:BIOPB_INSTALL_FROM_SOURCE) -and ($env:BIOPB_INSTALL_FROM_SOURCE -ne '0')
+    $release = $null   # cached release metadata, fetched on demand below
 
     # ===== 0. System Check =====
     Write-Step "[0/6] Checking system..."
@@ -380,8 +401,11 @@ function Install-Biopb {
     }
     Write-Ok "Platform: Windows ($arch)"
 
-    # Required tools. curl/Invoke-WebRequest is built in; we need git and tar.
-    foreach ($tool in @("git", "tar")) {
+    # Required tools. curl/Invoke-WebRequest is built in; we always need tar, and
+    # git only when building from a source checkout.
+    $requiredTools = @("tar")
+    if ($InstallFromSource) { $requiredTools += "git" }
+    foreach ($tool in $requiredTools) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
             Write-Err2 "$tool not found"
             switch ($tool) {
@@ -439,19 +463,23 @@ function Install-Biopb {
         Write-Ok "uv already installed ($(uv --version))"
     }
 
-    $bufVersion = "1.70.0"
-    $bufPath = Join-Path $LocalBin "buf.exe"
-    $bufCurrent = ""
-    if (Get-Command buf -ErrorAction SilentlyContinue) { $bufCurrent = (buf --version 2>$null) }
-    if ($bufCurrent -ne $bufVersion) {
-        Write-Inf "Installing buf $bufVersion..."
-        if (-not (Test-Path -LiteralPath $LocalBin)) { New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null }
-        if (Test-Path -LiteralPath $bufPath) { Remove-Item -LiteralPath $bufPath -Force }
-        $bufUrl = "https://github.com/bufbuild/buf/releases/download/v$bufVersion/buf-Windows-$bufArch.exe"
-        Invoke-WebRequest -Uri $bufUrl -OutFile $bufPath
-        Write-Ok "buf $bufVersion installed"
-    } else {
-        Write-Ok "buf already installed ($bufCurrent)"
+    # buf generates the protobuf/Flight stubs at build time, so it is only needed
+    # when building from a source checkout. Release wheels ship the stubs prebuilt.
+    if ($InstallFromSource) {
+        $bufVersion = "1.70.0"
+        $bufPath = Join-Path $LocalBin "buf.exe"
+        $bufCurrent = ""
+        if (Get-Command buf -ErrorAction SilentlyContinue) { $bufCurrent = (buf --version 2>$null) }
+        if ($bufCurrent -ne $bufVersion) {
+            Write-Inf "Installing buf $bufVersion..."
+            if (-not (Test-Path -LiteralPath $LocalBin)) { New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null }
+            if (Test-Path -LiteralPath $bufPath) { Remove-Item -LiteralPath $bufPath -Force }
+            $bufUrl = "https://github.com/bufbuild/buf/releases/download/v$bufVersion/buf-Windows-$bufArch.exe"
+            Invoke-WebRequest -Uri $bufUrl -OutFile $bufPath
+            Write-Ok "buf $bufVersion installed"
+        } else {
+            Write-Ok "buf already installed ($bufCurrent)"
+        }
     }
 
     # ===== 2. Python =====
@@ -491,6 +519,45 @@ function Install-Biopb {
         Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"
     }
 
+    # Resolve where biopb + biopb-tensor-server come from. They must be installed
+    # as a matched pair from a single build: the tensor server is self-contained
+    # and may use proto fields newer than any biopb on PyPI, so biopb is pinned to
+    # the sibling artifact (a git ref in source mode, a local wheel in release
+    # mode) and the resolver is never allowed to pull it from PyPI.
+    if ($InstallFromSource) {
+        Write-Inf "Building from source (HEAD of $RepoUrl)"
+        $biopbReq  = "biopb[tensor] @ $Repo"
+        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server"
+    } else {
+        try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null }
+        if (-not $release) {
+            Write-Err2 "Could not fetch the latest biopb release from $ReleaseRepo."
+            Write-Inf "Check your network, or build from source by setting:"
+            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
+            throw "release fetch failed"
+        }
+        $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
+        $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
+        if (-not $sdkAsset -or -not $tensorAsset) {
+            Write-Err2 "Release $($release.tag_name) has no biopb wheels attached."
+            Write-Inf "Build from source by setting:"
+            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
+            throw "release wheels missing"
+        }
+        Write-Inf "Installing from release $($release.tag_name)"
+        $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
+        if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+        $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
+        $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
+        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
+        Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
+        # Direct file:// references pin biopb to this exact wheel, so uv resolves
+        # the server's biopb dependency to it rather than to PyPI.
+        $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
+        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
+    }
+
     # Install everything into ONE uv tool environment so the components can
     # import and drive each other at runtime:
     #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
@@ -505,11 +572,11 @@ function Install-Biopb {
     # ipykernel, psutil) - without it `import mcp` fails. We require >=0.5.4:
     # that release drops biopb-mcp's stray, unpinned grpcio-tools dependency,
     # which otherwise collapses the shared solve to an unbuildable
-    # grpcio-tools==1.30.0.
+    # grpcio-tools==1.30.0. It comes from PyPI in both modes.
     $installArgs = @(
         "tool", "install", "--upgrade", "--force",
-        "biopb[tensor] @ $Repo",
-        "--with", "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server",
+        $biopbReq,
+        "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
     if ($InstallMcp) {
@@ -537,11 +604,10 @@ function Install-Biopb {
     if ($InstallWebapp) {
         if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
 
-        $latestTag = ""
-        try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/jiyuuchc/biopb/releases/latest" -Headers @{ "User-Agent" = "biopb-installer" }
-            $latestTag = $release.tag_name
-        } catch { $latestTag = "" }
+        # Reuse the release metadata already fetched for the wheels; in source
+        # mode this is the first (and only) fetch.
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null } }
+        $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
             Write-Warn2 "Unexpected tag format, skipping data browser install"
@@ -557,8 +623,10 @@ function Install-Biopb {
                 Write-Inf "Downloading $latestTag..."
                 Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
                 New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null
+                $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
+                $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
                 $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
-                Invoke-WebRequest -Uri "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" -OutFile $tarball
+                Invoke-WebRequest -Uri $webUrl -OutFile $tarball
                 tar -xzf $tarball -C $WebappDir --strip-components=1
                 Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
                 Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
