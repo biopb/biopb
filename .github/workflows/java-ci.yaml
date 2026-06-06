@@ -7,12 +7,10 @@ on:
       - main
     tags:
       - 'v*'
-    paths:
-      - 'src/main/java/**'
-      - 'src/test/java/**'
-      - 'proto/**'
-      - 'pom.xml'
-      - '.github/workflows/java-ci.yaml'
+    # No paths filter on push: a v* tag must always trigger the deploy
+    # regardless of which files the tagged commit changed. (A paths filter under
+    # push applies to tag pushes too, which would silently skip releases.)
+    # Path-based throttling lives on pull_request below — the high-volume path.
   pull_request:
     branches:
       - main
@@ -47,10 +45,11 @@ jobs:
           java-version: ${{ matrix.java-version }}
           distribution: 'temurin'
           cache: maven
-      - name: Build with Maven
+      - name: Build and test with Maven
+        # `package` runs compile -> test -> package, so the unit-test suite runs
+        # exactly once. The previous `package` + `test` ran it twice; `verify`
+        # would over-reach into the gpg sign-artifacts goal (no key in CI).
         run: mvn -B package --file pom.xml
-      - name: Run tests
-        run: mvn -B test --file pom.xml
 
   deploy:
     needs: build
@@ -73,7 +72,9 @@ jobs:
           gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
           gpg-passphrase: GPG_PASSPHRASE
       - name: Publish to Maven Central
-        run: mvn -B deploy -Drevision=${{ steps.version.outputs.VERSION }} -P release --file pom.xml
+        # Tests already passed in the build job for this commit; skip re-running
+        # them here so deploy just builds, signs, and publishes the artifacts.
+        run: mvn -B deploy -DskipTests -Drevision=${{ steps.version.outputs.VERSION }} -P release --file pom.xml
         env:
           MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
