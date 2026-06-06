@@ -158,8 +158,8 @@ _py() {
 
 # Merge a biopb stdio MCP entry into JSON <file> under top-level key <parent>
 # (e.g. "mcpServers" or "mcp"). <style> picks the entry shape: "stdio" for the
-# standard {type,command,args} form (Claude Desktop, Cursor, the canonical
-# mcp.json), "opencode" for opencode's {type:"local", command:[...]} form.
+# standard {command,args} form — no "type" (Claude Desktop, Cursor, the canonical
+# mcp.json) — and "opencode" for opencode's {type:"local", command:[...]} form.
 # <command> and the trailing args are the `biopb-mcp` invocation the client
 # spawns. Preserves all other content, creates the file (and parents) if absent,
 # and writes atomically. JSON-escaping happens in Python, so a command path with
@@ -490,9 +490,13 @@ _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
     RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null) || return 1
+    # `|| true`: a missing/error API response (no "tag_name") makes grep exit 1,
+    # which under `set -euo pipefail` would otherwise abort the whole installer
+    # from inside this command substitution. We want to return 1 and let the
+    # caller print a friendly message, so the empty-tag check below handles it.
     RELEASE_TAG=$(printf '%s' "$RELEASE_JSON" \
         | grep '"tag_name"' | head -1 \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/') || true
     [ -n "${RELEASE_TAG:-}" ] || return 1
     if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
         _warn "Unexpected release tag format: $RELEASE_TAG"
@@ -511,11 +515,15 @@ _urldecode() { printf '%b' "${1//%/\\x}"; }
 # Print the download URL of the first release asset whose filename matches the
 # given extended-regex (anchored at the end of the URL). Empty if none matches.
 # Requires _fetch_latest_release to have populated RELEASE_JSON first.
+# `|| true`: no match makes grep exit 1, which under `set -euo pipefail` would
+# abort the whole installer from inside the caller's command substitution.
+# Callers rely on an empty string to fall back / show a friendly error, so we
+# stay tolerant and return 0 with no output instead.
 _release_asset_url() {
     printf '%s' "${RELEASE_JSON:-}" \
         | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
         | sed -E 's/.*"(https[^"]+)".*/\1/' \
-        | grep -E "/$1\$" | head -1
+        | grep -E "/$1\$" | head -1 || true
 }
 
 install_biopb() {
