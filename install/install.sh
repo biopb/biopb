@@ -635,7 +635,7 @@ install_biopb() {
     # toolchain that most labs don't need (only legacy/proprietary formats need it).
     CHECKBOX_DEFAULTS=(1 0)
     read -r INSTALL_WEBAPP INSTALL_BIOFORMATS <<< "$(_checkbox \
-        "Built-in data browser" \
+        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)" \
         "Bio-Formats (more image formats; needs Java and extra setup during first run)")"
     unset CHECKBOX_DEFAULTS
     echo ""
