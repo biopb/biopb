@@ -114,6 +114,31 @@ def _remove_pid():
 
 def _is_process_running(pid: int) -> bool:
     """Check if process with PID is running."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        # On Windows os.kill(pid, 0) is NOT a liveness probe: signal value 0 is
+        # signal.CTRL_C_EVENT, so os.kill would call GenerateConsoleCtrlEvent and
+        # deliver a real Ctrl+C to the console process group (killing the daemon
+        # we just started, mid-import). Query the process handle instead.
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)  # Signal 0 just checks if process exists
         return True
@@ -235,6 +260,19 @@ def start(
     console.print(f"[green]Starting TensorFlight server...[/green]")
     console.print(f"  Config: {config}")
 
+    # Detach the daemon from the launching console/process group so it survives
+    # this command returning and ignores console control events (Ctrl+C, close).
+    detach_kwargs: dict = {}
+    if sys.platform == "win32":
+        # start_new_session (setsid) is POSIX-only and a silent no-op on Windows.
+        # Use creationflags instead: a new process group plus no inherited console
+        # so console Ctrl+C/close events can't reach the daemon.
+        detach_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        detach_kwargs["start_new_session"] = True  # setsid(): own process group
+
     with open(log_file, "a") as log:
         log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         process = subprocess.Popen(
@@ -242,7 +280,7 @@ def start(
             stdout=log,
             stderr=log,
             env=env,
-            start_new_session=True,  # Detach from current process group
+            **detach_kwargs,
         )
 
     _write_pid(process.pid)
@@ -300,10 +338,11 @@ def stop(
             raise typer.Exit(0)
         time.sleep(1)
 
-    # Force kill if still running
-    console.print(f"[yellow]Process still running after {timeout}s, sending SIGKILL[/yellow]")
+    # Force kill if still running. signal.SIGKILL is POSIX-only; on Windows fall
+    # back to SIGTERM, which os.kill maps to an unconditional TerminateProcess.
+    console.print(f"[yellow]Process still running after {timeout}s, force killing[/yellow]")
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except OSError:
         pass
 
@@ -370,7 +409,7 @@ def restart(
 
         if _is_process_running(pid):
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             except OSError:
                 pass
 
