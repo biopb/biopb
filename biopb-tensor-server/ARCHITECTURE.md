@@ -227,11 +227,22 @@ _graceful_shutdown` runs and the file-cache process lock is released.
 The sentinel name is **fixed, not PID-keyed**: on Windows the process `start`
 launches (and records in the PID file) can differ from the one actually running
 `launch()`/uvicorn (Store-Python/uv launcher shims), so a PID in the name would
-make `stop` and the daemon disagree. There's only ever one daemon (the PID file
-is singular too). A leftover sentinel from a prior run is ignored via an mtime
-guard. `stop` falls back to `TerminateProcess` (via `os.kill`) if the sentinel
-can't be written or the daemon doesn't exit within `--timeout`. On POSIX, `stop`
-sends `SIGTERM` as before. See `biopb/biopb#22`.
+make `stop` and the daemon disagree. A leftover sentinel from a prior run is
+ignored via an mtime guard. `stop` falls back to `TerminateProcess` (via
+`os.kill`) if the sentinel can't be written or the daemon doesn't exit within
+`--timeout`. On POSIX, `stop` sends `SIGTERM` as before. See `biopb/biopb#22`.
+
+This assumes the **single-server model**: the fixed sentinel name (and the
+singular PID file) are unambiguous because the `biopb` CLI runs at most one
+managed daemon. That single-instance guarantee comes from `biopb server start`
+(the PID-file check) — **not** from `launch` itself. Running
+`biopb-tensor-server launch`/`serve` directly bypasses it: such a process is
+**self-managed** — `biopb server stop` does not track it (no PID file, so it
+reports "no server running"), and you stop it with Ctrl+C / your own process
+control. Note that a directly-launched `launch` still installs the watcher on
+the same fixed sentinel, so running a managed daemon and a direct `launch` side
+by side on Windows is unsupported (a `biopb server stop` would also stop the
+direct one). On POSIX there is no such coupling — `stop` signals one PID.
 
 ---
 
