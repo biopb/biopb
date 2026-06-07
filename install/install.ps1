@@ -166,6 +166,7 @@ function Add-ToUserPath {
 # Cursor, ...). Uses native JSON (ConvertFrom/ConvertTo-Json) in place of jq.
 # biopb-mcp speaks stdio, so the client spawns the command itself — a bare
 # command+args entry (no "type") is the form every mcpServers client accepts.
+# Returns $true only if biopb was actually written into the client's config.
 function Merge-McpJson {
     param([string]$File, [string]$Command, [string[]]$CmdArgs, [string]$Label, [string]$ConfigDir)
     $dir = Split-Path -Parent $File
@@ -188,13 +189,15 @@ function Merge-McpJson {
             Write-Ok "${Label}: registered biopb (merged into $File)"
         } catch {
             Write-Warn2 "${Label}: could not merge $File - add biopb manually (see $ConfigDir\mcp.json)"
+            return $false
         }
-        return
+        return $true
     }
 
     $obj = [pscustomobject]@{ mcpServers = [pscustomobject]@{ biopb = $entry } }
     Set-FileUtf8NoBom -Path $File -Content ($obj | ConvertTo-Json -Depth 20)
     Write-Ok "${Label}: created $File"
+    return $true
 }
 
 # Detect installed agent systems and register the biopb MCP server with each.
@@ -241,18 +244,23 @@ function Set-McpClients {
     Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
     Write-Ok "MCP definition written: $ConfigDir\mcp.json"
 
-    $detected = $false
+    # Assume the user has no working wiring until a branch below actually writes
+    # biopb into a client's config; cleared ($false) only on a real registration,
+    # so a detected-but-unregistered client (failed `claude mcp add` or an
+    # unwritable config) still gets the canonical fallback at the end.
+    $needToShowMcpConfig = $true
 
     # --- Claude Code (managed through the `claude` CLI) ---
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        $detected = $true
         & claude mcp get biopb *> $null
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Claude Code: biopb already registered"
+            $needToShowMcpConfig = $false
         } else {
             & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
             if ($LASTEXITCODE -eq 0) {
                 Write-Ok "Claude Code: registered biopb (user scope)"
+                $needToShowMcpConfig = $false
             } else {
                 Write-Warn2 "Claude Code detected but registration failed - add it manually:"
                 Write-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
@@ -263,21 +271,22 @@ function Set-McpClients {
     # --- Claude Desktop (Windows: %APPDATA%\Claude) ---
     $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
     if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
-        $detected = $true
-        Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir
+        if (Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir) {
+            $needToShowMcpConfig = $false
+        }
     }
 
     # --- Cursor ---
     $cursorDir = Join-Path $BiopbHome ".cursor"
     if (Test-Path -LiteralPath $cursorDir) {
-        $detected = $true
-        Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir
+        if (Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir) {
+            $needToShowMcpConfig = $false
+        }
     }
 
     # --- opencode ---
     $opencodeCfgDir = Join-Path $BiopbHome ".config\opencode"
     if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $opencodeCfgDir)) {
-        $detected = $true
         $opencodeCfg = Join-Path $opencodeCfgDir "opencode.json"
         if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
 
@@ -300,6 +309,7 @@ function Set-McpClients {
                 }
                 Set-FileUtf8NoBom -Path $opencodeCfg -Content ($json | ConvertTo-Json -Depth 20)
                 Write-Ok "opencode: registered biopb (merged into $opencodeCfg)"
+                $needToShowMcpConfig = $false
             } catch {
                 Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
                 Write-Inf "Add under 'mcp' in $opencodeCfg :"
@@ -309,19 +319,13 @@ function Set-McpClients {
             $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
             Set-FileUtf8NoBom -Path $opencodeCfg -Content ($opencodeObj | ConvertTo-Json -Depth 20)
             Write-Ok "opencode: created $opencodeCfg"
+            $needToShowMcpConfig = $false
         }
     }
 
-    if (-not $detected) {
-        Write-Inf "No supported agent system detected (Claude Code, Claude Desktop, Cursor, opencode)."
-        Write-Inf "To use biopb, register this stdio command with your MCP client:"
-        Write-Cmd "$mcpCmd $($mcpArgs -join ' ')"
-        Write-Inf "A ready-to-use definition is at: $ConfigDir\mcp.json"
-    }
-
-    # There is no separate server to start: the agent spawns biopb-mcp over stdio
-    # on demand, which opens the napari window and brings up the data plane.
-    Write-Inf "Your AI agent launches biopb-mcp automatically; a napari window opens when it does."
+    # Nothing auto-wired biopb into a client. Defer the notice to the final
+    # summary (via a script-scoped flag) so it groups with the other warnings.
+    $script:McpNeedsManual = $needToShowMcpConfig
 }
 
 $ISSUE_URL = "https://github.com/biopb/biopb/issues/new"
@@ -427,16 +431,15 @@ function Install-Biopb {
     Write-Ok "System check passed"
 
     # ===== Optional components =====
-    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
-    # most labs don't need (only legacy/proprietary formats require it).
+    # biopb-mcp is always installed (it is the primary interface), so it is not
+    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
+    # toolchain that most labs don't need (only legacy/proprietary formats need it).
     $sel = Select-Components -Labels @(
-        "Built-in data browser",
-        "biopb-mcp (MCP server)",
-        "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)"
-    ) -Defaults @($true, $true, $false)
+        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)",
+        "Bio-Formats (more image formats; needs Java and extra setup during first run)"
+    ) -Defaults @($true, $false)
     $InstallWebapp     = $sel[0]
-    $InstallMcp        = $sel[1]
-    $InstallBioformats = $sel[2]
+    $InstallBioformats = $sel[1]
     Write-Host ""
 
     # ===== 1. Install uv + buf (if needed) =====
@@ -494,10 +497,14 @@ function Install-Biopb {
     # ===== 2. Python =====
     Write-Step "[2/6] Ensuring Python..."
 
-    # biopb-mcp requires Python >= 3.10; otherwise 3.8 is sufficient.
-    $minMinor = if ($InstallMcp) { 10 } else { 8 }
+    # biopb-mcp (always installed) requires Python >= 3.10.
+    $minMinor = 10
 
+    # $pythonSpec is the interpreter we pin `uv tool install` to below via --python.
+    # Without it, uv auto-discovers an interpreter and may pick an old system
+    # python (e.g. 3.9) that then fails biopb-mcp's Requires-Python>=3.10.
     $pythonOk = $false
+    $pythonSpec = ""
     $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($pyExe) {
         $verStr = & $pyExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
@@ -507,6 +514,7 @@ function Install-Biopb {
             if ($maj -gt 3 -or ($maj -eq 3 -and $min -ge $minMinor)) {
                 Write-Ok "Using system Python: $(& $pyExe --version)"
                 $pythonOk = $true
+                $pythonSpec = $pyExe
             } else {
                 Write-Warn2 "System Python too old ($(& $pyExe --version)), need >= 3.$minMinor"
             }
@@ -517,6 +525,7 @@ function Install-Biopb {
         uv python install 3.11
         Assert-LastExit "Python install"
         Write-Ok "Python 3.11 ready"
+        $pythonSpec = "3.11"
     }
 
     # ===== 3. Install biopb packages =====
@@ -585,18 +594,17 @@ function Install-Biopb {
     # unbuildable grpcio-tools==1.30.0. It comes from PyPI in both modes.
     $installArgs = @(
         "tool", "install", "--upgrade", "--force",
+        "--python", $pythonSpec,
         $biopbReq,
         "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
-    if ($InstallMcp) {
-        Write-Inf "  including biopb-mcp + napari"
-        $installArgs += @(
-            "--with", "biopb-mcp[mcp]>=0.6.0",
-            "--with", "napari[all]",
-            "--with-executables-from", "biopb-mcp"
-        )
-    }
+    Write-Inf "  including biopb-mcp + napari"
+    $installArgs += @(
+        "--with", "biopb-mcp[mcp]>=0.6.0",
+        "--with", "napari[all]",
+        "--with-executables-from", "biopb-mcp"
+    )
 
     Write-Inf "Installing biopb into one shared environment..."
     try {
@@ -707,57 +715,52 @@ monitor = true
     # ===== 6. Wire biopb-mcp into the user's agent system =====
     Write-Step "[6/6] Configuring MCP client..."
 
-    if ($InstallMcp) {
-        Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
-    } else {
-        Write-Inf "Skipped (biopb-mcp not installed)"
-    }
+    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
 
     # ===== Summary =====
+    # Two groups, in order: all informational blocks, then all warnings. Every
+    # block is one headline line, optional indented detail lines, then one blank
+    # line. Set-McpClients only sets a flag, so its warning lands in the warning
+    # group below rather than printing inline.
     Write-Host ""
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
+    Write-Host ""
 
-    if ($InstallMcp) {
-        Write-Host "Your AI agent launches biopb-mcp over stdio - just start your agent" -ForegroundColor Green
-        Write-Host "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it." -ForegroundColor Green
+    # Headlines via Write-Inf (indent 2, matching Write-Ok/Write-Warn2), detail
+    # lines indent 4.
+    # --- informational blocks ---
+    Write-Inf "Your AI agent launches biopb-mcp over stdio - just start your agent"
+    Write-Inf "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it."
+    Write-Host ""
+
+    if ($InstallWebapp) {
+        Write-Inf "Data browser available at http://localhost:8815"
         Write-Host ""
     }
 
-    Write-Host "To launch the data server only without other components:" -ForegroundColor Green
-    Write-Cmd "biopb server start"
+    Write-Inf "biopb-mcp configuration file:"
+    Write-Cmd "  $BiopbHome\.config\biopb-mcp\config.json"
     Write-Host ""
 
-    if (-not $InstallWebapp -or -not $InstallMcp -or -not $InstallBioformats) {
-        Write-Host "Optional components:" -ForegroundColor Green
-    }
+    Write-Inf "Data server configuration file:"
+    Write-Cmd "  $configFile"
+    Write-Host ""
+
+    Write-Inf "To upgrade: rerun this script"
+    Write-Host ""
+
+    # --- warnings ---
     if (-not $InstallWebapp) {
-        Write-Note "Data browser not installed - rerun this script to install"
-    } else {
-        Write-Ok "Data browser available at http://localhost:8815"
-    }
-    if (-not $InstallMcp) {
-        Write-Note "biopb-mcp not installed"
-        Write-Note "to add it into the shared environment, rerun this script and enable it"
-    }
-    if (-not $InstallBioformats) {
-        Write-Note "Bio-Formats not installed - ZVI/OIB/OIF and similar legacy formats unsupported"
-        Write-Note "to add later, rerun this script and enable Bio-Formats, or:"
-        Write-Cmd "         pip install `"biopb-tensor-server[bioformats]`""
-    }
-    if (-not $InstallWebapp -or -not $InstallMcp -or -not $InstallBioformats) { Write-Host "" }
-
-    if ($InstallMcp) {
-        Write-Host "biopb-mcp configuration file at:" -ForegroundColor Green
-        Write-Cmd "         $BiopbHome\.config\biopb-mcp\config.json"
+        Write-Warn2 "Data browser not installed"
+        Write-Inf "  rerun this script to install it"
         Write-Host ""
     }
 
-    Write-Host "Data server configuration file at:" -ForegroundColor Green
-    Write-Cmd "         $configFile"
-    Write-Host ""
-
-    Write-Host "To upgrade: rerun this script" -ForegroundColor Green
-    Write-Host ""
+    if ($script:McpNeedsManual) {
+        Write-Warn2 "biopb is not registered with any MCP client"
+        Write-Inf "  register it manually using $ConfigDir\mcp.json"
+        Write-Host ""
+    }
 }
 
 Show-Banner

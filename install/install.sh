@@ -233,13 +233,15 @@ PY
 # Merge the biopb server into a standard `mcpServers` JSON config (Claude Desktop,
 # Cursor, …). biopb-mcp speaks stdio, so the client spawns the command itself.
 # Usage: _mcp_json_merge <config-file> <command> <label> [args...]
+# Returns 0 only if biopb was actually written into the client's config.
 _mcp_json_merge() {
     local file="$1" command="$2" label="$3"; shift 3
     if _mcp_merge "$file" "mcpServers" "stdio" "$command" "$@"; then
         _ok "$label: registered biopb ($file)"
-    else
-        _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
+        return 0
     fi
+    _warn "$label: could not update $file — add biopb manually (see $CONFIG_DIR/mcp.json)"
+    return 1
 }
 
 # Detect AI agents (MCP clients) already on the system that biopb-mcp can plug into.
@@ -366,15 +368,20 @@ EOF
         _warn "Could not write $CONFIG_DIR/mcp.json"
     fi
 
-    local detected=0
+    # Assume the user has no working wiring until a branch below actually writes
+    # biopb into a client's config; cleared (0) only on a real registration, so a
+    # detected-but-unregistered client (failed `claude mcp add`, unwritable file,
+    # or Hermes' manual-only path) still gets the canonical fallback at the end.
+    local need_to_show_mcp_config=1
 
     # --- Claude Code (managed through the `claude` CLI) ---
     if command -v claude &>/dev/null; then
-        detected=1
         if claude mcp get biopb &>/dev/null; then
             _ok "Claude Code: biopb already registered"
+            need_to_show_mcp_config=0
         elif claude mcp add --scope user biopb -- "$mcp_cmd" "${mcp_args[@]}" &>/dev/null; then
             _ok "Claude Code: registered biopb (user scope)"
+            need_to_show_mcp_config=0
         else
             _warn "Claude Code detected but registration failed — add it manually:"
             _cmd "claude mcp add --scope user biopb -- $mcp_cmd ${mcp_args[*]}"
@@ -383,10 +390,12 @@ EOF
 
     # --- Hermes (NousResearch) — YAML config at ~/.hermes/config.yaml ---
     if [ -d "$HOME/.hermes" ]; then
-        detected=1
         if [ -f "$HOME/.hermes/config.yaml" ] && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
             _ok "Hermes: biopb already present in config.yaml"
+            need_to_show_mcp_config=0
         else
+            # We can't safely edit Hermes' YAML, so we only print the snippet — that
+            # is not an actual setup, so the flag stays set.
             _ok "Hermes detected"
             _info "Add the following under 'mcp_servers:' in $HOME/.hermes/config.yaml:"
             printf "    %sbiopb:\n      command: \"%s\"\n      args: [\"--transport\", \"stdio\"]%s\n" "$DIM" "$mcp_cmd" "$RESET"
@@ -400,23 +409,21 @@ EOF
         Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
     esac
     if [ -n "$cd_cfg" ] && [ -d "$(dirname "$cd_cfg")" ]; then
-        detected=1
-        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}"
+        _mcp_json_merge "$cd_cfg" "$mcp_cmd" "Claude Desktop" "${mcp_args[@]}" && need_to_show_mcp_config=0
     fi
 
     # --- Cursor ---
     if [ -d "$HOME/.cursor" ]; then
-        detected=1
-        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}"
+        _mcp_json_merge "$HOME/.cursor/mcp.json" "$mcp_cmd" "Cursor" "${mcp_args[@]}" && need_to_show_mcp_config=0
     fi
 
     # --- opencode ---
     local opencode_cfg_dir="$HOME/.config/opencode"
     if command -v opencode &>/dev/null || [ -d "$opencode_cfg_dir" ]; then
-        detected=1
         local opencode_cfg="$opencode_cfg_dir/opencode.json"
         if _mcp_merge "$opencode_cfg" "mcp" "opencode" "$mcp_cmd" "${mcp_args[@]}"; then
             _ok "opencode: registered biopb ($opencode_cfg)"
+            need_to_show_mcp_config=0
         else
             _warn "opencode: could not update $opencode_cfg — add biopb manually"
             _info "Add under 'mcp' in $opencode_cfg:"
@@ -424,17 +431,9 @@ EOF
         fi
     fi
 
-    if [ "$detected" = "0" ]; then
-        _info "No supported agent system detected (Claude Code, Claude Desktop, Cursor, Hermes, opencode)."
-        _info "To use biopb, register this stdio command with your MCP client:"
-        _cmd "$mcp_cmd ${mcp_args[*]}"
-        _info "A ready-to-use definition is at: $CONFIG_DIR/mcp.json"
-    fi
-
-    # There is no separate server to start: the agent spawns biopb-mcp over stdio
-    # on demand, which opens the napari window and brings up the data plane.
-    _info "Your AI agent launches biopb-mcp automatically; a napari window opens"
-    _info "when it does — no need to start it by hand."
+    # Nothing auto-wired biopb into a client. Defer the notice to the final
+    # summary (via a global) so it groups with the other warnings there.
+    MCP_NEEDS_MANUAL="$need_to_show_mcp_config"
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -446,9 +445,16 @@ EOF
 # install.sh prepends ~/.local/bin for its own use, which would otherwise make
 # both this check and `uv tool update-shell` believe the dir is already set up
 # (uv prints "already in PATH" and edits no rc file).
+# Make ~/.local/bin reachable from future shells. Prints nothing; instead it sets
+# two globals the final summary reads, so the PATH warning groups with the others:
+#   NEED_NEW_TERMINAL  — 1 if the user must open a new shell before biopb is found.
+#   PATH_EXPORT_HINT   — the export line to run by hand, only if we couldn't persist.
 _ensure_local_bin_on_path() {
     local bin_dir="$HOME/.local/bin"
     local original_path="${1:-$PATH}"
+
+    NEED_NEW_TERMINAL=0
+    PATH_EXPORT_HINT=""
 
     # Already persistently on the user's PATH? Nothing to do.
     case ":$original_path:" in
@@ -457,31 +463,13 @@ _ensure_local_bin_on_path() {
 
     # Persist for future shells. Run uv by absolute path with the original PATH
     # so it sees the dir as missing and updates the shell rc (idempotent; tolerate
-    # old uv lacking the subcommand).
-    local persisted=0
+    # old uv lacking the subcommand). If that fails, hand the user the export line.
     local uv_bin; uv_bin=$(command -v uv 2>/dev/null || true)
-    if [ -n "$uv_bin" ] && PATH="$original_path" "$uv_bin" tool update-shell &>/dev/null; then
-        persisted=1
+    if ! { [ -n "$uv_bin" ] && PATH="$original_path" "$uv_bin" tool update-shell &>/dev/null; }; then
+        PATH_EXPORT_HINT="export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 
-    local future_msg
-    if [ "$persisted" = "1" ]; then
-        future_msg="New shells should work automatically. But for THIS terminal, you need:"
-    else
-        future_msg="Add it to your shell profile, and run it now for THIS terminal:"
-    fi
-
-    # Full-width rules (no right border) so the banner is prominent but never
-    # misaligns, regardless of how long $HOME / the path is.
-    # local rule="──────────────────────────────────────────────────────────────────"
-    # printf "\n${YELLOW}${BOLD}  %s${RESET}\n" "$rule"
-    # printf   "${YELLOW}${BOLD}  ⚠  ACTION REQUIRED — PATH not configured${RESET}\n"
-    # printf   "${YELLOW}${BOLD}  %s${RESET}\n" "$rule"
-    _warn   "  %s is not on your PATH; biopb commands live there.\n" "$bin_dir"
-    _warn   "  %s\n" "$future_msg"
-    _info   "      ${CYAN}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}\n"
-    echo ""
-    # printf   "${YELLOW}${BOLD}  %s${RESET}\n\n" "$rule"
+    NEED_NEW_TERMINAL=1
 }
 
 # --- Release-based install helpers -------------------------------------------
@@ -632,13 +620,13 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
-    # most labs don't need (only legacy/proprietary formats require it).
-    CHECKBOX_DEFAULTS=(1 1 0)
-    read -r INSTALL_WEBAPP INSTALL_MCP INSTALL_BIOFORMATS <<< "$(_checkbox \
-        "Built-in data browser" \
-        "biopb-mcp (MCP server)" \
-        "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)")"
+    # biopb-mcp is always installed (it is the primary interface), so it is not
+    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
+    # toolchain that most labs don't need (only legacy/proprietary formats need it).
+    CHECKBOX_DEFAULTS=(1 0)
+    read -r INSTALL_WEBAPP INSTALL_BIOFORMATS <<< "$(_checkbox \
+        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)" \
+        "Bio-Formats (more image formats; needs Java and extra setup during first run)")"
     unset CHECKBOX_DEFAULTS
     echo ""
 
@@ -685,11 +673,8 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/6] Ensuring Python..."
 
-    # biopb-mcp requires Python >= 3.10; otherwise 3.8 is sufficient.
-    MIN_MINOR=8
-    if [ "$INSTALL_MCP" = "1" ]; then
-        MIN_MINOR=10
-    fi
+    # biopb-mcp (always installed) requires Python >= 3.10.
+    MIN_MINOR=10
 
     # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
     # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
@@ -804,14 +789,12 @@ install_biopb() {
         --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
-    if [ "$INSTALL_MCP" = "1" ]; then
-        _info "  including biopb-mcp + napari"
-        install_args+=(
-            --with "biopb-mcp[mcp]>=0.6.0"
-            --with "napari[all]"
-            --with-executables-from biopb-mcp
-        )
-    fi
+    _info "  including biopb-mcp + napari"
+    install_args+=(
+        --with "biopb-mcp[mcp]>=0.6.0"
+        --with "napari[all]"
+        --with-executables-from biopb-mcp
+    )
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -902,101 +885,96 @@ EOF
     # ===== 6. Wire biopb-mcp into the user's agent system =====
     _step "[6/6] Configuring MCP client..."
 
-    if [ "$INSTALL_MCP" = "1" ]; then
-        # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
-        # agents; if none is present, offer to install opencode so the user ends up
-        # with a working setup instead of a server with nothing to talk to it.
-        _detect_agents
-        if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
-            _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
-        else
-            _info ""
-            _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
-            _info "We can install and setup one (opencode) for you. This allows you to start"
-            _info "playing with the system using a free AI agent - no cost."
-            _info ""
-            if _confirm "Install the opencode agent now?"; then
-                _install_opencode
-            else
-                _info "No agent will be installed; set one up later and rerun to wire it in."
-            fi
-        fi
-        _setup_mcp
+    # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
+    # agents; if none is present, offer to install opencode so the user ends up
+    # with a working setup instead of a server with nothing to talk to it.
+    _detect_agents
+    if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
+        _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
     else
-        _info "Skipped (biopb-mcp not installed)"
+        _info ""
+        _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
+        _info "We can install and setup one (opencode) for you. This allows you to start"
+        _info "playing with the system using a free AI agent - no cost."
+        _info ""
+        if _confirm "Install the opencode agent now?"; then
+            _install_opencode
+        else
+            _info "No agent will be installed; set one up later and rerun to wire it in."
+        fi
     fi
+    _setup_mcp
 
     # ===== Summary =====
-    printf "\n%s%s%s\n" "${BOLD}" "${YELLOW}" "=== Installation Complete ===${YELLOW}"
+    # Two groups, in order: all informational blocks, then all warnings. Every
+    # block is one headline line, optional indented detail lines, then one blank
+    # line. _ensure_local_bin_on_path and _setup_mcp only set flags, so their
+    # warnings land in the warning group below rather than printing inline.
+    printf "\n%s%s%s\n\n" "${BOLD}" "${YELLOW}" "=== Installation Complete ===${RESET}"
 
-    # Make sure the user can actually invoke the freshly installed commands.
     _ensure_local_bin_on_path "$ORIGINAL_PATH"
 
-    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To launch the data server only without other components:${RESET}"
-    _cmd "biopb server start"
+    # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
+    # --- informational blocks ---
+    if [ "$INSTALL_WEBAPP" = "1" ]; then
+        _info "Data browser available at http://localhost:8815"
+        echo ""
+    fi
+
+    _info "biopb-mcp configuration file:"
+    _cmd "  $HOME/.config/biopb-mcp/config.json"
     echo ""
 
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
-        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Optional components:${RESET}"
+    _info "Data server configuration file:"
+    _cmd "  $CONFIG_FILE"
+    echo ""
+
+    _info "To upgrade: rerun this script"
+    echo ""
+
+    # --- warnings ---
+    if [ "$NEED_NEW_TERMINAL" = "1" ]; then
+        _warn "you need to start a new terminal in order to use biopb"
+        [ -n "$PATH_EXPORT_HINT" ] && _info "  or run now: ${CYAN}$PATH_EXPORT_HINT${RESET}"
+        echo ""
     fi
+
     if [ "$INSTALL_WEBAPP" = "0" ]; then
-        _note "Data browser not installed — rerun this script to install"
+        _warn "Data browser not installed"
+        _info "  rerun this script to install it"
+        echo ""
+    fi
+
+    if [ "${MCP_NEEDS_MANUAL:-0}" = "1" ]; then
+        _warn "biopb is not registered with any MCP client"
+        _info "  register it manually using $CONFIG_DIR/mcp.json"
+        echo ""
+    fi
+
+    local agent_cmd
+    agent_cmd=$(_agent_launch_cmd)
+
+    local rule="──────────────────────────────────────────────────────────────────"
+    printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
+    printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
+
+    printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
+    if [ -n "$agent_cmd" ]; then
+        _cmd "$agent_cmd"
     else
-        _ok "Data browser available at http://localhost:8815"
+        _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
     fi
-    if [ "$INSTALL_MCP" = "0" ]; then
-        _note "biopb-mcp not installed"
-        _note "to add it into the shared environment, rerun this script and enable it"
-    fi
-    if [ "$INSTALL_BIOFORMATS" = "0" ]; then
-        _note "Bio-Formats not installed — ZVI/OIB/OIF and similar legacy formats unsupported"
-        _note "to add later, rerun this script and enable Bio-Formats, or:"
-        _cmd "         pip install \"biopb-tensor-server[bioformats]\""
-    fi
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
-        echo ""
-    fi
-
-    if [ "$INSTALL_MCP" = "1" ]; then
-        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "biopb-mcp configuration file at:${RESET}"
-        _cmd "         $HOME/.config/biopb-mcp/config.json"
-        echo ""
-    fi
-
-    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Data server configuration file at:${RESET}"
-    _cmd "         $CONFIG_FILE"
+    _info "The agent launches biopb-mcp for you and a napari window opens."
+    _info "Keep the agent session running while you work."
     echo ""
 
-    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "To upgrade: rerun this script${RESET}"
+    printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
     echo ""
+
+    printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
     echo ""
 
-    if [ "$INSTALL_MCP" = "1" ]; then
-        local agent_cmd
-        agent_cmd=$(_agent_launch_cmd)
-
-        local rule="──────────────────────────────────────────────────────────────────"
-        printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
-        printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
-
-        printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
-        if [ -n "$agent_cmd" ]; then
-            _cmd "$agent_cmd"
-        else
-            _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
-        fi
-        _info "The agent launches biopb-mcp for you and a napari window opens."
-        _info "Keep the agent session running while you work."
-        echo ""
-
-        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
-    fi
+    printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
 }
 
 # Only run if script was fully downloaded (function defined completely)
