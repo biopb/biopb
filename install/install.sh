@@ -348,9 +348,11 @@ _setup_mcp() {
         cat > "$mcp_config" << 'EOF'
 {
   "mcp": {
-    "process_image_servers": [
-      "grpcs://cellpose.biopb.org:443"
-    ]
+    "services": {
+      "process_image_servers": [
+        "grpcs://cellpose.biopb.org:443"
+      ]
+    }
   }
 }
 EOF
