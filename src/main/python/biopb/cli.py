@@ -150,40 +150,38 @@ def _is_process_running(pid: int) -> bool:
         return False
 
 
-def _win_set_shutdown_event(pid: int) -> bool:
-    """Windows: signal the daemon's named shutdown event. Returns True if set.
+# Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
+# _graceful_stop() so a Windows user can see why graceful stop fell back to force-kill.
+_LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
 
-    The daemon runs as a background process (CREATE_NO_WINDOW) with no console we
-    can deliver a console control event to from here, so graceful shutdown is
-    coordinated through a named Win32 event instead: the daemon waits on it and,
-    when set, asks uvicorn to exit (see _install_windows_shutdown_listener in
-    biopb_tensor_server.http_server). We open the event by name and set it.
-    Returns False if it doesn't exist yet (old server, or daemon still starting
-    up), so the caller can fall back to force-kill.
+
+def _win_shutdown_sentinel(pid: int) -> Path:
+    """Path of the per-daemon shutdown sentinel file (Windows graceful stop).
+
+    Must match shutdown_sentinel_path() in biopb_tensor_server.http_server (kept
+    as a literal here to avoid importing heavy server deps just to stop).
     """
-    # Must match win_shutdown_event_name() in biopb_tensor_server.http_server
-    # (kept as a literal here to avoid importing heavy server deps just to stop).
-    name = f"Local\\biopb-tensor-shutdown-{pid}"
-    try:
-        import ctypes
-        from ctypes import wintypes
+    return PID_FILE.parent / f"tensor-server-{pid}.stop"
 
-        EVENT_MODIFY_STATE = 0x0002
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-        kernel32.OpenEventW.restype = wintypes.HANDLE
-        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
-        kernel32.SetEvent.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, name)
-        if not handle:
-            return False
-        try:
-            return bool(kernel32.SetEvent(handle))
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:  # noqa: BLE001 - best effort; caller falls back to force-kill
+
+def _win_request_shutdown(pid: int) -> bool:
+    """Windows: ask the daemon to shut down gracefully. Returns True if the
+    request was delivered (not whether the process has exited yet).
+
+    The daemon is a windowless background process in its own process group, so it
+    has no console to receive a CTRL_BREAK, and Win32 named events are brittle
+    across sessions/elevation. We instead drop a sentinel *file* the daemon polls
+    for (see _install_windows_shutdown_listener in biopb_tensor_server.http_server);
+    a file under the user's biopb dir is unambiguous regardless of how either
+    process was launched.
+    """
+    global _LAST_WIN_SHUTDOWN_DIAG
+    try:
+        _ensure_dirs()
+        _win_shutdown_sentinel(pid).write_text("stop")
+        return True
+    except OSError as e:
+        _LAST_WIN_SHUTDOWN_DIAG = f"could not write shutdown sentinel: {e}"
         return False
 
 
@@ -191,7 +189,7 @@ def _request_graceful_stop(pid: int) -> bool:
     """Ask the daemon to shut down gracefully. Returns whether the request was
     delivered (not whether the process has exited yet)."""
     if sys.platform == "win32":
-        return _win_set_shutdown_event(pid)
+        return _win_request_shutdown(pid)
     try:
         os.kill(pid, signal.SIGTERM)
         return True
@@ -205,14 +203,11 @@ def _graceful_stop(pid: int, timeout: int) -> bool:
     gracefully, False if it had to be force-killed. Assumes `pid` is running.
     """
     delivered = _request_graceful_stop(pid)
-    if not delivered and sys.platform == "win32":
-        # The daemon may still be starting (its named event isn't created until
-        # launch() runs, after heavy imports). Retry briefly before force-kill.
-        for _ in range(3):
-            time.sleep(0.3)
-            if _win_set_shutdown_event(pid):
-                delivered = True
-                break
+    if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
+        console.print(
+            f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
+            f"force killing.[/yellow]"
+        )
 
     for _ in range(timeout):
         if not _is_process_running(pid):

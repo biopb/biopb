@@ -30,11 +30,11 @@ class TestRequestGracefulStop:
         with patch.object(cli.os, "kill", side_effect=OSError):
             assert cli._request_graceful_stop(4321) is False
 
-    def test_windows_routes_to_named_event(self, monkeypatch):
+    def test_windows_routes_to_sentinel(self, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
-        with patch.object(cli, "_win_set_shutdown_event", return_value=True) as ev:
+        with patch.object(cli, "_win_request_shutdown", return_value=True) as req:
             assert cli._request_graceful_stop(4321) is True
-            ev.assert_called_once_with(4321)
+            req.assert_called_once_with(4321)
 
 
 class TestGracefulStop:
@@ -65,21 +65,23 @@ class TestGracefulStop:
             kill.assert_called_with(1234, expected_sig)
         remove.assert_called_once()
 
-    def test_windows_retries_event_when_daemon_still_starting(self, monkeypatch):
+    def test_force_kill_surfaces_diag_when_delivery_failed(self, monkeypatch, capsys):
         monkeypatch.setattr("sys.platform", "win32")
-        # Initial request fails (event not created yet), then succeeds on retry.
-        ev = MagicMock(side_effect=[False, False, True])
-        monkeypatch.setattr(cli, "_win_set_shutdown_event", ev)
         monkeypatch.setattr(cli, "_request_graceful_stop", lambda _pid: False)
-        # Process exits right after the event is finally set.
-        alive = iter([False])
-        monkeypatch.setattr(cli, "_is_process_running", lambda _pid: next(alive))
+        monkeypatch.setattr(cli, "_LAST_WIN_SHUTDOWN_DIAG", "could not write shutdown sentinel: boom")
+        monkeypatch.setattr(cli, "_is_process_running", lambda _pid: True)
         monkeypatch.setattr(cli, "_remove_pid", MagicMock())
-        assert cli._graceful_stop(1234, timeout=5) is True
-        assert ev.call_count == 3  # retried until it landed
+        with patch.object(cli.os, "kill"):
+            assert cli._graceful_stop(1234, timeout=1) is False
+        assert "Graceful stop unavailable" in capsys.readouterr().out
 
 
-class TestWinSetShutdownEventOffWindows:
-    def test_returns_false_safely_off_windows(self):
-        # ctypes.windll doesn't exist off Windows; must be caught, not raised.
-        assert cli._win_set_shutdown_event(1234) is False
+class TestWinRequestShutdown:
+    def test_writes_sentinel_file(self, tmp_path, monkeypatch):
+        # Redirect the biopb data dir to a temp location.
+        monkeypatch.setattr(cli, "PID_FILE", tmp_path / "tensor-server.pid")
+        assert cli._win_request_shutdown(4321) is True
+        sentinel = cli._win_shutdown_sentinel(4321)
+        assert sentinel.exists()
+        assert sentinel.read_text() == "stop"
+        assert sentinel == tmp_path / "tensor-server-4321.stop"
