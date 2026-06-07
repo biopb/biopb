@@ -630,13 +630,13 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
-    # most labs don't need (only legacy/proprietary formats require it).
-    CHECKBOX_DEFAULTS=(1 1 0)
-    read -r INSTALL_WEBAPP INSTALL_MCP INSTALL_BIOFORMATS <<< "$(_checkbox \
+    # biopb-mcp is always installed (it is the primary interface), so it is not
+    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
+    # toolchain that most labs don't need (only legacy/proprietary formats need it).
+    CHECKBOX_DEFAULTS=(1 0)
+    read -r INSTALL_WEBAPP INSTALL_BIOFORMATS <<< "$(_checkbox \
         "Built-in data browser" \
-        "biopb-mcp (MCP server)" \
-        "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)")"
+        "Bio-Formats (more image formats; needs Java and extra setup during first run)")"
     unset CHECKBOX_DEFAULTS
     echo ""
 
@@ -683,11 +683,8 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/6] Ensuring Python..."
 
-    # biopb-mcp requires Python >= 3.10; otherwise 3.8 is sufficient.
-    MIN_MINOR=8
-    if [ "$INSTALL_MCP" = "1" ]; then
-        MIN_MINOR=10
-    fi
+    # biopb-mcp (always installed) requires Python >= 3.10.
+    MIN_MINOR=10
 
     # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
     # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
@@ -802,14 +799,12 @@ install_biopb() {
         --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
-    if [ "$INSTALL_MCP" = "1" ]; then
-        _info "  including biopb-mcp + napari"
-        install_args+=(
-            --with "biopb-mcp[mcp]>=0.6.0"
-            --with "napari[all]"
-            --with-executables-from biopb-mcp
-        )
-    fi
+    _info "  including biopb-mcp + napari"
+    install_args+=(
+        --with "biopb-mcp[mcp]>=0.6.0"
+        --with "napari[all]"
+        --with-executables-from biopb-mcp
+    )
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
@@ -900,29 +895,25 @@ EOF
     # ===== 6. Wire biopb-mcp into the user's agent system =====
     _step "[6/6] Configuring MCP client..."
 
-    if [ "$INSTALL_MCP" = "1" ]; then
-        # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
-        # agents; if none is present, offer to install opencode so the user ends up
-        # with a working setup instead of a server with nothing to talk to it.
-        _detect_agents
-        if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
-            _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
-        else
-            _info ""
-            _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
-            _info "We can install and setup one (opencode) for you. This allows you to start"
-            _info "playing with the system using a free AI agent - no cost."
-            _info ""
-            if _confirm "Install the opencode agent now?"; then
-                _install_opencode
-            else
-                _info "No agent will be installed; set one up later and rerun to wire it in."
-            fi
-        fi
-        _setup_mcp
+    # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
+    # agents; if none is present, offer to install opencode so the user ends up
+    # with a working setup instead of a server with nothing to talk to it.
+    _detect_agents
+    if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
+        _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
     else
-        _info "Skipped (biopb-mcp not installed)"
+        _info ""
+        _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
+        _info "We can install and setup one (opencode) for you. This allows you to start"
+        _info "playing with the system using a free AI agent - no cost."
+        _info ""
+        if _confirm "Install the opencode agent now?"; then
+            _install_opencode
+        else
+            _info "No agent will be installed; set one up later and rerun to wire it in."
+        fi
     fi
+    _setup_mcp
 
     # ===== Summary =====
     printf "\n%s%s%s\n" "${BOLD}" "${YELLOW}" "=== Installation Complete ===${YELLOW}"
@@ -934,7 +925,7 @@ EOF
     _cmd "biopb server start"
     echo ""
 
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
         printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Optional components:${RESET}"
     fi
     if [ "$INSTALL_WEBAPP" = "0" ]; then
@@ -942,24 +933,18 @@ EOF
     else
         _ok "Data browser available at http://localhost:8815"
     fi
-    if [ "$INSTALL_MCP" = "0" ]; then
-        _note "biopb-mcp not installed"
-        _note "to add it into the shared environment, rerun this script and enable it"
-    fi
     if [ "$INSTALL_BIOFORMATS" = "0" ]; then
         _note "Bio-Formats not installed — ZVI/OIB/OIF and similar legacy formats unsupported"
         _note "to add later, rerun this script and enable Bio-Formats, or:"
         _cmd "         pip install \"biopb-tensor-server[bioformats]\""
     fi
-    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_MCP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
+    if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
         echo ""
     fi
 
-    if [ "$INSTALL_MCP" = "1" ]; then
-        printf "%s%s%s\n" "${BOLD}" "${GREEN}" "biopb-mcp configuration file at:${RESET}"
-        _cmd "         $HOME/.config/biopb-mcp/config.json"
-        echo ""
-    fi
+    printf "%s%s%s\n" "${BOLD}" "${GREEN}" "biopb-mcp configuration file at:${RESET}"
+    _cmd "         $HOME/.config/biopb-mcp/config.json"
+    echo ""
 
     printf "%s%s%s\n" "${BOLD}" "${GREEN}" "Data server configuration file at:${RESET}"
     _cmd "         $CONFIG_FILE"
@@ -969,32 +954,30 @@ EOF
     echo ""
     echo ""
 
-    if [ "$INSTALL_MCP" = "1" ]; then
-        local agent_cmd
-        agent_cmd=$(_agent_launch_cmd)
+    local agent_cmd
+    agent_cmd=$(_agent_launch_cmd)
 
-        local rule="──────────────────────────────────────────────────────────────────"
-        printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
-        printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
+    local rule="──────────────────────────────────────────────────────────────────"
+    printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
+    printf "%s%sCongratulations! You are ready to use BioPB. Next steps:%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
 
-        printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
-        if [ -n "$agent_cmd" ]; then
-            _cmd "$agent_cmd"
-        else
-            _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
-        fi
-        _info "The agent launches biopb-mcp for you and a napari window opens."
-        _info "Keep the agent session running while you work."
-        echo ""
-
-        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
-        echo ""
-
-        printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
+    printf "  %s1. Start a new shell session, then launch your AI agent.%s Run:\n" "${BOLD}" "${RESET}"
+    if [ -n "$agent_cmd" ]; then
+        _cmd "$agent_cmd"
+    else
+        _info "your AI agent (e.g. Claude Code, opencode, Cursor)"
     fi
+    _info "The agent launches biopb-mcp for you and a napari window opens."
+    _info "Keep the agent session running while you work."
+    echo ""
+
+    printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+    echo ""
+
+    printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"
+    echo ""
+
+    printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
 }
 
 # Only run if script was fully downloaded (function defined completely)

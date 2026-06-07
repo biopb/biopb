@@ -425,16 +425,15 @@ function Install-Biopb {
     Write-Ok "System check passed"
 
     # ===== Optional components =====
-    # Bio-Formats defaults to off: it pulls in a heavyweight Java toolchain that
-    # most labs don't need (only legacy/proprietary formats require it).
+    # biopb-mcp is always installed (it is the primary interface), so it is not
+    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
+    # toolchain that most labs don't need (only legacy/proprietary formats need it).
     $sel = Select-Components -Labels @(
         "Built-in data browser",
-        "biopb-mcp (MCP server)",
-        "Bio-Formats support (ZVI, OIB, OIF, ...; auto-downloads Java on first use)"
-    ) -Defaults @($true, $true, $false)
+        "Bio-Formats (more image formats; needs Java and extra setup during first run)"
+    ) -Defaults @($true, $false)
     $InstallWebapp     = $sel[0]
-    $InstallMcp        = $sel[1]
-    $InstallBioformats = $sel[2]
+    $InstallBioformats = $sel[1]
     Write-Host ""
 
     # ===== 1. Install uv + buf (if needed) =====
@@ -492,8 +491,8 @@ function Install-Biopb {
     # ===== 2. Python =====
     Write-Step "[2/6] Ensuring Python..."
 
-    # biopb-mcp requires Python >= 3.10; otherwise 3.8 is sufficient.
-    $minMinor = if ($InstallMcp) { 10 } else { 8 }
+    # biopb-mcp (always installed) requires Python >= 3.10.
+    $minMinor = 10
 
     $pythonOk = $false
     $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -587,14 +586,12 @@ function Install-Biopb {
         "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
-    if ($InstallMcp) {
-        Write-Inf "  including biopb-mcp + napari"
-        $installArgs += @(
-            "--with", "biopb-mcp[mcp]>=0.6.0",
-            "--with", "napari[all]",
-            "--with-executables-from", "biopb-mcp"
-        )
-    }
+    Write-Inf "  including biopb-mcp + napari"
+    $installArgs += @(
+        "--with", "biopb-mcp[mcp]>=0.6.0",
+        "--with", "napari[all]",
+        "--with-executables-from", "biopb-mcp"
+    )
 
     Write-Inf "Installing biopb into one shared environment..."
     try {
@@ -705,27 +702,21 @@ monitor = true
     # ===== 6. Wire biopb-mcp into the user's agent system =====
     Write-Step "[6/6] Configuring MCP client..."
 
-    if ($InstallMcp) {
-        Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
-    } else {
-        Write-Inf "Skipped (biopb-mcp not installed)"
-    }
+    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
 
     # ===== Summary =====
     Write-Host ""
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
 
-    if ($InstallMcp) {
-        Write-Host "Your AI agent launches biopb-mcp over stdio - just start your agent" -ForegroundColor Green
-        Write-Host "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it." -ForegroundColor Green
-        Write-Host ""
-    }
+    Write-Host "Your AI agent launches biopb-mcp over stdio - just start your agent" -ForegroundColor Green
+    Write-Host "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it." -ForegroundColor Green
+    Write-Host ""
 
     Write-Host "To launch the data server only without other components:" -ForegroundColor Green
     Write-Cmd "biopb server start"
     Write-Host ""
 
-    if (-not $InstallWebapp -or -not $InstallMcp -or -not $InstallBioformats) {
+    if (-not $InstallWebapp -or -not $InstallBioformats) {
         Write-Host "Optional components:" -ForegroundColor Green
     }
     if (-not $InstallWebapp) {
@@ -733,22 +724,16 @@ monitor = true
     } else {
         Write-Ok "Data browser available at http://localhost:8815"
     }
-    if (-not $InstallMcp) {
-        Write-Note "biopb-mcp not installed"
-        Write-Note "to add it into the shared environment, rerun this script and enable it"
-    }
     if (-not $InstallBioformats) {
         Write-Note "Bio-Formats not installed - ZVI/OIB/OIF and similar legacy formats unsupported"
         Write-Note "to add later, rerun this script and enable Bio-Formats, or:"
         Write-Cmd "         pip install `"biopb-tensor-server[bioformats]`""
     }
-    if (-not $InstallWebapp -or -not $InstallMcp -or -not $InstallBioformats) { Write-Host "" }
+    if (-not $InstallWebapp -or -not $InstallBioformats) { Write-Host "" }
 
-    if ($InstallMcp) {
-        Write-Host "biopb-mcp configuration file at:" -ForegroundColor Green
-        Write-Cmd "         $BiopbHome\.config\biopb-mcp\config.json"
-        Write-Host ""
-    }
+    Write-Host "biopb-mcp configuration file at:" -ForegroundColor Green
+    Write-Cmd "         $BiopbHome\.config\biopb-mcp\config.json"
+    Write-Host ""
 
     Write-Host "Data server configuration file at:" -ForegroundColor Green
     Write-Cmd "         $configFile"
