@@ -1,0 +1,124 @@
+name: Image Runtime CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'biopb-image-runtime/**'
+      - 'biopb-tensor-server/**'
+      - 'proto/**'
+      - 'src/main/python/**'
+      - 'pyproject.toml'
+      - '.github/workflows/image-runtime-ci.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'biopb-image-runtime/**'
+      - 'biopb-tensor-server/**'
+      - 'proto/**'
+      - 'src/main/python/**'
+      - 'pyproject.toml'
+      - '.github/workflows/image-runtime-ci.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Container-free unit + service tests. The server-backed tests launch the mock
+  # servicer as a local subprocess (no Docker, no GPU); the pure suites
+  # (stitch / dynamics_local) need only numpy + scipy.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      # biopb and biopb-tensor-server are NOT on PyPI. The biopb-image-base
+      # [test] extra requires biopb-tensor-server, so install it (and biopb)
+      # editable from source FIRST — that satisfies the requirement and stops
+      # pip from trying (and failing) to fetch it from PyPI. The mock servicer
+      # the tests spawn as a subprocess needs biopb-tensor-server at runtime.
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install -e ".[tensor]"
+          pip install -e "./biopb-tensor-server"
+          pip install -e "./biopb-image-runtime[test]"
+
+      - name: Run tests
+        run: pytest biopb-image-runtime/tests/
+
+  # Build the base Docker image and prove the shipped package imports. This is
+  # the safety net for pyproject.toml <-> requirements.txt drift and any
+  # packaging breakage that only manifests inside the image — invisible to a
+  # local `pip install -e .` (see biopb/biopb#26: scipy was added to
+  # pyproject.toml but the image installs from requirements.txt).
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      # The Dockerfile COPYs pre-built wheels for biopb and biopb-tensor-server
+      # from wheels/. Neither is published to PyPI, so build both from the
+      # current working tree (this validates the tree under review — equivalent
+      # to scripts/build.sh --dev — rather than a released tag).
+      - name: Build wheels
+        run: |
+          pip wheel . --no-deps -w wheels/
+          pip wheel ./biopb-tensor-server --no-deps -w wheels/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build base image (verify only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: biopb-image-runtime/Dockerfile
+          load: true
+          tags: biopb-image-base:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The package eagerly imports stitch -> dynamics_local -> scipy.ndimage at
+      # import time, so a missing runtime dep in the image fails here, not just
+      # in a derived service at deploy time.
+      - name: Smoke-test image import
+        run: |
+          docker run --rm biopb-image-base:ci \
+            python -c "from biopb_image_base import stitch, dynamics_local; import scipy; print('image import ok')"
