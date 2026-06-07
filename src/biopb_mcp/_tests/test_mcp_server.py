@@ -169,22 +169,39 @@ class TestTakeScreenshot:
 
 
 class TestSetHeadless:
-    def test_headless_sets_handshake_instructions(self):
+    def test_base_instructions_carry_guardrails(self):
+        # The operation guardrails must be delivered up front via the handshake
+        # instructions (not left to a pull-on-demand resource).
+        base = _server._BASE_INSTRUCTIONS
+        assert "query_sources" in base
+        assert "run_on_main" in base
+        assert "filesystem" in base.lower()
+        # And they are advertised when visible (no headless directive).
+        _server.set_headless(False)
+        assert _server.mcp._mcp_server.instructions == base
+
+    def test_headless_appends_directive_to_base_instructions(self):
         _server.set_headless(True)
         instr = _server.mcp._mcp_server.instructions
         assert instr is not None
+        # Always-on base guidance plus the headless directive.
+        assert instr.startswith(_server._BASE_INSTRUCTIONS)
         assert "HEADLESS" in instr
         # The directive is conditioned on the user reaching for the viewer.
         assert "viewer" in instr.lower()
 
-    def test_visible_clears_stale_instructions(self):
+    def test_visible_keeps_base_drops_headless_directive(self):
         # A flip headless -> visible must not leave the HEADLESS directive in
-        # the handshake (set_headless owns the field in both directions).
+        # the handshake, but must retain the always-on base guidance
+        # (set_headless owns the field in both directions).
         _server.set_headless(True)
-        assert _server.mcp._mcp_server.instructions is not None
+        assert "HEADLESS" in _server.mcp._mcp_server.instructions
         _server.set_headless(False)
         assert _server._headless is False
-        assert _server.mcp._mcp_server.instructions is None
+        assert (
+            _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
+        )
+        assert "HEADLESS" not in _server.mcp._mcp_server.instructions
 
     def test_server_status_reports_display_mode(self, server_with_host):
         _server.set_headless(True)

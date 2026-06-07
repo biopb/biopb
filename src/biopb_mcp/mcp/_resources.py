@@ -56,12 +56,10 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `ca
   ```
 
 ## Operation Guardrails **IMPORTANT**
-* All data should be from `client` or `viewer`. Avoid directly accessing the file system unless specifically requested by the user.
-* Prefer browsing the catalog through `client.query_sources(sql)` (server-side DuckDB, complete) than `client.list_sources()` (capped by the server for large catalogs).
-* Prefer lazy dask operations and only `.compute()` the final result.
-* Intermediate results should be put back on `viewer` to be validated by user at each step.
-* Do _not_ assume. Ask the user to clarify uncertainties - they know the data better than you do.
-* After accomplishing a task, ask the user if a skill should be added to the agent's toolbox for future use.
+The operation guardrails (filesystem avoidance, `query_sources` over
+`list_sources`, lazy-dask, returning intermediates to the viewer, ask-don't-
+assume, offer-a-skill) are delivered up front in the session `instructions` and
+apply on every turn — follow them throughout.
 
 ## Quick Examples
 ```python

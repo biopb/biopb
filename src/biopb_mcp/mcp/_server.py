@@ -34,8 +34,46 @@ _headless: bool = False
 
 # Handed to the client in the initialize handshake (the only handshake-time
 # carrier MCP defines). Clients that honor it inject it into the model's
-# context from the first turn; phrased to fire only when the user actually
-# reaches for the viewer (compliance is up to the client/agent).
+# context from the first turn (compliance is up to the client/agent), so this
+# field carries the guidance that must hold on *every* turn — the operation
+# guardrails and the viewer-threading invariant — which a pull-on-demand
+# resource (guide://main) cannot guarantee the agent ever reads. Verbose,
+# situational reference (namespace table, code recipes, examples) stays in the
+# resources, pulled when actually needed. The execute_code docstring already
+# carries the namespace/job-model summary, so it is not repeated here.
+_BASE_INSTRUCTIONS = (
+    "This biopb-mcp session drives a live napari viewer through a child IPython "
+    "kernel; `execute_code` runs arbitrary Python in that kernel (agent-first: "
+    "prefer writing code over asking for bespoke tools). Read these resources "
+    "for detail before non-trivial work: guide://main (namespace, examples, "
+    "long-running jobs & cancellation), guide://tensor (data access/upload), "
+    "guide://viewer (layers/camera/dims), guide://annotations "
+    "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
+    "\n"
+    "Threading: viewer reads are safe from a job thread, but every viewer "
+    "*mutation* must run on the Qt main thread. `viewer.load_tensor()` and the "
+    "`viewer.add_*()` family are already wrapped; wrap anything else (layer "
+    "properties, `viewer.dims`, `viewer.camera`, callback registration) in "
+    "`run_on_main(fn)`.\n"
+    "\n"
+    "Operation guardrails (apply on every turn):\n"
+    "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
+    "explicitly asks.\n"
+    "- Browse the catalog with `client.query_sources(sql)` (server-side DuckDB, "
+    "complete), not `client.list_sources()` (server-capped for large "
+    "catalogs).\n"
+    "- Prefer lazy dask operations; only `.compute()` the final result.\n"
+    "- Put intermediate results back on `viewer` for the user to validate at "
+    "each step.\n"
+    "- Do not assume — ask the user to clarify uncertainties; they know the "
+    "data better than you do.\n"
+    "- After accomplishing a task, ask the user whether a skill should be added "
+    "to the agent's toolbox for future use."
+)
+
+# Appended to _BASE_INSTRUCTIONS when the session is headless. Phrased to fire
+# only when the user actually reaches for the viewer (compliance is up to the
+# client/agent).
 _HEADLESS_INSTRUCTIONS = (
     "This biopb-mcp session is running HEADLESS: it was started without a "
     "display, so there is NO napari viewer window and screenshots are not "
@@ -79,6 +117,12 @@ def build_transport_security(
 
 
 mcp = FastMCP("biopb-mcp", transport_security=build_transport_security())
+
+# FastMCP built the low-level server with instructions=None at import; seed the
+# always-on base guidance now so it is present even if set_headless is never
+# called (e.g. tests, or a standalone import). set_headless recomposes from this
+# base.
+mcp._mcp_server.instructions = _BASE_INSTRUCTIONS
 
 _PNG_DELIM = "<<PNG_B64>>"
 
@@ -221,16 +265,18 @@ def set_headless(headless: bool):
     """Mark the session compute-only (no viewer) and advertise it to the agent
     via the initialize ``instructions`` field.
 
-    Owns that field in both directions (idempotent): set the headless directive
-    when headless, clear it otherwise, so a flip back to visible can't leave a
-    stale HEADLESS directive in the handshake. The low-level Server holds the
-    `instructions` returned in the handshake; FastMCP built it at import with
-    None, so set it here.
+    Recomposes that field from ``_BASE_INSTRUCTIONS`` in both directions
+    (idempotent): append the headless directive when headless, drop it
+    otherwise, so a flip back to visible can't leave a stale HEADLESS directive
+    in the handshake while preserving the always-on base guidance. The
+    low-level Server holds the `instructions` returned in the handshake.
     """
     global _headless
     _headless = bool(headless)
     mcp._mcp_server.instructions = (
-        _HEADLESS_INSTRUCTIONS if _headless else None
+        _BASE_INSTRUCTIONS + "\n\n" + _HEADLESS_INSTRUCTIONS
+        if _headless
+        else _BASE_INSTRUCTIONS
     )
 
 
