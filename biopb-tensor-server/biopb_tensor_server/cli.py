@@ -10,6 +10,7 @@ Commands:
 import os
 import secrets
 import signal
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -68,6 +69,66 @@ def _install_sigterm_handler() -> None:
     except (ValueError, OSError):
         # Not on the main thread (e.g. under some test runners) - skip.
         pass
+
+
+def _win_shutdown_event_name(pid: int) -> str:
+    """Name of the per-daemon Win32 shutdown event.
+
+    Must stay in sync with the name `biopb server stop` opens (see the same
+    helper duplicated in biopb.cli). Session-local (``Local\\``) namespace,
+    keyed by PID so multiple server instances don't collide.
+    """
+    return f"Local\\biopb-tensor-shutdown-{pid}"
+
+
+def _install_windows_shutdown_listener() -> None:
+    """Windows-only: make `biopb server stop` able to shut us down gracefully.
+
+    The daemon runs under CREATE_NO_WINDOW with its own hidden console, so a
+    console control event sent by `biopb server stop` (which lives in a
+    different console) can't reach it - console signals don't cross consoles.
+    Instead we wait on a named Win32 event that `stop` sets, then deliver a
+    *self*-directed CTRL_BREAK, which IS allowed within our own console and
+    which uvicorn handles as a graceful shutdown request (running launch()'s
+    finally -> _graceful_shutdown, so the file-cache process lock is released).
+
+    Best-effort and a no-op off Windows; if anything fails, `stop` falls back
+    to TerminateProcess.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+        # Manual-reset, initially non-signaled.
+        handle = kernel32.CreateEventW(
+            None, True, False, _win_shutdown_event_name(os.getpid())
+        )
+        if not handle:
+            return
+    except Exception:  # noqa: BLE001 - best effort; stop has a force-kill fallback
+        return
+
+    def _wait_and_signal() -> None:
+        INFINITE = 0xFFFFFFFF
+        kernel32.WaitForSingleObject(handle, INFINITE)
+        try:
+            os.kill(os.getpid(), signal.CTRL_BREAK_EVENT)
+        except OSError:
+            pass
+
+    threading.Thread(
+        target=_wait_and_signal, name="win-shutdown-listener", daemon=True
+    ).start()
 
 
 def _graceful_shutdown(source_manager, watcher, flight_server) -> None:
@@ -696,6 +757,10 @@ def launch(
         biopb-tensor-server launch -c config.toml --log-level DEBUG
     """
     import re as _re
+
+    # Enable graceful `biopb server stop` on Windows (no-op elsewhere). Installed
+    # early so the named shutdown event exists by the time `stop` may signal it.
+    _install_windows_shutdown_listener()
 
     # --- Load server config and setup logging ---
     server_config = load_config(config)

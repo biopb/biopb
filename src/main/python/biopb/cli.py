@@ -150,6 +150,87 @@ def _is_process_running(pid: int) -> bool:
         return False
 
 
+def _win_set_shutdown_event(pid: int) -> bool:
+    """Windows: signal the daemon's named shutdown event. Returns True if set.
+
+    The daemon (biopb_tensor_server launch) runs with its own hidden console, so
+    a console control event can't be delivered to it from here. It instead waits
+    on a named Win32 event and self-delivers CTRL_BREAK when set; we open that
+    event by name and set it. Returns False if the event doesn't exist yet (old
+    server, or daemon still starting up), so the caller can fall back.
+    """
+    try:
+        from biopb_tensor_server.cli import _win_shutdown_event_name
+        name = _win_shutdown_event_name(pid)
+    except Exception:  # noqa: BLE001 - keep name in sync if the import is unavailable
+        name = f"Local\\biopb-tensor-shutdown-{pid}"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        EVENT_MODIFY_STATE = 0x0002
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.OpenEventW.restype = wintypes.HANDLE
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.SetEvent.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, name)
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.SetEvent(handle))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - best effort; caller falls back to force-kill
+        return False
+
+
+def _request_graceful_stop(pid: int) -> bool:
+    """Ask the daemon to shut down gracefully. Returns whether the request was
+    delivered (not whether the process has exited yet)."""
+    if sys.platform == "win32":
+        return _win_set_shutdown_event(pid)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _graceful_stop(pid: int, timeout: int) -> bool:
+    """Stop a running daemon: request graceful shutdown, wait up to `timeout`
+    seconds, then force-kill. Removes the PID file. Returns True if it exited
+    gracefully, False if it had to be force-killed. Assumes `pid` is running.
+    """
+    delivered = _request_graceful_stop(pid)
+    if not delivered and sys.platform == "win32":
+        # The daemon may still be starting (its named event isn't created until
+        # launch() runs, after heavy imports). Retry briefly before force-kill.
+        for _ in range(3):
+            time.sleep(0.3)
+            if _win_set_shutdown_event(pid):
+                delivered = True
+                break
+
+    for _ in range(timeout):
+        if not _is_process_running(pid):
+            _remove_pid()
+            return True
+        time.sleep(1)
+
+    # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to SIGTERM,
+    # which os.kill maps to an unconditional TerminateProcess.
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        pass
+    time.sleep(0.5)
+    _remove_pid()
+    return False
+
+
 def _get_log_file() -> Path:
     """Get log file path."""
     return LOG_DIR / "tensor-server.log"
@@ -331,32 +412,13 @@ def stop(
 
     console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
 
-    # Send SIGTERM for graceful shutdown
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        console.print(f"[red]Failed to send SIGTERM: {e}[/red]")
-        raise typer.Exit(1)
-
-    # Wait for process to terminate
-    for i in range(timeout):
-        if not _is_process_running(pid):
-            console.print("[green]TensorFlight server stopped[/green]")
-            _remove_pid()
-            raise typer.Exit(0)
-        time.sleep(1)
-
-    # Force kill if still running. signal.SIGKILL is POSIX-only; on Windows fall
-    # back to SIGTERM, which os.kill maps to an unconditional TerminateProcess.
-    console.print(f"[yellow]Process still running after {timeout}s, force killing[/yellow]")
-    try:
-        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-    except OSError:
-        pass
-
-    time.sleep(0.5)
-    _remove_pid()
-    console.print("[green]TensorFlight server stopped (forced)[/green]")
+    if _graceful_stop(pid, timeout):
+        console.print("[green]TensorFlight server stopped[/green]")
+    else:
+        console.print(
+            f"[yellow]Did not stop within {timeout}s; force killed[/yellow]"
+        )
+    raise typer.Exit(0)
 
 
 @server_app.command("restart")
@@ -405,23 +467,7 @@ def restart(
     pid = _read_pid()
     if pid and _is_process_running(pid):
         console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-
-        for i in range(timeout):
-            if not _is_process_running(pid):
-                break
-            time.sleep(1)
-
-        if _is_process_running(pid):
-            try:
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-            except OSError:
-                pass
-
-        _remove_pid()
+        _graceful_stop(pid, timeout)
         time.sleep(1)
 
     # Start with same options

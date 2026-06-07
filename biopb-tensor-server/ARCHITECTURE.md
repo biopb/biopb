@@ -210,6 +210,20 @@ Startup sequence:
 
 Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 
+### Windows daemon shutdown (`biopb server stop`)
+
+When run as a background daemon (`biopb server start`), `launch` is spawned on
+Windows with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, giving it its own
+hidden console. Because console control events can't cross console boundaries,
+`biopb server stop` (a different console) can't deliver a `CTRL_BREAK` to it
+directly. Instead, `launch` installs `_install_windows_shutdown_listener()`: a
+daemon thread waits on a named Win32 event `Local\biopb-tensor-shutdown-<pid>`
+and, when `stop` sets it, self-delivers `CTRL_BREAK` — which uvicorn handles as
+a graceful shutdown, so `launch`'s `finally → _graceful_shutdown` runs and the
+file-cache process lock is released. `stop` falls back to `TerminateProcess`
+(via `os.kill`) if the event can't be opened (older server, or daemon still
+starting). On POSIX, `stop` sends `SIGTERM` as before. See `biopb/biopb#22`.
+
 ---
 
 ## Discovery & Directory Monitoring
