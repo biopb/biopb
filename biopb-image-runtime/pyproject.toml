@@ -16,6 +16,7 @@ dependencies = [
   "grpcio-health-checking",
   "protobuf",
   "numpy",
+  "scipy",
   "imageio",
   "typer",
   "pyarrow >= 14.0.0",
