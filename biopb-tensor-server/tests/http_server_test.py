@@ -759,3 +759,27 @@ class TestQuerySourcesEndpoint:
             headers=_bearer(_TOKEN),
         )
         assert r.status_code == 502
+
+
+class TestWindowsShutdownListener:
+    """The graceful-stop listener used by `biopb server stop` on Windows."""
+
+    def test_sentinel_path_matches_stop_side_contract(self):
+        from pathlib import Path
+        from biopb_tensor_server.http_server import shutdown_sentinel_path
+
+        # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).
+        # Fixed name (not pid-keyed) so stop and the daemon always agree.
+        expected = Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
+        assert shutdown_sentinel_path() == expected
+
+    def test_noop_off_windows(self):
+        from biopb_tensor_server.http_server import _install_windows_shutdown_listener
+
+        server = SimpleNamespace(should_exit=False)
+        before = threading.active_count()
+        with patch("biopb_tensor_server.http_server.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            _install_windows_shutdown_listener(server)  # must not raise
+        assert threading.active_count() == before  # no watcher thread started
+        assert server.should_exit is False
