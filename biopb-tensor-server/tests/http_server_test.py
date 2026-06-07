@@ -759,3 +759,24 @@ class TestQuerySourcesEndpoint:
             headers=_bearer(_TOKEN),
         )
         assert r.status_code == 502
+
+
+class TestWindowsShutdownListener:
+    """The graceful-stop listener used by `biopb server stop` on Windows."""
+
+    def test_event_name_matches_stop_side_contract(self):
+        from biopb_tensor_server.http_server import win_shutdown_event_name
+
+        # Must match the literal name biopb.cli._win_set_shutdown_event opens.
+        assert win_shutdown_event_name(4321) == "Local\\biopb-tensor-shutdown-4321"
+
+    def test_noop_off_windows(self):
+        from biopb_tensor_server.http_server import _install_windows_shutdown_listener
+
+        server = SimpleNamespace(should_exit=False)
+        before = threading.active_count()
+        with patch("biopb_tensor_server.http_server.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            _install_windows_shutdown_listener(server)  # must not raise
+        assert threading.active_count() == before  # no watcher thread started
+        assert server.should_exit is False

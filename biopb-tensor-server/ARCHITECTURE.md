@@ -213,16 +213,18 @@ Token validation rules: 16–128 characters, regex `[A-Za-z0-9_\-]+`.
 ### Windows daemon shutdown (`biopb server stop`)
 
 When run as a background daemon (`biopb server start`), `launch` is spawned on
-Windows with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, giving it its own
-hidden console. Because console control events can't cross console boundaries,
-`biopb server stop` (a different console) can't deliver a `CTRL_BREAK` to it
-directly. Instead, `launch` installs `_install_windows_shutdown_listener()`: a
-daemon thread waits on a named Win32 event `Local\biopb-tensor-shutdown-<pid>`
-and, when `stop` sets it, self-delivers `CTRL_BREAK` — which uvicorn handles as
-a graceful shutdown, so `launch`'s `finally → _graceful_shutdown` runs and the
-file-cache process lock is released. `stop` falls back to `TerminateProcess`
-(via `os.kill`) if the event can't be opened (older server, or daemon still
-starting). On POSIX, `stop` sends `SIGTERM` as before. See `biopb/biopb#22`.
+Windows with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`. It therefore has no
+console that `biopb server stop` (running in a different console) can deliver a
+console control event to — console signals don't reliably cross processes here.
+So graceful shutdown is coordinated through a **named Win32 event** instead of a
+signal: `run_http_server` calls `_install_windows_shutdown_listener(server)`,
+which creates `Local\biopb-tensor-shutdown-<pid>` and a daemon thread that waits
+on it; when `stop` sets the event, the thread sets `server.should_exit = True`.
+uvicorn polls that flag (~0.1s) and returns from `run()`, so `launch`'s
+`finally → _graceful_shutdown` runs and the file-cache process lock is released.
+`stop` falls back to `TerminateProcess` (via `os.kill`) if the event can't be
+opened (older server, or daemon still starting). On POSIX, `stop` sends
+`SIGTERM` as before. See `biopb/biopb#22`.
 
 ---
 

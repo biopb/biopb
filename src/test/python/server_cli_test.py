@@ -59,8 +59,10 @@ class TestGracefulStop:
         monkeypatch.setattr(cli, "_remove_pid", remove)
         with patch.object(cli.os, "kill") as kill:
             assert cli._graceful_stop(1234, timeout=2) is False
-            # Last call is the force-kill (SIGKILL on POSIX).
-            kill.assert_called_with(1234, cli.signal.SIGKILL)
+            # Last call is the force-kill: SIGKILL on POSIX, SIGTERM on Windows
+            # (signal.SIGKILL doesn't exist there) - matches the code's fallback.
+            expected_sig = getattr(cli.signal, "SIGKILL", cli.signal.SIGTERM)
+            kill.assert_called_with(1234, expected_sig)
         remove.assert_called_once()
 
     def test_windows_retries_event_when_daemon_still_starting(self, monkeypatch):

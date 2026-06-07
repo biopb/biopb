@@ -153,17 +153,17 @@ def _is_process_running(pid: int) -> bool:
 def _win_set_shutdown_event(pid: int) -> bool:
     """Windows: signal the daemon's named shutdown event. Returns True if set.
 
-    The daemon (biopb_tensor_server launch) runs with its own hidden console, so
-    a console control event can't be delivered to it from here. It instead waits
-    on a named Win32 event and self-delivers CTRL_BREAK when set; we open that
-    event by name and set it. Returns False if the event doesn't exist yet (old
-    server, or daemon still starting up), so the caller can fall back.
+    The daemon runs as a background process (CREATE_NO_WINDOW) with no console we
+    can deliver a console control event to from here, so graceful shutdown is
+    coordinated through a named Win32 event instead: the daemon waits on it and,
+    when set, asks uvicorn to exit (see _install_windows_shutdown_listener in
+    biopb_tensor_server.http_server). We open the event by name and set it.
+    Returns False if it doesn't exist yet (old server, or daemon still starting
+    up), so the caller can fall back to force-kill.
     """
-    try:
-        from biopb_tensor_server.cli import _win_shutdown_event_name
-        name = _win_shutdown_event_name(pid)
-    except Exception:  # noqa: BLE001 - keep name in sync if the import is unavailable
-        name = f"Local\\biopb-tensor-shutdown-{pid}"
+    # Must match win_shutdown_event_name() in biopb_tensor_server.http_server
+    # (kept as a literal here to avoid importing heavy server deps just to stop).
+    name = f"Local\\biopb-tensor-shutdown-{pid}"
     try:
         import ctypes
         from ctypes import wintypes
@@ -350,12 +350,14 @@ def start(
     detach_kwargs: dict = {}
     if sys.platform == "win32":
         # start_new_session (setsid) is POSIX-only and a silent no-op on Windows.
-        # Use creationflags instead: CREATE_NO_WINDOW gives the daemon its own
-        # hidden console (so it's detached from the launching terminal's console -
-        # its Ctrl+C/close can't reach it - yet a console API touched later by the
-        # server or a dependency won't AllocConsole and pop a visible window, as
-        # DETACHED_PROCESS did). CREATE_NEW_PROCESS_GROUP makes it a group leader
-        # so it also ignores the parent group's Ctrl+C.
+        # Use creationflags instead. CREATE_NO_WINDOW runs the daemon without a
+        # console *window*, so no visible console pops up (unlike DETACHED_PROCESS,
+        # where a later console-API call could AllocConsole a *visible* window).
+        # CREATE_NEW_PROCESS_GROUP makes it a group leader so the launching
+        # terminal's Ctrl+C doesn't propagate to it. Because it has no console the
+        # terminal can interact with, graceful `stop` can't use a console control
+        # event - it uses a named Win32 event instead (see _win_set_shutdown_event
+        # and biopb_tensor_server.http_server._install_windows_shutdown_listener).
         detach_kwargs["creationflags"] = (
             subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )

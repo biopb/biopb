@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import os
 import re
 import secrets
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -1224,6 +1226,68 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def win_shutdown_event_name(pid: int) -> str:
+    """Name of the per-daemon Win32 shutdown event.
+
+    Must stay in sync with the name `biopb server stop` opens (duplicated in
+    biopb.cli). Session-local (``Local\\``) namespace, keyed by PID so multiple
+    server instances don't collide.
+    """
+    return f"Local\\biopb-tensor-shutdown-{pid}"
+
+
+def _install_windows_shutdown_listener(server) -> None:
+    """Windows-only: let `biopb server stop` shut the daemon down gracefully.
+
+    The daemon is a background process (CREATE_NO_WINDOW) with no usable console
+    that `biopb server stop` could deliver a console control event to from its
+    own console - console signals don't cross processes/consoles reliably here.
+    So instead of signals we wait on a named Win32 event that `stop` sets and,
+    when it fires, ask uvicorn to exit by setting ``server.should_exit`` (which
+    uvicorn polls every 0.1s). uvicorn then returns from run(), so launch()'s
+    ``finally -> _graceful_shutdown`` runs and the file-cache lock is released.
+
+    No-op off Windows. Best-effort: if setup fails, `stop` force-kills instead.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+        name = win_shutdown_event_name(os.getpid())
+        # Manual-reset, initially non-signaled.
+        handle = kernel32.CreateEventW(None, True, False, name)
+        if not handle:
+            logger.warning(
+                "Windows shutdown listener: CreateEventW failed; "
+                "`biopb server stop` will force-kill this process."
+            )
+            return
+    except Exception:  # noqa: BLE001 - best effort; stop has a force-kill fallback
+        logger.exception("Windows shutdown listener setup failed")
+        return
+
+    def _wait_and_exit() -> None:
+        INFINITE = 0xFFFFFFFF
+        kernel32.WaitForSingleObject(handle, INFINITE)
+        logger.info("Shutdown event received; requesting graceful uvicorn exit.")
+        server.should_exit = True
+
+    threading.Thread(
+        target=_wait_and_exit, name="win-shutdown-listener", daemon=True
+    ).start()
+    logger.info("Windows shutdown listener installed (event: %s).", name)
+
+
 def run(
     flight_location: str = "grpc://localhost:8815",
     token: Optional[str] = None,
@@ -1245,4 +1309,8 @@ def run(
         cors_origins=cors_origins,
         static_dir=static_dir,
     )
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
+    # Windows: enable graceful `biopb server stop` via a named-event watcher that
+    # flips server.should_exit (no-op on other platforms, which use SIGTERM).
+    _install_windows_shutdown_listener(server)
+    server.run()
