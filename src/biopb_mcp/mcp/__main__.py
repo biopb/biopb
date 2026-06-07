@@ -18,6 +18,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -240,9 +241,30 @@ def main(argv=None):
         )
     else:
         logger.info("Starting napari kernel (a viewer window will appear)...")
-    host.start()
-    logger.info("Kernel ready.")
 
+    # Bring the kernel up OFF the main thread so the MCP handshake is served
+    # immediately. The kernel + napari/Qt viewer + dask bring-up is slow and, on
+    # WSL, routinely exceeds an MCP client's startup timeout (e.g. 30s) — which
+    # made `biopb-mcp --transport stdio` fail to register there whenever the
+    # bring-up was slow. Tools dispatch through KernelHost.execute(), which waits
+    # on the host's readiness signal, so a call that lands before the kernel is
+    # ready reports "starting" instead of racing a half-built kernel.
+    def _start_kernel():
+        try:
+            host.start()
+            logger.info("Kernel ready.")
+        except Exception:
+            logger.exception(
+                "Kernel startup failed; tools will report a terminal startup "
+                "error (call restart_kernel to retry). See the kernel log for "
+                "the bootstrap traceback."
+            )
+
+    threading.Thread(
+        target=_start_kernel, name="kernel-start", daemon=True
+    ).start()
+
+    # Reap the kernel on exit even if it is still mid-bringup when we stop.
     atexit.register(host.shutdown)
 
     def _handle_signal(signum, frame):

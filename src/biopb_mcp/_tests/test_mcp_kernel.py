@@ -236,6 +236,33 @@ class TestKernelLifecycle:
             host.start()
         host.shutdown()
 
+    def test_failed_start_surfaces_terminal_error_not_starting(self):
+        # A bootstrap failure (probe never passes) must be distinguishable from
+        # a slow-but-progressing startup: the launcher runs start() on a
+        # background thread that only logs the raise, so execute()/health() are
+        # the only window the client has into *why* the kernel never came up.
+        host = KernelHost(
+            health_probe_code="print('viewer' in dir())",
+            health_probe_expect="True",
+            startup_timeout=60.0,
+            parent_death_pipe=False,
+        )
+        # Mimic the launcher's background start: swallow the raise, leave the
+        # host not-ready with its recorded start_error.
+        with pytest.raises(RuntimeError):
+            host.start()
+        try:
+            assert host.health()["ready"] is False
+            assert host.health()["start_error"]  # the recorded reason
+            # execute() reports a terminal error immediately (no startup wait)
+            # rather than the generic "starting".
+            res = host.execute("print('hi')")
+            assert res["status"] == "error"
+            assert "startup failed" in res["error_text"].lower()
+            assert "restart_kernel" in res["error_text"]
+        finally:
+            host.shutdown()
+
 
 # ---------------------------------------------------------------------------
 # Orphan hardening (issue #13)
@@ -371,17 +398,100 @@ class TestHealth:
             h = host.health()
             assert set(h) == {
                 "alive",
+                "ready",
+                "start_error",
                 "busy",
                 "dead",
                 "recent_respawns",
                 "watchdog_running",
             }
             assert h["alive"] is True
+            assert h["ready"] is True
+            assert h["start_error"] is None
             assert h["dead"] is False
             assert h["watchdog_running"] is True
         finally:
             host.shutdown()
         assert host.health()["watchdog_running"] is False
+
+
+class TestReadiness:
+    """The kernel boots off-thread (launcher serves the handshake first), so
+    execute() returns a not-ready status immediately rather than blocking on
+    bring-up; the agent polls server_status to know when to retry."""
+
+    def test_execute_before_ready_returns_starting_immediately(self):
+        # Never started: not ready, no _start_error. execute() must return a
+        # "starting" status *without blocking* on readiness — a blocking wait
+        # could hang for the whole startup budget and trip the client's per-call
+        # timeout. The agent polls server_status / retries instead.
+        host = KernelHost(startup_timeout=60.0, parent_death_pipe=False)
+        assert host.health()["ready"] is False
+        t0 = time.monotonic()
+        res = host.execute("print('hi')")
+        elapsed = time.monotonic() - t0
+        assert res["status"] == "starting"
+        assert "server_status" in res["error_text"]
+        assert elapsed < 1.0  # returned immediately, did not wait on readiness
+
+    def test_ready_after_start_then_cleared_on_shutdown(self):
+        host = KernelHost(health_probe_code=None, parent_death_pipe=False)
+        host.start()
+        try:
+            assert host.health()["ready"] is True
+        finally:
+            host.shutdown()
+        assert host.health()["ready"] is False
+
+
+class TestStartRestartSerialization:
+    """The launcher runs start() on a background thread, so a restart_kernel
+    can land while the initial start() is still in _launch(). start() and
+    restart() must serialize on the lifecycle lock — otherwise both mutate the
+    shared _km/_kc/_pgid state at once (wrong kernel / orphaned process)."""
+
+    def test_restart_during_startup_is_serialized(self):
+        import threading
+
+        host = KernelHost(
+            health_probe_code=None,
+            parent_death_pipe=False,
+            watchdog_interval=0,
+        )
+        real_launch = host._launch
+        counter_lock = threading.Lock()  # guards the counters, not the host
+        active = {"n": 0, "max": 0}
+
+        def slow_launch():
+            # Widen the bring-up window and record overlap: if start() and
+            # restart() are NOT serialized, both reach here at once and max > 1.
+            with counter_lock:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            try:
+                time.sleep(0.3)
+                real_launch()
+            finally:
+                with counter_lock:
+                    active["n"] -= 1
+
+        host._launch = slow_launch
+
+        start_thread = threading.Thread(target=host.start, name="kernel-start")
+        start_thread.start()
+        try:
+            # Fire a restart while start() is still inside its (slowed) _launch.
+            time.sleep(0.1)
+            host.restart()
+            start_thread.join(timeout=60.0)
+            assert not start_thread.is_alive()
+            # The two lifecycle ops never overlapped, and exactly one live
+            # kernel remains and accepts work.
+            assert active["max"] == 1
+            assert host.is_alive()
+            assert host.execute("x = 1")["status"] == "ok"
+        finally:
+            host.shutdown()
 
 
 class TestParentDeathPipe:

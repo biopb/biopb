@@ -68,6 +68,8 @@ def mock_kernel_host():
     host.is_busy.return_value = False
     host.health.return_value = {
         "alive": True,
+        "ready": True,
+        "start_error": None,
         "busy": False,
         "dead": False,
         "recent_respawns": 0,
@@ -416,6 +418,66 @@ class TestServerStatus:
         result = _server.server_status()
         assert "Sessions" not in result
         assert "Bridge" not in result
+
+    def test_starting_kernel_skips_query(self, server_with_host):
+        # Kernel still booting (launcher serves the handshake first): report the
+        # state and do NOT query the kernel — execute() would block on readiness.
+        server_with_host.health.return_value = {
+            "alive": True,
+            "ready": False,
+            "start_error": None,
+            "busy": False,
+            "dead": False,
+            "recent_respawns": 0,
+            "watchdog_running": True,
+        }
+        result = _server.server_status()
+        assert "ready: False" in result
+        assert "starting" in result.lower()
+        server_with_host.execute.assert_not_called()
+
+    def test_dead_kernel_reports_only_dead_not_starting(
+        self, server_with_host
+    ):
+        # When the watchdog marks the host dead, ready is also false. Report a
+        # single DEAD state and return — not DEAD *and* a contradictory
+        # "starting"/"failed" line.
+        server_with_host.health.return_value = {
+            "alive": False,
+            "ready": False,
+            "start_error": "respawn after unexpected death failed",
+            "busy": False,
+            "dead": True,
+            "recent_respawns": 3,
+            "watchdog_running": False,
+        }
+        result = _server.server_status()
+        assert "DEAD" in result
+        assert "starting" not in result.lower()
+        assert "state: failed" not in result
+        # The recorded reason rides along under DEAD (not as a second state).
+        assert "respawn after unexpected death failed" in result
+        server_with_host.execute.assert_not_called()
+
+    def test_failed_startup_reports_error_not_starting(self, server_with_host):
+        # A terminal bootstrap failure (start_error recorded) must read as
+        # "failed" with the reason — not the generic "starting" that a slow but
+        # progressing bring-up shows — so the two are distinguishable.
+        server_with_host.health.return_value = {
+            "alive": False,
+            "ready": False,
+            "start_error": "viewer absent: ImportError: no Qt platform",
+            "busy": False,
+            "dead": False,
+            "recent_respawns": 0,
+            "watchdog_running": False,
+        }
+        result = _server.server_status()
+        assert "failed" in result.lower()
+        assert "no Qt platform" in result
+        assert "restart_kernel" in result
+        assert "starting" not in result.lower()
+        server_with_host.execute.assert_not_called()
 
 
 # -----------------------------------------------------------------------
