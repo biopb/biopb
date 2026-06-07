@@ -16,6 +16,8 @@ on:
     paths:
       - 'biopb-tensor-server/**'
       - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
       - 'src/main/python/**'
       - 'pyproject.toml'
       - '.github/workflows/tensor-server-ci.yaml'
