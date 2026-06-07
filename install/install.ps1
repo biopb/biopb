@@ -726,8 +726,7 @@ monitor = true
     }
     if (-not $InstallBioformats) {
         Write-Note "Bio-Formats not installed - ZVI/OIB/OIF and similar legacy formats unsupported"
-        Write-Note "to add later, rerun this script and enable Bio-Formats, or:"
-        Write-Cmd "         pip install `"biopb-tensor-server[bioformats]`""
+        Write-Note "to add later, rerun this script and enable Bio-Formats"
     }
     if (-not $InstallWebapp -or -not $InstallBioformats) { Write-Host "" }
 

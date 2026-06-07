@@ -935,8 +935,7 @@ EOF
     fi
     if [ "$INSTALL_BIOFORMATS" = "0" ]; then
         _note "Bio-Formats not installed — ZVI/OIB/OIF and similar legacy formats unsupported"
-        _note "to add later, rerun this script and enable Bio-Formats, or:"
-        _cmd "         pip install \"biopb-tensor-server[bioformats]\""
+        _note "to add later, rerun this script and enable Bio-Formats"
     fi
     if [ "$INSTALL_WEBAPP" = "0" ] || [ "$INSTALL_BIOFORMATS" = "0" ]; then
         echo ""
