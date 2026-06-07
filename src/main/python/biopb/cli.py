@@ -269,10 +269,14 @@ def start(
     detach_kwargs: dict = {}
     if sys.platform == "win32":
         # start_new_session (setsid) is POSIX-only and a silent no-op on Windows.
-        # Use creationflags instead: a new process group plus no inherited console
-        # so console Ctrl+C/close events can't reach the daemon.
+        # Use creationflags instead: CREATE_NO_WINDOW gives the daemon its own
+        # hidden console (so it's detached from the launching terminal's console -
+        # its Ctrl+C/close can't reach it - yet a console API touched later by the
+        # server or a dependency won't AllocConsole and pop a visible window, as
+        # DETACHED_PROCESS did). CREATE_NEW_PROCESS_GROUP makes it a group leader
+        # so it also ignores the parent group's Ctrl+C.
         detach_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
     else:
         detach_kwargs["start_new_session"] = True  # setsid(): own process group
