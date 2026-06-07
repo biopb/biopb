@@ -222,9 +222,11 @@ function Set-McpClients {
         $mcpConfigContent = @'
 {
   "mcp": {
-    "process_image_servers": [
-      "grpcs://cellpose.biopb.org:443"
-    ]
+    "services": {
+      "process_image_servers": [
+        "grpcs://cellpose.biopb.org:443"
+      ]
+    }
   }
 }
 '@
