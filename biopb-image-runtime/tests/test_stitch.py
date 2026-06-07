@@ -205,8 +205,9 @@ def test_pruning_keeps_known_set_bounded():
     sizes = []
     out, n_ids = _run(gt, observer=lambda s: sizes.append(s["known_size"]))
     assert _same_partition(out, gt)  # nothing pruned too early
-    # 80px image height has 2 core-rows; the known set should be far smaller
-    # than the total cell count (~64), bounded by a frontier band.
+    # The image is 400x80 (HxW); with 40x40 cores that's 10 core-rows x 2
+    # core-columns (32 cells total). The known set should stay far smaller
+    # than that, bounded by a frontier band of about one core-row.
     assert max(sizes) <= 12, f"known set grew too large: {max(sizes)}"
 
 
