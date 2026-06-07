@@ -48,23 +48,28 @@ class TestParseArgs:
             )
 
 
+def _cfg(**transport):
+    """Build a full config carrying only the given mcp.transport overrides."""
+    return {"mcp": {"transport": transport}}
+
+
 class TestConfigDefaults:
     def test_clean_config_passes_through(self):
-        assert _config_defaults({"transport": "http", "port": 9000}) == (
+        assert _config_defaults(_cfg(kind="http", port=9000)) == (
             "http",
             9000,
         )
 
     def test_unknown_transport_falls_back_to_stdio(self):
-        transport, _ = _config_defaults({"transport": "ftp"})
+        transport, _ = _config_defaults(_cfg(kind="ftp"))
         assert transport == "stdio"
 
     def test_stringified_port_is_coerced_to_int(self):
-        _, port = _config_defaults({"port": "8765"})
+        _, port = _config_defaults(_cfg(port="8765"))
         assert port == 8765
 
     def test_garbage_port_falls_back(self):
-        _, port = _config_defaults({"port": "not-a-number"})
+        _, port = _config_defaults(_cfg(port="not-a-number"))
         assert port == 8765
 
     def test_empty_config_uses_documented_defaults(self):
@@ -74,7 +79,7 @@ class TestConfigDefaults:
 class TestOpenKernelLog:
     def test_uses_configured_path(self, tmp_path):
         path = tmp_path / "k.log"
-        f = _open_kernel_log({"kernel_log": str(path)})
+        f = _open_kernel_log(_cfg(kernel_log=str(path)))
         try:
             f.write(b"hello\n")
             f.flush()
@@ -89,7 +94,7 @@ class TestOpenKernelLog:
 
         monkeypatch.setattr(cfg, "get_config_dir", lambda: tmp_path)
 
-        f = _open_kernel_log({"kernel_log": ""})
+        f = _open_kernel_log(_cfg(kernel_log=""))
         try:
             assert (tmp_path / "kernel.log").exists()
         finally:
@@ -99,7 +104,7 @@ class TestOpenKernelLog:
         # An unwritable path must not crash the launcher; it degrades to the
         # stderr byte sink (sys.stderr.buffer when present, else sys.stderr).
         f = _open_kernel_log(
-            {"kernel_log": "/nonexistent_dir/deep/path/kernel.log"}
+            _cfg(kernel_log="/nonexistent_dir/deep/path/kernel.log")
         )
         assert f is getattr(sys.stderr, "buffer", sys.stderr)
 

@@ -26,12 +26,9 @@ from urllib.parse import urlparse
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from ._config import load_config, save_config
+from ._config import get_setting, load_config, save_config
 
 logger = logging.getLogger(__name__)
-
-# Default tensor server URL when neither env nor config provides one.
-_DEFAULT_URL = "grpc://localhost:8815"
 
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
@@ -124,10 +121,8 @@ class TensorConnection:
 
         Fallback order: environment variables -> config file -> default.
         """
-        url = (
-            os.environ.get("BIOPB_TENSOR_URL")
-            or config.get("tensor_browser", {}).get("server_url")
-            or _DEFAULT_URL
+        url = os.environ.get("BIOPB_TENSOR_URL") or get_setting(
+            config, "tensor_browser.server_url"
         )
         token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
         return url, token
@@ -222,7 +217,8 @@ class TensorConnection:
         """Save the current URL to config.
 
         Reloads from disk first so keys this service does not own (e.g.
-        ``mcp.process_image_servers``) are not clobbered by a stale snapshot.
+        ``mcp.services.process_image_servers``) are not clobbered by a stale
+        snapshot.
         """
         config = load_config()
         config.setdefault("tensor_browser", {})
@@ -279,7 +275,7 @@ class TensorConnection:
 
     def server_start_timeout(self) -> float:
         """The configured ``mcp.server_start_timeout`` boot-wait budget (s)."""
-        return load_config().get("mcp", {}).get("server_start_timeout", 60.0)
+        return get_setting(load_config(), "mcp.server_start_timeout")
 
     def launch_local_server(
         self,

@@ -25,7 +25,9 @@ class TestConfigureDask:
         """threads/synchronous schedulers yield no client and no cluster."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask({"dask_scheduler": "threads"})
+        client, cluster = _configure_dask(
+            {"mcp": {"dask": {"scheduler": "threads"}}}
+        )
         assert client is None
         assert cluster is None
 
@@ -46,8 +48,12 @@ class TestConfigureDask:
 
         client, cluster = _configure_dask(
             {
-                "dask_scheduler": "distributed",
-                "dask_distributed_address": "tcp://1.2.3.4:8786",
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "tcp://1.2.3.4:8786",
+                    }
+                }
             }
         )
         assert isinstance(client, _FakeClient)
@@ -67,7 +73,7 @@ class TestConfigureDask:
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
         client, cluster = _configure_dask(
-            {"dask_scheduler": "distributed", "dask_distributed_address": ""}
+            {"mcp": {"dask": {"scheduler": "distributed", "address": ""}}}
         )
         assert client is None
         assert cluster is None

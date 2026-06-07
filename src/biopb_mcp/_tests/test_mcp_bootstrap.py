@@ -28,7 +28,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 "tok",
-                {"dask_cache_budget": "1G"},
+                {"mcp": {"dask": {"cache_budget": "1G"}}},
                 planned_workers=12,
             )
         # 1G // 12 planned workers, NOT // 5 live workers
@@ -42,7 +42,10 @@ class TestRegisterCachePlugin:
         with patch.object(tclient, "make_cache_plugin") as mk:
             mk.return_value = MagicMock()
             _bootstrap._register_cache_plugin(
-                dc, "grpc://remote:8815", None, {"dask_cache_budget": "1G"}
+                dc,
+                "grpc://remote:8815",
+                None,
+                {"mcp": {"dask": {"cache_budget": "1G"}}},
             )
         assert mk.call_args.args[2] == 1_000_000_000 // 4
 
@@ -54,7 +57,7 @@ class TestRegisterCachePlugin:
                 dc,
                 "grpc://remote:8815",
                 None,
-                {"dask_cache_budget": 800_000_000},
+                {"mcp": {"dask": {"cache_budget": 800_000_000}}},
                 planned_workers=2,
             )
         assert mk.call_args.args[2] == 400_000_000

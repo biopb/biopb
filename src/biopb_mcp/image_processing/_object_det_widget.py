@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import numpy as np
 from magicgui.widgets import ComboBox, create_widget
 
-from .._config import get_grid_params, load_config, save_config
+from .._config import get_grid_params, get_setting, load_config, save_config
 from ._widget_base import _make_full_width, _WidgetBase
 
 if TYPE_CHECKING:
@@ -19,10 +19,8 @@ class ObjectDetectionWidget(_WidgetBase):
     def __init__(self, viewer: "napari.viewer.Viewer"):
         super().__init__(viewer)
 
-        detection_config = self._config.get("detection", {})
-
         self._threshold = create_widget(
-            value=detection_config.get("min_score", 0.4),
+            value=get_setting(self._config, "widget.detection.min_score"),
             label="Min Score",
             annotation=float,
             widget_type="FloatSlider",
@@ -37,7 +35,7 @@ class ObjectDetectionWidget(_WidgetBase):
         self._use_advanced.changed.connect(self._activte_advanced_inputs)
 
         self._size_hint = create_widget(
-            value=detection_config.get("size_hint", 32.0),
+            value=get_setting(self._config, "widget.detection.size_hint"),
             label="Size Hint",
             annotation=float,
             widget_type="FloatSlider",
@@ -45,14 +43,14 @@ class ObjectDetectionWidget(_WidgetBase):
         )
 
         self._nms = ComboBox(
-            value=detection_config.get("nms", "Off"),
+            value=get_setting(self._config, "widget.detection.nms"),
             choices=["Off", "Iou-0.2", "Iou-0.4", "Iou-0.6", "Iou-0.8"],
             label="NMS",
             visible=False,
         )
 
         self._aspect_ratio = create_widget(
-            value=detection_config.get("z_aspect_ratio", 1.0),
+            value=get_setting(self._config, "widget.detection.z_aspect_ratio"),
             label="Z Aspect Ratio",
             options={"visible": False},
         )
@@ -148,16 +146,18 @@ class ObjectDetectionWidget(_WidgetBase):
         """Save current widget settings to config file.
 
         Reloads from disk first so keys this widget does not own (e.g.
-        mcp.process_image_servers) are not clobbered by a stale snapshot.
+        mcp.services.process_image_servers) are not clobbered by a stale
+        snapshot.
         """
         settings = self._snapshot()
         config = load_config()
-        config["server"]["url"] = settings["Server"]
-        config["3D"] = settings["3D"]
-        config["detection"]["min_score"] = settings["Min Score"]
-        config["detection"]["size_hint"] = settings["Size Hint"]
-        config["detection"]["nms"] = settings["NMS"]
-        config["detection"]["z_aspect_ratio"] = settings["Z Aspect Ratio"]
+        detection = config["widget"]["detection"]
+        config["widget"]["server_url"] = settings["Server"]
+        config["widget"]["is_3d"] = settings["3D"]
+        detection["min_score"] = settings["Min Score"]
+        detection["size_hint"] = settings["Size Hint"]
+        detection["nms"] = settings["NMS"]
+        detection["z_aspect_ratio"] = settings["Z Aspect Ratio"]
         save_config(config)
         self._config = config
 

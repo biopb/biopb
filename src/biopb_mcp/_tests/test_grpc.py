@@ -1,20 +1,20 @@
 """Tests for _grpc.py gRPC communication."""
 
-import numpy as np
-import pytest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pytest
+
 from biopb_mcp.image_processing._grpc import (
+    _check_chunk_memory,
     _encode_image,
     _estimate_chunk_memory_mb,
-    _check_chunk_memory,
     _get_detection_settings,
     _get_grpc_channel,
     _get_label_filter,
     _object_detection_build_request,
     _parse_annotation_tsv,
     _parse_server_url,
-    check_server_health,
 )
 
 
@@ -372,7 +372,6 @@ class TestGrpcObjectDetection:
         """Wrong dimensions for 2D mode raises ValueError."""
         # The function is wrapped in thread_worker, so we test the validation
         # by calling the underlying logic
-        from biopb_mcp.image_processing._grpc import grpc_object_detection
 
         # Create test data with wrong dimensions (3D data when expecting 2D)
         image_data = np.random.rand(2, 10, 100, 100, 1)  # 5D (3D mode) data
@@ -386,12 +385,11 @@ class TestGrpcObjectDetection:
         # Get the generator function (before thread_worker wraps it)
         # We can't easily test this due to thread_worker decorator
         # But we document the expected behavior
-        pass  # thread_worker testing requires complex mocking
+        # thread_worker testing requires complex mocking
 
     def test_invalid_dimensions_3d_mode(self):
         """Wrong dimensions for 3D mode raises ValueError."""
         # Similar to above - documenting expected behavior
-        pass
 
     @patch("biopb_mcp.image_processing._grpc._get_grpc_channel")
     @patch("biopb_mcp.image_processing._grpc.proto.ObjectDetectionStub")
@@ -429,7 +427,7 @@ class TestGrpcObjectDetection:
         # Get the generator (need to unwrap thread_worker)
         # thread_worker returns a worker object, but for testing we call the inner generator
         # We'll mock thread_worker to return the generator directly
-        pass  # Skip this for now - thread_worker testing is complex
+        # Skip this for now - thread_worker testing is complex
 
 
 class TestGrpcProcessImage:
@@ -440,12 +438,10 @@ class TestGrpcProcessImage:
         # This tests that grid_positions must be None for process_image
         # The validation happens inside the generator, wrapped by thread_worker
         # We document the expected behavior - ValueError should be raised
-        pass
 
     def test_invalid_dimensions_raises(self):
         """Wrong dimensions raises ValueError."""
         # Documenting expected behavior - ValueError for wrong dimensions
-        pass
 
 
 class TestParseAnnotationTsv:

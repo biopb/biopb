@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp import _connection
+from biopb_mcp._config import DEFAULT_CONFIG
 from biopb_mcp._connection import (
-    _DEFAULT_URL,
     SERVER_QUERY_THRESHOLD,
     TensorConnection,
 )
@@ -53,7 +53,7 @@ class TestResolveFromConfig:
 
     def test_default_when_nothing(self):
         url, token = TensorConnection.resolve_from_config({})
-        assert url == _DEFAULT_URL
+        assert url == DEFAULT_CONFIG["tensor_browser"]["server_url"]
         assert token is None
 
 
@@ -292,7 +292,7 @@ class TestPersistUrl:
         # A fresh config with a key the service does not own.
         existing = {
             "tensor_browser": {"server_url": "grpc://old:1"},
-            "mcp": {"process_image_servers": ["grpc://ops:5"]},
+            "mcp": {"services": {"process_image_servers": ["grpc://ops:5"]}},
         }
         saved = {}
         monkeypatch.setattr(_connection, "load_config", lambda: dict(existing))
@@ -305,7 +305,9 @@ class TestPersistUrl:
         conn.persist_url()
 
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["mcp"]["process_image_servers"] == ["grpc://ops:5"]
+        assert saved["mcp"]["services"]["process_image_servers"] == [
+            "grpc://ops:5"
+        ]
 
 
 # ---------------------------------------------------------------------------

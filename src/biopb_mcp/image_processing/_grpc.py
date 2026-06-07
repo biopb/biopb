@@ -19,7 +19,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from napari.qt.threading import thread_worker
 
 from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
-from .._config import load_config
+from .._config import get_setting, load_config
 from ._render import _adjust_response_offset, _generate_label
 from .._typing import napari_data
 
@@ -76,9 +76,8 @@ def _check_chunk_memory(chunk) -> None:
         MemoryError: If chunk size exceeds error_threshold_mb from config
     """
     config = load_config()
-    memory_config = config.get("memory", {})
-    warn_mb = memory_config.get("warn_threshold_mb", 500)
-    error_mb = memory_config.get("error_threshold_mb", 2000)
+    warn_mb = get_setting(config, "memory.warn_threshold_mb")
+    error_mb = get_setting(config, "memory.error_threshold_mb")
 
     estimated_mb = _estimate_chunk_memory_mb(chunk)
 
@@ -310,7 +309,7 @@ def _get_grpc_channel(settings: dict):
         )
 
     config = load_config()
-    max_msg_size = config["grpc"]["max_message_size_mb"]
+    max_msg_size = get_setting(config, "grpc.max_message_size_mb")
     max_msg_bytes = 1024 * 1024 * max_msg_size
 
     # Determine scheme: explicit from URL, or auto-detect based on port
@@ -349,7 +348,7 @@ def check_server_health(
     """
     if timeout is None:
         config = load_config()
-        timeout = config["timeout"]["health_check"]
+        timeout = get_setting(config, "timeout.health_check")
 
     try:
         with _get_grpc_channel(settings) as channel:
@@ -379,7 +378,7 @@ def get_op_names(
     """
     if timeout is None:
         config = load_config()
-        timeout = config["timeout"]["get_op_names"]
+        timeout = get_setting(config, "timeout.get_op_names")
 
     with _get_grpc_channel(settings) as channel:
         stub = proto.ProcessImageStub(channel)
@@ -440,7 +439,9 @@ def grpc_object_detection(
 
     # Get timeout from config
     config = load_config()
-    timeout = config["timeout"]["detection_3d" if is3d else "detection_2d"]
+    timeout = get_setting(
+        config, f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
+    )
 
     server = settings["Server"]
     logger.info("Starting object detection on %s", server)
@@ -619,10 +620,11 @@ def grpc_process_image(
     """
     # Get timeout and concurrency from config
     config = load_config()
-    timeout = config["timeout"][
-        "detection_3d" if "Z" in iter_spec.axis_order else "detection_2d"
-    ]
-    max_concurrent = config["grpc"].get("max_concurrent_calls", 4)
+    is3d = "Z" in iter_spec.axis_order
+    timeout = get_setting(
+        config, f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
+    )
+    max_concurrent = get_setting(config, "grpc.max_concurrent_calls")
 
     server = settings["Server"]
     logger.info(

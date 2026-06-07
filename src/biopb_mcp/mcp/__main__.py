@@ -2,7 +2,7 @@
 
 This process *is* the MCP server: it owns a child Jupyter kernel that hosts a
 visible napari viewer when a display is available, or a compute-only headless
-kernel when none is (see ``mcp.display_mode``).  Run it with::
+kernel when none is (see ``mcp.transport.display_mode``).  Run it with::
 
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
@@ -56,7 +56,7 @@ def _has_display():
 
 
 def _resolve_headless(display_mode, has_display):
-    """Map ``mcp.display_mode`` + display availability to a headless bool.
+    """Map ``mcp.transport.display_mode`` + display availability to headless.
 
     ``"headless"`` -> always; ``"visible"`` -> never (the caller fails fast if
     no display); ``"auto"`` / anything else -> headless only when no display.
@@ -68,29 +68,33 @@ def _resolve_headless(display_mode, has_display):
     return not has_display
 
 
-def _config_defaults(mcp_config):
+def _config_defaults(config):
     """Validate/coerce the config-derived launcher defaults.
 
     argparse only type-checks and constrains *CLI-provided* values, not
-    ``default=`` values — so a malformed config (a bad ``transport`` string, a
-    stringified ``port``) would otherwise flow straight through. Return a clean
-    ``(transport, port)`` falling back to the documented defaults.
+    ``default=`` values — so a malformed config (a bad ``transport.kind``
+    string, a stringified ``transport.port``) would otherwise flow straight
+    through. Return a clean ``(transport, port)`` falling back to the documented
+    defaults.
     """
-    transport = mcp_config.get("transport", "stdio")
+    from .._config import get_setting
+
+    transport = get_setting(config, "mcp.transport.kind")
     if transport not in ("http", "stdio"):
-        logger.warning("Unknown mcp.transport %r; using stdio", transport)
+        logger.warning("Unknown mcp.transport.kind %r; using stdio", transport)
         transport = "stdio"
     try:
-        port = int(mcp_config.get("port", 8765))
+        port = int(get_setting(config, "mcp.transport.port"))
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid mcp.port %r; using 8765", mcp_config.get("port")
+            "Invalid mcp.transport.port %r; using 8765",
+            get_setting(config, "mcp.transport.port"),
         )
         port = 8765
     return transport, port
 
 
-def _open_kernel_log(mcp_config):
+def _open_kernel_log(config):
     """Open the file the kernel's native stdout/stderr is redirected to in
     stdio mode (keeps Qt/GL/dask/gRPC output off the JSON-RPC channel).
 
@@ -100,9 +104,11 @@ def _open_kernel_log(mcp_config):
     exercised. On failure, falls back to the launcher's stderr buffer so the
     kernel still starts.
     """
-    from .._config import get_config_dir
+    from .._config import get_config_dir, get_setting
 
-    path = mcp_config.get("kernel_log") or str(get_config_dir() / "kernel.log")
+    path = get_setting(config, "mcp.transport.kernel_log") or str(
+        get_config_dir() / "kernel.log"
+    )
     try:
         return open(path, "ab", buffering=0)
     except OSError:
@@ -121,13 +127,12 @@ def main(argv=None):
     # stray byte on it corrupts the stream; stderr is harmless in both modes.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-    from .._config import load_config
+    from .._config import get_setting, load_config
     from . import _server
     from ._kernel import KernelHost
 
     config = load_config()
-    mcp_config = config.get("mcp", {})
-    default_transport, default_port = _config_defaults(mcp_config)
+    default_transport, default_port = _config_defaults(config)
     opts = _parse_args(
         argv,
         default_transport=default_transport,
@@ -139,14 +144,17 @@ def main(argv=None):
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
     # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
     # the user demands "visible" we degrade to a compute-only headless kernel.
-    display_mode = mcp_config.get("display_mode", "auto")
+    display_mode = get_setting(config, "mcp.transport.display_mode")
     has_display = _has_display()
     if display_mode == "visible" and not has_display:
-        kernel_log_path = mcp_config.get("kernel_log") or "the kernel log"
+        kernel_log_path = (
+            get_setting(config, "mcp.transport.kernel_log") or "the kernel log"
+        )
         logger.error(
             "display_mode='visible' but no display detected "
             "($DISPLAY/$WAYLAND_DISPLAY are unset). Start an X/Wayland session, "
-            "or set mcp.display_mode to 'auto' or 'headless'. (Kernel output: %s)",
+            "or set mcp.transport.display_mode to 'auto' or 'headless'. "
+            "(Kernel output: %s)",
             kernel_log_path,
         )
         return 2
@@ -173,22 +181,13 @@ def main(argv=None):
     if headless:
         kernel_env["BIOPB_HEADLESS"] = "1"
 
-    # Prefer the gRPC socket over the tensor server's /dev/shm fast-path: the
-    # shm path creates+writes+unlinks a fresh POSIX segment per chunk, measured
-    # ~2.4-3x slower than the socket for large localhost chunks. Driven by
-    # config so the installer can seed it (no-op on Windows, no POSIX shm).
-    # setdefault leaves any explicit shell override intact. Inherited by the
-    # kernel and the dask LocalCluster workers it spawns.
-    if mcp_config.get("tensor_disable_shm"):
-        kernel_env.setdefault("BIOPB_SHM_TRANSFER_DISABLED", "1")
-
     # Let the data-plane client cache chunks for a localhost tensor server
     # (otherwise skipped as redundant with the server's own cache). Bridges
     # interactive viewer responsiveness: repeated/overlapping plane reads
     # within a chunk hit the cache instead of re-fetching the whole chunk.
     # Inherited by the LocalCluster workers, where the bootstrap's cache plugin
-    # bounds each worker at dask_cache_budget // n_workers.
-    if mcp_config.get("tensor_cache_local"):
+    # bounds each worker at mcp.dask.cache_budget // n_workers.
+    if get_setting(config, "mcp.tensor.cache_local"):
         kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
 
     # In stdio mode the kernel must not inherit the launcher's fd 1 (the
@@ -196,7 +195,7 @@ def main(argv=None):
     # http mode it inherits the launcher's fds as before (None).
     kernel_stdout = kernel_stderr = None
     if transport == "stdio":
-        kernel_stdout = kernel_stderr = _open_kernel_log(mcp_config)
+        kernel_stdout = kernel_stderr = _open_kernel_log(config)
 
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
@@ -215,22 +214,24 @@ def main(argv=None):
 
     host = KernelHost(
         extra_arguments=extra_arguments,
-        kernel_name=mcp_config.get("kernel_name", "python3"),
-        startup_timeout=mcp_config.get("kernel_startup_timeout", 60.0),
-        execute_timeout=mcp_config.get("execute_timeout", 120.0),
-        busy_lock_timeout=mcp_config.get("busy_lock_timeout", 5.0),
+        kernel_name=get_setting(config, "mcp.kernel.name"),
+        startup_timeout=get_setting(config, "mcp.kernel.startup_timeout"),
+        execute_timeout=get_setting(config, "mcp.kernel.execute_timeout"),
+        busy_lock_timeout=get_setting(config, "mcp.kernel.busy_lock_timeout"),
         env=kernel_env,
         kernel_stdout=kernel_stdout,
         kernel_stderr=kernel_stderr,
-        watchdog_interval=mcp_config.get("watchdog_interval", 5.0),
-        watchdog_max_respawns=mcp_config.get("watchdog_max_respawns", 3),
-        watchdog_respawn_window=mcp_config.get(
-            "watchdog_respawn_window", 60.0
+        watchdog_interval=get_setting(config, "mcp.kernel.watchdog_interval"),
+        watchdog_max_respawns=get_setting(
+            config, "mcp.kernel.watchdog_max_respawns"
         ),
-        parent_death_pipe=mcp_config.get("parent_death_pipe", True),
+        watchdog_respawn_window=get_setting(
+            config, "mcp.kernel.watchdog_respawn_window"
+        ),
+        parent_death_pipe=get_setting(config, "mcp.kernel.parent_death_pipe"),
     )
     _server.set_kernel_host(host)
-    _server.set_promote_after(mcp_config.get("promote_after", 10.0))
+    _server.set_promote_after(get_setting(config, "mcp.kernel.promote_after"))
     # Surfaces headless state to the agent (initialize `instructions`) and the
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
@@ -288,8 +289,10 @@ def main(argv=None):
     else:
         _server.run(
             port,
-            allowed_origins=mcp_config.get("allowed_origins", []),
-            allowed_hosts=mcp_config.get("allowed_hosts", []),
+            allowed_origins=get_setting(
+                config, "mcp.transport.allowed_origins"
+            ),
+            allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
         )
 
     # If the server loop returns on its own, exit the same way: shut down the

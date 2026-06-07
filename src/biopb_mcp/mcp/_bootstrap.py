@@ -43,12 +43,12 @@ class _HeadlessViewer:
         return False
 
 
-def _configure_dask(mcp_config: dict):
+def _configure_dask(config: dict):
     """Set up dask in the kernel process.
 
     Returns ``(client, cluster)``:
 
-    * ``"distributed"`` + an external ``dask_distributed_address`` -> a
+    * ``"distributed"`` + an external ``mcp.dask.address`` -> a
       ``Client`` attached to that scheduler; ``cluster`` is ``None``.
     * ``"distributed"`` + no address -> a kernel-local multi-process
       ``LocalCluster`` and a ``Client`` bound to it. This is the default and
@@ -60,9 +60,11 @@ def _configure_dask(mcp_config: dict):
     """
     import dask
 
-    scheduler = mcp_config.get("dask_scheduler", "distributed")
-    num_workers = mcp_config.get("dask_num_workers", 0) or None
-    address = mcp_config.get("dask_distributed_address", "")
+    from .._config import get_setting
+
+    scheduler = get_setting(config, "mcp.dask.scheduler")
+    num_workers = get_setting(config, "mcp.dask.num_workers") or None
+    address = get_setting(config, "mcp.dask.address")
 
     if scheduler == "distributed":
         try:
@@ -84,12 +86,12 @@ def _configure_dask(mcp_config: dict):
             cluster = LocalCluster(
                 n_workers=num_workers,
                 processes=True,
-                threads_per_worker=mcp_config.get(
-                    "dask_threads_per_worker", 1
+                threads_per_worker=get_setting(
+                    config, "mcp.dask.threads_per_worker"
                 ),
-                memory_limit=mcp_config.get("dask_memory_limit", "auto"),
-                dashboard_address=mcp_config.get(
-                    "dask_dashboard_address", "127.0.0.1:0"
+                memory_limit=get_setting(config, "mcp.dask.memory_limit"),
+                dashboard_address=get_setting(
+                    config, "mcp.dask.dashboard_address"
                 ),
                 local_directory=local_directory,
             )
@@ -116,11 +118,11 @@ def _configure_dask(mcp_config: dict):
 
 
 def _register_cache_plugin(
-    dask_client, url, token, mcp_config: dict, planned_workers=None
+    dask_client, url, token, config: dict, planned_workers=None
 ):
     """Pin a cluster-wide data-plane chunk-cache budget across dask workers.
 
-    Splits ``mcp.dask_cache_budget`` evenly across the live workers and installs
+    Splits ``mcp.dask.cache_budget`` evenly across the live workers and installs
     a worker-init plugin so each worker (current and future) caps its per-process
     cache at ``budget // n_workers``. No-op without a distributed client; the
     plugin itself resolves a localhost server to no cache. Best-effort: a failure
@@ -132,11 +134,12 @@ def _register_cache_plugin(
     if dask_client is None:
         return
     try:
+        from biopb.tensor.client import make_cache_plugin
         from dask.utils import parse_bytes
 
-        from biopb.tensor.client import make_cache_plugin
+        from .._config import get_setting
 
-        budget_cfg = mcp_config.get("dask_cache_budget", "1G")
+        budget_cfg = get_setting(config, "mcp.dask.cache_budget")
         budget = (
             int(budget_cfg)
             if isinstance(budget_cfg, (int, float))
@@ -186,14 +189,13 @@ def _bootstrap_impl():
     import numpy as np
     from IPython import get_ipython
 
-    from .._config import load_config
+    from .._config import get_setting, load_config
     from .._connection import TensorConnection
     from . import _jobs
     from ._process_ops import build_ops
 
     ip = get_ipython()
     config = load_config()
-    mcp_config = config.get("mcp", {})
 
     # Headless (compute-only) mode: the launcher sets BIOPB_HEADLESS when no
     # display is available (or display_mode forces it), so we skip Qt/napari
@@ -207,7 +209,7 @@ def _bootstrap_impl():
         ip.enable_gui("qt")
 
     # 2. Configure dask in the compute process.
-    dask_client, dask_cluster = _configure_dask(mcp_config)
+    dask_client, dask_cluster = _configure_dask(config)
 
     # 3. Data-access service, shared by the widget and the agent namespace.
     conn = TensorConnection(config)
@@ -227,7 +229,7 @@ def _bootstrap_impl():
         else None
     )
     conn.on_connect = lambda url, token: _register_cache_plugin(
-        dask_client, url, token, mcp_config, planned_workers
+        dask_client, url, token, config, planned_workers
     )
 
     # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
@@ -235,7 +237,7 @@ def _bootstrap_impl():
     #    single-process scheduler so they share the main-process chunk cache
     #    instead of scattering across the distributed cluster (issue #8).
     #    Headless: no viewer — `viewer` is a self-describing sentinel instead.
-    compute_scheduler = mcp_config.get("viewer_compute_scheduler", "threads")
+    compute_scheduler = get_setting(config, "mcp.viewer.compute_scheduler")
     if headless:
         viewer = _HeadlessViewer()
         logger.info("Headless mode: no napari viewer (no display).")
@@ -253,9 +255,9 @@ def _bootstrap_impl():
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
-    timeout_config = config.get("timeout", {})
-    grpc_config = config.get("grpc", {})
-    max_msg_bytes = grpc_config.get("max_message_size_mb", 512) * 1024 * 1024
+    max_msg_bytes = (
+        get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
+    )
     channel_options = [
         ("grpc.max_receive_message_length", max_msg_bytes),
         ("grpc.max_send_message_length", max_msg_bytes),
@@ -263,9 +265,11 @@ def _bootstrap_impl():
     try:
         ops = build_ops(
             client_getter=lambda: conn.client,
-            server_urls=mcp_config.get("process_image_servers", []),
-            op_names_timeout=timeout_config.get("get_op_names", 10.0),
-            run_timeout=timeout_config.get("process_image", 300.0),
+            server_urls=get_setting(
+                config, "mcp.services.process_image_servers"
+            ),
+            op_names_timeout=get_setting(config, "timeout.get_op_names"),
+            run_timeout=get_setting(config, "timeout.process_image"),
             channel_options=channel_options,
         )
     except Exception:

@@ -1,6 +1,7 @@
 """Dynamically built ``biopb.image.ProcessImage`` operations for the agent.
 
-Each ProcessImage servicer URL listed in ``config["mcp"]["process_image_servers"]``
+Each ProcessImage servicer URL listed in
+``config["mcp"]["services"]["process_image_servers"]``
 (``grpc://`` for plaintext, ``grpcs://`` for TLS) is queried via ``GetOpNames``.
 Every advertised op becomes a thin callable placed in the ``ops`` dict in the
 ``execute_code`` namespace.

@@ -67,7 +67,8 @@ def build_transport_security(
     """Build DNS-rebinding protection settings for the loopback server.
 
     The loopback allowlists are always enforced; ``extra_origins`` /
-    ``extra_hosts`` (from ``config['mcp']``) are appended so an admin fronting
+    ``extra_hosts`` (from ``config['mcp']['transport']``) are appended so an
+    admin fronting
     the server with a reverse proxy can permit the proxy's Host/Origin.
     """
     return TransportSecuritySettings(

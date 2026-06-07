@@ -13,7 +13,7 @@ from magicgui.widgets import (
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QSizePolicy
 
-from .._config import load_config, save_config
+from .._config import get_setting, load_config, save_config
 
 if TYPE_CHECKING:
     import napari
@@ -214,11 +214,13 @@ class _WidgetBase(Container):
         )
 
         self._is3d = create_widget(
-            label="3D", annotation=bool, value=self._config.get("3D", False)
+            label="3D",
+            annotation=bool,
+            value=get_setting(self._config, "widget.is_3d"),
         )
 
         self._server = create_widget(
-            value=self._config["server"]["url"],
+            value=get_setting(self._config, "widget.server_url"),
             label="Server",
             annotation=str,
         )
@@ -340,11 +342,12 @@ class _WidgetBase(Container):
         """Save current widget settings to config file.
 
         Reloads from disk first so keys this widget does not own (e.g.
-        mcp.process_image_servers) are not clobbered by a stale snapshot.
+        mcp.services.process_image_servers) are not clobbered by a stale
+        snapshot.
         """
         settings = self._snapshot()
         config = load_config()
-        config["server"]["url"] = settings["Server"]
-        config["3D"] = settings["3D"]
+        config["widget"]["server_url"] = settings["Server"]
+        config["widget"]["is_3d"] = settings["3D"]
         save_config(config)
         self._config = config

@@ -115,15 +115,17 @@ biopb_mcp.mcp` (requires `$DISPLAY`; a viewer window appears). Install the
 optional deps with `pip install biopb-mcp[mcp]`.
 
 **Transport** is chosen once at startup (not co-served) via `--transport` /
-`config['mcp']['transport']`: `http` (default — loopback streamable-http on
-`port`) or `stdio` (JSON-RPC on stdin/stdout, for a client that spawns
-`biopb-mcp --transport stdio` as a subprocess). The kernel/viewer/dask stack is
-identical either way. In stdio mode fd 1 *is* the protocol channel, so the
-launcher logs to stderr and redirects the kernel's *native* stdout/stderr to a
-log file (`config['mcp']['kernel_log']`, default
+`config['mcp']['transport']['kind']`: `stdio` (default — JSON-RPC on
+stdin/stdout, for a client that spawns `biopb-mcp --transport stdio` as a
+subprocess) or `http` (loopback streamable-http on `transport.port`). The
+kernel/viewer/dask stack is identical either way. In stdio mode fd 1 *is* the
+protocol channel, so the launcher logs to stderr and redirects the kernel's
+*native* stdout/stderr to a log file
+(`config['mcp']['transport']['kernel_log']`, default
 `~/.config/biopb-mcp/kernel.log`) — otherwise Qt/GL/dask/gRPC C-level writes
 would corrupt the stream. stdio has no network surface, so the Host/Origin
-allowlist (`allowed_origins`/`allowed_hosts`) is http-only and not applied. NB:
+allowlist (`transport.allowed_origins`/`transport.allowed_hosts`) is http-only
+and not applied. NB:
 the orphaned-kernel risks (issue #13) are amplified under stdio (one kernel tree
 per client launch); the `PR_SET_PDEATHSIG`/watchdog hardening there is a
 prerequisite before recommending stdio for production.
@@ -199,43 +201,84 @@ reverse proxy. The server **enforces a DNS-rebinding / `Origin` / `Host`
 allowlist** (loopback only, set explicitly in `_server.py` via
 `build_transport_security()`), so a malicious page in the user's browser is
 rejected (`403`/`421`) before it can reach the kernel. The allowlist is
-extensible via `config['mcp']['allowed_origins']` / `['allowed_hosts']` for a
-reverse-proxy front; there is no loopback token (the `Origin` check already
+extensible via `config['mcp']['transport']['allowed_origins']` /
+`config['mcp']['transport']['allowed_hosts']` for a reverse-proxy front; there
+is no loopback token (the `Origin` check already
 blocks the browser-attacker threat). Do not describe this as sandboxed.
+
+**Error-propagation model (general — applies beyond startup).** Letting an
+exception propagate *upward* — including out of a Qt callback (timer/signal slot,
+e.g. the connect/autostart ticks in `tensor_browser/_widget.py`) — is **generally
+safe in both hosts and will not qFatal-abort the process**, so prefer surfacing
+real failures over silently swallowing them. The reason: PyQt6 only calls
+`qFatal()`/`abort()` on an unhandled slot exception when `sys.excepthook` is the
+*default* `sys.__excepthook__`, and a **non-default hook is always installed** in
+both contexts — napari's `notification_manager` in the standalone plugin (set by
+`napari.run()` via `with notification_manager:`), and ipykernel's
+`ZMQInteractiveShell.excepthook` in the **MCP kernel** (where `napari.run()` is
+never called — the kernel's `%gui qt` inputhook drives the loop and `run()`
+early-returns under an IPython loop — so napari's hooks are absent but the kernel's
+own hook covers it). The only difference is *where the error surfaces*: a GUI
+notification in the plugin vs. a printed traceback in the kernel output (kernel.log
+under stdio) for MCP. Verified empirically: a slot exception aborts with SIGABRT
+only under the default hook and exits cleanly under any override, and the ipykernel
+hook stays non-default through `enable_gui("qt")` and `napari.Viewer()`. Caveat:
+this only covers crash-safety — a propagated error in the MCP kernel produces a log
+traceback, not an agent- or user-facing message, so still catch where you want a
+clean, reported failure.
 
 ### Configuration (`_config.py`)
 
 `DEFAULT_CONFIG` is stored under the home-relative config dir
 (`~/.config/biopb-mcp`, matching the biopb server and installer on all
-platforms) and merged with defaults on load. Key sections: `server`,
-`tensor_browser.server_url`, `detection`, `grid` (tiling for large images),
-`timeout`, `grpc.max_message_size_mb`, `memory`, and `mcp`. The `mcp` section
-holds `transport` (`http`/`stdio`, default `http`; chosen at startup, also via
-`--transport`), `kernel_log` (stdio-only; where the kernel's native
-stdout/stderr is redirected so it can't corrupt fd 1, default
-`~/.config/biopb-mcp/kernel.log`), `port` (8765),
-`execute_timeout` (120s; now bounds only the quick in-band
-snippets), `promote_after` (10s; how long `execute_code` waits inline before
-returning a job handle), `busy_lock_timeout` (5s), `kernel_name`,
-`kernel_startup_timeout`, the dask settings
-(`dask_scheduler` defaults to `distributed`, which with an empty
-`dask_distributed_address` auto-spins a kernel-local multi-process
-`LocalCluster` — the only mode where `cancel_job` can stop an in-flight
-`.compute()`; set a non-empty address to attach to an external scheduler
-instead, or `threads`/`synchronous` for a low-overhead in-process scheduler with
-no mid-compute cancel. `dask_num_workers`/`dask_threads_per_worker`/
-`dask_memory_limit`/`dask_dashboard_address` size the auto-spun cluster; the
-dashboard binds loopback only),
-`allowed_origins`/`allowed_hosts` (extra Host/Origin values appended to the
-loopback DNS-rebinding allowlist for a reverse-proxy front; http transport only),
-`viewer_compute_scheduler` (default `threads`; pins the napari viewer's *serial*
-slice reads to a single-process scheduler via `_viewer_compute.wrap_levels` so
-they share the one main-process `conn.client` chunk cache instead of scattering
-across the distributed cluster's per-worker caches — issue #8. The viewer being
-serial makes this free; the agent's explicit `da` computes keep the distributed
-default. `synchronous` for fully serial reads, `""` to disable wrapping), and
-`process_image_servers` (the `grpc://`/`grpcs://` ProcessImage URLs exposed as
-`ops`).
+platforms) and **deep-merged** with defaults on load — a partial nested user
+section overrides only its own leaves and leaves sibling defaults intact. Read
+values with `get_setting(config, "dotted.path")`, which falls back to
+`DEFAULT_CONFIG` so call sites never restate a default literal.
+
+Top-level sections: `widget` (the experimental demo widgets' settings —
+`server_url`, `is_3d`, `detection`, and `grid` tiling — the only consumer is
+`image_processing/`), `tensor_browser.server_url` (data-plane URL, deliberately
+top-level because the GUI-independent `TensorConnection` reads it from the
+headless kernel too), `timeout`, `grpc.max_message_size_mb`, `memory`, and `mcp`.
+The `mcp` section is grouped by concern:
+
+- **`mcp.transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
+  startup, also via `--transport`), `port` (8765), `display_mode`, `kernel_log`
+  (stdio-only; where the kernel's native stdout/stderr is redirected so it can't
+  corrupt fd 1, default `~/.config/biopb-mcp/kernel.log`), and
+  `allowed_origins`/`allowed_hosts` (extra Host/Origin values appended to the
+  loopback DNS-rebinding allowlist for a reverse-proxy front; http only).
+- **`mcp.kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now
+  bounds only the quick in-band snippets), `busy_lock_timeout` (5s),
+  `promote_after` (10s; how long `execute_code` waits inline before returning a
+  job handle), `parent_death_pipe`, and the `watchdog_*` orphan-hardening knobs
+  (issue #13).
+- **`mcp.dask`** — `scheduler` defaults to `distributed`, which with an empty
+  `address` auto-spins a kernel-local multi-process `LocalCluster` (the only mode
+  where `cancel_job` can stop an in-flight `.compute()`); set a non-empty
+  `address` to attach to an external scheduler, or `threads`/`synchronous` for a
+  low-overhead in-process scheduler with no mid-compute cancel.
+  `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
+  auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
+  cluster-wide chunk cache (split across workers).
+- **`mcp.tensor`** — `cache_local` (let the data-plane client cache chunks even
+  for a localhost server; translated to `BIOPB_CACHE_LOCAL` in the kernel env).
+- **`mcp.viewer`** — `compute_scheduler` (default `threads`; pins the napari
+  viewer's *serial* slice reads to a single-process scheduler via
+  `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`
+  chunk cache instead of scattering across the distributed cluster's per-worker
+  caches — issue #8. The viewer being serial makes this free; the agent's
+  explicit `da` computes keep the distributed default. `synchronous` for fully
+  serial reads, `""` to disable wrapping).
+- **`mcp.services.process_image_servers`** — the `grpc://`/`grpcs://`
+  ProcessImage URLs exposed as `ops`.
+- **`mcp.server_start_timeout`** — the autostart boot-wait budget (issue #12).
+
+For back-compat, `load_config` relocates the one legacy flat key the biopb
+installer still seeds (`mcp.process_image_servers` →
+`mcp.services.process_image_servers`); the next `save_config` persists the nested
+form, so it self-heals.
 
 ### Plugin Entry Points
 
