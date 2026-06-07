@@ -34,7 +34,7 @@ class TestRequestGracefulStop:
         monkeypatch.setattr("sys.platform", "win32")
         with patch.object(cli, "_win_request_shutdown", return_value=True) as req:
             assert cli._request_graceful_stop(4321) is True
-            req.assert_called_once_with(4321)
+            req.assert_called_once_with()  # sentinel name is not pid-keyed
 
 
 class TestGracefulStop:
@@ -71,17 +71,20 @@ class TestGracefulStop:
         monkeypatch.setattr(cli, "_LAST_WIN_SHUTDOWN_DIAG", "could not write shutdown sentinel: boom")
         monkeypatch.setattr(cli, "_is_process_running", lambda _pid: True)
         monkeypatch.setattr(cli, "_remove_pid", MagicMock())
+        monkeypatch.setattr(cli, "_win_remove_sentinel", MagicMock())
         with patch.object(cli.os, "kill"):
             assert cli._graceful_stop(1234, timeout=1) is False
         assert "Graceful stop unavailable" in capsys.readouterr().out
 
 
 class TestWinRequestShutdown:
-    def test_writes_sentinel_file(self, tmp_path, monkeypatch):
+    def test_writes_fixed_sentinel_file(self, tmp_path, monkeypatch):
         # Redirect the biopb data dir to a temp location.
         monkeypatch.setattr(cli, "PID_FILE", tmp_path / "tensor-server.pid")
-        assert cli._win_request_shutdown(4321) is True
-        sentinel = cli._win_shutdown_sentinel(4321)
+        assert cli._win_request_shutdown() is True
+        sentinel = cli._win_shutdown_sentinel()
         assert sentinel.exists()
         assert sentinel.read_text() == "stop"
-        assert sentinel == tmp_path / "tensor-server-4321.stop"
+        assert sentinel == tmp_path / "tensor-server.stop"  # not pid-keyed
+        cli._win_remove_sentinel()
+        assert not sentinel.exists()

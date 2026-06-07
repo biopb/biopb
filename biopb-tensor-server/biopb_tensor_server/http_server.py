@@ -1226,16 +1226,19 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def shutdown_sentinel_path(pid: int) -> "os.PathLike":
-    """Path of the per-daemon shutdown sentinel file `biopb server stop` writes.
+def shutdown_sentinel_path() -> "os.PathLike":
+    """Path of the shutdown sentinel file `biopb server stop` writes.
 
     Must stay in sync with the path biopb.cli computes (duplicated there to avoid
-    importing heavy server deps just to stop). Lives in the user's biopb data dir
-    and is keyed by PID so multiple server instances don't collide.
+    importing heavy server deps just to stop). A single fixed name in the user's
+    biopb data dir - NOT keyed by PID: on Windows the process `start` launches
+    can differ from the one running launch()/uvicorn (Store-Python/uv shims), so
+    the daemon's os.getpid() and the PID file may disagree. There is only ever
+    one daemon (the PID file is singular too), so a fixed name is unambiguous.
     """
     from pathlib import Path
 
-    return Path.home() / ".local" / "share" / "biopb" / f"tensor-server-{pid}.stop"
+    return Path.home() / ".local" / "share" / "biopb" / "tensor-server.stop"
 
 
 def _install_windows_shutdown_listener(server) -> None:
@@ -1249,31 +1252,31 @@ def _install_windows_shutdown_listener(server) -> None:
     can't stall shutdown). uvicorn then returns from run(), so launch()'s
     ``finally -> _graceful_shutdown`` runs and the file-cache lock is released.
 
-    No-op off Windows (POSIX uses SIGTERM). Best-effort: on any error `stop`
-    force-kills after its timeout.
+    A leftover sentinel from a previous run is ignored via an mtime guard (only
+    files modified at/after this watcher started count), so no startup delete is
+    needed. No-op off Windows (POSIX uses SIGTERM). Best-effort: on any error
+    `stop` force-kills after its timeout.
     """
     if sys.platform != "win32":
         return
 
-    sentinel = shutdown_sentinel_path(os.getpid())
-    # Clear any sentinel left by a previous process that happened to reuse this
-    # PID, so we don't shut down immediately on a stale file.
-    try:
-        os.remove(sentinel)
-    except OSError:
-        pass
+    sentinel = shutdown_sentinel_path()
+    installed_at = time.time()
 
     def _watch() -> None:
         while True:
-            if os.path.exists(sentinel):
-                logger.info("Shutdown sentinel found; requesting graceful exit.")
-                server.should_exit = True
-                server.force_exit = True
-                try:
-                    os.remove(sentinel)
-                except OSError:
-                    pass
-                return
+            try:
+                if os.path.exists(sentinel) and os.path.getmtime(sentinel) >= installed_at:
+                    logger.info("Shutdown sentinel found; requesting graceful exit.")
+                    server.should_exit = True
+                    server.force_exit = True
+                    try:
+                        os.remove(sentinel)
+                    except OSError:
+                        pass
+                    return
+            except OSError:
+                pass
             time.sleep(0.2)
 
     threading.Thread(

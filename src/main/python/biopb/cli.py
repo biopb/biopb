@@ -155,16 +155,19 @@ def _is_process_running(pid: int) -> bool:
 _LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
 
 
-def _win_shutdown_sentinel(pid: int) -> Path:
-    """Path of the per-daemon shutdown sentinel file (Windows graceful stop).
+def _win_shutdown_sentinel() -> Path:
+    """Path of the shutdown sentinel file (Windows graceful stop).
 
     Must match shutdown_sentinel_path() in biopb_tensor_server.http_server (kept
-    as a literal here to avoid importing heavy server deps just to stop).
+    as a literal here to avoid importing heavy server deps just to stop). A single
+    fixed name - NOT keyed by PID: on Windows the daemon's os.getpid() can differ
+    from the PID `start` recorded (Store-Python/uv launcher shims), so a pid in
+    the name would make stop and the daemon disagree. One daemon, one sentinel.
     """
-    return PID_FILE.parent / f"tensor-server-{pid}.stop"
+    return PID_FILE.parent / "tensor-server.stop"
 
 
-def _win_request_shutdown(pid: int) -> bool:
+def _win_request_shutdown() -> bool:
     """Windows: ask the daemon to shut down gracefully. Returns True if the
     request was delivered (not whether the process has exited yet).
 
@@ -178,18 +181,27 @@ def _win_request_shutdown(pid: int) -> bool:
     global _LAST_WIN_SHUTDOWN_DIAG
     try:
         _ensure_dirs()
-        _win_shutdown_sentinel(pid).write_text("stop")
+        _win_shutdown_sentinel().write_text("stop")
         return True
     except OSError as e:
         _LAST_WIN_SHUTDOWN_DIAG = f"could not write shutdown sentinel: {e}"
         return False
 
 
+def _win_remove_sentinel() -> None:
+    """Remove the shutdown sentinel (best effort), so it doesn't linger after a
+    force-kill where the daemon never consumed it."""
+    try:
+        _win_shutdown_sentinel().unlink()
+    except OSError:
+        pass
+
+
 def _request_graceful_stop(pid: int) -> bool:
     """Ask the daemon to shut down gracefully. Returns whether the request was
     delivered (not whether the process has exited yet)."""
     if sys.platform == "win32":
-        return _win_request_shutdown(pid)
+        return _win_request_shutdown()
     try:
         os.kill(pid, signal.SIGTERM)
         return True
@@ -209,21 +221,26 @@ def _graceful_stop(pid: int, timeout: int) -> bool:
             f"force killing.[/yellow]"
         )
 
+    graceful = False
     for _ in range(timeout):
         if not _is_process_running(pid):
-            _remove_pid()
-            return True
+            graceful = True
+            break
         time.sleep(1)
 
-    # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to SIGTERM,
-    # which os.kill maps to an unconditional TerminateProcess.
-    try:
-        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-    except OSError:
-        pass
-    time.sleep(0.5)
+    if not graceful:
+        # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to
+        # SIGTERM, which os.kill maps to an unconditional TerminateProcess.
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError:
+            pass
+        time.sleep(0.5)
+
     _remove_pid()
-    return False
+    if sys.platform == "win32":
+        _win_remove_sentinel()  # tidy up if the daemon never consumed it
+    return graceful
 
 
 def _get_log_file() -> Path:

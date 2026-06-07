@@ -218,15 +218,20 @@ console that `biopb server stop` (running in a different console) can deliver a
 console control event to — and Win32 named events proved brittle across
 sessions/elevation. So graceful shutdown is coordinated through a **sentinel
 file** instead: `run_http_server` calls `_install_windows_shutdown_listener(server)`,
-which starts a daemon thread that polls for
-`~/.local/share/biopb/tensor-server-<pid>.stop` every 0.2s. When `stop` writes
-that file, the thread sets `server.should_exit = True` *and* `server.force_exit
-= True` (so an open browser/keep-alive connection can't stall shutdown). uvicorn
-returns from `run()`, so `launch`'s `finally → _graceful_shutdown` runs and the
-file-cache process lock is released. `stop` falls back to `TerminateProcess`
-(via `os.kill`) if the sentinel can't be written or the daemon doesn't exit
-within `--timeout`. On POSIX, `stop` sends `SIGTERM` as before. See
-`biopb/biopb#22`.
+which starts a daemon thread that polls for `~/.local/share/biopb/tensor-server.stop`
+every 0.2s. When `stop` writes that file, the thread sets `server.should_exit =
+True` *and* `server.force_exit = True` (so an open browser/keep-alive connection
+can't stall shutdown). uvicorn returns from `run()`, so `launch`'s `finally →
+_graceful_shutdown` runs and the file-cache process lock is released.
+
+The sentinel name is **fixed, not PID-keyed**: on Windows the process `start`
+launches (and records in the PID file) can differ from the one actually running
+`launch()`/uvicorn (Store-Python/uv launcher shims), so a PID in the name would
+make `stop` and the daemon disagree. There's only ever one daemon (the PID file
+is singular too). A leftover sentinel from a prior run is ignored via an mtime
+guard. `stop` falls back to `TerminateProcess` (via `os.kill`) if the sentinel
+can't be written or the daemon doesn't exit within `--timeout`. On POSIX, `stop`
+sends `SIGTERM` as before. See `biopb/biopb#22`.
 
 ---
 
