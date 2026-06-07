@@ -20,6 +20,8 @@ from biopb_image_base.common import (
     ensure_eager,
 )
 from biopb_image_base.health import HealthServicer, add_health_servicer
+from biopb_image_base import dynamics_local, stitch
+from biopb_image_base.stitch import stitch_lazy_segmentation, uniform_core
 
 __all__ = [
     "setup_logging",
@@ -35,4 +37,8 @@ __all__ = [
     "ensure_eager",
     "HealthServicer",
     "add_health_servicer",
+    "stitch",
+    "dynamics_local",
+    "stitch_lazy_segmentation",
+    "uniform_core",
 ]

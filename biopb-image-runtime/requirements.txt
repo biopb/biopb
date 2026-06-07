@@ -2,6 +2,8 @@ grpcio-health-checking
 imageio
 typer
 numpy
+# For the lazy flow-stitch utilities (biopb_image_base.dynamics_local uses scipy.ndimage)
+scipy
 # For lazy data handling (TensorFlightClient)
 pyarrow >= 14.0.0
 dask[array]
