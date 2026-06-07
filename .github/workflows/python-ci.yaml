@@ -18,6 +18,8 @@ on:
       - 'src/main/python/**'
       - 'src/test/python/**'
       - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
       - 'pyproject.toml'
       - '.github/workflows/python-ci.yaml'
   workflow_dispatch:
