@@ -31,11 +31,6 @@ Pre-built standalone installers are available from the [Releases](https://github
 | macOS (Apple Silicon) | `biopb-mcp-macos-arm.tar.gz` |
 | Linux | `biopb-mcp-linux.tar.gz` |
 
-**Usage:**
-- **Windows**: Extract the zip and run `biopb-mcp.exe`
-- **macOS**: Extract and open `biopb-mcp.app` (right-click → "Open" to bypass Gatekeeper for unsigned apps)
-- **Linux**: Extract and run `./biopb-mcp`
-
 ### Development Version
 
 To install latest development version:
