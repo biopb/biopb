@@ -24,7 +24,7 @@ WORKDIR /app
 RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
     && pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir "$TENSOR_WHEEL[web,ome-zarr,aics,medical,ndtiff]" \
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,medical,ndtiff,hdf5]" \
     && pip install --no-cache-dir bioformats-jar
 
 # Stage 3: Runtime (nginx + python)

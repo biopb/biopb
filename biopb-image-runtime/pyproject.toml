@@ -21,7 +21,6 @@ dependencies = [
   "typer",
   "pyarrow >= 14.0.0",
   "dask[array]",
-  "cachey >= 0.1.0",
 ]
 
 [project.optional-dependencies]

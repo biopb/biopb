@@ -15,12 +15,11 @@ dependencies = [
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0",
   "dask[array] >= 2024.0.0",
-  "cachey >= 0.1.0",
+  "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
   "tifffile >= 2021.8.30",
   "numpy < 2.0",
   "typer >= 0.12.0",
   "tomli >= 2.0.0; python_version < '3.11'",
-  "watchdog >= 4.0.0",
   "duckdb",
 ]
 
@@ -41,9 +40,6 @@ dependencies = [
     # so the dependency list stays defined once, in [web].
     "biopb-tensor-server[web]",
   ]
-  ome-zarr = [
-    "ome-zarr >= 0.6.1",
-  ]
   aics = [
     "aicsimageio >= 4.0.0",
     "aicspylibczi >= 3.1.1",
@@ -53,6 +49,9 @@ dependencies = [
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",
+  ]
+  hdf5 = [
+    "h5py >= 3.0.0",
   ]
   # Java Bio-Formats fallback for legacy/proprietary formats with no pure-Python
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
