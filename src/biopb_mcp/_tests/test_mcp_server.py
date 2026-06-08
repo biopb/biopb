@@ -189,6 +189,11 @@ class TestSetHeadless:
         assert "guardrails" in base.lower()
         assert "query_sources" in base
         assert "filesystem" in base.lower()
+        # The catalog contract agents most often get wrong must be pushed up
+        # front (return type + the real column name), not left to a pull-only
+        # resource -- see also execute_code's docstring.
+        assert "to_pandas" in base
+        assert "source_url" in base
         # And they are advertised when visible (no headless directive).
         _server.set_headless(False)
         assert _server.mcp._mcp_server.instructions == base
@@ -232,6 +237,15 @@ class TestExecuteCode:
     def _fast_sleep(self, monkeypatch):
         # Skip the inter-poll sleep so tests don't wait real seconds.
         monkeypatch.setattr(_server.time, "sleep", lambda *a, **k: None)
+
+    def test_docstring_carries_catalog_contract(self):
+        # The tool description is always in the model's context, unlike the
+        # pull-only guide:// resources; the high-failure catalog facts must
+        # live here so the agent sees them at the point of action.
+        doc = _server.execute_code.__doc__ or _server.execute_code.fn.__doc__
+        assert "source_url" in doc
+        assert "to_pandas" in doc
+        assert "add_tensor" in doc
 
     def test_returns_error_when_no_host(self):
         _server._kernel_host = None
