@@ -306,10 +306,28 @@ _install_opencode() {
     _info "opencode needs an API key to talk to an LLM (free with opencode zen):"
     _info "  1. Open ${BOLD}https://opencode.ai/auth${RESET}, sign in, create a new API key, and copy it."
     printf "  ${DIM}Paste the API key (or press Enter to skip): ${RESET}" >/dev/tty
-    local _key=""
-    read -rs _key </dev/tty || _key=""
-    _key="${_key%$'\r'}"
-    printf "\n" >/dev/tty   # read -s ate the user's newline
+    # Read silently but echo a "*" per character so the user gets visual
+    # confirmation their paste registered (plain `read -s` shows nothing, which
+    # makes it hard to tell whether a paste worked).
+    local _key="" _ch=""
+    while IFS= read -rs -n1 _ch </dev/tty; do
+        # Empty _ch on a newline-terminated read => Enter pressed; we're done.
+        [ -z "$_ch" ] && break
+        case "$_ch" in
+            $'\r') break ;;                              # carriage return => done
+            $'\x7f'|$'\b')                               # backspace / delete
+                if [ -n "$_key" ]; then
+                    _key="${_key%?}"
+                    printf '\b \b' >/dev/tty
+                fi
+                ;;
+            *)
+                _key+="$_ch"
+                printf '*' >/dev/tty
+                ;;
+        esac
+    done
+    printf "\n" >/dev/tty   # the silent read ate the user's newline
 
     if [ -n "$_key" ]; then
         if _opencode_write_auth "$_key"; then
