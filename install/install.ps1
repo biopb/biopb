@@ -531,7 +531,7 @@ function Install-Biopb {
     # ===== 3. Install biopb packages =====
     Write-Step "[3/6] Installing biopb packages..."
 
-    $tensorExtras = "web,ome-zarr,aics,medical,ndtiff"
+    $tensorExtras = "web,aics,medical,ndtiff,hdf5"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
         Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"

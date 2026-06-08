@@ -736,7 +736,7 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/6] Installing biopb packages..."
 
-    TENSOR_EXTRAS="web,ome-zarr,aics,medical,ndtiff"
+    TENSOR_EXTRAS="web,aics,medical,ndtiff,hdf5"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"

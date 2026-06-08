@@ -84,7 +84,8 @@ Concrete adapters:
 ### Chunk caching
 
 `CacheManager` provides a pluggable cache layer between `DoGet` and the
-adapter. The default backend is an in-process LRU memory cache (`cachey`).
+adapter. The default backend is an in-process LRU memory cache
+(`OrderedDict`-based, in `cache/memory_backend.py`).
 An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ---
