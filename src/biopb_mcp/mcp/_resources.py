@@ -177,7 +177,8 @@ else:
 ## Browse Sources
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
-# The sources table has columns: source_id, source_url, source_type, metadata_json
+# The sources table columns: source_id, source_url, source_type, dtype,
+# indexed_at, metadata_json, shape_summary
 arrow_table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
 print(arrow_table.to_pandas())
 
