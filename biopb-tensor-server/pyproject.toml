@@ -53,6 +53,10 @@ dependencies = [
   hdf5 = [
     "h5py >= 3.0.0",
   ]
+  # Deprecated, kept for backward compatibility: OmeZarrAdapter reads multiscales
+  # via the core `zarr` dependency (no `ome-zarr` package needed). Empty so that
+  # pinned installs of `biopb-tensor-server[ome-zarr]` still resolve.
+  ome-zarr = []
   # Java Bio-Formats fallback for legacy/proprietary formats with no pure-Python
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
   # download a small, user-cached JDK on first read.
