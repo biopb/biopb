@@ -20,7 +20,32 @@ def test_array_protocol_attributes_delegate(base):
     assert w.shape == base.shape
     assert w.dtype == base.dtype
     assert w.ndim == base.ndim
+    assert w.size == base.size
     assert len(w) == len(base)
+
+
+def test_satisfies_napari_layer_data_protocol(base):
+    """The proxy must pass napari's runtime_checkable LayerDataProtocol.
+
+    Regression: napari's isinstance check resolves the protocol's required
+    members (shape/dtype/ndim/size/__getitem__) with inspect.getattr_static,
+    which bypasses __getattr__. A member delegated only via __getattr__ (as
+    ``size`` once was) is invisible to that check, so add_image() rejects the
+    proxy ("does not implement 'LayerDataProtocol'") and tensor loads fail.
+    """
+    import inspect
+
+    protocols = pytest.importorskip("napari.layers._data_protocols")
+    proto = protocols.LayerDataProtocol
+
+    w = _ViewerArray(base, "threads")
+    # The members napari's LayerDataProtocol requires. Each must resolve
+    # *statically* (no __getattr__) -- that is how the protocol's isinstance
+    # check (inspect.getattr_static, Py 3.12) sees them.
+    _MISSING = object()
+    for attr in ("shape", "dtype", "ndim", "size", "__getitem__"):
+        assert inspect.getattr_static(w, attr, _MISSING) is not _MISSING, attr
+    assert isinstance(w, proto)
 
 
 def test_asarray_materializes_correctly(base):

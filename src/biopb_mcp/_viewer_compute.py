@@ -92,6 +92,16 @@ class _ViewerArray(NDArrayOperatorsMixin):
     def ndim(self):
         return self._arr.ndim
 
+    @property
+    def size(self):
+        # napari's LayerDataProtocol (a runtime_checkable Protocol) lists
+        # ``size`` as a required non-callable member, and its isinstance check
+        # resolves members with ``inspect.getattr_static`` -- which bypasses
+        # ``__getattr__``. So ``size`` must exist as a real class attribute,
+        # not be delegated below, or napari rejects the proxy with
+        # "does not implement 'LayerDataProtocol'" and add_image() fails.
+        return self._arr.size
+
     def __len__(self):
         return len(self._arr)
 
