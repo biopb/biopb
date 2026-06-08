@@ -937,7 +937,7 @@ class TensorFlightClient:
 
         return source_descriptors
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> pa.Table:
+    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:
         """Execute SQL query against server's source metadata database.
 
         Requires server to have metadata_db.enabled=True in config.
@@ -967,11 +967,14 @@ class TensorFlightClient:
             surfaced via a logged INFO line.
 
         Raises:
-            FlightServerError: If server does not have metadata database enabled
-            ValueError: If *format* is not one of the supported values, or if
-                the query contains forbidden keywords or references disallowed
-                tables
-            ImportError: If ``format="pandas"`` but pandas is not installed
+            ValueError: If *format* is not one of the supported values. (SQL
+                validation -- forbidden keywords / disallowed tables -- happens
+                server-side and surfaces as a Flight error, below, not a
+                client-side ValueError.)
+            ImportError: If ``format="pandas"`` but pandas is not installed.
+            FlightServerError: If the server has no metadata database enabled,
+                or rejects the query (e.g. forbidden keywords / disallowed
+                tables).
 
         Example:
             >>> client = TensorFlightClient('grpc://localhost:8815')
