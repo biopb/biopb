@@ -937,29 +937,53 @@ class TensorFlightClient:
 
         return source_descriptors
 
-    def query_sources(self, sql: str) -> pa.Table:
+    def query_sources(self, sql: str, *, format: str = "arrow") -> pa.Table:
         """Execute SQL query against server's source metadata database.
-
-        Returns Arrow Table with query results. Schema metadata may contain
-        'total_sources' and 'returned_sources' keys if result was truncated.
 
         Requires server to have metadata_db.enabled=True in config.
 
         Args:
             sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
+            format: Shape of the returned result:
+
+                - ``"arrow"`` (default) — a ``pyarrow.Table``. This is the
+                  historical return type; the default is unchanged for backward
+                  compatibility. Zero-copy, and the only format that preserves
+                  the schema metadata described under *Note*.
+                - ``"pandas"`` — a ``pandas.DataFrame`` (requires pandas).
+                - ``"records"`` — a ``list[dict]``, one dict per row.
 
         Returns:
-            pyarrow.Table with query results
+            The query result in the requested ``format``; an empty query
+            returns an empty object of that same type. For ``"pandas"`` and
+            ``"records"`` the usual Arrow->Python coercion applies (list
+            columns such as ``shape_summary`` become Python lists / object
+            dtype, and nullable integer columns may widen to float).
+
+        Note:
+            The server reports truncation via schema metadata
+            (``total_sources`` / ``returned_sources``). Those keys survive only
+            on the ``"arrow"`` result; for every format truncation is also
+            surfaced via a logged INFO line.
 
         Raises:
             FlightServerError: If server does not have metadata database enabled
-            ValueError: If query contains forbidden keywords or references disallowed tables
+            ValueError: If *format* is not one of the supported values, or if
+                the query contains forbidden keywords or references disallowed
+                tables
+            ImportError: If ``format="pandas"`` but pandas is not installed
 
         Example:
             >>> client = TensorFlightClient('grpc://localhost:8815')
             >>> table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
-            >>> print(table.to_pandas())
+            >>> table.to_pandas()  # or pass format="pandas" to get a DataFrame
         """
+        if format not in ("pandas", "arrow", "records"):
+            raise ValueError(
+                f"query_sources: unknown format {format!r}; "
+                "expected 'pandas', 'arrow', or 'records'"
+            )
+
         cmd = FlightCmd(
             source_id="__metadata_query__",
             metadata_query=MetadataQueryOption(sql=sql),
@@ -987,10 +1011,35 @@ class TensorFlightClient:
             reader = self._client.do_get(
                 info.endpoints[0].ticket, options=self._call_options
             )
-            return reader.read_all()
+            table = reader.read_all()
         else:
             # Empty result
-            return info.schema.empty_table()
+            table = info.schema.empty_table()
+
+        return self._format_query_result(table, format)
+
+    @staticmethod
+    def _format_query_result(table: pa.Table, format: str):
+        """Convert a query result Arrow table to the caller-requested format.
+
+        ``"arrow"`` (the default) returns the Table unchanged -- backward
+        compatible and the only zero-copy / metadata-preserving option.
+        ``"pandas"``/``"records"`` are opt-in conveniences; pandas is imported
+        lazily so it is required only when ``format="pandas"`` is requested.
+        """
+        if format == "arrow":
+            return table
+        if format == "records":
+            return table.to_pylist()
+        # format == "pandas" (validated by the caller)
+        try:
+            import pandas  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "query_sources(format='pandas') requires pandas; install "
+                "pandas, or call with format='arrow' / format='records'."
+            ) from exc
+        return table.to_pandas()
 
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata.

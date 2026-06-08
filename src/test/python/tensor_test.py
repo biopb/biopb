@@ -557,5 +557,63 @@ class TestTensorFlightClient:
             client.close()
 
 
+class TestQuerySourcesFormat:
+    """query_sources output-format conversion (server-free).
+
+    Exercises TensorFlightClient._format_query_result directly. The default
+    stays 'arrow' (pyarrow.Table) for backward compatibility; 'pandas' and
+    'records' are opt-in conveniences.
+    """
+
+    @staticmethod
+    def _table():
+        import pyarrow as pa
+
+        return pa.table(
+            {
+                "source_id": ["a", "b"],
+                # list column mirrors the real `shape_summary` catalog field
+                "shape_summary": [[1, 4, 5734, 5734], [1, 5, 7616, 7616]],
+            }
+        )
+
+    def test_default_format_is_arrow(self):
+        # Backward-compat guard: the historical pyarrow.Table return must stay
+        # the default so existing Arrow consumers don't break.
+        import inspect
+
+        default = inspect.signature(
+            TensorFlightClient.query_sources
+        ).parameters["format"].default
+        assert default == "arrow"
+
+    def test_arrow_passthrough_is_same_object(self):
+        t = self._table()
+        assert TensorFlightClient._format_query_result(t, "arrow") is t
+
+    def test_pandas_format_returns_dataframe(self):
+        pd = pytest.importorskip("pandas")
+        t = self._table()
+        out = TensorFlightClient._format_query_result(t, "pandas")
+        assert isinstance(out, pd.DataFrame)
+        assert list(out["source_id"]) == ["a", "b"]
+        assert list(out["shape_summary"].iloc[0]) == [1, 4, 5734, 5734]
+
+    def test_records_returns_list_of_dicts(self):
+        t = self._table()
+        out = TensorFlightClient._format_query_result(t, "records")
+        assert out == [
+            {"source_id": "a", "shape_summary": [1, 4, 5734, 5734]},
+            {"source_id": "b", "shape_summary": [1, 5, 7616, 7616]},
+        ]
+
+    def test_unknown_format_rejected_before_network(self):
+        # Validated at the top of query_sources, so a bad format fails fast
+        # without a server / connection.
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        with pytest.raises(ValueError, match="unknown format"):
+            client.query_sources("SELECT 1", format="polars")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
