@@ -4,8 +4,9 @@ Runs *inside* the child Jupyter kernel.  ``execute_code`` submits agent code
 here; it executes in a **background daemon thread** so the kernel's main thread
 (and its integrated ``%gui qt`` Qt event loop) stays free to service quick tool
 calls — ``take_screenshot`` / ``server_status`` / ``poll_job`` — while a
-multi-minute job runs.  Because dask / gRPC / numpy release the GIL, the viewer
-keeps updating live and the agent can watch and screenshot mid-job.
+multi-minute job runs.  Long C calls will block context switching, although dask,
+gRPC and numpy all drop GIL, so the job and the viewer/tools are expected to run
+smoothly.
 
 Design notes
 ------------
@@ -14,7 +15,7 @@ Design notes
   concurrent mutation unsafe).
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
-  :func:`run_on_main`; ``_bootstrap`` wraps ``load_tensor`` + the ``add_*``
+  :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
   family so the common paths are automatic.
 * **Output capture.** A thread-aware stdout/stderr dispatcher (installed once by
   :func:`install`) routes a job thread's prints into that job's buffer instead
@@ -329,7 +330,7 @@ def reset():
 # -- viewer wrapping --------------------------------------------------------
 
 _VIEWER_GUI_METHODS = (
-    "load_tensor",
+    "add_tensor",
     "add_image",
     "add_labels",
     "add_points",

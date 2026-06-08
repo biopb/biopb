@@ -1,7 +1,7 @@
 """Helper functions injected into the execute_code namespace.
 
-``load_tensor`` is monkey-patched onto the viewer instance so the agent
-calls ``viewer.load_tensor("source_id")``.
+``add_tensor`` is monkey-patched onto the viewer instance so the agent
+calls ``viewer.add_tensor("source_id")``.
 """
 
 import logging
@@ -24,8 +24,34 @@ def _tensor_short_name(array_id: str) -> str:
     return parts[-1] if parts else array_id
 
 
-def patch_viewer_load_tensor(viewer, connection, compute_scheduler=None):
-    """Monkey-patch ``load_tensor`` onto *viewer*, reading client/sources from
+def viewer_window_alive(viewer) -> bool:
+    """True only if the napari Qt window's C++ object is still alive.
+
+    Detects a user-closed / destroyed window so the tools stop reporting a
+    half-dead viewer as healthy: after the user closes the window the Python
+    ``viewer`` survives (the kernel namespace holds it), but its Qt window and
+    vispy canvas are destroyed, so mutations silently no-op and ``screenshot``
+    raises.  Covers all three teardown shapes: a user X-close (``_qt_window``
+    wraps a deleted C++ object, so ``isVisible()`` raises ``RuntimeError``), a
+    programmatic ``Window.close()`` (``del self._qt_window`` -> attribute gone),
+    and the headless sentinel (``__getattr__`` raises).  An alive-but-minimized
+    or hidden window is still "alive" (``isVisible()`` returns a bool rather than
+    raising)."""
+    try:
+        window = getattr(viewer, "window", None)
+        if window is None:
+            return False
+        qt_window = getattr(window, "_qt_window", None)
+        if qt_window is None:  # programmatic close did `del self._qt_window`
+            return False
+        qt_window.isVisible()  # raises RuntimeError if the C++ object is deleted
+        return True
+    except Exception:
+        return False
+
+
+def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
+    """Monkey-patch ``add_tensor`` onto *viewer*, reading client/sources from
     the live ``TensorConnection`` *connection*.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
@@ -33,12 +59,12 @@ def patch_viewer_load_tensor(viewer, connection, compute_scheduler=None):
     serial viewer hits the shared main-process chunk cache instead of scattering
     across the distributed cluster (issue #8)."""
 
-    def load_tensor(
+    def add_tensor(
         source_id: str,
         tensor_id: str | None = None,
         name: str | None = None,
     ) -> str:
-        """Load a tensor dataset into the viewer.
+        """Add a tensor dataset to the viewer as an image layer.
 
         Args:
             source_id: Source identifier on the tensor server.
@@ -127,6 +153,6 @@ def patch_viewer_load_tensor(viewer, connection, compute_scheduler=None):
         return name
 
     # napari.Viewer is a pydantic evented model with validate_assignment, so a
-    # plain ``viewer.load_tensor = ...`` is rejected.  Write through to the
+    # plain ``viewer.add_tensor = ...`` is rejected.  Write through to the
     # instance dict to bypass field validation.
-    object.__setattr__(viewer, "load_tensor", load_tensor)
+    object.__setattr__(viewer, "add_tensor", add_tensor)

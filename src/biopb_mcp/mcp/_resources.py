@@ -4,32 +4,22 @@ Each constant is served as an MCP resource that the agent reads on demand.
 """
 
 GUIDE = """\
-# biopb-mcp Automation Guide
+# biopb-mcp IPython Kernel Guide
 
-## Domain Guides
-Read these resources for detailed operations:
-- `guide://tensor` — dataset access and upload
-- `guide://viewer` — layers, camera, dims, display
-- `guide://annotations` — segmentations, points, shapes, labels
-- `guide://ops` — server-side image processing operations
+**Operation Guardrails** are in session `instructions`. Apply on every turn — follow them throughout.
 
-## Execution environment
-Code submitted via `execute_code` runs in a child Jupyter kernel (a real IPython kernel)
-with napari integrated via `%gui qt`. Imports are allowed and variables persist across
-`execute_code` calls until the kernel is restarted.
-
-### Namespace (available in execute_code)
+## Namespace
 | Name | Type | Description |
 |------|------|-------------|
-| `client` | TensorFlightClient or None | Client instance (None if not connected to data server) for browsing/retrieving catalog data |
-| `viewer` | napari.Viewer | The active viewer instance that user sees |
+| `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data |
+| `viewer` | napari.Viewer | The active viewer instance that user sees and manipulates |
 | `np` | module | numpy |
 | `da` | module | dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
-| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result; required for viewer mutations from a job thread (no-op on the main thread) |
+| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the main thread and returns its result; required for viewer mutations from a job thread (no-op on the main thread) |
 | `cancelled` | callable | `cancelled()` -> True if the running job has been asked to cancel; poll it in long loops for cooperative cancellation |
 
-* The viewer is a live desktop window. Reads are safe from a job thread, but mutations must run on the main thread — wrap them in `run_on_main()`. `viewer.load_tensor()` and the `viewer.add_*()` family are already wrapped; everything else (layer properties, `viewer.dims`, `viewer.camera`, callback registration) is not.
+* The viewer is a live desktop window. Reads are safe from a job thread, but mutations must run on the main thread — wrap them in `run_on_main()`. `viewer.add_tensor()` and the `viewer.add_*()` family are already wrapped; everything else (layer properties, `viewer.dims`, `viewer.camera`, callback registration) is not.
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
 * `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
@@ -54,12 +44,6 @@ watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `ca
       done.append(fut.result())
       print(f"{len(done)}/{len(futs)} done", flush=True)   # visible via poll_job
   ```
-
-## Operation Guardrails **IMPORTANT**
-The operation guardrails (filesystem avoidance, `query_sources` over
-`list_sources`, lazy-dask, returning intermediates to the viewer, ask-don't-
-assume, offer-a-skill) are delivered up front in the session `instructions` and
-apply on every turn — follow them throughout.
 
 ## Quick Examples
 ```python
@@ -86,7 +70,7 @@ mask_arr = arr > 0.5
 source_id = client.upload_array(mask_arr, "cache:thresholded_v1")
 
 # 4. Display in viewer for user inspection and approval before next step
-layer_name = viewer.load_tensor(source_id)
+layer_name = viewer.add_tensor(source_id)
 ```
 """
 
@@ -94,11 +78,17 @@ VIEWER = """\
 # Viewer Operations
 
 **Threading:** reads are safe from a job thread, but every *mutation* must run on
-the Qt main thread. `viewer.load_tensor()` and the `viewer.add_*()` family are
+the Qt main thread. `viewer.add_*()` family are
 already wrapped for you. For anything else — layer properties, `viewer.dims`,
 `viewer.layers.remove()`, `viewer.camera`, registering callbacks — wrap the
 mutation in `run_on_main()` (a no-op when already on the main thread). Batch
 related mutations into one `run_on_main()` call.
+
+**If the user closes the napari window**, the viewer object survives but its
+canvas is destroyed: `viewer.*` mutations silently no-op (layers go to the model
+but nothing is shown) and screenshots fail. `server_status` reports
+`window: CLOSED`; `execute_code` appends a note. Call `restart_kernel` to
+restore the viewer.
 
 ## Layers
 ```python
@@ -114,7 +104,7 @@ run_on_main(lambda: viewer.layers.remove(viewer.layers["name"]))
 
 # Load data to viewer; auto-handles pyramid. Accepts any valid source_id.
 # (already wrapped — call directly)
-layer_name = viewer.load_tensor(source_id="source_id", tensor_id=None, name=None)
+layer_name = viewer.add_tensor(source_id="source_id", tensor_id=None, name=None)
 
 # Layer properties (mutations — batch into one run_on_main call)
 def _style():
@@ -204,8 +194,8 @@ print(meta)
 ## Load into Viewer
 ```python
 # Auto-handles the multiscale pyramid for large images.
-layer_name = viewer.load_tensor("source_id")                   # single-tensor source
-layer_name = viewer.load_tensor("source_id", tensor_id="t1")   # multi-tensor source
+layer_name = viewer.add_tensor("source_id")                   # single-tensor source
+layer_name = viewer.add_tensor("source_id", tensor_id="t1")   # multi-tensor source
 
 # Or get a lazy dask array directly, without adding a layer:
 arr = client.get_tensor("source_id", tensor_id="t1")           # tensor_id optional if single
@@ -261,6 +251,6 @@ Call signature: `ops["name"](image, dim_labels=None, **kwargs)`
 ```python
 labels = ops["cellpose_cyto2"](arr)          # ndarray -> ndarray
 seg_id = ops["cellpose_cyto2"]("raw_data_id") # id -> id (lazy, large data)
-viewer.load_tensor(seg_id)                    # view the result
+viewer.add_tensor(seg_id)                    # view the result
 ```
 """

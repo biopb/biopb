@@ -23,11 +23,15 @@ def _result(stdout="", result_text="", error_text="", status="ok"):
     }
 
 
-def _job_reply(**payload):
+def _job_reply(window_alive=True, **payload):
     """A kernel ``execute`` result whose stdout carries the job runner's
-    single-line ``<<JOB_JSON>>`` payload (what submit/poll/cancel/list print).
+    single-line ``<<JOB_JSON>>`` payload.
+
+    The snippet wraps the call result as ``{"r": <result>, "w": <window
+    alive?>}``; ``payload`` becomes ``r`` and ``window_alive`` becomes ``w``.
     """
-    return _result(stdout=_server._JOB_DELIM + json.dumps(payload) + "\n")
+    envelope = {"r": payload, "w": window_alive}
+    return _result(stdout=_server._JOB_DELIM + json.dumps(envelope) + "\n")
 
 
 def _snapshot(
@@ -92,7 +96,7 @@ def server_with_host(mock_kernel_host):
 
 class TestResources:
     def test_guide_resource_returns_string(self):
-        content = _server.get_guide()
+        content = _server.get_kernel_guide()
         assert "biopb-mcp" in content
         assert "execute_code" in content
 
@@ -162,6 +166,15 @@ class TestTakeScreenshot:
         snippet = server_with_host.execute.call_args[0][0]
         assert "canvas_only=False" in snippet
 
+    def test_window_closed_returns_clear_message(self, server_with_host):
+        server_with_host.execute.return_value = _result(
+            stdout=_server._WINDOW_CLOSED_DELIM + "\n"
+        )
+        result = _server.take_screenshot()
+        assert result[0].type == "text"
+        assert "window was closed" in result[0].text
+        assert "restart_kernel" in result[0].text
+
 
 # -----------------------------------------------------------------------
 # headless mode
@@ -173,8 +186,8 @@ class TestSetHeadless:
         # The operation guardrails must be delivered up front via the handshake
         # instructions (not left to a pull-on-demand resource).
         base = _server._BASE_INSTRUCTIONS
+        assert "guardrails" in base.lower()
         assert "query_sources" in base
-        assert "run_on_main" in base
         assert "filesystem" in base.lower()
         # And they are advertised when visible (no headless directive).
         _server.set_headless(False)
@@ -295,6 +308,34 @@ class TestExecuteCode:
         result = _server.execute_code("x = 1")
         assert "interrupted" in result
 
+    def test_inline_result_appends_window_closed_note(self, server_with_host):
+        server_with_host.execute.side_effect = [
+            _job_reply(job_id="job-1", status="running", window_alive=False),
+            _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
+        ]
+        result = _server.execute_code("viewer.add_image(arr)")
+        assert "done" in result
+        assert "viewer window is closed" in result
+        assert "restart_kernel" in result
+
+    def test_job_handle_appends_window_closed_note(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-7", status="running", window_alive=False
+        )
+        _server.set_promote_after(0.0)
+        result = _server.execute_code("while True: pass")
+        assert "job-7" in result
+        assert "viewer window is closed" in result
+
+    def test_window_note_suppressed_when_headless(self, server_with_host):
+        _server.set_headless(True)
+        server_with_host.execute.side_effect = [
+            _job_reply(job_id="job-1", status="running", window_alive=False),
+            _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
+        ]
+        result = _server.execute_code("compute()")
+        assert "viewer window is closed" not in result
+
 
 class TestJobTools:
     def test_poll_job_formats_status(self, server_with_host):
@@ -310,6 +351,23 @@ class TestJobTools:
             job_id="job-9", status="unknown", error_text=""
         )
         assert "No such job" in _server.poll_job("job-9")
+
+    def test_poll_job_terminal_appends_window_closed_note(
+        self, server_with_host
+    ):
+        server_with_host.execute.return_value = _job_reply(
+            window_alive=False, **_snapshot(status="ok", stdout="done\n")
+        )
+        result = _server.poll_job("job-1")
+        assert "viewer window is closed" in result
+
+    def test_poll_job_running_omits_window_note(self, server_with_host):
+        # A still-running job: no terminal result yet, so no closed-window note.
+        server_with_host.execute.return_value = _job_reply(
+            window_alive=False, **_snapshot(status="running", stdout="step\n")
+        )
+        result = _server.poll_job("job-1")
+        assert "viewer window is closed" not in result
 
     def test_cancel_job_requests_cancellation(self, server_with_host):
         server_with_host.execute.return_value = _job_reply(

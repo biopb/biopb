@@ -283,15 +283,19 @@ def _bootstrap_impl():
     #    common viewer-mutating methods to the Qt main thread.
     _jobs.install(ip)
     if not headless:
-        from ._helpers import patch_viewer_load_tensor
+        from ._helpers import patch_viewer_add_tensor
 
-        patch_viewer_load_tensor(
+        patch_viewer_add_tensor(
             viewer, conn, compute_scheduler=compute_scheduler
         )
         _jobs.wrap_viewer_for_threads(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
+    #    _viewer_window_alive lets the tools detect a user-closed window (the
+    #    Python `viewer` survives a window close, so mutations silently no-op).
+    from ._helpers import viewer_window_alive
+
     ip.user_ns.update(
         {
             "viewer": viewer,
@@ -305,5 +309,6 @@ def _bootstrap_impl():
             "_jobs": _jobs,
             "run_on_main": _jobs.run_on_main,
             "cancelled": _jobs.cancelled,
+            "_viewer_window_alive": lambda: viewer_window_alive(viewer),
         }
     )

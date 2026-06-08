@@ -36,25 +36,14 @@ _headless: bool = False
 # carrier MCP defines). Clients that honor it inject it into the model's
 # context from the first turn (compliance is up to the client/agent), so this
 # field carries the guidance that must hold on *every* turn — the operation
-# guardrails and the viewer-threading invariant — which a pull-on-demand
-# resource (guide://main) cannot guarantee the agent ever reads. Verbose,
-# situational reference (namespace table, code recipes, examples) stays in the
-# resources, pulled when actually needed. The execute_code docstring already
-# carries the namespace/job-model summary, so it is not repeated here.
+# guardrails.
 _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a live napari viewer through a child IPython "
-    "kernel; `execute_code` runs arbitrary Python in that kernel (agent-first: "
-    "prefer writing code over asking for bespoke tools). Read these resources "
-    "for detail before non-trivial work: guide://main (namespace, examples, "
+    "kernel; `execute_code` runs arbitrary Python in that kernel. Read these resources "
+    "for detail before non-trivial work: guide://kernel (namespace, examples, "
     "long-running jobs & cancellation), guide://tensor (data access/upload), "
     "guide://viewer (layers/camera/dims), guide://annotations "
     "(labels/points/shapes), guide://ops (server-side image-processing ops).\n"
-    "\n"
-    "Threading: viewer reads are safe from a job thread, but every viewer "
-    "*mutation* must run on the Qt main thread. `viewer.load_tensor()` and the "
-    "`viewer.add_*()` family are already wrapped; wrap anything else (layer "
-    "properties, `viewer.dims`, `viewer.camera`, callback registration) in "
-    "`run_on_main(fn)`.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
@@ -67,7 +56,7 @@ _BASE_INSTRUCTIONS = (
     "each step.\n"
     "- Do not assume — ask the user to clarify uncertainties; they know the "
     "data better than you do.\n"
-    "- After accomplishing a task, ask the user whether a skill should be added "
+    "- After accomplishing a task, ask the user whether a new skill should be generated and added "
     "to the agent's toolbox for future use."
 )
 
@@ -130,6 +119,18 @@ _PNG_DELIM = "<<PNG_B64>>"
 # reply to a submit/poll/cancel/list snippet (mirrors the _PNG_DELIM pattern).
 _JOB_DELIM = "<<JOB_JSON>>"
 
+# Sentinel printed by the screenshot snippet when the napari window has been
+# closed (the viewer survives in the namespace, but its canvas is destroyed).
+_WINDOW_CLOSED_DELIM = "<<WINDOW_CLOSED>>"
+
+# Appended to a result when the agent's code ran but the viewer window is closed,
+# so the silent no-op of viewer mutations is surfaced rather than read as success.
+_WINDOW_CLOSED_NOTE = (
+    "\n\n⚠ The napari viewer window is closed — viewer layers won't be "
+    "displayed (data/compute results are still valid). Call restart_kernel to "
+    "restore the viewer."
+)
+
 
 def _job_snippet(call: str) -> str:
     """Build a snippet that prints ``_jobs.<call>``'s result as delimited JSON.
@@ -137,19 +138,33 @@ def _job_snippet(call: str) -> str:
     ``call`` is a fully-formed call expression with arguments already embedded
     via ``repr`` by the caller (agent code is RCE by design, but embedding via
     ``repr`` keeps the payload a valid literal regardless of its contents).
+
+    The payload is ``{"r": <call result>, "w": <viewer window alive?>}`` so the
+    same round-trip also reports whether the viewer window is still open (a
+    user-closed window turns viewer mutations into silent no-ops). The liveness
+    probe is auxiliary, so a kernel that never bound ``_viewer_window_alive``
+    (e.g. a partial/test bootstrap) reports ``w: null`` rather than breaking the
+    job round-trip.
     """
     return (
         "import json as _json\n"
-        "print('" + _JOB_DELIM + "' + _json.dumps(_jobs." + call + "))\n"
+        "print('" + _JOB_DELIM + "' + _json.dumps("
+        "{'r': _jobs." + call + ", "
+        "'w': globals().get('_viewer_window_alive', lambda: None)()}))\n"
     )
 
 
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
-    "_arr = viewer.screenshot(canvas_only={canvas_only})\n"
-    "_bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
-    "_ok, _buf = _cv2.imencode('.png', _bgra)\n"
-    "print('" + _PNG_DELIM + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
+    "if not _viewer_window_alive():\n"
+    "    print('" + _WINDOW_CLOSED_DELIM + "')\n"
+    "else:\n"
+    "    _arr = viewer.screenshot(canvas_only={canvas_only})\n"
+    "    _bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
+    "    _ok, _buf = _cv2.imencode('.png', _bgra)\n"
+    "    print('"
+    + _PNG_DELIM
+    + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
 )
 
 # Self-contained inspection snippet.  Built by string concatenation (no
@@ -223,13 +238,18 @@ else:
 
 print("")
 print("## Viewer")
-if viewer:
+if not viewer:
+    print("  headless: no viewer (no display)")
+elif not _viewer_window_alive():
+    print("  window: CLOSED — the napari window was closed; layer mutations")
+    print("    won't display. Data/compute still work; restart_kernel to restore.")
+    print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
+else:
+    print("  window: open")
     print("  layers: " + str(len(viewer.layers)))
     for _layer in list(viewer.layers)[:10]:
         _shape = getattr(_layer.data, "shape", "?")
         print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
-else:
-    print("  headless: no viewer (no display)")
 
 print("")
 print("## Jobs")
@@ -319,11 +339,31 @@ def _extract_json(text: str):
 
 
 def _run_job_call(host, call: str):
-    """Run a ``_jobs.<call>`` snippet; return (parsed_json, raw_result)."""
+    """Run a ``_jobs.<call>`` snippet.
+
+    Returns ``(result, raw_result, window_alive)`` where ``result`` is the
+    parsed ``_jobs.<call>`` value (None if the snippet failed) and
+    ``window_alive`` is the viewer-window liveness flag carried in the same
+    payload (None when unknown, e.g. the snippet did not run cleanly).
+    """
     res = host.execute(_job_snippet(call))
     if res.get("status") != "ok":
-        return None, res
-    return _extract_json(res.get("stdout", "")), res
+        return None, res, None
+    payload = _extract_json(res.get("stdout", ""))
+    if payload is None:
+        return None, res, None
+    return payload.get("r"), res, payload.get("w")
+
+
+def _window_note(window_alive) -> str:
+    """Closed-window warning to append when a result returns with no viewer.
+
+    Gated on non-headless (headless has no window and carries its own
+    messaging). ``window_alive`` is None when liveness is unknown -> no note.
+    """
+    if not _headless and window_alive is False:
+        return _WINDOW_CLOSED_NOTE
+    return ""
 
 
 def _format_job_status(snap: dict) -> str:
@@ -342,8 +382,8 @@ def _format_job_status(snap: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.resource("guide://main")
-def get_guide() -> str:
+@mcp.resource("guide://kernel")
+def get_kernel_guide() -> str:
     """Overview: available namespaces, helper functions, resource URIs."""
     return _resources.GUIDE
 
@@ -406,6 +446,20 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = host.execute(snippet)
+    if (
+        _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM)
+        is not None
+    ):
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "No screenshot: the napari viewer window was closed. Data "
+                    "access and compute via execute_code still work; call "
+                    "restart_kernel to restore a viewer window."
+                ),
+            )
+        ]
     data = _extract_delimited(res.get("stdout", ""), _PNG_DELIM)
     if data is None:
         detail = (
@@ -419,31 +473,30 @@ def take_screenshot(canvas_only: bool = True) -> list:
 def execute_code(python_code: str) -> str:
     """Execute Python code in the napari kernel.
 
-    **READ THE `guide://main` RESOURCE FOR EXECUTION GUARDRAILS BEFORE USE.**
-
     The kernel is a full Jupyter/IPython kernel (imports allowed) with the
-    namespace: viewer (with a load_tensor method), np, da, client, and ops (a
-    dict of biopb.image ProcessImage operations). Use print() to produce
-    output; the last expression's repr is also returned. Variables persist
+    namespace: viewer (with an add_tensor method), client(image data access), and ops (a
+    dict of image processing operations). np and da are also imported. Variables persist
     across calls until the kernel is restarted.
 
-    Code runs in a background thread, so a long job does NOT block the viewer:
-    if it finishes quickly the result is returned inline; otherwise this returns
+    Code runs in a background thread so it does not block the main thread.
+    If it finishes quickly the result is returned inline; otherwise this returns
     a job handle (job-N) and the code keeps running. Poll it with poll_job,
     watch it with take_screenshot / server_status, and stop it with cancel_job
     (cooperative) or restart_kernel (guaranteed). Only one job runs at a time.
 
-    Inside a long job, mutate the viewer via the auto-wrapped load_tensor /
-    add_* methods or run_on_main(fn) (GUI calls must reach the main thread);
-    note rich IPython display() output is not captured (use print). Read
-    guide://main for namespace details and guide://viewer / guide://tensor /
-    guide://annotations for domain-specific patterns.
+    Results include print() output and the last expression's repr. Rich IPython
+    display() output is not captured; use print().
+
+    Inside a job, wrap viewer mutations in run_on_main(fn) so they run on the Qt
+    main thread. Viewer's add_* methods are pre-wrapped.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
 
-    submitted, res = _run_job_call(host, "submit(" + repr(python_code) + ")")
+    submitted, res, window_alive = _run_job_call(
+        host, "submit(" + repr(python_code) + ")"
+    )
     if submitted is None:
         return _format_execute_result(res)
     if submitted.get("error") == "busy":
@@ -459,11 +512,14 @@ def execute_code(python_code: str) -> str:
     snap = submitted
     while time.monotonic() < deadline:
         time.sleep(0.4)
-        snap, res = _run_job_call(host, "poll(" + repr(job_id) + ")")
+        snap, res, window_alive = _run_job_call(
+            host, "poll(" + repr(job_id) + ")"
+        )
         if snap is None:
             return _format_execute_result(res)
         if snap.get("status") != "running":
-            return _format_execute_result(snap)  # terminal: inline result
+            # terminal: inline result
+            return _format_execute_result(snap) + _window_note(window_alive)
 
     # Still running after promote_after: hand back a job handle.
     partial = snap.get("stdout", "") if snap else ""
@@ -471,7 +527,9 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
-        "Partial output:\n" + (partial or "(none yet)")
+        "Partial output:\n"
+        + (partial or "(none yet)")
+        + _window_note(window_alive)
     )
 
 
@@ -487,12 +545,15 @@ def poll_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    snap, res = _run_job_call(host, "poll(" + repr(job_id) + ")")
+    snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
     if snap is None:
         return _format_execute_result(res)
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'."
-    return _format_job_status(snap)
+    note = (
+        _window_note(window_alive) if snap.get("status") != "running" else ""
+    )
+    return _format_job_status(snap) + note
 
 
 @mcp.tool()
@@ -508,7 +569,9 @@ def cancel_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    data, res = _run_job_call(host, "cancel(" + repr(job_id) + ")")
+    data, res, _window_alive = _run_job_call(
+        host, "cancel(" + repr(job_id) + ")"
+    )
     if data is None:
         return _format_execute_result(res)
     status = data.get("status")

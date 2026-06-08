@@ -26,6 +26,13 @@ pytest.importorskip("jupyter_client")
 from biopb_mcp.mcp import _jobs, _server  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
+
+def _job_result(stdout):
+    """Unwrap the ``{"r": result, "w": window_alive}`` job-snippet envelope."""
+    payload = _server._extract_json(stdout)
+    return payload["r"] if payload else None
+
+
 # ---------------------------------------------------------------------------
 # Unit: in-kernel job runner with a fake shell (no real kernel)
 # ---------------------------------------------------------------------------
@@ -182,13 +189,13 @@ class TestJobConcurrency:
         res = kernel.execute(
             _server._job_snippet("submit(" + repr(code) + ")"), timeout=15.0
         )
-        return _server._extract_json(res["stdout"])
+        return _job_result(res["stdout"])
 
     def _poll(self, kernel, job_id):
         res = kernel.execute(
             _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
-        return _server._extract_json(res["stdout"])
+        return _job_result(res["stdout"])
 
     def test_main_thread_free_while_job_runs(self, kernel):
         # A GIL-releasing background job (time.sleep) must not block the kernel
@@ -253,7 +260,7 @@ class TestNapariJobs:
                 _server._job_snippet("poll(" + repr(job_id) + ")"),
                 timeout=15.0,
             )
-            snap = _server._extract_json(res["stdout"])
+            snap = _job_result(res["stdout"])
             if snap and snap["status"] != "running":
                 return snap
             time.sleep(0.2)
@@ -270,7 +277,7 @@ class TestNapariJobs:
                 + ")"
             )
         )
-        job_id = _server._extract_json(sub["stdout"])["job_id"]
+        job_id = _job_result(sub["stdout"])["job_id"]
         snap = self._poll_until_done(napari_kernel, job_id)
         assert snap["status"] == "ok", snap
         after = napari_kernel.execute("print(len(viewer.layers))")["stdout"]
@@ -296,10 +303,10 @@ class TestNapariJobs:
                 "submit(" + repr("import time; time.sleep(30)") + ")"
             )
         )
-        job_id = _server._extract_json(sub["stdout"])["job_id"]
+        job_id = _job_result(sub["stdout"])["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)
         res = napari_kernel.execute(
             _server._job_snippet("poll(" + repr(job_id) + ")"), timeout=15.0
         )
-        snap = _server._extract_json(res["stdout"])
+        snap = _job_result(res["stdout"])
         assert snap["status"] == "unknown"
