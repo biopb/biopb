@@ -82,12 +82,12 @@ pre-commit run --all-files
    ProcessImage gRPC protocol. The demo widgets exist to test algorithm servers;
    they are not the primary interface.
 2. **MCP server** — a standalone process that exposes a live napari viewer to an
-   AI agent over MCP (streamable-http). The project thesis is *"agent first;
+   AI agent over MCP. The project thesis is *"agent first;
    provide tools only if they help."* The agent drives napari through a real
    Python kernel; image results go to the viewer, other results to the agent's
    chat.
 
-Read `napari.md` for a summary of napari's architecture and plugin system.
+Read [napari.md](docs/napari.md) for a summary of napari's architecture and plugin system.
 
 ### Data connection (`_connection.py`)
 
@@ -144,7 +144,7 @@ waits up to `promote_after` seconds; if the code finishes it returns the result
 inline, otherwise it returns a job handle (`job-N`) and keeps running. One job
 at a time. Because the viewer has Qt main-thread affinity, GUI mutations from
 the worker thread are marshaled to the main thread: `_bootstrap` wraps
-`load_tensor` + the `add_*` family, and `run_on_main(fn)` is exposed for the
+`add_tensor` + the `add_*` family, and `run_on_main(fn)` is exposed for the
 rest; `cancelled()` supports cooperative `cancel_job`. Rich IPython `display()`
 output is not captured (code is exec'd, not run via `run_cell`).
 
@@ -177,12 +177,16 @@ output is not captured (code is exec'd, not run via `run_cell`).
 - `_process_ops.py` — `build_ops()`: a thin `Run()` callable per configured
   `ProcessImage` servicer URL (discovered via `GetOpNames`), exposed as `ops`.
 - `_resources.py` — string constants served as MCP resources.
-- `_helpers.py` — monkey-patches `viewer.load_tensor()` for agent use.
+- `_helpers.py` — monkey-patches `viewer.add_tensor()` for agent use; also
+  `viewer_window_alive()`, the closed-window liveness probe (bound into the
+  kernel namespace as `_viewer_window_alive`) that lets `server_status` /
+  `take_screenshot` / `execute_code` detect a user-closed window instead of
+  silently mutating a destroyed viewer.
 
 **Tools (8):** `take_screenshot`, `execute_code`, `poll_job`, `cancel_job`,
 `inspect_object`, `interrupt_kernel`, `restart_kernel`, `server_status`.
 
-**Resources (5):** `guide://main`, `guide://viewer`, `guide://tensor`,
+**Resources (5):** `guide://kernel`, `guide://viewer`, `guide://tensor`,
 `guide://annotations`, `guide://ops`.
 
 **`execute_code` namespace** (populated by `_bootstrap.py`):
@@ -338,7 +342,8 @@ Apply at the class level for test classes that require napari viewers. See
     - `_bootstrap.py` — in-kernel bootstrap (namespace, viewer, dask, ops, jobs)
     - `_process_ops.py` — `build_ops()` ProcessImage callables
     - `_resources.py` — resource content strings
-    - `_helpers.py` — `load_tensor()` viewer patch
+    - `_helpers.py` — `add_tensor()` viewer patch + `viewer_window_alive()`
+      closed-window probe
   - `_tests/` — test files
 
 ## Dependencies

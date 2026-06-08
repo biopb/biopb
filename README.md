@@ -45,8 +45,7 @@ a port already in use on a shared node), see [docs/troubleshooting.md](docs/trou
 
 ## Contributing
 
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
+Contributions are very welcome. Read [development.md](development.md) first to understand the project architecture.
 
 ## License
 
