@@ -1,8 +1,8 @@
 """Tests for _tensor_utils shared utilities."""
 
-import types
 from unittest.mock import MagicMock, call
 
+import dask.array as da
 import pytest
 
 from biopb_mcp._config import get_default_config, get_setting
@@ -36,12 +36,14 @@ def _arr_with_shape(shape):
 
 
 def _scaling_side_effect(shape):
-    """get_tensor side effect returning an array whose ``.shape`` is *shape*
+    """get_tensor side effect returning a mock whose ``.shape`` is *shape*
     downsampled per ``scale_hint`` (floor division).
 
     build_pyramid_levels reads the *returned* array's real extents (the server's
     downsample rounding isn't part of the API), so multi-level pyramid tests
-    must hand back arrays whose shape actually shrinks with the scale hint."""
+    must hand back arrays whose shape actually shrinks with the scale hint. Use
+    this for tests that only inspect the ``scale_hint`` call args -- the
+    canonicalizing transpose/expand at the end is a harmless no-op on mocks."""
 
     def _get_tensor(source_id, tensor_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
@@ -50,58 +52,72 @@ def _scaling_side_effect(shape):
     return _get_tensor
 
 
+def _dask_scaling_side_effect(shape):
+    """Like ``_scaling_side_effect`` but returns real dask arrays, so the
+    canonicalizing transpose/singleton-insert produce real output shapes and a
+    real ``.ndim`` (needed wherever the test inspects the returned levels)."""
+
+    def _get_tensor(source_id, tensor_id, scale_hint=None):
+        hint = scale_hint or [1] * len(shape)
+        new = [max(1, s // h) for s, h in zip(shape, hint)]
+        return da.zeros(new, chunks=new)
+
+    return _get_tensor
+
+
 class TestGetXyDimIndices:
     def test_uses_dim_labels(self):
-        desc = _make_tensor_desc([10, 512, 512], dim_labels=["z", "y", "x"])
-        y_idx, x_idx = get_xy_dim_indices(desc)
-        assert y_idx == 1
-        assert x_idx == 2
+        assert get_xy_dim_indices([10, 512, 512], ["z", "y", "x"]) == (1, 2)
 
     def test_case_insensitive_labels(self):
-        desc = _make_tensor_desc([512, 512], dim_labels=["Y", "X"])
-        y_idx, x_idx = get_xy_dim_indices(desc)
-        assert y_idx == 0
-        assert x_idx == 1
+        assert get_xy_dim_indices([512, 512], ["Y", "X"]) == (0, 1)
 
     def test_fallback_last_two_dims(self):
         # Standard [..., Y, X]: Y is second-to-last, X is last.
-        desc = _make_tensor_desc([3, 100, 200])
-        y_idx, x_idx = get_xy_dim_indices(desc)
-        assert y_idx == 1
-        assert x_idx == 2
+        assert get_xy_dim_indices([3, 100, 200]) == (1, 2)
 
     def test_2d_no_labels(self):
         # [Y, X]: Y first, X last.
-        desc = _make_tensor_desc([100, 200])
-        y_idx, x_idx = get_xy_dim_indices(desc)
-        assert y_idx == 0
-        assert x_idx == 1
+        assert get_xy_dim_indices([100, 200]) == (0, 1)
 
     def test_labels_without_xy_falls_back(self):
         # Labels present but no x/y -> positional [..., Y, X] fallback.
-        desc = _make_tensor_desc([10, 512, 512], dim_labels=["z", "r", "c"])
-        y_idx, x_idx = get_xy_dim_indices(desc)
-        assert y_idx == 1
-        assert x_idx == 2
+        assert get_xy_dim_indices([10, 512, 512], ["z", "r", "c"]) == (1, 2)
 
     def test_under_2d_raises(self):
         # A 1-D tensor is not a displayable image; fail loud rather than
         # return a bogus (0, 0).
         with pytest.raises(ValueError):
-            get_xy_dim_indices(_make_tensor_desc([100]))
+            get_xy_dim_indices([100])
+
+
+class TestGetZDimIndex:
+    def test_label_z_wins_over_position(self):
+        assert get_z_dim_index([10, 5, 512, 512], ["z", "c", "y", "x"]) == 0
+
+    def test_labels_without_z_is_none(self):
+        # Labels present but no z -> not volumetric (e.g. [C, Y, X]).
+        assert get_z_dim_index([3, 512, 512], ["c", "y", "x"]) is None
+
+    def test_no_labels_3d_positional(self):
+        # No labels -> assume [..., Z, Y, X]; z is third-from-last.
+        assert get_z_dim_index([20, 512, 512]) == 0
+
+    def test_no_labels_2d_is_none(self):
+        assert get_z_dim_index([512, 512]) is None
 
 
 class TestBuildPyramidLevels:
     def test_small_image_returns_single_level(self):
         desc = _make_tensor_desc([256, 256])
         client = MagicMock()
-        mock_arr = _arr_with_shape([256, 256])
-        client.get_tensor.return_value = mock_arr
+        client.get_tensor.return_value = da.zeros((256, 256))
 
         levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
 
         assert len(levels) == 1
-        assert levels[0] is mock_arr
+        # Canonical output always carries an explicit (here singleton) Z.
+        assert levels[0].shape == (1, 256, 256)
         # Unified loop always passes a scale_hint, even for a single level.
         client.get_tensor.assert_called_once_with(
             "src", "t1", scale_hint=[1, 1]
@@ -207,24 +223,49 @@ class TestBuildPyramidLevels:
             assert len(c[1]["scale_hint"]) == 2
 
 
-class TestGetZDimIndex:
-    def test_label_z_wins_over_position(self):
-        desc = _make_tensor_desc(
-            [10, 5, 512, 512], dim_labels=["z", "c", "y", "x"]
+class TestBuildPyramidCanonicalOrder:
+    """build_pyramid_levels emits levels in napari display order
+    [..., Z, Y, X], transposing mis-ordered sources and inserting a singleton
+    Z when the tensor has none."""
+
+    def test_inserts_singleton_z_for_2d(self):
+        desc = _make_tensor_desc([64, 64], ["y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((64, 64))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (1, 64, 64)
+
+    def test_reorders_trailing_channel(self):
+        # [Y, X, C] -> [C, Z(=1), Y, X].
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (3, 1, 64, 32)
+
+    def test_reorders_buried_z(self):
+        # [Z, C, Y, X] -> [C, Z, Y, X]; real z, so no singleton inserted.
+        desc = _make_tensor_desc([10, 3, 64, 64], ["z", "c", "y", "x"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((10, 3, 64, 64))
+
+        levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
+        assert levels[0].shape == (3, 10, 64, 64)
+
+    def test_uses_source_desc_labels_when_tensor_unlabeled(self):
+        # Per-tensor labels missing -> fall back to the source descriptor's
+        # labels for both the reorder and the (implicit) scale alignment.
+        desc = _make_tensor_desc([64, 32, 3], None)
+        source_desc = MagicMock(dim_labels=["y", "x", "c"])
+        client = MagicMock()
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+
+        levels = build_pyramid_levels(
+            client, "src", "t1", desc, source_desc=source_desc, config=_CFG
         )
-        assert get_z_dim_index(desc) == 0
-
-    def test_labels_without_z_is_none(self):
-        # Labels present but no z -> not volumetric (e.g. [C, Y, X]).
-        desc = _make_tensor_desc([3, 512, 512], dim_labels=["c", "y", "x"])
-        assert get_z_dim_index(desc) is None
-
-    def test_no_labels_3d_positional(self):
-        # No labels -> assume [..., Z, Y, X]; z is third-from-last.
-        assert get_z_dim_index(_make_tensor_desc([20, 512, 512])) == 0
-
-    def test_no_labels_2d_is_none(self):
-        assert get_z_dim_index(_make_tensor_desc([512, 512])) is None
+        assert levels[0].shape == (3, 1, 64, 32)
 
 
 def _make_metadata_client(
@@ -250,42 +291,32 @@ def _make_metadata_client(
     return client
 
 
-def test_build_layer_scale_maps_labeled_dims():
+def test_build_layer_scale_maps_canonical_trailing_axes():
+    # Canonical [..., Z, Y, X]: psz/psy/psx land on the last three axes,
+    # leading axes (channel) get 1.0.
     client = _make_metadata_client(psx=0.325, psy=0.325, psz=2.0)
-    desc = _make_tensor_desc((3, 10, 512, 512), ["c", "z", "y", "x"])
-    scale, info = build_layer_scale(client, "src", desc)
+    scale, info = build_layer_scale(client, "src", ndim=4)
     assert scale == [1.0, 2.0, 0.325, 0.325]
     assert info["physical_size_x"] == 0.325
     assert info["physical_size_x_unit"] == "µm"
 
 
-def test_build_layer_scale_positional_fallback_without_labels():
+def test_build_layer_scale_2d_canonical_has_singleton_z():
+    # A 2D source is canonicalized to [Z(=1), Y, X], so ndim is 3 and the
+    # singleton z gets 1.0 (no physical_size_z).
     client = _make_metadata_client(psx=0.5, psy=0.25)
-    desc = _make_tensor_desc((512, 256), None)
-    scale, _ = build_layer_scale(client, "src", desc)
-    # trailing (..., y, x): scale[-2] is y, scale[-1] is x
-    assert scale == [0.25, 0.5]
+    scale, _ = build_layer_scale(client, "src", ndim=3)
+    assert scale == [1.0, 0.25, 0.5]
 
 
 def test_build_layer_scale_none_when_no_physical_sizes():
     client = _make_metadata_client()
-    desc = _make_tensor_desc((512, 512), ["y", "x"])
-    assert build_layer_scale(client, "src", desc) == (None, None)
+    assert build_layer_scale(client, "src", ndim=3) == (None, None)
 
 
 def test_build_layer_scale_none_on_metadata_error():
     client = _make_metadata_client(raises=True)
-    desc = _make_tensor_desc((512, 512), ["y", "x"])
-    assert build_layer_scale(client, "src", desc) == (None, None)
-
-
-def test_build_layer_scale_falls_back_to_source_dim_labels():
-    client = _make_metadata_client(psx=0.5, psy=0.5, psz=3.0)
-    # Per-tensor labels missing; source descriptor supplies them.
-    desc = _make_tensor_desc((10, 256, 256), None)
-    source_desc = types.SimpleNamespace(dim_labels=["z", "y", "x"])
-    scale, _ = build_layer_scale(client, "src", desc, source_desc=source_desc)
-    assert scale == [3.0, 0.5, 0.5]
+    assert build_layer_scale(client, "src", ndim=3) == (None, None)
 
 
 class TestAddTensorLayer:
@@ -295,7 +326,7 @@ class TestAddTensorLayer:
     def test_multiscale_with_ome_scale_and_metadata(self):
         viewer = MagicMock()
         client = _make_metadata_client(psx=0.5, psy=0.25)
-        client.get_tensor.side_effect = _scaling_side_effect([8192, 8192])
+        client.get_tensor.side_effect = _dask_scaling_side_effect([8192, 8192])
         desc = _make_tensor_desc([8192, 8192], ["y", "x"])
 
         add_tensor_layer(
@@ -307,7 +338,8 @@ class TestAddTensorLayer:
         assert isinstance(levels_arg, list) and len(levels_arg) > 1
         assert kwargs["name"] == "lyr"
         assert kwargs["multiscale"] is True
-        assert kwargs["scale"] == [0.25, 0.5]
+        # Canonical [Z(=1), Y, X]: scale is [z, y, x] = [1.0, 0.25, 0.5].
+        assert kwargs["scale"] == [1.0, 0.25, 0.5]
         phys = kwargs["metadata"]["ome_physical_size"]
         assert phys["physical_size_x"] == 0.5
 
@@ -315,7 +347,7 @@ class TestAddTensorLayer:
         viewer = MagicMock()
         # No physical sizes -> no scale/metadata kwargs.
         client = _make_metadata_client()
-        client.get_tensor.return_value = _arr_with_shape([256, 256])
+        client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
         add_tensor_layer(
@@ -324,3 +356,22 @@ class TestAddTensorLayer:
 
         _, kwargs = viewer.add_image.call_args
         assert kwargs == {"name": "lyr"}
+
+    def test_misordered_axes_canonicalized_with_aligned_scale(self):
+        viewer = MagicMock()
+        client = _make_metadata_client(psx=0.5, psy=0.25)
+        # [Y, X, C] layout: without canonicalization napari would display the
+        # wrong plane. A real dask array so the transpose actually reorders.
+        client.get_tensor.return_value = da.zeros((64, 32, 3))
+        desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+
+        add_tensor_layer(
+            viewer, client, "src", "t1", desc, name="lyr", config=_CFG
+        )
+
+        arr = viewer.add_image.call_args[0][0]
+        _, kwargs = viewer.add_image.call_args
+        # Reordered to [C, Z(=1), Y, X].
+        assert arr.shape == (3, 1, 64, 32)
+        # Scale aligns to the canonical output: [c, z, y, x].
+        assert kwargs["scale"] == [1.0, 1.0, 0.25, 0.5]

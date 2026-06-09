@@ -5,7 +5,7 @@ used by both the tensor browser widget and the MCP server.
 """
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from biopb.tensor import TensorFlightClient
 
@@ -14,28 +14,28 @@ from ._config import get_setting, load_config
 logger = logging.getLogger(__name__)
 
 
-def get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
-    """Get indices of x and y dimensions from tensor descriptor.
+def get_xy_dim_indices(
+    shape: Sequence[int], dim_labels: Optional[Sequence[str]] = None
+) -> Tuple[int, int]:
+    """Indices of the y and x dimensions for a tensor of *shape*.
 
-    Uses dim_labels as primary source (looks for 'x', 'y').
-    Falls back to the last two dimensions under the standard ``[..., Y, X]``
-    convention (X last, Y second-to-last) when dim_labels are unavailable.
+    Uses *dim_labels* as the primary source (looks for 'x', 'y'), falling back
+    to the last two dimensions under the standard ``[..., Y, X]`` convention
+    (X last, Y second-to-last) when labels are unavailable.
 
     Returns:
-        Tuple of (y_index, x_index) - y first for row/col convention
+        Tuple of (y_index, x_index) -- y first, matching the row/col convention.
 
     Raises:
         ValueError: the tensor has fewer than 2 dimensions (not a displayable
             image).
     """
-    ndim = len(tensor_desc.shape)
+    ndim = len(shape)
 
-    if tensor_desc.dim_labels:
-        labels_lower = [l.lower() for l in tensor_desc.dim_labels]
+    if dim_labels:
+        labels_lower = [str(label).lower() for label in dim_labels]
         try:
-            x_idx = labels_lower.index("x")
-            y_idx = labels_lower.index("y")
-            return (y_idx, x_idx)
+            return (labels_lower.index("y"), labels_lower.index("x"))
         except ValueError:
             pass
 
@@ -48,24 +48,23 @@ def get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
     return (ndim - 2, ndim - 1)
 
 
-def get_z_dim_index(tensor_desc) -> Optional[int]:
+def get_z_dim_index(
+    shape: Sequence[int], dim_labels: Optional[Sequence[str]] = None
+) -> Optional[int]:
     """Index of the z (depth) axis, or ``None`` when the tensor has none.
 
-    Respects ``dim_labels`` ('z') first: when labels are present but carry no
+    Respects *dim_labels* ('z') first: when labels are present but carry no
     'z', the tensor is taken to have no depth axis (``None``) -- not every 3-D+
     tensor is volumetric (``[T, Y, X]``, ``[C, Y, X]`` have no z). With no
     labels, assume the positional ``[..., Z, Y, X]`` convention -- the
     third-from-last axis -- for 3-D+ tensors, and ``None`` for <3-D.
 
-    napari's 3-D mode displays the last three axes positionally, so this is only
-    the *true* depth when z sits at ``ndim-3``; a label-identified z elsewhere
-    is a mis-ordered source (handled by transposing to ``[..., Z, Y, X]``, a
-    separate concern). Mis-identifying a small channel/time axis as z is
-    low-risk: such axes stay below the pyramid floor and are never downsampled.
+    Mis-identifying a small channel/time axis as z is low-risk: such axes stay
+    below the pyramid floor and are never downsampled.
     """
-    ndim = len(tensor_desc.shape)
-    if tensor_desc.dim_labels:
-        labels_lower = [str(label).lower() for label in tensor_desc.dim_labels]
+    ndim = len(shape)
+    if dim_labels:
+        labels_lower = [str(label).lower() for label in dim_labels]
         return labels_lower.index("z") if "z" in labels_lower else None
     return ndim - 3 if ndim >= 3 else None
 
@@ -75,9 +74,10 @@ def build_pyramid_levels(
     source_id: str,
     tensor_id: str,
     tensor_desc,
+    source_desc=None,
     config: Optional[dict] = None,
 ) -> List:
-    """Build resolution-pyramid levels for a tensor.
+    """Build resolution-pyramid levels for a tensor in napari display order.
 
     One unified rule serves 2-D and 3-D data and bounds napari's 3-D
     whole-volume read (issue #29). All knobs come from the ``pyramid`` config
@@ -104,8 +104,20 @@ def build_pyramid_levels(
     ceil) is not part of the API contract, so trusting the real shape keeps the
     budget check correct either way.
 
+    **Output axis order.** napari displays the *last* ndisplay axes by position
+    and ignores ``dim_labels`` for layout, so a source advertising an
+    out-of-order layout (``[Y, X, C]``, a buried Z, swapped X/Y) would render
+    the wrong plane silently. Using the labels (per-tensor, falling back to
+    *source_desc*), each level is transposed so X is last, Y second-to-last, and
+    Z third-to-last -- with a singleton Z *inserted* when the tensor has none.
+    The result is therefore **always** in canonical ``[..., Z, Y, X]`` order
+    (rank >= 3), which lets ``build_layer_scale`` map physical sizes onto fixed
+    trailing positions without re-deriving the labels. The transpose is a lazy
+    dask graph relabel; the real server emits ordered axes, so it is normally a
+    no-op guard.
+
     Returns:
-        List of dask arrays at different resolution levels (pyramid)
+        List of dask arrays at canonical ``[..., Z, Y, X]`` resolution levels.
     """
     if config is None:
         config = load_config()
@@ -114,10 +126,15 @@ def build_pyramid_levels(
     budget_root = get_setting(config, "pyramid.pixel_budget_cubic_root")
     pixel_budget = budget_root**3
 
-    ndim = len(tensor_desc.shape)
+    shape = tensor_desc.shape
+    ndim = len(shape)
 
-    y_idx, x_idx = get_xy_dim_indices(tensor_desc)
-    z_idx = get_z_dim_index(tensor_desc)
+    # Per-tensor labels win; fall back to the source descriptor's labels.
+    dim_labels = tensor_desc.dim_labels or getattr(
+        source_desc, "dim_labels", None
+    )
+    y_idx, x_idx = get_xy_dim_indices(shape, dim_labels)
+    z_idx = get_z_dim_index(shape, dim_labels)
     # A degenerate label set could map z onto an x/y axis; drop it if so.
     if z_idx is not None and z_idx in (x_idx, y_idx):
         z_idx = None
@@ -130,6 +147,7 @@ def build_pyramid_levels(
     sx = sy = sz = 1
 
     while True:
+        # scale_hint is in the *source* axis order the server expects.
         scale_hint = [1] * ndim
         scale_hint[x_idx] = sx
         scale_hint[y_idx] = sy
@@ -162,31 +180,42 @@ def build_pyramid_levels(
             break  # nothing left to shrink; avoid an infinite loop
         sx, sy, sz = nsx, nsy, nsz
 
+    # Canonicalize to [..., Z, Y, X], reusing the indices computed above (no
+    # second pass over the labels). Transpose moves X/Y/Z into place; a missing
+    # Z is inserted as a singleton so the output rank and trailing axes are
+    # uniform for every tensor. Both ops are lazy on dask arrays.
+    trailing = ([z_idx] if z_idx is not None else []) + [y_idx, x_idx]
+    perm = tuple([i for i in range(ndim) if i not in trailing] + trailing)
+    if perm != tuple(range(ndim)):
+        levels = [level.transpose(perm) for level in levels]
+    if z_idx is None:
+        levels = [level[..., None, :, :] for level in levels]
+
     return levels
 
 
 def build_layer_scale(
     client: TensorFlightClient,
     source_id: str,
-    tensor_desc,
-    source_desc=None,
+    ndim: int,
 ) -> Tuple[Optional[List[float]], Optional[dict]]:
     """Build a napari ``scale`` vector from a source's OME pixel sizes.
 
-    Reads ``client.get_source_metadata`` (a dict — the server's OME model
-    dumped to JSON) and maps ``physical_size_x/y/z`` onto the tensor's
-    dimension axes, so areas/volumes the agent computes come out in physical
-    units (e.g. µm²) instead of pixels.
+    Reads ``client.get_source_metadata`` (a dict -- the server's OME model
+    dumped to JSON) for ``physical_size_x/y/z`` so areas/volumes the agent
+    computes come out in physical units (e.g. µm²) instead of pixels.
 
-    Axis order comes from ``tensor_desc.dim_labels``, falling back to the source
-    descriptor's ``dim_labels`` (``source_desc``) when the per-tensor labels are
-    empty, then to positional x/y.
+    *ndim* is the rank of the layer array, which ``build_pyramid_levels``
+    guarantees is in canonical ``[..., Z, Y, X]`` order (rank >= 3, with an
+    explicit -- possibly singleton -- Z). So the physical sizes map onto fixed
+    positions: X is the last axis, Y the second-to-last, Z the third-to-last;
+    leading axes (channel, time) get 1.0. No label inspection is needed.
 
     Returns:
-        ``(scale, info)`` where *scale* is a per-axis list aligned to
-        ``tensor_desc`` dims (``None`` if no physical sizes are available) and
-        *info* is a small dict of the physical sizes + units for surfacing to
-        the agent (``None`` if unavailable).
+        ``(scale, info)`` where *scale* is a per-axis list of length *ndim*
+        (``None`` if no physical sizes are available) and *info* is a small dict
+        of the physical sizes + units for surfacing to the agent (``None`` if
+        unavailable).
     """
 
     def _positive_float(value):
@@ -207,37 +236,22 @@ def build_layer_scale(
         if not pixels:
             return None, None
 
-        psize = {
-            "x": _positive_float(pixels.get("physical_size_x")),
-            "y": _positive_float(pixels.get("physical_size_y")),
-            "z": _positive_float(pixels.get("physical_size_z")),
-        }
-        if not any(psize.values()):
+        psx = _positive_float(pixels.get("physical_size_x"))
+        psy = _positive_float(pixels.get("physical_size_y"))
+        psz = _positive_float(pixels.get("physical_size_z"))
+        if not any((psx, psy, psz)):
             return None, None
 
-        ndim = len(tensor_desc.shape)
-        dim_labels = tensor_desc.dim_labels or getattr(
-            source_desc, "dim_labels", None
-        )
-        labels = [str(label).lower() for label in (dim_labels or [])]
-
+        # Canonical [..., Z, Y, X]: physical sizes land on the trailing axes.
         scale = [1.0] * ndim
-        for axis, value in psize.items():
-            if value and axis in labels:
-                scale[labels.index(axis)] = value
-
-        # Fall back to the conventional trailing (..., y, x) axes when the
-        # descriptor carries no usable labels.
-        if "x" not in labels and "y" not in labels and ndim >= 2:
-            if psize["x"]:
-                scale[ndim - 1] = psize["x"]
-            if psize["y"]:
-                scale[ndim - 2] = psize["y"]
+        scale[-1] = psx or 1.0
+        scale[-2] = psy or 1.0
+        scale[-3] = psz or 1.0
 
         info = {
-            "physical_size_x": psize["x"],
-            "physical_size_y": psize["y"],
-            "physical_size_z": psize["z"],
+            "physical_size_x": psx,
+            "physical_size_y": psy,
+            "physical_size_z": psz,
             "physical_size_x_unit": pixels.get("physical_size_x_unit"),
             "physical_size_y_unit": pixels.get("physical_size_y_unit"),
             "physical_size_z_unit": pixels.get("physical_size_z_unit"),
@@ -263,8 +277,9 @@ def add_tensor_layer(
     """Build a tensor's pyramid and add it to *viewer* as an image layer.
 
     The shared "load a tensor into the viewer" pipeline used by both the Tensor
-    Browser widget and the MCP ``add_tensor``: build pyramid levels, pin their
-    slice reads to a single-process scheduler so the serial viewer shares the
+    Browser widget and the MCP ``add_tensor``: build pyramid levels (already
+    canonicalized to napari's ``[..., Z, Y, X]`` display order), pin their slice
+    reads to a single-process scheduler so the serial viewer shares the
     main-process chunk cache (issue #8; no-op standalone), attach the source's
     OME physical pixel size as ``scale`` + ``metadata['ome_physical_size']`` so
     the agent's areas/volumes come out in physical units, then ``add_image``
@@ -279,14 +294,20 @@ def add_tensor_layer(
     from ._viewer_compute import wrap_levels
 
     levels = build_pyramid_levels(
-        client, source_id, tensor_id, tensor_desc, config=config
+        client,
+        source_id,
+        tensor_id,
+        tensor_desc,
+        source_desc=source_desc,
+        config=config,
     )
+    # Levels are in canonical [..., Z, Y, X] order, so the scale maps onto the
+    # output rank directly -- no reordering to keep in sync.
+    out_ndim = levels[0].ndim
     levels = wrap_levels(levels, compute_scheduler)
 
     add_kwargs = {"name": name}
-    scale, phys = build_layer_scale(
-        client, source_id, tensor_desc, source_desc=source_desc
-    )
+    scale, phys = build_layer_scale(client, source_id, out_ndim)
     if scale is not None:
         add_kwargs["scale"] = scale
     if phys is not None:

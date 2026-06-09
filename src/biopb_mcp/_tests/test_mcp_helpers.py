@@ -227,7 +227,11 @@ class TestPatchViewerAddTensor:
         connection.client = client
         connection.sources = {"src1": src}
 
+        # build_pyramid_levels emits canonical [..., Z, Y, X] levels; a 2D
+        # source becomes [Z(=1), Y, X], so the level reports ndim 3 and
+        # build_layer_scale maps psz/psy/psx onto the trailing axes.
         mock_arr = MagicMock()
+        mock_arr.ndim = 3
         with patch(
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
@@ -236,7 +240,7 @@ class TestPatchViewerAddTensor:
             viewer.add_tensor("src1")
 
         _, kwargs = viewer.add_image.call_args
-        assert kwargs["scale"] == [0.25, 0.5]
+        assert kwargs["scale"] == [1.0, 0.25, 0.5]
         phys = kwargs["metadata"]["ome_physical_size"]
         assert phys["physical_size_x"] == 0.5
         assert phys["physical_size_y"] == 0.25
