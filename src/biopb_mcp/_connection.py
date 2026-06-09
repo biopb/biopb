@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from ._config import get_setting, load_config, save_config
+from ._config import CONFIG, get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class TensorConnection:
         self.last_status: str = "disconnected"
         self.last_message: str = ""
 
-        cfg = config if config is not None else load_config()
+        cfg = config if config is not None else CONFIG.as_dict()
         self.url, self.token = self.resolve_from_config(cfg)
 
         # Optional callback invoked after every successful connect with the
@@ -214,16 +214,14 @@ class TensorConnection:
         return self.client.query_sources(sql)
 
     def persist_url(self) -> None:
-        """Save the current URL to config.
+        """Save the current URL via the config singleton.
 
-        Reloads from disk first so keys this service does not own (e.g.
-        ``mcp.services.process_image_servers``) are not clobbered by a stale
-        snapshot.
+        A targeted ``CONFIG.set`` touches only ``tensor_browser.server_url``;
+        keys this service does not own (e.g.
+        ``mcp.services.process_image_servers``) are preserved in the cached
+        merged config and re-persisted intact.
         """
-        config = load_config()
-        config.setdefault("tensor_browser", {})
-        config["tensor_browser"]["server_url"] = self.url
-        save_config(config)
+        CONFIG.set("tensor_browser.server_url", self.url)
 
     def health(self):
         """Return the server health check result, or ``None`` if not connected."""
@@ -275,7 +273,7 @@ class TensorConnection:
 
     def server_start_timeout(self) -> float:
         """The configured ``mcp.server_start_timeout`` boot-wait budget (s)."""
-        return get_setting(load_config(), "mcp.server_start_timeout")
+        return CONFIG.get("mcp.server_start_timeout")
 
     def launch_local_server(
         self,

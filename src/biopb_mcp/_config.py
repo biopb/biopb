@@ -28,6 +28,8 @@ so call sites never duplicate a default literal.
 import copy
 import json
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import Tuple
 
@@ -355,14 +357,13 @@ def _migrate_legacy_keys(config: dict) -> dict:
     return config
 
 
-def load_config() -> dict:
-    """Load configuration from file.
+def _read_and_merge_from_disk() -> dict:
+    """Read the config file, migrate legacy keys, and merge onto defaults.
 
-    If the config file doesn't exist, returns default config.
-    If the file exists but is malformed, returns default config and logs error.
-
-    Returns:
-        Configuration dict with all expected keys.
+    Returns a fully-merged config dict with every expected key present. A
+    missing, malformed, or unreadable file falls back to ``get_default_config()``
+    (logged). This is the single code path from disk into memory; the ``CONFIG``
+    singleton and :func:`load_config` both route through it.
     """
     config_path = get_config_path()
 
@@ -391,20 +392,152 @@ def load_config() -> dict:
         return get_default_config()
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write *data* as JSON to *path* atomically (temp file + ``os.replace``).
+
+    Writing to a sibling temp file and renaming over the target means a reader
+    never sees a half-written config: the rename is atomic on POSIX and Windows.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique per process *and* thread so two concurrent writers never collide on
+    # the temp file (CONFIG._save serializes them under the lock, but this keeps
+    # the helper safe if called directly, e.g. via save_config).
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with tmp.open("w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+        logger.debug("Saved config to %s", path)
+    except Exception as e:
+        logger.warning("Failed to save config: %s", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+class _Config:
+    """Process-wide config singleton: lazy cached read, write-through to disk.
+
+    One instance (:data:`CONFIG`) is the single runtime source of truth. The
+    first access reads disk once (via :func:`_read_and_merge_from_disk`) and
+    caches the merged dict for the process lifetime; :meth:`reload` invalidates
+    it. Every read routes through :meth:`get` and every write through
+    :meth:`set`, so nothing else touches the file or re-merges defaults.
+
+    Thread-safe: the MCP kernel runs agent code in background threads that may
+    read config, so lazy init / set / reload take an ``RLock``.
+    """
+
+    def __init__(self) -> None:
+        self._data: dict | None = None
+        self._lock = threading.RLock()
+
+    def _ensure_loaded(self) -> None:
+        with self._lock:
+            if self._data is None:
+                self._data = _read_and_merge_from_disk()
+
+    def get(self, path: str, default=_MISSING):
+        """Read a dotted *path*, falling back to ``DEFAULT_CONFIG``.
+
+        Same contract as :func:`get_setting` (the ambient form of it): on a miss
+        at any level, returns *default* if given, else the ``DEFAULT_CONFIG``
+        value, else raises ``KeyError``.
+
+        Holds the lock across the dotted-path walk so a read is never serialized
+        against a concurrent :meth:`set` / :meth:`reload`: without it a reader
+        could observe a half-applied multi-key write (a created-but-empty
+        intermediate section) or a momentarily-``None`` cache mid-reload, and
+        silently fall back to the default. ``RLock`` makes the nested
+        :meth:`_ensure_loaded` acquisition re-entrant.
+        """
+        with self._lock:
+            self._ensure_loaded()
+            return get_setting(self._data, path, default)
+
+    def set(self, path: str, value, *, persist: bool = True) -> None:
+        """Set a dotted *path* in the cache; write through to disk by default.
+
+        Walks/creates intermediate sections, sets the leaf, and (when *persist*)
+        atomically rewrites the file so cache and disk stay in lockstep. Pass
+        ``persist=False`` to batch several sets, then call :meth:`save` once.
+        """
+        self._ensure_loaded()
+        with self._lock:
+            node = self._data
+            keys = path.split(".")
+            for key in keys[:-1]:
+                child = node.get(key)
+                if not isinstance(child, dict):
+                    child = {}
+                    node[key] = child
+                node = child
+            node[keys[-1]] = value
+            if persist:
+                self._save()
+
+    def save(self) -> None:
+        """Persist the current cached config to disk (single atomic write)."""
+        self._ensure_loaded()
+        with self._lock:
+            self._save()
+
+    def reload(self) -> None:
+        """Invalidate the cache; the next read re-reads disk.
+
+        For tests, external edits, or a future SIGHUP-style reload.
+        """
+        with self._lock:
+            self._data = None
+
+    def as_dict(self) -> dict:
+        """Return the *live* cached merged dict (not a copy).
+
+        Escape hatch for code that threads the raw dict (the MCP bootstrap, the
+        explicit-dict ``get_setting`` form). Callers must treat it as read-only;
+        all mutation goes through :meth:`set`.
+
+        Unlike :meth:`get`, this returns a reference the caller dereferences
+        *outside* the lock, so it is **not** safe to hold across a concurrent
+        :meth:`set` -- use it for startup/single-threaded threading (the
+        bootstrap) and prefer :meth:`get` for thread-safe ambient reads.
+        """
+        self._ensure_loaded()
+        return self._data
+
+    def _save(self) -> None:
+        _atomic_write_json(get_config_path(), self._data)
+
+
+# The one config instance in the process. All reads/writes route through it.
+CONFIG = _Config()
+
+
+def load_config() -> dict:
+    """Return the process config dict (cached singleton).
+
+    Back-compat shim over :data:`CONFIG`: returns the live merged dict so callers
+    that thread a dict (e.g. the MCP bootstrap) keep working. The result is the
+    shared cached instance -- treat it read-only and write via ``CONFIG.set``.
+    """
+    return CONFIG.as_dict()
+
+
 def save_config(config: dict) -> None:
-    """Save configuration to file.
+    """Persist *config* to disk and refresh the singleton cache.
+
+    Back-compat shim: atomically writes the given dict, then invalidates the
+    cache so the next read re-merges it from disk (avoids aliasing an external
+    dict into the cache). Prefer ``CONFIG.set(path, value)`` for targeted writes.
 
     Args:
         config: Configuration dict to save.
     """
-    config_path = get_config_path()
-
-    try:
-        with config_path.open("w") as f:
-            json.dump(config, f, indent=2)
-        logger.debug("Saved config to %s", config_path)
-    except Exception as e:
-        logger.warning("Failed to save config: %s", e)
+    _atomic_write_json(get_config_path(), config)
+    CONFIG.reload()
 
 
 def get_grid_params(

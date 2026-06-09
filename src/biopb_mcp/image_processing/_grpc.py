@@ -3,8 +3,9 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Generator, Optional, Tuple
+from typing import Tuple
 
 import biopb.image as proto
 import grpc
@@ -18,10 +19,10 @@ from google.protobuf import empty_pb2, struct_pb2
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from napari.qt.threading import thread_worker
 
-from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
-from .._config import get_setting, load_config
-from ._render import _adjust_response_offset, _generate_label
+from .._config import CONFIG
 from .._typing import napari_data
+from ._chunking import FULL_ORDER, IterationSpec, _data_iterator
+from ._render import _adjust_response_offset, _generate_label
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,8 @@ def _check_chunk_memory(chunk) -> None:
     Raises:
         MemoryError: If chunk size exceeds error_threshold_mb from config
     """
-    config = load_config()
-    warn_mb = get_setting(config, "memory.warn_threshold_mb")
-    error_mb = get_setting(config, "memory.error_threshold_mb")
+    warn_mb = CONFIG.get("memory.warn_threshold_mb")
+    error_mb = CONFIG.get("memory.error_threshold_mb")
 
     estimated_mb = _estimate_chunk_memory_mb(chunk)
 
@@ -97,7 +97,7 @@ def _check_chunk_memory(chunk) -> None:
 
 def _parse_server_url(
     server_url: str,
-) -> Tuple[str, int, Optional[str], Optional[str]]:
+) -> Tuple[str, int, str | None, str | None]:
     """Parse server URL extracting host, port, scheme, and optional label filter.
 
     Args:
@@ -147,7 +147,7 @@ def _parse_server_url(
     )
 
 
-def _get_label_filter(server_url: str) -> Optional[str]:
+def _get_label_filter(server_url: str) -> str | None:
     """Extract label filter from server URL path component.
 
     Args:
@@ -308,8 +308,7 @@ def _get_grpc_channel(settings: dict):
             "Use format 'hostname:port' (e.g., 'localhost:50051') or include scheme like 'http://localhost:50051'"
         )
 
-    config = load_config()
-    max_msg_size = get_setting(config, "grpc.max_message_size_mb")
+    max_msg_size = CONFIG.get("grpc.max_message_size_mb")
     max_msg_bytes = 1024 * 1024 * max_msg_size
 
     # Determine scheme: explicit from URL, or auto-detect based on port
@@ -334,9 +333,7 @@ def _get_grpc_channel(settings: dict):
         )
 
 
-def check_server_health(
-    settings: dict, timeout: Optional[float] = None
-) -> bool:
+def check_server_health(settings: dict, timeout: float | None = None) -> bool:
     """Check if the gRPC server is healthy and ready to serve requests.
 
     Args:
@@ -347,8 +344,7 @@ def check_server_health(
         True if server is healthy, False otherwise
     """
     if timeout is None:
-        config = load_config()
-        timeout = get_setting(config, "timeout.health_check")
+        timeout = CONFIG.get("timeout.health_check")
 
     try:
         with _get_grpc_channel(settings) as channel:
@@ -362,7 +358,7 @@ def check_server_health(
 
 
 def get_op_names(
-    settings: dict, timeout: Optional[float] = None
+    settings: dict, timeout: float | None = None
 ) -> proto.OpNames:
     """Query server for available operations and their schemas.
 
@@ -377,8 +373,7 @@ def get_op_names(
         Exception: If connection or query fails
     """
     if timeout is None:
-        config = load_config()
-        timeout = get_setting(config, "timeout.get_op_names")
+        timeout = CONFIG.get("timeout.get_op_names")
 
     with _get_grpc_channel(settings) as channel:
         stub = proto.ProcessImageStub(channel)
@@ -411,8 +406,8 @@ def grpc_object_detection(
     image_data: napari_data,
     settings: dict,
     grid_positions: list,
-    abort_event: Optional[threading.Event] = None,
-    future_container: Optional[dict] = None,
+    abort_event: threading.Event | None = None,
+    future_container: dict | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """Run object detection on image data via gRPC.
 
@@ -438,9 +433,8 @@ def grpc_object_detection(
         )
 
     # Get timeout from config
-    config = load_config()
-    timeout = get_setting(
-        config, f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
+    timeout = CONFIG.get(
+        f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
     )
 
     server = settings["Server"]
@@ -525,7 +519,7 @@ def _process_single_chunk(
     op_name: str,
     kwargs: dict,
     timeout: float,
-) -> Tuple[Optional[np.ndarray], dict, pd.DataFrame]:
+) -> Tuple[np.ndarray | None, dict, pd.DataFrame]:
     """Process a single chunk via gRPC (for ThreadPoolExecutor).
 
     Args:
@@ -597,9 +591,9 @@ def grpc_process_image(
     image_data: napari_data,
     settings: dict,
     iter_spec: IterationSpec,
-    abort_event: Optional[threading.Event] = None,
-    future_container: Optional[dict] = None,
-) -> Generator[Tuple[Optional[np.ndarray], dict, dict], None, None]:
+    abort_event: threading.Event | None = None,
+    future_container: dict | None = None,
+) -> Generator[Tuple[np.ndarray | None, dict, dict], None, None]:
     """Run image processing via gRPC with dimensional iteration.
 
     Args:
@@ -619,12 +613,11 @@ def grpc_process_image(
         ValueError: If operation changes iterated dimensions from singleton
     """
     # Get timeout and concurrency from config
-    config = load_config()
     is3d = "Z" in iter_spec.axis_order
-    timeout = get_setting(
-        config, f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
+    timeout = CONFIG.get(
+        f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
     )
-    max_concurrent = get_setting(config, "grpc.max_concurrent_calls")
+    max_concurrent = CONFIG.get("grpc.max_concurrent_calls")
 
     server = settings["Server"]
     logger.info(

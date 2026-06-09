@@ -288,22 +288,31 @@ class TestConnectWhenBooted:
 
 
 class TestPersistUrl:
-    def test_preserves_unowned_keys(self, monkeypatch):
-        # A fresh config with a key the service does not own.
-        existing = {
-            "tensor_browser": {"server_url": "grpc://old:1"},
-            "mcp": {"services": {"process_image_servers": ["grpc://ops:5"]}},
-        }
-        saved = {}
-        monkeypatch.setattr(_connection, "load_config", lambda: dict(existing))
-        monkeypatch.setattr(
-            _connection, "save_config", lambda cfg: saved.update(cfg)
+    def test_preserves_unowned_keys(self):
+        # persist_url() writes via CONFIG.set, which preserves keys the service
+        # does not own (here mcp.services.process_image_servers) -- both in the
+        # cache and on disk.
+        import json
+
+        from biopb_mcp._config import CONFIG, get_config_path
+
+        CONFIG.set(
+            "mcp.services.process_image_servers",
+            ["grpc://ops:5"],
+            persist=False,
         )
+        CONFIG.set("tensor_browser.server_url", "grpc://old:1", persist=False)
 
         conn = TensorConnection(config={})
         conn.url = "grpc://new:2"
         conn.persist_url()
 
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
+        assert CONFIG.get("mcp.services.process_image_servers") == [
+            "grpc://ops:5"
+        ]
+        with get_config_path().open() as f:
+            saved = json.load(f)
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
         assert saved["mcp"]["services"]["process_image_servers"] == [
             "grpc://ops:5"
@@ -405,12 +414,10 @@ class TestLaunchLocalServer:
         with pytest.raises(RuntimeError, match="biopb CLI not found"):
             conn.launch_local_server()
 
-    def test_server_start_timeout_from_config(self, monkeypatch):
-        monkeypatch.setattr(
-            _connection,
-            "load_config",
-            lambda: {"mcp": {"server_start_timeout": 12.5}},
-        )
+    def test_server_start_timeout_from_config(self):
+        from biopb_mcp._config import CONFIG
+
+        CONFIG.set("mcp.server_start_timeout", 12.5, persist=False)
         conn = TensorConnection(config={})
         assert conn.server_start_timeout() == 12.5
 

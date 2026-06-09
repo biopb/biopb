@@ -13,7 +13,7 @@ from magicgui.widgets import (
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QSizePolicy
 
-from .._config import get_setting, load_config, save_config
+from .._config import CONFIG
 
 if TYPE_CHECKING:
     import napari
@@ -206,9 +206,6 @@ class _WidgetBase(Container):
         # Make container expand to fill available width in dock widget
         self.native.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # Load persisted config
-        self._config = load_config()
-
         self._image_layer_combo = create_widget(
             label="Image", annotation="napari.layers.Image"
         )
@@ -216,11 +213,11 @@ class _WidgetBase(Container):
         self._is3d = create_widget(
             label="3D",
             annotation=bool,
-            value=get_setting(self._config, "widget.is_3d"),
+            value=CONFIG.get("widget.is_3d"),
         )
 
         self._server = create_widget(
-            value=get_setting(self._config, "widget.server_url"),
+            value=CONFIG.get("widget.server_url"),
             label="Server",
             annotation=str,
         )
@@ -339,15 +336,13 @@ class _WidgetBase(Container):
         self._total_calls = 0
 
     def _save_config(self):
-        """Save current widget settings to config file.
+        """Save current widget settings via the config singleton.
 
-        Reloads from disk first so keys this widget does not own (e.g.
-        mcp.services.process_image_servers) are not clobbered by a stale
-        snapshot.
+        Targeted ``CONFIG.set`` writes touch only this widget's leaves; sibling
+        keys (e.g. mcp.services.process_image_servers) are preserved. Batched
+        with ``persist=False`` and flushed once via ``CONFIG.save()``.
         """
         settings = self._snapshot()
-        config = load_config()
-        config["widget"]["server_url"] = settings["Server"]
-        config["widget"]["is_3d"] = settings["3D"]
-        save_config(config)
-        self._config = config
+        CONFIG.set("widget.server_url", settings["Server"], persist=False)
+        CONFIG.set("widget.is_3d", settings["3D"], persist=False)
+        CONFIG.save()

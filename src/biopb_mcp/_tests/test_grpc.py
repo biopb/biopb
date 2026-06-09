@@ -608,15 +608,12 @@ class TestCheckChunkMemory:
         with pytest.raises(MemoryError, match="exceeds memory limit"):
             _check_chunk_memory(mock_chunk)
 
-    @patch("biopb_mcp.image_processing._grpc.load_config")
-    def test_custom_threshold(self, mock_load_config):
+    def test_custom_threshold(self):
         """Custom thresholds from config are respected."""
-        mock_load_config.return_value = {
-            "memory": {
-                "warn_threshold_mb": 10,
-                "error_threshold_mb": 50,
-            }
-        }
+        from biopb_mcp._config import CONFIG
+
+        CONFIG.set("memory.warn_threshold_mb", 10, persist=False)
+        CONFIG.set("memory.error_threshold_mb", 50, persist=False)
 
         chunk = np.zeros((1024, 1024, 10), dtype=np.float32)
         # 1024 * 1024 * 10 * 4 ≈ 40 MB (over warn=10, under error=50)
@@ -624,15 +621,12 @@ class TestCheckChunkMemory:
         # Should not raise, but would warn
         _check_chunk_memory(chunk)
 
-    @patch("biopb_mcp.image_processing._grpc.load_config")
-    def test_custom_error_threshold_raises(self, mock_load_config):
+    def test_custom_error_threshold_raises(self):
         """Custom error threshold from config raises MemoryError."""
-        mock_load_config.return_value = {
-            "memory": {
-                "warn_threshold_mb": 10,
-                "error_threshold_mb": 20,
-            }
-        }
+        from biopb_mcp._config import CONFIG
+
+        CONFIG.set("memory.warn_threshold_mb", 10, persist=False)
+        CONFIG.set("memory.error_threshold_mb", 20, persist=False)
 
         chunk = np.zeros((1024, 1024, 10), dtype=np.float32)
         # 1024 * 1024 * 10 * 4 ≈ 40 MB (over error=20)

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import numpy as np
 from magicgui.widgets import ComboBox, create_widget
 
-from .._config import get_grid_params, get_setting, load_config, save_config
+from .._config import CONFIG, get_grid_params
 from ._widget_base import _make_full_width, _WidgetBase
 
 if TYPE_CHECKING:
@@ -20,7 +20,7 @@ class ObjectDetectionWidget(_WidgetBase):
         super().__init__(viewer)
 
         self._threshold = create_widget(
-            value=get_setting(self._config, "widget.detection.min_score"),
+            value=CONFIG.get("widget.detection.min_score"),
             label="Min Score",
             annotation=float,
             widget_type="FloatSlider",
@@ -35,7 +35,7 @@ class ObjectDetectionWidget(_WidgetBase):
         self._use_advanced.changed.connect(self._activte_advanced_inputs)
 
         self._size_hint = create_widget(
-            value=get_setting(self._config, "widget.detection.size_hint"),
+            value=CONFIG.get("widget.detection.size_hint"),
             label="Size Hint",
             annotation=float,
             widget_type="FloatSlider",
@@ -43,14 +43,14 @@ class ObjectDetectionWidget(_WidgetBase):
         )
 
         self._nms = ComboBox(
-            value=get_setting(self._config, "widget.detection.nms"),
+            value=CONFIG.get("widget.detection.nms"),
             choices=["Off", "Iou-0.2", "Iou-0.4", "Iou-0.6", "Iou-0.8"],
             label="NMS",
             visible=False,
         )
 
         self._aspect_ratio = create_widget(
-            value=get_setting(self._config, "widget.detection.z_aspect_ratio"),
+            value=CONFIG.get("widget.detection.z_aspect_ratio"),
             label="Z Aspect Ratio",
             options={"visible": False},
         )
@@ -121,7 +121,7 @@ class ObjectDetectionWidget(_WidgetBase):
             list of slice tuples defining patch positions
         """
         is_3d = settings["3D"]
-        grid_size, stride = get_grid_params(is_3d, self._config)
+        grid_size, stride = get_grid_params(is_3d, CONFIG.as_dict())
 
         pos_pars = (
             image.shape[:-1],
@@ -143,23 +143,28 @@ class ObjectDetectionWidget(_WidgetBase):
         return grids
 
     def _save_config(self):
-        """Save current widget settings to config file.
+        """Save current widget settings via the config singleton.
 
-        Reloads from disk first so keys this widget does not own (e.g.
-        mcp.services.process_image_servers) are not clobbered by a stale
-        snapshot.
+        Targeted ``CONFIG.set`` writes touch only this widget's leaves; sibling
+        keys (e.g. mcp.services.process_image_servers) are preserved. Batched
+        with ``persist=False`` and flushed once via ``CONFIG.save()``.
         """
         settings = self._snapshot()
-        config = load_config()
-        detection = config["widget"]["detection"]
-        config["widget"]["server_url"] = settings["Server"]
-        config["widget"]["is_3d"] = settings["3D"]
-        detection["min_score"] = settings["Min Score"]
-        detection["size_hint"] = settings["Size Hint"]
-        detection["nms"] = settings["NMS"]
-        detection["z_aspect_ratio"] = settings["Z Aspect Ratio"]
-        save_config(config)
-        self._config = config
+        CONFIG.set("widget.server_url", settings["Server"], persist=False)
+        CONFIG.set("widget.is_3d", settings["3D"], persist=False)
+        CONFIG.set(
+            "widget.detection.min_score", settings["Min Score"], persist=False
+        )
+        CONFIG.set(
+            "widget.detection.size_hint", settings["Size Hint"], persist=False
+        )
+        CONFIG.set("widget.detection.nms", settings["NMS"], persist=False)
+        CONFIG.set(
+            "widget.detection.z_aspect_ratio",
+            settings["Z Aspect Ratio"],
+            persist=False,
+        )
+        CONFIG.save()
 
     def run(self):
         from ._grpc import CALL_START, grpc_object_detection

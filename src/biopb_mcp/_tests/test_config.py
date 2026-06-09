@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 from biopb_mcp._config import (
+    CONFIG,
     DEFAULT_CONFIG,
+    get_config_path,
     get_default_config,
     get_grid_params,
     get_setting,
@@ -358,3 +360,147 @@ class TestGetSetting:
     def test_unknown_path_without_default_raises(self):
         with pytest.raises(KeyError):
             get_setting({}, "mcp.nope.nada")
+
+
+class TestConfigSingleton:
+    """Tests for the process-wide CONFIG singleton (issue #31).
+
+    The autouse `_isolate_config` fixture (conftest.py) points Path.home at a
+    tmp dir and resets CONFIG before/after each test, so these run hermetically.
+    """
+
+    def test_lazy_loads_once_until_reload(self, monkeypatch):
+        """Disk is read once and memoized until reload()."""
+        import biopb_mcp._config as cfg
+
+        calls = {"n": 0}
+        real = cfg._read_and_merge_from_disk
+
+        def _counting():
+            calls["n"] += 1
+            return real()
+
+        monkeypatch.setattr(cfg, "_read_and_merge_from_disk", _counting)
+
+        CONFIG.reload()
+        CONFIG.get("pyramid.threshold")
+        CONFIG.get("mcp.transport.port")
+        assert calls["n"] == 1  # second get hits the cache
+
+        CONFIG.reload()
+        CONFIG.get("pyramid.threshold")
+        assert calls["n"] == 2  # reload forces a fresh read
+
+    def test_get_falls_back_to_default_config(self):
+        """With no file, get() resolves from DEFAULT_CONFIG."""
+        assert CONFIG.get("mcp.transport.port") == 8765
+        assert CONFIG.get("widget.server_url") == "localhost:50051"
+
+    def test_set_persist_updates_cache_and_file(self):
+        """set() with persist=True updates the cache AND the file."""
+        CONFIG.set("tensor_browser.server_url", "grpc://set:1")
+
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://set:1"
+        with get_config_path().open() as f:
+            on_disk = json.load(f)
+        assert on_disk["tensor_browser"]["server_url"] == "grpc://set:1"
+
+    def test_set_no_persist_then_save_writes_once(self):
+        """persist=False defers the write; save() flushes the batch."""
+        CONFIG.set("widget.is_3d", True, persist=False)
+        CONFIG.set("widget.server_url", "deferred:1", persist=False)
+        # Nothing written yet.
+        assert not get_config_path().exists()
+
+        CONFIG.save()
+        with get_config_path().open() as f:
+            on_disk = json.load(f)
+        assert on_disk["widget"]["is_3d"] is True
+        assert on_disk["widget"]["server_url"] == "deferred:1"
+
+    def test_set_creates_missing_intermediate_section(self):
+        """A dotted path through a missing section is created."""
+        CONFIG.set("brandnew.section.leaf", 5, persist=False)
+        assert CONFIG.get("brandnew.section.leaf") == 5
+
+    def test_reload_picks_up_external_edit(self):
+        """After reload(), an externally-edited file is observed."""
+        # Prime the cache with defaults.
+        assert (
+            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
+        )
+
+        # Edit the file out-of-band; the cache is stale until reload().
+        path = get_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            json.dump({"tensor_browser": {"server_url": "grpc://ext:9"}}, f)
+        assert (
+            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
+        )
+
+        CONFIG.reload()
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://ext:9"
+
+    def test_load_config_returns_live_singleton(self):
+        """The load_config() shim returns the cached singleton dict."""
+        assert load_config() is CONFIG.as_dict()
+
+    def test_save_config_shim_refreshes_cache(self):
+        """save_config() persists and the next read reflects it."""
+        config = get_default_config()
+        config["widget"]["detection"]["min_score"] = 0.9
+        save_config(config)
+
+        assert CONFIG.get("widget.detection.min_score") == 0.9
+
+    def test_get_serialized_against_concurrent_reload(self, monkeypatch):
+        """get() holds the lock across _ensure_loaded + the dotted-path walk.
+
+        A reader paused *between* loading the cache and walking it must not let a
+        concurrent reload() null the cache out from under it (which would make
+        get() silently return the DEFAULT_CONFIG value instead of the on-disk
+        one). We force exactly that interleaving deterministically: a slow
+        _ensure_loaded blocks the reader at the critical point, then a reload
+        runs in another thread. With the lock held across the whole get(), the
+        reload blocks until the reader finishes; without it, the reload nulls
+        the cache mid-read.
+        """
+        import threading
+
+        path = get_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            json.dump({"tensor_browser": {"server_url": "grpc://disk:1"}}, f)
+        CONFIG.reload()
+
+        real_ensure = CONFIG._ensure_loaded
+        at_critical_point = threading.Event()
+        proceed = threading.Event()
+
+        def slow_ensure():
+            real_ensure()  # cache is now populated from disk
+            at_critical_point.set()
+            proceed.wait(2)  # pause between load and the dotted-path walk
+
+        monkeypatch.setattr(CONFIG, "_ensure_loaded", slow_ensure)
+
+        result = {}
+
+        def getter():
+            result["v"] = CONFIG.get("tensor_browser.server_url")
+
+        g = threading.Thread(target=getter)
+        g.start()
+        assert at_critical_point.wait(2)
+
+        # Reader is parked mid-get(). Fire a reload from another thread: it must
+        # not take effect until the reader releases the lock.
+        r = threading.Thread(target=CONFIG.reload)
+        r.start()
+        r.join(0.3)
+        proceed.set()
+        g.join(2)
+        r.join(2)
+
+        assert result["v"] == "grpc://disk:1"

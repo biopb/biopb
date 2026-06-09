@@ -5,17 +5,18 @@ used by both the tensor browser widget and the MCP server.
 """
 
 import logging
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import List, Tuple
 
 from biopb.tensor import TensorFlightClient
 
-from ._config import get_setting, load_config
+from ._config import CONFIG, get_setting
 
 logger = logging.getLogger(__name__)
 
 
 def get_xy_dim_indices(
-    shape: Sequence[int], dim_labels: Optional[Sequence[str]] = None
+    shape: Sequence[int], dim_labels: Sequence[str] | None = None
 ) -> Tuple[int, int]:
     """Indices of the y and x dimensions for a tensor of *shape*.
 
@@ -49,8 +50,8 @@ def get_xy_dim_indices(
 
 
 def get_z_dim_index(
-    shape: Sequence[int], dim_labels: Optional[Sequence[str]] = None
-) -> Optional[int]:
+    shape: Sequence[int], dim_labels: Sequence[str] | None = None
+) -> int | None:
     """Index of the z (depth) axis, or ``None`` when the tensor has none.
 
     Respects *dim_labels* ('z') first: when labels are present but carry no
@@ -75,7 +76,7 @@ def build_pyramid_levels(
     tensor_id: str,
     tensor_desc,
     source_desc=None,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> List:
     """Build resolution-pyramid levels for a tensor in napari display order.
 
@@ -120,7 +121,7 @@ def build_pyramid_levels(
         List of dask arrays at canonical ``[..., Z, Y, X]`` resolution levels.
     """
     if config is None:
-        config = load_config()
+        config = CONFIG.as_dict()
     threshold = get_setting(config, "pyramid.threshold")
     downscale_factor = get_setting(config, "pyramid.downscale_factor")
     budget_root = get_setting(config, "pyramid.pixel_budget_cubic_root")
@@ -198,7 +199,7 @@ def build_layer_scale(
     client: TensorFlightClient,
     source_id: str,
     ndim: int,
-) -> Tuple[Optional[List[float]], Optional[dict]]:
+) -> Tuple[List[float] | None, dict | None]:
     """Build a napari ``scale`` vector from a source's OME pixel sizes.
 
     Reads ``client.get_source_metadata`` (a dict -- the server's OME model
@@ -271,8 +272,8 @@ def add_tensor_layer(
     *,
     name: str,
     source_desc=None,
-    compute_scheduler: Optional[str] = None,
-    config: Optional[dict] = None,
+    compute_scheduler: str | None = None,
+    config: dict | None = None,
 ):
     """Build a tensor's pyramid and add it to *viewer* as an image layer.
 
