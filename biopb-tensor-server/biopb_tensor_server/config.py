@@ -263,6 +263,12 @@ class PrecacheConfig:
         pixel_budget_cubic_root: Cube root of the warmed level's voxel budget
             (Lx*Ly*Lz <= this**3). MUST mirror biopb-mcp's
             pyramid.pixel_budget_cubic_root.
+        backlog_enabled: Also warm sources already present at startup (the
+            "backlog"), as a secondary pass behind live additions.
+        backlog_high_water: Stop backlog warming once the file cache fills past
+            this fraction of its max_bytes, so precache never evicts live data.
+        backlog_idle_recheck_seconds: When the cache is over the high-water mark,
+            how long the backlog naps before re-checking for freed room.
     """
 
     enabled: bool = True
@@ -272,6 +278,10 @@ class PrecacheConfig:
     threshold: int = 4096
     downscale_factor: int = 4
     pixel_budget_cubic_root: int = 512
+    # Startup-backlog (existing sources) knobs.
+    backlog_enabled: bool = True
+    backlog_high_water: float = 0.8
+    backlog_idle_recheck_seconds: float = 5.0
 
 
 @dataclass
@@ -457,6 +467,11 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         downscale_factor=int(precache_data.get("downscale_factor", 4)),
         pixel_budget_cubic_root=int(
             precache_data.get("pixel_budget_cubic_root", 512)
+        ),
+        backlog_enabled=bool(precache_data.get("backlog_enabled", True)),
+        backlog_high_water=float(precache_data.get("backlog_high_water", 0.8)),
+        backlog_idle_recheck_seconds=float(
+            precache_data.get("backlog_idle_recheck_seconds", 5.0)
         ),
     )
 

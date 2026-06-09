@@ -364,6 +364,13 @@ def _setup_flight_server(
     # STARTING to SERVING so clients waiting through startup can proceed.
     server.mark_ready()
 
+    # Seed the secondary backlog with the local sources discovered at startup,
+    # so they warm (newest first) when the server is otherwise idle. Done after
+    # start()/mark_ready() so the live tier is already wired and the backlog is
+    # exactly the startup set.
+    if precache_worker is not None and server_config.precache.backlog_enabled:
+        precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
+
     console.print(f"[green]Flight server ready at {location}[/green]")
 
     return server, source_manager, watcher, precache_worker

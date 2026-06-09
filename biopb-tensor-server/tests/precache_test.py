@@ -460,3 +460,319 @@ class TestPreemptionAndLifecycle:
             assert worker._queue.qsize() == 2
         finally:
             server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: startup backlog (existing sources).
+# ---------------------------------------------------------------------------
+
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
+    import zarr
+
+    from biopb_tensor_server import ZarrAdapter
+
+    arr = zarr.open_array(
+        str(tmp_path / f"{source_id}.zarr"),
+        mode="w",
+        shape=shape,
+        chunks=(1024, 1024),
+        dtype="uint16",
+    )
+    arr[:] = 3
+    adapter = ZarrAdapter(arr, source_id, ["y", "x"])
+    server.register_source(source_id, adapter)
+    return adapter
+
+
+def _located_all(server, cache_manager, source_ids):
+    """True once every source's coarsest-level chunk resolves on disk."""
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+    for sid in source_ids:
+        adapter = server._get_source_adapter(sid)
+        td = adapter.list_tensor_descriptors()[0]
+        ta = adapter.get_tensor_adapter(td.array_id)
+        scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
+        req = TensorDescriptor(
+            array_id=td.array_id,
+            dim_labels=td.dim_labels,
+            shape=td.shape,
+            chunk_shape=ta.get_tensor_descriptor().chunk_shape,
+            dtype=td.dtype,
+        )
+        req.scale_hint[:] = scale
+        req.reduction_method = "area"
+        plan = ta.get_read_plan(req)
+        if not plan.chunk_endpoints:
+            return False
+        for ce in plan.chunk_endpoints:
+            if cache_manager.locate_entry(ce.chunk_id) is None:
+                return False
+    return True
+
+
+class _FakeBackend:
+    def __init__(self, total, mx):
+        self._st = SimpleNamespace(total_bytes=total, max_bytes=mx)
+
+    def stats(self):
+        return self._st
+
+
+class TestHeadroomProbe:
+    def test_has_headroom_tracks_high_water(self, monkeypatch):
+        from biopb_tensor_server import precache as pc
+
+        worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
+        backend = _FakeBackend(total=0, mx=1000)
+        mgr = SimpleNamespace(backend=backend)
+        monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
+
+        assert worker._has_headroom() is True  # empty
+        backend._st.total_bytes = 700  # below 0.8 * 1000
+        assert worker._has_headroom() is True
+        backend._st.total_bytes = 800  # at the mark -> not below
+        assert worker._has_headroom() is False
+        backend._st.total_bytes = 900  # over
+        assert worker._has_headroom() is False
+
+    def test_no_headroom_when_unbounded_or_missing(self, monkeypatch):
+        from biopb_tensor_server import precache as pc
+
+        worker = PrecacheWorker(None, PrecacheConfig())
+        # max_bytes <= 0 -> can't reason about fill, treat as no headroom.
+        mgr = SimpleNamespace(backend=_FakeBackend(total=0, mx=0))
+        monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
+        assert worker._has_headroom() is False
+        # No cache at all.
+        monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: None)
+        assert worker._has_headroom() is False
+
+
+class TestBacklogSeeding:
+    def test_orders_newest_mtime_first(self):
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.seed_backlog([("old", 100.0), ("new", 200.0), ("mid", 150.0)])
+        assert worker._pop_backlog()[1] == "new"
+        assert worker._pop_backlog()[1] == "mid"
+        assert worker._pop_backlog()[1] == "old"
+        assert worker._pop_backlog() is None
+
+    def test_skips_live_queued_sources(self):
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.enqueue("a")  # now in the live tier (_seen)
+        worker.seed_backlog([("a", 100.0), ("b", 50.0)])
+        # 'a' is already live -> only 'b' lands in the backlog.
+        assert worker._pop_backlog()[1] == "b"
+        assert worker._pop_backlog() is None
+
+    def test_seed_dedups_within_backlog(self):
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.seed_backlog([("a", 100.0)])
+        worker.seed_backlog([("a", 999.0)])  # already present -> ignored
+        assert worker._pop_backlog()[1] == "a"
+        assert worker._pop_backlog() is None
+
+    def test_requeue_restores_front_priority(self):
+        worker = PrecacheWorker(None, PrecacheConfig())
+        worker.seed_backlog([("a", 100.0), ("b", 200.0)])
+        neg_mtime, sid = worker._pop_backlog()
+        assert sid == "b"  # newest
+        worker._requeue_backlog(sid, neg_mtime)
+        # Resumes at the front (still the newest among remaining).
+        assert worker._pop_backlog()[1] == "b"
+        assert worker._pop_backlog()[1] == "a"
+
+
+class TestIterLocalSourceMtimes:
+    def _bare_sm(self):
+        from biopb_tensor_server.discovery import AdapterRegistry, DiscoveryState
+        from biopb_tensor_server.source_manager import SourceManager
+
+        server = TensorFlightServer("grpc://localhost:0")
+        sm = SourceManager(
+            server=server,
+            registry=AdapterRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(),
+        )
+        return server, sm
+
+    def test_skips_remote_and_unstatable(self, tmp_path):
+        server, sm = self._bare_sm()
+        try:
+            real = tmp_path / "f.zarr"
+            real.mkdir()
+            sm._state.claims["local"] = SimpleNamespace(
+                source_id="local", primary_path=str(real), is_remote=False
+            )
+            sm._state.claims["remote"] = SimpleNamespace(
+                source_id="remote", primary_path="s3://bucket/x", is_remote=True
+            )
+            sm._state.claims["gone"] = SimpleNamespace(
+                source_id="gone",
+                primary_path=str(tmp_path / "missing"),
+                is_remote=False,
+            )
+            out = dict(sm.iter_local_source_mtimes())
+            assert "local" in out
+            assert isinstance(out["local"], float)
+            assert "remote" not in out  # no os.stat mtime
+            assert "gone" not in out  # OSError -> skipped
+        finally:
+            server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestBacklogWarming:
+    def _init_file_cache(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+
+    def test_backlog_warms_existing_sources(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "s-old")
+            _register_zarr(server, tmp_path, "s-new")
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            worker.seed_backlog([("s-old", 100.0), ("s-new", 200.0)])
+            worker.start()
+            cm = CacheManager.get_instance()
+            deadline = time.time() + 8.0
+            while time.time() < deadline and not _located_all(
+                server, cm, ("s-old", "s-new")
+            ):
+                time.sleep(0.05)
+            worker.stop()
+            assert _located_all(server, cm, ("s-old", "s-new"))
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_live_and_backlog_both_warm(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "live")
+            _register_zarr(server, tmp_path, "backlog")
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            worker.seed_backlog([("backlog", 100.0)])
+            worker.enqueue("live")
+            worker.start()
+            cm = CacheManager.get_instance()
+            deadline = time.time() + 8.0
+            while time.time() < deadline and not _located_all(
+                server, cm, ("live", "backlog")
+            ):
+                time.sleep(0.05)
+            worker.stop()
+            assert _located_all(server, cm, ("live", "backlog"))
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_backlog_tensor_preempts_on_live_traffic(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "src")
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            # A live source is waiting -> a backlog tensor must yield immediately,
+            # before warming any chunk.
+            worker._queue.put("live")
+            adapter = server._get_source_adapter("src")
+            td = adapter.list_tensor_descriptors()[0]
+            cm = CacheManager.get_instance()
+            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            assert preempted is True
+            assert cm.stats().misses == 0  # bailed before the first chunk
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_backlog_tensor_preempts_when_cache_full(self, tmp_path, monkeypatch):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "src")
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            monkeypatch.setattr(worker, "_has_headroom", lambda: False)
+            adapter = server._get_source_adapter("src")
+            td = adapter.list_tensor_descriptors()[0]
+            cm = CacheManager.get_instance()
+            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            assert preempted is True
+            assert cm.stats().misses == 0  # no eviction-causing writes
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_backlog_tensor_warms_when_clear(self, tmp_path):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "src")
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            adapter = server._get_source_adapter("src")
+            td = adapter.list_tensor_descriptors()[0]
+            cm = CacheManager.get_instance()
+            # Empty live queue + plenty of headroom -> warms, no preempt.
+            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            assert preempted is False
+            assert cm.stats().misses > 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_run_skips_backlog_without_headroom(self, tmp_path, monkeypatch):
+        from biopb_tensor_server.cache import CacheManager
+
+        self._init_file_cache(tmp_path)
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            _register_zarr(server, tmp_path, "src")
+            worker = PrecacheWorker(
+                server,
+                PrecacheConfig(
+                    idle_debounce_seconds=0.0, backlog_idle_recheck_seconds=0.05
+                ),
+            )
+            monkeypatch.setattr(worker, "_has_headroom", lambda: False)
+            worker.seed_backlog([("src", 100.0)])
+            worker.start()
+            time.sleep(0.5)
+            worker.stop()
+            # Cache full -> the backlog tier never warms, and the source stays
+            # queued for a later retry.
+            assert CacheManager.get_instance().stats().misses == 0
+            assert worker._backlog_has_items()
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()

@@ -1,31 +1,41 @@
 """Background pre-cache worker for the tensor server.
 
-When a new source is added to the catalog *after* startup, this worker warms the
-file cache for that source at the coarsest pyramid level a client requests on
-open (see ``compute_precache_scale_hint``), so the first view a scientist opens
-is already warm instead of paying a cold decode+downsample on the critical path.
+This worker warms the file cache so the first view a scientist opens is already
+warm instead of paying a cold decode+downsample on the critical path. It warms
+at the coarsest pyramid level a client requests on open (see
+``compute_precache_scale_hint``).
+
+It serves two tiers, in strict priority order:
+
+- **Live tier (primary).** Sources added to the catalog *after* startup, fed by
+  ``SourceManager``'s commit hook (``enqueue``). Always warmed.
+- **Backlog tier (secondary).** Local sources already present at startup, seeded
+  once via ``seed_backlog`` and ordered newest-mtime-first. Drained only when the
+  live queue is empty, and bounded so it never evicts live data (see below).
 
 Design constraints (all best-effort, never fatal to the server):
 
 - **File backend only.** Inert unless the cache is the persistent
   ``ArrowFileBackend``; on a memory backend it drops queued work.
-- **Runtime additions only.** The queue is fed by ``SourceManager``'s commit
-  hook, which only fires for sources added after ``start()`` -- the initial
-  startup scan is excluded.
 - **Stays out of the way.** Before each chunk it waits until the Flight server
   has been idle for ``idle_debounce_seconds`` (no in-flight ``do_get``), and it
   re-checks between chunks so a burst of live traffic preempts it at chunk
   granularity. On the locked adapters precache's reads also serialize behind
   live reads through the per-source ``_io_lock``, so it never races a
   non-thread-safe reader.
+- **Backlog never evicts live data.** The file cache evicts globally on every
+  write, so the backlog tier gates each chunk on cache fill and stops above
+  ``backlog_high_water`` of the cache's ``max_bytes``, and yields the moment a
+  live source is enqueued.
 """
 
 from __future__ import annotations
 
+import heapq
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -43,7 +53,8 @@ _POLL_INTERVAL_SECONDS = 0.2
 
 
 class PrecacheWorker:
-    """Daemon thread that warms the file cache for newly-added sources."""
+    """Daemon thread that warms the file cache for newly-added and existing
+    sources."""
 
     def __init__(self, server: "TensorFlightServer", config: "PrecacheConfig"):
         self._server = server
@@ -51,6 +62,11 @@ class PrecacheWorker:
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._seen: Set[str] = set()
         self._seen_lock = threading.Lock()
+        # Backlog tier: a newest-mtime-first heap of (-mtime, seq, source_id).
+        self._backlog: List[Tuple[float, int, str]] = []
+        self._backlog_ids: Set[str] = set()
+        self._backlog_seq = 0
+        self._backlog_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -74,32 +90,132 @@ class PrecacheWorker:
             self._thread = None
         logger.info("PrecacheWorker stopped")
 
-    # -- producer API (handed to SourceManager._on_source_committed) -------
+    # -- producer API ------------------------------------------------------
 
     def enqueue(self, source_id: str) -> None:
-        """Queue a source for warming (non-blocking, deduplicated)."""
+        """Queue a live (runtime) source for warming (non-blocking, deduped).
+
+        Handed to ``SourceManager._on_source_committed``.
+        """
         with self._seen_lock:
             if source_id in self._seen:
                 return
             self._seen.add(source_id)
         self._queue.put(source_id)
 
+    def seed_backlog(self, items: Sequence[Tuple[str, float]]) -> None:
+        """Seed the secondary backlog with ``(source_id, mtime)`` pairs.
+
+        Called once at startup with the existing local sources. Items already
+        queued in the live tier or the backlog are skipped.
+        """
+        if not items:
+            return
+        with self._seen_lock:
+            seen_snapshot = set(self._seen)
+        added = 0
+        with self._backlog_lock:
+            for source_id, mtime in items:
+                if source_id in self._backlog_ids or source_id in seen_snapshot:
+                    continue
+                self._backlog_seq += 1
+                heapq.heappush(
+                    self._backlog, (-mtime, self._backlog_seq, source_id)
+                )
+                self._backlog_ids.add(source_id)
+                added += 1
+        logger.info(
+            "precache: seeded %d/%d existing sources into backlog",
+            added,
+            len(items),
+        )
+
     # -- worker loop -------------------------------------------------------
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # 1. Live tier (primary): always drained first.
+            try:
+                source_id = self._queue.get_nowait()
+            except queue.Empty:
+                source_id = None
+            if source_id is not None:
+                self._process_live(source_id)
+                continue
+
+            # 2. Backlog tier (secondary): only on a file backend with headroom.
+            if self._backlog_has_items():
+                if not self._file_backend_active():
+                    self._clear_backlog()
+                    continue
+                if not self._has_headroom():
+                    # Cache is full; warming would evict live data. Nap and
+                    # re-check (live eviction may free room later).
+                    self._stop.wait(self._cfg.backlog_idle_recheck_seconds)
+                    continue
+                self._drain_one_backlog()
+                continue
+
+            # 3. Idle: block briefly for the next live addition.
             try:
                 source_id = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            # Drop the dedup marker before processing: a commit that arrives
-            # while we work should be allowed to re-queue a fresh pass.
-            with self._seen_lock:
-                self._seen.discard(source_id)
-            try:
-                self._process_source(source_id)
-            except Exception:
-                logger.exception("precache: failed for source %s", source_id)
+            self._process_live(source_id)
+
+    def _process_live(self, source_id: str) -> None:
+        # Drop the dedup marker before processing: a commit that arrives while
+        # we work should be allowed to re-queue a fresh pass.
+        with self._seen_lock:
+            self._seen.discard(source_id)
+        try:
+            self._process_source(source_id)
+        except Exception:
+            logger.exception("precache: failed for source %s", source_id)
+
+    def _drain_one_backlog(self) -> None:
+        entry = self._pop_backlog()
+        if entry is None:
+            return
+        neg_mtime, source_id = entry
+        try:
+            preempted = self._process_source(source_id, backlog=True)
+        except Exception:
+            logger.exception("precache: backlog failed for source %s", source_id)
+            preempted = False
+        if preempted:
+            # Live traffic or a full cache interrupted us; resume this source
+            # (newest first) once conditions allow. Re-warm is cheap (hits).
+            self._requeue_backlog(source_id, neg_mtime)
+
+    # -- backlog bookkeeping -----------------------------------------------
+
+    def _backlog_has_items(self) -> bool:
+        with self._backlog_lock:
+            return bool(self._backlog)
+
+    def _pop_backlog(self) -> Optional[Tuple[float, str]]:
+        with self._backlog_lock:
+            if not self._backlog:
+                return None
+            neg_mtime, _seq, source_id = heapq.heappop(self._backlog)
+            self._backlog_ids.discard(source_id)
+            return neg_mtime, source_id
+
+    def _requeue_backlog(self, source_id: str, neg_mtime: float) -> None:
+        with self._backlog_lock:
+            if source_id in self._backlog_ids:
+                return
+            self._backlog_seq += 1
+            heapq.heappush(self._backlog, (neg_mtime, self._backlog_seq, source_id))
+            self._backlog_ids.add(source_id)
+
+    def _clear_backlog(self) -> None:
+        with self._backlog_lock:
+            self._backlog.clear()
+            self._backlog_ids.clear()
+
+    # -- gates -------------------------------------------------------------
 
     def _file_backend_active(self) -> bool:
         """True only when the persistent file cache is in use."""
@@ -107,6 +223,23 @@ class PrecacheWorker:
         return cache_manager is not None and isinstance(
             cache_manager.backend, ArrowFileBackend
         )
+
+    def _has_headroom(self) -> bool:
+        """True while the file cache is below the backlog high-water mark.
+
+        Keeps the backlog tier from filling the cache to the brim and evicting
+        genuinely-hot live data (the cache evicts globally on every write).
+        """
+        cache_manager = CacheManager.get_instance()
+        if cache_manager is None:
+            return False
+        try:
+            st = cache_manager.backend.stats()
+        except Exception:
+            return False
+        if st.max_bytes <= 0:
+            return False
+        return st.total_bytes < st.max_bytes * self._cfg.backlog_high_water
 
     def _wait_until_idle(self) -> bool:
         """Block until the Flight server is idle. Return False if asked to stop."""
@@ -117,31 +250,42 @@ class PrecacheWorker:
             self._stop.wait(_POLL_INTERVAL_SECONDS)
         return False
 
-    def _process_source(self, source_id: str) -> None:
+    # -- per-source warming ------------------------------------------------
+
+    def _process_source(self, source_id: str, backlog: bool = False) -> bool:
+        """Warm every tensor of a source. Return True if a backlog pass was
+        preempted (and should be re-queued)."""
         # Runtime file-backend gate: the "only run if file-based caching"
         # condition, enforced regardless of config.
         if not self._file_backend_active():
             logger.debug("precache: file backend not active, skipping %s", source_id)
-            return
+            return False
         cache_manager = CacheManager.get_instance()
 
         source_adapter = self._server._get_source_adapter(source_id)
         if source_adapter is None:
-            return
+            return False
         try:
             descriptors = source_adapter.list_tensor_descriptors()
         except Exception:
             logger.exception(
                 "precache: list_tensor_descriptors failed for %s", source_id
             )
-            return
+            return False
 
         for td in descriptors:
             if self._stop.is_set():
-                return
-            self._process_tensor(source_adapter, td, cache_manager)
+                return False
+            if self._process_tensor(
+                source_adapter, td, cache_manager, backlog=backlog
+            ):
+                return True  # preempted mid-source
+        return False
 
-    def _process_tensor(self, source_adapter, td, cache_manager) -> None:
+    def _process_tensor(
+        self, source_adapter, td, cache_manager, backlog: bool = False
+    ) -> bool:
+        """Warm one tensor's coarsest level. Return True if preempted (backlog)."""
         # The client passes the descriptor's array_id verbatim as tensor_id
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
@@ -149,16 +293,16 @@ class PrecacheWorker:
             tensor_adapter = source_adapter.get_tensor_adapter(tensor_id)
         except Exception:
             logger.exception("precache: get_tensor_adapter failed for %s", tensor_id)
-            return
+            return False
         if tensor_adapter is None:
-            return
+            return False
         try:
             base_desc = tensor_adapter.get_tensor_descriptor()
         except Exception:
             logger.exception(
                 "precache: get_tensor_descriptor failed for %s", tensor_id
             )
-            return
+            return False
 
         scale = compute_precache_scale_hint(
             list(base_desc.shape),
@@ -184,17 +328,24 @@ class PrecacheWorker:
             read_plan = tensor_adapter.get_read_plan(request_desc)
         except Exception:
             logger.exception("precache: get_read_plan failed for %s", tensor_id)
-            return
+            return False
 
         endpoints = read_plan.chunk_endpoints
         warmed = 0
         for ce in endpoints:
             if self._stop.is_set():
-                return
+                return False
+            if backlog:
+                # Yield to live work the instant any arrives.
+                if not self._queue.empty():
+                    return True
+                # Respect cache headroom: live traffic may have filled it.
+                if not self._has_headroom():
+                    return True
             # Debounce + preempt between chunks: wait for the server to be idle
             # before warming each chunk.
             if not self._wait_until_idle():
-                return
+                return False
             try:
                 tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
                 warmed += 1
@@ -203,9 +354,11 @@ class PrecacheWorker:
                 logger.debug("precache: chunk warm failed for %s: %s", tensor_id, e)
 
         logger.info(
-            "precache: warmed %d/%d chunks for %s at scale=%s",
+            "precache: warmed %d/%d chunks for %s at scale=%s%s",
             warmed,
             len(endpoints),
             tensor_id,
             scale,
+            " (backlog)" if backlog else "",
         )
+        return False

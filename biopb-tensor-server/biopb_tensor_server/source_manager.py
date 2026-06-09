@@ -7,6 +7,7 @@ and metadata database synchronization for monitored local directories.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -134,6 +135,24 @@ class SourceManager:
         )
         self._thread.start()
         logger.info("SourceManager started")
+
+    def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
+        """Return ``(source_id, mtime)`` for every currently-registered *local*
+        source, for seeding the precache backlog (newest first).
+
+        Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
+        can't be stat-ed (e.g. removed between commit and this call).
+        """
+        out: List[Tuple[str, float]] = []
+        for claim in list(self._state.claims.values()):
+            if claim.is_remote:
+                continue
+            try:
+                mtime = os.stat(claim.primary_path).st_mtime
+            except OSError:
+                continue
+            out.append((claim.source_id, mtime))
+        return out
 
     def stop(self) -> None:
         """Stop the event processing loop."""
