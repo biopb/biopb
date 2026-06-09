@@ -96,8 +96,12 @@ function Select-Components {
 }
 
 # Prompt the user to choose a data directory; returns the chosen path string.
+# With -KeepOption an extra "0) Keep my current config file" choice is shown as
+# the default; selecting it (or Enter, or any invalid input) returns $null as a
+# sentinel meaning "leave the existing config untouched." Callers pass this when
+# a biopb.toml already exists, since hand-editing TOML is error-prone.
 function Select-DataDir {
-    param([string]$BiopbHome)
+    param([string]$BiopbHome, [switch]$KeepOption)
 
     $candidates = New-Object System.Collections.Generic.List[string]
     $seen = New-Object System.Collections.Generic.HashSet[string]
@@ -127,6 +131,10 @@ function Select-DataDir {
     Write-Host ""
     Write-Host "  Select your microscopy data directory:" -ForegroundColor White
     Write-Host ""
+    if ($KeepOption) {
+        Write-Host "    0) " -ForegroundColor Cyan -NoNewline
+        Write-Host "Keep my current config file (default)"
+    }
     for ($i = 0; $i -lt $n; $i++) {
         Write-Host ("    {0}) " -f ($i + 1)) -ForegroundColor Cyan -NoNewline
         Write-Host $candidates[$i]
@@ -134,8 +142,12 @@ function Select-DataDir {
     Write-Host ("    {0}) " -f $manualOpt) -ForegroundColor Cyan -NoNewline
     Write-Host "Enter path manually"
     Write-Host ""
-    $choice = Read-Host "  Choice [1]"
-    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
+    # Default differs by mode: keep current config (0) vs first candidate (1).
+    $defaultChoice = if ($KeepOption) { "0" } else { "1" }
+    $choice = Read-Host "  Choice [$defaultChoice]"
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
+
+    if ($KeepOption -and $choice -eq "0") { return $null }   # sentinel: keep config
 
     if ($choice -eq "$manualOpt") {
         $manual = Read-Host "  Path [$defaultDir]"
@@ -144,6 +156,11 @@ function Select-DataDir {
     }
     elseif ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $n) {
         return $candidates[[int]$choice - 1]
+    }
+    elseif ($KeepOption) {
+        # In keep mode, an unrecognized choice is non-destructive: keep the config.
+        Write-Host "  Invalid choice, keeping current config"
+        return $null
     }
     else {
         Write-Host "  Invalid choice, using default"
@@ -762,16 +779,43 @@ function Install-Biopb {
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
     $configFile = Join-Path $ConfigDir "biopb.toml"
 
-    if (Test-Path -LiteralPath $configFile) {
-        Write-Ok "Config exists at $configFile (preserved)"
+    # We never edit an existing biopb.toml in place — hand-editing TOML is
+    # error-prone and most users can't do it. Instead the data-directory prompt is
+    # always offered; when a config already exists it gains a default "0) Keep my
+    # current config file" option, and choosing a fresh data dir backs up the old
+    # config and writes a brand-new one. $null $dataDir is the "keep" sentinel.
+    $dataDir = $null
+    $keepConfig = $false
+    if ((Test-Path -LiteralPath $configFile) -and (-not $env:BIOPB_DATA_DIR)) {
+        $dataDir = Select-DataDir -BiopbHome $BiopbHome -KeepOption
+        Write-Host ""
+        if ($null -eq $dataDir) { $keepConfig = $true }
+    }
+    elseif (Test-Path -LiteralPath $configFile) {
+        # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
+        # install. With a config already present we keep it (its data dir wins).
+        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $configFile to apply BIOPB_DATA_DIR)."
+        $keepConfig = $true
+    }
+    elseif ($env:BIOPB_DATA_DIR) {
+        $dataDir = $env:BIOPB_DATA_DIR
+        Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
+    }
+    else {
+        $dataDir = Select-DataDir -BiopbHome $BiopbHome
+        Write-Host ""
+        Write-Ok "Data directory: $dataDir"
+    }
+
+    if ($keepConfig) {
+        Write-Ok "Keeping current config: $configFile"
     } else {
-        if ($env:BIOPB_DATA_DIR) {
-            $dataDir = $env:BIOPB_DATA_DIR
-            Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
-        } else {
-            $dataDir = Select-DataDir -BiopbHome $BiopbHome
-            Write-Host ""
-            Write-Ok "Data directory: $dataDir"
+        # Preserve the previous config (a chosen new data dir must never silently
+        # discard the user's old settings) by renaming it to a timestamped backup.
+        if (Test-Path -LiteralPath $configFile) {
+            $backup = "$configFile.bak." + (Get-Date -Format "yyyyMMddHHmmss")
+            Move-Item -LiteralPath $configFile -Destination $backup -Force
+            Write-Inf "Backed up previous config to $backup"
         }
 
         # Escape for a TOML basic string: backslashes first, then quotes.
