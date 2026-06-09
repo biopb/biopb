@@ -876,3 +876,248 @@ class TestSkipNativePyramid:
             server.shutdown()
             CacheManager.get_instance().close()
             CacheManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Server-advertised pyramid plan (server-decided multi-scale).
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPyramidPlan:
+    """The full computed plan generalizes the coarsest-only helper."""
+
+    def test_level_zero_is_full_resolution(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        levels = build_pyramid_plan([20000, 20000], ["y", "x"])
+        assert list(levels[0].scale_hint) == [1, 1]
+        assert list(levels[0].shape) == [20000, 20000]
+        assert levels[0].native is False
+        assert levels[0].reduction_method == "area"
+
+    def test_coarsest_matches_precache_helper(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        for shape, labels in [
+            ([20000, 20000], ["y", "x"]),
+            ([1000, 8000, 8000], ["z", "y", "x"]),
+            ([8, 20000, 20000], ["z", "y", "x"]),
+            ([10, 3, 20000, 20000], ["t", "c", "y", "x"]),
+        ]:
+            levels = build_pyramid_plan(shape, labels)
+            assert list(levels[-1].scale_hint) == compute_precache_scale_hint(
+                shape, labels
+            )
+
+    def test_each_level_shape_is_ceil_div(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.downsample import ceil_div
+
+        shape = [1000, 8000, 8000]
+        levels = build_pyramid_plan(shape, ["z", "y", "x"])
+        for level in levels:
+            expected = [
+                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)
+            ]
+            assert list(level.shape) == expected
+
+    def test_levels_strictly_coarsen(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        levels = build_pyramid_plan([20000, 20000], ["y", "x"])
+        # Each successive level downsamples at least one axis further.
+        for prev, nxt in zip(levels, levels[1:]):
+            assert any(b > a for a, b in zip(prev.scale_hint, nxt.scale_hint))
+
+    def test_small_source_is_single_full_res_level(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        levels = build_pyramid_plan([512, 512], ["y", "x"])
+        assert len(levels) == 1
+        assert list(levels[0].scale_hint) == [1, 1]
+
+    def test_reduction_method_is_configurable(self):
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        levels = build_pyramid_plan(
+            [20000, 20000], ["y", "x"], reduction_method="nearest"
+        )
+        assert all(level.reduction_method == "nearest" for level in levels)
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not installed")
+class TestNativePyramidLevels:
+    """OME-Zarr advertises its on-disk levels, and they round-trip."""
+
+    def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
+        import zarr
+
+        from biopb_tensor_server import OmeZarrAdapter
+
+        zarr_path, _level_paths, _zattrs = multires_ome_zarr
+        root = zarr.open_group(zarr_path, mode="r")
+        return OmeZarrAdapter(root["0"], source_id)
+
+    def test_enumerates_native_datasets(self, multires_ome_zarr):
+        adapter = self._ome_adapter(multires_ome_zarr)
+        levels = adapter.get_native_pyramid_levels()
+        # The fixture builds 4 levels at scale 1,2,4,8 (shape 256..32).
+        assert levels is not None
+        assert [list(lv.scale_hint) for lv in levels] == [
+            [1, 1], [2, 2], [4, 4], [8, 8],
+        ]
+        assert all(lv.native is True for lv in levels)
+        assert all(lv.reduction_method == "precompute" for lv in levels)
+        assert [list(lv.shape) for lv in levels] == [
+            [256, 256], [128, 128], [64, 64], [32, 32],
+        ]
+
+    def test_each_advertised_level_round_trips(self, multires_ome_zarr):
+        """Every advertised level resolves to its native dataset via get_read_plan."""
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        adapter = self._ome_adapter(multires_ome_zarr)
+        levels = adapter.get_native_pyramid_levels()
+        for level in levels:
+            scale = tuple(level.scale_hint)
+            # The exact-match routing finds a precomputed dataset for this scale.
+            assert adapter._find_level_for_scale(scale) is not None
+            # And a precompute read plan succeeds and returns the level's shape.
+            req = TensorDescriptor(
+                array_id=adapter.array_id,
+                scale_hint=list(scale),
+                reduction_method="precompute",
+            )
+            plan = adapter.get_read_plan(req)
+            assert list(plan.descriptor.shape) == list(level.shape)
+
+    def test_plain_zarr_has_no_native_levels(self, tmp_path):
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+
+        arr = zarr.open_array(
+            str(tmp_path / "a.zarr"),
+            mode="w",
+            shape=(64, 64),
+            chunks=(32, 32),
+            dtype="uint16",
+        )
+        adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+        assert adapter.get_native_pyramid_levels() is None
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not installed")
+class TestAdvertisedPyramidDescriptor:
+    """get_flight_info fills `pyramid`; list_flights leaves it empty."""
+
+    def _flight_info(self, server, source_id, tensor_id=""):
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import FlightCmd, TensorReadOption
+
+        cmd = FlightCmd(
+            source_id=source_id,
+            tensor_read=TensorReadOption(tensor_id=tensor_id),
+        )
+        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        return server.get_flight_info(None, desc)
+
+    def _descriptor(self, info):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return TensorDescriptor.FromString(info.descriptor.command)
+
+    def _big_zarr_adapter(self, tmp_path):
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+
+        arr = zarr.open_array(
+            str(tmp_path / "big.zarr"),
+            mode="w",
+            shape=(20000, 20000),
+            chunks=(1024, 1024),
+            dtype="uint8",
+        )
+        return ZarrAdapter(arr, "big", ["y", "x"])
+
+    def test_get_flight_info_advertises_computed_pyramid(self, tmp_path):
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            desc = self._descriptor(self._flight_info(server, "big", "big"))
+            assert len(desc.pyramid) >= 2
+            assert list(desc.pyramid[0].scale_hint) == [1, 1]
+            assert all(not lv.native for lv in desc.pyramid)
+            assert list(desc.pyramid[-1].scale_hint) == compute_precache_scale_hint(
+                [20000, 20000], ["y", "x"]
+            )
+        finally:
+            server.shutdown()
+
+    def test_get_flight_info_advertises_native_pyramid(self, multires_ome_zarr):
+        import zarr
+
+        from biopb_tensor_server import OmeZarrAdapter
+
+        zarr_path, _lp, _z = multires_ome_zarr
+        root = zarr.open_group(zarr_path, mode="r")
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source(
+                "ome", OmeZarrAdapter(root["0"], "ome")
+            )
+            desc = self._descriptor(self._flight_info(server, "ome", "ome"))
+            assert len(desc.pyramid) == 4
+            assert all(lv.native for lv in desc.pyramid)
+            assert all(lv.reduction_method == "precompute" for lv in desc.pyramid)
+        finally:
+            server.shutdown()
+
+    def test_list_flights_leaves_pyramid_empty(self, tmp_path):
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", self._big_zarr_adapter(tmp_path))
+            infos = list(server.list_flights(None, b""))
+            assert infos
+            src = DataSourceDescriptor.FromString(infos[0].descriptor.command)
+            assert all(len(t.pyramid) == 0 for t in src.tensors)
+        finally:
+            server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not installed")
+class TestPrecacheAdvertisedAlignment:
+    """Precache warms exactly the scale the server advertises (no drift)."""
+
+    def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        arr = zarr.open_array(
+            str(tmp_path / "big.zarr"),
+            mode="w",
+            shape=(20000, 20000),
+            chunks=(1024, 1024),
+            dtype="uint8",
+        )
+        adapter = ZarrAdapter(arr, "big", ["y", "x"])
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("big", adapter)
+            base_desc = adapter.get_tensor_descriptor()
+            advertised = server._advertised_pyramid(adapter, "big", base_desc)
+            # The worker warms build_pyramid_plan(...)[-1]; the server advertises
+            # the same plan -- so their coarsest scales are identical.
+            worker_coarsest = build_pyramid_plan(
+                list(base_desc.shape), list(base_desc.dim_labels)
+            )[-1]
+            assert list(advertised[-1].scale_hint) == list(
+                worker_coarsest.scale_hint
+            )
+        finally:
+            server.shutdown()

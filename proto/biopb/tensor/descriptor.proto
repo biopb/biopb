@@ -40,6 +40,34 @@ message TensorDescriptor {
   // For precomputed pyramids: multiscales[].datasets[].path and scale info.
   // Empty string if no metadata available.
   string metadata_json = 9;
+
+  // Server-advertised resolution pyramid: the ordered levels the server
+  // recommends reading this tensor at, coarsest decision made server-side so
+  // native (precomputed) pyramids are honored and the precache worker and
+  // client request the same scales. Level 0 is full resolution
+  // (scale_hint all 1s). A client reads each level via the normal scale_hint
+  // read path. Populated only by GetFlightInfo (left empty in ListFlights,
+  // like metadata_json); empty also means "old server / decide client-side".
+  repeated PyramidLevel pyramid = 10;
+}
+
+// One resolution level of a tensor's server-advertised pyramid.
+message PyramidLevel {
+  // Per-dimension integer downsampling factors vs. full resolution.
+  // Level 0 is [1, 1, ...]; matches TensorDescriptor.scale_hint semantics.
+  repeated int64 scale_hint = 1;
+
+  // Method to request this level: "area" | "nearest" | "linear" | "precompute".
+  // "precompute" means the server serves a native on-disk level (see `native`).
+  string reduction_method = 2;
+
+  // Logical (downsampled) shape of this level -- what a read of this level
+  // returns, so the client can size the level without a probe read.
+  repeated int64 shape = 3;
+
+  // True if this level is served from a precomputed on-disk pyramid (e.g. an
+  // OME-Zarr multiscales dataset) rather than downsampled on the fly.
+  bool native = 4;
 }
 
 // Specifies a sub-region of the tensor for filtered endpoint discovery

@@ -2,8 +2,9 @@
 
 This worker warms the file cache so the first view a scientist opens is already
 warm instead of paying a cold decode+downsample on the critical path. It warms
-at the coarsest pyramid level a client requests on open (see
-``compute_precache_scale_hint``).
+the coarsest level of the same pyramid the server advertises on the tensor
+descriptor (see ``chunk.build_pyramid_plan``), so the warmed scale always matches
+what the client requests on open.
 
 It serves two tiers, in strict priority order:
 
@@ -40,10 +41,10 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
-from biopb_tensor_server.chunk import compute_precache_scale_hint
+from biopb_tensor_server.chunk import build_pyramid_plan
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import PrecacheConfig
+    from biopb_tensor_server.config import PrecacheConfig, PyramidConfig
     from biopb_tensor_server.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,22 @@ class PrecacheWorker:
     """Daemon thread that warms the file cache for newly-added and existing
     sources."""
 
-    def __init__(self, server: "TensorFlightServer", config: "PrecacheConfig"):
+    def __init__(
+        self,
+        server: "TensorFlightServer",
+        config: "PrecacheConfig",
+        pyramid_config: Optional["PyramidConfig"] = None,
+    ):
         self._server = server
         self._cfg = config
+        # Pyramid level definition is shared with the server's advertised
+        # TensorDescriptor.pyramid, so the warmed scale == the advertised scale.
+        # Defaults to the canonical knobs when a caller omits it.
+        if pyramid_config is None:
+            from biopb_tensor_server.config import PyramidConfig
+
+            pyramid_config = PyramidConfig()
+        self._pyramid_cfg = pyramid_config
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._seen: Set[str] = set()
         self._seen_lock = threading.Lock()
@@ -314,13 +328,18 @@ class PrecacheWorker:
             )
             return False
 
-        scale = compute_precache_scale_hint(
+        # Warm the coarsest level of the same plan the server advertises (a
+        # non-native source: native ones are skipped above), so the warmed
+        # chunk_ids are exactly what the client fetches on open.
+        cfg = self._pyramid_cfg
+        coarsest = build_pyramid_plan(
             list(base_desc.shape),
             list(base_desc.dim_labels),
-            threshold=self._cfg.threshold,
-            downscale_factor=self._cfg.downscale_factor,
-            pixel_budget_cubic_root=self._cfg.pixel_budget_cubic_root,
-        )
+            reduction_method=cfg.reduction_method,
+            threshold=cfg.threshold,
+            downscale_factor=cfg.downscale_factor,
+            pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
+        )[-1]
 
         # Build the request descriptor exactly as get_flight_info does, so the
         # read plan's scaled chunk_ids match what the client will fetch.
@@ -331,8 +350,8 @@ class PrecacheWorker:
             chunk_shape=base_desc.chunk_shape,
             dtype=base_desc.dtype,
         )
-        request_desc.scale_hint[:] = scale
-        request_desc.reduction_method = self._cfg.reduction_method
+        request_desc.scale_hint[:] = list(coarsest.scale_hint)
+        request_desc.reduction_method = coarsest.reduction_method
 
         try:
             read_plan = tensor_adapter.get_read_plan(request_desc)
@@ -368,7 +387,7 @@ class PrecacheWorker:
             warmed,
             len(endpoints),
             tensor_id,
-            scale,
+            list(coarsest.scale_hint),
             " (backlog)" if backlog else "",
         )
         return False

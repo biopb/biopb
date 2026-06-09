@@ -29,6 +29,7 @@ import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
+    PyramidLevel,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -212,6 +213,23 @@ class SourceAdapter(ABC):
         cheaply from their own coarse levels.
         """
         return False
+
+    def get_native_pyramid_levels(
+        self, tensor_id: Optional[str] = None
+    ) -> Optional[List["PyramidLevel"]]:
+        """Native (precomputed on-disk) pyramid levels for *tensor_id*, or None.
+
+        Returns ``None`` for formats without a real on-disk pyramid (the default),
+        in which case the server advertises a *computed* pyramid via
+        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
+        natively (e.g. OME-Zarr multiscales) override this to return one
+        ``PyramidLevel`` per native dataset, each with ``native=True`` and
+        ``reduction_method="precompute"`` so the client requests the on-disk level
+        directly. Each level's ``scale_hint`` MUST be the value the adapter's own
+        ``get_read_plan`` "precompute" routing matches on, so an advertised level
+        round-trips to its dataset.
+        """
+        return None
 
 
 class TensorAdapter(ABC):

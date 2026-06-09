@@ -14,7 +14,7 @@ from math import lcm
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-from biopb.tensor.descriptor_pb2 import SliceHint
+from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.downsample import ceil_div
@@ -449,24 +449,28 @@ def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
     return ndim - 3 if ndim >= 3 else None
 
 
-def compute_precache_scale_hint(
+def compute_pyramid_scale_hints(
     shape: Sequence[int],
     dim_labels=None,
     threshold: int = PRECACHE_THRESHOLD,
     downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
     pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
-) -> List[int]:
-    """Per-axis scale_hint for the *coarsest* pyramid level a client requests.
+) -> List[List[int]]:
+    """Per-axis scale_hint for *every* level of a computed pyramid.
 
-    This is a faithful port of biopb-mcp's ``build_pyramid_levels`` loop: X, Y
-    and Z are downsampled individually (all other axes stay at 1), each stopping
-    at ``axis_floor = min(pixel_budget_cubic_root, threshold)``, until the level
-    satisfies ``Lx*Ly*Lz <= pixel_budget_cubic_root**3`` and ``Lx, Ly <=
-    threshold``. ``ceil_div(L, s)`` is the server's own ``logical_shape``
-    (base.py), so the resulting scale matches the client's terminal level and the
-    warmed chunk_ids line up exactly.
+    A faithful port of biopb-mcp's ``build_pyramid_levels`` loop, emitting the
+    full sequence of levels (not just the coarsest): level 0 is full resolution
+    (all 1s), then X, Y and Z are downsampled individually (all other axes stay
+    at 1), each stopping at ``axis_floor = min(pixel_budget_cubic_root,
+    threshold)``, until the level satisfies ``Lx*Ly*Lz <=
+    pixel_budget_cubic_root**3`` and ``Lx, Ly <= threshold``. ``ceil_div(L, s)``
+    is the server's own ``logical_shape`` (base.py), so each scale matches the
+    client's level and the warmed chunk_ids line up exactly.
 
     A tensor with no z axis is treated as ``Lz = 1`` and never gets a z factor.
+
+    Returns:
+        Non-empty list of per-axis scale vectors, coarsest last.
     """
     ndim = len(shape)
     budget = pixel_budget_cubic_root ** 3
@@ -478,7 +482,16 @@ def compute_precache_scale_hint(
     if z_idx is not None and z_idx in (x_idx, y_idx):
         z_idx = None
 
+    def _scale_vector(sx, sy, sz):
+        scale = [1] * ndim
+        scale[x_idx] = sx
+        scale[y_idx] = sy
+        if z_idx is not None:
+            scale[z_idx] = sz
+        return scale
+
     sx = sy = sz = 1
+    scales = [_scale_vector(sx, sy, sz)]  # level 0: full resolution
     while True:
         lx = ceil_div(shape[x_idx], sx)
         ly = ceil_div(shape[y_idx], sy)
@@ -491,13 +504,72 @@ def compute_precache_scale_hint(
         if (nsx, nsy, nsz) == (sx, sy, sz):
             break  # nothing left to shrink; avoid an infinite loop
         sx, sy, sz = nsx, nsy, nsz
+        scales.append(_scale_vector(sx, sy, sz))
 
-    scale = [1] * ndim
-    scale[x_idx] = sx
-    scale[y_idx] = sy
-    if z_idx is not None:
-        scale[z_idx] = sz
-    return scale
+    return scales
+
+
+def compute_precache_scale_hint(
+    shape: Sequence[int],
+    dim_labels=None,
+    threshold: int = PRECACHE_THRESHOLD,
+    downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
+    pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+) -> List[int]:
+    """Per-axis scale_hint for the *coarsest* pyramid level a client requests.
+
+    The coarsest level the precache worker warms -- the last entry of
+    :func:`compute_pyramid_scale_hints`, kept as a thin wrapper so there is one
+    pyramid loop, not two.
+    """
+    return compute_pyramid_scale_hints(
+        shape,
+        dim_labels,
+        threshold=threshold,
+        downscale_factor=downscale_factor,
+        pixel_budget_cubic_root=pixel_budget_cubic_root,
+    )[-1]
+
+
+def build_pyramid_plan(
+    shape: Sequence[int],
+    dim_labels=None,
+    reduction_method: str = "area",
+    threshold: int = PRECACHE_THRESHOLD,
+    downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
+    pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+) -> List[PyramidLevel]:
+    """Server-advertised computed pyramid as a list of ``PyramidLevel`` protos.
+
+    Wraps :func:`compute_pyramid_scale_hints` (level 0 = full resolution,
+    coarsest last); each level carries its scale_hint, the on-the-fly
+    ``reduction_method``, and its logical shape ``ceil_div(base, scale)`` -- the
+    same extent ``get_read_plan`` returns for that scale, so a client can size
+    the level without a probe read. ``native`` is False (computed, not on-disk).
+
+    For sources that ship a real pyramid, the adapter overrides this with native
+    levels (see ``SourceAdapter.get_native_pyramid_levels``); this is the generic
+    fallback for everything else.
+    """
+    scales = compute_pyramid_scale_hints(
+        shape,
+        dim_labels,
+        threshold=threshold,
+        downscale_factor=downscale_factor,
+        pixel_budget_cubic_root=pixel_budget_cubic_root,
+    )
+    levels: List[PyramidLevel] = []
+    for scale in scales:
+        level_shape = [ceil_div(int(dim), s) for dim, s in zip(shape, scale)]
+        levels.append(
+            PyramidLevel(
+                scale_hint=scale,
+                reduction_method=reduction_method,
+                shape=level_shape,
+                native=False,
+            )
+        )
+    return levels
 
 
 def compute_safe_chunk_size(

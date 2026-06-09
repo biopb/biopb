@@ -56,9 +56,28 @@ which may expose multiple tensors (e.g., multi-field).
 
 | Method | Description |
 |--------|-------------|
-| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto |
-| `GetFlightInfo` | Returns chunk endpoints for a specific tensor, respecting `SliceHint` and `TensorReadOptions` in the descriptor |
+| `ListFlights` | Returns one `FlightInfo` per registered source, embedding a serialised `DataSourceDescriptor` proto. Lean: leaves `TensorDescriptor.pyramid` and `metadata_json` empty |
+| `GetFlightInfo` | Returns chunk endpoints for a specific tensor, respecting `SliceHint` and `TensorReadOptions` in the descriptor. Also fills `TensorDescriptor.pyramid` — the **server-advertised** resolution levels (see below) — and `metadata_json` when requested |
 | `DoGet` | Fetches a single chunk identified by a `TensorTicket`; reads from the adapter and returns a `RecordBatch` stream |
+
+#### Server-advertised pyramid (`TensorDescriptor.pyramid`)
+
+The server decides the resolution pyramid, rather than the client computing one
+from the tensor shape. `GetFlightInfo` fills `pyramid` with an ordered list of
+`PyramidLevel` (`scale_hint`, `reduction_method`, logical `shape`, `native`);
+level 0 is full resolution. The client reads each advertised level via the normal
+`scale_hint` path. Two sources of levels (`TensorFlightServer._advertised_pyramid`):
+
+- **Native** — adapters that ship a real on-disk pyramid override
+  `SourceAdapter.get_native_pyramid_levels()` (only `OmeZarrAdapter` today) to
+  return one `native=True`, `reduction_method="precompute"` level per multiscales
+  dataset, so the client requests the precomputed level directly. Each level's
+  `scale_hint` is the value `_find_level_for_scale` matches on, so it round-trips.
+- **Computed** — everything else gets `chunk.build_pyramid_plan(...)`, a full
+  pyramid (level 0 → coarsest) generated from the authoritative `[pyramid]` config
+  knobs (`threshold` / `downscale_factor` / `pixel_budget_cubic_root`). The
+  precache worker warms the *coarsest* of this same plan, so the warmed scale and
+  the advertised scale can never drift.
 
 ### BackendAdapter interface
 
@@ -69,6 +88,7 @@ All adapters implement `BackendAdapter`:
 | `get_tensor_descriptor()` | `TensorDescriptor` proto |
 | `get_chunk_endpoints(ticket)` | List of `ChunkBounds` |
 | `read_chunk(bounds)` | `np.ndarray` |
+| `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native on-disk levels (default `None`; `OmeZarrAdapter` overrides) |
 
 Concrete adapters:
 
@@ -434,6 +454,12 @@ port = 8815
 
 [cache]
 max_bytes = 2_000_000_000   # 2 GB in-process
+
+[pyramid]                    # authoritative resolution-level definition
+threshold = 4096             # max X/Y extent of the coarsest level
+downscale_factor = 4         # per-level step
+pixel_budget_cubic_root = 512  # coarsest level voxel budget = this**3
+reduction_method = "area"    # on-the-fly downsampling for computed levels
 
 [[sources]]
 url        = "/data/" # triggers recursive discovery

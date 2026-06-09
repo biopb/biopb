@@ -294,6 +294,7 @@ def _setup_flight_server(
         metadata_db=metadata_db,
         max_list_flights_results=server_config.metadata_db.max_list_flights_results,
         grpc_max_message_size=80 * 1024 * 1024,
+        pyramid_config=server_config.pyramid,
     )
 
     # Set up watcher for monitored sources (None for static-only configs)
@@ -346,7 +347,9 @@ def _setup_flight_server(
     # excluded. The worker itself no-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
-        precache_worker = PrecacheWorker(server, server_config.precache)
+        precache_worker = PrecacheWorker(
+            server, server_config.precache, server_config.pyramid
+        )
         source_manager._on_source_committed = precache_worker.enqueue
 
     if watcher and source_manager:
