@@ -539,6 +539,80 @@ _release_asset_url() {
         | grep -E "/$1\$" | head -1 || true
 }
 
+# Print the tail of the server log, indented, for diagnosing a bad startup.
+_tail_log() {
+    local log="$1"
+    [ -f "$log" ] || return 0
+    _info "recent server log ($log):"
+    tail -n 15 "$log" 2>/dev/null | while IFS= read -r line; do
+        printf "      ${DIM}%s${RESET}\n" "$line"
+    done
+}
+
+# Start (or restart) the background data server, then report its health.
+# Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
+# Starting now lets the pre-cache warm overviews before the user opens anything,
+# and a restart makes an already-running (stale) server pick up the new code.
+_start_data_server() {
+    local log_file="$HOME/.local/share/biopb/logs/tensor-server.log"
+
+    if [ "${BIOPB_NO_SERVER_START:-0}" = "1" ]; then
+        _info "Skipping server start (BIOPB_NO_SERVER_START=1)"
+        _info "  start it later with: ${CYAN}biopb server start${RESET}"
+        return 0
+    fi
+    if ! command -v biopb >/dev/null 2>&1; then
+        _warn "biopb not found on PATH; skipping server start"
+        _info "  start it later with: ${CYAN}biopb server start${RESET}"
+        return 0
+    fi
+
+    # 'restart' loads the just-installed code if a server is already running,
+    # and is a plain start otherwise.
+    biopb server restart >/dev/null 2>&1 || true
+
+    # Ask the daemon for its health, polling until it reaches SERVING (or 60s).
+    # stderr carries live progress ("data server starting - N found so far...")
+    # and is intentionally NOT swallowed so the user sees the wait; stdout is the
+    # JSON verdict we parse below.
+    local out health count
+    out=$(biopb server status --json --wait 60) || out=""
+
+    # Tolerate an older biopb that predates --json/--wait: fall back to a plain
+    # liveness check so the installer still works during a version transition.
+    if [ -z "$out" ]; then
+        if biopb server status 2>/dev/null | grep -q "Running"; then
+            _ok "Data server started"
+        else
+            _warn "Data server may not have started"
+            _tail_log "$log_file"
+            _info "  full log: ${CYAN}$log_file${RESET}"
+        fi
+        return 0
+    fi
+
+    health=$(printf '%s' "$out" | sed -n 's/.*"health"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    count=$(printf '%s' "$out" | sed -n 's/.*"source_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+
+    if [ "$health" != "SERVING" ]; then
+        _warn "Data server did not come up cleanly"
+        _info "  it may still be scanning a large folder, or failed to start:"
+        _tail_log "$log_file"
+        _info "  full log: ${CYAN}$log_file${RESET}"
+        return 0
+    fi
+
+    if [ -z "$count" ] || [ "$count" = "0" ]; then
+        _warn "Data server is running but found no data sources"
+        _info "  check that your data folder holds supported images (see config):"
+        _cmd "  $CONFIG_FILE"
+        _tail_log "$log_file"
+        return 0
+    fi
+
+    _ok "Data server ready — $count data source(s) found; pre-caching overviews"
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -569,7 +643,7 @@ install_biopb() {
     echo ""
 
     # ===== 0. System Check =====
-    _step "[0/6] Checking system..."
+    _step "[0/7] Checking system..."
 
     OS=$(uname -s)
     ARCH=$(uname -m)
@@ -649,7 +723,7 @@ install_biopb() {
     echo ""
 
     # ===== 1. Install uv + buf (if needed) =====
-    _step "[1/6] Ensuring build tools..."
+    _step "[1/7] Ensuring build tools..."
 
     # Remember the user's real shell PATH before we prepend ~/.local/bin for our
     # own process — _ensure_local_bin_on_path needs it to tell whether the dir is
@@ -689,7 +763,7 @@ install_biopb() {
     fi
 
     # ===== 2. Python =====
-    _step "[2/6] Ensuring Python..."
+    _step "[2/7] Ensuring Python..."
 
     # biopb-mcp (always installed) requires Python >= 3.10.
     MIN_MINOR=10
@@ -734,7 +808,7 @@ install_biopb() {
     fi
 
     # ===== 3. Install biopb packages =====
-    _step "[3/6] Installing biopb packages..."
+    _step "[3/7] Installing biopb packages..."
 
     TENSOR_EXTRAS="web,aics,medical,ndtiff,hdf5"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
@@ -822,7 +896,7 @@ install_biopb() {
     _ok "$VERSION_OUTPUT"
 
     # ===== 4. Webapp =====
-    _step "[4/6] Installing data browser..."
+    _step "[4/7] Installing data browser..."
 
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
@@ -855,7 +929,7 @@ install_biopb() {
     fi
 
     # ===== 5. Config =====
-    _step "[5/6] Config..."
+    _step "[5/7] Config..."
 
     mkdir -p "$CONFIG_DIR"
     CONFIG_FILE="$CONFIG_DIR/biopb.toml"
@@ -900,8 +974,14 @@ EOF
         _ok "Created: $CONFIG_FILE"
     fi
 
-    # ===== 6. Wire biopb-mcp into the user's agent system =====
-    _step "[6/6] Configuring MCP client..."
+    # ===== 6. Start the data server =====
+    # Before MCP wiring so a typo in the data dir (step 5) surfaces right after
+    # the choice, while pre-cache gets the earliest possible head start.
+    _step "[6/7] Starting data server..."
+    _start_data_server
+
+    # ===== 7. Wire biopb-mcp into the user's agent system =====
+    _step "[7/7] Configuring MCP client..."
 
     # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
     # agents; if none is present, offer to install opencode so the user ends up

@@ -1,5 +1,6 @@
 """Top-level CLI for BioPB."""
 
+import json
 import os
 import signal
 import subprocess
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
-from typing import Optional
+from typing import Optional, Tuple
 
 import typer
 
@@ -488,29 +489,143 @@ def restart(
     start(config=config, static_dir=static_dir, web_port=web_port, web_host=web_host, log_level=log_level, token=token)
 
 
+def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
+    """Best-effort gRPC endpoint + token for a running server's health query.
+
+    Reads host/port from the TOML config (defaults 127.0.0.1:8815); a server
+    bound to 0.0.0.0/:: is reached over loopback. The token comes from
+    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
+    """
+    host, port = "127.0.0.1", 8815
+    if config and config.exists():
+        try:
+            from biopb_tensor_server.config import load_config as _load_server_config
+            cfg = _load_server_config(config)
+            host = cfg.host or host
+            port = int(cfg.port or port)
+        except Exception:
+            pass
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
+    return f"grpc://{host}:{port}", token
+
+
+def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
+    """Return the server's Flight health dict, or None if unreachable."""
+    try:
+        from biopb.tensor.client import TensorFlightClient
+    except Exception:
+        return None
+    client = None
+    try:
+        client = TensorFlightClient(location, cache_bytes=0, token=token)
+        return client.health_check()
+    except Exception:
+        return None
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 @server_app.command("status")
-def status():
-    """Check TensorFlight server daemon status."""
+def status(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+    wait: float = typer.Option(
+        0.0,
+        "--wait",
+        "-w",
+        help="Seconds to poll for the server to reach SERVING (0 = check once)",
+    ),
+):
+    """Check TensorFlight server daemon status and live health."""
     pid = _read_pid()
+    running = bool(pid and _is_process_running(pid))
+    stale = bool(pid and not running)
+
+    # When running, ask the daemon for its Flight health (status + source_count),
+    # polling up to --wait for it to finish its initial scan and report SERVING.
+    health: Optional[dict] = None
+    if running:
+        location, token = _resolve_grpc_endpoint(config)
+        deadline = time.monotonic() + max(0.0, wait)
+        last_report = None
+        while True:
+            health = _query_health(location, token)
+            st = health.get("status") if health else None
+            n = health.get("source_count") if health else None
+            # While waiting, log human-facing progress to stderr so stdout stays
+            # clean for --json. The terminal SERVING line is left to the table /
+            # JSON (or the caller) so we don't duplicate the final verdict.
+            if wait > 0 and st != "SERVING":
+                report = (
+                    "waiting for the data server to come up..."
+                    if st is None
+                    else f"data server starting - {n} source(s) found so far..."
+                )
+                if report != last_report:
+                    print(report, file=sys.stderr, flush=True)
+                    last_report = report
+            if (health and st == "SERVING") or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+
+    health_status = health.get("status") if health else None
+    source_count = health.get("source_count") if health else None
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "running": running,
+                    "pid": pid if running else None,
+                    "status": "running"
+                    if running
+                    else ("stale" if stale else "stopped"),
+                    "health": health_status,
+                    "source_count": source_count,
+                    "writable": health.get("writable") if health else None,
+                    "uptime_seconds": health.get("uptime_seconds") if health else None,
+                }
+            )
+        )
+        raise typer.Exit(0)
 
     table = Table(title="TensorFlight Server Status")
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="green")
 
-    if not pid:
-        table.add_row("Status", "Not running")
+    if not running:
+        table.add_row("Status", "Not running (stale PID)" if stale else "Not running")
+        if stale:
+            table.add_row("PID file", str(PID_FILE) + " (stale)")
         console.print(table)
         raise typer.Exit(0)
 
-    if _is_process_running(pid):
-        table.add_row("Status", "Running")
-        table.add_row("PID", str(pid))
-        table.add_row("PID file", str(PID_FILE))
-        table.add_row("Log file", str(_get_log_file()))
+    table.add_row("Status", "Running")
+    table.add_row("PID", str(pid))
+    if health:
+        table.add_row("Health", str(health_status))
+        if source_count is not None:
+            table.add_row("Sources", str(source_count))
+        if health.get("uptime_seconds") is not None:
+            table.add_row("Uptime", f"{health.get('uptime_seconds')}s")
+        if health.get("writable") is not None:
+            table.add_row("Writable", str(health.get("writable")))
     else:
-        table.add_row("Status", "Not running (stale PID)")
-        table.add_row("PID file", str(PID_FILE) + " (stale)")
-
+        table.add_row("Health", "unreachable")
+    table.add_row("Config", str(config))
+    table.add_row("PID file", str(PID_FILE))
+    table.add_row("Log file", str(_get_log_file()))
     console.print(table)
 
 
