@@ -9,19 +9,24 @@ from typing import List, Optional, Tuple
 
 from biopb.tensor import TensorFlightClient
 
-logger = logging.getLogger(__name__)
+from ._config import get_setting, load_config
 
-PYRAMID_THRESHOLD = 4096
+logger = logging.getLogger(__name__)
 
 
 def get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
     """Get indices of x and y dimensions from tensor descriptor.
 
     Uses dim_labels as primary source (looks for 'x', 'y').
-    Falls back to last two dimensions if dim_labels not available.
+    Falls back to the last two dimensions under the standard ``[..., Y, X]``
+    convention (X last, Y second-to-last) when dim_labels are unavailable.
 
     Returns:
         Tuple of (y_index, x_index) - y first for row/col convention
+
+    Raises:
+        ValueError: the tensor has fewer than 2 dimensions (not a displayable
+            image).
     """
     ndim = len(tensor_desc.shape)
 
@@ -34,10 +39,35 @@ def get_xy_dim_indices(tensor_desc) -> Tuple[int, int]:
         except ValueError:
             pass
 
-    if ndim >= 2:
-        return (ndim - 1, ndim - 2)
+    if ndim < 2:
+        raise ValueError(
+            f"Cannot identify x/y dimensions: tensor is {ndim}-D; napari needs "
+            "at least 2 dimensions to display an image."
+        )
+    # Standard [..., Y, X]: X is the last axis, Y the second-to-last.
+    return (ndim - 2, ndim - 1)
 
-    return (0, 1) if ndim == 2 else (0, 0)
+
+def get_z_dim_index(tensor_desc) -> Optional[int]:
+    """Index of the z (depth) axis, or ``None`` when the tensor has none.
+
+    Respects ``dim_labels`` ('z') first: when labels are present but carry no
+    'z', the tensor is taken to have no depth axis (``None``) -- not every 3-D+
+    tensor is volumetric (``[T, Y, X]``, ``[C, Y, X]`` have no z). With no
+    labels, assume the positional ``[..., Z, Y, X]`` convention -- the
+    third-from-last axis -- for 3-D+ tensors, and ``None`` for <3-D.
+
+    napari's 3-D mode displays the last three axes positionally, so this is only
+    the *true* depth when z sits at ``ndim-3``; a label-identified z elsewhere
+    is a mis-ordered source (handled by transposing to ``[..., Z, Y, X]``, a
+    separate concern). Mis-identifying a small channel/time axis as z is
+    low-risk: such axes stay below the pyramid floor and are never downsampled.
+    """
+    ndim = len(tensor_desc.shape)
+    if tensor_desc.dim_labels:
+        labels_lower = [str(label).lower() for label in tensor_desc.dim_labels]
+        return labels_lower.index("z") if "z" in labels_lower else None
+    return ndim - 3 if ndim >= 3 else None
 
 
 def build_pyramid_levels(
@@ -45,41 +75,92 @@ def build_pyramid_levels(
     source_id: str,
     tensor_id: str,
     tensor_desc,
+    config: Optional[dict] = None,
 ) -> List:
-    """Build pyramid levels for large x-y datasets.
+    """Build resolution-pyramid levels for a tensor.
+
+    One unified rule serves 2-D and 3-D data and bounds napari's 3-D
+    whole-volume read (issue #29). All knobs come from the ``pyramid`` config
+    section (``config`` defaults to the on-disk config):
+
+    - ``threshold`` -- max x/y extent of the coarsest level (caps 2-D reads),
+    - ``downscale_factor`` -- linear step between levels,
+    - ``pixel_budget_cubic_root`` -- per-axis floor; its cube is the max voxels
+      (``Lx*Ly*Lz``) allowed in the coarsest level, bounding the whole-volume
+      read napari issues in 3-D. Stored as the cube root (not the product) so
+      the floor and the budget are exact integers, free of cube-root rounding.
+
+    Each level is requested at the current per-axis scale, then x, y and z are
+    downsampled *individually* -- skipping any axis that has reached the floor
+    (``pixel_budget_cubic_root``, capped at ``threshold``) -- until the coarsest
+    level fits both the voxel budget and ``threshold`` in x/y. The floor keeps
+    small axes (channels, time, thin z) from being over-shrunk and guarantees
+    termination: once every axis is at or below it, ``Lx*Ly*Lz <= floor**3 <=
+    budget`` and ``Lx, Ly <= threshold``. A tensor without a z axis is treated
+    as ``Lz = 1`` and never gets a z scale factor.
+
+    The per-level extents are read from the *returned* array's shape, not
+    computed as ``L // scale`` -- the server's downsample rounding (floor vs
+    ceil) is not part of the API contract, so trusting the real shape keeps the
+    budget check correct either way.
 
     Returns:
         List of dask arrays at different resolution levels (pyramid)
     """
-    shape = tensor_desc.shape
-    ndim = len(shape)
+    if config is None:
+        config = load_config()
+    threshold = get_setting(config, "pyramid.threshold")
+    downscale_factor = get_setting(config, "pyramid.downscale_factor")
+    budget_root = get_setting(config, "pyramid.pixel_budget_cubic_root")
+    pixel_budget = budget_root**3
+
+    ndim = len(tensor_desc.shape)
 
     y_idx, x_idx = get_xy_dim_indices(tensor_desc)
+    z_idx = get_z_dim_index(tensor_desc)
+    # A degenerate label set could map z onto an x/y axis; drop it if so.
+    if z_idx is not None and z_idx in (x_idx, y_idx):
+        z_idx = None
 
-    x_size = shape[x_idx]
-    y_size = shape[y_idx]
-
-    if x_size <= PYRAMID_THRESHOLD and y_size <= PYRAMID_THRESHOLD:
-        return [client.get_tensor(source_id, tensor_id)]
+    # Stop shrinking an axis once it reaches this floor; see the docstring for
+    # why the cube-root-capped-at-threshold value guarantees termination.
+    axis_floor = min(budget_root, threshold)
 
     levels = []
-    scale = 1
-    min_size = 256
+    sx = sy = sz = 1
 
     while True:
         scale_hint = [1] * ndim
-        scale_hint[y_idx] = scale
-        scale_hint[x_idx] = scale
+        scale_hint[x_idx] = sx
+        scale_hint[y_idx] = sy
+        if z_idx is not None:
+            scale_hint[z_idx] = sz
 
         arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
         levels.append(arr)
 
-        scaled_x = x_size // scale
-        scaled_y = y_size // scale
-        if scaled_x < min_size or scaled_y < min_size:
+        # Real downsampled extents from the returned array, not floor(L/scale).
+        lx = arr.shape[x_idx]
+        ly = arr.shape[y_idx]
+        lz = arr.shape[z_idx] if z_idx is not None else 1
+        if (
+            lx * ly * lz <= pixel_budget
+            and lx <= threshold
+            and ly <= threshold
+        ):
             break
 
-        scale *= 2
+        # Downsample each axis individually, leaving any already at the floor.
+        nsx = sx * downscale_factor if lx > axis_floor else sx
+        nsy = sy * downscale_factor if ly > axis_floor else sy
+        nsz = (
+            sz * downscale_factor
+            if (z_idx is not None and lz > axis_floor)
+            else sz
+        )
+        if (nsx, nsy, nsz) == (sx, sy, sz):
+            break  # nothing left to shrink; avoid an infinite loop
+        sx, sy, sz = nsx, nsy, nsz
 
     return levels
 
@@ -92,9 +173,10 @@ def build_layer_scale(
 ) -> Tuple[Optional[List[float]], Optional[dict]]:
     """Build a napari ``scale`` vector from a source's OME pixel sizes.
 
-    Reads ``client.get_source_metadata`` (an ``ome_types`` OME object) and maps
-    ``physical_size_x/y/z`` onto the tensor's dimension axes, so areas/volumes
-    the agent computes come out in physical units (e.g. µm²) instead of pixels.
+    Reads ``client.get_source_metadata`` (a dict — the server's OME model
+    dumped to JSON) and maps ``physical_size_x/y/z`` onto the tensor's
+    dimension axes, so areas/volumes the agent computes come out in physical
+    units (e.g. µm²) instead of pixels.
 
     Axis order comes from ``tensor_desc.dim_labels``, falling back to the source
     descriptor's ``dim_labels`` (``source_desc``) when the per-tensor labels are
@@ -118,17 +200,17 @@ def build_layer_scale(
     try:
         metadata = client.get_source_metadata(source_id)
 
-        images = getattr(metadata, "images", None)
+        images = metadata.get("images") if isinstance(metadata, dict) else None
         if not images:
             return None, None
-        pixels = getattr(images[0], "pixels", None)
-        if pixels is None:
+        pixels = images[0].get("pixels")
+        if not pixels:
             return None, None
 
         psize = {
-            "x": _positive_float(getattr(pixels, "physical_size_x", None)),
-            "y": _positive_float(getattr(pixels, "physical_size_y", None)),
-            "z": _positive_float(getattr(pixels, "physical_size_z", None)),
+            "x": _positive_float(pixels.get("physical_size_x")),
+            "y": _positive_float(pixels.get("physical_size_y")),
+            "z": _positive_float(pixels.get("physical_size_z")),
         }
         if not any(psize.values()):
             return None, None
@@ -156,17 +238,60 @@ def build_layer_scale(
             "physical_size_x": psize["x"],
             "physical_size_y": psize["y"],
             "physical_size_z": psize["z"],
-            "physical_size_x_unit": getattr(
-                pixels, "physical_size_x_unit", None
-            ),
-            "physical_size_y_unit": getattr(
-                pixels, "physical_size_y_unit", None
-            ),
-            "physical_size_z_unit": getattr(
-                pixels, "physical_size_z_unit", None
-            ),
+            "physical_size_x_unit": pixels.get("physical_size_x_unit"),
+            "physical_size_y_unit": pixels.get("physical_size_y_unit"),
+            "physical_size_z_unit": pixels.get("physical_size_z_unit"),
         }
         return scale, info
     except Exception as exc:
         logger.warning("build_layer_scale failed for %s: %s", source_id, exc)
         return None, None
+
+
+def add_tensor_layer(
+    viewer,
+    client: TensorFlightClient,
+    source_id: str,
+    tensor_id: str,
+    tensor_desc,
+    *,
+    name: str,
+    source_desc=None,
+    compute_scheduler: Optional[str] = None,
+    config: Optional[dict] = None,
+):
+    """Build a tensor's pyramid and add it to *viewer* as an image layer.
+
+    The shared "load a tensor into the viewer" pipeline used by both the Tensor
+    Browser widget and the MCP ``add_tensor``: build pyramid levels, pin their
+    slice reads to a single-process scheduler so the serial viewer shares the
+    main-process chunk cache (issue #8; no-op standalone), attach the source's
+    OME physical pixel size as ``scale`` + ``metadata['ome_physical_size']`` so
+    the agent's areas/volumes come out in physical units, then ``add_image``
+    (``multiscale=True`` when there is more than one level).
+
+    Source resolution, layer *name*, and any cursor/logging/error handling stay
+    with the caller; everything from building levels through ``add_image`` is
+    uniform here so the three call sites can't drift.
+
+    Returns the created napari layer.
+    """
+    from ._viewer_compute import wrap_levels
+
+    levels = build_pyramid_levels(
+        client, source_id, tensor_id, tensor_desc, config=config
+    )
+    levels = wrap_levels(levels, compute_scheduler)
+
+    add_kwargs = {"name": name}
+    scale, phys = build_layer_scale(
+        client, source_id, tensor_desc, source_desc=source_desc
+    )
+    if scale is not None:
+        add_kwargs["scale"] = scale
+    if phys is not None:
+        add_kwargs["metadata"] = {"ome_physical_size": phys}
+
+    if len(levels) > 1:
+        return viewer.add_image(levels, multiscale=True, **add_kwargs)
+    return viewer.add_image(levels[0], **add_kwargs)

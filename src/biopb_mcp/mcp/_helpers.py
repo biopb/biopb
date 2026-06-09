@@ -75,8 +75,7 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
         Returns:
             The name of the created viewer layer.
         """
-        from .._tensor_utils import build_layer_scale, build_pyramid_levels
-        from .._viewer_compute import wrap_levels
+        from .._tensor_utils import add_tensor_layer
 
         client = connection.client
         if client is None:
@@ -119,10 +118,6 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
                 f"Tensor '{tensor_id}' not found in source '{source_id}'"
             )
 
-        levels = build_pyramid_levels(
-            client, source_id, tensor_id, tensor_desc
-        )
-
         if name is None:
             stem = _get_url_stem(src.source_url) or source_id
             if len(src.tensors) > 1:
@@ -130,25 +125,18 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
             else:
                 name = stem
 
-        # Pull OME physical pixel size so the agent's areas/volumes come out
-        # in physical units (e.g. µm²) rather than pixels (review finding B3).
-        scale, phys = build_layer_scale(
-            client, source_id, tensor_desc, source_desc=src
+        # Shared build-pyramid -> wrap -> OME scale -> add_image pipeline
+        # (also used by the Tensor Browser widget).
+        add_tensor_layer(
+            viewer,
+            client,
+            source_id,
+            tensor_id,
+            tensor_desc,
+            name=name,
+            source_desc=src,
+            compute_scheduler=compute_scheduler,
         )
-        add_kwargs = {"name": name}
-        if scale is not None:
-            add_kwargs["scale"] = scale
-        if phys is not None:
-            add_kwargs["metadata"] = {"ome_physical_size": phys}
-
-        # Pin the viewer's slice reads to a single-process scheduler so the
-        # serial viewer shares the main-process chunk cache (issue #8).
-        levels = wrap_levels(levels, compute_scheduler)
-
-        if len(levels) > 1:
-            viewer.add_image(levels, multiscale=True, **add_kwargs)
-        else:
-            viewer.add_image(levels[0], **add_kwargs)
 
         return name
 

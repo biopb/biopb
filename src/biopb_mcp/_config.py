@@ -12,6 +12,10 @@ The schema is grouped by concern:
 - ``tensor_browser`` -- data-plane URL, read by the GUI-independent
                         ``TensorConnection`` (so the headless MCP kernel uses it
                         too -- this is deliberately *not* under ``widget``).
+- ``pyramid``        -- multiscale pyramid construction knobs (``threshold`` /
+                        ``downscale_factor``), shared by the browser widget and
+                        MCP ``add_tensor``; GUI-independent like
+                        ``tensor_browser``.
 - ``timeout``/``grpc``/``memory`` -- compute-plane knobs shared by the demo
                         widgets' gRPC path and the MCP kernel's ``ops``.
 - ``mcp``            -- the MCP server, split into ``transport`` / ``kernel`` /
@@ -55,6 +59,38 @@ DEFAULT_CONFIG = {
     },
     "tensor_browser": {
         "server_url": "grpc://localhost:8815",
+    },
+    # Multiscale pyramid construction for large tensors, shared by the Tensor
+    # Browser widget and the MCP `add_tensor` (both call
+    # `_tensor_utils.build_pyramid_levels`). Top-level because it is a
+    # GUI-independent data-plane concern, like `tensor_browser`.
+    "pyramid": {
+        # Don't build a pyramid unless an x/y dimension exceeds this size; also
+        # the stop criterion -- levels are emitted until the coarsest one fits
+        # within `threshold` in both x and y. So the coarsest level always lands
+        # in (threshold // downscale_factor, threshold].
+        "threshold": 4096,
+        # Linear downscale between successive levels. A 4x step (vs the
+        # conventional 2x) roughly halves the level count for a large image,
+        # halving the per-level `get_tensor` round trips paid on every
+        # `add_tensor` (the dominant cost of pyramid construction). Coarser than
+        # 2x, so napari may read up to 4x more pixels per slice when zoom falls
+        # between levels; napari infers level ratios from array shapes, so
+        # non-2x steps are fine.
+        "downscale_factor": 4,
+        # Per-axis edge length of the coarsest level's 3D whole-volume read
+        # (issue #29). napari's 3D mode reads the entire coarsest level (its last
+        # three axes -- z, y, x) in one shot, so an XY-only pyramid OOMs on a
+        # deep stack. The voxel budget is this value CUBED (Lx*Ly*Lz); we store
+        # the cube root, not the product, so the floor `min(root, threshold)` and
+        # the budget `root**3` are exact integers instead of a fragile
+        # `round(product ** (1/3))`. Levels are emitted until the coarsest fits
+        # BOTH the budget and `threshold` in x/y; x/y/z are downsampled
+        # individually, each stopping at this floor so small axes (channels,
+        # time, thin z) are never over-shrunk. Default 512 -> ~134M voxels.
+        # Voxel count, not bytes -- multiply by the dtype itemsize for the
+        # actual read size.
+        "pixel_budget_cubic_root": 512,
     },
     "timeout": {
         "health_check": 5.0,

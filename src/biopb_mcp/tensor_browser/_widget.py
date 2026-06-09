@@ -33,8 +33,7 @@ from qtpy.QtWidgets import (
 )
 
 from .._connection import ServerStarting, TensorConnection
-from .._tensor_utils import build_layer_scale, build_pyramid_levels
-from .._viewer_compute import wrap_levels
+from .._tensor_utils import add_tensor_layer
 
 if TYPE_CHECKING:
     import napari
@@ -937,48 +936,25 @@ class TensorBrowserWidget(QWidget):
         try:
             for tensor in src.tensors:
                 try:
-                    # Build pyramid levels if needed
-                    levels = build_pyramid_levels(
-                        self._client, source_id, tensor.array_id, tensor
-                    )
-                    # Pin slice reads to a single-process scheduler in the MCP
-                    # context (no-op standalone); see issue #8.
-                    levels = wrap_levels(levels, self._compute_scheduler)
                     tensor_name = _tensor_short_name(tensor.array_id)
                     layer_name = f"{stem}/{tensor_name}"
-
-                    # OME physical pixel size → layer.scale (B3).
-                    scale, _ = build_layer_scale(
-                        self._client, source_id, tensor, source_desc=src
+                    # Shared build-pyramid -> wrap -> OME scale -> add_image
+                    # pipeline (also used by the MCP add_tensor).
+                    add_tensor_layer(
+                        self._viewer,
+                        self._client,
+                        source_id,
+                        tensor.array_id,
+                        tensor,
+                        name=layer_name,
+                        source_desc=src,
+                        compute_scheduler=self._compute_scheduler,
                     )
-                    scale_kwargs = (
-                        {"scale": scale} if scale is not None else {}
+                    logger.info(
+                        "Added tensor layer '%s' from source '%s'",
+                        layer_name,
+                        source_id,
                     )
-
-                    # Add as multiscale pyramid if multiple levels
-                    if len(levels) > 1:
-                        self._viewer.add_image(
-                            levels,
-                            name=layer_name,
-                            multiscale=True,
-                            **scale_kwargs,
-                        )
-                        logger.info(
-                            "Added multiscale pyramid '%s' (%d levels) from source '%s'",
-                            layer_name,
-                            len(levels),
-                            source_id,
-                        )
-                    else:
-                        self._viewer.add_image(
-                            levels[0], name=layer_name, **scale_kwargs
-                        )
-                        logger.info(
-                            "Added tensor '%s' from source '%s' to viewer as '%s'",
-                            tensor.array_id,
-                            source_id,
-                            layer_name,
-                        )
                 except Exception:
                     logger.exception(
                         "Failed to load tensor %s", tensor.array_id
@@ -1124,17 +1100,6 @@ class TensorBrowserWidget(QWidget):
             # Show busy cursor during loading
             QApplication.setOverrideCursor(Qt.BusyCursor)
 
-            # Build pyramid levels if x-y dimensions are large
-            levels = build_pyramid_levels(
-                self._client,
-                self._selected_source_id,
-                self._selected_tensor_id,
-                tensor_desc,
-            )
-            # Pin slice reads to a single-process scheduler in the MCP context
-            # (no-op standalone); see issue #8.
-            levels = wrap_levels(levels, self._compute_scheduler)
-
             # Build layer name: source_url.stem[/tensor_short_name]
             url_parts = _get_path_parts(src.source_url)
             stem = url_parts[-1] if url_parts else self._selected_source_id
@@ -1145,39 +1110,23 @@ class TensorBrowserWidget(QWidget):
                 tensor_name = _tensor_short_name(self._selected_tensor_id)
                 layer_name = f"{stem}/{tensor_name}"
 
-            # OME physical pixel size → layer.scale (review finding B3).
-            scale, _ = build_layer_scale(
+            # Shared build-pyramid -> wrap -> OME scale -> add_image pipeline
+            # (also used by the MCP add_tensor).
+            add_tensor_layer(
+                self._viewer,
                 self._client,
                 self._selected_source_id,
+                self._selected_tensor_id,
                 tensor_desc,
+                name=layer_name,
                 source_desc=src,
+                compute_scheduler=self._compute_scheduler,
             )
-            scale_kwargs = {"scale": scale} if scale is not None else {}
-
-            # Add as multiscale pyramid if multiple levels, otherwise single array
-            if len(levels) > 1:
-                self._viewer.add_image(
-                    levels,
-                    name=layer_name,
-                    multiscale=True,
-                    **scale_kwargs,
-                )
-                logger.info(
-                    "Added multiscale pyramid '%s' (%d levels) from source '%s'",
-                    layer_name,
-                    len(levels),
-                    self._selected_source_id,
-                )
-            else:
-                self._viewer.add_image(
-                    levels[0], name=layer_name, **scale_kwargs
-                )
-                logger.info(
-                    "Added tensor '%s' from source '%s' to viewer as '%s'",
-                    self._selected_tensor_id,
-                    self._selected_source_id,
-                    layer_name,
-                )
+            logger.info(
+                "Added tensor layer '%s' from source '%s'",
+                layer_name,
+                self._selected_source_id,
+            )
 
         except Exception:
             self._show_error("Failed to load tensor")

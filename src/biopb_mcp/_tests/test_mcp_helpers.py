@@ -207,23 +207,23 @@ class TestPatchViewerAddTensor:
             viewer.add_tensor("src1", tensor_id="wrong")
 
     def test_applies_ome_scale_and_metadata(self, viewer, connection):
-        import types
-
         tensor = _make_tensor("t1", [256, 256])
         tensor.dim_labels = ["y", "x"]
         src = _make_source("http://server/data/cal", [tensor])
         client = MagicMock()
-        pixels = types.SimpleNamespace(
-            physical_size_x=0.5,
-            physical_size_y=0.25,
-            physical_size_z=None,
-            physical_size_x_unit="µm",
-            physical_size_y_unit="µm",
-            physical_size_z_unit=None,
-        )
-        client.get_source_metadata.return_value = types.SimpleNamespace(
-            images=[types.SimpleNamespace(pixels=pixels)]
-        )
+        # get_source_metadata returns the OME model as a dict (server's OME
+        # model dumped to JSON), matching the real client contract.
+        pixels = {
+            "physical_size_x": 0.5,
+            "physical_size_y": 0.25,
+            "physical_size_z": None,
+            "physical_size_x_unit": "µm",
+            "physical_size_y_unit": "µm",
+            "physical_size_z_unit": None,
+        }
+        client.get_source_metadata.return_value = {
+            "images": [{"pixels": pixels}]
+        }
         connection.client = client
         connection.sources = {"src1": src}
 
