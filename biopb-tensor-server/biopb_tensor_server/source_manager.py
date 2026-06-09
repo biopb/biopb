@@ -143,15 +143,24 @@ class SourceManager:
         Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
         can't be stat-ed (e.g. removed between commit and this call).
         """
+        # Snapshot under the same lock that guards claim mutations: the watcher's
+        # event-loop thread adds/removes claims via _commit_add_claim /
+        # _commit_remove_claim, so iterating self._state.claims unlocked could
+        # race a concurrent rescan ("dict changed size during iteration"). Copy
+        # the few fields we need under the lock, then stat() outside it (I/O).
+        with self._lock:
+            snapshot = [
+                (claim.source_id, claim.primary_path)
+                for claim in self._state.claims.values()
+                if not claim.is_remote
+            ]
         out: List[Tuple[str, float]] = []
-        for claim in list(self._state.claims.values()):
-            if claim.is_remote:
-                continue
+        for source_id, primary_path in snapshot:
             try:
-                mtime = os.stat(claim.primary_path).st_mtime
+                mtime = os.stat(primary_path).st_mtime
             except OSError:
                 continue
-            out.append((claim.source_id, mtime))
+            out.append((source_id, mtime))
         return out
 
     def stop(self) -> None:

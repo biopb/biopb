@@ -627,6 +627,46 @@ class TestIterLocalSourceMtimes:
         finally:
             server.shutdown()
 
+    def test_snapshot_taken_under_lock(self):
+        # The read must snapshot _state.claims under self._lock (the same lock
+        # _commit_add_claim/_commit_remove_claim hold) so it can't iterate the
+        # dict while the watcher's event loop mutates it. Prove it by holding the
+        # lock in another thread: the reader must block until it is released.
+        server, sm = self._bare_sm()
+        holder = None
+        try:
+            sm._state.claims["a"] = SimpleNamespace(
+                source_id="a", primary_path="/x", is_remote=True
+            )
+            held = threading.Event()
+            release = threading.Event()
+            done = threading.Event()
+
+            def hold_lock():
+                with sm._lock:
+                    held.set()
+                    release.wait(2.0)
+
+            holder = threading.Thread(target=hold_lock, daemon=True)
+            holder.start()
+            assert held.wait(1.0)
+
+            reader = threading.Thread(
+                target=lambda: (sm.iter_local_source_mtimes(), done.set()),
+                daemon=True,
+            )
+            reader.start()
+            # Lock is held elsewhere -> the snapshot can't proceed yet.
+            assert not done.wait(0.3)
+            release.set()
+            # Released -> the read completes.
+            assert done.wait(2.0)
+        finally:
+            release.set()
+            if holder is not None:
+                holder.join(1.0)
+            server.shutdown()
+
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestBacklogWarming:
