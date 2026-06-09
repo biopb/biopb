@@ -85,13 +85,19 @@ _checkbox() {
 }
 
 # Prompt the user to choose a data directory.
-# Usage: _pick_data_dir <varname>  — writes result into caller's variable (no subshell).
-# All prompts go to /dev/tty. Requires PLATFORM to be set before calling.
+# Usage: _pick_data_dir <varname> [keep]  — writes result into caller's variable
+# (no subshell). All prompts go to /dev/tty. Requires PLATFORM to be set first.
+#
+# When the second arg is non-empty ("keep" mode), an extra "0) Keep my current
+# config file" option is shown as the *default*; choosing it (or Enter, or any
+# invalid input) returns the empty string as a sentinel meaning "don't touch the
+# existing config." Callers pass this when a biopb.toml already exists.
 _pick_data_dir() {
     # Caller passes the name of a variable to receive the result. We assign into
     # it with `printf -v` rather than a `local -n` nameref, because namerefs need
     # bash >= 4.3 and macOS ships bash 3.2.
     local _retvar_name=$1
+    local keep_mode="${2:-}"
     local candidates=() seen=()
 
     for dir in \
@@ -123,17 +129,26 @@ _pick_data_dir() {
     local default_dir="${candidates[0]:-$HOME}"
 
     printf "\n  %sSelect your microscopy data directory:%s\n\n" "$BOLD" "$RESET" >/dev/tty
+    if [ -n "$keep_mode" ]; then
+        printf "    ${CYAN}0)${RESET} Keep my current config file ${DIM}(default)${RESET}\n" >/dev/tty
+    fi
     local i=1
     for dir in "${candidates[@]+"${candidates[@]}"}"; do
         printf "    ${CYAN}%d)${RESET} %s\n" "$i" "$dir" >/dev/tty
         i=$((i + 1))
     done
     printf "    ${CYAN}%d)${RESET} Enter path manually\n\n" "$manual_opt" >/dev/tty
-    printf "  %sChoice [1]:%s " "$DIM" "$RESET" >/dev/tty
-    local choice; read -r choice </dev/tty
-    choice="${choice:-1}"
 
-    if [ "$choice" = "$manual_opt" ]; then
+    # Default differs by mode: keep current config (0) vs first candidate (1).
+    local default_choice=1
+    [ -n "$keep_mode" ] && default_choice=0
+    printf "  %sChoice [%s]:%s " "$DIM" "$default_choice" "$RESET" >/dev/tty
+    local choice; read -r choice </dev/tty
+    choice="${choice:-$default_choice}"
+
+    if [ -n "$keep_mode" ] && [ "$choice" = "0" ]; then
+        printf -v "$_retvar_name" '%s' ""   # sentinel: keep the existing config
+    elif [ "$choice" = "$manual_opt" ]; then
         local manual
         printf "  Path [%s]: " "$default_dir" >/dev/tty
         read -r manual </dev/tty
@@ -141,6 +156,10 @@ _pick_data_dir() {
         printf -v "$_retvar_name" '%s' "${manual:-$default_dir}"
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
         printf -v "$_retvar_name" '%s' "${candidates[$((choice - 1))]}"
+    elif [ -n "$keep_mode" ]; then
+        # In keep mode, an unrecognized choice is non-destructive: keep the config.
+        printf "  Invalid choice, keeping current config\n" >/dev/tty
+        printf -v "$_retvar_name" '%s' ""
     else
         printf "  Invalid choice, using default\n" >/dev/tty
         printf -v "$_retvar_name" '%s' "$default_dir"
@@ -934,22 +953,42 @@ install_biopb() {
     mkdir -p "$CONFIG_DIR"
     CONFIG_FILE="$CONFIG_DIR/biopb.toml"
 
-    if [ -f "$CONFIG_FILE" ]; then
-        _ok "Config exists at $CONFIG_FILE (preserved)"
+    # We never edit an existing biopb.toml in place — hand-editing TOML is
+    # error-prone and most users can't do it. Instead the data-directory prompt is
+    # always offered; when a config already exists it gains a default "0) Keep my
+    # current config file" option, and choosing a fresh data dir backs up the old
+    # config and writes a brand-new one. An empty DATA_DIR is the "keep" sentinel.
+    local DATA_DIR
+    if [ -f "$CONFIG_FILE" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
+        _pick_data_dir DATA_DIR keep
+        echo ""
+    elif [ -f "$CONFIG_FILE" ]; then
+        # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
+        # install. With a config already present we keep it (its data dir wins).
+        _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $CONFIG_FILE to apply BIOPB_DATA_DIR)."
+        DATA_DIR=""
+    elif [ -n "${BIOPB_DATA_DIR:-}" ]; then
+        DATA_DIR="$BIOPB_DATA_DIR"
+        _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
     else
-        local DATA_DIR
-        if [ -n "${BIOPB_DATA_DIR:-}" ]; then
-            DATA_DIR="$BIOPB_DATA_DIR"
-            _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
-        else
-            _pick_data_dir DATA_DIR
-            echo ""
-            _ok "Data directory: $DATA_DIR"
-        fi
+        _pick_data_dir DATA_DIR
+        echo ""
+        _ok "Data directory: $DATA_DIR"
+    fi
 
+    if [ -z "$DATA_DIR" ]; then
+        _ok "Keeping current config: $CONFIG_FILE"
+    else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
             exit 1
+        fi
+        # Preserve the previous config (a chosen new data dir must never silently
+        # discard the user's old settings) by renaming it to a timestamped backup.
+        if [ -f "$CONFIG_FILE" ]; then
+            local _config_backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
+            mv "$CONFIG_FILE" "$_config_backup"
+            _info "Backed up previous config to $_config_backup"
         fi
         TOML_DATA_DIR="${DATA_DIR//\\/\\\\}"
         TOML_DATA_DIR="${TOML_DATA_DIR//\"/\\\"}"
