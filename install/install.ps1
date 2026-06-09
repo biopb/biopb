@@ -105,13 +105,15 @@ function Select-DataDir {
 
     $candidates = New-Object System.Collections.Generic.List[string]
     $seen = New-Object System.Collections.Generic.HashSet[string]
+    # Offer dedicated data subfolders only — never the profile root, Documents,
+    # or OneDrive. Those are riddled with OneDrive "Files On-Demand" placeholders
+    # that hydrate-on-read and hang recursive discovery before the server can
+    # bind. Data/Microscopy folders aren't OneDrive-redirected by
+    # default; users who keep data elsewhere can still enter a path manually.
     foreach ($d in @(
-        $BiopbHome,
-        (Join-Path $BiopbHome 'Documents'),
         (Join-Path $BiopbHome 'Data'),
         (Join-Path $BiopbHome 'data'),
-        (Join-Path $BiopbHome 'Microscopy'),
-        (Join-Path $BiopbHome 'OneDrive')
+        (Join-Path $BiopbHome 'Microscopy')
     )) {
         if ((Test-Path -LiteralPath $d) -and $seen.Add($d.ToLowerInvariant())) {
             $candidates.Add($d) | Out-Null
@@ -126,7 +128,9 @@ function Select-DataDir {
 
     $n = $candidates.Count
     $manualOpt = $n + 1
-    $defaultDir = if ($n -gt 0) { $candidates[0] } else { $BiopbHome }
+    # Fall back to a dedicated data subfolder, never the profile root: an empty
+    # manual entry must not silently re-point discovery at the whole profile.
+    $defaultDir = if ($n -gt 0) { $candidates[0] } else { (Join-Path $BiopbHome 'Microscopy') }
 
     Write-Host ""
     Write-Host "  Select your microscopy data directory:" -ForegroundColor White
