@@ -4,12 +4,13 @@ Extends ZarrAdapter with OME multiscales metadata support.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from biopb.tensor.descriptor_pb2 import SliceHint, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.base import TensorReadPlan
@@ -20,6 +21,9 @@ if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore
+
+
+logger = logging.getLogger(__name__)
 
 
 class OmeZarrAdapter(ZarrAdapter):
@@ -591,6 +595,62 @@ class OmeZarrAdapter(ZarrAdapter):
             return False
         datasets = multiscales[0].get('datasets', [])
         return len(datasets) >= 2
+
+    def get_native_pyramid_levels(
+        self, tensor_id: Optional[str] = None
+    ) -> Optional[List[PyramidLevel]]:
+        """Advertise the OME-Zarr multiscales datasets as native pyramid levels.
+
+        One ``PyramidLevel`` per native dataset, ``native=True`` and
+        ``reduction_method="precompute"`` so the client requests the on-disk level
+        directly (no on-the-fly downsampling). Each level's ``scale_hint`` is the
+        dataset's NGFF ``scale`` transformation via :meth:`_get_level_scale` --
+        the exact value :meth:`_find_level_for_scale` matches on -- so an
+        advertised level round-trips through ``get_read_plan`` to its dataset.
+
+        Returns ``None`` (-> the server advertises a *computed* pyramid) unless
+        this is a single image with a real (>=2 level) native pyramid, mirroring
+        :meth:`has_native_pyramid`. HCS plates and single-level images fall
+        through to the computed path.
+
+        Note: this reuses the existing integer convention -- NGFF ``scale`` values
+        are taken as downsample factors relative to level 0 (level 0 == [1,1,...]).
+        Files that instead store physical pixel sizes are not matched here, the
+        same pre-existing limitation as ``_find_level_for_scale``.
+        """
+        if not self.has_native_pyramid():
+            return None
+
+        multiscales = self.ome_metadata.get('multiscales', [])
+        datasets = multiscales[0].get('datasets', [])
+        levels: List[PyramidLevel] = []
+        for ds in datasets:
+            path = ds.get('path')
+            if path is None:
+                continue
+            scale = self._get_level_scale(path)
+            if not scale:
+                continue
+            try:
+                level_shape = list(
+                    self.get_level_adapter(path).get_tensor_descriptor().shape
+                )
+            except Exception:
+                logger.exception(
+                    "ome-zarr: failed to size native level %s of %s",
+                    path,
+                    self.source_id,
+                )
+                continue
+            levels.append(
+                PyramidLevel(
+                    scale_hint=list(scale),
+                    reduction_method="precompute",
+                    shape=level_shape,
+                    native=True,
+                )
+            )
+        return levels or None
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors available in this source.

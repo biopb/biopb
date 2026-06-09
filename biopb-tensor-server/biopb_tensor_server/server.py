@@ -34,7 +34,8 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.chunk import encode_chunk_id
+from biopb_tensor_server.chunk import build_pyramid_plan, encode_chunk_id
+from biopb_tensor_server.config import PyramidConfig
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,7 @@ class TensorFlightServer(flight.FlightServerBase):
         metadata_db: Optional[MetadataDatabase] = None,
         max_list_flights_results: int = 100000,
         grpc_max_message_size: Optional[int] = None,
+        pyramid_config: Optional[PyramidConfig] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -156,6 +158,11 @@ class TensorFlightServer(flight.FlightServerBase):
         self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._max_list_flights_results = max_list_flights_results
+        # Authoritative resolution-pyramid knobs. Used to advertise
+        # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
+        # with the precache worker so the warmed scales can't drift from the
+        # advertised ones.
+        self._pyramid_config = pyramid_config or PyramidConfig()
         self._start_time: float = time.time()
         self._upload_state_lock = threading.RLock()
         self._upload_states: Dict[str, Dict[str, Any]] = {}
@@ -288,6 +295,43 @@ class TensorFlightServer(flight.FlightServerBase):
         """Thread-safe source lookup."""
         with self._sources_lock:
             return self._sources.get(source_id)
+
+    def _advertised_pyramid(
+        self,
+        source_adapter: Optional[SourceAdapter],
+        tensor_id: Optional[str],
+        base_desc: TensorDescriptor,
+    ) -> List["PyramidLevel"]:
+        """The pyramid levels to advertise for a tensor.
+
+        Native (precomputed on-disk) levels when the source ships them, else a
+        computed pyramid from the authoritative ``[pyramid]`` knobs. Filled only
+        by ``get_flight_info`` -- ``list_flights`` leaves ``pyramid`` empty, like
+        ``metadata_json``. Cheap (arithmetic + already-memoized level adapters),
+        so it is recomputed per open rather than separately cached.
+        """
+        levels = None
+        if source_adapter is not None:
+            try:
+                levels = source_adapter.get_native_pyramid_levels(tensor_id)
+            except Exception:
+                logger.exception(
+                    "pyramid: native enumeration failed for %s/%s",
+                    source_adapter.source_id,
+                    tensor_id,
+                )
+                levels = None
+        if levels is None:
+            cfg = self._pyramid_config
+            levels = build_pyramid_plan(
+                list(base_desc.shape),
+                list(base_desc.dim_labels),
+                reduction_method=cfg.reduction_method,
+                threshold=cfg.threshold,
+                downscale_factor=cfg.downscale_factor,
+                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
+            )
+        return levels
 
     def _get_sources_snapshot(self) -> List[Tuple[str, SourceAdapter]]:
         """Return a stable snapshot of registered sources for iteration."""
@@ -625,9 +669,19 @@ class TensorFlightServer(flight.FlightServerBase):
             read_plan = tensor_adapter.get_read_plan(tensor_desc)
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
+            source_adapter = self._get_source_adapter(source_id)
+
+            # Advertise the server-decided resolution pyramid. Filled here (open
+            # time), never in list_flights -- like metadata_json -- so discovery
+            # stays lean. The client reads each advertised level via the normal
+            # scale_hint path; native sources get their precomputed levels.
+            read_plan.descriptor.ClearField("pyramid")
+            read_plan.descriptor.pyramid.extend(
+                self._advertised_pyramid(source_adapter, tensor_id, base_desc)
+            )
+
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                source_adapter = self._get_source_adapter(source_id)
                 raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
