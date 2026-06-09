@@ -230,6 +230,26 @@ class SourceAdapter(ABC):
         """
         return None
 
+    def get_physical_scale(
+        self, tensor_id: Optional[str] = None
+    ) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dimension physical pixel size + unit, source axis order.
+
+        Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
+        ``dim_labels`` this source's ``get_tensor_descriptor()`` emits (so the
+        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
+        ``physical_unit`` without remapping). Element ``i`` is the physical
+        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
+        dimension with no known physical size (e.g. T/C axes).
+
+        Returns ``None`` when no physical sizes are known. This is the compact
+        ~200-byte summary the tensor-load hot path needs (issue #31), so it must
+        be **cheap** -- read it straight off the resident metadata model, never
+        a full ``get_metadata()`` dump. Default ``None``; format adapters that
+        carry physical voxel sizes override it.
+        """
+        return None
+
 
 class TensorAdapter(ABC):
     """Abstract base class for tensor-level adapters.

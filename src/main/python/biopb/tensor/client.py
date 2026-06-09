@@ -1090,6 +1090,41 @@ class TensorFlightClient:
             return wrapped.get("metadata", {})
         return {}
 
+    def get_physical_scale(
+        self, source_id: str, tensor_id: Optional[str] = None
+    ) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dimension physical pixel size + unit for a tensor.
+
+        Returns ``(scale, unit)``: two lists aligned with the tensor's
+        ``dim_labels`` (source axis order), or ``None`` when the server
+        advertised no physical sizes (an older server, or a format that carries
+        none). This is the compact summary the server folds onto the descriptor
+        ``GetFlightInfo`` already returns (issue #31), so the common case avoids
+        the much larger ``get_source_metadata`` round trip.
+
+        Reads the descriptor cached by a prior ``get_tensor()`` when available
+        (no extra RPC); otherwise issues one cheap ``GetFlightInfo`` via
+        ``get_source()``.
+
+        Args:
+            source_id: Source identifier.
+            tensor_id: Tensor within the source; defaults to the source's first.
+
+        Returns:
+            ``(scale, unit)`` lists, or ``None`` if no physical scale is known.
+        """
+        desc = self._descriptors.get(tensor_id) if tensor_id else None
+        if desc is None:
+            self.get_source(source_id, tensor_id)
+            desc = self._descriptors.get(tensor_id) if tensor_id else None
+            if desc is None:
+                src = self._sources.get(source_id)
+                if src and src.tensors:
+                    desc = src.tensors[0]
+        if desc is None or not desc.physical_scale:
+            return None
+        return list(desc.physical_scale), list(desc.physical_unit)
+
     def get_source(
         self,
         source_id: str,

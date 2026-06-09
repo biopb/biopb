@@ -680,6 +680,24 @@ class TensorFlightServer(flight.FlightServerBase):
                 self._advertised_pyramid(source_adapter, tensor_id, base_desc)
             )
 
+            # Compact per-dim physical scale summary. Filled here at open time
+            # (always, like pyramid -- NOT gated on with_metadata), never in
+            # list_flights, so the common tensor-load path gets physical sizes
+            # without fetching the full OME tree (issue #31). Full-res values:
+            # do not scale by scale_hint (napari multiscale scale is level-0).
+            read_plan.descriptor.ClearField("physical_scale")
+            read_plan.descriptor.ClearField("physical_unit")
+            try:
+                phys = tensor_adapter.get_physical_scale(tensor_id)
+            except Exception:
+                phys = None
+            if phys is not None:
+                scale_vec, unit_vec = phys
+                ndim = len(read_plan.descriptor.dim_labels)
+                if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
+                    read_plan.descriptor.physical_scale[:] = scale_vec
+                    read_plan.descriptor.physical_unit[:] = unit_vec
+
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
                 raw_metadata = tensor_adapter.get_metadata()

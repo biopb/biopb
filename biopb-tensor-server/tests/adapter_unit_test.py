@@ -267,6 +267,180 @@ class TestGetScaledReadPlan:
             assert list(plan.descriptor.shape) == [25, 25]
 
 
+class TestGetPhysicalScale:
+    """Per-dim physical-scale summary folded onto the descriptor (issue #31)."""
+
+    def _make_ome_zarr(self, tmpdir, zattrs, shape=(100, 100), chunks=(50, 50)):
+        import json
+
+        import zarr
+
+        zarr_path = os.path.join(tmpdir, "test.ome.zarr")
+        root = zarr.open_group(zarr_path, mode="w")
+        root.create_dataset("0", shape=shape, chunks=chunks, dtype="uint8")
+        with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
+            json.dump(zattrs, f)
+        root = zarr.open_group(zarr_path, mode="r")
+        return OmeZarrAdapter(root["0"], "test")
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_ome_zarr_physical_scale_from_units(self):
+        """Axes with units yield physical sizes aligned to dim order."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zattrs = {
+                "multiscales": [{
+                    "axes": [
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [
+                        {"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [0.325, 0.325]}]},
+                        {"path": "1", "coordinateTransformations": [
+                            {"type": "scale", "scale": [0.65, 0.65]}]},
+                    ],
+                }]
+            }
+            adapter = self._make_ome_zarr(tmpdir, zattrs)
+            scale, unit = adapter.get_physical_scale()
+            assert scale == [0.325, 0.325]
+            assert unit == ["micrometer", "micrometer"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_ome_zarr_global_scale_composes(self):
+        """A multiscales-level scale transform composes with the level-0 scale."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zattrs = {
+                "multiscales": [{
+                    "axes": [
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "coordinateTransformations": [
+                        {"type": "scale", "scale": [0.5, 0.5]}],
+                    "datasets": [
+                        {"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [1, 1]}]},
+                    ],
+                }]
+            }
+            adapter = self._make_ome_zarr(tmpdir, zattrs)
+            scale, unit = adapter.get_physical_scale()
+            assert scale == [0.5, 0.5]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_ome_zarr_no_unit_returns_none(self):
+        """Unit-less (relative) scales carry no physical info -> None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zattrs = {
+                "multiscales": [{
+                    "axes": [{"name": "y", "type": "space"},
+                             {"name": "x", "type": "space"}],
+                    "datasets": [
+                        {"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [1, 1]}]},
+                    ],
+                }]
+            }
+            adapter = self._make_ome_zarr(tmpdir, zattrs)
+            assert adapter.get_physical_scale() is None
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_ome_zarr_channel_axis_zeroed(self):
+        """A channel axis (no unit) gets 0.0/'' while space axes carry sizes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zattrs = {
+                "multiscales": [{
+                    "axes": [
+                        {"name": "c", "type": "channel"},
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [
+                        {"path": "0", "coordinateTransformations": [
+                            {"type": "scale", "scale": [1, 0.5, 0.5]}]},
+                    ],
+                }]
+            }
+            adapter = self._make_ome_zarr(
+                tmpdir, zattrs, shape=(2, 100, 100), chunks=(1, 50, 50)
+            )
+            scale, unit = adapter.get_physical_scale()
+            assert scale == [0.0, 0.5, 0.5]
+            assert unit == ["", "micrometer", "micrometer"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_zarr_adapter_has_no_physical_scale(self):
+        """A plain ZarrAdapter inherits the base None (no physical sizes)."""
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, "plain.zarr")
+            arr = zarr.open_array(
+                zarr_path, mode="w", shape=(64, 64), chunks=(32, 32), dtype="uint8"
+            )
+            adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+            assert adapter.get_physical_scale() is None
+
+    def _make_aics_adapter(self, dim_labels, scene_index, scenes, images):
+        """Build an AicsImageIoAdapterBase without __init__ (no real file)."""
+        from unittest.mock import MagicMock
+
+        from biopb_tensor_server.adapters.aicsimageio import (
+            _AicsImageIoAdapterBase,
+        )
+
+        a = _AicsImageIoAdapterBase.__new__(_AicsImageIoAdapterBase)
+        a.dim_labels = dim_labels
+        a.scene_index = scene_index
+        a._aics_image = MagicMock()
+        a._aics_image.scenes = scenes
+        a._aics_image.ome_metadata.images = images
+        return a
+
+    @staticmethod
+    def _ome_pixels(psx, psy, psz, unit="µm"):
+        from unittest.mock import MagicMock
+
+        u = MagicMock()
+        u.value = unit
+        px = MagicMock()
+        px.physical_size_x, px.physical_size_y, px.physical_size_z = psx, psy, psz
+        px.physical_size_x_unit = px.physical_size_y_unit = px.physical_size_z_unit = u
+        img = MagicMock()
+        img.pixels = px
+        return img
+
+    def test_aics_physical_scale_maps_by_label_and_zeros_tc(self):
+        """Aics OME pixel sizes map onto dim_labels; T/C get 0.0/''."""
+        img = self._ome_pixels(0.325, 0.325, 2.0)
+        adapter = self._make_aics_adapter(
+            ["T", "C", "Z", "Y", "X"], scene_index=0, scenes=["s0"], images=[img]
+        )
+        scale, unit = adapter.get_physical_scale()
+        assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]
+        assert unit == ["", "", "µm", "µm", "µm"]
+
+    def test_aics_physical_scale_resolves_scene_by_tensor_id(self):
+        """A multi-scene source resolves the right OME image by tensor_id."""
+        img0 = self._ome_pixels(1.0, 1.0, 0.0)
+        img1 = self._ome_pixels(0.5, 0.5, 0.0)
+        adapter = self._make_aics_adapter(
+            ["C", "Y", "X"], scene_index=None,
+            scenes=["s0", "s1"], images=[img0, img1],
+        )
+        scale, _ = adapter.get_physical_scale("s1")
+        assert scale == [0.0, 0.5, 0.5]
+
+    def test_aics_physical_scale_none_when_no_sizes(self):
+        """No positive physical size anywhere -> None."""
+        img = self._ome_pixels(None, None, None)
+        adapter = self._make_aics_adapter(
+            ["Y", "X"], scene_index=0, scenes=["s0"], images=[img]
+        )
+        assert adapter.get_physical_scale() is None
+
+
 class TestOmeZarrPrecompute:
     """Tests for OmeZarrAdapter precomputed level support."""
 
