@@ -11,11 +11,13 @@ import logging
 import struct
 from dataclasses import dataclass
 from math import lcm
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
+
+from biopb_tensor_server.downsample import ceil_div
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +407,97 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     method = chunk_id[method_offset + 2:method_offset + 2 + method_len].decode('utf-8')
 
     return tuple(scale_hint), method
+
+
+# Defaults mirroring biopb-mcp's [pyramid] config (build_pyramid_levels). These
+# decide the coarsest pyramid level the client requests on open; the precache
+# worker must warm exactly that scale or its chunk_ids won't match. Keep in sync
+# with biopb-mcp/src/biopb_mcp/_config.py if that is retuned.
+PRECACHE_THRESHOLD = 4096
+PRECACHE_DOWNSCALE_FACTOR = 4
+PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 512
+
+
+def _precache_xy_indices(shape: Sequence[int], dim_labels) -> Tuple[int, int]:
+    """(y_idx, x_idx), matching biopb-mcp's get_xy_dim_indices.
+
+    Prefers 'y'/'x' dim_labels; falls back to the ``[..., Y, X]`` convention
+    (X last, Y second-to-last).
+    """
+    ndim = len(shape)
+    if dim_labels:
+        labels_lower = [str(label).lower() for label in dim_labels]
+        try:
+            return labels_lower.index("y"), labels_lower.index("x")
+        except ValueError:
+            pass
+    if ndim < 2:
+        raise ValueError(f"Cannot identify x/y dimensions: tensor is {ndim}-D")
+    return ndim - 2, ndim - 1
+
+
+def _precache_z_index(shape: Sequence[int], dim_labels) -> Optional[int]:
+    """Index of the z axis or None, matching biopb-mcp's get_z_dim_index.
+
+    Prefers a 'z' dim_label (absent label => no depth axis); else the positional
+    ``[..., Z, Y, X]`` convention (third-from-last) for 3-D+ tensors.
+    """
+    ndim = len(shape)
+    if dim_labels:
+        labels_lower = [str(label).lower() for label in dim_labels]
+        return labels_lower.index("z") if "z" in labels_lower else None
+    return ndim - 3 if ndim >= 3 else None
+
+
+def compute_precache_scale_hint(
+    shape: Sequence[int],
+    dim_labels=None,
+    threshold: int = PRECACHE_THRESHOLD,
+    downscale_factor: int = PRECACHE_DOWNSCALE_FACTOR,
+    pixel_budget_cubic_root: int = PRECACHE_PIXEL_BUDGET_CUBIC_ROOT,
+) -> List[int]:
+    """Per-axis scale_hint for the *coarsest* pyramid level a client requests.
+
+    This is a faithful port of biopb-mcp's ``build_pyramid_levels`` loop: X, Y
+    and Z are downsampled individually (all other axes stay at 1), each stopping
+    at ``axis_floor = min(pixel_budget_cubic_root, threshold)``, until the level
+    satisfies ``Lx*Ly*Lz <= pixel_budget_cubic_root**3`` and ``Lx, Ly <=
+    threshold``. ``ceil_div(L, s)`` is the server's own ``logical_shape``
+    (base.py), so the resulting scale matches the client's terminal level and the
+    warmed chunk_ids line up exactly.
+
+    A tensor with no z axis is treated as ``Lz = 1`` and never gets a z factor.
+    """
+    ndim = len(shape)
+    budget = pixel_budget_cubic_root ** 3
+    floor = min(pixel_budget_cubic_root, threshold)
+
+    y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
+    z_idx = _precache_z_index(shape, dim_labels)
+    # A degenerate label set could map z onto an x/y axis; drop it if so.
+    if z_idx is not None and z_idx in (x_idx, y_idx):
+        z_idx = None
+
+    sx = sy = sz = 1
+    while True:
+        lx = ceil_div(shape[x_idx], sx)
+        ly = ceil_div(shape[y_idx], sy)
+        lz = ceil_div(shape[z_idx], sz) if z_idx is not None else 1
+        if lx * ly * lz <= budget and lx <= threshold and ly <= threshold:
+            break
+        nsx = sx * downscale_factor if lx > floor else sx
+        nsy = sy * downscale_factor if ly > floor else sy
+        nsz = sz * downscale_factor if (z_idx is not None and lz > floor) else sz
+        if (nsx, nsy, nsz) == (sx, sy, sz):
+            break  # nothing left to shrink; avoid an infinite loop
+        sx, sy, sz = nsx, nsy, nsz
+
+    scale = [1] * ndim
+    scale[x_idx] = sx
+    scale[y_idx] = sy
+    if z_idx is not None:
+        scale[z_idx] = sz
+    return scale
 
 
 def compute_safe_chunk_size(

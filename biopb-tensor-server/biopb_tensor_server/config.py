@@ -243,6 +243,48 @@ class CacheConfig:
 
 
 @dataclass
+class PrecacheConfig:
+    """Background pre-cache worker configuration.
+
+    The worker warms the file cache for newly-added sources at the *coarsest*
+    pyramid level a client requests on open, so the first view is already warm.
+    It is inert unless the file cache backend is in use, and stays off the wire
+    while live reads are in flight.
+
+    Attributes:
+        enabled: Run the background precache worker (no-op on a memory backend).
+        idle_debounce_seconds: Quiet period required before the worker resumes
+            after live Flight traffic.
+        reduction_method: Downsampling reduction ("area" = proper averaging).
+        threshold: Max X/Y extent of the warmed level. MUST mirror biopb-mcp's
+            pyramid.threshold so the warmed scale matches the client's chunk_ids.
+        downscale_factor: Per-level step. MUST mirror biopb-mcp's
+            pyramid.downscale_factor.
+        pixel_budget_cubic_root: Cube root of the warmed level's voxel budget
+            (Lx*Ly*Lz <= this**3). MUST mirror biopb-mcp's
+            pyramid.pixel_budget_cubic_root.
+        backlog_enabled: Also warm sources already present at startup (the
+            "backlog"), as a secondary pass behind live additions.
+        backlog_high_water: Stop backlog warming once the file cache fills past
+            this fraction of its max_bytes, so precache never evicts live data.
+        backlog_idle_recheck_seconds: When the cache is over the high-water mark,
+            how long the backlog naps before re-checking for freed room.
+    """
+
+    enabled: bool = True
+    idle_debounce_seconds: float = 2.0
+    reduction_method: str = "area"
+    # Mirror biopb-mcp [pyramid] defaults; re-sync if that is retuned.
+    threshold: int = 4096
+    downscale_factor: int = 4
+    pixel_budget_cubic_root: int = 512
+    # Startup-backlog (existing sources) knobs.
+    backlog_enabled: bool = True
+    backlog_high_water: float = 0.8
+    backlog_idle_recheck_seconds: float = 5.0
+
+
+@dataclass
 class MetadataDbConfig:
     """Configuration for DuckDB metadata database and source catalog safety limits.
 
@@ -314,6 +356,7 @@ class ServerConfig:
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
+    precache: PrecacheConfig = field(default_factory=PrecacheConfig)
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
     sources: List[SourceConfig] = field(default_factory=list)
@@ -412,6 +455,26 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         file_max_total_bytes=file_max_total_bytes,
     )
 
+    # Parse precache settings
+    precache_data = data.get("precache", {})
+    precache_config = PrecacheConfig(
+        enabled=bool(precache_data.get("enabled", True)),
+        idle_debounce_seconds=float(
+            precache_data.get("idle_debounce_seconds", 2.0)
+        ),
+        reduction_method=precache_data.get("reduction_method", "area"),
+        threshold=int(precache_data.get("threshold", 4096)),
+        downscale_factor=int(precache_data.get("downscale_factor", 4)),
+        pixel_budget_cubic_root=int(
+            precache_data.get("pixel_budget_cubic_root", 512)
+        ),
+        backlog_enabled=bool(precache_data.get("backlog_enabled", True)),
+        backlog_high_water=float(precache_data.get("backlog_high_water", 0.8)),
+        backlog_idle_recheck_seconds=float(
+            precache_data.get("backlog_idle_recheck_seconds", 5.0)
+        ),
+    )
+
     # Parse credentials settings (NEW)
     credentials_data = data.get("credentials", {})
     credentials_default_profile = credentials_data.get("default_profile", None)
@@ -493,6 +556,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         writable=writable,
         write_dir=write_dir,
         cache=cache_config,
+        precache=precache_config,
         credentials=credentials_config,
         metadata_db=metadata_db_config,
         sources=sources,

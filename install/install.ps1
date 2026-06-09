@@ -382,6 +382,96 @@ function Get-LatestRelease {
         -Headers @{ "User-Agent" = "biopb-installer" }
 }
 
+# Print the tail of the server log, indented, for diagnosing a bad startup.
+function Show-LogTail {
+    param([string]$LogFile)
+    if (-not (Test-Path -LiteralPath $LogFile)) { return }
+    Write-Inf "recent server log ($LogFile):"
+    Get-Content -LiteralPath $LogFile -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "      $_" -ForegroundColor DarkGray
+    }
+}
+
+# Start (or restart) the background data server, then report its health.
+# Best-effort: never aborts the install. Skip with $env:BIOPB_NO_SERVER_START=1.
+# Starting now lets the pre-cache warm overviews before the user opens anything,
+# and a restart makes an already-running (stale) server pick up the new code.
+function Start-DataServer {
+    param([string]$BiopbHome, [string]$ConfigFile)
+
+    $logFile = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
+
+    if ($env:BIOPB_NO_SERVER_START -eq "1") {
+        Write-Inf "Skipping server start (BIOPB_NO_SERVER_START=1)"
+        Write-Inf "  start it later with: biopb server start"
+        return
+    }
+    if (-not (Get-Command biopb -ErrorAction SilentlyContinue)) {
+        Write-Warn2 "biopb not found on PATH; skipping server start"
+        Write-Inf "  start it later with: biopb server start"
+        return
+    }
+
+    # 'restart' loads the just-installed code if a server is already running,
+    # and is a plain start otherwise.
+    try { & biopb server restart *> $null } catch { }
+
+    # Ask the daemon for its health, polling until SERVING (or 60s). Merge stderr
+    # (live progress: "data server starting - N found so far...") into the stream
+    # and surface it via Write-Inf as it arrives; the JSON verdict (the line
+    # starting with '{') on stdout is captured for parsing below.
+    $result = @{ json = $null }
+    try {
+        & biopb server status --json --wait 60 2>&1 | ForEach-Object {
+            $s = "$_"
+            if ($s.TrimStart().StartsWith("{")) { $result.json = $s.Trim() }
+            elseif ($s.Trim()) { Write-Inf $s.Trim() }
+        }
+    } catch { }
+    $out = $result.json
+    if (-not $out) { $out = "" }
+
+    # Tolerate an older biopb that predates --json/--wait: fall back to a plain
+    # liveness check so the installer still works during a version transition.
+    if (-not $out) {
+        $plain = ""
+        try { $plain = (& biopb server status 2>$null | Out-String) } catch { $plain = "" }
+        if ($plain -match "Running") {
+            Write-Ok "Data server started"
+        } else {
+            Write-Warn2 "Data server may not have started"
+            Show-LogTail -LogFile $logFile
+            Write-Inf "  full log: $logFile"
+        }
+        return
+    }
+
+    $health = $null; $count = $null
+    try {
+        $obj = $out | ConvertFrom-Json
+        $health = $obj.health
+        $count = $obj.source_count
+    } catch { }
+
+    if ($health -ne "SERVING") {
+        Write-Warn2 "Data server did not come up cleanly"
+        Write-Inf "  it may still be scanning a large folder, or failed to start:"
+        Show-LogTail -LogFile $logFile
+        Write-Inf "  full log: $logFile"
+        return
+    }
+
+    if ((-not $count) -or ($count -eq 0)) {
+        Write-Warn2 "Data server is running but found no data sources"
+        Write-Inf "  check that your data folder holds supported images (see config):"
+        Write-Cmd "  $ConfigFile"
+        Show-LogTail -LogFile $logFile
+        return
+    }
+
+    Write-Ok "Data server ready - $count data source(s) found; pre-caching overviews"
+}
+
 function Install-Biopb {
     $RepoUrl     = "https://github.com/biopb/biopb"
     $Repo        = "git+$RepoUrl"
@@ -397,7 +487,7 @@ function Install-Biopb {
     $release = $null   # cached release metadata, fetched on demand below
 
     # ===== 0. System Check =====
-    Write-Step "[0/6] Checking system..."
+    Write-Step "[0/7] Checking system..."
 
     $arch = $env:PROCESSOR_ARCHITECTURE
     switch ($arch) {
@@ -443,7 +533,7 @@ function Install-Biopb {
     Write-Host ""
 
     # ===== 1. Install uv + buf (if needed) =====
-    Write-Step "[1/6] Ensuring build tools..."
+    Write-Step "[1/7] Ensuring build tools..."
 
     # uv's installer (piped in below) voluntarily aborts unless the effective
     # execution policy is one of Unrestricted/RemoteSigned/Bypass -- even though
@@ -495,7 +585,7 @@ function Install-Biopb {
     }
 
     # ===== 2. Python =====
-    Write-Step "[2/6] Ensuring Python..."
+    Write-Step "[2/7] Ensuring Python..."
 
     # biopb-mcp (always installed) requires Python >= 3.10.
     $minMinor = 10
@@ -529,7 +619,7 @@ function Install-Biopb {
     }
 
     # ===== 3. Install biopb packages =====
-    Write-Step "[3/6] Installing biopb packages..."
+    Write-Step "[3/7] Installing biopb packages..."
 
     $tensorExtras = "web,aics,medical,ndtiff,hdf5"
     if ($InstallBioformats) {
@@ -625,7 +715,7 @@ function Install-Biopb {
     Write-Ok "$versionOutput"
 
     # ===== 4. Webapp =====
-    Write-Step "[4/6] Installing data browser..."
+    Write-Step "[4/7] Installing data browser..."
 
     if ($InstallWebapp) {
         if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
@@ -667,7 +757,7 @@ function Install-Biopb {
     }
 
     # ===== 5. Config =====
-    Write-Step "[5/6] Config..."
+    Write-Step "[5/7] Config..."
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
     $configFile = Join-Path $ConfigDir "biopb.toml"
@@ -712,8 +802,14 @@ monitor = true
         Write-Ok "Created: $configFile"
     }
 
-    # ===== 6. Wire biopb-mcp into the user's agent system =====
-    Write-Step "[6/6] Configuring MCP client..."
+    # ===== 6. Start the data server =====
+    # Before MCP wiring so a typo in the data dir (step 5) surfaces right after
+    # the choice, while pre-cache gets the earliest possible head start.
+    Write-Step "[6/7] Starting data server..."
+    Start-DataServer -BiopbHome $BiopbHome -ConfigFile $configFile
+
+    # ===== 7. Wire biopb-mcp into the user's agent system =====
+    Write-Step "[7/7] Configuring MCP client..."
 
     Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
 

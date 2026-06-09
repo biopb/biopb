@@ -203,6 +203,17 @@ class SourceAdapter(ABC):
         return self
 
 
+    def has_native_pyramid(self) -> bool:
+        """Whether this source ships a well-formed multi-resolution pyramid.
+
+        Default False. Formats that natively store precomputed downsampled
+        levels (e.g. OME-Zarr multiscales) override this to report True, which
+        lets the precache worker skip them -- they already serve overviews
+        cheaply from their own coarse levels.
+        """
+        return False
+
+
 class TensorAdapter(ABC):
     """Abstract base class for tensor-level adapters.
 

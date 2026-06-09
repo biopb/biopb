@@ -577,6 +577,21 @@ class OmeZarrAdapter(ZarrAdapter):
         """Return OME-Zarr .zattrs content directly."""
         return self.ome_metadata
 
+    def has_native_pyramid(self) -> bool:
+        """True for a single OME-Zarr image with a real (>=2 level) pyramid.
+
+        Such sources already serve overviews efficiently from their native
+        coarse levels, so the precache worker skips them. HCS plates report
+        False (their fields are warmed individually, like any other source).
+        """
+        if self._is_hcs_plate:
+            return False
+        multiscales = self.ome_metadata.get('multiscales', [])
+        if not multiscales:
+            return False
+        datasets = multiscales[0].get('datasets', [])
+        return len(datasets) >= 2
+
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors available in this source.
 

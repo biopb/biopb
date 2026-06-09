@@ -5,9 +5,11 @@ named-event request) and the force-kill fallback. OS calls are mocked so the
 tests are deterministic and fast on any platform; time.sleep is neutralized.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from typer.testing import CliRunner
 
 import biopb.cli as cli
 
@@ -75,6 +77,109 @@ class TestGracefulStop:
         with patch.object(cli.os, "kill"):
             assert cli._graceful_stop(1234, timeout=1) is False
         assert "Graceful stop unavailable" in capsys.readouterr().out
+
+
+class TestStatusHealth:
+    """`server status` now queries the live Flight health (status + source_count)
+    and can emit JSON for scripting (used by the installer)."""
+
+    def _invoke(self, monkeypatch, *, pid, running, health, extra_args=()):
+        monkeypatch.setattr(cli, "_read_pid", lambda: pid)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
+        if isinstance(health, list):
+            seq = iter(health)
+            monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
+        else:
+            monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: health)
+        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        res = CliRunner().invoke(cli.app, ["server", "status", "--json", *extra_args])
+        assert res.exit_code == 0, res.output
+        return json.loads(res.stdout.strip().splitlines()[-1])
+
+    def test_running_serving_reports_sources(self, monkeypatch):
+        d = self._invoke(
+            monkeypatch,
+            pid=123,
+            running=True,
+            health={"status": "SERVING", "source_count": 7, "writable": False,
+                    "uptime_seconds": 42},
+        )
+        assert d["running"] is True and d["pid"] == 123
+        assert d["status"] == "running"
+        assert d["health"] == "SERVING" and d["source_count"] == 7
+
+    def test_not_running(self, monkeypatch):
+        d = self._invoke(monkeypatch, pid=None, running=False, health=None)
+        assert d["running"] is False and d["pid"] is None
+        assert d["status"] == "stopped"
+        assert d["health"] is None and d["source_count"] is None
+
+    def test_stale_pid(self, monkeypatch):
+        d = self._invoke(monkeypatch, pid=999, running=False, health=None)
+        assert d["running"] is False and d["status"] == "stale"
+
+    def test_running_but_no_sources(self, monkeypatch):
+        d = self._invoke(
+            monkeypatch,
+            pid=5,
+            running=True,
+            health={"status": "SERVING", "source_count": 0},
+        )
+        assert d["health"] == "SERVING" and d["source_count"] == 0
+
+    def test_unreachable_health(self, monkeypatch):
+        # Process up but Flight unreachable -> health None, still running.
+        d = self._invoke(monkeypatch, pid=5, running=True, health=None)
+        assert d["running"] is True and d["health"] is None
+
+    def test_wait_polls_until_serving(self, monkeypatch):
+        # First probe STARTING, second SERVING; --wait drives the poll loop
+        # (time.sleep is neutralized by the autouse fixture).
+        d = self._invoke(
+            monkeypatch,
+            pid=5,
+            running=True,
+            health=[
+                {"status": "STARTING", "source_count": 0},
+                {"status": "SERVING", "source_count": 3},
+            ],
+            extra_args=["--wait", "5"],
+        )
+        assert d["health"] == "SERVING" and d["source_count"] == 3
+
+    def test_wait_logs_progress(self, monkeypatch):
+        # --wait should log a human-facing progress report while STARTING; JSON
+        # stays the last line (parsed by _invoke).
+        monkeypatch.setattr(cli, "_read_pid", lambda: 5)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        seq = iter(
+            [
+                {"status": "STARTING", "source_count": 2},
+                {"status": "SERVING", "source_count": 4},
+            ]
+        )
+        monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
+        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        res = CliRunner().invoke(
+            cli.app, ["server", "status", "--json", "--wait", "5"]
+        )
+        assert res.exit_code == 0, res.output
+        assert "starting" in res.output and "2 source" in res.output
+        # JSON (final verdict) is still the last line.
+        last = json.loads(res.stdout.strip().splitlines()[-1])
+        assert last["health"] == "SERVING" and last["source_count"] == 4
+
+    def test_no_wait_is_silent(self, monkeypatch):
+        # Without --wait, a single probe and no progress chatter.
+        monkeypatch.setattr(cli, "_read_pid", lambda: 5)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(
+            cli, "_query_health", lambda *_a, **_k: {"status": "SERVING", "source_count": 1}
+        )
+        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        res = CliRunner().invoke(cli.app, ["server", "status", "--json"])
+        assert res.exit_code == 0
+        assert "starting" not in res.output and "waiting" not in res.output
 
 
 class TestWinRequestShutdown:

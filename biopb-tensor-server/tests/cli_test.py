@@ -38,7 +38,7 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *args, **kwargs: (server, source_manager, watcher),
+        lambda *args, **kwargs: (server, source_manager, watcher, None),
     )
 
     cli.serve(config=Path("unused.toml"))
@@ -84,7 +84,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable()),
+        lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
     )
 
     cli.serve(config=Path("unused.toml"))

@@ -7,11 +7,12 @@ and metadata database synchronization for monitored local directories.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
@@ -78,6 +79,12 @@ class SourceManager:
         # Thread management
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # Background precache hook: called with a source_id when a source is
+        # committed *after* start() (the runtime phase). Left None for the
+        # initial startup scan -- which is committed before start() -- so the
+        # precache worker only warms sources that arrive live. See start().
+        self._on_source_committed: Optional[Callable[[str], None]] = None
+        self._runtime_phase = False
         # Rescan/reconcile helpers may re-enter other state-mutating helpers.
         # Use an RLock so nested calls on the same thread do not deadlock.
         self._lock = threading.RLock()
@@ -116,6 +123,10 @@ class SourceManager:
             logger.warning("SourceManager already running")
             return
 
+        # Everything committed from here on is a live (runtime) addition; the
+        # initial startup scan ran before this point and is excluded from the
+        # precache hook.
+        self._runtime_phase = True
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -124,6 +135,33 @@ class SourceManager:
         )
         self._thread.start()
         logger.info("SourceManager started")
+
+    def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
+        """Return ``(source_id, mtime)`` for every currently-registered *local*
+        source, for seeding the precache backlog (newest first).
+
+        Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
+        can't be stat-ed (e.g. removed between commit and this call).
+        """
+        # Snapshot under the same lock that guards claim mutations: the watcher's
+        # event-loop thread adds/removes claims via _commit_add_claim /
+        # _commit_remove_claim, so iterating self._state.claims unlocked could
+        # race a concurrent rescan ("dict changed size during iteration"). Copy
+        # the few fields we need under the lock, then stat() outside it (I/O).
+        with self._lock:
+            snapshot = [
+                (claim.source_id, claim.primary_path)
+                for claim in self._state.claims.values()
+                if not claim.is_remote
+            ]
+        out: List[Tuple[str, float]] = []
+        for source_id, primary_path in snapshot:
+            try:
+                mtime = os.stat(primary_path).st_mtime
+            except OSError:
+                continue
+            out.append((source_id, mtime))
+        return out
 
     def stop(self) -> None:
         """Stop the event processing loop."""
@@ -684,6 +722,17 @@ class SourceManager:
                 claim
             )
             self._clear_failed_source_attempt(claim.source_id)
+
+        # Notify the precache worker of live additions only (runtime phase).
+        # Best-effort: a hook failure must never abort a source commit.
+        if self._runtime_phase and self._on_source_committed is not None:
+            try:
+                self._on_source_committed(claim.source_id)
+            except Exception:
+                logger.exception(
+                    "precache on_source_committed hook failed for %s",
+                    claim.source_id,
+                )
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:
