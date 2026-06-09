@@ -120,16 +120,27 @@ def _configure_dask(config: dict):
 def _register_cache_plugin(
     dask_client, url, token, config: dict, planned_workers=None
 ):
-    """Pin a cluster-wide data-plane chunk-cache budget across dask workers.
+    """Pin the data-plane chunk-cache budget across dask workers.
 
-    Splits ``mcp.dask.cache_budget`` evenly across the live workers and installs
-    a worker-init plugin so each worker (current and future) caps its per-process
-    cache at ``budget // n_workers``. No-op without a distributed client; the
-    plugin itself resolves a localhost server to no cache. Best-effort: a failure
-    here must not break the connect flow that invokes it.
+    For a **remote** server, splits ``mcp.dask.cache_budget`` evenly across the
+    workers and installs a worker-init plugin so each worker (current and future)
+    caps its per-process cache at ``budget // n_workers``.
 
-    Called from ``TensorConnection.on_connect`` with the final ``(url, token)``
-    (the token is only known after connect).
+    For a **localhost** server, pins every worker to **no cache** (0). A dask
+    worker consumes a whole chunk as its task unit, so the slice-chunk-mismatch
+    amortization that justifies a client-side cache -- the viewer slicing a small
+    region out of a large chunk -- never applies to a worker. On localhost the
+    server's mmap/page-cache fast path already shares decoded chunks across all
+    workers for free, so a per-worker cache is pure replicated memory (measured:
+    ~1.7x a plane's size, with no speedup). Pinning workers off here restores
+    biopb's own localhost default for them while leaving the main-process viewer
+    cache (the ``BIOPB_CACHE_LOCAL`` opt-in) intact -- that env var, inherited by
+    every worker, would otherwise leak a real cache into each one.
+
+    No-op without a distributed client. Best-effort: a failure here must not
+    break the connect flow that invokes it. Called from
+    ``TensorConnection.on_connect`` with the final ``(url, token)`` (the token is
+    only known after connect).
     """
     if dask_client is None:
         return
@@ -139,25 +150,38 @@ def _register_cache_plugin(
 
         from .._config import get_setting
 
-        budget_cfg = get_setting(config, "mcp.dask.cache_budget")
-        budget = (
-            int(budget_cfg)
-            if isinstance(budget_cfg, (int, float))
-            else parse_bytes(budget_cfg)
+        try:
+            from biopb.tensor.client import _is_localhost_location
+        except Exception:  # pragma: no cover - older biopb without the helper
+
+            def _is_localhost_location(_url):
+                return False
+
+        n_workers = max(
+            1,
+            planned_workers
+            or len(dask_client.scheduler_info().get("workers", {})),
         )
-        n_workers = planned_workers or len(
-            dask_client.scheduler_info().get("workers", {})
-        )
-        n_workers = max(1, n_workers)
-        per_worker = max(0, budget // n_workers)
+
+        if _is_localhost_location(url):
+            # Workers consume whole chunks and share the server's mmap/page-cache
+            # path, so a per-worker cache only replicates memory (see docstring).
+            per_worker = 0
+        else:
+            budget_cfg = get_setting(config, "mcp.dask.cache_budget")
+            budget = (
+                int(budget_cfg)
+                if isinstance(budget_cfg, (int, float))
+                else parse_bytes(budget_cfg)
+            )
+            per_worker = max(0, budget // n_workers)
 
         plugin = make_cache_plugin(url, token, per_worker)
         if plugin is None:
             return
         dask_client.register_plugin(plugin)
         logger.info(
-            "Chunk-cache budget %s -> %d B/worker across %d workers (%s)",
-            budget_cfg,
+            "Chunk-cache plugin: %d B/worker x %d workers (%s)",
             per_worker,
             n_workers,
             url,
@@ -214,11 +238,12 @@ def _bootstrap_impl():
     # 3. Data-access service, shared by the widget and the agent namespace.
     conn = TensorConnection(config)
 
-    # 3b. Pin a bounded, cluster-wide chunk-cache budget across the worker
-    #     processes. The data-plane client's per-process cache is otherwise
-    #     replicated in every worker (budget x n_workers); splitting one budget
-    #     across workers bounds the aggregate. A localhost server resolves to no
-    #     cache regardless, so this only bites for remote servers. Registered via
+    # 3b. Bound the data-plane chunk cache across the worker processes, which
+    #     would otherwise each replicate it. For a localhost server the plugin
+    #     pins workers to no cache (they consume whole chunks and share the
+    #     server's mmap/page-cache path; the main-process viewer keeps its cache
+    #     via BIOPB_CACHE_LOCAL for its sub-chunk slice reads); for a remote
+    #     server it splits mcp.dask.cache_budget across workers. Registered via
     #     the connect hook because the token is only final after connect, and
     #     re-runs on reconnect (the plugin is named, so re-registration replaces).
     #     Divide by the cluster's *planned* worker count (worker_spec), not the

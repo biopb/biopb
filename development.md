@@ -364,7 +364,15 @@ pyqt6, jupyter_client, ipykernel, napari-skimage-regionprops.
 ## Development Notes
 
 - setuptools_scm for versioning
-- Black formatter, line-length 79; Ruff for linting
+- **Formatting/linting is gated by `pre-commit` only** — `pre-commit run
+  --all-files` (or `--files <changed>`) is the single source of truth; there is
+  no separate lint command to run. Active hooks: `black` (line-length 79),
+  `check-docstring-first`, `end-of-file-fixer`, `trailing-whitespace`,
+  `check-yaml`, and `napari-plugin-checks`. A `[tool.ruff]` config exists in
+  `pyproject.toml`, but the ruff hook is **commented out** in
+  `.pre-commit-config.yaml` and is *not* enforced — don't invoke ruff (it isn't
+  installed in `.venv`) or treat its rules as the gate; validate with
+  pre-commit.
 - magicgui for automatic GUI generation in the demo widgets
 - QT API set to pyqt6 in pytest configuration
 - Headless testing uses `QT_QPA_PLATFORM=offscreen`

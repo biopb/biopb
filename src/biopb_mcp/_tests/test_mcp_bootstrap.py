@@ -62,6 +62,24 @@ class TestRegisterCachePlugin:
             )
         assert mk.call_args.args[2] == 400_000_000
 
+    def test_localhost_pins_workers_off(self):
+        # On localhost a worker's per-process cache is redundant: workers consume
+        # whole chunks and share the server's mmap/page-cache path, so the plugin
+        # pins workers to 0 regardless of the configured budget (the main-process
+        # viewer keeps its cache via BIOPB_CACHE_LOCAL, not this plugin).
+        dc = _fake_dask_client(8)
+        with patch.object(tclient, "make_cache_plugin") as mk:
+            mk.return_value = MagicMock()
+            _bootstrap._register_cache_plugin(
+                dc,
+                "grpc://localhost:8815",
+                None,
+                {"mcp": {"dask": {"cache_budget": "4G"}}},
+                planned_workers=8,
+            )
+        assert mk.call_args.args[2] == 0
+        dc.register_plugin.assert_called_once_with(mk.return_value)
+
     def test_noop_without_dask_client(self):
         # must not raise when there is no distributed client
         _bootstrap._register_cache_plugin(None, "grpc://x:1", None, {})
