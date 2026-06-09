@@ -31,8 +31,10 @@ message TensorDescriptor {
   // These do not change tensor identity, only how a specific read request is planned.
   repeated int64 scale_hint = 7;
 
-  // Dynamic reduction/downsampling method for scaled reads: "nearest", "area", "linear".
-  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area".
+  // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",
+  // "linear", or "precompute" (serve a native on-disk pyramid level).
+  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
+  // "precomputed" -> "precompute".
   string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
@@ -111,8 +113,10 @@ message TensorReadOption {
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   repeated int64 scale_hint = 3;
 
-  // Dynamic reduction/downsampling method: "nearest", "area", "linear".
-  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area".
+  // Dynamic reduction/downsampling method: "nearest", "area", "linear", or
+  // "precompute" (serve a native on-disk pyramid level).
+  // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
+  // "precomputed" -> "precompute".
   string reduction_method = 4;
 
   // If true, server populates metadata_json with wrapped metadata.

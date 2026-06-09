@@ -26,7 +26,6 @@ import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
     FlightCmd,
-    PyramidLevel,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket

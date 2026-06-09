@@ -29,7 +29,6 @@ import numpy as np
 import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
-    PyramidLevel,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
