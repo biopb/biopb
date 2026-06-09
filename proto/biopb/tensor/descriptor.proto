@@ -51,6 +51,20 @@ message TensorDescriptor {
   // read path. Populated only by GetFlightInfo (left empty in ListFlights,
   // like metadata_json); empty also means "old server / decide client-side".
   repeated PyramidLevel pyramid = 10;
+
+  // Per-dimension physical pixel size, aligned 1:1 with dim_labels/shape
+  // (same length and order). Element i is the physical extent of one sample
+  // along dimension i, in the unit given by physical_unit[i]. 0.0 means
+  // "unknown" for that dimension. This is the ~200-byte summary consumers need
+  // for display scale, so the common case avoids fetching the full OME tree.
+  // Populated by GetFlightInfo (left empty in ListFlights, like pyramid /
+  // metadata_json); empty also means "old server / no physical scale -> the
+  // full OME (metadata_json) remains the authoritative source".
+  repeated double physical_scale = 11;
+
+  // Per-dimension unit string for physical_scale (e.g. "micrometer", "µm"),
+  // aligned 1:1 with physical_scale. "" means unknown.
+  repeated string physical_unit = 12;
 }
 
 // One resolution level of a tensor's server-advertised pyramid.

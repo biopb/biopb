@@ -229,6 +229,98 @@ class TestOmeZarrIntegration:
             server.shutdown()
 
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_physical_scale_summary_on_descriptor(self, temp_dir):
+        """The per-dim physical-scale summary rides the descriptor that
+        get_tensor (with_metadata=False) fetches, so the common path needs no
+        full-OME round trip (issue #31). It must be empty in list_flights."""
+        import json
+        import os
+
+        import zarr
+
+        from biopb_tensor_server import OmeZarrAdapter
+
+        # OME-Zarr with real physical units (the fixture uses relative scales).
+        zarr_path = os.path.join(temp_dir, "phys.ome.zarr")
+        root = zarr.open_group(zarr_path, mode="w")
+        root.create_dataset("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
+        zattrs = {
+            "multiscales": [{
+                "axes": [
+                    {"name": "y", "type": "space", "unit": "micrometer"},
+                    {"name": "x", "type": "space", "unit": "micrometer"},
+                ],
+                "datasets": [
+                    {"path": "0", "coordinateTransformations": [
+                        {"type": "scale", "scale": [0.5, 0.25]}]},
+                ],
+            }]
+        }
+        with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
+            json.dump(zattrs, f)
+
+        root = zarr.open_group(zarr_path, mode="r")
+        adapter = OmeZarrAdapter(root["0"], "phys")
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("phys", adapter)
+        server.mark_ready()
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+
+            # list_flights stays lean: no physical scale advertised there.
+            sources = client.list_sources()
+            listed = sources["phys"].tensors[0]
+            assert not listed.physical_scale
+
+            # A normal get_tensor (with_metadata=False) populates the cached
+            # descriptor's summary; get_physical_scale reads it with no extra
+            # full-OME fetch.
+            client.get_tensor("phys", "phys")
+            scale, unit = client.get_physical_scale("phys", "phys")
+            assert list(scale) == [0.5, 0.25]
+            assert list(unit) == ["micrometer", "micrometer"]
+
+            client.close()
+        finally:
+            server.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_plain_zarr_has_no_physical_scale(self, simple_zarr_array):
+        """A plain Zarr source advertises no physical scale -> client None."""
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+
+        zarr_path, shape, chunks = simple_zarr_array
+        arr = zarr.open_array(zarr_path, mode="r")
+        adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("plain", adapter)
+        server.mark_ready()
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+            client.get_tensor("plain", "plain")
+            assert client.get_physical_scale("plain", "plain") is None
+            client.close()
+        finally:
+            server.shutdown()
+
+
 class TestOmeTiffIntegration:
     """Integration tests for OME-TIFF files (now handled by AicsImageIoAdapter)."""
 

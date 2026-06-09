@@ -524,6 +524,63 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         except Exception:
             return {}
 
+    def get_physical_scale(self, tensor_id=None):
+        """Per-dim physical pixel size + unit from the resident OME model.
+
+        Reads ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}``
+        directly (no full ``model_dump``) and maps it onto this tensor's
+        ``dim_labels`` by axis label. T/C axes get ``0.0`` / ``""``. Returns
+        ``None`` when no positive physical size is known. See
+        ``SourceAdapter.get_physical_scale``.
+        """
+        try:
+            ome = self._aics_image.ome_metadata
+            if ome is None or not getattr(ome, "images", None):
+                return None
+
+            # OME images are in img.scenes order. A scene-level adapter knows
+            # its index directly; otherwise resolve the requested tensor_id.
+            idx = self.scene_index if self.scene_index is not None else 0
+            if tensor_id is not None:
+                scene_ids = list(self._aics_image.scenes)
+                if tensor_id in scene_ids:
+                    idx = scene_ids.index(tensor_id)
+            if idx >= len(ome.images):
+                return None
+
+            px = ome.images[idx].pixels
+
+            def _unit(u):
+                if u is None:
+                    return ""
+                return str(getattr(u, "value", None) or u)
+
+            by_label = {
+                "x": (px.physical_size_x, _unit(px.physical_size_x_unit)),
+                "y": (px.physical_size_y, _unit(px.physical_size_y_unit)),
+                "z": (px.physical_size_z, _unit(px.physical_size_z_unit)),
+            }
+
+            labels = self.dim_labels or list(self._aics_image.dims.order)
+            scale, unit = [], []
+            for lab in labels:
+                v, u = by_label.get(str(lab).lower(), (None, ""))
+                try:
+                    fv = float(v) if v is not None else 0.0
+                except (TypeError, ValueError):
+                    fv = 0.0
+                if fv > 0:
+                    scale.append(fv)
+                    unit.append(u)
+                else:
+                    scale.append(0.0)
+                    unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
+
 
 # =============================================================================
 # Format-specific subclasses

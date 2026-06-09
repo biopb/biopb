@@ -581,6 +581,61 @@ class OmeZarrAdapter(ZarrAdapter):
         """Return OME-Zarr .zattrs content directly."""
         return self.ome_metadata
 
+    def get_physical_scale(self, tensor_id=None):
+        """Per-dim physical pixel size + unit from the multiscales transforms.
+
+        Physical size of an axis = (optional multiscales-level scale transform)
+        x (level-0 dataset scale), in that axis' ``unit``. Aligned to the axes
+        order (which is also this adapter's ``dim_labels``). Only axes that
+        declare a ``unit`` carry a physical size -- the OME-Zarr scale is
+        otherwise a dimensionless (relative) downsample factor, so unit-less
+        axes (and channel/index axes) get ``0.0`` / ``""``. Returns ``None``
+        when no axis declares a unit (no physical information). See
+        ``SourceAdapter.get_physical_scale``.
+        """
+        try:
+            multiscales = self.ome_metadata.get("multiscales", [])
+            if not multiscales:
+                return None  # HCS plate or non-image: no top-level multiscales
+            ms = multiscales[0]
+            axes = ms.get("axes", []) or self.axes
+            datasets = ms.get("datasets", [])
+            if not axes or not datasets:
+                return None
+            ndim = len(axes)
+
+            def _scale_vec(transforms):
+                for t in transforms or []:
+                    if t.get("type") == "scale":
+                        vec = t.get("scale", [])
+                        if len(vec) == ndim:
+                            return [float(v) for v in vec]
+                return [1.0] * ndim
+
+            # Transforms compose: dataset (level-0) scale, then multiscales-level.
+            global_scale = _scale_vec(ms.get("coordinateTransformations"))
+            level0_scale = _scale_vec(datasets[0].get("coordinateTransformations"))
+
+            scale, unit = [], []
+            for i, ax in enumerate(axes):
+                u = ax.get("unit", "") if isinstance(ax, dict) else ""
+                if u:
+                    try:
+                        v = global_scale[i] * level0_scale[i]
+                    except (TypeError, ValueError, IndexError):
+                        v = 0.0
+                    if v > 0:
+                        scale.append(v)
+                        unit.append(str(u))
+                        continue
+                scale.append(0.0)
+                unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
+
     def has_native_pyramid(self) -> bool:
         """True for a single OME-Zarr image with a real (>=2 level) pyramid.
 
