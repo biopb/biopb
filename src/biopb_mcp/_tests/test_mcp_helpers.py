@@ -70,7 +70,7 @@ class TestPatchViewerAddTensor:
         src = _make_source("http://server/data/remote_img", [tensor])
         client = MagicMock()
         client.get_source.return_value = src
-        client.get_source_metadata.return_value.images = []
+        client.get_physical_scale.return_value = None
         connection.client = client
         connection.sources = {}  # source absent from the cached catalog
 
@@ -107,7 +107,7 @@ class TestPatchViewerAddTensor:
         tensor = _make_tensor("t1", [256, 256])
         src = _make_source("http://server/data/my_image", [tensor])
         connection.client = MagicMock()
-        connection.client.get_source_metadata.return_value.images = []
+        connection.client.get_physical_scale.return_value = None
         connection.sources = {"src1": src}
 
         mock_arr = MagicMock()
@@ -129,7 +129,7 @@ class TestPatchViewerAddTensor:
         tensor = _make_tensor("t1", [256, 256])
         src = _make_source("http://server/data/my_image", [tensor])
         connection.client = MagicMock()
-        connection.client.get_source_metadata.return_value.images = []
+        connection.client.get_physical_scale.return_value = None
         connection.sources = {"src1": src}
 
         mock_arr = MagicMock()
@@ -163,7 +163,7 @@ class TestPatchViewerAddTensor:
         t2 = _make_tensor("t2", [128, 128])
         src = _make_source("http://server/data/multi", [t1, t2])
         connection.client = MagicMock()
-        connection.client.get_source_metadata.return_value.images = []
+        connection.client.get_physical_scale.return_value = None
         connection.sources = {"src1": src}
 
         mock_arr = MagicMock()
@@ -181,7 +181,7 @@ class TestPatchViewerAddTensor:
         tensor = _make_tensor("t1", [8192, 8192])
         src = _make_source("http://server/big", [tensor])
         connection.client = MagicMock()
-        connection.client.get_source_metadata.return_value.images = []
+        connection.client.get_physical_scale.return_value = None
         connection.sources = {"src1": src}
 
         levels = [MagicMock(), MagicMock()]
@@ -211,19 +211,9 @@ class TestPatchViewerAddTensor:
         tensor.dim_labels = ["y", "x"]
         src = _make_source("http://server/data/cal", [tensor])
         client = MagicMock()
-        # get_source_metadata returns the OME model as a dict (server's OME
-        # model dumped to JSON), matching the real client contract.
-        pixels = {
-            "physical_size_x": 0.5,
-            "physical_size_y": 0.25,
-            "physical_size_z": None,
-            "physical_size_x_unit": "µm",
-            "physical_size_y_unit": "µm",
-            "physical_size_z_unit": None,
-        }
-        client.get_source_metadata.return_value = {
-            "images": [{"pixels": pixels}]
-        }
+        # get_physical_scale returns the compact per-dim (scale, unit) summary
+        # in source axis order [y, x] (the descriptor field, issue #31).
+        client.get_physical_scale.return_value = ([0.25, 0.5], ["µm", "µm"])
         connection.client = client
         connection.sources = {"src1": src}
 

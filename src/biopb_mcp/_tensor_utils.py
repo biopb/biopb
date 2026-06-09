@@ -199,18 +199,30 @@ def build_layer_scale(
     client: TensorFlightClient,
     source_id: str,
     ndim: int,
+    *,
+    tensor_id: str | None = None,
+    tensor_desc=None,
+    source_desc=None,
 ) -> Tuple[List[float] | None, dict | None]:
-    """Build a napari ``scale`` vector from a source's OME pixel sizes.
+    """Build a napari ``scale`` vector from a source's physical pixel sizes.
 
-    Reads ``client.get_source_metadata`` (a dict -- the server's OME model
-    dumped to JSON) for ``physical_size_x/y/z`` so areas/volumes the agent
-    computes come out in physical units (e.g. µm²) instead of pixels.
+    Reads ``client.get_physical_scale`` -- the compact per-dimension summary the
+    server folds onto the descriptor ``get_tensor`` already fetches (biopb issue
+    #31) -- so areas/volumes the agent computes come out in physical units (e.g.
+    µm²) instead of pixels, without the heavy ``get_source_metadata`` (full OME)
+    round trip. The summary is in *source* axis order; the source's
+    ``dim_labels`` (per-tensor, falling back to *source_desc*) map each physical
+    size onto x/y/z via :func:`get_xy_dim_indices` / :func:`get_z_dim_index`.
 
     *ndim* is the rank of the layer array, which ``build_pyramid_levels``
     guarantees is in canonical ``[..., Z, Y, X]`` order (rank >= 3, with an
-    explicit -- possibly singleton -- Z). So the physical sizes map onto fixed
-    positions: X is the last axis, Y the second-to-last, Z the third-to-last;
-    leading axes (channel, time) get 1.0. No label inspection is needed.
+    explicit -- possibly singleton -- Z). So the resolved x/y/z sizes land on
+    fixed trailing positions: X last, Y second-to-last, Z third-to-last; leading
+    axes (channel, time) get 1.0.
+
+    When the server advertises no physical scale (an older server, or a format
+    that carries none), returns ``(None, None)`` -- the layer simply gets no
+    physical scale. There is no full-OME fallback.
 
     Returns:
         ``(scale, info)`` where *scale* is a per-axis list of length *ndim*
@@ -228,18 +240,42 @@ def build_layer_scale(
         return value if value > 0 else None
 
     try:
-        metadata = client.get_source_metadata(source_id)
-
-        images = metadata.get("images") if isinstance(metadata, dict) else None
-        if not images:
+        phys = client.get_physical_scale(source_id, tensor_id)
+        if phys is None:
             return None, None
-        pixels = images[0].get("pixels")
-        if not pixels:
-            return None, None
+        scale_vec, unit_vec = phys
 
-        psx = _positive_float(pixels.get("physical_size_x"))
-        psy = _positive_float(pixels.get("physical_size_y"))
-        psz = _positive_float(pixels.get("physical_size_z"))
+        # Map source-order physical sizes onto x/y/z by dim label.
+        dim_labels = None
+        if tensor_desc is not None:
+            dim_labels = tensor_desc.dim_labels
+        if not dim_labels:
+            dim_labels = getattr(source_desc, "dim_labels", None)
+        src_shape = (
+            list(tensor_desc.shape) if tensor_desc is not None else scale_vec
+        )
+        y_idx, x_idx = get_xy_dim_indices(src_shape, dim_labels)
+        z_idx = get_z_dim_index(src_shape, dim_labels)
+        if z_idx is not None and z_idx in (x_idx, y_idx):
+            z_idx = None
+
+        def _at(idx):
+            return (
+                scale_vec[idx]
+                if (idx is not None and idx < len(scale_vec))
+                else None
+            )
+
+        def _unit_at(idx):
+            return (
+                unit_vec[idx]
+                if (idx is not None and idx < len(unit_vec))
+                else None
+            )
+
+        psx = _positive_float(_at(x_idx))
+        psy = _positive_float(_at(y_idx))
+        psz = _positive_float(_at(z_idx))
         if not any((psx, psy, psz)):
             return None, None
 
@@ -253,9 +289,9 @@ def build_layer_scale(
             "physical_size_x": psx,
             "physical_size_y": psy,
             "physical_size_z": psz,
-            "physical_size_x_unit": pixels.get("physical_size_x_unit"),
-            "physical_size_y_unit": pixels.get("physical_size_y_unit"),
-            "physical_size_z_unit": pixels.get("physical_size_z_unit"),
+            "physical_size_x_unit": _unit_at(x_idx) or None,
+            "physical_size_y_unit": _unit_at(y_idx) or None,
+            "physical_size_z_unit": _unit_at(z_idx) or None,
         }
         return scale, info
     except Exception as exc:
@@ -308,7 +344,14 @@ def add_tensor_layer(
     levels = wrap_levels(levels, compute_scheduler)
 
     add_kwargs = {"name": name}
-    scale, phys = build_layer_scale(client, source_id, out_ndim)
+    scale, phys = build_layer_scale(
+        client,
+        source_id,
+        out_ndim,
+        tensor_id=tensor_id,
+        tensor_desc=tensor_desc,
+        source_desc=source_desc,
+    )
     if scale is not None:
         add_kwargs["scale"] = scale
     if phys is not None:

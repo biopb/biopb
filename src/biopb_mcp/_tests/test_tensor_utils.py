@@ -270,34 +270,37 @@ class TestBuildPyramidCanonicalOrder:
         assert levels[0].shape == (3, 1, 64, 32)
 
 
-def _make_metadata_client(
-    psx=None, psy=None, psz=None, unit="µm", raises=False
-):
-    """Mock TensorFlightClient whose get_source_metadata returns the OME
-    metadata as a dict (the server's OME model dumped to JSON), matching the
-    real client contract."""
+def _make_physical_client(scale_vec=None, unit_vec=None, raises=False):
+    """Mock TensorFlightClient whose ``get_physical_scale`` returns the compact
+    per-dimension ``(scale, unit)`` summary in *source* axis order (the
+    descriptor field the server folds on, biopb issue #31), or ``None`` when no
+    physical scale is advertised (old server / format without physical sizes).
+    """
     client = MagicMock()
     if raises:
-        client.get_source_metadata.side_effect = RuntimeError("boom")
+        client.get_physical_scale.side_effect = RuntimeError("boom")
         return client
-    pixels = {
-        "physical_size_x": psx,
-        "physical_size_y": psy,
-        "physical_size_z": psz,
-        "physical_size_x_unit": unit,
-        "physical_size_y_unit": unit,
-        "physical_size_z_unit": unit,
-    }
-    metadata = {"images": [{"pixels": pixels}]}
-    client.get_source_metadata.return_value = metadata
+    if scale_vec is None:
+        client.get_physical_scale.return_value = None
+    else:
+        client.get_physical_scale.return_value = (
+            scale_vec,
+            unit_vec if unit_vec is not None else ["" for _ in scale_vec],
+        )
     return client
 
 
 def test_build_layer_scale_maps_canonical_trailing_axes():
-    # Canonical [..., Z, Y, X]: psz/psy/psx land on the last three axes,
-    # leading axes (channel) get 1.0.
-    client = _make_metadata_client(psx=0.325, psy=0.325, psz=2.0)
-    scale, info = build_layer_scale(client, "src", ndim=4)
+    # Source order [t, c, z, y, x] -> physical sizes map to x/y/z by label and
+    # land on the canonical [..., Z, Y, X] trailing axes; leading axes get 1.0.
+    client = _make_physical_client(
+        [0.0, 0.0, 2.0, 0.325, 0.325],
+        ["", "", "µm", "µm", "µm"],
+    )
+    desc = _make_tensor_desc([1, 3, 10, 64, 64], ["t", "c", "z", "y", "x"])
+    scale, info = build_layer_scale(
+        client, "src", ndim=4, tensor_id="t1", tensor_desc=desc
+    )
     assert scale == [1.0, 2.0, 0.325, 0.325]
     assert info["physical_size_x"] == 0.325
     assert info["physical_size_x_unit"] == "µm"
@@ -306,28 +309,62 @@ def test_build_layer_scale_maps_canonical_trailing_axes():
 def test_build_layer_scale_2d_canonical_has_singleton_z():
     # A 2D source is canonicalized to [Z(=1), Y, X], so ndim is 3 and the
     # singleton z gets 1.0 (no physical_size_z).
-    client = _make_metadata_client(psx=0.5, psy=0.25)
-    scale, _ = build_layer_scale(client, "src", ndim=3)
+    client = _make_physical_client([0.25, 0.5], ["µm", "µm"])
+    desc = _make_tensor_desc([512, 512], ["y", "x"])
+    scale, _ = build_layer_scale(
+        client, "src", ndim=3, tensor_id="t1", tensor_desc=desc
+    )
     assert scale == [1.0, 0.25, 0.5]
 
 
+def test_build_layer_scale_maps_misordered_source_axes_by_label():
+    # Source order [y, x, c]: x/y must be resolved by label, not position.
+    client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
+    desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
+    scale, info = build_layer_scale(
+        client, "src", ndim=4, tensor_id="t1", tensor_desc=desc
+    )
+    # Canonical [C, Z(=1), Y, X].
+    assert scale == [1.0, 1.0, 0.25, 0.5]
+    assert info["physical_size_y"] == 0.25
+    assert info["physical_size_x"] == 0.5
+
+
 def test_build_layer_scale_none_when_no_physical_sizes():
-    client = _make_metadata_client()
-    assert build_layer_scale(client, "src", ndim=3) == (None, None)
+    # All-zero source scale -> nothing to apply.
+    client = _make_physical_client([0.0, 0.0, 0.0], ["", "", ""])
+    desc = _make_tensor_desc([10, 64, 64], ["z", "y", "x"])
+    assert build_layer_scale(
+        client, "src", ndim=3, tensor_id="t1", tensor_desc=desc
+    ) == (None, None)
 
 
-def test_build_layer_scale_none_on_metadata_error():
-    client = _make_metadata_client(raises=True)
-    assert build_layer_scale(client, "src", ndim=3) == (None, None)
+def test_build_layer_scale_none_on_old_server():
+    # Old server / no summary advertised -> get_physical_scale returns None and
+    # we do NOT fall back to the full-OME get_source_metadata fetch (issue #31).
+    client = _make_physical_client(None)
+    desc = _make_tensor_desc([10, 64, 64], ["z", "y", "x"])
+    assert build_layer_scale(
+        client, "src", ndim=3, tensor_id="t1", tensor_desc=desc
+    ) == (None, None)
+    client.get_source_metadata.assert_not_called()
+
+
+def test_build_layer_scale_none_on_error():
+    client = _make_physical_client(raises=True)
+    desc = _make_tensor_desc([10, 64, 64], ["z", "y", "x"])
+    assert build_layer_scale(
+        client, "src", ndim=3, tensor_id="t1", tensor_desc=desc
+    ) == (None, None)
 
 
 class TestAddTensorLayer:
-    """The shared build-pyramid -> wrap -> OME scale -> add_image pipeline
+    """The shared build-pyramid -> wrap -> physical scale -> add_image pipeline
     used by both the Tensor Browser widget and the MCP add_tensor."""
 
-    def test_multiscale_with_ome_scale_and_metadata(self):
+    def test_multiscale_with_physical_scale_and_metadata(self):
         viewer = MagicMock()
-        client = _make_metadata_client(psx=0.5, psy=0.25)
+        client = _make_physical_client([0.25, 0.5], ["µm", "µm"])
         client.get_tensor.side_effect = _dask_scaling_side_effect([8192, 8192])
         desc = _make_tensor_desc([8192, 8192], ["y", "x"])
 
@@ -344,11 +381,13 @@ class TestAddTensorLayer:
         assert kwargs["scale"] == [1.0, 0.25, 0.5]
         phys = kwargs["metadata"]["ome_physical_size"]
         assert phys["physical_size_x"] == 0.5
+        # The whole point of #31: no full-OME fetch on the hot path.
+        client.get_source_metadata.assert_not_called()
 
     def test_single_level_omits_multiscale_and_scale(self):
         viewer = MagicMock()
         # No physical sizes -> no scale/metadata kwargs.
-        client = _make_metadata_client()
+        client = _make_physical_client(None)
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
@@ -361,7 +400,7 @@ class TestAddTensorLayer:
 
     def test_misordered_axes_canonicalized_with_aligned_scale(self):
         viewer = MagicMock()
-        client = _make_metadata_client(psx=0.5, psy=0.25)
+        client = _make_physical_client([0.25, 0.5, 0.0], ["µm", "µm", ""])
         # [Y, X, C] layout: without canonicalization napari would display the
         # wrong plane. A real dask array so the transpose actually reorders.
         client.get_tensor.return_value = da.zeros((64, 32, 3))
