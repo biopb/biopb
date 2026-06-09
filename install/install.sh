@@ -114,13 +114,25 @@ _pick_data_dir() {
     done
 
     if [ "$PLATFORM" = "WSL" ]; then
+        # On WSL, offer dedicated data subfolders under the Windows profile, but
+        # NEVER the profile root itself. Recursively scanning the profile walks
+        # AppData and, fatally, OneDrive "Files On-Demand" placeholders, which
+        # hydrate-on-read through drvfs and hang discovery before the server can
+        # bind. Data/Microscopy folders aren't OneDrive-redirected
+        # by default the way Documents/Desktop/Pictures are; users who keep data
+        # elsewhere can still type a /mnt/c/... path manually.
         local win_user; win_user=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
-        local wsl_home="/mnt/c/Users/$win_user"
-        if [ -n "$win_user" ] && [ -d "$wsl_home" ]; then
-            local real; real=$(realpath "$wsl_home" 2>/dev/null || echo "$wsl_home")
-            local dup=0
-            for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
-            [ "$dup" = "0" ] && candidates+=("$wsl_home")
+        if [ -n "$win_user" ]; then
+            for dir in \
+                "/mnt/c/Users/$win_user/Microscopy" \
+                "/mnt/c/Users/$win_user/Data" \
+                "/mnt/c/Users/$win_user/data"; do
+                [ -d "$dir" ] || continue
+                local real; real=$(realpath "$dir" 2>/dev/null || echo "$dir")
+                local dup=0
+                for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
+                [ "$dup" = "0" ] && candidates+=("$dir") && seen+=("$real")
+            done
         fi
     fi
 
