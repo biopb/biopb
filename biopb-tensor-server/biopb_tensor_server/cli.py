@@ -35,6 +35,7 @@ from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.metadata_db import MetadataDatabase
+from biopb_tensor_server.precache import PrecacheWorker
 from biopb_tensor_server.server import TensorFlightServer
 from biopb_tensor_server.source_manager import create_source_manager
 from biopb_tensor_server.watcher import get_watcher
@@ -70,15 +71,20 @@ def _install_sigterm_handler() -> None:
         pass
 
 
-def _graceful_shutdown(source_manager, watcher, flight_server) -> None:
+def _graceful_shutdown(
+    source_manager, watcher, flight_server, precache_worker=None
+) -> None:
     """Best-effort orderly shutdown.
 
-    Stops source discovery and the filesystem watcher, shuts down the Flight
-    server, and closes the cache manager so the file-backend process lock is
-    released. Each step is isolated so a failure in one still lets the cache
-    lock be released (the important part for clean restarts).
+    Stops the precache worker and source discovery and the filesystem watcher,
+    shuts down the Flight server, and closes the cache manager so the
+    file-backend process lock is released. Each step is isolated so a failure in
+    one still lets the cache lock be released (the important part for clean
+    restarts). The precache worker is stopped first so no new warm work starts
+    during teardown.
     """
     for label, action in (
+        ("precache worker", lambda: precache_worker and precache_worker.stop()),
         ("source manager", lambda: source_manager and source_manager.stop()),
         ("watcher", lambda: watcher and watcher.stop()),
         ("flight server", lambda: flight_server and flight_server.shutdown()),
@@ -120,7 +126,7 @@ def _setup_flight_server(
         token: Access token for Flight server authentication
 
     Returns:
-        Tuple of (flight_server, source_manager, watcher)
+        Tuple of (flight_server, source_manager, watcher, precache_worker)
 
     Raises:
         typer.Exit: If no sources configured or no sources loaded successfully
@@ -332,6 +338,15 @@ def _setup_flight_server(
     if metadata_db is not None:
         metadata_db.initial_sync(server._sources)
 
+    # Background precache worker: warm the file cache for sources added live.
+    # Wire the commit hook BEFORE source_manager.start() so runtime additions
+    # are captured; the initial scan was committed before start() and is
+    # excluded. The worker itself no-ops on a memory backend.
+    precache_worker = None
+    if server_config.precache.enabled:
+        precache_worker = PrecacheWorker(server, server_config.precache)
+        source_manager._on_source_committed = precache_worker.enqueue
+
     if watcher and source_manager:
         try:
             watcher.start(monitored_dirs)
@@ -342,13 +357,16 @@ def _setup_flight_server(
             watcher.stop()
             watcher = None
 
+    if precache_worker is not None:
+        precache_worker.start()
+
     # Initial scan/registration is complete: flip the health action from
     # STARTING to SERVING so clients waiting through startup can proceed.
     server.mark_ready()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
-    return server, source_manager, watcher
+    return server, source_manager, watcher, precache_worker
 
 
 def _create_source_adapter(source: SourceConfig, registry=None):
@@ -458,7 +476,7 @@ def serve(
     # Token from env var only (no auto-gen for serve - it's non-interactive)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
 
-    server, source_manager, watcher = _setup_flight_server(
+    server, source_manager, watcher, precache_worker = _setup_flight_server(
         server_config,
         host=host,
         port=port,
@@ -483,7 +501,7 @@ def serve(
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
-        _graceful_shutdown(source_manager, watcher, server)
+        _graceful_shutdown(source_manager, watcher, server, precache_worker)
 
 
 @app.command()
@@ -767,7 +785,7 @@ def launch(
         )
 
     # --- Start Flight server ---
-    flight_server, source_manager, watcher = _setup_flight_server(
+    flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
         server_config, token=effective_token
     )
 
@@ -835,7 +853,7 @@ def launch(
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
     finally:
-        _graceful_shutdown(source_manager, watcher, flight_server)
+        _graceful_shutdown(source_manager, watcher, flight_server, precache_worker)
 
     try:
         from biopb_tensor_server import __version__

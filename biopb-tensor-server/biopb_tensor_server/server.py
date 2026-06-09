@@ -11,6 +11,7 @@ The server supports:
 - Metadata queries: SQL queries against source catalog (via DuckDB)
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -166,6 +167,36 @@ class TensorFlightServer(flight.FlightServerBase):
         # from "down" and wait instead of timing out. Set on the main thread,
         # read from gRPC handler threads, hence an Event.
         self._ready = threading.Event()
+
+        # Flight activity tracking for the background precache worker: counts
+        # in-flight heavy reads (do_get) and stamps the last time one finished,
+        # so the worker can stay off the wire while real traffic flows. Cheap --
+        # one uncontended lock + int + monotonic stamp per do_get.
+        self._activity_lock = threading.Lock()
+        self._inflight = 0
+        self._last_active = 0.0  # time.monotonic() of last do_get completion
+
+    @contextlib.contextmanager
+    def _serving_request(self):
+        """Mark a heavy read in flight for its duration (precache idle signal)."""
+        with self._activity_lock:
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._inflight -= 1
+                self._last_active = time.monotonic()
+
+    def flight_idle_for(self, seconds: float) -> bool:
+        """True if no heavy read is in flight and none finished within *seconds*.
+
+        Used by the precache worker to debounce against live traffic.
+        """
+        with self._activity_lock:
+            if self._inflight > 0:
+                return False
+            return (time.monotonic() - self._last_active) >= seconds
 
     def mark_ready(self) -> None:
         """Signal that initial source registration is complete.
@@ -662,38 +693,41 @@ class TensorFlightServer(flight.FlightServerBase):
                 )
             return flight.RecordBatchStream(result)
 
-        tensor_ticket = self._parse_ticket(ticket)
-        logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
+        # Heavy chunk-read path: track it as in-flight so the background
+        # precache worker stays idle while real reads are happening.
+        with self._serving_request():
+            tensor_ticket = self._parse_ticket(ticket)
+            logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-        source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
-        self._authorize_source(context, source_id)
+            source_id = decode_chunk_id(tensor_ticket.chunk_id)[0].split("/")[0]
+            self._authorize_source(context, source_id)
 
-        adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
-        if adapter is None:
-            raise flight.FlightServerError(
-                f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}..."
-            )
+            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
+            if adapter is None:
+                raise flight.FlightServerError(
+                    f"Adapter not found for chunk_id: {tensor_ticket.chunk_id[:16]}..."
+                )
 
-        # Get cache manager singleton (if initialized)
-        cache_manager = CacheManager.get_instance()
+            # Get cache manager singleton (if initialized)
+            cache_manager = CacheManager.get_instance()
 
-        # Read the chunk, using the configured cache backend when applicable.
-        try:
-            record_batch = adapter.resolve_chunk_data(
-                tensor_ticket.chunk_id, cache_manager
-            )
-        except (OSError, IOError, ValueError) as e:
-            # ValueError can be raised by bounds validation or parsing failures
-            raise flight.FlightInternalError(
-                f"I/O error reading chunk data: {e}"
-            ) from e
+            # Read the chunk, using the configured cache backend when applicable.
+            try:
+                record_batch = adapter.resolve_chunk_data(
+                    tensor_ticket.chunk_id, cache_manager
+                )
+            except (OSError, IOError, ValueError) as e:
+                # ValueError can be raised by bounds validation or parsing failures
+                raise flight.FlightInternalError(
+                    f"I/O error reading chunk data: {e}"
+                ) from e
 
-        batch_size = sum(col.nbytes for col in record_batch.columns)
-        logger.debug(f"do_get: returning {batch_size} bytes")
+            batch_size = sum(col.nbytes for col in record_batch.columns)
+            logger.debug(f"do_get: returning {batch_size} bytes")
 
-        # zoer copy wrapper - do _not_ convert to pa.Table!
-        reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
-        return flight.RecordBatchStream(reader)
+            # zoer copy wrapper - do _not_ convert to pa.Table!
+            reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
+            return flight.RecordBatchStream(reader)
 
     def _handle_chunk_locate(self, chunk_id: bytes) -> str:
         """Locate a cached chunk on disk for the localhost cache-file handoff.
