@@ -114,7 +114,9 @@ def _setup_flight_server(
     gpu_min_merged_chunks: Optional[int] = None,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
-) -> Tuple[TensorFlightServer, Optional[object], Optional[object]]:
+) -> Tuple[
+    TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
+]:
     """Set up the Flight server with cache, sources, and monitoring.
 
     Args:

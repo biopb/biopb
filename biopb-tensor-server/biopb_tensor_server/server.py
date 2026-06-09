@@ -725,7 +725,7 @@ class TensorFlightServer(flight.FlightServerBase):
             batch_size = sum(col.nbytes for col in record_batch.columns)
             logger.debug(f"do_get: returning {batch_size} bytes")
 
-            # zoer copy wrapper - do _not_ convert to pa.Table!
+            # zero-copy wrapper - do _not_ convert to pa.Table!
             reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
             return flight.RecordBatchStream(reader)
 
