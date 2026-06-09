@@ -48,11 +48,11 @@ _BASE_INSTRUCTIONS = (
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
     "explicitly asks.\n"
-    "- Browse the catalog with `client.query_sources(sql)` (server-side DuckDB, "
-    "complete), not `client.list_sources()` (server-capped for large "
-    "catalogs). It returns a pyarrow.Table — call `.to_pandas()`; the `sources` "
-    "columns are source_id, source_url, source_type, dtype, indexed_at, "
-    "metadata_json, shape_summary.\n"
+    '- Browse the catalog with `client.query_sources(sql, format="pandas")` '
+    "(server-side DuckDB, complete), not `client.list_sources()` "
+    "(server-capped for large catalogs); the `sources` columns are source_id, "
+    "source_url, source_type, dtype, indexed_at, metadata_json, "
+    "shape_summary.\n"
     "- Prefer lazy dask operations; only `.compute()` the final result.\n"
     "- Put intermediate results back on `viewer` for the user to validate at "
     "each step.\n"
@@ -494,11 +494,11 @@ def execute_code(python_code: str) -> str:
     main thread. Viewer's add_* methods are pre-wrapped.
 
     * data access (see guide://tensor for more details):
-    - client.query_sources(sql) runs server-side DuckDB and returns a
-      pyarrow.Table; call .to_pandas() for a DataFrame. The `sources` table
-      columns are: source_id, source_url, source_type, dtype, indexed_at,
-      metadata_json, shape_summary (note source_url, not "url"). Prefer this
-      over client.list_sources() (server-capped for large catalogs).
+    - client.query_sources(sql, format="pandas") runs server-side DuckDB and
+      returns a DataFrame. The `sources` table columns are: source_id,
+      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary
+      (note source_url, not "url"). Prefer this over client.list_sources()
+      (server-capped for large catalogs).
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
       (auto-handles the multiscale pyramid). client.get_tensor(source_id,
       tensor_id=None) returns a lazy dask array without adding a layer.

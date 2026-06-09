@@ -179,8 +179,8 @@ else:
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
 # indexed_at, metadata_json, shape_summary
-arrow_table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
-print(arrow_table.to_pandas())
+df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
+print(df)
 
 # Convenience listing (NOTE: capped by the server for large catalogs)
 for sid, src in client.list_sources().items():

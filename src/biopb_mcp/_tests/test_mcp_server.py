@@ -192,7 +192,7 @@ class TestSetHeadless:
         # The catalog contract agents most often get wrong must be pushed up
         # front (return type + the real column name), not left to a pull-only
         # resource -- see also execute_code's docstring.
-        assert "to_pandas" in base
+        assert 'format="pandas"' in base
         assert "source_url" in base
         # And they are advertised when visible (no headless directive).
         _server.set_headless(False)
@@ -244,7 +244,7 @@ class TestExecuteCode:
         # live here so the agent sees them at the point of action.
         doc = _server.execute_code.__doc__ or _server.execute_code.fn.__doc__
         assert "source_url" in doc
-        assert "to_pandas" in doc
+        assert 'format="pandas"' in doc
         assert "add_tensor" in doc
 
     def test_returns_error_when_no_host(self):
