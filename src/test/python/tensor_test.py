@@ -615,5 +615,72 @@ class TestQuerySourcesFormat:
             client.query_sources("SELECT 1", format="polars")
 
 
+class TestGetPhysicalScale:
+    """get_physical_scale reads the descriptor summary (server-free).
+
+    Exercises the client accessor for the per-dim physical-scale summary the
+    server folds onto the descriptor (issue #31), driving the descriptor /
+    source caches directly so no connection is needed.
+    """
+
+    @staticmethod
+    def _client():
+        # Build without __init__ (no connection); the method only touches the
+        # in-memory caches and (in the fallback) get_source, which we stub.
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        client._descriptors = {}
+        client._sources = {}
+        client.get_source = Mock()
+        return client
+
+    @staticmethod
+    def _desc(array_id, scale=None, unit=None):
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
+        desc = TensorDescriptor(array_id=array_id, dim_labels=["z", "y", "x"])
+        if scale is not None:
+            desc.physical_scale[:] = scale
+            desc.physical_unit[:] = unit
+        return desc, DataSourceDescriptor
+
+    def test_reads_cached_descriptor_without_rpc(self):
+        # A descriptor cached by a prior get_tensor() carries the summary, so
+        # get_physical_scale returns it with no extra fetch.
+        client = self._client()
+        desc, _ = self._desc(
+            "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
+        )
+        client._descriptors["t1"] = desc
+
+        scale, unit = client.get_physical_scale("src", "t1")
+        assert scale == [2.0, 0.325, 0.325]
+        assert unit == ["micrometer", "micrometer", "micrometer"]
+        client.get_source.assert_not_called()
+
+    def test_none_when_summary_empty(self):
+        # Old server / no physical sizes -> empty repeated field -> None.
+        client = self._client()
+        desc, _ = self._desc("t1")  # no physical_scale set
+        client._descriptors["t1"] = desc
+
+        assert client.get_physical_scale("src", "t1") is None
+
+    def test_falls_back_to_source_cache(self):
+        # Not in the descriptor cache: get_source is consulted (stubbed here),
+        # then the source's first tensor descriptor supplies the summary.
+        client = self._client()
+        desc, DataSourceDescriptor = self._desc(
+            "t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"]
+        )
+        client._sources["src"] = DataSourceDescriptor(
+            source_id="src", tensors=[desc]
+        )
+
+        scale, unit = client.get_physical_scale("src")  # tensor_id defaults
+        assert scale == [1.0, 0.5, 0.5]
+        assert unit == ["", "micrometer", "micrometer"]
+        client.get_source.assert_called_once_with("src", None)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
