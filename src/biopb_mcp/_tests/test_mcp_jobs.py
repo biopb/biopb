@@ -83,7 +83,7 @@ class TestJobRunnerUnit:
 
     def test_one_job_at_a_time(self, runner):
         jid = _jobs.submit(
-            "import time\n" "while not cancelled():\n    time.sleep(0.02)"
+            "import time\nwhile not cancelled():\n    time.sleep(0.02)"
         )["job_id"]
         try:
             busy = _jobs.submit("1 + 1")

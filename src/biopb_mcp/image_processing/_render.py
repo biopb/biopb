@@ -40,7 +40,7 @@ def _render_meshes(
         bm = [True] * len(response.detections)
 
     meshes = []
-    for det, selected in zip(response.detections, bm):
+    for det, selected in zip(response.detections, bm, strict=False):
         if selected:
             verts, cells = [], []
             for vert in det.roi.mesh.verts:
@@ -108,7 +108,9 @@ def _render_polygons(
         bm = _filter_boxes(np.array(bboxes))
 
         detections = [
-            det for det, selected in zip(response.detections, bm) if selected
+            det
+            for det, selected in zip(response.detections, bm, strict=False)
+            if selected
         ]
 
     else:

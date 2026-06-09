@@ -127,6 +127,6 @@ def wrap_levels(levels, scheduler: str | None):
     """
     if not scheduler:
         return levels
-    if isinstance(levels, (list, tuple)):
+    if isinstance(levels, list | tuple):
         return type(levels)(_ViewerArray(a, scheduler) for a in levels)
     return _ViewerArray(levels, scheduler)

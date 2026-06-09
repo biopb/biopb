@@ -157,7 +157,12 @@ lint.select = [
 lint.ignore = [
     "E501", # line too long. let black handle this
     "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
-    "SIM117", # flake8-simplify - some of merged with statements are not looking great with black, reanble after drop python 3.9
+    "SIM117", # flake8-simplify - some merged with statements don't look great with black; revisit later
+    "BLE001", # blind-except - intentional best-effort cleanup paths (e.g. _kernel.py, _config.py, connect/autostart) that must never propagate.
+    "UP035", # deprecated-import - keep typing.List/Dict for magicgui runtime annotations, consistent with the UP006/UP007 ignores.
+    "G004", # logging-f-string - stylistic; the codebase mixes f-string and lazy %-style logs.
+    "SIM105", # suppressible-exception - keep explicit try/except/pass over contextlib.suppress in death-pipe / cleanup paths.
+    "B904", # raise-without-from-inside-except - one deliberate re-raise in image_processing/_grpc.py.
 ]
 
 exclude = [

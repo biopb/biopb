@@ -371,21 +371,9 @@ class TestGrpcObjectDetection:
     def test_invalid_dimensions_2d_mode(self):
         """Wrong dimensions for 2D mode raises ValueError."""
         # The function is wrapped in thread_worker, so we test the validation
-        # by calling the underlying logic
-
-        # Create test data with wrong dimensions (3D data when expecting 2D)
-        image_data = np.random.rand(2, 10, 100, 100, 1)  # 5D (3D mode) data
-        settings = {
-            "3D": False,  # Expecting 4D data
-            "Server": "localhost:50051",
-            "Scheme": "HTTP",
-        }
-        grid_positions = []
-
-        # Get the generator function (before thread_worker wraps it)
-        # We can't easily test this due to thread_worker decorator
-        # But we document the expected behavior
-        # thread_worker testing requires complex mocking
+        # by calling the underlying logic.
+        # We can't easily test this due to the thread_worker decorator, which
+        # requires complex mocking; this documents the expected behavior.
 
     def test_invalid_dimensions_3d_mode(self):
         """Wrong dimensions for 3D mode raises ValueError."""
@@ -412,22 +400,9 @@ class TestGrpcObjectDetection:
         mock_response.detections = []
         mock_stub.RunDetection.return_value = mock_response
 
-        # Create test data (2D)
-        image_data = np.random.rand(2, 100, 100, 1)  # 2 images, 2D
-        settings = {
-            "3D": False,
-            "Server": "localhost:50051",
-            "Z Aspect Ratio": 1.0,
-            "Min Score": 0.5,
-            "NMS": "Off",
-            "Size Hint": 30.0,
-        }
-        grid_positions = [(slice(0, 100), slice(0, 100))]
-
-        # Get the generator (need to unwrap thread_worker)
-        # thread_worker returns a worker object, but for testing we call the inner generator
-        # We'll mock thread_worker to return the generator directly
-        # Skip this for now - thread_worker testing is complex
+        # Getting the generator means unwrapping thread_worker (it returns a
+        # worker object, not the inner generator); that mocking is complex, so
+        # this documents the expected behavior rather than exercising it.
 
 
 class TestGrpcProcessImage:

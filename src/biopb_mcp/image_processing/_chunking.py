@@ -157,7 +157,7 @@ def _data_iterator(data: np.ndarray, iter_dims: set[str], axis_order: str):
     iter_shape = tuple(data.shape[idx] for idx in iter_indices)
 
     for idx_tuple in np.ndindex(iter_shape):
-        position = dict(zip(iter_indices, idx_tuple))
+        position = dict(zip(iter_indices, idx_tuple, strict=False))
 
         # Build slices: iterate dims get single index, others get full slice
         slices = [slice(None)] * data.ndim

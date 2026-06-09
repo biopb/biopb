@@ -171,7 +171,7 @@ def _register_cache_plugin(
             budget_cfg = get_setting(config, "mcp.dask.cache_budget")
             budget = (
                 int(budget_cfg)
-                if isinstance(budget_cfg, (int, float))
+                if isinstance(budget_cfg, int | float)
                 else parse_bytes(budget_cfg)
             )
             per_worker = max(0, budget // n_workers)

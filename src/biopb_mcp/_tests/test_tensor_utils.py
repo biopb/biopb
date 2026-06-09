@@ -47,7 +47,9 @@ def _scaling_side_effect(shape):
 
     def _get_tensor(source_id, tensor_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
-        return _arr_with_shape([max(1, s // h) for s, h in zip(shape, hint)])
+        return _arr_with_shape(
+            [max(1, s // h) for s, h in zip(shape, hint, strict=False)]
+        )
 
     return _get_tensor
 
@@ -59,7 +61,7 @@ def _dask_scaling_side_effect(shape):
 
     def _get_tensor(source_id, tensor_id, scale_hint=None):
         hint = scale_hint or [1] * len(shape)
-        new = [max(1, s // h) for s, h in zip(shape, hint)]
+        new = [max(1, s // h) for s, h in zip(shape, hint, strict=False)]
         return da.zeros(new, chunks=new)
 
     return _get_tensor

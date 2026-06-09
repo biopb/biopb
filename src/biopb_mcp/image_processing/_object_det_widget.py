@@ -130,7 +130,8 @@ class ObjectDetectionWidget(_WidgetBase):
         )
 
         grid_start = [
-            slice(0, max(d - (gs - ss), 1), ss) for d, gs, ss in zip(*pos_pars)
+            slice(0, max(d - (gs - ss), 1), ss)
+            for d, gs, ss in zip(*pos_pars, strict=False)
         ]
         grid_start = np.moveaxis(np.mgrid[grid_start], 0, -1)
         grid_start = grid_start.reshape(-1, image.ndim - 1)

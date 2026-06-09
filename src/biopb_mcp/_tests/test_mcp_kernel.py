@@ -180,8 +180,7 @@ class TestKernelLifecycle:
         it must NOT appear in the execute result but MUST land in the file.
         """
         log = tmp_path / "kernel.log"
-        f = open(log, "ab", buffering=0)
-        try:
+        with open(log, "ab", buffering=0) as f:
             host = KernelHost(
                 health_probe_code=None,
                 startup_timeout=60.0,
@@ -192,8 +191,6 @@ class TestKernelLifecycle:
             res = host.execute("import os; os.write(1, b'NATIVE_FD1_MARKER')")
             assert "NATIVE_FD1_MARKER" not in res["stdout"]
             host.shutdown()
-        finally:
-            f.close()
         assert b"NATIVE_FD1_MARKER" in log.read_bytes()
 
     def test_shutdown_attempts_graceful_close_before_kill(self, monkeypatch):

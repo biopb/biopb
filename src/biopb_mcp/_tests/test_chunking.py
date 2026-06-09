@@ -1,8 +1,9 @@
 """Tests for _chunking.py chunking utilities."""
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
-from unittest.mock import MagicMock
 
 from biopb_mcp.image_processing._chunking import (
     IterationSpec,
@@ -193,7 +194,7 @@ class TestDataIterator:
         assert len(results) == 6  # 2 * 3
 
         # Each result should have singleton T and Z
-        for position, chunk in results:
+        for _position, chunk in results:
             assert chunk.shape == (1, 1, 100, 100)
 
 

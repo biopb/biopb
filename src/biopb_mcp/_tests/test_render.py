@@ -1,13 +1,13 @@
 """Tests for _render.py rendering functions."""
 
+from typing import List
+
 import numpy as np
 import pytest
-from typing import List
 
 from biopb_mcp.image_processing._render import (
     _adjust_response_offset,
     _generate_label,
-    _render_meshes,
     _render_polygons,
 )
 

@@ -3,8 +3,9 @@
 import os
 import sys
 import time
+
 import pytest
-from qtpy.QtCore import QTimer
+
 from biopb_mcp.image_processing._grpc import CALL_START
 
 
@@ -19,6 +20,7 @@ class TestProgressTimer:
     def test_timer_ticks_when_started(self, qtbot, make_napari_viewer):
         """Timer ticks and updates progress bar value when started."""
         from qtpy.QtWidgets import QApplication
+
         from biopb_mcp.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
@@ -62,6 +64,7 @@ class TestProgressTimer:
     def test_on_call_starting_starts_timer(self, qtbot, make_napari_viewer):
         """_on_call_starting() increments pending calls and starts the timer."""
         from qtpy.QtWidgets import QApplication
+
         from biopb_mcp.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
@@ -125,7 +128,6 @@ class TestProgressTimer:
 
     def test_progress_uses_scaled_integers(self, qtbot, make_napari_viewer):
         """Progress increments proportionally based on completed/total ratio."""
-        from qtpy.QtWidgets import QApplication
         from biopb_mcp.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
@@ -165,9 +167,10 @@ class TestProgressTimer:
         self, qtbot, make_napari_viewer
     ):
         """Timer ticks while a thread worker is blocked."""
-        from qtpy.QtWidgets import QApplication
-        from biopb_mcp.image_processing._widget_base import _WidgetBase
         from napari.qt.threading import thread_worker
+        from qtpy.QtWidgets import QApplication
+
+        from biopb_mcp.image_processing._widget_base import _WidgetBase
 
         viewer = make_napari_viewer()
         widget = _WidgetBase(viewer)
@@ -241,10 +244,10 @@ class TestSignalDelivery:
 
     def test_yielded_signals_delivered(self, qtbot, make_napari_viewer):
         """Yielded signals from thread worker are eventually delivered."""
-        from qtpy.QtWidgets import QApplication
         from napari.qt.threading import thread_worker
+        from qtpy.QtWidgets import QApplication
 
-        viewer = make_napari_viewer()
+        make_napari_viewer()
 
         signals_received = []
 

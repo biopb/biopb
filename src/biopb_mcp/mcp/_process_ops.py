@@ -18,7 +18,8 @@ source_id string) on both input and output:
 """
 
 import logging
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 import biopb.image as proto

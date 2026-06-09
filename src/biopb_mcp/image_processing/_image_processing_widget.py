@@ -115,7 +115,7 @@ class ImageProcessingWidget(_WidgetBase):
 
     def _fetch_ops(self):
         """Fetch available operations from server asynchronously."""
-        from ._grpc import get_op_names, _get_label_filter
+        from ._grpc import _get_label_filter, get_op_names
 
         self._ops_status.value = "Ops: Fetching..."
         self._op_selector.visible = False
@@ -191,7 +191,7 @@ class ImageProcessingWidget(_WidgetBase):
         self._op_selector.visible = False
         self._kwargs_container.visible = False
 
-        worker = thread_worker(
+        thread_worker(
             _fetch,
             start_thread=True,
             connect={"returned": _on_result},

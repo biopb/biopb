@@ -190,7 +190,7 @@ class TestPatchViewerAddTensor:
             return_value=levels,
         ):
             patch_viewer_add_tensor(viewer, connection)
-            name = viewer.add_tensor("src1")
+            viewer.add_tensor("src1")
 
         viewer.add_image.assert_called_once_with(
             levels, name="big", multiscale=True

@@ -226,9 +226,7 @@ def _is_empty_for_display(value) -> bool:
         if not value:
             return True
         return all(_is_empty_for_display(v) for v in value.values())
-    if isinstance(value, str) and not value.strip():
-        return True
-    return False
+    return isinstance(value, str) and not value.strip()
 
 
 def _filter_empty_metadata(metadata: Dict) -> Dict:

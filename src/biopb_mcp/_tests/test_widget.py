@@ -2,7 +2,6 @@ import os
 import sys
 
 import pytest
-import numpy as np
 
 from biopb_mcp.image_processing import ObjectDetectionWidget
 

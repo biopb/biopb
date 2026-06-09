@@ -83,7 +83,7 @@ class TestFilterBoxes:
         boxes = np.array([[0, 0, 10, 10]])
         result = _filter_boxes(boxes)
         assert len(result) == 1
-        assert result[0] == True
+        assert result[0]
 
     def test_non_overlapping_kept(self):
         """Non-overlapping boxes are all kept."""
@@ -102,8 +102,8 @@ class TestFilterBoxes:
         )
         result = _filter_boxes(boxes, threshold=0.75)
         # Small box (last) should be removed since it's fully enclosed
-        assert result[1] == False
-        assert result[0] == True
+        assert not result[1]
+        assert result[0]
 
     def test_threshold_adjustment(self):
         """Different threshold values affect filtering."""
