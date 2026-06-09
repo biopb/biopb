@@ -936,6 +936,26 @@ class TestBuildPyramidPlan:
         assert len(levels) == 1
         assert list(levels[0].scale_hint) == [1, 1]
 
+    @pytest.mark.parametrize(
+        "shape,labels",
+        [
+            ([100000], ["x"]),       # 1-D with a label
+            ([100000], None),        # 1-D, no labels (no X/Y to resolve)
+            ([], []),                # 0-D scalar
+        ],
+    )
+    def test_sub_2d_is_single_unscaled_level(self, shape, labels):
+        # <2-D tensors have no Y/X plane: one full-resolution level, never a raise
+        # (regression -- _precache_xy_indices used to raise, breaking GetFlightInfo).
+        from biopb_tensor_server.chunk import build_pyramid_plan
+
+        levels = build_pyramid_plan(shape, labels)
+        assert len(levels) == 1
+        assert list(levels[0].scale_hint) == [1] * len(shape)
+        assert list(levels[0].shape) == list(shape)
+        # The coarsest-helper wrapper must agree (no scaling).
+        assert compute_precache_scale_hint(shape, labels) == [1] * len(shape)
+
     def test_reduction_method_is_configurable(self):
         from biopb_tensor_server.chunk import build_pyramid_plan
 
@@ -1071,6 +1091,30 @@ class TestAdvertisedPyramidDescriptor:
             assert len(desc.pyramid) == 4
             assert all(lv.native for lv in desc.pyramid)
             assert all(lv.reduction_method == "precompute" for lv in desc.pyramid)
+        finally:
+            server.shutdown()
+
+    def test_get_flight_info_on_1d_source_is_single_unscaled_level(self, tmp_path):
+        # A 1-D tensor has no Y/X plane; GetFlightInfo must advertise one full-res
+        # level rather than raise (regression for the <2-D guard).
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+
+        arr = zarr.open_array(
+            str(tmp_path / "line.zarr"),
+            mode="w",
+            shape=(100000,),
+            chunks=(8192,),
+            dtype="uint8",
+        )
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            server.register_source("line", ZarrAdapter(arr, "line", ["x"]))
+            desc = self._descriptor(self._flight_info(server, "line", "line"))
+            assert len(desc.pyramid) == 1
+            assert list(desc.pyramid[0].scale_hint) == [1]
+            assert list(desc.pyramid[0].shape) == [100000]
         finally:
             server.shutdown()
 

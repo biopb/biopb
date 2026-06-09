@@ -473,6 +473,14 @@ def compute_pyramid_scale_hints(
         Non-empty list of per-axis scale vectors, coarsest last.
     """
     ndim = len(shape)
+
+    # A tensor with fewer than two axes has no Y/X plane to downsample, so there
+    # is no meaningful pyramid -- advertise a single full-resolution level. This
+    # also keeps build_pyramid_plan / get_flight_info from raising on 1-D (or 0-D)
+    # tensors, where _precache_xy_indices has no X/Y to resolve.
+    if ndim < 2:
+        return [[1] * ndim]
+
     budget = pixel_budget_cubic_root ** 3
     floor = min(pixel_budget_cubic_root, threshold)
 
