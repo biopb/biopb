@@ -7,6 +7,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates bash \
     && rm -rf /var/lib/apt/lists/*
 
+# Seed standalone TIFFs at /root so picking $HOME as the data dir gives the
+# server (install step 7) real sources to discover and pre-cache, mimicking a
+# real start. Distinct names => each is its own dataset (claimed individually by
+# aicsimageio); discovery prunes hidden dirs (~/.local, ~/.config), so scanning
+# /root stays cheap. imagemagick is purged afterward to keep the image clean.
+RUN apt-get update && apt-get install -y --no-install-recommends imagemagick \
+    && for n in aaa bbb ccc ddd eee; do \
+         convert -size 2048x2048 xc:black +noise Gaussian \
+                 -colorspace Gray -depth 16 "/root/$n.tif"; \
+       done \
+    && apt-get purge -y imagemagick \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY ../install.sh /install.sh
 
 CMD ["/bin/bash"]
