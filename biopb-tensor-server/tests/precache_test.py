@@ -776,3 +776,63 @@ class TestBacklogWarming:
             server.shutdown()
             CacheManager.get_instance().close()
             CacheManager.reset()
+
+
+# ---------------------------------------------------------------------------
+# Skip natively-multiscale sources (well-formed OME-Zarr pyramids).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestSkipNativePyramid:
+    def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
+        import zarr
+
+        from biopb_tensor_server import OmeZarrAdapter
+
+        zarr_path, _level_paths, _zattrs = multires_ome_zarr
+        root = zarr.open_group(zarr_path, mode="r")
+        return OmeZarrAdapter(root["0"], source_id)
+
+    def test_ome_zarr_reports_native_pyramid(self, multires_ome_zarr):
+        adapter = self._ome_adapter(multires_ome_zarr)
+        assert adapter.has_native_pyramid() is True
+
+    def test_plain_zarr_has_no_native_pyramid(self, tmp_path):
+        import zarr
+
+        from biopb_tensor_server import ZarrAdapter
+
+        arr = zarr.open_array(
+            str(tmp_path / "a.zarr"),
+            mode="w",
+            shape=(64, 64),
+            chunks=(32, 32),
+            dtype="uint16",
+        )
+        adapter = ZarrAdapter(arr, "plain", ["y", "x"])
+        assert adapter.has_native_pyramid() is False
+
+    def test_precache_skips_native_multiscale_source(
+        self, multires_ome_zarr, tmp_path
+    ):
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        server = TensorFlightServer("grpc://localhost:0")
+        try:
+            adapter = self._ome_adapter(multires_ome_zarr)
+            server.register_source("ome-native", adapter)
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            # File backend is active, so absent the skip this would warm chunks.
+            preempted = worker._process_source("ome-native")
+            assert preempted is False
+            assert CacheManager.get_instance().stats().misses == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()

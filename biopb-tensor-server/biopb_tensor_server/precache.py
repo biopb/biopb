@@ -265,6 +265,16 @@ class PrecacheWorker:
         source_adapter = self._server._get_source_adapter(source_id)
         if source_adapter is None:
             return False
+        # Skip formats that ship their own multi-resolution pyramid (e.g.
+        # well-formed OME-Zarr): they already serve overviews cheaply from
+        # native coarse levels, so precache gains little. The client's overview
+        # request would also use a synthetic scale that doesn't reuse these
+        # anyway, so warming them is wasted I/O.
+        if source_adapter.has_native_pyramid():
+            logger.debug(
+                "precache: skipping well-formed multiscale source %s", source_id
+            )
+            return False
         try:
             descriptors = source_adapter.list_tensor_descriptors()
         except Exception:
