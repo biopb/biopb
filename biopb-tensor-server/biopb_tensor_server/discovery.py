@@ -76,6 +76,98 @@ def _hash_path(path: Path) -> str:
     return hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
 
 
+# Directory names that are never microscopy-data roots but are common, enormous,
+# and — fatally on Windows/WSL — full of OneDrive "Files On-Demand" placeholders
+# whose content recalls (and can hang) on read. Recursive discovery must never
+# descend into them no matter how broad a root it is pointed at; a Windows user
+# profile (e.g. /mnt/c/Users/<user>) otherwise stalls the server before it binds.
+# Matched case-insensitively against the bare directory name.
+_SKIP_DIR_NAMES = frozenset(
+    {
+        "appdata",
+        "$recycle.bin",
+        "$winreagent",
+        "system volume information",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "recovery",
+        "node_modules",
+    }
+)
+
+# Windows file-attribute bits marking content that is not resident on local disk
+# (cloud placeholder / HSM stub). Defined numerically because the stdlib ``stat``
+# module exposes only some of them. Reading such a file triggers an on-demand
+# recall that can block indefinitely — OneDrive Files On-Demand over WSL ``drvfs``
+# is the motivating case — so discovery skips it rather than let an adapter open
+# it to sniff its format.
+_FILE_ATTRIBUTE_OFFLINE = 0x00001000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+_OFFLINE_ATTR_MASK = (
+    _FILE_ATTRIBUTE_OFFLINE
+    | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+# Skipping suspected cloud placeholders is best-effort and on by default; the
+# POSIX signal (zero allocated blocks) is a heuristic, so allow an escape hatch in
+# case a filesystem reports it spuriously and discovery wrongly skips real files.
+_SKIP_OFFLINE = os.environ.get("BIOPB_DISCOVERY_SKIP_OFFLINE", "1") != "0"
+
+
+def _is_skippable_system_dir(name: str) -> bool:
+    """True for well-known system/cloud directory names discovery must not enter.
+
+    Covers the fixed names in ``_SKIP_DIR_NAMES`` plus OneDrive roots, which are
+    named ``OneDrive`` or ``OneDrive - <Org>``.
+    """
+    low = name.lower()
+    if low in _SKIP_DIR_NAMES:
+        return True
+    return low == "onedrive" or low.startswith("onedrive -") or low.startswith(
+        "onedrive-"
+    )
+
+
+def _is_offline_placeholder(path: Path) -> bool:
+    """Best-effort: True when *path*'s content is not resident on local disk.
+
+    ``os.stat`` reads metadata only and does **not** trigger a recall, so a
+    placeholder can be detected and skipped before any adapter opens the file.
+    Two signals, by platform:
+
+    - Windows: the ``FILE_ATTRIBUTE_OFFLINE`` / ``RECALL_ON_*`` bits in
+      ``st_file_attributes``.
+    - POSIX/WSL: zero allocated blocks (``st_blocks == 0``) — the content is
+      stubbed out. No logical-size floor: a placeholder is indistinguishable
+      from a resident/sparse file by stat alone (verified — drvfs reports a
+      OneDrive placeholder as a plain ``regular file`` with ``blocks == 0`` and
+      no reparse tag or xattr), so we skip *every* zero-block file. Missing a
+      benign one (resident tiny file, sparse file, empty file) is harmless;
+      opening a real placeholder while offline would block indefinitely, which
+      is the failure this guard exists to prevent.
+
+    Never raises; returns ``False`` whenever the signal is unavailable, so a
+    normal file is never wrongly skipped on that account.
+    """
+    if not _SKIP_OFFLINE:
+        return False
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+
+    attrs = getattr(st, "st_file_attributes", 0)
+    if attrs and (attrs & _OFFLINE_ATTR_MASK):
+        return True
+
+    st_blocks = getattr(st, "st_blocks", None)
+    return st_blocks == 0
+
+
 class ClaimContext:
     """Unified path access for claim protocol.
 
@@ -198,6 +290,25 @@ def walk_with_identity_tracking(
             if path.name.startswith("."):
                 continue
 
+            # Never enter system/cloud directories (AppData, OneDrive, Windows,
+            # …): they are not data, and reading their cloud placeholders can hang
+            # discovery. Checked on the name alone so it costs no stat and prunes
+            # the whole subtree.
+            try:
+                is_dir = path.is_dir()
+            except OSError:
+                continue  # Broken entry or permission issue
+            if is_dir and _is_skippable_system_dir(path.name):
+                logger.debug("walk: skipping system/cloud directory %s", path)
+                continue
+
+            # Skip files whose content is not resident locally (cloud/HSM
+            # placeholders): an adapter opening one to sniff its format would
+            # recall it on demand and may block indefinitely.
+            if not is_dir and _is_offline_placeholder(path):
+                logger.info("walk: skipping offline/placeholder file %s", path)
+                continue
+
             if path_filter is not None and not path_filter(path):
                 continue
 
@@ -213,7 +324,7 @@ def walk_with_identity_tracking(
             yield path
 
             # Recurse into real directories (not symlinks pointing to dirs)
-            if path.is_dir() and not path.is_symlink():
+            if is_dir and not path.is_symlink():
                 yield from walk_with_identity_tracking(
                     path,
                     visited_identities,
