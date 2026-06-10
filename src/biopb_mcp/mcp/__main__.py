@@ -147,10 +147,10 @@ def _open_kernel_log(config):
     exercised. On failure, falls back to the launcher's stderr buffer so the
     kernel still starts.
     """
-    from .._config import get_config_dir, get_setting
+    from .._config import get_log_dir, get_setting
 
     path = get_setting(config, "mcp.transport.kernel_log") or str(
-        get_config_dir() / "kernel.log"
+        get_log_dir() / "kernel.log"
     )
     try:
         return open(path, "ab", buffering=0)

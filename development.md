@@ -122,7 +122,7 @@ kernel/viewer/dask stack is identical either way. In stdio mode fd 1 *is* the
 protocol channel, so the launcher logs to stderr and redirects the kernel's
 *native* stdout/stderr to a log file
 (`config['mcp']['transport']['kernel_log']`, default
-`~/.config/biopb-mcp/kernel.log`) — otherwise Qt/GL/dask/gRPC C-level writes
+`~/.local/share/biopb-mcp/log/kernel.log`) — otherwise Qt/GL/dask/gRPC C-level writes
 would corrupt the stream. stdio has no network surface, so the Host/Origin
 allowlist (`transport.allowed_origins`/`transport.allowed_hosts`) is http-only
 and not applied. NB:
@@ -275,7 +275,7 @@ The `mcp` section is grouped by concern:
 - **`mcp.transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
   startup, also via `--transport`), `port` (8765), `display_mode`, `kernel_log`
   (stdio-only; where the kernel's native stdout/stderr is redirected so it can't
-  corrupt fd 1, default `~/.config/biopb-mcp/kernel.log`), and
+  corrupt fd 1, default `~/.local/share/biopb-mcp/log/kernel.log`), and
   `allowed_origins`/`allowed_hosts` (extra Host/Origin values appended to the
   loopback DNS-rebinding allowlist for a reverse-proxy front; http only).
 - **`mcp.kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now

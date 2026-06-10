@@ -136,7 +136,8 @@ DEFAULT_CONFIG = {
             "display_mode": "auto",
             # Where the child kernel's *native* (C-level) stdout/stderr is
             # written in stdio mode, so it never corrupts the JSON-RPC stream on
-            # fd 1. Empty -> ~/.config/biopb-mcp/kernel.log. Ignored in http mode
+            # fd 1. Empty -> ~/.local/share/biopb-mcp/log/kernel.log. Ignored in
+            # http mode
             # (the kernel inherits the launcher's fds, which are not a protocol
             # channel).
             "kernel_log": "",
@@ -337,6 +338,21 @@ def get_config_path() -> Path:
         Path to config.json file.
     """
     return get_config_dir() / "config.json"
+
+
+def get_log_dir() -> Path:
+    """Get the log directory (~/.local/share/biopb-mcp/log on all platforms).
+
+    Logs are persistent runtime state, not user-editable config, so they live
+    under the XDG *data* tree rather than ~/.config — matching the biopb tensor
+    server, which writes to ~/.local/share/biopb/log.
+
+    Returns:
+        Path to the log directory for biopb-mcp.
+    """
+    log_dir = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

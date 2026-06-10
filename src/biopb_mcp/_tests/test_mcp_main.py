@@ -88,12 +88,12 @@ class TestOpenKernelLog:
             f.close()
         assert path.read_bytes() == b"hello\n"
 
-    def test_empty_path_defaults_under_config_dir(self, tmp_path, monkeypatch):
-        # _open_kernel_log does `from .._config import get_config_dir` at call
+    def test_empty_path_defaults_under_log_dir(self, tmp_path, monkeypatch):
+        # _open_kernel_log does `from .._config import get_log_dir` at call
         # time, so patching the source module is what takes effect.
         import biopb_mcp._config as cfg
 
-        monkeypatch.setattr(cfg, "get_config_dir", lambda: tmp_path)
+        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
 
         f = _open_kernel_log(_cfg(kernel_log=""))
         try:
