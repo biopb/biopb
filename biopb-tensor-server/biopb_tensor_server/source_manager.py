@@ -20,7 +20,9 @@ from biopb_tensor_server.discovery import (
     DiscoveryState,
     SourceClaim,
     discover_sources,
+    get_file_identity,
     is_remote_url,
+    should_skip_walk_entry,
 )
 from biopb_tensor_server.watcher import (
     DirectoryWatcher,
@@ -336,7 +338,24 @@ class SourceManager:
         next_stable_observations: Dict[str, int] = {}
         next_pending_scan: Dict[str, bool] = {}
         skipped_dirs: Set[str] = set()
+        # One identity set across all monitored roots for this refresh: breaks
+        # directory loops (symlink, Windows junction, hardlink, bind mount) and
+        # also stops overlapping roots from walking a shared subtree twice.
+        visited_identities: Set[str] = set()
         for monitored_dir in sorted(self._monitored_dirs):
+            # An explicitly-configured root is honored unconditionally — even if
+            # it is a symlink, hidden, or named like a pruned system dir; the
+            # skips only ever apply to entries found *inside* it. That contract is
+            # the sum of two pieces here, both load-bearing:
+            #   * resolve() — the root reaches _scan_tree_state already
+            #     dereferenced, so its is_symlink reads False and the symlink/loop
+            #     guard there does not reject a symlinked root (the guard rejects
+            #     symlinks by the entry's *own* pre-resolution flag; resolving the
+            #     root up front is precisely what exempts it);
+            #   * is_root=True — tells _scan_tree_state to skip the
+            #     hidden/system/offline policy for this entry only.
+            # Change either and a symlinked or oddly-named monitored root silently
+            # stops being scanned.
             self._scan_tree_state(
                 monitored_dir.resolve(),
                 now,
@@ -346,6 +365,8 @@ class SourceManager:
                 skipped_dirs,
                 force_full,
                 self._aggressive_dir_pruning,
+                visited_identities,
+                is_root=True,
             )
         if publish:
             self._entry_state = next_state
@@ -369,16 +390,25 @@ class SourceManager:
         skipped_dirs: Set[str],
         force_full: bool,
         allow_prune: bool,
+        visited_identities: Set[str],
+        is_root: bool = False,
     ) -> None:
         """Capture the current filesystem signature state for one subtree."""
         try:
+            # Symlink-ness of the *entry itself*, read before resolving — once
+            # resolved the path is the canonical target and is never a symlink,
+            # so checking the resolved path (the old bug) never fired.
+            is_symlink = path.is_symlink()
             resolved_path = path.resolve(strict=False)
-            if resolved_path.name.startswith("."):
-                return
-
             stat_result = resolved_path.stat()
             is_directory = resolved_path.is_dir()
         except OSError:
+            return
+
+        # Shared skip policy (hidden / system / cloud-placeholder), identical to
+        # the claim walk's. Applied to entries found while walking, never to an
+        # explicitly-configured root.
+        if not is_root and should_skip_walk_entry(path, is_directory):
             return
 
         path_str = str(resolved_path)
@@ -401,8 +431,18 @@ class SourceManager:
         next_stable_observations[path_str] = stable_observations
         next_pending_scan[path_str] = pending_scan
 
-        if not is_directory or resolved_path.is_symlink():
+        # Only real directories are walked further. Never follow a symlinked
+        # directory; and break every *other* kind of loop — Windows junction,
+        # hardlink, bind mount, none of which present as a symlink — by
+        # filesystem identity, since the symlink flag alone is not enough.
+        # (A configured root passes this only because _refresh_entry_state hands
+        # it in pre-resolved, so is_symlink is False — see the call site.)
+        if not is_directory or is_symlink:
             return
+        identity = get_file_identity(resolved_path)
+        if identity in visited_identities:
+            return
+        visited_identities.add(identity)
 
         if (
             allow_prune
@@ -434,6 +474,7 @@ class SourceManager:
                     skipped_dirs,
                     force_full,
                     True,
+                    visited_identities,
                 )
         except OSError:
             return
