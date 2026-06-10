@@ -158,6 +158,78 @@ class TestJobRunnerUnit:
         _jobs.reset()
         assert _jobs.jobs_summary() == []
 
+    # -- user-action attribution (observe web UI) ---------------------------
+
+    def test_cancel_current_attributes_reason(self, runner):
+        jid = _jobs.submit(
+            "import time\nwhile not cancelled():\n    time.sleep(0.02)"
+        )["job_id"]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        out = _jobs.cancel_current(reason="stopped by Alice")
+        assert out["cancelled"] is True
+        assert out["job_id"] == jid
+        snap = self._wait(jid)
+        assert snap["status"] == "cancelled"
+        assert snap["cancel_reason"] == "stopped by Alice"
+        # The reason is surfaced in error_text so poll_job/execute_code render it.
+        assert "stopped by Alice" in snap["error_text"]
+
+    def test_cancel_current_when_idle(self):
+        # No runner fixture -> no running job in a fresh registry.
+        _jobs.reset()
+        out = _jobs.cancel_current(reason="x")
+        assert out == {"job_id": None, "cancelled": False, "status": "idle"}
+
+    def test_interrupt_current_stops_uncooperative_job(self, runner):
+        # A loop that NEVER checks cancelled() -> only a KeyboardInterrupt raised
+        # into the worker thread can stop it (short of restart).
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")[
+            "job_id"
+        ]
+        while _jobs.poll(jid)["status"] != "running":
+            time.sleep(0.02)
+        out = _jobs.interrupt_current(reason="forced by Bob")
+        assert out["job_id"] == jid and out["interrupted"] is True
+        snap = self._wait(jid)
+        # Distinct terminal status from a plain cooperative cancel.
+        assert snap["status"] == "interrupted"
+        assert "forced by Bob" in snap["error_text"]
+        assert "KeyboardInterrupt" in snap["error_text"]
+
+    def test_interrupt_current_when_idle(self):
+        _jobs.reset()
+        assert _jobs.interrupt_current("x") == {
+            "job_id": None,
+            "interrupted": False,
+            "status": "idle",
+        }
+
+    def test_raise_in_thread_no_ident(self):
+        assert _jobs._raise_in_thread(None, KeyboardInterrupt) == 0
+
+    # -- submitted code is recorded (observe UI) ----------------------------
+
+    def test_job_stores_submitted_code(self, runner):
+        src = "x = 1 + 1\nprint('hi')"
+        jid = _jobs.submit(src)["job_id"]
+        snap = self._wait(jid)
+        assert snap["code"] == src
+
+    def test_jobs_summary_has_code_preview(self, runner):
+        jid = _jobs.submit("\n\n  print('first real line')  \nmore = 2")[
+            "job_id"
+        ]
+        self._wait(jid)
+        summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
+        assert summ["code_preview"] == "print('first real line')"
+
+    def test_code_preview_helper(self):
+        assert _jobs._code_preview("") == ""
+        assert _jobs._code_preview("\n\n  hello  \nworld") == "hello"
+        capped = _jobs._code_preview("x" * 100)
+        assert len(capped) == 80 and capped.endswith("…")
+
 
 # ---------------------------------------------------------------------------
 # Real bare kernel: the main thread stays free while a job runs

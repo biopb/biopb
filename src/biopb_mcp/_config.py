@@ -245,6 +245,26 @@ DEFAULT_CONFIG = {
             # agent kernel's `ops` dict.
             "process_image_servers": [],
         },
+        "observe": {
+            # Minimal loopback web UI for watching execute_code job history and
+            # cancelling/interrupting/restarting the current execution. **http
+            # transport only**: it mounts on the existing MCP app (sharing
+            # `mcp.transport.port` and the MCP event loop), so it adds no network
+            # surface beyond `/mcp` — same loopback bind, same Host/Origin
+            # allowlist (the kernel is already RCE over that port). It is
+            # therefore **on by default (opt-out)** in http; set False to
+            # disable. It is never available under stdio — a second HTTP server
+            # in the stdio launcher process would risk the fd-1 JSON-RPC channel
+            # and race the kernel — so under stdio it is silently skipped.
+            "enabled": True,
+            # Detail-view stdout cap (chars). The tail is kept (most recent
+            # output matters for a running job) with a truncation marker; the
+            # full length is reported alongside.
+            "max_output_chars": 20000,
+            # How often (ms) the page polls the job list / status. Deliberately
+            # slow: each poll is a kernel round-trip competing with agent calls.
+            "poll_interval_ms": 3000,
+        },
         # Give-up budget (seconds) for start_local_server's just-launched boot
         # wait, where connection-refused is tolerated while the server binds and
         # scans its data folder. The normal auto-connect path has no timeout: it

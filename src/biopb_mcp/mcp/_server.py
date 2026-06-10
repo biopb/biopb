@@ -618,17 +618,28 @@ def inspect_object(object_path: str) -> str:
 
 @mcp.tool()
 def interrupt_kernel() -> str:
-    """Interrupt the current kernel execution by sending SIGINT.
+    """Force-stop the current job by raising KeyboardInterrupt in its thread.
 
-    Best-effort: pure-Python loops stop with KeyboardInterrupt, but blocking
-    C-level calls (gRPC tensor fetches, native dask compute) ignore SIGINT.
-    If the kernel stays unresponsive, use restart_kernel — the guaranteed stop.
+    Stronger than cancel_job: it does not require the code to check cancelled().
+    The job runs in a background worker thread, so a SIGINT (which Python delivers
+    only to the kernel main thread) can't reach it — this raises the exception
+    directly into the worker. Best-effort: it lands at the next bytecode, so a
+    blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
+    it returns to Python; if the kernel stays stuck, use restart_kernel — the
+    guaranteed stop.
     """
     host = _kernel_host
     if host is None:
         return "Error: kernel host not initialized"
-    host.interrupt()
-    return "Interrupt signal (SIGINT) sent to kernel."
+    data, res, _w = _run_job_call(host, "interrupt_current()")
+    if data is None:
+        return _format_execute_result(res)
+    if data.get("interrupted"):
+        return (
+            f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
+            "its thread). If it does not stop, use restart_kernel."
+        )
+    return "No running job to interrupt."
 
 
 @mcp.tool()
@@ -676,8 +687,23 @@ def server_status() -> str:
         f"  memory_used_percent: {mem.percent}%",
         f"  process_rss: {proc_mem.rss / (1024 ** 2):.0f} MB",
         "",
-        "## Kernel",
     ]
+
+    # Observe web UI: server-process state, independent of the kernel, so report
+    # it before (and regardless of) kernel health. No kernel round-trip.
+    from . import _observe
+
+    obs = _observe.describe(getattr(mcp.settings, "port", None))
+    lines.append("## Observe")
+    if obs["running"]:
+        lines.append(f"  url: {obs['url']}")
+        lines.append(f"  mode: {obs['mode']}")
+    else:
+        lines.append(
+            "  status: not running (mcp.observe.enabled off or failed to start)"
+        )
+    lines.append("")
+    lines.append("## Kernel")
 
     if host is None:
         lines.append("  state: not initialized")

@@ -31,6 +31,7 @@ Design notes
 """
 
 import ast
+import ctypes
 import io
 import logging
 import sys
@@ -64,23 +65,40 @@ _lock = threading.RLock()
 class _Job:
     __slots__ = (
         "job_id",
+        "code",
         "status",
         "stdout",
         "result_text",
         "error_text",
         "cancel_event",
+        "cancel_reason",
+        "interrupted",
         "thread",
         "started",
         "finished",
     )
 
-    def __init__(self, job_id):
+    def __init__(self, job_id, code=""):
         self.job_id = job_id
-        self.status = "running"  # running | ok | error | cancelled
+        # The submitted source (as passed to submit(), before the internal
+        # _REFRESH_PREFIX), so the observe UI can show what each job ran.
+        self.code = code
+        # running | ok | error | cancelled | interrupted
+        self.status = "running"
         self.stdout = io.StringIO()
         self.result_text = ""
         self.error_text = ""
         self.cancel_event = threading.Event()
+        # Set by interrupt_current(): the job was force-stopped with a
+        # KeyboardInterrupt raised into its thread (vs. a plain cooperative
+        # cancel). Distinguished so the UI/agent can tell the two stops apart.
+        self.interrupted = False
+        # Human-readable reason a *user* acted on this job (cancel/interrupt via
+        # the observe web UI). Threaded into the finalized error_text so the
+        # agent sees the attribution through its normal poll_job / execute_code
+        # result, instead of an unexplained cancellation. None for agent-driven
+        # or untagged stops.
+        self.cancel_reason = None
         self.thread = None
         self.started = time.monotonic()
         self.finished = None
@@ -92,10 +110,12 @@ class _Job:
     def snapshot(self):
         return {
             "job_id": self.job_id,
+            "code": self.code,
             "status": self.status,
             "stdout": self.stdout.getvalue(),
             "result_text": self.result_text,
             "error_text": self.error_text,
+            "cancel_reason": self.cancel_reason,
             "elapsed": self.elapsed(),
         }
 
@@ -231,10 +251,30 @@ def _run(job, code):
     finally:
         _jobs_by_thread.pop(threading.get_ident(), None)
         job.finished = time.monotonic()
-        if job.cancel_event.is_set():
+        # interrupted (forced KeyboardInterrupt) is distinct from a plain
+        # cooperative cancel; check it first since interrupt_current sets the
+        # cancel flag too.
+        if job.interrupted:
+            job.status = "interrupted"
+        elif job.cancel_event.is_set():
             job.status = "cancelled"
         else:
             job.status = "error" if exc else "ok"
+        # Surface a user-attributed stop (cancel/interrupt via the observe web
+        # UI) to the agent: prefix error_text with the reason so poll_job /
+        # execute_code render it. A cancel that left no traceback gets the
+        # reason as its whole error_text; an interrupt's KeyboardInterrupt
+        # traceback is annotated with who triggered it.
+        if job.cancel_reason and job.status in (
+            "cancelled",
+            "error",
+            "interrupted",
+        ):
+            job.error_text = (
+                job.cancel_reason
+                if not job.error_text
+                else job.cancel_reason + "\n" + job.error_text
+            )
 
 
 def _has_running_job():
@@ -262,7 +302,7 @@ def submit(code):
                 return {"error": "busy", "running_job_id": jid}
         _job_seq += 1
         job_id = f"job-{_job_seq}"
-        job = _Job(job_id)
+        job = _Job(job_id, code)
         _jobs[job_id] = job
         _prune()
         thread = threading.Thread(
@@ -280,12 +320,16 @@ def poll(job_id):
     return job.snapshot()
 
 
-def cancel(job_id):
+def cancel(job_id, reason=None):
     job = _jobs.get(job_id)
     if job is None:
         return {"job_id": job_id, "cancelled": False, "status": "unknown"}
     if job.status != "running":
         return {"job_id": job_id, "cancelled": False, "status": job.status}
+    # Set the reason before the event: the job only unwinds after observing the
+    # event / future-cancel, so its finalizer is guaranteed to see the reason.
+    if reason:
+        job.cancel_reason = reason
     job.cancel_event.set()
     # Distributed dask: cancel in-flight futures.  This is what actually stops a
     # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
@@ -308,6 +352,85 @@ def cancel(job_id):
     return {"job_id": job_id, "cancelled": True, "status": job.status}
 
 
+def _running_job():
+    """The single running job, or None. One job at a time (see submit())."""
+    for j in _jobs.values():
+        if j.status == "running":
+            return j
+    return None
+
+
+def cancel_current(reason=None):
+    """Cancel the current running job (global; the kernel runs one at a time).
+
+    The observe web UI has no per-job handle — controls act on "the current
+    execution". Delegates to :func:`cancel` so the dask-future cancellation and
+    cooperative-flag behaviour are identical. ``{"cancelled": False}`` when the
+    kernel is idle.
+    """
+    job = _running_job()
+    if job is None:
+        return {"job_id": None, "cancelled": False, "status": "idle"}
+    return cancel(job.job_id, reason=reason)
+
+
+def _raise_in_thread(ident, exctype):
+    """Asynchronously raise *exctype* in the thread with *ident*.
+
+    CPython's ``PyThreadState_SetAsyncExc`` schedules the exception for the next
+    bytecode executed by that thread — so it does *not* break a blocking C call
+    (``time.sleep``, gRPC) until it returns to Python. Returns the number of
+    threads affected (1 on success, 0 if the thread already finished).
+    """
+    if not ident:
+        return 0
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(ident), ctypes.py_object(exctype)
+    )
+    if (
+        res > 1
+    ):  # never expected to hit >1; undo to avoid corrupting a bystander
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+        return 0
+    return res
+
+
+def interrupt_current(reason=None):
+    """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
+    raised directly into the job's worker thread.
+
+    ``SIGINT`` can't do this — Python delivers signals only to the kernel main
+    thread, while the job runs in a background worker — so an uncooperative
+    pure-Python loop (one that never checks :func:`cancelled`) would otherwise be
+    stoppable only by ``restart_kernel``. This first runs the cooperative
+    :func:`cancel` (flag, attribution reason, in-flight dask-future cancel), then
+    forces the worker thread via :func:`_raise_in_thread`. The exception lands at
+    the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
+    False, "status": "idle"}`` when the kernel is idle.
+    """
+    job = _running_job()
+    if job is None:
+        return {"job_id": None, "interrupted": False, "status": "idle"}
+    job.interrupted = True  # finalize as "interrupted", not "cancelled"
+    cancel(job.job_id, reason=reason)
+    ident = job.thread.ident if job.thread is not None else None
+    raised = _raise_in_thread(ident, KeyboardInterrupt)
+    return {"job_id": job.job_id, "interrupted": bool(raised)}
+
+
+def _code_preview(code, limit=80):
+    """First non-blank line of *code*, trimmed and length-capped.
+
+    Keeps jobs_summary light (the full source is in the per-job snapshot) while
+    giving each list row an identifying one-liner.
+    """
+    for line in code.splitlines():
+        line = line.strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 1] + "…"
+    return ""
+
+
 def jobs_summary():
     return [
         {
@@ -315,6 +438,7 @@ def jobs_summary():
             "status": j.status,
             "elapsed": j.elapsed(),
             "stdout_len": len(j.stdout.getvalue()),
+            "code_preview": _code_preview(j.code),
         }
         for j in _jobs.values()
     ]

@@ -442,10 +442,20 @@ class TestInspectObject:
 
 
 class TestInterruptRestart:
-    def test_interrupt_delegates_to_host(self, server_with_host):
+    def test_interrupt_forces_running_job(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id="job-3", interrupted=True
+        )
         result = _server.interrupt_kernel()
-        server_with_host.interrupt.assert_called_once()
-        assert "SIGINT" in result
+        snippet = server_with_host.execute.call_args[0][0]
+        assert "interrupt_current(" in snippet
+        assert "job-3" in result
+
+    def test_interrupt_no_running_job(self, server_with_host):
+        server_with_host.execute.return_value = _job_reply(
+            job_id=None, interrupted=False
+        )
+        assert "No running job" in _server.interrupt_kernel()
 
     def test_interrupt_no_host(self):
         _server._kernel_host = None
@@ -507,6 +517,39 @@ class TestServerStatus:
         result = _server.server_status()
         assert "Sessions" not in result
         assert "Bridge" not in result
+
+    def test_reports_observe_disabled_by_default(
+        self, server_with_host, monkeypatch
+    ):
+        from biopb_mcp.mcp import _observe
+
+        monkeypatch.setattr(_observe, "_mounted_http", False)
+        result = _server.server_status()
+        assert "## Observe" in result
+        assert "not running" in result
+
+    def test_reports_observe_url_when_running(
+        self, server_with_host, monkeypatch
+    ):
+        from biopb_mcp.mcp import _observe
+
+        monkeypatch.setattr(_observe, "_mounted_http", True)
+        result = _server.server_status()
+        assert "## Observe" in result
+        assert "/observe" in result
+        assert "http://127.0.0.1:" in result
+
+    def test_reports_observe_even_when_kernel_not_initialized(
+        self, monkeypatch
+    ):
+        from biopb_mcp.mcp import _observe
+
+        # Observe is server-process state -> reported despite no kernel.
+        _server._kernel_host = None
+        monkeypatch.setattr(_observe, "_mounted_http", True)
+        result = _server.server_status()
+        assert "## Observe" in result
+        assert "/observe" in result
 
     def test_starting_kernel_skips_query(self, server_with_host):
         # Kernel still booting (launcher serves the handshake first): report the

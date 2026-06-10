@@ -68,6 +68,49 @@ def _resolve_headless(display_mode, has_display):
     return not has_display
 
 
+def _setup_observe(config, transport):
+    """Wire up the web observe UI (http transport only).
+
+    On by default (``mcp.observe.enabled``, opt-out); it mounts on the existing
+    MCP app and shares its loop/port. It is **not** supported under stdio: a
+    second uvicorn server in the stdio launcher process risks corrupting the
+    fd-1 JSON-RPC channel and races the kernel, so under stdio it is silently
+    skipped (debug-logged, since it is on by default and most stdio users never
+    asked for it). Fully guarded — an observe failure logs and is swallowed so
+    it can never block the MCP server. Returns True if mounted.
+    """
+    from .._config import get_setting
+
+    if not get_setting(config, "mcp.observe.enabled"):
+        return False
+    if transport != "http":
+        logger.debug(
+            "observe UI is http-only; not started under %s transport",
+            transport,
+        )
+        return False
+    try:
+        from . import _observe
+
+        _observe.configure(
+            max_output_chars=get_setting(
+                config, "mcp.observe.max_output_chars"
+            ),
+            poll_interval_ms=get_setting(
+                config, "mcp.observe.poll_interval_ms"
+            ),
+            allowed_origins=get_setting(
+                config, "mcp.transport.allowed_origins"
+            ),
+            allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+        )
+        _observe.register_http_routes()
+        return True
+    except Exception:
+        logger.exception("observe UI failed to start; continuing without it")
+        return False
+
+
 def _config_defaults(config):
     """Validate/coerce the config-derived launcher defaults.
 
@@ -281,6 +324,10 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # Opt-in web "observe" UI (http transport only). Set up before the (blocking)
+    # transport run: custom routes are read when the streamable-http app is built.
+    _setup_observe(config, transport)
 
     if transport == "stdio":
         # Client closing stdin (EOF) returns from run_stdio(); the post-run

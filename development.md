@@ -170,10 +170,35 @@ output is not captured (code is exec'd, not run via `run_cell`).
   failure it prints a `BOOTSTRAP_ERROR` sentinel; the host's health probe
   detects success via `'viewer' in dir()`.
 - `_jobs.py` — runs *inside* the kernel. The async job runner: a `_jobs`
-  registry, `submit`/`poll`/`cancel`/`jobs_summary`, a thread-aware stdout
-  dispatcher, `run_on_main` (Qt main-thread marshaling with proper exception
-  propagation), `cancelled()`, and `wrap_viewer_for_threads`. `cancel` is
-  cooperative and also cancels in-flight distributed-dask futures.
+  registry, `submit`/`poll`/`cancel`/`cancel_current`/`interrupt_current`/
+  `jobs_summary`, a thread-aware stdout dispatcher, `run_on_main` (Qt main-thread
+  marshaling with proper exception propagation), `cancelled()`, and
+  `wrap_viewer_for_threads`. The stop ladder: `cancel`/`cancel_current` is
+  cooperative (sets a flag the code polls via `cancelled()`) and also cancels
+  in-flight distributed-dask futures; `interrupt_current` does that *plus* raises
+  a `KeyboardInterrupt` directly into the job's worker thread via
+  `PyThreadState_SetAsyncExc` (a `SIGINT` only reaches the kernel main thread, not
+  the worker, so it can't stop a background job), forcing an uncooperative
+  pure-Python loop to stop short of `restart_kernel`. A `reason=...` on either
+  threads a human-readable `cancel_reason` into the job record (prefixed onto the
+  finalized `error_text`), so a stop triggered by a *user* in the observe UI
+  surfaces to the agent via `poll_job` instead of an unexplained cancellation.
+- `_observe.py` — runs *in the MCP server process* (not the kernel). The web
+  "observe" UI (`mcp.observe.enabled`, **on by default / opt-out**): job history
+  (the submitted code + truncated output) + global cancel/interrupt/restart
+  knobs. **http transport only** — the routes mount on the existing FastMCP app
+  via `mcp.custom_route`
+  (same loop and port as `/mcp`). It is deliberately *not* supported under stdio:
+  a second uvicorn server in the stdio launcher process would risk the fd-1
+  JSON-RPC channel (uvicorn attaches a stdout log handler) and a second
+  event-loop thread driving the one `KernelHost` races the MCP thread and can
+  wedge the kernel — so under stdio the launcher logs a hint and skips it. Custom
+  routes are *not* covered by FastMCP's transport-security, so each route carries
+  its **own** Host/Origin guard reusing the SDK's `TransportSecurityMiddleware`
+  validators with the same loopback allowlist. Reads reuse `_server._run_job_call`;
+  controls are direct `KernelHost` calls — no new IPC, no dask-dashboard
+  dependence. Wired by `__main__._setup_observe` (fully guarded; a failure never
+  blocks the server).
 - `_process_ops.py` — `build_ops()`: a thin `Run()` callable per configured
   `ProcessImage` servicer URL (discovered via `GetOpNames`), exposed as `ops`.
 - `_resources.py` — string constants served as MCP resources.
@@ -277,6 +302,12 @@ The `mcp` section is grouped by concern:
   serial reads, `""` to disable wrapping).
 - **`mcp.services.process_image_servers`** — the `grpc://`/`grpcs://`
   ProcessImage URLs exposed as `ops`.
+- **`mcp.observe`** — the web observe UI (`_observe.py`): `enabled` (**on by
+  default / opt-out**; **http transport only** — it mounts on the MCP app so it
+  adds no surface beyond `/mcp`; under stdio it is silently skipped, since a
+  second HTTP server in the stdio process risks the fd-1 JSON-RPC channel and
+  races the kernel), `max_output_chars` (detail-view stdout cap, tail kept),
+  `poll_interval_ms` (page poll cadence).
 - **`mcp.server_start_timeout`** — the autostart boot-wait budget (issue #12).
 
 For back-compat, `load_config` relocates the one legacy flat key the biopb
@@ -338,7 +369,9 @@ Apply at the class level for test classes that require napari viewers. See
     - `_server.py` — FastMCP server, tools, resources
     - `_kernel.py` — `KernelHost` (child Jupyter kernel lifecycle)
     - `_jobs.py` — in-kernel async job runner (submit/poll/cancel, main-thread
-      marshaling, thread-aware stdout)
+      marshaling, thread-aware stdout, user-action attribution)
+    - `_observe.py` — loopback web "observe" UI (job history + global
+      cancel/interrupt/restart), in the MCP server process
     - `_bootstrap.py` — in-kernel bootstrap (namespace, viewer, dask, ops, jobs)
     - `_process_ops.py` — `build_ops()` ProcessImage callables
     - `_resources.py` — resource content strings
