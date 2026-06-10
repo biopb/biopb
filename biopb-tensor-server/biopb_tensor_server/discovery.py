@@ -168,6 +168,38 @@ def _is_offline_placeholder(path: Path) -> bool:
     return st_blocks == 0
 
 
+def should_skip_walk_entry(path: Path, is_dir: bool) -> bool:
+    """Shared per-entry skip policy for discovery tree walks.
+
+    Both traversals over the monitored trees route their skip decision through
+    this one predicate — the claim walk (``walk_with_identity_tracking``) and the
+    signature/stability scan (``SourceManager._scan_tree_state``) — so the policy
+    cannot drift between them. That drift is exactly what left the signature scan
+    descending into OneDrive placeholders the claim walk had already learned to
+    prune.
+
+    Decides on the entry's *name* and metadata only — never opens content, so it
+    cannot itself trigger a cloud recall:
+
+    - hidden entries (name starts with ``.``);
+    - well-known system/cloud directories (``_is_skippable_system_dir``);
+    - files whose content is not resident locally (``_is_offline_placeholder``).
+
+    Checked against the supplied (pre-resolution) ``path`` name so a symlink or
+    junction named e.g. ``OneDrive`` is pruned by its own name, not its target's.
+
+    Loop protection (symlinks, Windows junctions, hardlinks, bind mounts) is
+    **not** handled here — it needs per-walk identity state and is applied at
+    each walk's recursion point via ``get_file_identity``.
+    """
+    name = path.name
+    if name.startswith("."):
+        return True
+    if is_dir:
+        return _is_skippable_system_dir(name)
+    return _is_offline_placeholder(path)
+
+
 class ClaimContext:
     """Unified path access for claim protocol.
 
@@ -286,27 +318,17 @@ def walk_with_identity_tracking(
     """
     try:
         for path in root.iterdir():
-            # Skip hidden files/directories
-            if path.name.startswith("."):
-                continue
-
-            # Never enter system/cloud directories (AppData, OneDrive, Windows,
-            # …): they are not data, and reading their cloud placeholders can hang
-            # discovery. Checked on the name alone so it costs no stat and prunes
-            # the whole subtree.
             try:
                 is_dir = path.is_dir()
             except OSError:
                 continue  # Broken entry or permission issue
-            if is_dir and _is_skippable_system_dir(path.name):
-                logger.debug("walk: skipping system/cloud directory %s", path)
-                continue
 
-            # Skip files whose content is not resident locally (cloud/HSM
-            # placeholders): an adapter opening one to sniff its format would
-            # recall it on demand and may block indefinitely.
-            if not is_dir and _is_offline_placeholder(path):
-                logger.info("walk: skipping offline/placeholder file %s", path)
+            # Shared skip policy: hidden entries, system/cloud directories
+            # (AppData, OneDrive, Windows, …), and offline/placeholder files
+            # whose content recalls on read. Pruned by name/metadata so the whole
+            # subtree is skipped without a content open that could hang.
+            if should_skip_walk_entry(path, is_dir):
+                logger.debug("walk: skipping %s", path)
                 continue
 
             if path_filter is not None and not path_filter(path):

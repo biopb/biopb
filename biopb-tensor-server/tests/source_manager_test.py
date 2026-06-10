@@ -955,3 +955,108 @@ class TestSourceManagerRegressions:
             if "Failed to create adapter for source" in record.message
         ]
         assert len(error_records) == 2
+
+
+def _make_signature_manager(monitored_dirs):
+    """A SourceManager wired only enough to exercise the signature scan."""
+    return SourceManager(
+        server=_FakeServer(),
+        registry=_FakeRegistry(),
+        discovery_state=DiscoveryState(),
+        watcher=None,
+        monitored_dirs=set(monitored_dirs),
+        stability_window=0.0,
+        probe_open_files=False,
+    )
+
+
+def _scan(manager):
+    """Run one signature refresh and return its {resolved_path_str: ...} map."""
+    next_state, _obs, _pending, _skipped = manager._refresh_entry_state(
+        force_full=True, publish=False
+    )
+    return next_state
+
+
+class TestSignatureScanLoopAndSkip:
+    """The signature/stability scan (_scan_tree_state) must share the claim
+    walk's skip policy and never wedge on a directory loop. Symlink-correctness
+    alone is not enough: junctions / hardlinks / bind mounts don't present as
+    symlinks, so the real guard is filesystem-identity dedup.
+    """
+
+    def _symlink_or_skip(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=target.is_dir())
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform/filesystem")
+
+    def test_terminates_on_symlink_cycle(self, tmp_path):
+        # root/loop -> root is a self-cycle. Before the fix, _scan_tree_state
+        # checked is_symlink() on the *resolved* path (always False), so the
+        # symlink guard never fired and the cycle recursed to RecursionError.
+        root = tmp_path / "monitored"
+        (root / "real").mkdir(parents=True)
+        (root / "real" / "sample.dat").write_text("hi")
+        self._symlink_or_skip(root / "loop", root)
+
+        manager = _make_signature_manager({root})
+        next_state = _scan(manager)  # must not raise RecursionError
+
+        assert str((root / "real" / "sample.dat").resolve()) in next_state
+
+    def test_does_not_follow_symlink_out_of_tree(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.dat").write_text("not ours")
+
+        root = tmp_path / "monitored"
+        root.mkdir()
+        (root / "sample.dat").write_text("ours")
+        self._symlink_or_skip(root / "escape", outside)
+
+        next_state = _scan(_make_signature_manager({root}))
+
+        assert str((root / "sample.dat").resolve()) in next_state
+        # The symlinked dir is recorded but never descended into.
+        assert str((outside / "secret.dat").resolve()) not in next_state
+
+    def test_prunes_system_and_offline_entries(self, tmp_path):
+        # Parity with walk_with_identity_tracking: the signature scan must also
+        # skip system/cloud dirs and offline placeholders, by the same policy.
+        root = tmp_path / "monitored"
+        (root / "Microscopy").mkdir(parents=True)
+        (root / "Microscopy" / "good.dat").write_text("data")
+        (root / "AppData" / "Local").mkdir(parents=True)
+        (root / "AppData" / "Local" / "junk.dat").write_text("junk")
+        (root / "OneDrive - Lab").mkdir(parents=True)
+        (root / "OneDrive - Lab" / "cloud.dat").write_text("cloud")
+
+        stub = root / "placeholder.dat"
+        with open(stub, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        # getattr: native Windows os.stat has no st_blocks, so the offline
+        # sub-check below is skipped there while the system-dir pruning still runs.
+        offline_supported = getattr(os.stat(stub), "st_blocks", None) == 0
+
+        next_state = _scan(_make_signature_manager({root}))
+
+        assert str((root / "Microscopy" / "good.dat").resolve()) in next_state
+        assert str((root / "AppData").resolve()) not in next_state
+        assert str((root / "AppData" / "Local" / "junk.dat").resolve()) not in next_state
+        assert str((root / "OneDrive - Lab").resolve()) not in next_state
+        if offline_supported:
+            assert str(stub.resolve()) not in next_state
+
+    def test_overlapping_roots_dedup_by_identity(self, tmp_path):
+        # Two roots where one nests inside the other: identity dedup (no symlink
+        # involved) must stop the shared subtree being walked twice, and the
+        # scan must still capture the data file.
+        root = tmp_path / "monitored"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "sample.dat").write_text("hi")
+
+        next_state = _scan(_make_signature_manager({root, sub}))
+
+        assert str((sub / "sample.dat").resolve()) in next_state
