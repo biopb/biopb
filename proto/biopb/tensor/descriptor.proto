@@ -10,7 +10,15 @@ option java_package = "biopb.tensor";
 // "Tensor identity" note). Every server, SDK, and CLI MUST adhere to this.
 //
 // A tensor is identified by the ORDERED PAIR (source_id, array_id):
-//   * source_id -- globally unique among the server's data sources.
+//   * source_id -- globally unique among the server's data sources, and
+//                  slash-free: it MUST NOT contain '/'. This is load-bearing,
+//                  not cosmetic: the chunk_id encoding below joins source_id and
+//                  array_id with '/' and decodes by splitting on the FIRST '/'.
+//                  Because array_id MAY contain '/' (hierarchical handles), a
+//                  '/' in source_id would make the pair undecodable. Enforce
+//                  this at the mint/register boundary where a source_id is
+//                  assigned (auto-generated ids are already slash-free;
+//                  caller-supplied ids must be validated).
 //   * array_id  -- unique only WITHIN its source. It is the same value as
 //                  TensorReadOption.tensor_id; the two fields are synonyms
 //                  (one names the descriptor, the other the request).
@@ -26,7 +34,10 @@ option java_package = "biopb.tensor";
 // Conventions:
 //   * Single-tensor sources use the constant handle array_id = "0" -- NOT
 //     source_id. Reusing source_id as a tensor handle is the conflation this
-//     policy removes.
+//     policy removes. "0" is just the conventional handle for the sole tensor,
+//     NOT a reserved sentinel: a multi-tensor source MAY also name a tensor
+//     "0" (handles are unique only per-source), so consumers MUST NOT infer
+//     "single-tensor source" from array_id == "0".
 //   * An unset/empty tensor_id in a request means "the source's default
 //     (first) tensor"; the server resolves it (biopb/biopb#44). Empty is a
 //     request shorthand, never a stored handle, and is distinct from "0".
@@ -39,7 +50,9 @@ option java_package = "biopb.tensor";
 //     array_id), never by array_id alone.
 //   * The source-qualified string "source_id/array_id" is reserved for the
 //     server-internal chunk_id encoding ONLY -- a Flight ticket carries no
-//     source_id field, so its chunk_id must self-describe its source. The
+//     source_id field, so its chunk_id must self-describe its source. Decoders
+//     MUST split on the FIRST '/' (source_id is slash-free; array_id may not
+//     be, so rsplit/last-slash would corrupt hierarchical handles). The
 //     qualified form MUST NOT appear in any TensorDescriptor.array_id on the
 //     wire.
 // ============================================================================
