@@ -233,6 +233,26 @@ def _dtype_to_numpy(dtype_str: str) -> np.dtype:
     return np.dtype(dtype_str)
 
 
+def _tensor_matches(td_array_id: str, req_tensor_id: str, source_id: str) -> bool:
+    """Whether *req_tensor_id* refers to the descriptor whose array_id is
+    *td_array_id*, tolerant of identity-policy forms.
+
+    A catalog descriptor carries the globally-unique array_id (``source_id`` or
+    ``source_id/field``), but a browser/TS caller may address a tensor by the
+    bare within-source ``field``. Compare after reducing both sides to the field
+    (strip a leading ``source_id/``) so the lookup matches either form. Used only
+    for the best-effort dim-label attachment, never for the read itself.
+    """
+    if td_array_id == req_tensor_id:
+        return True
+    prefix = f"{source_id}/"
+
+    def field(value: str) -> str:
+        return value[len(prefix):] if value.startswith(prefix) else value
+
+    return field(td_array_id) == field(req_tensor_id)
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
@@ -772,7 +792,7 @@ def create_app(
                 sources = client._sources  # type: ignore[attr-defined]
                 if req.source_id in sources:
                     for td in sources[req.source_id].tensors:
-                        if td.array_id == req.tensor_id:
+                        if _tensor_matches(td.array_id, req.tensor_id, req.source_id):
                             headers["X-Dim-Labels"] = ",".join(td.dim_labels)
                             break
             except Exception:
@@ -866,7 +886,7 @@ def create_app(
                 sources = client._sources  # type: ignore[attr-defined]
                 if req.source_id in sources:
                     for td in sources[req.source_id].tensors:
-                        if td.array_id == req.tensor_id:
+                        if _tensor_matches(td.array_id, req.tensor_id, req.source_id):
                             dim_labels = list(td.dim_labels)
                             break
             except Exception:

@@ -685,10 +685,13 @@ def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[byt
     if descriptor.reduction_method:
         read_opt.reduction_method = descriptor.reduction_method
 
-    # Build FlightCmd - use array_id as source_id (convention for single-tensor sources)
-    # For multi-tensor sources, endpoints should be populated in SerializedTensor
+    # FlightCmd.source_id is the slash-free prefix of the array_id (identity
+    # policy: array_id is source_id or source_id/field). tensor_id (above)
+    # carries the full array_id, which the server reduces to the within-source
+    # field -- so this works for multi-tensor SerializedTensors too, not only
+    # the single-tensor case where array_id == source_id.
     cmd = FlightCmd(
-        source_id=descriptor.array_id,
+        source_id=descriptor.array_id.split("/", 1)[0],
         tensor_read=read_opt,
     )
 

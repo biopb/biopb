@@ -312,6 +312,29 @@ class TestSliceEndpoint:
         labels = r.headers["x-dim-labels"].split(",")
         assert labels == ["z", "y", "x"]
 
+    def test_slice_xdimlabels_qualified_catalog_bare_request(self):
+        """Identity policy: the catalog descriptor carries the qualified
+        array_id ("src0/t0"), but a browser may address the tensor by the bare
+        field ("t0"). The best-effort dim-label lookup must still match and
+        attach X-Dim-Labels (it is tolerant of both forms)."""
+        qualified = _make_source_desc(
+            tensors=[_make_tensor_desc(array_id="src0/t0", dim_labels=["z", "y", "x"])]
+        )
+        mock_fc = _build_mock_client(qualified)
+        with patch(
+            "biopb_tensor_server.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=_TOKEN, dev_mode=False)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post(
+                    "/api/slice",
+                    json={"source_id": "src0", "tensor_id": "t0"},
+                    headers=_bearer(_TOKEN),
+                )
+        assert r.status_code == 200
+        assert r.headers["x-dim-labels"].split(",") == ["z", "y", "x"]
+
     def test_slice_body_bytesize_matches_shape(self, auth_client):
         tc, _ = auth_client
         r = self._post_slice(tc)
