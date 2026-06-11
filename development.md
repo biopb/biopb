@@ -306,6 +306,38 @@ editing the code.
   the tensor server: `health`, `create_source`, `upload_status`, `chunk_locate`
   — alongside the normal `do_get`/`do_put`/`get_flight_info`/`list_flights`.
 
+- **A tensor is identified by its `array_id` alone** — the policy every server,
+  SDK (Python/Java/TS), and the CLI must follow. The authoritative spec lives in
+  `proto/biopb/tensor/descriptor.proto` (top-of-file comment block); the short
+  version: `array_id` is **globally unique** and is the primary key, constructed
+  as `source_id` (single-tensor source) or `source_id/field` (multi-tensor). It
+  is the same value as `TensorReadOption.tensor_id`. `source_id` is globally
+  unique **and slash-free**, so it is a *derived projection* of `array_id` —
+  recoverable as `array_id.split("/", 1)[0]` — carried on the wire only as a
+  routing convenience; `array_id` is authoritative. The `field` part may itself
+  contain `/` (e.g. HCS `well/field`); the source boundary is always the **first**
+  `/`, which is why `source_id` must be slash-free. The **same** `array_id` is
+  used identically in the wire descriptor, the request `tensor_id`, the
+  `chunk_id` (a length-prefixed binary field, so an embedded `/` is safe), and
+  every cache key — there is **no** separate bare-vs-qualified form. Collapsing
+  that former dual-form to one identifier is what removes the translation seam
+  behind the cross-source cache collisions (`biopb/biopb#45`) and the upload
+  path's `array_id`/`source_id` conflation. The server resolves a request by
+  stripping the `source_id` prefix; for back-compat it also accepts a bare field,
+  the `source_id`, or an empty `tensor_id` (→ the default/first tensor,
+  `biopb/biopb#44`). *Conformance note: keys/caches that key by `array_id` are
+  now correct (it is globally unique); pending alignment — multi-tensor adapters
+  (`aicsimageio`, `ome_zarr` HCS) still emit the **bare** `field` from
+  `list_tensor_descriptors` and must emit the qualified `source_id/field`; the
+  `#48` server prefix-strip (which forced the bare form) must be removed and the
+  read-resolution chokepoint must strip the `source_id` prefix before
+  `get_tensor_adapter` (mirroring the chunk router, which already does this); the
+  HTTP `td.array_id == req.tensor_id` compare and the Python/Java spots that use
+  `array_id` as a `source_id` need the split-on-first-`/` derivation. Already
+  conformant: `source_id` slash-free validation (PR #50), single-tensor
+  `array_id == source_id` (the default construction — no `"0"` sentinel), and the
+  CLI's `source_id/tensor_id` parsing.*
+
 - **`biopb/ome/*.proto` is vestigial.** It is a comprehensive OME metadata model
   from an early blueprint that was **not adopted**. In practice OME/microscopy
   metadata travels as **JSON** (e.g. `metadata_json` on a tensor descriptor,

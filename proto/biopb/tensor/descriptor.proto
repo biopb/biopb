@@ -5,9 +5,68 @@ package biopb.tensor;
 option java_multiple_files = true;
 option java_package = "biopb.tensor";
 
+// ============================================================================
+// Tensor identity policy (authoritative; mirrored in the root CLAUDE.md
+// "Tensor identity" note). Every server, SDK, and CLI MUST adhere to this.
+//
+// A tensor is identified by its array_id ALONE. array_id is GLOBALLY UNIQUE
+// across the whole server, so it -- not a (source, tensor) pair -- is the
+// primary key.
+//
+// CONSTRUCTION. array_id is always built from the source and an optional
+// within-source field name:
+//   * single-tensor source: array_id = source_id           (e.g. "zarr_a3f2")
+//   * multi-tensor source:  array_id = source_id "/" field  (e.g.
+//                           "aics_7f3/Image:0", or an HCS "plate_x/A01/0")
+// It is the SAME value as TensorReadOption.tensor_id; the two fields are
+// synonyms (one names a descriptor, the other a request).
+//
+// source_id IS A DERIVED PROJECTION, not independent identity. Because
+// source_id is globally unique AND slash-free (it MUST NOT contain '/'), it is
+// always recoverable as the prefix before the first '/':
+//       source_id = array_id.split('/', 1)[0]
+// source_id is still carried on the wire (FlightCmd.source_id) as a routing
+// convenience, but array_id is AUTHORITATIVE; when both are present they MUST
+// be consistent. The field part MAY contain '/' (a hierarchical handle, e.g.
+// an HCS "well/field"); the source boundary is always the FIRST '/', which is
+// why source_id must be slash-free. Enforce slash-free source_id at the
+// mint/register boundary (auto-generated ids already comply; caller-supplied
+// ids must be validated).
+//
+// ONE FORM EVERYWHERE. The same array_id appears identically in the wire
+// TensorDescriptor.array_id, the TensorReadOption.tensor_id, the chunk_id
+// encoding, and every descriptor cache key. There is NO separate "bare handle"
+// vs "source-qualified" form. Collapsing that former dual-form to a single
+// identifier is what removes the translation seam that caused cross-source
+// descriptor-cache collisions (biopb/biopb#45) and the upload path's
+// array_id/source_id conflation.
+//
+// REQUEST RESOLUTION. A read request's tensor_id is normally the array_id. The
+// server resolves the within-source tensor by stripping the source_id prefix
+// (split on the first '/'); a single-tensor source has no field. For backward
+// compatibility the server ALSO accepts a bare field name, the source_id
+// itself, or an unset/empty tensor_id (-> the source's default/first tensor,
+// biopb/biopb#44). The canonical form it echoes back is always the full
+// array_id.
+//
+// INVARIANTS every producer/consumer upholds:
+//   * For a given tensor the array_id is IDENTICAL across ListFlights
+//     (DataSourceDescriptor.tensors[].array_id), GetFlightInfo (the response
+//     TensorDescriptor.array_id), and the adapter's own tensor descriptor --
+//     always the full source_id[/field] form.
+//   * SDKs key their descriptor cache by array_id (it is globally unique);
+//     keying by (source_id, array_id) is also correct but redundant.
+//   * chunk_id encodes the array_id directly as a length-prefixed binary field,
+//     so an embedded '/' is just payload (safe). A Flight ticket carries no
+//     source_id field, so recovering source_id from a chunk's array_id uses the
+//     same split-on-the-first-'/' rule.
+// ============================================================================
+
 // Encoded into FlightDescriptor.cmd bytes (identifies the tensor)
 message TensorDescriptor {
-  // Unique identifier for the tensor/array
+  // Globally-unique tensor identifier and primary key (see the tensor identity
+  // policy above). Constructed as source_id (single-tensor) or source_id/field
+  // (multi-tensor). Same value as TensorReadOption.tensor_id.
   string array_id = 1;
 
   // Maps dimension index to semantic label (e.g., ["z", "y", "x"])
@@ -117,7 +176,12 @@ message MetadataQueryOption {
 // Flattened structure - no nested messages for read options.
 // Used in FlightCmd.tensor_read branch.
 message TensorReadOption {
-  // Which tensor within the source
+  // Which tensor to read -- normally the globally-unique array_id (see the
+  // tensor identity policy at the top of this file); the same value as
+  // TensorDescriptor.array_id. The server strips the source_id prefix (split on
+  // the first '/') to resolve the within-source tensor. For back-compat it also
+  // accepts a bare field name or the source_id; unset/empty means "the source's
+  // default (first) tensor" and is resolved server-side (#44).
   string tensor_id = 1;
 
   // Optional sub-region to read
@@ -143,7 +207,11 @@ message TensorReadOption {
 // - "__metadata_query__" -> MetadataQueryOption branch (SQL query)
 // - Any other value -> TensorReadOption branch (tensor read)
 message FlightCmd {
-  // Which data source (flight identifier), or "__metadata_query__" for SQL queries
+  // Which data source (flight identifier), globally unique among sources and
+  // slash-free, or "__metadata_query__" for SQL queries. A derived projection
+  // of the tensor's array_id (the prefix before the first '/'), carried here as
+  // a routing convenience; array_id is authoritative (see the identity policy
+  // at the top of this file).
   string source_id = 1;
 
   oneof command {
