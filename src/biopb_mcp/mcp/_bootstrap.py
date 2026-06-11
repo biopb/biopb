@@ -190,6 +190,43 @@ def _register_cache_plugin(
         logger.exception("Failed to register chunk-cache budget plugin")
 
 
+def _install_window_close_hook(viewer):
+    """Signal the launcher when the user closes the napari window.
+
+    The launcher inherits the *write* end of a pipe via ``BIOPB_WINDOW_CLOSE_FD``
+    (set by ``KernelHost._launch``, name = ``_kernel.ENV_WINDOW_CLOSE_FD``); a
+    reader thread there reaps this kernel back to idle on the byte we write. We
+    connect to the Qt main window's ``destroyed`` signal — the same
+    ``viewer.window._qt_window`` the closed-window probe (``viewer_window_alive``)
+    keys off — which fires once the C++ window is deleted (a user X-close deletes
+    it). Idempotent and fully best-effort: a missing fd, an absent window, or any
+    wiring/IO failure must never break the bootstrap.
+    """
+    fd_str = os.environ.get("BIOPB_WINDOW_CLOSE_FD")
+    if not fd_str:
+        return
+    try:
+        fd = int(fd_str)
+    except ValueError:
+        return
+
+    fired = {"done": False}
+
+    def _notify(*_args):
+        if fired["done"]:
+            return
+        fired["done"] = True
+        try:
+            os.write(fd, b"x")
+        except OSError:
+            pass
+
+    try:
+        viewer.window._qt_window.destroyed.connect(_notify)
+    except Exception:
+        logger.exception("Failed to install napari window-close hook")
+
+
 def bootstrap():
     """Entry point called from the kernel's exec_lines."""
     try:
@@ -276,6 +313,9 @@ def _bootstrap_impl():
             viewer, connection=conn, compute_scheduler=compute_scheduler
         )
         viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+        # Tear the kernel down to idle when the user closes the window: signal
+        # the launcher's reader thread over the inherited window-close pipe.
+        _install_window_close_hook(viewer)
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor

@@ -1,7 +1,11 @@
 # Design note: http-only transport + on-demand kernel (daemon model)
 
-**Status:** design / future reference (not yet implemented). Captures a direction
-agreed in discussion so a future implementer (or future us) can pick it up.
+**Status:** Direction 2 (on-demand kernel) is **implemented** — though as
+*explicit* start (a `start_kernel` tool the agent calls), **not** the implicit
+lazy-on-first-`execute()` trigger this note sketches; see the "Direction 2"
+section below for the as-built notes. Direction 1 (http-only) remains design /
+future reference. Captures directions agreed in discussion so a future
+implementer (or future us) can pick them up.
 
 **Why this exists.** Adding the web "observe" UI (`mcp/_observe.py`)
 exposed a structural weakness: a feature that worked under the **http** transport
@@ -82,6 +86,27 @@ care largely goes away.
 This is the change that *makes the daemon model viable*, and it is independent of
 Direction 1 (could be done today) — but it is essential once the server is a
 long-running daemon.
+
+> **As built (PR #41).** Shipped, but with three deliberate departures from the
+> sketch below, decided in review:
+> 1. **Explicit, not lazy.** Start is driven by a `start_kernel` tool the agent
+>    calls — not an implicit trigger inside `execute()`. Kernel-dependent tools
+>    instead *guard* (return "call `start_kernel`") when the kernel is down, which
+>    is correct on any client and needs no dynamic tool list / `list_changed`.
+> 2. **Synchronous.** `ensure_started()` blocks until ready (like `restart()`),
+>    rather than returning "starting" for the agent to poll — FastMCP runs sync
+>    tool handlers on the event loop, so `restart_kernel` already blocks and the
+>    two now match. The transient "starting" status survives only for a watchdog
+>    respawn, derived from `is_alive() && !ready` (no `_starting` flag).
+> 3. **Display resolved at boot, not spawn.** Re-reading `$DISPLAY` at spawn is a
+>    no-op (a process's env is frozen at exec; `_has_display()` checks presence,
+>    not liveness), so the "resolve at spawn time" refactor below was skipped —
+>    `set_headless` / the `visible` fail-fast stay at boot. Revisit with Direction
+>    1 if an env-refresh mechanism appears.
+>
+> Also added, beyond the sketch: **closing the napari window tears the kernel
+> down to idle** (a reverse window-close pipe), with the reason attributed to the
+> agent. Idle teardown and the multi-client policy remain deferred, as below.
 
 **Principle:** server up = cheap and always; **kernel up = lazy**, because the
 kernel is the heavy/GUI part (child Jupyter kernel → napari viewer → dask cluster).

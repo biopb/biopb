@@ -111,8 +111,10 @@ from the environment, not saved.
 
 The MCP server **is its own process** — it does *not* auto-start on plugin
 import. Launch it with the console script `biopb-mcp` or `python -m
-biopb_mcp.mcp` (requires `$DISPLAY`; a viewer window appears). Install the
-optional deps with `pip install biopb-mcp[mcp]`.
+biopb_mcp.mcp`. Install the optional deps with `pip install biopb-mcp[mcp]`.
+The launcher comes up **idle**: the heavy kernel (and, with a display, the
+napari viewer window) is **not** spawned at boot — it starts on demand when an
+agent calls the `start_kernel` tool (see the kernel-lifecycle note below).
 
 **Transport** is chosen once at startup (not co-served) via `--transport` /
 `config['mcp']['transport']['kind']`: `stdio` (default — JSON-RPC on
@@ -136,6 +138,24 @@ Agent code runs *in that kernel*, not on the MCP server's thread or napari's Qt
 loop — so a runaway execution can be interrupted (`SIGINT`) or hard-restarted
 (process-group `SIGKILL` + respawn) without killing the MCP server.
 
+**On-demand kernel lifecycle.** The kernel is launched lazily, not at boot, so a
+long-running server binds cheaply and never pops a viewer (or Qt-aborts on a
+display-less host) with nobody connected. The `start_kernel` tool drives
+`KernelHost.ensure_started()` — **synchronous** (it blocks until the kernel is
+ready or the bring-up fails, like `restart_kernel`/`restart()`; FastMCP runs sync
+tool handlers on the event loop, so both lifecycle tools block) and idempotent;
+it is also the recovery path after a failed/dead kernel. Until then the host is
+idle and the kernel-dependent tools funnel through `KernelHost.execute()`, which
+returns a structured not-ready status — `not_started` (idle → call
+`start_kernel`), `error`/`dead` (call `start_kernel` to retry), or `starting` (a
+watchdog respawn in flight, derived from `is_alive() && !ready`). Conversely,
+**closing the napari window tears the kernel back down to idle**: a reverse of
+the parent-death pipe (the kernel holds the write end of a `BIOPB_WINDOW_CLOSE_FD`
+pipe and the bootstrap fires it from the window's `destroyed` signal; a server
+reader thread calls `shutdown()` on the byte). A user-attributed
+`_teardown_reason` is then surfaced via `execute()` / `server_status` so the
+agent learns *why* a running job vanished. Rebuild with `start_kernel`.
+
 **Async job model (`_jobs.py`):** `execute_code` runs agent code in a
 **background daemon thread inside the kernel**, so the kernel main thread (and
 its `%gui qt` Qt loop) stays free to service `take_screenshot` / `server_status`
@@ -149,8 +169,10 @@ rest; `cancelled()` supports cooperative `cancel_job`. Rich IPython `display()`
 output is not captured (code is exec'd, not run via `run_cell`).
 
 **Files:**
-- `__main__.py` / `__init__.py` — launcher; builds the `KernelHost`, injects the
-  bootstrap via `IPKernelApp.exec_lines`, then runs the FastMCP server.
+- `__main__.py` / `__init__.py` — launcher; builds the `KernelHost` **idle**
+  (does not eager-start it), injects the bootstrap via `IPKernelApp.exec_lines`,
+  then runs the FastMCP server. The kernel is brought up later by the
+  `start_kernel` tool.
 - `_server.py` — FastMCP server (`mcp = FastMCP("biopb-mcp")`); defines the
   tools/resources and dispatches them to the `KernelHost`. `run()` serves
   streamable-http on `127.0.0.1:<port>/mcp`; `run_stdio()` serves the same
@@ -161,14 +183,18 @@ output is not captured (code is exec'd, not run via `run_cell`).
   — never during the long compute, which runs in a detached kernel thread.
   `execute()` has an `execute_timeout` (now bounds only those quick snippets,
   SIGINT on timeout) and a `busy_lock_timeout` (returns `"busy"` if another
-  quick call holds the lock). `restart()` releases dask then group-kills and
-  respawns (re-running bootstrap, which clears job state).
+  quick call holds the lock). `ensure_started()` is the synchronous, idempotent
+  on-demand start (no eager boot); `restart()` releases dask then group-kills and
+  respawns (re-running bootstrap, which clears job state). `_watch_window_close`
+  (a reader thread on the inherited window-close pipe) tears the kernel down to
+  idle when the user closes the viewer, recording a `_teardown_reason`.
 - `_bootstrap.py` — runs *inside* the kernel via `exec_lines`. Enables `%gui qt`,
   configures dask, constructs the `TensorConnection`, opens the napari viewer +
   Tensor Browser, builds `ops`, installs the job runner (`_jobs.install` +
-  `wrap_viewer_for_threads`), and populates the `execute_code` namespace. On
-  failure it prints a `BOOTSTRAP_ERROR` sentinel; the host's health probe
-  detects success via `'viewer' in dir()`.
+  `wrap_viewer_for_threads`), wires the window-close hook (the viewer's
+  `destroyed` signal → a byte on `BIOPB_WINDOW_CLOSE_FD`), and populates the
+  `execute_code` namespace. On failure it prints a `BOOTSTRAP_ERROR` sentinel;
+  the host's health probe detects success via `'viewer' in dir()`.
 - `_jobs.py` — runs *inside* the kernel. The async job runner: a `_jobs`
   registry, `submit`/`poll`/`cancel`/`cancel_current`/`interrupt_current`/
   `jobs_summary`, a thread-aware stdout dispatcher, `run_on_main` (Qt main-thread
@@ -208,8 +234,9 @@ output is not captured (code is exec'd, not run via `run_cell`).
   `take_screenshot` / `execute_code` detect a user-closed window instead of
   silently mutating a destroyed viewer.
 
-**Tools (8):** `take_screenshot`, `execute_code`, `poll_job`, `cancel_job`,
-`inspect_object`, `interrupt_kernel`, `restart_kernel`, `server_status`.
+**Tools (9):** `start_kernel`, `take_screenshot`, `execute_code`, `poll_job`,
+`cancel_job`, `inspect_object`, `interrupt_kernel`, `restart_kernel`,
+`server_status`.
 
 **Resources (5):** `guide://kernel`, `guide://viewer`, `guide://tensor`,
 `guide://annotations`, `guide://ops`.

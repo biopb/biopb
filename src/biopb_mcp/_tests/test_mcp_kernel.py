@@ -262,7 +262,7 @@ class TestKernelLifecycle:
             res = host.execute("print('hi')")
             assert res["status"] == "error"
             assert "startup failed" in res["error_text"].lower()
-            assert "restart_kernel" in res["error_text"]
+            assert "start_kernel" in res["error_text"]
         finally:
             host.shutdown()
 
@@ -403,6 +403,7 @@ class TestHealth:
                 "alive",
                 "ready",
                 "start_error",
+                "teardown_reason",
                 "busy",
                 "dead",
                 "recent_respawns",
@@ -411,6 +412,7 @@ class TestHealth:
             assert h["alive"] is True
             assert h["ready"] is True
             assert h["start_error"] is None
+            assert h["teardown_reason"] is None
             assert h["dead"] is False
             assert h["watchdog_running"] is True
         finally:
@@ -423,17 +425,19 @@ class TestReadiness:
     execute() returns a not-ready status immediately rather than blocking on
     bring-up; the agent polls server_status to know when to retry."""
 
-    def test_execute_before_ready_returns_starting_immediately(self):
-        # Never started: not ready, no _start_error. execute() must return a
-        # "starting" status *without blocking* on readiness — a blocking wait
-        # could hang for the whole startup budget and trip the client's per-call
-        # timeout. The agent polls server_status / retries instead.
+    def test_execute_before_started_returns_not_started_immediately(self):
+        # Never started (on-demand model): not ready, not starting, no
+        # _start_error. execute() must return a "not_started" status pointing at
+        # start_kernel *without blocking* on readiness — a blocking wait could
+        # hang for the whole startup budget and trip the client's per-call
+        # timeout. The agent calls start_kernel / polls server_status instead.
         host = KernelHost(startup_timeout=60.0, parent_death_pipe=False)
         assert host.health()["ready"] is False
         t0 = time.monotonic()
         res = host.execute("print('hi')")
         elapsed = time.monotonic() - t0
-        assert res["status"] == "starting"
+        assert res["status"] == "not_started"
+        assert "start_kernel" in res["error_text"]
         assert "server_status" in res["error_text"]
         assert elapsed < 1.0  # returned immediately, did not wait on readiness
 
@@ -606,3 +610,117 @@ class TestNapariBootstrap:
         )
         res = napari_kernel.execute(snippet)
         assert "<<PNG_B64>>" in res["stdout"]
+
+
+class TestOnDemandStart:
+    """ensure_started(): the kernel is launched on demand, not at construction."""
+
+    def test_idle_host_reports_not_started(self):
+        # Constructed but never started: execute() must return a structured
+        # not_started status pointing at start_kernel, not block or crash.
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            res = host.execute("1 + 1")
+            assert res["status"] == "not_started"
+            assert "start_kernel" in res["error_text"]
+            assert host.health()["ready"] is False
+            assert host.is_alive() is False
+        finally:
+            host.shutdown()
+
+    def test_ensure_started_is_synchronous_and_idempotent(self):
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            # Synchronous: ensure_started blocks until ready and reports ready
+            # (no "starting"/poll dance).
+            assert host.ensure_started() == {"state": "ready"}
+            assert host.is_alive()
+            assert host.execute("2 + 2")["status"] == "ok"
+            # A ready kernel is a no-op.
+            assert host.ensure_started() == {"state": "ready"}
+        finally:
+            host.shutdown()
+
+    def test_ensure_started_clears_prior_start_error(self):
+        # A recorded terminal failure must not wedge ensure_started: an explicit
+        # (re)start clears it and re-attempts (start_kernel is the retry path).
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            host._start_error = "stale failure"
+            assert host.ensure_started() == {"state": "ready"}
+            assert host._start_error is None
+            assert host.is_alive()
+        finally:
+            host.shutdown()
+
+    def test_ensure_started_reports_error_on_failure(self):
+        # A bring-up failure is returned as a state dict (not raised) so the
+        # start_kernel tool can turn it into a message.
+        host = KernelHost(
+            health_probe_code="print('viewer' in dir())",
+            health_probe_expect="True",
+            startup_timeout=60.0,
+            watchdog_interval=0,
+        )
+        try:
+            result = host.ensure_started()
+            assert result["state"] == "error"
+            assert result["error"]
+            assert host.health()["ready"] is False
+        finally:
+            host.shutdown()
+
+
+@posix_only
+class TestWindowClosePipe:
+    """The reverse kernel->server pipe reaps the kernel when the window closes."""
+
+    def test_window_close_byte_tears_down_to_idle(self):
+        host = KernelHost(
+            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
+        )
+        try:
+            host.start()
+            assert host._window_r is not None
+            # Simulate the in-kernel close hook: the kernel writes a byte to its
+            # inherited write end of the window-close pipe.
+            host.execute(
+                "import os; "
+                "os.write(int(os.environ['BIOPB_WINDOW_CLOSE_FD']), b'x')"
+            )
+            deadline = time.time() + 10
+            while host.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
+            assert not host.is_alive()
+            assert host._teardown_reason and "window" in host._teardown_reason
+            # The teardown is attributed on the next tool call...
+            res = host.execute("1 + 1")
+            assert res["status"] == "not_started"
+            assert "window" in res["error_text"]
+            # ...and cleared by an explicit restart (synchronous).
+            assert host.ensure_started() == {"state": "ready"}
+            assert host._teardown_reason is None
+        finally:
+            host.shutdown()
+
+    def test_normal_shutdown_is_not_attributed_to_window_close(self):
+        # The reader thread's EOF path (kernel died via another teardown) must
+        # not misfire as a window close.
+        host = KernelHost(
+            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
+        )
+        host.start()
+        host.shutdown()
+        assert host._teardown_reason is None
+
+    def test_disabled_pipe_has_no_read_fd(self):
+        host = KernelHost(
+            health_probe_code=None,
+            window_close_pipe=False,
+            watchdog_interval=0,
+        )
+        try:
+            host.start()
+            assert host._window_r is None
+        finally:
+            host.shutdown()

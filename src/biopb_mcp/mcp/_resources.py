@@ -84,11 +84,12 @@ already wrapped for you. For anything else — layer properties, `viewer.dims`,
 mutation in `run_on_main()` (a no-op when already on the main thread). Batch
 related mutations into one `run_on_main()` call.
 
-**If the user closes the napari window**, the viewer object survives but its
-canvas is destroyed: `viewer.*` mutations silently no-op (layers go to the model
-but nothing is shown) and screenshots fail. `server_status` reports
-`window: CLOSED`; `execute_code` appends a note. Call `restart_kernel` to
-restore the viewer.
+**If the user closes the napari window**, the kernel is torn down to idle and
+any running job is stopped. `server_status` then reports the kernel `not
+started`, attributing it to the window close, and the kernel-dependent tools
+return the same. Call `start_kernel` to rebuild the viewer. (Briefly, before
+the teardown completes, a tool may instead see `window: CLOSED` with a note to
+`restart_kernel` — either recovers it.)
 
 ## Layers
 ```python

@@ -18,7 +18,6 @@ import shutil
 import signal
 import sys
 import tempfile
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +271,9 @@ def main(argv=None):
             config, "mcp.kernel.watchdog_respawn_window"
         ),
         parent_death_pipe=get_setting(config, "mcp.kernel.parent_death_pipe"),
+        # The window-close pipe only matters with a viewer; a headless kernel
+        # has no window to close, so don't wire it up.
+        window_close_pipe=not headless,
     )
     _server.set_kernel_host(host)
     _server.set_promote_after(get_setting(config, "mcp.kernel.promote_after"))
@@ -279,36 +281,25 @@ def main(argv=None):
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
 
+    # On-demand start: the kernel is NOT launched here. The server stays cheap
+    # and idle (no viewer window pops, no Qt abort on a display-less daemon)
+    # until an agent calls the `start_kernel` tool, which drives
+    # host.ensure_started() — a synchronous bring-up that blocks that one tool
+    # call until the kernel is ready. Other tool calls landing before then get a
+    # structured "not started" status (see KernelHost.execute).
     if headless:
         logger.info(
-            "Starting kernel in headless mode (no viewer; no display)."
+            "Headless mode (no viewer; no display). Kernel starts on the first "
+            "start_kernel call."
         )
     else:
-        logger.info("Starting napari kernel (a viewer window will appear)...")
+        logger.info(
+            "Ready. The napari kernel (and viewer window) starts on the first "
+            "start_kernel call."
+        )
 
-    # Bring the kernel up OFF the main thread so the MCP handshake is served
-    # immediately. The kernel + napari/Qt viewer + dask bring-up is slow and, on
-    # WSL, routinely exceeds an MCP client's startup timeout (e.g. 30s) — which
-    # made `biopb-mcp --transport stdio` fail to register there whenever the
-    # bring-up was slow. Tools dispatch through KernelHost.execute(), which waits
-    # on the host's readiness signal, so a call that lands before the kernel is
-    # ready reports "starting" instead of racing a half-built kernel.
-    def _start_kernel():
-        try:
-            host.start()
-            logger.info("Kernel ready.")
-        except Exception:
-            logger.exception(
-                "Kernel startup failed; tools will report a terminal startup "
-                "error (call restart_kernel to retry). See the kernel log for "
-                "the bootstrap traceback."
-            )
-
-    threading.Thread(
-        target=_start_kernel, name="kernel-start", daemon=True
-    ).start()
-
-    # Reap the kernel on exit even if it is still mid-bringup when we stop.
+    # Reap the kernel on exit even if it is still mid-bringup when we stop
+    # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
     def _handle_signal(signum, frame):
