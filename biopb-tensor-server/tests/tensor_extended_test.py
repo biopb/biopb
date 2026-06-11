@@ -85,8 +85,9 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
         descriptors = adapter.list_tensor_descriptors()
         assert len(descriptors) == 1
         desc = descriptors[0]
-        # array_id is the scene_id (e.g., 'Image:0'), not the source_id
-        assert desc.array_id == 'Image:0'
+        # array_id is the globally-unique source_id/field (identity policy); the
+        # scene id "Image:0" is the within-source field.
+        assert desc.array_id == 'test-embedded/Image:0'
         # aicsimageio uses TCZYX dimension order
         assert list(desc.shape) == [1, 3, 1, 128, 128]
         # dtype is numpy dtype string format (e.g., '<u2' for little-endian uint16)

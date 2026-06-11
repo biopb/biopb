@@ -202,6 +202,20 @@ class SourceAdapter(ABC):
         """
         return self
 
+    def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
+        """Reduce a source-qualified array_id to its within-source field.
+
+        Per the tensor identity policy, a tensor's array_id is ``source_id`` or
+        ``source_id/field``. Multi-tensor ``get_tensor_adapter`` overrides key on
+        the ``field`` part, but a caller may legitimately hand them the full
+        array_id ("a tensor is identifiable by array_id alone"). Strip the
+        ``source_id/`` prefix when present (split on the first '/'); a bare field
+        is returned unchanged. Idempotent with the server's own reduction.
+        """
+        if tensor_id and self.source_id and tensor_id.startswith(f"{self.source_id}/"):
+            return tensor_id[len(self.source_id) + 1:]
+        return tensor_id
+
 
     def has_native_pyramid(self) -> bool:
         """Whether this source ships a well-formed multi-resolution pyramid.

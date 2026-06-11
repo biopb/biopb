@@ -385,6 +385,29 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return bounds.SerializeToString()
 
+    @staticmethod
+    def _field_within_source(source_id: str, tensor_id: str) -> Optional[str]:
+        """Reduce a request tensor_id to the within-source field name that
+        ``get_tensor_adapter`` keys on.
+
+        Per the tensor identity policy, array_id is ``source_id`` (single-tensor)
+        or ``source_id/field`` (multi-tensor), and a client normally sends that
+        array_id back as the request tensor_id. The within-source adapters key on
+        the ``field`` part only, so strip the ``source_id/`` prefix (split on the
+        first '/'; source_id is slash-free, the field may itself contain '/').
+        Liberal for back-compat: also accepts a bare field name or the source_id
+        itself; returns ``None`` for the single-tensor / "source addressed by its
+        own id" case.
+        """
+        if not tensor_id:
+            return None
+        prefix = f"{source_id}/"
+        if tensor_id.startswith(prefix):
+            return tensor_id[len(prefix):]
+        if tensor_id == source_id:
+            return None
+        return tensor_id
+
     def _get_adapter_for_tensor(
         self, source_id: str, tensor_id: str
     ) -> Optional[TensorAdapter]:
@@ -392,7 +415,9 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Args:
             source_id: The data source identifier
-            tensor_id: The tensor identifier within the source
+            tensor_id: The within-source field name (already reduced from any
+                source-qualified array_id by ``_field_within_source``), or None
+                for the source's sole/default tensor.
 
         Returns:
             TensorAdapter for the specified tensor, or None if not found
@@ -644,13 +669,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 if descriptors:
                     tensor_id = descriptors[0].array_id
 
+        # Reduce the (now possibly source-qualified) tensor_id to the
+        # within-source field the adapters key on (identity policy: array_id is
+        # source_id or source_id/field). The wire descriptor still reports the
+        # full array_id -- which the adapter's get_tensor_descriptor() carries.
+        field = self._field_within_source(source_id, tensor_id)
+
         logger.debug(
-            f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}"
+            f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}, field={field}"
         )
 
         # Get tensor adapter for the specified source and tensor
         tensor_adapter = self._get_adapter_for_tensor(
-            source_id, tensor_id
+            source_id, field
         )
         if tensor_adapter is None:
             logger.warning(
@@ -683,21 +714,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
             read_plan = tensor_adapter.get_read_plan(tensor_desc)
 
-            # Emit a single, source-unique array_id for this tensor across every
-            # RPC (#45 fault 2). get_read_plan copies the adapter's *qualified*
-            # array_id ("source_id/tensor_name"), but list_flights advertises the
-            # *bare* tensor_name -- so the same tensor came back in two forms and
-            # split / collided the client's descriptor cache. Strip the leading
-            # "source_id/" so the data path matches list_flights. Derived from the
-            # adapter's real array_id (not the requested tensor_id), so adapters
-            # that ignore tensor_id still report their true id and the client can
-            # still reject a bogus tensor_id. Chunk routing is unaffected: the
-            # endpoints' chunk_ids already encode the qualified array_id.
-            _qualified_prefix = f"{source_id}/"
-            if read_plan.descriptor.array_id.startswith(_qualified_prefix):
-                read_plan.descriptor.array_id = read_plan.descriptor.array_id[
-                    len(_qualified_prefix):
-                ]
+            # The response descriptor's array_id is the adapter's own
+            # source-unique array_id (source_id or source_id/field), carried
+            # through get_read_plan from get_tensor_descriptor(). Under the
+            # identity policy this same qualified array_id is what list_flights
+            # advertises, the chunk_ids encode, and the client caches -- one form
+            # everywhere, so there is nothing to strip here (cf. the removed #45
+            # bare-form normalization; the bare/qualified split it papered over
+            # no longer exists).
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
@@ -709,7 +733,7 @@ class TensorFlightServer(flight.FlightServerBase):
             # scale_hint path; native sources get their precomputed levels.
             read_plan.descriptor.ClearField("pyramid")
             read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(source_adapter, tensor_id, base_desc)
+                self._advertised_pyramid(source_adapter, field, base_desc)
             )
 
             # Compact per-dim physical scale summary. Filled here at open time
@@ -720,7 +744,7 @@ class TensorFlightServer(flight.FlightServerBase):
             read_plan.descriptor.ClearField("physical_scale")
             read_plan.descriptor.ClearField("physical_unit")
             try:
-                phys = tensor_adapter.get_physical_scale(tensor_id)
+                phys = tensor_adapter.get_physical_scale(field)
             except Exception:
                 phys = None
             if phys is not None:
