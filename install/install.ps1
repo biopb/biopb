@@ -228,10 +228,12 @@ function Set-McpClients {
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
-    # biopb-mcp 0.6.0+ speaks MCP over stdio: the AI agent spawns it as a child
-    # process (`biopb-mcp --transport stdio`) rather than connecting to a
-    # long-running HTTP server. Each client needs the *command* to run, not a URL;
-    # we register the resolved absolute path so GUI agents (e.g. Claude Desktop),
+    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
+    # (`biopb-mcp --transport stdio`). Recent biopb-mcp makes that child a thin
+    # bridge that brings up — and shares across clients — a local http daemon on
+    # demand (the daemon outlives any one client). The client contract is
+    # unchanged, so each client still needs the *command* to run, not a URL; we
+    # register the resolved absolute path so GUI agents (e.g. Claude Desktop),
     # which don't inherit the shell PATH, can still find it.
     $mcpArgs = @("--transport", "stdio")
 
