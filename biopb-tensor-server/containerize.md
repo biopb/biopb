@@ -82,7 +82,59 @@ docker run -d \
 | `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
 | `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind HTTP to localhost (Singularity/HPC only; ignored in Docker) |
-| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Base temp directory (avoids multi-user collisions on shared /tmp) |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written. **Does not relocate the file cache** — see [Cache Storage](#cache-storage) |
+| `CACHE_MAX_TOTAL_GB` | `128` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
+| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB (same applicability as above) |
+| `TMPDIR` | (unset) | System temp dir; the file cache lives at `$TMPDIR/biopb-cache-<uid>`. Set this (or use a config file) to move the cache — see [Cache Storage](#cache-storage) |
+
+### Cache Storage
+
+The server keeps a **file-backed cache of decoded chunks** (Arrow IPC segments)
+so repeat reads skip re-decoding TIFF/CZI/Zarr. You need to know **where it lives
+and how big it can get**, because the defaults differ between Docker and
+Singularity.
+
+**Location.** The cache directory is *not* `BIOPB_TMP`. The generated config
+leaves `file_cache_dir` unset, so it falls back to the library default
+`<system temp dir>/biopb-cache-<uid>` (the system temp dir honors `$TMPDIR` /
+`$TEMP` / `$TMP`):
+
+- **Docker**: runs as root with a private `/tmp` and no `TMPDIR`, so the cache
+  lands at **`/tmp/biopb-cache-0` on the container's ephemeral writable layer**
+  (overlay2). It is **not** a mounted volume — it consumes the Docker graph
+  storage under `/var/lib/docker` and is discarded on `docker rm`.
+- **Singularity/HPC**: auto-binds the host `/tmp` and runs as your real user, so
+  the cache lands at **`/tmp/biopb-cache-<your-uid>` on host disk** — persistent,
+  per-user, on real storage. (This is why HPC deployments never see the writable-
+  layer growth that Docker can.)
+
+**Size.** When config is generated from env vars, the cap defaults to
+**`CACHE_MAX_TOTAL_GB=128`** (128 GB), with `CACHE_MAX_SEGMENT_MB=256` per
+segment. The cache is LRU-bounded — it evicts to stay at the cap rather than
+growing without limit — but under Docker that still means up to **128 GB can
+accumulate on the writable layer**. (The library default when constructing
+`CacheConfig` directly is 4 GB; the 128 GB figure is set by the container
+entrypoint.)
+
+**Controlling it under Docker.** Pick one:
+
+```bash
+# Lower the cap
+docker run ... -e CACHE_MAX_TOTAL_GB=16 biopb-tensor-server:latest
+
+# Put the cache on a mounted volume instead of the writable layer
+docker run ... -v tensor-cache:/cache -e TMPDIR=/cache biopb-tensor-server:latest
+#   → cache lands at /cache/biopb-cache-0 on the volume
+
+# Or pin it explicitly via a config file ([cache] file_cache_dir = "/cache")
+docker run ... -v tensor-cache:/cache -v ~/my-config.toml:/custom.toml \
+    -e CONFIG_FILE=/custom.toml biopb-tensor-server:latest
+```
+
+> Note: `CACHE_MAX_TOTAL_GB` / `CACHE_MAX_SEGMENT_MB` only apply when the
+> entrypoint **generates** the config from env vars. If you supply your own
+> `CONFIG_FILE`, set the limits in its `[cache]` block (`file_max_total_gb`,
+> `file_max_segment_mb`, `file_cache_dir`) instead.
 
 ### Port Derivation
 
