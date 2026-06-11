@@ -629,6 +629,21 @@ class TensorFlightServer(flight.FlightServerBase):
 
         self._authorize_source(context, source_id)
 
+        # Resolve an unset/empty tensor_id (proto3 default "") to the source's
+        # default (first) tensor. get_source / get_physical_scale are documented
+        # to accept no tensor_id, but the client sends "" for the unset case;
+        # forwarding that to a multi-tensor adapter's get_tensor_adapter blows up
+        # (aicsimageio's scene_ids.index("") -> "Unknown scene: ", OME-Zarr HCS
+        # field parsing), so honor the documented default in this one chokepoint
+        # rather than at every adapter call site. The first descriptor's array_id
+        # is the same default the client's own get_tensor path resolves to (#44).
+        if not tensor_id:
+            default_adapter = self._get_source_adapter(source_id)
+            if default_adapter is not None:
+                descriptors = default_adapter.list_tensor_descriptors()
+                if descriptors:
+                    tensor_id = descriptors[0].array_id
+
         logger.debug(
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}"
         )
@@ -667,6 +682,23 @@ class TensorFlightServer(flight.FlightServerBase):
                 tensor_desc.reduction_method = read_opt.reduction_method
 
             read_plan = tensor_adapter.get_read_plan(tensor_desc)
+
+            # Emit a single, source-unique array_id for this tensor across every
+            # RPC (#45 fault 2). get_read_plan copies the adapter's *qualified*
+            # array_id ("source_id/tensor_name"), but list_flights advertises the
+            # *bare* tensor_name -- so the same tensor came back in two forms and
+            # split / collided the client's descriptor cache. Strip the leading
+            # "source_id/" so the data path matches list_flights. Derived from the
+            # adapter's real array_id (not the requested tensor_id), so adapters
+            # that ignore tensor_id still report their true id and the client can
+            # still reject a bogus tensor_id. Chunk routing is unaffected: the
+            # endpoints' chunk_ids already encode the qualified array_id.
+            _qualified_prefix = f"{source_id}/"
+            if read_plan.descriptor.array_id.startswith(_qualified_prefix):
+                read_plan.descriptor.array_id = read_plan.descriptor.array_id[
+                    len(_qualified_prefix):
+                ]
+
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
             source_adapter = self._get_source_adapter(source_id)

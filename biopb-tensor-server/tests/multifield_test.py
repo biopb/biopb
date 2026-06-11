@@ -271,6 +271,50 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
+    def test_get_source_without_tensor_id_resolves_default_tensor(self):
+        """get_source()/get_physical_scale() with no tensor_id must resolve the
+        source's default (first) tensor, not forward "" to the adapter.
+
+        Regression for #44: the client sends tensor_id="" (proto3 default) when
+        none is given; before the chokepoint default-resolution in
+        get_flight_info, that "" reached MockMultifieldAdapter.get_tensor_adapter
+        -- which (like aicsimageio's scene lookup) raises on an unknown tensor,
+        surfacing as a Flight error for a documented-valid call.
+        """
+        tensor_specs = [
+            ("pos_0", (32, 32), "uint8"),
+            ("pos_1", (64, 64), "uint8"),
+        ]
+        adapter = MockMultifieldAdapter("multifield-default", tensor_specs)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("multifield-default", adapter)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            # No tensor_id -> must not raise "Unknown tensor: " and must come
+            # back anchored on the first tensor.
+            source_desc = client.get_source("multifield-default")
+            assert len(source_desc.tensors) == 1
+            # Shape unambiguously identifies the default (first) tensor; the
+            # descriptor now reports the bare tensor_id, consistent across RPCs
+            # (#45 fault 2).
+            assert source_desc.tensors[0].shape == [32, 32]
+            assert source_desc.tensors[0].array_id == "pos_0"
+
+            # get_physical_scale rides the same no-tensor_id path; the mock
+            # advertises none, so None (cleanly), never a Flight error.
+            assert client.get_physical_scale("multifield-default") is None
+
+            client.close()
+        finally:
+            server.shutdown()
+
     def test_single_tensor_source_still_works(self):
         """Single tensor sources should still work with new API."""
         tensor_specs = [
@@ -317,3 +361,121 @@ class TestMultifieldDifferentDtypes:
         assert descriptors[0].dtype == "uint8"
         assert descriptors[1].dtype == "float32"
         assert descriptors[2].dtype == "uint16"
+
+
+class MockImage0Adapter(BackendAdapter):
+    """Single-tensor source whose tensor is named "Image:0".
+
+    Models a single-scene aicsimageio file: every such file names its one
+    tensor "Image:0", so two distinct sources share a *non-unique* bare
+    array_id. It also mirrors aicsimageio's two array_id forms (issue #45
+    fault 2): list_tensor_descriptors() advertises the bare "Image:0", while
+    the tensor-level get_tensor_descriptor() carries the source-qualified
+    "source_id/Image:0".
+    """
+
+    @classmethod
+    def claim(cls, path, visited_identities):
+        return None
+
+    @classmethod
+    def create_from_config(cls, source, credentials_config=None):
+        raise NotImplementedError("MockImage0Adapter is for testing only")
+
+    def __init__(self, source_id, shape, physical_scale, physical_unit):
+        self.source_id = source_id
+        self._tensor_name = "Image:0"  # array_id property -> source_id/Image:0
+        self._shape = shape
+        self._physical_scale = physical_scale
+        self._physical_unit = physical_unit
+        self._source_url = f"mock://{source_id}"
+        self._source_type = "mock-aics"
+
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        # Tensor-level: source-qualified array_id, like aicsimageio.
+        return TensorDescriptor(
+            array_id=self.array_id,
+            dim_labels=["z", "y", "x"],
+            shape=list(self._shape),
+            chunk_shape=list(self._shape),
+            dtype="uint8",
+        )
+
+    def list_tensor_descriptors(self):
+        # Source-level listing: bare array_id, like aicsimageio.
+        return [
+            TensorDescriptor(
+                array_id=self._tensor_name,
+                dim_labels=["z", "y", "x"],
+                shape=list(self._shape),
+                chunk_shape=list(self._shape),
+                dtype="uint8",
+            )
+        ]
+
+    def get_metadata(self) -> dict:
+        return {}
+
+    def get_physical_scale(self, tensor_id=None):
+        return list(self._physical_scale), list(self._physical_unit)
+
+    def get_data(self, bounds) -> np.ndarray:
+        super().get_data(bounds)
+        shape = tuple(
+            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+        )
+        return np.zeros(shape, dtype="uint8")
+
+
+class TestDescriptorCacheCollision:
+    """Regression for #45: cross-source descriptor cache collisions.
+
+    Two single-scene-aicsimageio-like sources share the bare tensor id
+    "Image:0". A descriptor cache keyed by the bare array_id collapses them to
+    one entry, so get_physical_scale / get_source silently return another
+    source's descriptor (wrong shape, dims, physical scale). The cache must be
+    keyed per (source_id, array_id).
+    """
+
+    def test_same_bare_array_id_across_sources_returns_own_descriptor(self):
+        srcA = MockImage0Adapter(
+            "aics_aaa", (10, 256, 256), [2.0, 0.5, 0.5], ["um", "um", "um"]
+        )
+        srcB = MockImage0Adapter(
+            "aics_bbb", (181, 1024, 1024), [4.0, 0.1, 0.1], ["um", "um", "um"]
+        )
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("aics_aaa", srcA)
+        server.register_source("aics_bbb", srcB)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            # get_source returns each source's own shape, never the other's.
+            assert client.get_source("aics_aaa").tensors[0].shape == [10, 256, 256]
+            assert client.get_source("aics_bbb").tensors[0].shape == [181, 1024, 1024]
+
+            # get_physical_scale reads from the descriptor cache keyed on the
+            # bare tensor id "Image:0" -- the exact collision in #45. Each must
+            # return its OWN scale. With a bare-only key the second source reads
+            # the first's cached entry and returns the wrong scale.
+            scale_a, unit_a = client.get_physical_scale("aics_aaa", "Image:0")
+            assert scale_a == [2.0, 0.5, 0.5]
+            assert unit_a == ["um", "um", "um"]
+
+            scale_b, unit_b = client.get_physical_scale("aics_bbb", "Image:0")
+            assert scale_b == [4.0, 0.1, 0.1]
+            assert unit_b == ["um", "um", "um"]
+
+            # Both sources coexist in the cache under distinct composite keys.
+            assert client._descriptor_key("aics_aaa", "Image:0") in client._descriptors
+            assert client._descriptor_key("aics_bbb", "Image:0") in client._descriptors
+
+            client.close()
+        finally:
+            server.shutdown()

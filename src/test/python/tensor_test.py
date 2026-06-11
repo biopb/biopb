@@ -599,6 +599,40 @@ class TestQuerySourcesFormat:
         assert list(out["source_id"]) == ["a", "b"]
         assert list(out["shape_summary"].iloc[0]) == [1, 4, 5734, 5734]
 
+    def test_pandas_string_nulls_become_none_not_nan(self):
+        # issue #47: a NULL in a *string* column (e.g. metadata_json) coerces
+        # to a float NaN under Arrow->pandas, and NaN is *truthy* -- so the
+        # obvious `if row.metadata_json:` guard passes and json.loads() then
+        # blows up on a float. We normalize string-column nulls to None.
+        pd = pytest.importorskip("pandas")
+        import pyarrow as pa
+
+        t = pa.table(
+            {
+                # mixed: one row has metadata, one is NULL -> Arrow `string`
+                # col with nulls (the sharp case; an all-NULL page is already
+                # None because it becomes an Arrow `null`-typed column).
+                "source_id": ["a", "b"],
+                "metadata_json": pa.array(['{"x": 1}', None], type=pa.string()),
+            }
+        )
+        out = TensorFlightClient._format_query_result(t, "pandas")
+        missing = out["metadata_json"].iloc[1]
+        assert missing is None
+        assert not missing  # falsy, so `if row.metadata_json:` is skipped
+        assert out["metadata_json"].iloc[0] == '{"x": 1}'
+
+    def test_pandas_numeric_nan_is_untouched(self):
+        # The fix targets string columns by Arrow schema, so a genuine NaN in a
+        # real float column must survive (we only normalize text nulls).
+        pd = pytest.importorskip("pandas")
+        import math
+        import pyarrow as pa
+
+        t = pa.table({"score": pa.array([1.5, None], type=pa.float64())})
+        out = TensorFlightClient._format_query_result(t, "pandas")
+        assert math.isnan(out["score"].iloc[1])
+
     def test_records_returns_list_of_dicts(self):
         t = self._table()
         out = TensorFlightClient._format_query_result(t, "records")
@@ -613,6 +647,35 @@ class TestQuerySourcesFormat:
         client = TensorFlightClient.__new__(TensorFlightClient)
         with pytest.raises(ValueError, match="unknown format"):
             client.query_sources("SELECT 1", format="polars")
+
+
+class TestDescriptorKey:
+    """_descriptor_key normalization (server-free, issue #45).
+
+    The descriptor cache key must be source-unique and must collapse the bare
+    and source-qualified array_id forms (which different RPCs emit) for the same
+    tensor onto a single key.
+    """
+
+    def test_bare_and_qualified_forms_collapse_to_one_key(self):
+        # An old data endpoint returns "src/Image:0"; list_sources returns the
+        # bare "Image:0". Both are the same tensor -> one key.
+        assert TensorFlightClient._descriptor_key(
+            "src", "Image:0"
+        ) == TensorFlightClient._descriptor_key("src", "src/Image:0")
+
+    def test_same_bare_id_different_sources_do_not_collide(self):
+        # Two aicsimageio files both name their tensor "Image:0"; keys must differ.
+        assert TensorFlightClient._descriptor_key(
+            "aics_aaa", "Image:0"
+        ) != TensorFlightClient._descriptor_key("aics_bbb", "Image:0")
+
+    def test_only_own_source_prefix_is_stripped(self):
+        # A leading prefix that isn't this source's id is left intact.
+        assert TensorFlightClient._descriptor_key("src", "other/Image:0") == (
+            "src",
+            "other/Image:0",
+        )
 
 
 class TestGetPhysicalScale:
@@ -650,7 +713,7 @@ class TestGetPhysicalScale:
         desc, _ = self._desc(
             "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
         )
-        client._descriptors["t1"] = desc
+        client._descriptors[client._descriptor_key("src", "t1")] = desc
 
         scale, unit = client.get_physical_scale("src", "t1")
         assert scale == [2.0, 0.325, 0.325]
@@ -661,7 +724,7 @@ class TestGetPhysicalScale:
         # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
         desc, _ = self._desc("t1")  # no physical_scale set
-        client._descriptors["t1"] = desc
+        client._descriptors[client._descriptor_key("src", "t1")] = desc
 
         assert client.get_physical_scale("src", "t1") is None
 
