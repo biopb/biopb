@@ -19,17 +19,17 @@ The `run_server()` helper optionally starts an embedded TensorFlightServer for e
 
 ```
 ┌─────────────────────────────────────────────┐
-│  image-server (single process)               │
-│                                              │
+│  image-server (single process)              │
+│                                             │
 │  ┌─────────────┐      ┌─────────────────┐   │
 │  │ gRPC server │      │ embedded Flight │   │
 │  │ port 50051  │◀────▶│ cache server    │   │
 │  │             │      │ port 8817       │   │
 │  └─────────────┘      └─────────────────┘   │
-│                              │               │
-│                              ▼               │
-│                       /data/cache/           │
-│                       (file-based)           │
+│                              │              │
+│                              ▼              │
+│                       /data/cache/          │
+│                       (file-based)          │
 └─────────────────────────────────────────────┘
 ```
 

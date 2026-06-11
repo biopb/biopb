@@ -165,18 +165,18 @@ understanding in detail.
               │  MCP tools + resources                      ▲
               │  (streamable-http, 127.0.0.1:8765/mcp)      │ watches / prompts
               ▼                                             │
-   ┌───────────────────────┐                               │
-   │  MCP server process    │                              │
-   │  (FastMCP, _server.py) │                              │
-   └───────────┬───────────┘                               │
+   ┌────────────────────────┐                               │
+   │  MCP server process    │                               │
+   │  (FastMCP, _server.py) │                               │
+   └───────────┬────────────┘                               │
                │ dispatch (serialized by one RLock)         │
                ▼                                            │
-   ┌──────────────────────────────────────────────┐        │
+   ┌────────────────────────────────────────────────┐       │
    │  child Jupyter kernel (separate process)       │       │
    │    opens ── napari viewer window ──────────────┼───────┘
-   │    namespace:  viewer, np, da, client, ops      │
-   │        │              │               │         │
-   └────────┼──────────────┼───────────────┼─────────┘
+   │    namespace:  viewer, np, da, client, ops     │
+   │        │              │               │        │
+   └────────┼──────────────┼───────────────┼────────┘
             ▼              ▼               ▼
          viewer        data plane     compute plane
                      client / dask   ops (ProcessImage)
