@@ -889,9 +889,27 @@ class TensorFlightClient:
             if token
             else flight.FlightCallOptions()
         )
-        # Cache descriptors for metadata
+        # Cache descriptors for metadata. Keyed by (source_id, bare array_id):
+        # array_id alone is NOT unique across sources -- e.g. aicsimageio names
+        # every single-scene file's tensor "Image:0" -- so a bare-array_id key
+        # collides and silently returns another source's descriptor (issue #45).
         self._sources: Dict[str, DataSourceDescriptor] = {}
-        self._descriptors: Dict[str, TensorDescriptor] = {}
+        self._descriptors: Dict[Tuple[str, str], TensorDescriptor] = {}
+
+    @staticmethod
+    def _descriptor_key(source_id: str, array_id: str) -> Tuple[str, str]:
+        """Composite, source-unique key for the descriptor cache (issue #45).
+
+        ``array_id`` arrives in two forms depending on the RPC: bare
+        (``"Image:0"`` from ``list_sources`` / ``get_source``) or
+        source-qualified (``"src/Image:0"`` from an older data endpoint). Strip a
+        leading ``"{source_id}/"`` so both forms map to one key and never
+        collide across sources or split the cache for the same tensor.
+        """
+        prefix = f"{source_id}/"
+        if array_id.startswith(prefix):
+            array_id = array_id[len(prefix):]
+        return (source_id, array_id)
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
@@ -915,7 +933,9 @@ class TensorFlightClient:
             source_descriptors[source_desc.source_id] = source_desc
             # Cache tensor descriptors
             for tensor_desc in source_desc.tensors:
-                self._descriptors[tensor_desc.array_id] = tensor_desc
+                self._descriptors[
+                    self._descriptor_key(source_desc.source_id, tensor_desc.array_id)
+                ] = tensor_desc
 
             # Check schema metadata for truncation info
             if info.schema.metadata:
@@ -958,7 +978,11 @@ class TensorFlightClient:
             returns an empty object of that same type. For ``"pandas"`` and
             ``"records"`` the usual Arrow->Python coercion applies (list
             columns such as ``shape_summary`` become Python lists / object
-            dtype, and nullable integer columns may widen to float).
+            dtype, and nullable integer columns may widen to float). For
+            ``"pandas"``, NULLs in string columns (e.g. ``metadata_json``) are
+            normalized to ``None`` rather than the truthy float ``NaN`` Arrow
+            would otherwise produce, so ``if row.metadata_json:`` behaves as
+            expected.
 
         Note:
             The server reports truncation via schema metadata
@@ -1042,7 +1066,21 @@ class TensorFlightClient:
                 "query_sources(format='pandas') requires pandas; install "
                 "pandas, or call with format='arrow' / format='records'."
             ) from exc
-        return table.to_pandas()
+        df = table.to_pandas()
+        # Arrow->pandas turns a NULL in a string column into a float NaN, which
+        # is *truthy* -- so `if row.metadata_json:` silently passes and then the
+        # downstream `json.loads(...)` blows up on a float (issue #47). Normalize
+        # missing text cells back to None (falsy, pd.notna-clean). Target by the
+        # Arrow schema so genuine numeric NaN in real float columns is untouched.
+        # Go through object dtype: pandas' str dtype re-coerces a None put back
+        # in via .where() to NaN, but an object column preserves None.
+        for field in table.schema:
+            if pa.types.is_string(field.type) or pa.types.is_large_string(
+                field.type
+            ):
+                col = df[field.name].astype(object)
+                df[field.name] = col.where(col.notna(), None)
+        return df
 
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata.
@@ -1113,10 +1151,18 @@ class TensorFlightClient:
         Returns:
             ``(scale, unit)`` lists, or ``None`` if no physical scale is known.
         """
-        desc = self._descriptors.get(tensor_id) if tensor_id else None
+        desc = (
+            self._descriptors.get(self._descriptor_key(source_id, tensor_id))
+            if tensor_id
+            else None
+        )
         if desc is None:
             self.get_source(source_id, tensor_id)
-            desc = self._descriptors.get(tensor_id) if tensor_id else None
+            desc = (
+                self._descriptors.get(self._descriptor_key(source_id, tensor_id))
+                if tensor_id
+                else None
+            )
             if desc is None:
                 src = self._sources.get(source_id)
                 if src and src.tensors:
@@ -1153,7 +1199,9 @@ class TensorFlightClient:
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
         source_desc = DataSourceDescriptor(source_id=source_id, tensors=[tensor_desc])
         self._sources[source_id] = source_desc
-        self._descriptors[tensor_desc.array_id] = tensor_desc
+        self._descriptors[
+            self._descriptor_key(source_id, tensor_desc.array_id)
+        ] = tensor_desc
         return source_desc
 
     def _get_tensor_context(
@@ -1232,7 +1280,9 @@ class TensorFlightClient:
                 self.get_source(source_id, tensor_id)
             except Exception:
                 pass  # let the ValueError below surface the clean message
-            tensor_desc = self._descriptors.get(tensor_id)
+            tensor_desc = self._descriptors.get(
+                self._descriptor_key(source_id, tensor_id)
+            )
 
         if tensor_desc is None:
             raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
@@ -1279,7 +1329,9 @@ class TensorFlightClient:
         schema_metadata = _extract_schema_metadata(info.schema)
 
         # Cache the response descriptor
-        self._descriptors[response_desc.array_id] = response_desc
+        self._descriptors[
+            self._descriptor_key(source_id, response_desc.array_id)
+        ] = response_desc
 
         # Parse endpoints into (chunk_id, bounds) pairs
         endpoints = []
