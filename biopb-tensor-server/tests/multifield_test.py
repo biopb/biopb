@@ -302,14 +302,51 @@ class TestMultifieldServerClient:
             source_desc = client.get_source("multifield-default")
             assert len(source_desc.tensors) == 1
             # Shape unambiguously identifies the default (first) tensor; the
-            # descriptor now reports the bare tensor_id, consistent across RPCs
-            # (#45 fault 2).
+            # descriptor reports the globally-unique source_id/field array_id
+            # (identity policy).
             assert source_desc.tensors[0].shape == [32, 32]
-            assert source_desc.tensors[0].array_id == "pos_0"
+            assert source_desc.tensors[0].array_id == "multifield-default/pos_0"
 
             # get_physical_scale rides the same no-tensor_id path; the mock
             # advertises none, so None (cleanly), never a Flight error.
             assert client.get_physical_scale("multifield-default") is None
+
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_get_tensor_accepts_qualified_and_bare_id(self):
+        """Identity policy: the wire array_id is the globally-unique
+        source_id/field, and a read resolves whether addressed by that qualified
+        array_id or (back-compat) the bare within-source field.
+        """
+        tensor_specs = [
+            ("pos_0", (32, 32), "uint8"),
+            ("pos_1", (64, 64), "uint8"),
+        ]
+        adapter = MockMultifieldAdapter("mf-liberal", tensor_specs)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("mf-liberal", adapter)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            # Addressed by the full source-qualified array_id...
+            qualified = client.get_tensor("mf-liberal", "mf-liberal/pos_1")
+            assert qualified.shape == (64, 64)
+            # ...and by the bare within-source field (back-compat).
+            bare = client.get_tensor("mf-liberal", "pos_1")
+            assert bare.shape == (64, 64)
+            np.testing.assert_array_equal(qualified.compute(), bare.compute())
+
+            # The wire descriptor reports the qualified array_id.
+            source_desc = client.get_source("mf-liberal", "pos_1")
+            assert source_desc.tensors[0].array_id == "mf-liberal/pos_1"
 
             client.close()
         finally:
@@ -425,6 +462,30 @@ class MockImage0Adapter(BackendAdapter):
             int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
         )
         return np.zeros(shape, dtype="uint8")
+
+
+class TestFieldWithinSource:
+    """_field_within_source reduces a request tensor_id to the within-source
+    field the adapters key on (identity policy, server-free)."""
+
+    def test_strips_source_qualified_prefix(self):
+        assert TensorFlightServer._field_within_source("src", "src/Image:0") == "Image:0"
+
+    def test_hierarchical_field_keeps_inner_slashes(self):
+        # HCS: array_id = source/well/field; split only on the first '/'.
+        assert (
+            TensorFlightServer._field_within_source("plate", "plate/A01/0") == "A01/0"
+        )
+
+    def test_bare_field_passes_through(self):
+        # Back-compat: a client sending just the field.
+        assert TensorFlightServer._field_within_source("src", "Image:0") == "Image:0"
+
+    def test_source_id_itself_resolves_to_default(self):
+        assert TensorFlightServer._field_within_source("src", "src") is None
+
+    def test_empty_resolves_to_default(self):
+        assert TensorFlightServer._field_within_source("src", "") is None
 
 
 class TestDescriptorCacheCollision:

@@ -418,9 +418,11 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
 
                     descriptors.append(
                         TensorDescriptor(
-                            array_id=scene_ids[
-                                i
-                            ],  # Use img.scenes ID for get_tensor_adapter
+                            # Globally-unique array_id = source_id/field (the
+                            # scene id is the within-source field). Identity
+                            # policy: list_flights, get_flight_info, and the
+                            # chunk_id all carry this one qualified form.
+                            array_id=f"{self.source_id}/{scene_ids[i]}",
                             dim_labels=self.dim_labels
                             if self.dim_labels
                             else list(self._aics_image.dims.order),
@@ -441,7 +443,9 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
 
                 descriptors.append(
                     TensorDescriptor(
-                        array_id=scene_id,
+                        # Globally-unique array_id = source_id/field (identity
+                        # policy); the scene id is the within-source field.
+                        array_id=f"{self.source_id}/{scene_id}",
                         dim_labels=self.dim_labels
                         if self.dim_labels
                         else list(self._aics_image.dims.order),
@@ -464,6 +468,10 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         Returns:
             Adapter for the specified scene, with tensor context set
         """
+        # Accept either the within-source field (scene id) or the full
+        # source-qualified array_id (identity policy: array_id = source_id/field).
+        tensor_id = self._within_source_field(tensor_id)
+
         # Source-level: lazy initialize tensor level adapters
         scene_ids = list(self._aics_image.scenes)
         try:

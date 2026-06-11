@@ -548,7 +548,12 @@ class OmeZarrAdapter(ZarrAdapter):
                         pass
 
                 descriptors.append(TensorDescriptor(
-                    array_id=field_key,  # '{well_name}/{field_index}'
+                    # Globally-unique array_id = source_id/field (identity
+                    # policy). The HCS field is itself hierarchical
+                    # ("well_name/field_index"), so array_id is
+                    # "source_id/well_name/field_index"; source_id is slash-free
+                    # and recovered by splitting on the first '/'.
+                    array_id=f"{self.source_id}/{field_key}",
                     dim_labels=dim_labels,
                     shape=shape,
                     chunk_shape=chunk_shape,
@@ -737,6 +742,10 @@ class OmeZarrAdapter(ZarrAdapter):
         if not self._is_hcs_plate:
             # Single image: use base class behavior
             return super().get_tensor_adapter(tensor_id)
+
+        # Accept either the within-source field ('well/field') or the full
+        # source-qualified array_id 'source_id/well/field' (identity policy).
+        tensor_id = self._within_source_field(tensor_id)
 
         # HCS plate: create field-level adapter
         # Parse tensor_id as 'well_name/field_index'
