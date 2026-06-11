@@ -352,6 +352,49 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
+    def test_fetch_endpoints_via_get_flight_info_multi_tensor(self):
+        """The SerializedTensor endpoint-fetch fallback must derive source_id
+        from a multi-tensor qualified array_id ("source_id/field").
+
+        Regression for the identity-policy alignment: previously it set the
+        FlightCmd source_id to the *whole* array_id, so for "mf-fetch/pos_1" the
+        server looked up source "mf-fetch/pos_1" and failed. It must split on the
+        first "/" -> source "mf-fetch", and the server reduces the tensor_id to
+        the "pos_1" field.
+        """
+        from biopb.tensor.client import _fetch_endpoints_via_get_flight_info
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        tensor_specs = [
+            ("pos_0", (32, 32), "uint8"),
+            ("pos_1", (64, 64), "uint8"),
+        ]
+        adapter = MockMultifieldAdapter("mf-fetch", tensor_specs)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("mf-fetch", adapter)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            pb = SerializedTensor(location=f"grpc://localhost:{server.port}")
+            # Qualified multi-tensor array_id; endpoints left empty triggers the
+            # GetFlightInfo fallback under test.
+            pb.tensor_descriptor.array_id = "mf-fetch/pos_1"
+
+            chunk_ids, bounds = _fetch_endpoints_via_get_flight_info(pb)
+
+            assert len(chunk_ids) > 0
+            assert len(chunk_ids) == len(bounds)
+            # Extent matches pos_1's 64x64 shape -> the qualified array_id
+            # resolved to the correct within-source field (not pos_0's 32x32).
+            max_stop = [max(b.stop[i] for b in bounds) for i in range(2)]
+            assert max_stop == [64, 64]
+        finally:
+            server.shutdown()
+
     def test_single_tensor_source_still_works(self):
         """Single tensor sources should still work with new API."""
         tensor_specs = [
