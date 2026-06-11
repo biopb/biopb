@@ -325,18 +325,16 @@ editing the code.
   path's `array_id`/`source_id` conflation. The server resolves a request by
   stripping the `source_id` prefix; for back-compat it also accepts a bare field,
   the `source_id`, or an empty `tensor_id` (→ the default/first tensor,
-  `biopb/biopb#44`). *Conformance note: keys/caches that key by `array_id` are
-  now correct (it is globally unique); pending alignment — multi-tensor adapters
-  (`aicsimageio`, `ome_zarr` HCS) still emit the **bare** `field` from
-  `list_tensor_descriptors` and must emit the qualified `source_id/field`; the
-  `#48` server prefix-strip (which forced the bare form) must be removed and the
-  read-resolution chokepoint must strip the `source_id` prefix before
-  `get_tensor_adapter` (mirroring the chunk router, which already does this); the
-  HTTP `td.array_id == req.tensor_id` compare and the Python/Java spots that use
-  `array_id` as a `source_id` need the split-on-first-`/` derivation. Already
-  conformant: `source_id` slash-free validation (PR #50), single-tensor
-  `array_id == source_id` (the default construction — no `"0"` sentinel), and the
-  CLI's `source_id/tensor_id` parsing.*
+  `biopb/biopb#44`). *Implemented across the stack: `source_id` slash-free
+  validation at registration (`#50`); the server emits the qualified `array_id`
+  from `list_flights`/`GetFlightInfo`/the chunk descriptor and reduces a request
+  `tensor_id` to the within-source field at one chokepoint
+  (`_field_within_source`), with `get_tensor_adapter` tolerant of either form
+  (`#51`); the HTTP sidecar's dim-label lookup and the Java/Python
+  `SerializedTensor` endpoint-fetch derive `source_id` as the slash-free prefix
+  and tolerate both forms (`#52`). Single-tensor `array_id == source_id` is the
+  default construction (no `"0"` sentinel), and the CLI's `source_id/tensor_id`
+  parsing was already conformant.*
 
 - **`biopb/ome/*.proto` is vestigial.** It is a comprehensive OME metadata model
   from an early blueprint that was **not adopted**. In practice OME/microscopy

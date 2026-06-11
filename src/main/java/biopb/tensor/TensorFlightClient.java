@@ -666,9 +666,12 @@ public class TensorFlightClient implements AutoCloseable {
             readBuilder.setReductionMethod(descriptor.getReductionMethod());
         }
 
-        // Build FlightCmd - use array_id as source_id (convention for single-tensor sources)
+        // Build FlightCmd. Per the tensor identity policy, the descriptor's
+        // array_id is "source_id" or "source_id/field"; the FlightCmd source_id
+        // is the slash-free prefix (the tensor_id above carries the full
+        // array_id, which the server reduces to the within-source field).
         FlightCmd cmd = FlightCmd.newBuilder()
-                .setSourceId(descriptor.getArrayId())
+                .setSourceId(sourceIdFromArrayId(descriptor.getArrayId()))
                 .setTensorRead(readBuilder.build())
                 .build();
 
@@ -1663,11 +1666,28 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     private static String getUploadSourceId(SerializedTensor pb) {
-        String sourceId = pb.getTensorDescriptor().getArrayId();
-        if (sourceId == null || sourceId.isEmpty()) {
+        String arrayId = pb.getTensorDescriptor().getArrayId();
+        if (arrayId == null || arrayId.isEmpty()) {
             throw new IllegalArgumentException("SerializedTensor tensor_descriptor.array_id is required");
         }
-        return sourceId;
+        // Uploaded sources are single-tensor (array_id == source_id), but derive
+        // the prefix anyway so this is correct under the identity policy.
+        return sourceIdFromArrayId(arrayId);
+    }
+
+    /**
+     * Derive the source_id from a tensor's array_id.
+     *
+     * <p>Per the tensor identity policy, array_id is {@code source_id}
+     * (single-tensor) or {@code source_id/field} (multi-tensor), and source_id
+     * is globally unique and slash-free, so it is the prefix before the first
+     * {@code '/'}.
+     *
+     * <p>Package-private for unit testing.
+     */
+    static String sourceIdFromArrayId(String arrayId) {
+        int slash = arrayId.indexOf('/');
+        return slash < 0 ? arrayId : arrayId.substring(0, slash);
     }
 
     private static class EndpointIndex {

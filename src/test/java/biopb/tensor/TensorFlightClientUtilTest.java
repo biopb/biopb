@@ -46,6 +46,26 @@ public class TensorFlightClientUtilTest {
         // See TensorFlightClientTest.testScaledReadRejectsUnsupportedMethod
     }
 
+    // Tensor identity policy: source_id is the prefix of array_id before the
+    // first '/' (array_id = source_id or source_id/field; source_id slash-free).
+
+    @Test
+    public void testSourceIdFromArrayIdSingleTensor() {
+        // single-tensor source: array_id == source_id (no slash)
+        assertEquals("zarr_a3f2", TensorFlightClient.sourceIdFromArrayId("zarr_a3f2"));
+    }
+
+    @Test
+    public void testSourceIdFromArrayIdMultiTensor() {
+        assertEquals("aics_7f3", TensorFlightClient.sourceIdFromArrayId("aics_7f3/Image:0"));
+    }
+
+    @Test
+    public void testSourceIdFromArrayIdHierarchicalField() {
+        // HCS: array_id = source/well/field; split only on the first '/'
+        assertEquals("plate_x", TensorFlightClient.sourceIdFromArrayId("plate_x/A01/0"));
+    }
+
     // We can test bytesPerElement and createType by examining the types they create
 
     @Test
