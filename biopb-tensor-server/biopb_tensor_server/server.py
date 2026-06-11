@@ -223,9 +223,29 @@ class TensorFlightServer(flight.FlightServerBase):
         """Register a data source with the server.
 
         Args:
-            source_id: Unique identifier for the data source
+            source_id: Unique identifier for the data source. Must be non-empty
+                and slash-free (see Raises).
             adapter: Source adapter for the data source
+
+        Raises:
+            ValueError: If *source_id* is empty or contains ``"/"``. The tensor
+                identity policy (proto/biopb/tensor/descriptor.proto) requires a
+                slash-free source_id: the internal chunk-route id is
+                ``"source_id/array_id"`` and is decoded by splitting on the first
+                ``"/"``, so a ``"/"`` in source_id would make the
+                (source_id, array_id) pair undecodable. Auto-generated ids are
+                already slash-free; this guards caller-supplied ones. This is the
+                single registration chokepoint -- discovery, the source manager,
+                uploads, and direct use all funnel through here.
         """
+        if not source_id:
+            raise ValueError("register_source: source_id must be non-empty")
+        if "/" in source_id:
+            raise ValueError(
+                f"register_source: source_id must not contain '/' (got "
+                f"{source_id!r}); the chunk-route id source_id/array_id decodes "
+                f"by splitting on the first '/'."
+            )
         with self._sources_lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
