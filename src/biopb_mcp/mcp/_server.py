@@ -829,15 +829,6 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
     mcp.run(transport="streamable-http")
 
 
-def run_stdio():
-    """Run the MCP server over stdio (JSON-RPC on stdin/stdout).
-
-    The alternative to :func:`run`: a client spawns biopb-mcp as a subprocess
-    and speaks JSON-RPC over the pipe. There is no listening socket, so the
-    Host/Origin allowlist (:func:`build_transport_security`) is irrelevant and
-    not applied. fd 1 *is* the protocol channel, so the launcher must keep its
-    own stdout pristine (logging -> stderr) and the kernel's native output must
-    be redirected away from fd 1 (the launcher passes a kernel log file).
-    """
-    logger.info("MCP server speaking stdio (JSON-RPC on stdin/stdout)")
-    mcp.run(transport="stdio")
+# run_stdio() is gone: this process serves http only (daemon migration,
+# Direction 1). stdio clients are served by the launcher's bridge mode
+# instead — see `_shim`, which fronts this server's /mcp endpoint.

@@ -116,21 +116,30 @@ The launcher comes up **idle**: the heavy kernel (and, with a display, the
 napari viewer window) is **not** spawned at boot — it starts on demand when an
 agent calls the `start_kernel` tool (see the kernel-lifecycle note below).
 
-**Transport** is chosen once at startup (not co-served) via `--transport` /
-`config['mcp']['transport']['kind']`: `stdio` (default — JSON-RPC on
-stdin/stdout, for a client that spawns `biopb-mcp --transport stdio` as a
-subprocess) or `http` (loopback streamable-http on `transport.port`). The
-kernel/viewer/dask stack is identical either way. In stdio mode fd 1 *is* the
-protocol channel, so the launcher logs to stderr and redirects the kernel's
-*native* stdout/stderr to a log file
-(`config['mcp']['transport']['kernel_log']`, default
-`~/.local/share/biopb-mcp/log/kernel.log`) — otherwise Qt/GL/dask/gRPC C-level writes
-would corrupt the stream. stdio has no network surface, so the Host/Origin
-allowlist (`transport.allowed_origins`/`transport.allowed_hosts`) is http-only
-and not applied. NB:
-the orphaned-kernel risks (issue #13) are amplified under stdio (one kernel tree
-per client launch); the `PR_SET_PDEATHSIG`/watchdog hardening there is a
-prerequisite before recommending stdio for production.
+**Transport.** The MCP server itself is **http-only** (loopback
+streamable-http on `transport.port`; daemon migration Direction 1,
+docs/daemon-migration.md). `--transport` / `config['mcp']['transport']['kind']`
+still accepts `stdio` (deprecated; still the default so installer-seeded
+client configs keep working unchanged), but stdio no longer serves MCP from
+the launcher process: it runs the **shim** (`mcp/_shim.py`) — a featherweight
+bridge that probes `127.0.0.1:<port>`, spawns the http daemon detached if
+nothing is listening (daemon + kernel output goes to `transport.kernel_log`,
+default `~/.local/share/biopb-mcp/log/kernel.log`), and pumps stdio JSON-RPC
+to `/mcp` until the client closes stdin. Concurrent shims race benignly (the
+port bind picks one daemon; losers exit on EADDRINUSE and every shim converges
+on the winner). The shim process owns fd 1 as a protocol channel but imports
+only the mcp SDK — no Qt/dask/uvicorn — so the old fd-1 corruption class is
+structurally impossible; it replays the daemon's initialize result verbatim
+(including `instructions` — the field the generic `mcp-proxy` bridge drops;
+see docs/mcp-proxy-vet.md for why the bridge is vendored), and any bridge
+failure exits the shim so the client sees EOF, never a hung server. Notable
+behavior shifts vs. the old direct-stdio serving: the daemon (and kernel)
+**outlives the client** and is **shared across concurrent clients** — one
+kernel, one viewer, the project thesis made literal — and the Host/Origin
+allowlist plus the observe UI now apply to stdio-bridged sessions too, since
+everything is the one http server. Native http
+(`claude mcp add --transport http biopb http://127.0.0.1:8765/mcp`) skips the
+shim entirely and is preferred where the client supports it.
 
 The process owns a **single child Jupyter kernel** (real IPython kernel via
 `jupyter_client`) that hosts the napari viewer, dask, and the tensor client.
@@ -175,8 +184,11 @@ output is not captured (code is exec'd, not run via `run_cell`).
   `start_kernel` tool.
 - `_server.py` — FastMCP server (`mcp = FastMCP("biopb-mcp")`); defines the
   tools/resources and dispatches them to the `KernelHost`. `run()` serves
-  streamable-http on `127.0.0.1:<port>/mcp`; `run_stdio()` serves the same
-  tools over stdio (no port, no Host/Origin allowlist).
+  streamable-http on `127.0.0.1:<port>/mcp` — the only serving path in this
+  process.
+- `_shim.py` — the stdio bridge (`--transport stdio`): ensures the http
+  daemon is listening (spawning it detached if not) and pumps stdio JSON-RPC
+  to `/mcp`, replaying the daemon's initialize result verbatim.
 - `_kernel.py` — `KernelHost`: manages the one child kernel. A single
   `threading.RLock` serializes access to the kernel shell channel; with the job
   model it is held only for the *quick* snippets (submit/poll/screenshot/status)

@@ -1,8 +1,12 @@
 """Launcher for the biopb-mcp MCP server.
 
-This process *is* the MCP server: it owns a child Jupyter kernel that hosts a
-visible napari viewer when a display is available, or a compute-only headless
-kernel when none is (see ``mcp.transport.display_mode``).  Run it with::
+Under the http transport this process *is* the MCP server: it owns a child
+Jupyter kernel that hosts a visible napari viewer when a display is available,
+or a compute-only headless kernel when none is (see
+``mcp.transport.display_mode``).  Under the (deprecated) stdio transport it is
+instead a thin bridge: it ensures the http daemon is running on the configured
+loopback port — spawning it detached if needed — and pumps stdio JSON-RPC to
+it (see ``_shim``).  Run it with::
 
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
@@ -32,7 +36,9 @@ def _parse_args(argv, default_transport, default_port):
         "--transport",
         choices=["http", "stdio"],
         default=default_transport,
-        help="Front-end transport (default from config; falls back to stdio).",
+        help="Front-end transport (default from config; falls back to stdio). "
+        "stdio is deprecated: it is now served by bridging to the local http "
+        "daemon (spawned on demand); prefer connecting over http directly.",
     )
     parser.add_argument(
         "--port",
@@ -67,26 +73,17 @@ def _resolve_headless(display_mode, has_display):
     return not has_display
 
 
-def _setup_observe(config, transport):
-    """Wire up the web observe UI (http transport only).
+def _setup_observe(config):
+    """Wire up the web observe UI.
 
     On by default (``mcp.observe.enabled``, opt-out); it mounts on the existing
-    MCP app and shares its loop/port. It is **not** supported under stdio: a
-    second uvicorn server in the stdio launcher process risks corrupting the
-    fd-1 JSON-RPC channel and races the kernel, so under stdio it is silently
-    skipped (debug-logged, since it is on by default and most stdio users never
-    asked for it). Fully guarded — an observe failure logs and is swallowed so
-    it can never block the MCP server. Returns True if mounted.
+    MCP app and shares its loop/port. Fully guarded — an observe failure logs
+    and is swallowed so it can never block the MCP server. Returns True if
+    mounted.
     """
     from .._config import get_setting
 
     if not get_setting(config, "mcp.observe.enabled"):
-        return False
-    if transport != "http":
-        logger.debug(
-            "observe UI is http-only; not started under %s transport",
-            transport,
-        )
         return False
     try:
         from . import _observe
@@ -136,42 +133,13 @@ def _config_defaults(config):
     return transport, port
 
 
-def _open_kernel_log(config):
-    """Open the file the kernel's native stdout/stderr is redirected to in
-    stdio mode (keeps Qt/GL/dask/gRPC output off the JSON-RPC channel).
-
-    Opened binary, append, unbuffered: the handle's fd is the subprocess'
-    native stdout/stderr, which emits arbitrary bytes (Qt/GL/dask/gRPC), so a
-    byte sink avoids any text-layer translation and matches how KernelHost is
-    exercised. On failure, falls back to the launcher's stderr buffer so the
-    kernel still starts.
-    """
-    from .._config import get_log_dir, get_setting
-
-    path = get_setting(config, "mcp.transport.kernel_log") or str(
-        get_log_dir() / "kernel.log"
-    )
-    try:
-        return open(path, "ab", buffering=0)
-    except OSError:
-        logger.warning(
-            "Could not open kernel log %s; routing kernel output to stderr",
-            path,
-        )
-        # Native fd redirection needs a byte sink; sys.stderr is a text wrapper,
-        # so hand back its binary buffer when present (absent under some test
-        # capture shims, where the text stream itself is the safe fallback).
-        return getattr(sys.stderr, "buffer", sys.stderr)
-
-
 def main(argv=None):
-    # Log to stderr always: in stdio mode fd 1 is the JSON-RPC channel and any
-    # stray byte on it corrupts the stream; stderr is harmless in both modes.
+    # Log to stderr always: in stdio (bridge) mode fd 1 is the JSON-RPC
+    # channel and any stray byte on it corrupts the stream; stderr is harmless
+    # in both modes.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-    from .._config import get_setting, load_config
-    from . import _server
-    from ._kernel import KernelHost
+    from .._config import load_config
 
     config = load_config()
     default_transport, default_port = _config_defaults(config)
@@ -180,8 +148,29 @@ def main(argv=None):
         default_transport=default_transport,
         default_port=default_port,
     )
-    transport = opts.transport
-    port = opts.port
+
+    if opts.transport == "stdio":
+        # Bridge mode: keep this process featherweight — the heavy stack
+        # (FastMCP/uvicorn/kernel plumbing) is only imported by the daemon it
+        # spawns. Any bridge failure exits nonzero so the client sees EOF
+        # rather than a hung server entry.
+        from . import _shim
+
+        try:
+            _shim.serve(config, opts.port)
+        except Exception:
+            logger.exception("stdio bridge failed")
+            return 1
+        return 0
+
+    return _serve_http(config, opts.port)
+
+
+def _serve_http(config, port):
+    """Run the real MCP server (streamable-http) in the foreground."""
+    from .._config import get_setting
+    from . import _server
+    from ._kernel import KernelHost
 
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
     # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
@@ -232,12 +221,10 @@ def main(argv=None):
     if get_setting(config, "mcp.tensor.cache_local"):
         kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
 
-    # In stdio mode the kernel must not inherit the launcher's fd 1 (the
-    # JSON-RPC channel): redirect its native stdout/stderr to a log file. In
-    # http mode it inherits the launcher's fds as before (None).
-    kernel_stdout = kernel_stderr = None
-    if transport == "stdio":
-        kernel_stdout = kernel_stderr = _open_kernel_log(config)
+    # The kernel inherits this process' fds. fd 1 is not a protocol channel
+    # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
+    # the launcher's stdout/stderr — which, when the daemon was spawned by the
+    # stdio shim, is the daemon log file (see _shim._open_daemon_log).
 
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
@@ -261,8 +248,6 @@ def main(argv=None):
         execute_timeout=get_setting(config, "mcp.kernel.execute_timeout"),
         busy_lock_timeout=get_setting(config, "mcp.kernel.busy_lock_timeout"),
         env=kernel_env,
-        kernel_stdout=kernel_stdout,
-        kernel_stderr=kernel_stderr,
         watchdog_interval=get_setting(config, "mcp.kernel.watchdog_interval"),
         watchdog_max_respawns=get_setting(
             config, "mcp.kernel.watchdog_max_respawns"
@@ -316,22 +301,15 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Opt-in web "observe" UI (http transport only). Set up before the (blocking)
-    # transport run: custom routes are read when the streamable-http app is built.
-    _setup_observe(config, transport)
+    # Opt-in web "observe" UI. Set up before the (blocking) transport run:
+    # custom routes are read when the streamable-http app is built.
+    _setup_observe(config)
 
-    if transport == "stdio":
-        # Client closing stdin (EOF) returns from run_stdio(); the post-run
-        # shutdown below then reaps the kernel. No port / Origin allowlist.
-        _server.run_stdio()
-    else:
-        _server.run(
-            port,
-            allowed_origins=get_setting(
-                config, "mcp.transport.allowed_origins"
-            ),
-            allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
-        )
+    _server.run(
+        port,
+        allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
+        allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+    )
 
     # If the server loop returns on its own, exit the same way: shut down the
     # kernel and bypass Py_FinalizeEx (atexit handlers do not run after

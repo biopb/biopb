@@ -717,12 +717,11 @@ class TestTransportSecurity:
 # -----------------------------------------------------------------------
 
 
-class TestRunStdio:
-    def test_run_stdio_uses_stdio_transport(self, monkeypatch):
-        calls = {}
-        monkeypatch.setattr(_server.mcp, "run", lambda **kw: calls.update(kw))
-        _server.run_stdio()
-        assert calls == {"transport": "stdio"}
+class TestRun:
+    def test_no_stdio_serving_in_this_process(self):
+        # Direction 1: this process serves http only; stdio is the launcher's
+        # bridge (`_shim`), not a second serving path here.
+        assert not hasattr(_server, "run_stdio")
 
     def test_run_http_uses_streamable_http(self, monkeypatch):
         calls = {}

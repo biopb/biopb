@@ -3,21 +3,23 @@
 A small web interface (``/observe`` + ``/api/*``) that shows ``execute_code``
 job history with truncated output and exposes global control knobs — cancel the
 current job, interrupt (force a KeyboardInterrupt into its thread), hard-restart
-the kernel. On by default in http (opt-out via ``mcp.observe.enabled``).
+the kernel. On by default (opt-out via ``mcp.observe.enabled``).
 
 It is hosted in the *MCP server process* (the one that owns the
 :class:`~biopb_mcp.mcp._kernel.KernelHost`), so controls are direct method calls
 and reads reuse the same in-kernel job round-trip the tools use — no new IPC, and
 no dependence on the dask scheduler/dashboard.
 
-**http transport only.** :func:`register_http_routes` mounts the routes on the
-*existing* FastMCP Starlette app via ``mcp.custom_route``, so they share the MCP
-loop and port (``mcp.transport.port``) with ``/mcp``. There is deliberately **no
-stdio support**: standing a second uvicorn server up inside the stdio launcher
-process is unsafe — fd 1 is the JSON-RPC channel, and uvicorn attaches a stdout
-log handler that could corrupt it, while a second event-loop thread driving the
-one ``KernelHost`` races the MCP thread and can wedge the kernel. So in stdio the
-launcher logs a hint and does not start the UI (see ``__main__._setup_observe``).
+**Mounted on the http server.** :func:`register_http_routes` mounts the routes
+on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
+the MCP loop and port (``mcp.transport.port``) with ``/mcp``. The server is
+http-only (daemon migration, docs/daemon-migration.md), so the UI is always
+available — stdio clients reach it too: they connect through the launcher's
+stdio→http bridge (``mcp/_shim.py``) and so hit ``/observe`` on the shared
+daemon like any other http client. (It was once skipped under a stdio-*serving*
+launcher, where standing a second uvicorn up inside the protocol process risked
+the fd-1 JSON-RPC channel and raced the one ``KernelHost`` — that launcher no
+longer exists.)
 
 Security: the kernel is RCE by design, so every route carries its **own**
 Host/Origin guard (:func:`_check_origin`) — FastMCP's transport-security only

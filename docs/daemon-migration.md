@@ -3,9 +3,21 @@
 **Status:** Direction 2 (on-demand kernel) is **implemented** — though as
 *explicit* start (a `start_kernel` tool the agent calls), **not** the implicit
 lazy-on-first-`execute()` trigger this note sketches; see the "Direction 2"
-section below for the as-built notes. Direction 1 (http-only) remains design /
-future reference. Captures directions agreed in discussion so a future
-implementer (or future us) can pick them up.
+section below for the as-built notes. Direction 1 (http-only) is
+**implemented** (June 2026), with one deliberate departure from the sketch
+below: instead of documenting an external `mcp-proxy` recipe for stdio-only
+clients, the bridge is **vendored as a shim** (`mcp/_shim.py`) and
+`--transport stdio` *is* the shim — it ensures the http daemon is running on
+the configured port (spawning it detached on first use) and pumps stdio
+JSON-RPC to `/mcp`. So `_server.run_stdio()` and the launcher's stdio serving
+branch are gone, the kernel-log fd-redirection machinery is retired (the
+`kernel_log` key now names the detached daemon's output file), and
+installer-seeded `biopb-mcp --transport stdio` client configs migrate with
+zero config change. mcp-proxy was vetted and rejected for this role — it
+drops the initialize `instructions` field, hangs on daemon death, and floats
+broken deps; see docs/mcp-proxy-vet.md. Still open: idle teardown / the
+daemon stop story, and flipping the default `transport.kind` to http once
+clients are predominantly native-http.
 
 **Why this exists.** Adding the web "observe" UI (`mcp/_observe.py`)
 exposed a structural weakness: a feature that worked under the **http** transport
@@ -195,12 +207,20 @@ and only spins up the GUI kernel when a client actually uses it.
   `_resolve_headless`, `_open_kernel_log`, `_setup_observe`; the transport dispatch.
 - `mcp/_kernel.py` — `KernelHost.start` / `_launch` / `execute` (the "starting"
   short-circuit) / `health`; `_ready` / `_start_error` / `_dead` state.
-- `mcp/_server.py` — `run` / `run_stdio`; `build_transport_security`; `server_status`.
+- `mcp/_server.py` — `run` (http; the only serving path — `run_stdio` is
+  gone); `build_transport_security`; `server_status`.
+- `mcp/_shim.py` — the as-built Direction 1 bridge: `ensure_daemon` (probe /
+  detached spawn / readiness wait), `build_proxy` + `replay_init_options`
+  (vendored stdio↔http pump), `serve` (launcher entry).
 - `mcp/_observe.py` — http-only mount (`register_http_routes`), the precedent.
 
 ## References
 
 - [sparfenyuk/mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) — generic
-  streamable-http ↔ stdio bridge (PyPI).
+  streamable-http ↔ stdio bridge (PyPI). **Vetted June 2026 — see
+  [mcp-proxy-vet.md](mcp-proxy-vet.md):** viable only with pinned deps, an
+  upstream fix for the dropped initialize `instructions`, and a shim-level
+  lifetime guard; vendoring the ~150-line bridge is the recommended
+  alternative.
 - [Claude Code MCP docs](https://code.claude.com/docs/en/mcp) — native http
   transport (`claude mcp add --transport http`).

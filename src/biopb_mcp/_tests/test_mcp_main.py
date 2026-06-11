@@ -1,7 +1,8 @@
-"""Tests for the launcher's transport selection and kernel-log helper.
+"""Tests for the launcher's transport selection and dispatch.
 
-These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing and
-the stdio kernel-log file) without starting a real kernel or viewer.
+These exercise the pure plumbing in ``biopb_mcp.mcp.__main__`` (arg parsing
+and the stdio-vs-http dispatch) without starting a real kernel, viewer, or
+daemon.
 """
 
 import sys
@@ -11,10 +12,10 @@ import pytest
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
-    _open_kernel_log,
     _parse_args,
     _resolve_headless,
     _setup_observe,
+    main,
 )
 
 
@@ -77,37 +78,35 @@ class TestConfigDefaults:
         assert _config_defaults({}) == ("stdio", 8765)
 
 
-class TestOpenKernelLog:
-    def test_uses_configured_path(self, tmp_path):
-        path = tmp_path / "k.log"
-        f = _open_kernel_log(_cfg(kernel_log=str(path)))
-        try:
-            f.write(b"hello\n")
-            f.flush()
-        finally:
-            f.close()
-        assert path.read_bytes() == b"hello\n"
+class TestMainDispatch:
+    """main() routes stdio to the shim without touching the heavy stack."""
 
-    def test_empty_path_defaults_under_log_dir(self, tmp_path, monkeypatch):
-        # _open_kernel_log does `from .._config import get_log_dir` at call
-        # time, so patching the source module is what takes effect.
+    @pytest.fixture(autouse=True)
+    def empty_config(self, monkeypatch):
         import biopb_mcp._config as cfg
 
-        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
+        monkeypatch.setattr(cfg, "load_config", dict)
 
-        f = _open_kernel_log(_cfg(kernel_log=""))
-        try:
-            assert (tmp_path / "kernel.log").exists()
-        finally:
-            f.close()
+    def test_stdio_runs_the_shim(self, monkeypatch):
+        from biopb_mcp.mcp import _shim
 
-    def test_falls_back_to_stderr_on_open_error(self):
-        # An unwritable path must not crash the launcher; it degrades to the
-        # stderr byte sink (sys.stderr.buffer when present, else sys.stderr).
-        f = _open_kernel_log(
-            _cfg(kernel_log="/nonexistent_dir/deep/path/kernel.log")
+        calls = []
+        monkeypatch.setattr(
+            _shim, "serve", lambda config, port: calls.append((config, port))
         )
-        assert f is getattr(sys.stderr, "buffer", sys.stderr)
+        assert main(["--transport", "stdio", "--port", "9123"]) == 0
+        assert calls == [({}, 9123)]
+
+    def test_stdio_bridge_failure_exits_nonzero(self, monkeypatch):
+        from biopb_mcp.mcp import _shim
+
+        def _boom(config, port):
+            raise TimeoutError("daemon never came up")
+
+        monkeypatch.setattr(_shim, "serve", _boom)
+        # The shim failing must surface as a nonzero exit (client sees EOF),
+        # never a traceback-crash or a hung launcher.
+        assert main(["--transport", "stdio"]) == 1
 
 
 class TestHasDisplay:
@@ -167,19 +166,14 @@ class TestSetupObserve:
         )
         return calls
 
-    def test_enabled_by_default_in_http(self, fake_observe):
-        # Opt-out: empty config -> on in http.
-        assert _setup_observe({}, "http") is True
+    def test_enabled_by_default(self, fake_observe):
+        # Opt-out: empty config -> on.
+        assert _setup_observe({}) is True
         assert fake_observe["http"] == 1
 
     def test_explicitly_disabled(self, fake_observe):
         cfg = {"mcp": {"observe": {"enabled": False}}}
-        assert _setup_observe(cfg, "http") is False
-        assert fake_observe == {"configure": 0, "http": 0}
-
-    def test_stdio_never_starts(self, fake_observe):
-        # http-only: even on-by-default, stdio must NOT mount or configure.
-        assert _setup_observe({}, "stdio") is False
+        assert _setup_observe(cfg) is False
         assert fake_observe == {"configure": 0, "http": 0}
 
     def test_failure_is_swallowed(self, monkeypatch):
@@ -192,4 +186,4 @@ class TestSetupObserve:
         monkeypatch.setattr(_observe, "register_http_routes", _boom)
         cfg = {"mcp": {"observe": {"enabled": True}}}
         # An observe failure must never propagate out of the launcher.
-        assert _setup_observe(cfg, "http") is False
+        assert _setup_observe(cfg) is False

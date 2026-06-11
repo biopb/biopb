@@ -111,11 +111,14 @@ DEFAULT_CONFIG = {
     },
     "mcp": {
         "transport": {
-            # Front-end transport: "stdio" (JSON-RPC on stdin/stdout, for a
-            # client that spawns biopb-mcp as a subprocess, the default) or
-            # "http" (loopback streamable-http on `port`). The kernel/viewer/dask
-            # stack is identical either way. Overridable per-launch with
-            # `--transport`.
+            # Front-end transport: "http" (loopback streamable-http on `port`;
+            # the real server) or "stdio" (deprecated; for a client that
+            # spawns biopb-mcp as a subprocess). stdio no longer serves MCP
+            # from this process: it bridges stdin/stdout to the http daemon on
+            # `port`, spawning it detached if nothing is listening (see
+            # docs/daemon-migration.md). The default stays "stdio" so
+            # installer-seeded client configs keep working unchanged.
+            # Overridable per-launch with `--transport`.
             "kind": "stdio",
             "port": 8765,
             # Whether the kernel opens a visible napari viewer:
@@ -134,12 +137,12 @@ DEFAULT_CONFIG = {
             # viewer-dependent tools return a clear message; the `viewer`
             # namespace object self-describes on access.
             "display_mode": "auto",
-            # Where the child kernel's *native* (C-level) stdout/stderr is
-            # written in stdio mode, so it never corrupts the JSON-RPC stream on
-            # fd 1. Empty -> ~/.local/share/biopb-mcp/log/kernel.log. Ignored in
-            # http mode
-            # (the kernel inherits the launcher's fds, which are not a protocol
-            # channel).
+            # Where the stdio bridge sends the spawned daemon's stdout/stderr
+            # (inherited by its child kernel, so this still carries the native
+            # Qt/GL/dask/gRPC output the key always named). Empty ->
+            # ~/.local/share/biopb-mcp/log/kernel.log. Unused when the daemon
+            # is launched directly with --transport http (output stays on the
+            # launching terminal/service manager).
             "kernel_log": "",
             # Extra Host/Origin header values appended to the loopback allowlist
             # that guards the server against DNS-rebinding / cross-origin browser
