@@ -4,6 +4,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 from biopb.tensor import TensorFlightClient
 
 from biopb_tensor_server import TensorFlightServer
@@ -271,9 +272,10 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
-    def test_get_source_without_tensor_id_resolves_default_tensor(self):
-        """get_source()/get_physical_scale() with no tensor_id must resolve the
-        source's default (first) tensor, not forward "" to the adapter.
+    def test_get_descriptor_with_bare_source_id_resolves_default_tensor(self):
+        """get_descriptor(source_id)/get_physical_scale() with no within-source
+        field must resolve the source's default (first) tensor, not forward "" to
+        the adapter.
 
         Regression for #44: the client sends tensor_id="" (proto3 default) when
         none is given; before the chokepoint default-resolution in
@@ -297,19 +299,67 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # No tensor_id -> must not raise "Unknown tensor: " and must come
-            # back anchored on the first tensor.
-            source_desc = client.get_source("multifield-default")
-            assert len(source_desc.tensors) == 1
+            # Bare source_id -> must not raise "Unknown tensor: " and must come
+            # back anchored on the first tensor (server-side default resolution).
+            desc = client.get_descriptor("multifield-default")
             # Shape unambiguously identifies the default (first) tensor; the
             # descriptor reports the globally-unique source_id/field array_id
             # (identity policy).
-            assert source_desc.tensors[0].shape == [32, 32]
-            assert source_desc.tensors[0].array_id == "multifield-default/pos_0"
+            assert desc.shape == [32, 32]
+            assert desc.array_id == "multifield-default/pos_0"
 
             # get_physical_scale rides the same no-tensor_id path; the mock
             # advertises none, so None (cleanly), never a Flight error.
             assert client.get_physical_scale("multifield-default") is None
+
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_get_descriptor_enumeration_vs_probe(self):
+        """Issue #75: enumeration is list_sources(); get_descriptor() is a single
+        tensor probe; the deprecated get_source() warns and never clobbers the
+        full enumeration."""
+        tensor_specs = [
+            ("pos_0", (32, 32), "uint8"),
+            ("pos_1", (64, 64), "uint8"),
+            ("pos_2", (16, 16), "uint8"),
+        ]
+        adapter = MockMultifieldAdapter("multi", tensor_specs)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("multi", adapter)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            # Enumeration: list_sources() carries ALL scenes for the source.
+            enumerated = client.list_sources()["multi"].tensors
+            assert len(enumerated) == 3
+            assert sorted(list(t.shape) for t in enumerated) == [
+                [16, 16],
+                [32, 32],
+                [64, 64],
+            ]
+
+            # Probe: get_descriptor(array_id) fetches exactly the addressed scene
+            # -- including a non-default one (the #75 symptom: pos_1/pos_2 were
+            # unreachable through the old get_source path).
+            assert client.get_descriptor("multi/pos_1").shape == [64, 64]
+            assert client.get_descriptor("multi/pos_2").shape == [16, 16]
+
+            # Deprecated get_source(): warns, returns a single-tensor wrapper, and
+            # must NOT clobber the full enumeration cached above.
+            with pytest.warns(DeprecationWarning):
+                legacy = client.get_source("multi")
+            assert len(legacy.tensors) == 1
+            # The full enumeration cached by list_sources() is untouched (read the
+            # cache directly -- re-calling list_sources() would just refetch).
+            assert len(client._sources["multi"].tensors) == 3
 
             client.close()
         finally:
@@ -345,8 +395,8 @@ class TestMultifieldServerClient:
             np.testing.assert_array_equal(qualified.compute(), bare.compute())
 
             # The wire descriptor reports the qualified array_id.
-            source_desc = client.get_source("mf-liberal", "pos_1")
-            assert source_desc.tensors[0].array_id == "mf-liberal/pos_1"
+            desc = client.get_descriptor("mf-liberal/pos_1")
+            assert desc.array_id == "mf-liberal/pos_1"
 
             client.close()
         finally:
@@ -560,9 +610,9 @@ class TestDescriptorCacheCollision:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # get_source returns each source's own shape, never the other's.
-            assert client.get_source("aics_aaa").tensors[0].shape == [10, 256, 256]
-            assert client.get_source("aics_bbb").tensors[0].shape == [181, 1024, 1024]
+            # get_descriptor returns each source's own shape, never the other's.
+            assert client.get_descriptor("aics_aaa").shape == [10, 256, 256]
+            assert client.get_descriptor("aics_bbb").shape == [181, 1024, 1024]
 
             # get_physical_scale reads from the descriptor cache keyed on the
             # bare tensor id "Image:0" -- the exact collision in #45. Each must

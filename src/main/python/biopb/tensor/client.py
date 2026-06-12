@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -1050,7 +1051,7 @@ class TensorFlightClient:
         """Composite, source-unique key for the descriptor cache (issue #45).
 
         ``array_id`` arrives in two forms depending on the RPC: bare
-        (``"Image:0"`` from ``list_sources`` / ``get_source``) or
+        (``"Image:0"`` from ``list_sources`` / ``get_descriptor``) or
         source-qualified (``"src/Image:0"`` from an older data endpoint). Strip a
         leading ``"{source_id}/"`` so both forms map to one key and never
         collide across sources or split the cache for the same tensor.
@@ -1290,8 +1291,7 @@ class TensorFlightClient:
         the much larger ``get_source_metadata`` round trip.
 
         Reads the descriptor cached by a prior ``get_tensor()`` when available
-        (no extra RPC); otherwise issues one cheap ``GetFlightInfo`` via
-        ``get_source()``.
+        (no extra RPC); otherwise issues one cheap ``GetFlightInfo``.
 
         Args:
             source_id: Source identifier.
@@ -1306,51 +1306,119 @@ class TensorFlightClient:
             else None
         )
         if desc is None:
-            self.get_source(source_id, tensor_id)
-            desc = (
-                self._descriptors.get(self._descriptor_key(source_id, tensor_id))
-                if tensor_id
-                else None
-            )
-            if desc is None:
-                src = self._sources.get(source_id)
-                if src and src.tensors:
-                    desc = src.tensors[0]
+            try:
+                # tensor_id None -> the source's default (first) tensor.
+                desc = self._fetch_tensor_descriptor(source_id, tensor_id)
+            except Exception:
+                desc = None
         if desc is None or not desc.physical_scale:
             return None
         return list(desc.physical_scale), list(desc.physical_unit)
+
+    def _fetch_tensor_descriptor(
+        self,
+        source_id: str,
+        tensor_id: Optional[str] = None,
+    ) -> "TensorDescriptor":
+        """Fetch one tensor's descriptor directly from the server (internal).
+
+        Backs the public ``get_descriptor`` (the array_id-keyed primitive) and
+        the deprecated ``get_source``. Uses the per-tensor ``GetFlightInfo`` RPC,
+        so it resolves a source even when it is beyond the (truncatable)
+        ``list_sources()`` cap. ``tensor_id`` unset/empty -> the source's default
+        (first) tensor, resolved server-side (#44).
+
+        The descriptor is cached in ``self._descriptors`` (keyed by the
+        echoed-back array_id). ``self._sources`` is intentionally NOT touched, so
+        a single-tensor probe never clobbers a full enumeration cached by
+        ``list_sources()`` (issue #75).
+        """
+        read_opt = TensorReadOption(with_metadata=True)
+        # Anchor on the source's default tensor via the EMPTY-tensor_id path
+        # (server resolves it to the first descriptor's qualified array_id, #44)
+        # for both the unset case and a bare source_id. Sending the source_id as
+        # the tensor_id instead reduces to field=None, which a multi-tensor
+        # adapter need not resolve to a default; the empty path is robust and
+        # back-compatible. A within-source field is always sent verbatim.
+        if tensor_id and tensor_id != source_id:
+            read_opt.tensor_id = tensor_id
+        cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
+        fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        info = self._client.get_flight_info(fd, options=self._call_options)
+        tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
+        self._descriptors[
+            self._descriptor_key(source_id, tensor_desc.array_id)
+        ] = tensor_desc
+        return tensor_desc
+
+    def get_descriptor(self, array_id: str) -> "TensorDescriptor":
+        """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
+
+        This is the policy-conformant single-tensor probe: a tensor is identified
+        by its ``array_id`` ALONE (see the tensor identity policy at the top of
+        ``proto/biopb/tensor/descriptor.proto``), so this takes that one
+        identifier rather than a ``(source_id, tensor_id)`` pair. The source is
+        derived as the slash-free prefix ``array_id.split('/', 1)[0]`` and the
+        full ``array_id`` is sent as the request ``tensor_id``.
+
+        Works even when the source is beyond the (truncatable) ``list_sources()``
+        cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
+        source, or to anchor on a multi-tensor source's default/first tensor) is
+        accepted and resolves server-side. To enumerate ALL tensors/scenes of a
+        source, use ``list_sources()[source_id].tensors`` -- NOT this method.
+
+        Args:
+            array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
+                tensor source) or ``"aics_7f3/Image:0"`` (multi-tensor source).
+
+        Returns:
+            The ``TensorDescriptor`` for that tensor.
+        """
+        source_id = array_id.split("/", 1)[0]
+        return self._fetch_tensor_descriptor(source_id, array_id)
 
     def get_source(
         self,
         source_id: str,
         tensor_id: Optional[str] = None,
     ) -> "DataSourceDescriptor":
-        """Fetch one source's descriptor directly from the server.
+        """DEPRECATED -- use :meth:`get_descriptor` (one tensor) or
+        :meth:`list_sources` (all tensors of a source) instead.
 
-        Works even when the source is beyond the (truncatable) list_sources()
-        cap. Result is cached in self._sources/_descriptors.
+        This method is inconsistent with the tensor identity policy
+        (``proto/biopb/tensor/descriptor.proto``): it splits a tensor's identity
+        into a ``(source_id, tensor_id)`` pair, whereas a tensor is identified by
+        its globally-unique ``array_id`` alone. It is also misnamed -- despite
+        returning a ``DataSourceDescriptor``, it is a single-tensor probe: the
+        returned ``.tensors`` holds ONLY the resolved tensor (or the source's
+        default/first tensor when ``tensor_id`` is None), never the full scene
+        list. For a multi-scene source, ``get_source(id).tensors`` is length-1
+        and scenes 2..N are NOT enumerated here -- that was issue #75. Use
+        ``list_sources()[id].tensors`` for the complete enumeration.
 
         Args:
-            source_id: Data source identifier
-            tensor_id: Optional tensor to anchor the lookup. When None the
-                server returns the descriptor for its default (usually first)
-                tensor.
+            source_id: Data source identifier.
+            tensor_id: Optional tensor to anchor the lookup; None -> the source's
+                default (first) tensor.
 
         Returns:
-            DataSourceDescriptor with at least one TensorDescriptor populated.
+            DataSourceDescriptor wrapping the single resolved TensorDescriptor.
         """
-        read_opt = TensorReadOption(with_metadata=True)
-        if tensor_id:
-            read_opt.tensor_id = tensor_id
-        cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
-        fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._client.get_flight_info(fd, options=self._call_options)
-        tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
+        warnings.warn(
+            "TensorFlightClient.get_source() is deprecated and will be removed in "
+            "a future release: it is inconsistent with the array_id identity "
+            "policy and returns only a single tensor, not a source's full scene "
+            "list. Use get_descriptor(array_id) for one tensor, or list_sources() "
+            "to enumerate all tensors of a source.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        tensor_desc = self._fetch_tensor_descriptor(source_id, tensor_id)
         source_desc = DataSourceDescriptor(source_id=source_id, tensors=[tensor_desc])
-        self._sources[source_id] = source_desc
-        self._descriptors[
-            self._descriptor_key(source_id, tensor_desc.array_id)
-        ] = tensor_desc
+        # Do NOT clobber a full enumeration previously cached by list_sources();
+        # only seed _sources when this source is otherwise unknown (issue #75).
+        if source_id not in self._sources:
+            self._sources[source_id] = source_desc
         return source_desc
 
     def _get_tensor_context(
@@ -1392,7 +1460,10 @@ class TensorFlightClient:
                 f"Source '{source_id}' not in list_sources() result, fetching directly"
             )
             try:
-                self.get_source(source_id, tensor_id)
+                td = self._fetch_tensor_descriptor(source_id, tensor_id)
+                self._sources[source_id] = DataSourceDescriptor(
+                    source_id=source_id, tensors=[td]
+                )
             except Exception:
                 pass  # let the ValueError below surface the clean message
 
@@ -1426,7 +1497,7 @@ class TensorFlightClient:
                 f"fetching descriptor from server"
             )
             try:
-                self.get_source(source_id, tensor_id)
+                self._fetch_tensor_descriptor(source_id, tensor_id)
             except Exception:
                 pass  # let the ValueError below surface the clean message
             tensor_desc = self._descriptors.get(
