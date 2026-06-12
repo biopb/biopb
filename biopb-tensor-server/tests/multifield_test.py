@@ -2,6 +2,7 @@
 
 import threading
 import time
+import warnings
 
 import numpy as np
 import pytest
@@ -397,6 +398,45 @@ class TestMultifieldServerClient:
             # The wire descriptor reports the qualified array_id.
             desc = client.get_descriptor("mf-liberal/pos_1")
             assert desc.array_id == "mf-liberal/pos_1"
+
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_get_tensor_array_id_first_form_and_deprecation(self):
+        """get_tensor/get_tensor_pb take a single array_id (identity policy);
+        the legacy (source_id, tensor_id) form still works but warns."""
+        tensor_specs = [
+            ("pos_0", (32, 32), "uint8"),
+            ("pos_1", (64, 64), "uint8"),
+        ]
+        adapter = MockMultifieldAdapter("mf", tensor_specs)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("mf", adapter)
+
+        server_thread = threading.Thread(target=server.serve, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            # Canonical single-arg form: a qualified array_id reaches the scene.
+            assert client.get_tensor("mf/pos_1").shape == (64, 64)
+            assert client.get_tensor_pb("mf/pos_1") is not None
+
+            # A bare multi-tensor source id is ambiguous -> must specify (never a
+            # silent default; the #75 lesson). No deprecation warning either.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                with pytest.raises(ValueError, match="multiple tensors"):
+                    client.get_tensor("mf")
+
+            # Legacy two-arg form still works, but warns.
+            with pytest.warns(DeprecationWarning):
+                legacy = client.get_tensor("mf", "pos_1")
+            assert legacy.shape == (64, 64)
 
             client.close()
         finally:
