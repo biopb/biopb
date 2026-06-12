@@ -271,10 +271,25 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id: Unique identifier for the data source
         """
         with self._sources_lock:
-            self._sources.pop(source_id, None)
+            adapter = self._sources.pop(source_id, None)
         with self._upload_state_lock:
             self._upload_states.pop(source_id, None)
+        _close_adapter(adapter)
         logger.debug(f"Unregistered source: {source_id}")
+
+    def shutdown(self) -> None:
+        """Release source-adapter resources, then shut down the Flight server.
+
+        Some adapters hold long-lived OS handles (e.g. the OME-TIFF adapter's
+        persistent aszarr store). Closing them on shutdown releases those
+        handles -- required on Windows, where an open file cannot be deleted
+        (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
+        """
+        with self._sources_lock:
+            adapters = list(self._sources.values())
+        for adapter in adapters:
+            _close_adapter(adapter)
+        super().shutdown()
 
     def initialize_upload(
         self,
