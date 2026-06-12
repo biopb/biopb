@@ -23,6 +23,12 @@ dependencies = [
     "pytest >= 7.0",
     "pytest-timeout >= 2.1.0",
     "opencv-python-headless==4.10.0.84",
+    # biopb-mcp is the optional dependency behind the `biopb mcp ...` daemon
+    # commands; installed here so the gated subcommands' "available" path is
+    # exercised in the test environment. The base package is enough (the heavy
+    # `[mcp]` napari/pyqt stack is only needed to actually run the server, which
+    # the CLI launches in a child process, not in-test).
+    "biopb-mcp",
   ]
   tensor = [
     "pyarrow >= 14.0.0",

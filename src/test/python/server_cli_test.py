@@ -347,6 +347,223 @@ class TestCacheStats:
         assert cli._hit_rate(3, 1) == "75.0%"
 
 
+class TestMcpGate:
+    """`mcp` subcommands are gated on the optional biopb-mcp package via
+    _require_biopb_mcp (checks the import spec, no heavy import)."""
+
+    def test_require_raises_when_absent(self, monkeypatch):
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: None)
+        with pytest.raises(cli.typer.Exit) as ei:
+            cli._require_biopb_mcp()
+        assert ei.value.exit_code == 1
+
+    def test_require_passes_when_present(self, monkeypatch):
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+        cli._require_biopb_mcp()  # no raise
+
+    def test_gate_blocks_command_when_absent(self, monkeypatch):
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: None)
+        res = CliRunner().invoke(cli.app, ["mcp", "status"])
+        assert res.exit_code == 1
+        assert "biopb-mcp" in res.output and "not installed" in res.output
+
+    def test_gate_passes_command_when_present(self, monkeypatch):
+        # Spec present -> the gate is a no-op and the command proceeds (here a
+        # stopped daemon, so status exits 0 with "Not running").
+        monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: None)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
+        res = CliRunner().invoke(cli.app, ["mcp", "status"])
+        assert res.exit_code == 0
+        assert "Not running" in res.output
+
+
+class TestMcpLineLevel:
+    """`mcp logs --level` parses the biopb-mcp log format (basicConfig/uvicorn)."""
+
+    def test_basicconfig_and_uvicorn_formats(self):
+        assert cli._mcp_line_level("INFO:biopb_mcp.mcp.__main__:Ready") == "INFO"
+        assert cli._mcp_line_level("WARNING:biopb_mcp:slow") == "WARNING"
+        # uvicorn pads after the level: "LEVEL:    message"
+        assert cli._mcp_line_level("INFO:     127.0.0.1:8765 - GET /mcp") == "INFO"
+
+    def test_off_format_is_unclassified(self):
+        assert cli._mcp_line_level("Traceback (most recent call last):") is None
+        assert cli._mcp_line_level("    File \"x.py\", line 3, in f") is None
+        assert cli._mcp_line_level("") is None
+        # dask's " - LEVEL - " shape is not classified (best-effort).
+        assert cli._mcp_line_level("distributed.worker - INFO - busy") is None
+
+    def test_filter_with_mcp_level_carries_continuation(self):
+        lines = ["INFO:n:i", "WARNING:n:w", "  stack frame", "DEBUG:n:d"]
+        assert cli._filter_lines(lines, "WARNING", cli._mcp_line_level) == [
+            "WARNING:n:w",
+            "  stack frame",
+        ]
+
+
+class TestMcpStart:
+    """`mcp start` launches `python -m biopb_mcp.mcp --transport http`."""
+
+    def _setup(self, monkeypatch, tmp_path, *, existing, existing_alive, child_alive):
+        monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
+        monkeypatch.setattr(cli, "MCP_LOG_DIR", tmp_path)
+        monkeypatch.setattr(cli, "MCP_PID_FILE", tmp_path / "mcp-server.pid")
+        monkeypatch.setattr(cli, "_mcp_default_port", lambda: 8765)
+        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: existing)
+
+        def running(pid):
+            return existing_alive if pid == existing else child_alive
+
+        monkeypatch.setattr(cli, "_is_process_running", running)
+        proc = MagicMock()
+        proc.pid = 4242
+        popen = MagicMock(return_value=proc)
+        monkeypatch.setattr(cli.subprocess, "Popen", popen)
+        return popen
+
+    def test_starts_and_records_pid(self, monkeypatch, tmp_path):
+        popen = self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 0, res.output
+        assert "started (PID 4242)" in res.output
+        assert "http://127.0.0.1:8765/mcp" in res.output
+        # Launches the http transport in a child process.
+        cmd = popen.call_args.args[0]
+        assert cmd[1:] == ["-m", "biopb_mcp.mcp", "--transport", "http", "--port", "8765"]
+        assert (tmp_path / "mcp-server.pid").read_text() == "4242"
+
+    def test_custom_port(self, monkeypatch, tmp_path):
+        popen = self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        res = CliRunner().invoke(cli.app, ["mcp", "start", "--port", "9000"])
+        assert res.exit_code == 0, res.output
+        assert "http://127.0.0.1:9000/mcp" in res.output
+        assert popen.call_args.args[0][-1] == "9000"
+
+    def test_already_running_is_noop(self, monkeypatch, tmp_path):
+        popen = self._setup(
+            monkeypatch, tmp_path, existing=999, existing_alive=True, child_alive=True
+        )
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 0
+        assert "already running" in res.output
+        popen.assert_not_called()
+
+    def test_failed_start_exits_1(self, monkeypatch, tmp_path):
+        self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=False
+        )
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 1
+        assert "Failed to start" in res.output
+
+
+class TestMcpStop:
+    def _run(self, monkeypatch, *, pid, running, graceful=True):
+        monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
+        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: pid)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
+        monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
+        stop = MagicMock(return_value=graceful)
+        monkeypatch.setattr(cli, "_stop_mcp", stop)
+        res = CliRunner().invoke(cli.app, ["mcp", "stop"])
+        return res, stop
+
+    def test_not_running(self, monkeypatch):
+        res, stop = self._run(monkeypatch, pid=None, running=False)
+        assert res.exit_code == 0
+        assert "No biopb-mcp server running" in res.output
+        stop.assert_not_called()
+
+    def test_running_stops_gracefully(self, monkeypatch):
+        res, stop = self._run(monkeypatch, pid=123, running=True)
+        assert res.exit_code == 0
+        assert "stopped" in res.output
+        stop.assert_called_once()
+
+    def test_force_kill_reported(self, monkeypatch):
+        res, stop = self._run(monkeypatch, pid=123, running=True, graceful=False)
+        assert res.exit_code == 0
+        assert "force killed" in res.output
+
+
+class TestMcpStatus:
+    def _json(self, monkeypatch, *, pid, running, listening):
+        monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
+        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: pid)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
+        monkeypatch.setattr(cli, "_mcp_default_port", lambda: 8765)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: listening)
+        res = CliRunner().invoke(cli.app, ["mcp", "status", "--json"])
+        assert res.exit_code == 0, res.output
+        return json.loads(res.stdout.strip().splitlines()[-1])
+
+    def test_running_and_listening(self, monkeypatch):
+        d = self._json(monkeypatch, pid=42, running=True, listening=True)
+        assert d["running"] is True and d["pid"] == 42
+        assert d["status"] == "running" and d["listening"] is True
+        assert d["port"] == 8765 and d["url"] == "http://127.0.0.1:8765/mcp"
+
+    def test_running_not_listening(self, monkeypatch):
+        d = self._json(monkeypatch, pid=42, running=True, listening=False)
+        assert d["running"] is True and d["listening"] is False
+
+    def test_stopped(self, monkeypatch):
+        d = self._json(monkeypatch, pid=None, running=False, listening=False)
+        assert d["running"] is False and d["status"] == "stopped"
+        assert d["pid"] is None and d["url"] is None
+
+    def test_stale(self, monkeypatch):
+        d = self._json(monkeypatch, pid=999, running=False, listening=False)
+        assert d["status"] == "stale" and d["running"] is False
+
+
+class TestMcpLogs:
+    """`mcp logs` reads ~/.local/share/biopb-mcp/log/mcp-server.log."""
+
+    @pytest.fixture
+    def log_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
+        monkeypatch.setattr(cli, "MCP_LOG_DIR", tmp_path)
+        return tmp_path / "mcp-server.log"
+
+    def _run(self, *args):
+        return CliRunner().invoke(cli.app, ["mcp", "logs", *args])
+
+    def test_path_prints_and_exits(self, log_file):
+        res = self._run("--path")
+        assert res.exit_code == 0
+        assert str(log_file) in res.output
+
+    def test_missing_file_is_not_an_error(self, log_file):
+        res = self._run()
+        assert res.exit_code == 0
+        assert "No log file" in res.output
+
+    def test_tail_last_n_lines(self, log_file):
+        log_file.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
+        res = self._run("-n", "5")
+        out = res.output.strip().splitlines()
+        assert out == ["line 15", "line 16", "line 17", "line 18", "line 19"]
+
+    def test_level_filter_mcp_format(self, log_file):
+        log_file.write_text("INFO:n:i\nDEBUG:n:d\nWARNING:n:w\nERROR:n:e\n")
+        res = self._run("--level", "WARNING")
+        assert res.exit_code == 0
+        assert "WARNING:n:w" in res.output and "ERROR:n:e" in res.output
+        assert "INFO:n:i" not in res.output and "DEBUG:n:d" not in res.output
+
+    def test_invalid_level_exits_1(self, log_file):
+        log_file.write_text("INFO:n:i\n")
+        res = self._run("--level", "FOO")
+        assert res.exit_code == 1
+        assert "Invalid --level" in res.output
+
+
 class TestWinRequestShutdown:
     def test_writes_fixed_sentinel_file(self, tmp_path, monkeypatch):
         # Redirect the biopb data dir to a temp location.
