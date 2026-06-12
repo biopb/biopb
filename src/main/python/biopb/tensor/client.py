@@ -1914,6 +1914,24 @@ class TensorFlightClient:
             return json.loads(result.body.to_pybytes())
         return {"status": "UNKNOWN"}
 
+    def cache_stats(self) -> Dict[str, Any]:
+        """Fetch server-side cache statistics via Flight action.
+
+        Returns:
+            Dictionary of CacheStats fields: total_entries, total_bytes,
+            max_entries, max_bytes, hits, misses, evictions, pending_waits,
+            ref_held_evictions_skipped, oversized_skips, and (file backend)
+            per-pool stats under "pool_stats".
+
+        Raises:
+            FlightError: If server is unreachable or action fails
+        """
+        action = flight.Action("cache_stats", b"")
+        results = self._client.do_action(action, options=self._call_options)
+        for result in results:
+            return json.loads(result.body.to_pybytes())
+        return {}
+
     def get_upload_status(self, source_id: str) -> Dict[str, Any]:
         """Get upload status for a writable source.
 

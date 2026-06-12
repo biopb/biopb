@@ -486,6 +486,7 @@ class TensorFlightServer(flight.FlightServerBase):
             flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
             flight.ActionType("upload_status", "Upload status for a writable source"),
             flight.ActionType("chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"),
+            flight.ActionType("cache_stats", "Cache statistics - returns backend CacheStats JSON"),
         ]
 
     def do_action(
@@ -528,6 +529,14 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = decode_chunk_id(ticket.chunk_id)[0].split("/")[0]
             self._authorize_source(context, source_id)
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
+        elif action.type == "cache_stats":
+            from dataclasses import asdict
+
+            manager = CacheManager.get_instance()
+            if manager is None:
+                raise flight.FlightServerError("Cache not initialized")
+            # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
+            yield json.dumps(asdict(manager.stats())).encode("utf-8")
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
