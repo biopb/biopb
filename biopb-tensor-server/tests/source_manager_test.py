@@ -644,6 +644,168 @@ class TestSourceManagerRegressions:
         source_id = next(iter(state.claims))
         assert server.registered == [source_id]
 
+    def test_pruned_root_keeps_walking_while_copied_file_settles(
+        self, tmp_path, monkeypatch
+    ):
+        """biopb/biopb#53: a copy into an already-pruned aggressive root must
+        not be frozen out while its files are still settling.
+
+        Once the root is pruned its own mtime stops changing (writes deep in the
+        subtree don't bump it), so before the fix the root was re-pruned every
+        cycle and the still-young copied file never got discovered. The prune
+        gate must refuse while a descendant is pending, then resume once it
+        settles.
+        """
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+            aggressive_dir_pruning=True,
+        )
+
+        base_time = time.time()
+        clock = {"now": base_time}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        # Settle and prune the (empty) root.
+        manager._handle_rescan()
+        clock["now"] = base_time + 31.0
+        manager._handle_rescan()
+        clock["now"] = base_time + 62.0
+        manager._handle_rescan()
+        assert str(monitored_dir.resolve()) in manager._skipped_stable_dirs
+
+        # Simulate `cp -r newdir/` landing under the pruned root: creating the
+        # new child bumps the root's mtime, creating the file bumps newdir's.
+        newdir = monitored_dir / "newdir"
+        newdir.mkdir()
+        data_path = newdir / "a.dat"
+        data_path.write_text("partial")
+        appeared_at = base_time + 63.0
+        appeared_ns = int(appeared_at * 1_000_000_000)
+        os.utime(data_path, ns=(appeared_ns, appeared_ns))
+        os.utime(newdir, ns=(appeared_ns, appeared_ns))
+        os.utime(monitored_dir, ns=(appeared_ns, appeared_ns))
+
+        # The bumped root is walked once, but the file is too young to claim.
+        clock["now"] = appeared_at
+        manager._handle_rescan()
+        assert state.claims == {}
+
+        # The file keeps being written (its mtime advances) but neither newdir
+        # nor the root mtime changes. Before the fix the root's signature now
+        # looks stable and old enough, so it would be re-pruned and the pending
+        # file frozen; the fix refuses the prune while the file is pending.
+        writing_at = base_time + 70.0
+        writing_ns = int(writing_at * 1_000_000_000)
+        data_path.write_text("more data written")
+        os.utime(data_path, ns=(writing_ns, writing_ns))
+
+        clock["now"] = base_time + 93.0
+        manager._handle_rescan()
+        assert str(monitored_dir.resolve()) not in manager._skipped_stable_dirs
+        assert state.claims == {}
+
+        # Once the file is quiet >= stability_window it is discovered.
+        clock["now"] = base_time + 101.0
+        manager._handle_rescan()
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+        # With nothing left pending, pruning resumes — the guard is not a
+        # permanent disable.
+        clock["now"] = base_time + 102.0
+        manager._handle_rescan()
+        assert str(monitored_dir.resolve()) in manager._skipped_stable_dirs
+        assert source_id in state.claims
+
+    def test_pruned_nested_dir_keeps_walking_while_copied_file_settles(
+        self, tmp_path, monkeypatch
+    ):
+        """biopb/biopb#53, default config: child directories are always pruned
+        (allow_prune hard-coded True for children), so the same freeze occurs one
+        level down even with aggressive_dir_pruning disabled.
+        """
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        sub = monitored_dir / "sub"
+        sub.mkdir()
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+            probe_open_files=False,
+            full_rescan_interval=0.0,
+            aggressive_dir_pruning=False,
+        )
+
+        base_time = time.time()
+        clock = {"now": base_time}
+        monkeypatch.setattr(
+            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+        )
+
+        # Settle and prune the (empty) nested subdirectory.
+        manager._handle_rescan()
+        clock["now"] = base_time + 31.0
+        manager._handle_rescan()
+        clock["now"] = base_time + 62.0
+        manager._handle_rescan()
+        assert str(sub.resolve()) in manager._skipped_stable_dirs
+
+        # Copy a file into the settled subdir: its own mtime bumps once, then
+        # settles while the file is still being written.
+        data_path = sub / "a.dat"
+        data_path.write_text("partial")
+        appeared_at = base_time + 63.0
+        appeared_ns = int(appeared_at * 1_000_000_000)
+        os.utime(data_path, ns=(appeared_ns, appeared_ns))
+        os.utime(sub, ns=(appeared_ns, appeared_ns))
+
+        clock["now"] = appeared_at
+        manager._handle_rescan()
+        assert state.claims == {}
+
+        writing_at = base_time + 70.0
+        writing_ns = int(writing_at * 1_000_000_000)
+        data_path.write_text("more data written")
+        os.utime(data_path, ns=(writing_ns, writing_ns))
+
+        clock["now"] = base_time + 93.0
+        manager._handle_rescan()
+        assert str(sub.resolve()) not in manager._skipped_stable_dirs
+        assert state.claims == {}
+
+        clock["now"] = base_time + 101.0
+        manager._handle_rescan()
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+        clock["now"] = base_time + 102.0
+        manager._handle_rescan()
+        assert str(sub.resolve()) in manager._skipped_stable_dirs
+        assert source_id in state.claims
+
     def test_reconcile_keeps_unstable_missing_source(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
