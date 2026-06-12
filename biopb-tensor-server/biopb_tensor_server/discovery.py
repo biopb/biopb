@@ -303,6 +303,7 @@ def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
     path_filter: Optional[Callable[[Path], bool]] = None,
+    should_descend: Optional[Callable[[Path], bool]] = None,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
@@ -312,6 +313,13 @@ def walk_with_identity_tracking(
     Args:
         root: Root directory to walk
         visited_identities: Set of already-visited file identities
+        path_filter: Optional predicate; an entry is skipped when it returns False
+        should_descend: Optional predicate consulted *after* a directory entry has
+            been yielded (and the consumer has had a chance to claim it). When it
+            returns False the walk does not recurse into that directory. This lets
+            the consumer stop the walk from descending below a directory-level
+            claim — e.g. a ``.zarr`` store — whose interior files can never produce
+            a claim of their own (biopb/biopb#55).
 
     Yields:
         Paths to files/directories (not yet claimed)
@@ -345,12 +353,21 @@ def walk_with_identity_tracking(
 
             yield path
 
-            # Recurse into real directories (not symlinks pointing to dirs)
-            if is_dir and not path.is_symlink():
+            # Recurse into real directories (not symlinks pointing to dirs).
+            # ``should_descend`` runs after the yield, so the consumer has already
+            # decided whether to claim this directory; if it claimed it (e.g. a
+            # zarr store), skip the subtree instead of probing every chunk file
+            # for a claim that can never fire (biopb/biopb#55).
+            if (
+                is_dir
+                and not path.is_symlink()
+                and (should_descend is None or should_descend(path))
+            ):
                 yield from walk_with_identity_tracking(
                     path,
                     visited_identities,
                     path_filter=path_filter,
+                    should_descend=should_descend,
                 )
     except OSError:
         # Permission issue reading directory
@@ -734,6 +751,11 @@ def discover_sources(
         root,
         state.visited_identities,
         path_filter=path_filter,
+        # Don't descend below a directory the consumer just claimed: everything
+        # under a claimed source belongs to that source by construction, so
+        # probing interior files (e.g. zarr chunk stores) is pure waste
+        # (biopb/biopb#55).
+        should_descend=lambda p: not state.is_path_claimed(str(p)),
     ):
         paths_scanned += 1
         path_str = str(path)
