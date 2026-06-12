@@ -6,6 +6,7 @@ used by both the tensor browser widget and the MCP server.
 
 import logging
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import List, Tuple
 
 from biopb.tensor import TensorFlightClient
@@ -13,6 +14,37 @@ from biopb.tensor import TensorFlightClient
 from ._config import CONFIG, get_setting
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _origin_initial_view(viewer):
+    """Render the first-added layer at the dataset *origin*, not its center.
+
+    napari builds a layer's thumbnail from the origin slice but renders the
+    view at the *center* of every axis: adding the first layer runs
+    ``ViewerModel._add_layer_from_data`` -> ``dims._go_to_center_step()``. For a
+    tensor with non-spatial axes (channel/time) those are two *different*
+    slices, so loading one layer materializes two coarse planes. With a source
+    that has no native pyramid (e.g. nd2), each such plane is a full-resolution
+    server-side decode, so the redundant center slice roughly doubles cold load
+    time. Pinning the initial view to the origin makes the displayed slice
+    coincide with the thumbnail slice -> one decode instead of two.
+
+    Trade-off: the default view sits at index 0 on the sliced axes (e.g. the
+    first channel / first Z) rather than the middle. ``_go_to_center_step`` only
+    runs for the first layer, so this is a no-op for subsequent adds.
+    """
+    dims_cls = type(getattr(viewer, "dims", None))
+    orig = getattr(dims_cls, "_go_to_center_step", None)
+    if not callable(orig):
+        # Not a real napari viewer (e.g. a test mock) -- nothing to suppress.
+        yield
+        return
+    dims_cls._go_to_center_step = lambda self: None
+    try:
+        yield
+    finally:
+        dims_cls._go_to_center_step = orig
 
 
 def get_xy_dim_indices(
@@ -357,6 +389,7 @@ def add_tensor_layer(
     if phys is not None:
         add_kwargs["metadata"] = {"ome_physical_size": phys}
 
-    if len(levels) > 1:
-        return viewer.add_image(levels, multiscale=True, **add_kwargs)
-    return viewer.add_image(levels[0], **add_kwargs)
+    with _origin_initial_view(viewer):
+        if len(levels) > 1:
+            return viewer.add_image(levels, multiscale=True, **add_kwargs)
+        return viewer.add_image(levels[0], **add_kwargs)

@@ -7,6 +7,7 @@ import pytest
 
 from biopb_mcp._config import get_default_config, get_setting
 from biopb_mcp._tensor_utils import (
+    _origin_initial_view,
     add_tensor_layer,
     build_layer_scale,
     build_pyramid_levels,
@@ -416,3 +417,46 @@ class TestAddTensorLayer:
         assert arr.shape == (3, 1, 64, 32)
         # Scale aligns to the canonical output: [c, z, y, x].
         assert kwargs["scale"] == [1.0, 1.0, 0.25, 0.5]
+
+
+class TestOriginInitialView:
+    """The context manager that pins the first layer's view to the origin so a
+    multi-channel tensor decodes one coarse plane at load, not two (thumbnail
+    @origin + display @center)."""
+
+    def test_suppresses_and_restores_center_step(self):
+        class FakeDims:
+            def _go_to_center_step(self):
+                pass
+
+        orig = FakeDims._go_to_center_step
+        viewer = MagicMock()
+        viewer.dims = FakeDims()
+
+        with _origin_initial_view(viewer):
+            # While active, centering is neutralized to a no-op...
+            assert FakeDims._go_to_center_step is not orig
+            assert FakeDims._go_to_center_step(viewer.dims) is None
+        # ...and restored to the real method afterwards.
+        assert FakeDims._go_to_center_step is orig
+
+    def test_restores_on_exception(self):
+        class FakeDims:
+            def _go_to_center_step(self):
+                pass
+
+        orig = FakeDims._go_to_center_step
+        viewer = MagicMock()
+        viewer.dims = FakeDims()
+
+        with pytest.raises(ValueError):
+            with _origin_initial_view(viewer):
+                raise ValueError("boom")
+        assert FakeDims._go_to_center_step is orig
+
+    def test_noop_for_mock_viewer(self):
+        # A MagicMock viewer has no real Dims class method -> the manager must
+        # not raise or mutate the global MagicMock class.
+        with _origin_initial_view(MagicMock()):
+            pass
+        assert not hasattr(MagicMock, "_go_to_center_step")
