@@ -43,25 +43,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def get_file_identity(path: Path) -> str:
+def get_file_identity(path: Path, stat_result: Optional[os.stat_result] = None) -> str:
     """Get cross-platform stable file identity.
 
     Uses device + inode on Unix/NTFS, falls back to path hash on FAT32.
 
     Args:
-        path: Path to get identity for (should be resolved symlink)
+        path: Path to get identity for (should already be resolved).
+        stat_result: A ``stat`` of ``path`` the caller already holds. When given,
+            its ``(st_dev, st_ino)`` are used directly and no syscall is issued —
+            the walks stat every entry once for the signature, so re-resolving and
+            re-stat'ing here was pure waste (biopb/biopb#56). ``path`` must be the
+            resolved path the stat was taken of, so the hash fallback stays stable.
 
     Returns:
         Stable identity string for deduplication
     """
     try:
-        real_path = path.resolve()
-        stat = os.stat(real_path)
+        if stat_result is None:
+            real_path = path.resolve()
+            stat_result = os.stat(real_path)
+        else:
+            real_path = path
 
         # st_ino > 0 on Unix and Windows NTFS (sometimes)
-        if stat.st_ino > 0:
+        if stat_result.st_ino > 0:
             # Combine device + inode for uniqueness across mount points
-            return f"{stat.st_dev}:{stat.st_ino}"
+            return f"{stat_result.st_dev}:{stat_result.st_ino}"
         else:
             # FAT32 or filesystem without stable inodes
             # Use path hash as fallback
@@ -132,7 +140,9 @@ def _is_skippable_system_dir(name: str) -> bool:
     )
 
 
-def _is_offline_placeholder(path: Path) -> bool:
+def _is_offline_placeholder(
+    path: Path, stat_result: Optional[os.stat_result] = None
+) -> bool:
     """Best-effort: True when *path*'s content is not resident on local disk.
 
     ``os.stat`` reads metadata only and does **not** trigger a recall, so a
@@ -155,10 +165,12 @@ def _is_offline_placeholder(path: Path) -> bool:
     """
     if not _SKIP_OFFLINE:
         return False
-    try:
-        st = path.stat()
-    except OSError:
-        return False
+    st = stat_result
+    if st is None:
+        try:
+            st = path.stat()
+        except OSError:
+            return False
 
     attrs = getattr(st, "st_file_attributes", 0)
     if attrs and (attrs & _OFFLINE_ATTR_MASK):
@@ -168,7 +180,9 @@ def _is_offline_placeholder(path: Path) -> bool:
     return st_blocks == 0
 
 
-def should_skip_walk_entry(path: Path, is_dir: bool) -> bool:
+def should_skip_walk_entry(
+    path: Path, is_dir: bool, stat_result: Optional[os.stat_result] = None
+) -> bool:
     """Shared per-entry skip policy for discovery tree walks.
 
     Both traversals over the monitored trees route their skip decision through
@@ -191,13 +205,18 @@ def should_skip_walk_entry(path: Path, is_dir: bool) -> bool:
     Loop protection (symlinks, Windows junctions, hardlinks, bind mounts) is
     **not** handled here — it needs per-walk identity state and is applied at
     each walk's recursion point via ``get_file_identity``.
+
+    ``stat_result``, when supplied, is a stat of ``path`` the caller already holds;
+    it is forwarded to the offline-placeholder check so a walk that has already
+    stat'd the entry (the state walk) does not stat it a second time
+    (biopb/biopb#56).
     """
     name = path.name
     if name.startswith("."):
         return True
     if is_dir:
         return _is_skippable_system_dir(name)
-    return _is_offline_placeholder(path)
+    return _is_offline_placeholder(path, stat_result)
 
 
 class ClaimContext:
