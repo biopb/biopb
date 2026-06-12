@@ -128,7 +128,15 @@ def _resolve_serve_sources(
     for s in server_config.sources:
         if s.monitor and not s.is_remote:
             local_path = s.local_path
-            if local_path is not None and local_path.is_file():
+            # local_path cannot be None here -- both is_remote and local_path
+            # derive from _is_remote_url(url), so `not is_remote` guarantees a
+            # resolved path. Guard anyway: if that invariant ever broke, a None
+            # path must NOT be registered as a monitored directory. Route it to
+            # the expansion path, which validates it (and skips under tolerant).
+            if local_path is None:
+                to_expand.append(s)
+                continue
+            if local_path.is_file():
                 # Files cannot be live-monitored: register as a static source
                 # instead of silently dropping it.
                 logger.warning(
@@ -138,7 +146,7 @@ def _resolve_serve_sources(
                 )
                 to_expand.append(s)
                 continue
-            if local_path is not None and not local_path.exists():
+            if not local_path.exists():
                 # Not-yet-mounted dir: skip the (crashing) expansion. The watcher
                 # and rescan pick it up when it appears (the runtime self-heals).
                 logger.warning(
