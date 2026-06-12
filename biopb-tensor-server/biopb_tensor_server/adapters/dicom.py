@@ -393,26 +393,32 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         try:
             import pydicom
 
-            # Read first file to get series UID
-            first_ds = pydicom.dcmread(str(dcm_files[0]), stop_before_pixels=True)
-
-            if not hasattr(first_ds, 'SeriesInstanceUID'):
-                return None
-
-            series_uid = first_ds.SeriesInstanceUID
-
-            # Collect files that belong to this series
-            series_files = []
+            # Group the image-capable files by SeriesInstanceUID. Keying off the
+            # first globbed file's series (the old approach) made the result depend
+            # on glob order: a directory holding a singleton series ahead of a real
+            # multi-file series was wrongly rejected whenever the filesystem yielded
+            # the singleton first. Grouping every file and then choosing makes the
+            # decision independent of discovery order.
+            series_to_files = {}
             for f in dcm_files:
                 try:
                     ds = pydicom.dcmread(str(f), stop_before_pixels=True)
-                    if hasattr(ds, 'SeriesInstanceUID') and ds.SeriesInstanceUID == series_uid:
-                        # Check for image-related tags (Rows/Columns indicate pixel data capability)
-                        if hasattr(ds, 'Rows') and hasattr(ds, 'Columns'):
-                            series_files.append(f)
                 except Exception:
                     continue
+                series_uid = getattr(ds, 'SeriesInstanceUID', None)
+                # Rows/Columns indicate pixel-data capability.
+                if series_uid is None or not (
+                    hasattr(ds, 'Rows') and hasattr(ds, 'Columns')
+                ):
+                    continue
+                series_to_files.setdefault(str(series_uid), []).append(f)
 
+            # Claim the largest series with at least two slices.
+            series_uid, series_files = max(
+                series_to_files.items(),
+                key=lambda kv: len(kv[1]),
+                default=(None, []),
+            )
             if len(series_files) < 2:
                 return None
 
