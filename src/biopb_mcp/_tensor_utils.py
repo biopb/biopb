@@ -102,6 +102,47 @@ def get_z_dim_index(
     return ndim - 3 if ndim >= 3 else None
 
 
+def _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc):
+    """The server-advertised pyramid: per-level ``scale_hint`` + ``reduction_method``.
+
+    Returns the advertised level descriptors, or ``[]`` when the server
+    advertises none (older servers) or the lookup fails.
+
+    Why this matters: the server folds its downsample plan onto the descriptor
+    (``scale_hint`` *and* ``reduction_method`` per level) and pre-warms exactly
+    those chunk_ids. If the client builds its own ``scale_hint`` and omits the
+    reduction, the server falls back to a *different* default (e.g. ``nearest``
+    vs the advertised ``area``), so the client's chunk_ids never match the
+    pre-warmed ones and every first load pays a full cold read. Honoring the
+    advertised levels keeps the client's requests byte-identical to what the
+    server serves and precaches.
+
+    The lean catalog descriptor from ``list_sources`` carries no pyramid -- it
+    is filled only at open time (``get_flight_info``) -- so when the passed
+    *tensor_desc* lacks one, fetch the open-time descriptor once via
+    ``get_source``.
+    """
+    levels = list(getattr(tensor_desc, "pyramid", None) or [])
+    if levels:
+        return levels
+    try:
+        full = client.get_source(source_id, tensor_id)
+        tensors = list(getattr(full, "tensors", None) or [])
+        cand = next((t for t in tensors if t.array_id == tensor_id), None)
+        if cand is None and len(tensors) == 1:
+            cand = tensors[0]
+        if cand is not None:
+            return list(getattr(cand, "pyramid", None) or [])
+    except Exception:  # noqa: BLE001 - advisory; fall back to a client plan
+        logger.debug(
+            "advertised-pyramid lookup failed for %s/%s",
+            source_id,
+            tensor_id,
+            exc_info=True,
+        )
+    return []
+
+
 def build_pyramid_levels(
     client: TensorFlightClient,
     source_id: str,
@@ -112,8 +153,14 @@ def build_pyramid_levels(
 ) -> List:
     """Build resolution-pyramid levels for a tensor in napari display order.
 
-    One unified rule serves 2-D and 3-D data and bounds napari's 3-D
-    whole-volume read (issue #29). All knobs come from the ``pyramid`` config
+    When the server advertises a pyramid (the open-time descriptor carries one;
+    see :func:`_advertised_pyramid_levels`), each level is requested by its
+    advertised ``scale_hint`` *and* ``reduction_method`` so the client's
+    chunk_ids match what the server serves and pre-warms. The config-driven plan
+    below is the fallback for servers that advertise none.
+
+    That fallback uses one unified rule for 2-D and 3-D data and bounds napari's
+    3-D whole-volume read (issue #29). All knobs come from the ``pyramid`` config
     section (``config`` defaults to the on-disk config):
 
     - ``threshold`` -- max x/y extent of the coarsest level (caps 2-D reads),
@@ -176,42 +223,65 @@ def build_pyramid_levels(
     # why the cube-root-capped-at-threshold value guarantees termination.
     axis_floor = min(budget_root, threshold)
 
-    levels = []
-    sx = sy = sz = 1
+    # Prefer the server-advertised pyramid: request each level by the
+    # advertised scale_hint *and* reduction_method so the client's chunk_ids
+    # match what the server serves and pre-warms. The config-driven loop below
+    # is the fallback for servers that advertise no pyramid -- it recomputes the
+    # scale plan and (deliberately) omits reduction_method, which is fine only
+    # when there is nothing pre-warmed to miss.
+    advertised = _advertised_pyramid_levels(
+        client, source_id, tensor_id, tensor_desc
+    )
+    if advertised:
+        levels = [
+            client.get_tensor(
+                source_id,
+                tensor_id,
+                scale_hint=list(lv.scale_hint),
+                reduction_method=lv.reduction_method or None,
+            )
+            for lv in advertised
+        ]
+    else:
+        levels = []
+        sx = sy = sz = 1
 
-    while True:
-        # scale_hint is in the *source* axis order the server expects.
-        scale_hint = [1] * ndim
-        scale_hint[x_idx] = sx
-        scale_hint[y_idx] = sy
-        if z_idx is not None:
-            scale_hint[z_idx] = sz
+        while True:
+            # scale_hint is in the *source* axis order the server expects.
+            scale_hint = [1] * ndim
+            scale_hint[x_idx] = sx
+            scale_hint[y_idx] = sy
+            if z_idx is not None:
+                scale_hint[z_idx] = sz
 
-        arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
-        levels.append(arr)
+            arr = client.get_tensor(
+                source_id, tensor_id, scale_hint=scale_hint
+            )
+            levels.append(arr)
 
-        # Real downsampled extents from the returned array, not floor(L/scale).
-        lx = arr.shape[x_idx]
-        ly = arr.shape[y_idx]
-        lz = arr.shape[z_idx] if z_idx is not None else 1
-        if (
-            lx * ly * lz <= pixel_budget
-            and lx <= threshold
-            and ly <= threshold
-        ):
-            break
+            # Real downsampled extents from the returned array, not
+            # floor(L/scale).
+            lx = arr.shape[x_idx]
+            ly = arr.shape[y_idx]
+            lz = arr.shape[z_idx] if z_idx is not None else 1
+            if (
+                lx * ly * lz <= pixel_budget
+                and lx <= threshold
+                and ly <= threshold
+            ):
+                break
 
-        # Downsample each axis individually, leaving any already at the floor.
-        nsx = sx * downscale_factor if lx > axis_floor else sx
-        nsy = sy * downscale_factor if ly > axis_floor else sy
-        nsz = (
-            sz * downscale_factor
-            if (z_idx is not None and lz > axis_floor)
-            else sz
-        )
-        if (nsx, nsy, nsz) == (sx, sy, sz):
-            break  # nothing left to shrink; avoid an infinite loop
-        sx, sy, sz = nsx, nsy, nsz
+            # Downsample each axis individually, leaving any at the floor.
+            nsx = sx * downscale_factor if lx > axis_floor else sx
+            nsy = sy * downscale_factor if ly > axis_floor else sy
+            nsz = (
+                sz * downscale_factor
+                if (z_idx is not None and lz > axis_floor)
+                else sz
+            )
+            if (nsx, nsy, nsz) == (sx, sy, sz):
+                break  # nothing left to shrink; avoid an infinite loop
+            sx, sy, sz = nsx, nsy, nsz
 
     # Canonicalize to [..., Z, Y, X], reusing the indices computed above (no
     # second pass over the labels). Transpose moves X/Y/Z into place; a missing
