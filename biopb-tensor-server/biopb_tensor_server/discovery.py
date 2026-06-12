@@ -232,6 +232,7 @@ class ClaimContext:
         path: Path | str,
         store: Optional["RemoteStore"] = None,
         is_dir: Optional[bool] = None,
+        signature: Optional[Tuple] = None,
     ):
         self._path = Path(path) if store is None else None
         self._store = store
@@ -246,6 +247,13 @@ class ClaimContext:
         # sub-contexts get no cache, so structural probes (``.zattrs``, ``zarr.json``,
         # ``NDTiff.index``, …) still stat live.
         self._cached_is_dir = is_dir if store is None else None
+        # The entry's content-identity signature (st_dev, st_ino, st_size,
+        # st_mtime_ns, st_ctime_ns), as computed by the state walk. Adapters that
+        # open the file to sniff content (``_get_ome_metadata_from_tiff``) key a
+        # process-wide cache on it so a steady-state rescan re-reads unchanged
+        # headers from memory instead of disk (biopb/biopb#56, item 6). Local,
+        # top-level contexts only; ``join()`` sub-contexts carry no signature.
+        self._signature = signature if store is None else None
 
     def is_dir(self) -> bool:
         """Check if path is directory."""
@@ -343,6 +351,16 @@ class ClaimContext:
     def store(self) -> Optional["RemoteStore"]:
         """Get underlying RemoteStore if remote."""
         return self._store
+
+    @property
+    def signature(self) -> Optional[Tuple]:
+        """Content-identity signature for this entry, or None if not supplied.
+
+        Set only on the top-level snapshot-driven contexts (the state walk's
+        per-entry stat signature); ``None`` on live-walk and ``join()`` contexts,
+        which signals content-probe caches to run uncached.
+        """
+        return self._signature
 
 
 def walk_with_identity_tracking(
@@ -823,7 +841,7 @@ def discover_sources(
 
 
 def discover_sources_from_entries(
-    entries: Iterable[Tuple[str, bool]],
+    entries: Iterable[Tuple[str, bool, Optional[Tuple]]],
     registry: AdapterRegistry,
     state: Optional[DiscoveryState] = None,
     dim_labels: Optional[List[str]] = None,
@@ -840,10 +858,12 @@ def discover_sources_from_entries(
     claim protocol as :func:`discover_sources` straight off that snapshot
     (biopb/biopb#56, item 4).
 
-    ``entries`` is an ordered ``(resolved_path_str, is_dir)`` stream in **DFS
-    parent-first order** (the order ``_scan_tree_state`` inserts into its state dict),
-    which is what lets a directory-level claim or skip prune its whole subtree before
-    any interior entry is probed.
+    ``entries`` is an ordered ``(resolved_path_str, is_dir, signature)`` stream in
+    **DFS parent-first order** (the order ``_scan_tree_state`` inserts into its state
+    dict), which is what lets a directory-level claim or skip prune its whole subtree
+    before any interior entry is probed. ``signature`` is the state walk's content
+    identity for the entry, carried onto the ``ClaimContext`` so content-probing
+    adapters can memoize on it (biopb/biopb#56, item 6); it may be ``None``.
 
     Behavior is kept identical to a :func:`discover_sources` walk over the same tree:
 
@@ -870,7 +890,7 @@ def discover_sources_from_entries(
     def _under(path_str: str, prefix: str) -> bool:
         return path_str == prefix or path_str.startswith(prefix + os.sep)
 
-    for path_str, is_dir in entries:
+    for path_str, is_dir, signature in entries:
         # Drop prune prefixes we have walked out of (DFS contiguity), then skip
         # anything still beneath an active one (a claimed source or a skipped subtree).
         while prune_stack and not _under(path_str, prune_stack[-1]):
@@ -895,7 +915,7 @@ def discover_sources_from_entries(
                 prune_stack.append(path_str)
             continue
 
-        ctx = ClaimContext(Path(path_str), is_dir=is_dir)
+        ctx = ClaimContext(Path(path_str), is_dir=is_dir, signature=signature)
         claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]

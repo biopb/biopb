@@ -279,7 +279,10 @@ def _run_claim_walk(manager: SourceManager, root: Path):
     walk). ``_run_state_walk`` published ``_entry_state``/``_skipped_stable_dirs``, so
     this consumes them just like the runtime rescan does."""
     return discover_sources_from_entries(
-        ((path_str, entry[0]) for path_str, entry in manager._entry_state.items()),
+        (
+            (path_str, entry[0], entry[1])
+            for path_str, entry in manager._entry_state.items()
+        ),
         manager._registry,
         path_filter=manager._should_scan_resolved,
         skipped_dirs=manager._skipped_stable_dirs,

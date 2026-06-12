@@ -26,6 +26,7 @@ Relies on OS page cache for raw data caching.
 
 import threading
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
 
@@ -121,15 +122,24 @@ def _extract_files_from_ome_xml(
         return None
 
 
-def _get_ome_metadata_from_tiff(path: Path) -> Optional[str]:
-    """Extract OME-XML metadata from TIFF file if present.
+# Process-wide memoization of the embedded-OME-XML probe (biopb/biopb#56, item 6).
+# A steady-state rescan opens every monitored .tif through tifffile just to learn
+# whether it carries OME-XML — the dominant cost of the post-#63 claim phase
+# (~100 ms / 64 tiffs on a real tree). The result is a pure function of the file's
+# bytes, so it is cached keyed on the state walk's content-identity signature
+# (st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns): any byte change bumps the
+# signature, so a hit provably means identical content. A cached value of ``None``
+# ("no OME-XML") is meaningful and is stored too, so membership — not truthiness —
+# decides a hit. Bounded LRU; only the snapshot-driven path passes a signature, so
+# the single-threaded watcher is the only writer, but the lock keeps it safe if a
+# concurrent live walk ever supplies one.
+_OME_META_CACHE: "OrderedDict[Tuple[str, Tuple], Optional[str]]" = OrderedDict()
+_OME_META_CACHE_MAX = 4096
+_OME_META_CACHE_LOCK = threading.Lock()
 
-    Args:
-        path: Path to TIFF file
 
-    Returns:
-        OME-XML string if present, None otherwise
-    """
+def _probe_ome_metadata_from_tiff(path: Path) -> Optional[str]:
+    """Open the TIFF and return its embedded OME-XML, or None. No caching."""
     import tifffile
 
     try:
@@ -138,6 +148,41 @@ def _get_ome_metadata_from_tiff(path: Path) -> Optional[str]:
                 return tf.ome_metadata
     except Exception:
         return None
+    return None
+
+
+def _get_ome_metadata_from_tiff(
+    path: Path, signature: Optional[Tuple] = None
+) -> Optional[str]:
+    """Extract OME-XML metadata from a TIFF file if present.
+
+    Args:
+        path: Path to TIFF file
+        signature: Content-identity signature for ``path`` (from the discovery
+            state walk). When given, the probe result is memoized on
+            ``(path, signature)`` so an unchanged file is not reopened on the next
+            rescan. When ``None`` (live walk / ad-hoc call) the probe runs uncached.
+
+    Returns:
+        OME-XML string if present, None otherwise
+    """
+    if signature is None:
+        return _probe_ome_metadata_from_tiff(path)
+
+    key = (str(path), signature)
+    with _OME_META_CACHE_LOCK:
+        if key in _OME_META_CACHE:
+            _OME_META_CACHE.move_to_end(key)
+            return _OME_META_CACHE[key]
+
+    result = _probe_ome_metadata_from_tiff(path)
+
+    with _OME_META_CACHE_LOCK:
+        _OME_META_CACHE[key] = result
+        _OME_META_CACHE.move_to_end(key)
+        while len(_OME_META_CACHE) > _OME_META_CACHE_MAX:
+            _OME_META_CACHE.popitem(last=False)
+    return result
 
 
 # Core microscopy/image extensions for AicsImageIoAdapter fallback
@@ -644,7 +689,7 @@ class OmeTiffAdapter(_AicsImageIoAdapterBase):
             and ctx._path is not None
             and (name.endswith(".tif") or name.endswith(".tiff"))
         ):
-            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
+            ome_metadata = _get_ome_metadata_from_tiff(ctx._path, ctx.signature)
 
             if ome_metadata:
                 related_files = _extract_files_from_ome_xml(

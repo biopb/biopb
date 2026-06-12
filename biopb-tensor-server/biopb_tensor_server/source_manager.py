@@ -245,7 +245,10 @@ class SourceManager:
             # (their claims are preserved below), exactly as the old per-dir
             # `if ... in skipped_dirs: continue` did for whole roots.
             discovered_state = discover_sources_from_entries(
-                ((path_str, entry[0]) for path_str, entry in next_state.items()),
+                (
+                    (path_str, entry[0], entry[1])
+                    for path_str, entry in next_state.items()
+                ),
                 self._registry,
                 dim_labels=self._dim_labels,
                 path_filter=self._should_scan_resolved,
