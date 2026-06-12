@@ -658,6 +658,152 @@ def _fetch_chunk_distributed(
     return arr
 
 
+def _fetch_chunk_block(
+    id_map: Dict[Tuple[int, ...], bytes],
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]] = None,
+    block_info=None,
+) -> np.ndarray:
+    """``da.map_blocks`` callback that fetches one block by its grid location.
+
+    The single-Blockwise-layer construction (see
+    ``_build_dask_array_from_chunk_map``) routes here. ``id_map`` maps a block's
+    grid index -> ``chunk_id``; the block's bounds are taken from dask's own
+    ``block_info`` ``array-location`` (which equals the chunk bounds, since the
+    array's chunk grid is built from exactly those bounds), so only the opaque
+    ``chunk_id`` needs to ride in the graph literal. Pickle-safe for the same
+    reason as :func:`_fetch_chunk_distributed`: no closure over a FlightClient.
+    """
+    info = block_info[None]
+    chunk_id = id_map[tuple(info["chunk-location"])]
+    array_location = info["array-location"]  # [(start, stop), ...] per axis
+    bounds_start = tuple(int(start) for start, _ in array_location)
+    bounds_stop = tuple(int(stop) for _, stop in array_location)
+    return _fetch_chunk_distributed(
+        location,
+        token,
+        chunk_id,
+        bounds_start,
+        bounds_stop,
+        cache_bytes,
+        schema_metadata,
+    )
+
+
+def _regular_grid_chunks(
+    chunk_map: Dict[Tuple[int, ...], Tuple[bytes, Any]],
+    grid_shape: Tuple[int, ...],
+    shape: Tuple[int, ...],
+) -> Optional[Tuple[Tuple[int, ...], ...]]:
+    """Return the dask ``chunks`` tuple iff the grid is a regular tiling.
+
+    A regular tiling is a full Cartesian product of blocks whose per-axis sizes
+    are *separable* (the extent along axis *d* depends only on the block's index
+    along *d*) and contiguous, covering the full shape. That is exactly the
+    precondition for representing the array as a single ``Blockwise`` (map_blocks)
+    layer instead of an O(n_chunks)-layer ``da.block`` graph.
+
+    Returns the per-axis chunk-size tuple (suitable for ``da.map_blocks``'s
+    ``chunks=`` argument), or ``None`` if the grid is ragged/sparse and the
+    caller must fall back to ``da.block``.
+    """
+    ndim = len(shape)
+    axis_chunks: List[Tuple[int, ...]] = []
+    for axis in range(ndim):
+        # index along this axis -> (start, stop), verified consistent
+        extents: Dict[int, Tuple[int, int]] = {}
+        for chunk_idx, (_chunk_id, bounds) in chunk_map.items():
+            i = chunk_idx[axis]
+            extent = (int(bounds.start[axis]), int(bounds.stop[axis]))
+            if extents.setdefault(i, extent) != extent:
+                return None  # ragged: same index, different extent
+        if len(extents) != grid_shape[axis]:
+            return None  # missing indices along this axis
+        sizes: List[int] = []
+        expected_start = 0
+        for i in range(grid_shape[axis]):
+            if i not in extents:
+                return None
+            start, stop = extents[i]
+            if start != expected_start:
+                return None  # non-contiguous tiling
+            sizes.append(stop - start)
+            expected_start = stop
+        if expected_start != shape[axis]:
+            return None  # does not cover the full extent
+        axis_chunks.append(tuple(sizes))
+
+    n_blocks = 1
+    for g in grid_shape:
+        n_blocks *= g
+    if len(chunk_map) != n_blocks:
+        return None  # sparse grid (Cartesian product not fully populated)
+
+    return tuple(axis_chunks)
+
+
+def _build_dask_array_from_chunk_map(
+    chunk_map: Dict[Tuple[int, ...], Tuple[bytes, Any]],
+    grid_shape: Tuple[int, ...],
+    shape: Tuple[int, ...],
+    dtype: np.dtype,
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]],
+) -> da.Array:
+    """Build the lazy chunk-fetching dask array from a chunk-index map.
+
+    Shared by ``tensor_from_pb`` and ``_build_dask_array``. For a regular chunk
+    grid (the common case) this emits a *single* ``Blockwise`` (map_blocks)
+    layer, so slicing one chunk culls to O(1) tasks and graph optimization is
+    O(1) rather than O(n_chunks). This makes serial single-plane reads (napari
+    scrubbing a large T axis) and partial computes dramatically cheaper without
+    changing per-chunk fetch behavior or leaf-task parallelism. Ragged/sparse
+    grids fall back to the ``da.block``-of-``from_delayed`` construction.
+    """
+    if not chunk_map:
+        raise ValueError("No chunks found")
+
+    chunks = _regular_grid_chunks(chunk_map, grid_shape, shape)
+    if chunks is not None:
+        id_map = {chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()}
+        return da.map_blocks(
+            _fetch_chunk_block,
+            id_map,
+            location,
+            token,
+            cache_bytes,
+            schema_metadata,
+            dtype=dtype,
+            chunks=chunks,
+            meta=np.empty((0,) * len(shape), dtype=dtype),
+        )
+
+    # Fallback: ragged/sparse grid -> one delayed task per chunk.
+    blocks = np.empty(grid_shape, dtype=object)
+    for chunk_idx, (chunk_id, bounds) in chunk_map.items():
+        chunk_shape = tuple(
+            stop - start for start, stop in zip(bounds.start, bounds.stop)
+        )
+        blocks[chunk_idx] = da.from_delayed(
+            delayed(_fetch_chunk_distributed)(
+                location,
+                token,
+                chunk_id,
+                tuple(bounds.start),
+                tuple(bounds.stop),
+                cache_bytes,
+                schema_metadata,
+            ),
+            shape=chunk_shape,
+            dtype=dtype,
+        )
+    return da.block(blocks.tolist())
+
+
 def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[bytes], List[ChunkBounds]]:
     """Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
 
@@ -1548,7 +1694,7 @@ class TensorFlightClient:
             )
             chunk_map[chunk_idx] = (chunk_id, bounds)
 
-        # Build dask array with delayed chunk fetching
+        # Build dask array with lazy chunk fetching
         ndim = len(shape)
         grid_shape = tuple(
             max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
@@ -1557,30 +1703,16 @@ class TensorFlightClient:
         # Extract schema_metadata from pb for SHM transfer
         schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
 
-        blocks = np.empty(grid_shape, dtype=object)
-        for chunk_idx, (chunk_id, bounds) in chunk_map.items():
-            chunk_shape = tuple(
-                stop - start for start, stop in zip(bounds.start, bounds.stop)
-            )
-            delayed_arr = da.from_delayed(
-                delayed(_fetch_chunk_distributed)(
-                    pb.location,
-                    pb.auth_token if pb.auth_token else None,
-                    chunk_id,
-                    tuple(bounds.start),
-                    tuple(bounds.stop),
-                    cache_bytes,
-                    schema_metadata,
-                ),
-                shape=chunk_shape,
-                dtype=dtype,
-            )
-            blocks[chunk_idx] = delayed_arr
-
-        if blocks.size == 0:
-            raise ValueError("No chunks found in SerializedTensor")
-
-        dask_arr = da.block(blocks.tolist())
+        dask_arr = _build_dask_array_from_chunk_map(
+            chunk_map,
+            grid_shape,
+            shape,
+            dtype,
+            pb.location,
+            pb.auth_token if pb.auth_token else None,
+            cache_bytes,
+            schema_metadata,
+        )
 
         # Crop to the originally requested region if original_slice_hint present
         if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
@@ -1642,40 +1774,25 @@ class TensorFlightClient:
             )
             chunk_map[chunk_idx] = (chunk_id, bounds)
 
-        # Build dask array using da.from_delayed for each chunk
-        # The actual fetch is done by _fetch_chunk_distributed which uses module-level pools
+        # The actual fetch is done by _fetch_chunk_distributed which uses
+        # module-level pools; _build_dask_array_from_chunk_map emits a single
+        # Blockwise (map_blocks) layer for a regular grid, falling back to
+        # da.block-of-from_delayed for ragged/sparse grids.
         ndim = len(shape)
         grid_shape = tuple(
             max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
         )
 
-        # Create block array
-        blocks = np.empty(grid_shape, dtype=object)
-        for chunk_idx, (chunk_id, bounds) in chunk_map.items():
-            chunk_shape = tuple(
-                stop - start for start, stop in zip(bounds.start, bounds.stop)
-            )
-            # Use pickle-safe module-level function with connection params
-            delayed_arr = da.from_delayed(
-                delayed(_fetch_chunk_distributed)(
-                    self._location,
-                    self._token,
-                    chunk_id,
-                    tuple(bounds.start),
-                    tuple(bounds.stop),
-                    self._cache_bytes,
-                    schema_metadata,
-                ),
-                shape=chunk_shape,
-                dtype=dtype,
-            )
-            blocks[chunk_idx] = delayed_arr
-
-        if blocks.size == 0:
-            raise ValueError("No chunks found")
-
-        # Use da.block to combine chunks into a single array
-        return da.block(blocks.tolist())
+        return _build_dask_array_from_chunk_map(
+            chunk_map,
+            grid_shape,
+            shape,
+            dtype,
+            self._location,
+            self._token,
+            self._cache_bytes,
+            schema_metadata,
+        )
 
     # ====================
     # Upload API
