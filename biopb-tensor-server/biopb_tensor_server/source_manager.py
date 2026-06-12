@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.config import SourceConfig
@@ -392,23 +393,55 @@ class SourceManager:
         allow_prune: bool,
         visited_identities: Set[str],
         is_root: bool = False,
+        dir_entry: Optional[os.DirEntry] = None,
     ) -> None:
-        """Capture the current filesystem signature state for one subtree."""
+        """Capture the current filesystem signature state for one subtree.
+
+        ``dir_entry`` is the ``os.DirEntry`` the parent's ``os.scandir`` produced for
+        this entry (None for an explicitly-configured root, which the caller hands in
+        already resolved). Reusing it is the heart of the #56 per-entry syscall cut:
+        its ``d_type`` answers is-symlink without a syscall, its cached ``stat()`` is
+        the single stat we take, and a non-symlink child of an already-resolved
+        directory is canonical by construction — so we never re-``resolve()`` it.
+        Only the rare symlink entry pays a ``resolve()``, to preserve the
+        resolved-target keying that ``next_state`` and the loop guard depend on.
+        """
         try:
-            # Symlink-ness of the *entry itself*, read before resolving — once
-            # resolved the path is the canonical target and is never a symlink,
-            # so checking the resolved path (the old bug) never fired.
-            is_symlink = path.is_symlink()
-            resolved_path = path.resolve(strict=False)
-            stat_result = resolved_path.stat()
-            is_directory = resolved_path.is_dir()
+            if dir_entry is not None:
+                # is_symlink reads the entry's own d_type (the symlink-ness of the
+                # entry itself, never the target); stat() follows the symlink, so it
+                # matches the old resolved_path.stat() for the signature/identity.
+                is_symlink = dir_entry.is_symlink()
+                stat_result = dir_entry.stat()
+                # On Windows, DirEntry.stat() always reports st_ino/st_dev/st_nlink
+                # as zero (they are expensive to compute), so the cheap cached stat
+                # is missing the very fields the entry signature and file identity
+                # key on. The claim walk takes a real os.stat (real inode on NTFS),
+                # so a zeroed signature here would never match and every rescan would
+                # spuriously cycle the source (biopb/biopb#56). Pay one real stat to
+                # backfill the identity fields; POSIX DirEntry.stat() already does a
+                # real stat, so this only fires on Windows and the syscall-cut win is
+                # untouched.
+                if stat_result.st_ino == 0:
+                    stat_result = os.stat(dir_entry.path)
+            else:
+                # Root: _refresh_entry_state hands it in pre-resolved, so it is
+                # canonical and not itself a symlink.
+                is_symlink = False
+                stat_result = path.stat()
         except OSError:
             return
 
-        # Shared skip policy (hidden / system / cloud-placeholder), identical to
-        # the claim walk's. Applied to entries found while walking, never to an
-        # explicitly-configured root.
-        if not is_root and should_skip_walk_entry(path, is_directory):
+        is_directory = S_ISDIR(stat_result.st_mode)
+        # Resolve only symlinks. A non-symlink entry under an already-resolved parent
+        # is its own canonical path, so re-resolving it (the old per-entry cost, an
+        # O(depth) readlink walk) bought nothing (biopb/biopb#56).
+        resolved_path = path.resolve(strict=False) if is_symlink else path
+
+        # Shared skip policy (hidden / system / cloud-placeholder), identical to the
+        # claim walk's. Pass the stat we already took so the offline-placeholder
+        # check does not stat the entry a second time. Never applied to a root.
+        if not is_root and should_skip_walk_entry(path, is_directory, stat_result):
             return
 
         path_str = str(resolved_path)
@@ -439,7 +472,10 @@ class SourceManager:
         # it in pre-resolved, so is_symlink is False — see the call site.)
         if not is_directory or is_symlink:
             return
-        identity = get_file_identity(resolved_path)
+        # resolved_path is canonical and we already hold its stat — hand both to
+        # get_file_identity so it reuses (st_dev, st_ino) instead of re-resolving
+        # and re-stat'ing (biopb/biopb#56).
+        identity = get_file_identity(resolved_path, stat_result)
         if identity in visited_identities:
             return
         visited_identities.add(identity)
@@ -465,18 +501,24 @@ class SourceManager:
             return
 
         try:
-            for child in resolved_path.iterdir():
-                self._scan_tree_state(
-                    child,
-                    now,
-                    next_state,
-                    next_stable_observations,
-                    next_pending_scan,
-                    skipped_dirs,
-                    force_full,
-                    True,
-                    visited_identities,
-                )
+            # os.scandir yields DirEntry objects carrying d_type and a cached stat,
+            # so each child is processed with one stat and no resolve — the per-entry
+            # win (biopb/biopb#56). entry.path is the child under the canonical
+            # parent, hence itself canonical for the common non-symlink case.
+            with os.scandir(resolved_path) as entries:
+                for entry in entries:
+                    self._scan_tree_state(
+                        Path(entry.path),
+                        now,
+                        next_state,
+                        next_stable_observations,
+                        next_pending_scan,
+                        skipped_dirs,
+                        force_full,
+                        True,
+                        visited_identities,
+                        dir_entry=entry,
+                    )
         except OSError:
             return
 

@@ -12,28 +12,32 @@ syscalls are redundant:
 
 The issue is explicit that we **measure first** before optimizing. This module is
 that measurement: it drives one forced rescan over a representative tree and counts
-the syscall-bearing primitives, attributed per walk and per primitive, so the
-redundancy #56 describes is visible as a table and recorded as a baseline that the
-follow-up PRs (items 1-7) are graded against. **It changes no walk code.**
+the syscall-bearing primitives, attributed per walk and per primitive. It started
+as the pre-optimization baseline; with the state-walk rewrite landed (#56 items 1+2:
+``os.scandir`` + one reused stat per entry), it now also serves as the **regression
+guard** that locks that win in — ``logical_resolve`` is ~1, not ~1/entry, and the
+walks cost ~1 stat/entry, not the ~14-15 the baseline measured. **It changes no
+walk code.**
 
 Two complementary mechanisms:
 
 1. A Python-boundary counter (primary; deterministic, cross-platform) that tallies
    the os-level primitives (``os.stat``/``lstat``/``scandir``/``readlink``/``open``)
    the walks issue, plus the *logical* high-level calls (``Path.resolve``,
-   ``get_file_identity``) whose redundancy is the point. ``Path.resolve()`` fans out
+   ``get_file_identity``) whose redundancy was the point. ``Path.resolve()`` fans out
    into several ``lstat``/``readlink`` syscalls (O(depth)), so logical-call count and
-   syscall count are reported side by side.
+   syscall count are reported side by side. ``DirEntry.stat()`` calls C ``fstatat``
+   directly and so escapes an ``os.stat`` patch — the post-#56 per-entry stat — so it
+   is counted via a scandir proxy (``direntry_stat``) to keep the total honest.
 2. A ``strace -f -c`` ground-truth pass (secondary; Linux + strace only, else
    skipped) that validates the Python counter against real kernel counts.
 
-Each bucket maps to the #56 inventory item that would remove it:
+Each bucket maps to the #56 inventory item it relates to:
 
-    logical Path.resolve() counted >1x/entry      -> item 1 (drop redundant resolve)
-    os.stat fan-out per entry (is_dir after stat,
-        get_file_identity re-stat)                 -> items 1-2 (reuse stat; scandir)
-    ClaimContext is_dir()/is_file() per probe      -> item 3 (pass is_dir into ctx)
-    builtin open() per stable file                 -> item 5 (scope the append probe)
+    logical Path.resolve() (was >1x/entry, now ~1)  -> item 1 (drop redundant resolve)
+    direntry_stat ~1x/entry (was stat+lstat fan-out) -> items 1-2 (reuse stat; scandir)
+    ClaimContext is_dir()/is_file() per probe        -> item 3 (pass is_dir into ctx)
+    builtin open() per stable file                   -> item 5 (scope the append probe)
 
 Run:
     pytest benchmarks/scan_syscalls_test.py -s -v
@@ -75,22 +79,72 @@ def _count_interior_files(root: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
+class _CountingDirEntry:
+    """Wrap an ``os.DirEntry`` to count the ``stat()`` it issues.
+
+    ``DirEntry.stat()`` calls C ``fstatat`` directly, *bypassing* the ``os.stat``
+    Python callable — so patching ``os.stat`` cannot see it. After #56 the state
+    walk's one-stat-per-entry IS a ``DirEntry.stat()``, so without this proxy the
+    counter would silently under-report by ~1 syscall/entry. Everything else
+    delegates to the real entry untouched."""
+
+    __slots__ = ("_e", "_c")
+
+    def __init__(self, entry, counts):
+        self._e = entry
+        self._c = counts
+
+    def stat(self, *args, **kwargs):
+        self._c["direntry_stat"] += 1
+        return self._e.stat(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
+
+
+class _CountingScandir:
+    """Context-manager/iterator wrapper around ``os.scandir`` that yields
+    :class:`_CountingDirEntry` proxies and is otherwise transparent."""
+
+    def __init__(self, real, counts):
+        self._real = real
+        self._c = counts
+
+    def __iter__(self):
+        for entry in self._real:
+            yield _CountingDirEntry(entry, self._c)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 class _SyscallCounter:
     """Count the syscall-bearing primitives the walks issue, by patching them.
 
     Wrappers only count and delegate — they never change behavior — so running a
     walk inside the counter is observably identical, just instrumented. Patches
-    both the os module (true syscalls) and a couple of high-level entry points
-    (``Path.resolve``, ``get_file_identity``) whose *logical* call count is the
-    redundancy signal #56 item 1 is about.
+    the os module (true syscalls, including ``DirEntry.stat`` via a scandir proxy)
+    and a couple of high-level entry points (``Path.resolve``, ``get_file_identity``)
+    whose *logical* call count is the redundancy signal #56 item 1 was about — now
+    a regression signal: after #56 ``logical_resolve`` is ~1, not ~1/entry.
     """
 
     # os-level primitives = true syscalls (a Path method that issues one shows up
     # here too, since the patched os function is what it ultimately calls).
-    _OS_PRIMS = ("stat", "lstat", "scandir", "readlink", "open")
+    # ``scandir`` and ``direntry_stat`` are tracked separately (scandir needs a
+    # proxy to also catch DirEntry.stat), but all count toward the syscall total.
+    _OS_PRIMS = ("stat", "lstat", "readlink", "open")
+    _TRUE_SYSCALL_BUCKETS = _OS_PRIMS + ("scandir", "direntry_stat")
 
     def __init__(self):
-        self.counts = {name: 0 for name in self._OS_PRIMS}
+        self.counts = {name: 0 for name in self._TRUE_SYSCALL_BUCKETS}
         # Logical high-level calls (each fans out into several os-level syscalls).
         self.counts["logical_resolve"] = 0
         self.counts["logical_get_file_identity"] = 0
@@ -120,6 +174,16 @@ class _SyscallCounter:
 
             setattr(os, name, make())
 
+        # --- os.scandir: count the call AND wrap so DirEntry.stat is counted ---
+        orig_scandir = os.scandir
+        self._saved[("os", "scandir")] = orig_scandir
+
+        def scandir_wrapper(*args, **kwargs):
+            c["scandir"] += 1
+            return _CountingScandir(orig_scandir(*args, **kwargs), c)
+
+        os.scandir = scandir_wrapper
+
         # --- builtin open (the append probe, _can_open_for_append) ---
         orig_open = builtins.open
         self._saved[("builtins", "open")] = orig_open
@@ -140,15 +204,16 @@ class _SyscallCounter:
 
         pathlib.Path.resolve = resolve_wrapper
 
-        # --- logical get_file_identity (resolve + os.stat per call) ---
+        # --- logical get_file_identity (now reuses the caller's stat; #56) ---
         # Both walks call it, but each module that does `from ... import
         # get_file_identity` holds its own binding, so patch every such module —
         # patching only discovery would miss the state walk's calls (source_manager).
+        # Accept the optional stat_result arg #56 added.
         orig_identity = discovery.get_file_identity
 
-        def identity_wrapper(path):
+        def identity_wrapper(path, *args, **kwargs):
             c["logical_get_file_identity"] += 1
-            return orig_identity(path)
+            return orig_identity(path, *args, **kwargs)
 
         for mod in (discovery, source_manager):
             self._saved[(mod.__name__, "get_file_identity")] = mod.get_file_identity
@@ -159,6 +224,7 @@ class _SyscallCounter:
         finally:
             for name in self._OS_PRIMS:
                 setattr(os, name, self._saved[("os", name)])
+            os.scandir = self._saved[("os", "scandir")]
             builtins.open = self._saved[("builtins", "open")]
             pathlib.Path.resolve = self._saved[("Path", "resolve")]
             for mod in (discovery, source_manager):
@@ -166,8 +232,8 @@ class _SyscallCounter:
 
     @property
     def total_syscalls(self) -> int:
-        """Sum of the os-level (true-syscall) buckets only."""
-        return sum(self.counts[name] for name in self._OS_PRIMS)
+        """Sum of the true-syscall buckets (os-level + DirEntry.stat)."""
+        return sum(self.counts[name] for name in self._TRUE_SYSCALL_BUCKETS)
 
 
 def _make_manager(root: Path) -> SourceManager:
@@ -357,17 +423,20 @@ class TestSyscallBaseline:
         )
         print(f"--> wrote {out_path}")
 
-        # Light sanity only — this is a measurement, not a correctness gate. We do
-        # NOT hard-code #56's ~20-30 number; we record it.
+        # Records the numbers; the asserts below are regression guards locking in
+        # the #56 state-walk optimization (items 1+2), not the original baseline.
         assert n_files > 0
         assert total > 0
-        # The redundancy #56 item 1 targets: resolve() is issued more than once per
-        # entry across the two walks (is_symlink/resolve in the state walk, identity
-        # in both, _should_scan_path's re-resolve). Lock that in as the "before".
+        # Post-#56 the state walk no longer resolve()s every entry — only the rare
+        # symlink and the root — so resolve() count is far below the entry count.
+        # A regression that reintroduces the per-entry resolve fan-out trips this.
         logical_resolves = (
             state_c.counts["logical_resolve"] + claim_c.counts["logical_resolve"]
         )
-        assert logical_resolves > n_files
+        assert logical_resolves < n_files
+        # And the walks now cost ~1 stat/entry (DirEntry.stat), not the ~14-15 the
+        # baseline measured. Guard a generous ceiling so a future regression is loud.
+        assert per_entry < 5
 
     @pytest.mark.skipif(
         sys.platform != "linux" or shutil.which("strace") is None,
