@@ -291,6 +291,62 @@ class TestLogs:
         assert "Invalid --level" in res.output
 
 
+class TestCacheStats:
+    """`server cache-stats` queries the running daemon's cache hit/miss stats
+    and can emit JSON for scripting."""
+
+    _STATS = {
+        "hits": 80,
+        "misses": 20,
+        "evictions": 3,
+        "pending_waits": 0,
+        "oversized_skips": 0,
+        "ref_held_evictions_skipped": 0,
+        "total_entries": 12,
+        "total_bytes": 5 * 1024 * 1024,
+        "max_bytes": 512 * 1024 * 1024,
+        "pool_stats": {
+            "unified-tiny": {"hits": 50, "misses": 10, "segments": 2, "bytes": 1048576},
+        },
+    }
+
+    def _run(self, monkeypatch, *, running, stats, args=()):
+        monkeypatch.setattr(cli, "_read_pid", lambda: 123 if running else None)
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
+        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        monkeypatch.setattr(cli, "_query_cache_stats", lambda *_a, **_k: stats)
+        return CliRunner().invoke(cli.app, ["server", "cache-stats", *args])
+
+    def test_not_running_exits_1(self, monkeypatch):
+        res = self._run(monkeypatch, running=False, stats=None)
+        assert res.exit_code == 1
+        assert "not running" in res.output
+
+    def test_unreachable_exits_1(self, monkeypatch):
+        # Process up but the cache_stats action failed -> _query_cache_stats None.
+        res = self._run(monkeypatch, running=True, stats=None)
+        assert res.exit_code == 1
+        assert "Could not retrieve cache stats" in res.output
+
+    def test_json_emits_raw_dict(self, monkeypatch):
+        res = self._run(monkeypatch, running=True, stats=self._STATS, args=["--json"])
+        assert res.exit_code == 0, res.output
+        payload = json.loads(res.stdout.strip().splitlines()[-1])
+        assert payload["hits"] == 80 and payload["misses"] == 20
+        assert payload["pool_stats"]["unified-tiny"]["segments"] == 2
+
+    def test_table_renders_hit_rate_and_pools(self, monkeypatch):
+        res = self._run(monkeypatch, running=True, stats=self._STATS)
+        assert res.exit_code == 0, res.output
+        out = res.output
+        assert "Cache Statistics" in out and "80.0%" in out  # 80/(80+20)
+        assert "Per-pool Statistics" in out and "unified-tiny" in out
+
+    def test_hit_rate_guards_empty_cache(self):
+        assert cli._hit_rate(0, 0) == "n/a"
+        assert cli._hit_rate(3, 1) == "75.0%"
+
+
 class TestWinRequestShutdown:
     def test_writes_fixed_sentinel_file(self, tmp_path, monkeypatch):
         # Redirect the biopb data dir to a temp location.

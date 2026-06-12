@@ -577,6 +577,27 @@ def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
                 pass
 
 
+def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
+    """Return the server's cache-stats dict, or None if unreachable / no cache."""
+    try:
+        from biopb.tensor.client import TensorFlightClient
+    except Exception:
+        return None
+    client = None
+    try:
+        client = TensorFlightClient(location, cache_bytes=0, token=token)
+        return client.cache_stats()
+    except Exception:
+        return None
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 @server_app.command("status")
 def status(
     config: Path = typer.Option(
@@ -763,6 +784,96 @@ def logs(
     finally:
         f.close()
     raise typer.Exit(0)
+
+
+def _fmt_mb(n_bytes: int) -> str:
+    """Format a byte count as MB."""
+    return f"{n_bytes / (1024 * 1024):.1f} MB"
+
+
+def _hit_rate(hits: int, misses: int) -> str:
+    """Hit rate as a percentage string (guards divide-by-zero)."""
+    total = hits + misses
+    return f"{(hits / total * 100):.1f}%" if total else "n/a"
+
+
+def _render_cache_stats(stats: dict) -> None:
+    """Render a CacheStats dict (from TensorFlightClient.cache_stats) as tables."""
+    g = stats.get
+    table = Table(title="Cache Statistics")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green", justify="right")
+
+    hits, misses = g("hits", 0), g("misses", 0)
+    table.add_row("Hits", str(hits))
+    table.add_row("Misses", str(misses))
+    table.add_row("Hit rate", _hit_rate(hits, misses))
+    table.add_row("Evictions", str(g("evictions", 0)))
+    table.add_row("Pending waits", str(g("pending_waits", 0)))
+    table.add_row("Oversized skips", str(g("oversized_skips", 0)))
+    table.add_row("Ref-held evictions skipped", str(g("ref_held_evictions_skipped", 0)))
+    table.add_row("Entries", str(g("total_entries", 0)))
+    table.add_row("Size", _fmt_mb(g("total_bytes", 0)))
+    if g("max_entries", 0):
+        table.add_row("Max entries", str(g("max_entries")))
+    if g("max_bytes", 0):
+        table.add_row("Max size", _fmt_mb(g("max_bytes")))
+    console.print(table)
+
+    pool_stats = stats.get("pool_stats") or {}
+    if pool_stats:
+        ptable = Table(title="Per-pool Statistics")
+        for col in ("Pool", "Hits", "Misses", "Hit rate", "Segments", "Size"):
+            ptable.add_column(
+                col,
+                style="cyan" if col == "Pool" else "green",
+                justify="left" if col == "Pool" else "right",
+            )
+        for name, p in sorted(pool_stats.items()):
+            ptable.add_row(
+                name,
+                str(p.get("hits", 0)),
+                str(p.get("misses", 0)),
+                _hit_rate(p.get("hits", 0), p.get("misses", 0)),
+                str(p.get("segments", 0)),
+                _fmt_mb(p.get("bytes", 0)),
+            )
+        console.print(ptable)
+
+
+@server_app.command("cache-stats")
+def cache_stats(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show cache hit/miss diagnostics from the running server."""
+    pid = _read_pid()
+    if not pid or not _is_process_running(pid):
+        console.print("[yellow]TensorFlight server is not running.[/yellow]")
+        raise typer.Exit(1)
+
+    location, env_token = _resolve_grpc_endpoint(config)
+    stats = _query_cache_stats(location, token or env_token)
+
+    if stats is None:
+        console.print(
+            "[red]Could not retrieve cache stats[/red] "
+            "(server unreachable or cache not initialized)."
+        )
+        raise typer.Exit(1)
+
+    if json_output:
+        print(json.dumps(stats))
+        raise typer.Exit(0)
+
+    _render_cache_stats(stats)
 
 
 if __name__ == "__main__":
