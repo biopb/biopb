@@ -336,8 +336,8 @@ wheels = [
 
 [[package]]
 name = "biopb"
-version = "0.6.3"
-source = { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb-0.6.3-py3-none-any.whl" }
+version = "0.6.4"
+source = { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb-0.6.4-py3-none-any.whl" }
 dependencies = [
     { name = "grpcio" },
     { name = "imageio" },
@@ -346,7 +346,7 @@ dependencies = [
     { name = "typer" },
 ]
 wheels = [
-    { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb-0.6.3-py3-none-any.whl", hash = "sha256:a637fb4ba0fee3b963df7577e5a8e105edb97b0f2e7ce4c1b2093d596905434e" },
+    { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb-0.6.4-py3-none-any.whl", hash = "sha256:f542f741f244f61c381837a04e1eee24a539f2cac0bacd9d4b728884d4bf77d5" },
 ]
 
 [package.optional-dependencies]
@@ -363,6 +363,7 @@ tensor = [
 [package.metadata]
 requires-dist = [
     { name = "aicsimageio", marker = "extra == 'tensor'", specifier = ">=4.14.0" },
+    { name = "biopb-mcp", marker = "extra == 'test'" },
     { name = "cachey", marker = "extra == 'tensor'", specifier = ">=0.1.0" },
     { name = "dask", extras = ["array"], marker = "extra == 'tensor'", specifier = ">=2024.0.0" },
     { name = "grpcio" },
@@ -432,7 +433,7 @@ testing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "biopb", extras = ["tensor"], specifier = ">=0.6.3" },
+    { name = "biopb", extras = ["tensor"], specifier = ">=0.6.4" },
     { name = "distributed", marker = "extra == 'mcp'" },
     { name = "grpcio-health-checking" },
     { name = "ipykernel", marker = "extra == 'mcp'" },
@@ -455,14 +456,14 @@ provides-extras = ["tables", "mcp", "3d"]
 
 [package.metadata.requires-dev]
 integration = [
-    { name = "biopb", extras = ["tensor"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb-0.6.3-py3-none-any.whl" },
+    { name = "biopb", extras = ["tensor"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb-0.6.4-py3-none-any.whl" },
     { name = "biopb-mcp", extras = ["mcp"] },
-    { name = "biopb-tensor-server", extras = ["web"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb_tensor_server-0.4.3-py3-none-any.whl" },
+    { name = "biopb-tensor-server", extras = ["web"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb_tensor_server-0.4.4-py3-none-any.whl" },
 ]
 testing = [
-    { name = "biopb", extras = ["tensor"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb-0.6.3-py3-none-any.whl" },
+    { name = "biopb", extras = ["tensor"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb-0.6.4-py3-none-any.whl" },
     { name = "biopb-mcp", extras = ["mcp"] },
-    { name = "biopb-tensor-server", extras = ["web"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb_tensor_server-0.4.3-py3-none-any.whl" },
+    { name = "biopb-tensor-server", extras = ["web"], url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb_tensor_server-0.4.4-py3-none-any.whl" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-env" },
@@ -472,8 +473,8 @@ testing = [
 
 [[package]]
 name = "biopb-tensor-server"
-version = "0.4.3"
-source = { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb_tensor_server-0.4.3-py3-none-any.whl" }
+version = "0.4.4"
+source = { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb_tensor_server-0.4.4-py3-none-any.whl" }
 dependencies = [
     { name = "biopb" },
     { name = "dask", extra = ["array"] },
@@ -487,7 +488,7 @@ dependencies = [
     { name = "zarr" },
 ]
 wheels = [
-    { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.3/biopb_tensor_server-0.4.3-py3-none-any.whl", hash = "sha256:8f4d78abfda1ac10bdc455e73fd7e8c4c48e7d7a75863e1adc05ee15f8ebaa8e" },
+    { url = "https://github.com/biopb/biopb/releases/download/server-v0.4.4/biopb_tensor_server-0.4.4-py3-none-any.whl", hash = "sha256:3f80c384bf7c427ff6ff124dddc1d119821a80e2f4c2d9b282010d85ea80ee6c" },
 ]
 
 [package.optional-dependencies]
