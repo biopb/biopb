@@ -7,17 +7,21 @@ syscalls are redundant:
 
 - the **state walk** ``SourceManager._scan_tree_state`` — captures a stat-signature
   per entry for change/stability tracking;
-- the **claim walk** ``discover_sources`` / ``walk_with_identity_tracking`` — asks
-  the adapters to claim each stable entry.
+- the **claim walk** — asks the adapters to claim each stable entry. Post-#56 item 4
+  this no longer re-walks the filesystem: ``discover_sources_from_entries`` drives the
+  claim protocol straight off the state walk's snapshot, so the second walk's per-entry
+  ``stat``/``lstat``/``resolve``/``get_file_identity`` are gone and each adapter reads
+  ``is_dir``/``is_file`` from the cached flag instead of re-stat'ing.
 
 The issue is explicit that we **measure first** before optimizing. This module is
 that measurement: it drives one forced rescan over a representative tree and counts
-the syscall-bearing primitives, attributed per walk and per primitive. It started
-as the pre-optimization baseline; with the state-walk rewrite landed (#56 items 1+2:
-``os.scandir`` + one reused stat per entry), it now also serves as the **regression
-guard** that locks that win in — ``logical_resolve`` is ~1, not ~1/entry, and the
-walks cost ~1 stat/entry, not the ~14-15 the baseline measured. **It changes no
-walk code.**
+the syscall-bearing primitives, attributed per walk and per primitive. It started as
+the pre-optimization baseline; with the state-walk rewrite (items 1+2: ``os.scandir``
++ one reused stat per entry) and the single-traversal claim phase (items 3+4) landed,
+it now also serves as the **regression guard** locking those wins in — ``logical_resolve``
+is ~1 (not ~1/entry), the state walk costs ~1 stat/entry (not ~14-15), and the claim
+column's ``stat``/``scandir``/``logical_resolve`` collapse to ~0 (only genuine adapter
+content probes remain). **It changes no walk code.**
 
 Two complementary mechanisms:
 
@@ -36,7 +40,8 @@ Each bucket maps to the #56 inventory item it relates to:
 
     logical Path.resolve() (was >1x/entry, now ~1)  -> item 1 (drop redundant resolve)
     direntry_stat ~1x/entry (was stat+lstat fan-out) -> items 1-2 (reuse stat; scandir)
-    ClaimContext is_dir()/is_file() per probe        -> item 3 (pass is_dir into ctx)
+    claim-walk stat/is_dir/is_file per probe (was    -> items 3-4 (cache is_dir; drive
+        ~16x/entry, now ~0)                                claims from the snapshot)
     builtin open() per stable file                   -> item 5 (scope the append probe)
 
 Run:
@@ -55,7 +60,10 @@ from pathlib import Path
 import pytest
 
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import DiscoveryState, discover_sources
+from biopb_tensor_server.discovery import (
+    DiscoveryState,
+    discover_sources_from_entries,
+)
 from biopb_tensor_server.source_manager import SourceManager
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
@@ -243,8 +251,8 @@ def _make_manager(root: Path) -> SourceManager:
     discovery gate on the first pass (so the claim walk actually probes the whole
     tree); ``probe_open_files=True`` exercises the per-file append probe (#56 item 5);
     ``full_rescan_interval=0`` forces the full sweep. ``server=None`` is safe: the two
-    measured methods (``_refresh_entry_state``, ``discover_sources``) never touch it —
-    only reconcile/registration would, and we don't run that here.
+    measured methods (``_refresh_entry_state`` and the snapshot-driven claim phase)
+    never touch it — only reconcile/registration would, and we don't run that here.
     """
     return SourceManager(
         server=None,
@@ -266,12 +274,15 @@ def _run_state_walk(manager: SourceManager) -> None:
 
 
 def _run_claim_walk(manager: SourceManager, root: Path):
-    """Phase 2: adapter discovery, gated by the state walk's stability bookkeeping —
-    exactly how ``_handle_rescan`` drives it."""
-    return discover_sources(
-        root,
+    """Phase 2: adapter discovery driven from the state walk's published snapshot —
+    exactly how ``_handle_rescan`` drives it post-#56 item 4 (no second filesystem
+    walk). ``_run_state_walk`` published ``_entry_state``/``_skipped_stable_dirs``, so
+    this consumes them just like the runtime rescan does."""
+    return discover_sources_from_entries(
+        ((path_str, entry[0]) for path_str, entry in manager._entry_state.items()),
         manager._registry,
-        path_filter=manager._should_scan_path,
+        path_filter=manager._should_scan_resolved,
+        skipped_dirs=manager._skipped_stable_dirs,
     )
 
 

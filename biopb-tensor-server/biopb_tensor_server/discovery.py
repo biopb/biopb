@@ -28,6 +28,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
@@ -226,27 +227,53 @@ class ClaimContext:
     allowing claim() to work with both filesystem types uniformly.
     """
 
-    def __init__(self, path: Path | str, store: Optional["RemoteStore"] = None):
+    def __init__(
+        self,
+        path: Path | str,
+        store: Optional["RemoteStore"] = None,
+        is_dir: Optional[bool] = None,
+    ):
         self._path = Path(path) if store is None else None
         self._store = store
         self._remote_path = str(path) if store is not None else None
+        # When the caller already knows this entry's kind — the snapshot-driven
+        # discovery hands in the ``is_directory`` the state walk computed from its
+        # single ``DirEntry.stat()`` — cache it so ``is_dir``/``is_file``/``exists``
+        # answer without re-stat'ing the entry. Every registered adapter's
+        # ``claim()`` opens with an ``is_file()``/``is_dir()`` gate, so each rescan
+        # entry was being stat'd once per adapter (~16×) for a fact the walk already
+        # held (biopb/biopb#56, items 3+4). Local contexts only; ``join()``
+        # sub-contexts get no cache, so structural probes (``.zattrs``, ``zarr.json``,
+        # ``NDTiff.index``, …) still stat live.
+        self._cached_is_dir = is_dir if store is None else None
 
     def is_dir(self) -> bool:
         """Check if path is directory."""
         if self._store:
             return self._store.isdir(self._remote_path)
+        if self._cached_is_dir is not None:
+            return self._cached_is_dir
         return self._path.is_dir()
 
     def is_file(self) -> bool:
         """Check if path is file."""
         if self._store:
             return self._store.isfile(self._remote_path)
+        if self._cached_is_dir is not None:
+            # The entry exists (it came from a successful stat) and is not a
+            # directory ⇒ a file for claim purposes. Differs from ``Path.is_file()``
+            # (S_ISREG) only for the rare non-regular entry (socket/fifo/device),
+            # which every file-gated adapter rejects at its next extension/content
+            # check anyway.
+            return not self._cached_is_dir
         return self._path.is_file()
 
     def exists(self) -> bool:
         """Check if path exists."""
         if self._store:
             return self._store.exists(self._remote_path)
+        if self._cached_is_dir is not None:
+            return True
         return self._path.exists()
 
     def read_text(self, subpath: str = "") -> str:
@@ -791,6 +818,95 @@ def discover_sources(
 
     logger.debug(
         f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources"
+    )
+    return state
+
+
+def discover_sources_from_entries(
+    entries: Iterable[Tuple[str, bool]],
+    registry: AdapterRegistry,
+    state: Optional[DiscoveryState] = None,
+    dim_labels: Optional[List[str]] = None,
+    path_filter: Optional[Callable[[str], bool]] = None,
+    skipped_dirs: Optional[Set[str]] = None,
+) -> DiscoveryState:
+    """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
+
+    The periodic rescan already walks every monitored tree once to capture
+    stat-signatures (``SourceManager._scan_tree_state``). That walk holds everything
+    the claim phase needs — each entry's resolved path and whether it is a directory —
+    so re-walking the filesystem a second time just to probe adapters is pure
+    duplication (it was ~96% of the post-#61 rescan syscalls). This drives the same
+    claim protocol as :func:`discover_sources` straight off that snapshot
+    (biopb/biopb#56, item 4).
+
+    ``entries`` is an ordered ``(resolved_path_str, is_dir)`` stream in **DFS
+    parent-first order** (the order ``_scan_tree_state`` inserts into its state dict),
+    which is what lets a directory-level claim or skip prune its whole subtree before
+    any interior entry is probed.
+
+    Behavior is kept identical to a :func:`discover_sources` walk over the same tree:
+
+    - ``skipped_dirs`` (stable subtrees the state walk pruned) and any directory that
+      fails ``path_filter`` prune their entire subtree — mirroring how the walk does
+      not descend past a filtered/skipped directory. ``skipped_dirs`` descendants are
+      carried forward in the snapshot, so without this they would be re-probed; their
+      claims are preserved separately (``SourceManager._preserve_skipped_claims``).
+    - a claimed directory prunes its subtree (interior zarr chunk files etc. belong to
+      it by construction — biopb/biopb#55).
+    - ``path_filter`` (the stability gate) receives the already-resolved path string.
+
+    The prune set is maintained as a stack, exploiting the parent-first ordering: a
+    prefix is pushed when its subtree must be skipped and popped as soon as an entry
+    falls outside it, so the per-entry prune check stays O(1) amortized rather than
+    O(entries × prefixes).
+    """
+    if state is None:
+        state = DiscoveryState()
+
+    skipped = skipped_dirs or set()
+    prune_stack: List[str] = []
+
+    def _under(path_str: str, prefix: str) -> bool:
+        return path_str == prefix or path_str.startswith(prefix + os.sep)
+
+    for path_str, is_dir in entries:
+        # Drop prune prefixes we have walked out of (DFS contiguity), then skip
+        # anything still beneath an active one (a claimed source or a skipped subtree).
+        while prune_stack and not _under(path_str, prune_stack[-1]):
+            prune_stack.pop()
+        if prune_stack:
+            continue
+
+        # A stable skipped subtree: prune the root and everything beneath it.
+        if path_str in skipped:
+            prune_stack.append(path_str)
+            continue
+
+        # Consumed as a member of an already-recorded multi-file claim (companion
+        # OME, tiff/dicom series siblings) — same skip the walk applies.
+        if state.is_path_claimed(path_str):
+            continue
+
+        # Stability gate. A directory that is not yet eligible is not descended —
+        # exactly as the walk's path_filter short-circuits its recursion.
+        if path_filter is not None and not path_filter(path_str):
+            if is_dir:
+                prune_stack.append(path_str)
+            continue
+
+        ctx = ClaimContext(Path(path_str), is_dir=is_dir)
+        claims = registry.get_claims_for_path(ctx, state)
+        if claims:
+            claim = claims[0]
+            if claim.dim_labels is None and dim_labels is not None:
+                claim.dim_labels = dim_labels
+            state.add_claim(claim)
+            if is_dir:
+                prune_stack.append(path_str)
+
+    logger.debug(
+        "discover_sources_from_entries: found %d sources", len(state.claims)
     )
     return state
 

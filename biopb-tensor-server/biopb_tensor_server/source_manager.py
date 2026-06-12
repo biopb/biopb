@@ -20,7 +20,7 @@ from biopb_tensor_server.discovery import (
     AdapterRegistry,
     DiscoveryState,
     SourceClaim,
-    discover_sources,
+    discover_sources_from_entries,
     get_file_identity,
     is_remote_url,
     should_skip_walk_entry,
@@ -236,18 +236,21 @@ class SourceManager:
 
         rescan_succeeded = False
         try:
-            discovered_state = DiscoveryState()
-            for monitored_dir in sorted(self._monitored_dirs):
-                resolved_dir = monitored_dir.resolve()
-                if str(resolved_dir) in skipped_dirs:
-                    continue
-                discover_sources(
-                    monitored_dir,
-                    self._registry,
-                    state=discovered_state,
-                    dim_labels=self._dim_labels,
-                    path_filter=self._should_scan_path,
-                )
+            # Single traversal: the state walk above already visited every entry and
+            # recorded its (resolved path, is_directory) into next_state in DFS
+            # parent-first order. Drive the claim phase straight off that snapshot
+            # instead of re-walking the filesystem a second time — the duplicate walk
+            # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
+            # skipped_dirs prunes the stable subtrees the state walk carried forward
+            # (their claims are preserved below), exactly as the old per-dir
+            # `if ... in skipped_dirs: continue` did for whole roots.
+            discovered_state = discover_sources_from_entries(
+                ((path_str, entry[0]) for path_str, entry in next_state.items()),
+                self._registry,
+                dim_labels=self._dim_labels,
+                path_filter=self._should_scan_resolved,
+                skipped_dirs=skipped_dirs,
+            )
 
             self._preserve_skipped_claims(discovered_state, skipped_dirs)
 
@@ -618,14 +621,25 @@ class SourceManager:
             resolved_path = path.resolve(strict=False)
         except OSError:
             return False
+        return self._should_scan_resolved(str(resolved_path))
 
-        if resolved_path.name.startswith("."):
+    def _should_scan_resolved(self, resolved_str: str) -> bool:
+        """Stability gate for an entry whose resolved path string is already known.
+
+        The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
+        keys, which ``_scan_tree_state`` already stored as resolved path strings, so
+        the per-entry ``Path.resolve()`` ``_should_scan_path`` would otherwise repeat
+        is pure waste. Same predicate and the same load-bearing
+        ``_entry_pending_scan`` clear-on-pass side effect (the #53 subtree-pending
+        prune gate depends on it) — only the redundant resolve is dropped.
+        """
+        if os.path.basename(resolved_str).startswith("."):
             return False
 
-        if str(resolved_path) in self._skipped_stable_dirs:
+        if resolved_str in self._skipped_stable_dirs:
             return False
 
-        entry = self._entry_state.get(str(resolved_path))
+        entry = self._entry_state.get(resolved_str)
         if entry is None:
             return False
 
@@ -634,17 +648,17 @@ class SourceManager:
             return False
 
         stable_observations = self._entry_stable_observations.get(
-            str(resolved_path),
+            resolved_str,
             self._stable_rescans_required,
         )
         if stable_observations < self._stable_rescans_required:
             return False
 
         if not entry[0] and self._probe_open_files:
-            if not self._can_open_for_append(resolved_path):
+            if not self._can_open_for_append(Path(resolved_str)):
                 return False
 
-        self._entry_pending_scan[str(resolved_path)] = False
+        self._entry_pending_scan[resolved_str] = False
         return True
 
     def _can_open_for_append(self, path: Path) -> bool:
