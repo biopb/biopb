@@ -7,6 +7,7 @@ Commands:
     list       List tensors in a config file
 """
 
+import logging
 import os
 import secrets
 import signal
@@ -19,7 +20,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb_tensor_server.adapters import get_default_registry
+from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
@@ -45,6 +46,7 @@ app = typer.Typer(
     help="BioPB Tensor: Arrow Flight server for multi-dimensional arrays",
 )
 console = Console()
+logger = logging.getLogger(__name__)
 
 diag_app = typer.Typer(help="Diagnostic commands for a running TensorFlight server")
 app.add_typer(diag_app, name="diagnose")
@@ -101,6 +103,79 @@ def _graceful_shutdown(
             manager.close()
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]Error closing cache: {e}[/yellow]")
+
+
+def _resolve_serve_sources(
+    server_config: ServerConfig,
+    registry: Optional[AdapterRegistry] = None,
+) -> Tuple[List[SourceConfig], List[SourceConfig]]:
+    """Partition configured sources for the serve path.
+
+    Returns ``(static_sources, monitored_sources)``.
+
+    Local ``monitor = true`` directories are NOT expanded here: they are
+    (re)discovered by the bootstrap rescan, so expanding them at startup only
+    walks the tree an extra time before the server binds and crashes on a
+    not-yet-mounted directory (biopb/biopb#54). Remote monitor entries and
+    non-monitored entries are expanded as before; a single-file ``monitor=true``
+    entry is registered statically (with a warning) instead of being silently
+    dropped, and a missing/broken static source is warned-and-skipped rather
+    than aborting startup.
+    """
+    to_expand: List[SourceConfig] = []  # entries run through discover_sources
+    monitored_sources: List[SourceConfig] = []
+
+    for s in server_config.sources:
+        if s.monitor and not s.is_remote:
+            local_path = s.local_path
+            if local_path is not None and local_path.is_file():
+                # Files cannot be live-monitored: register as a static source
+                # instead of silently dropping it.
+                logger.warning(
+                    "Cannot live-monitor a single file; registering it as a "
+                    "static source: %s",
+                    s.url,
+                )
+                to_expand.append(s)
+                continue
+            if local_path is not None and not local_path.exists():
+                # Not-yet-mounted dir: skip the (crashing) expansion. The watcher
+                # and rescan pick it up when it appears (the runtime self-heals).
+                logger.warning(
+                    "Monitored path does not exist yet; will start monitoring "
+                    "when it appears: %s",
+                    s.url,
+                )
+            monitored_sources.append(s)  # directory (or not-yet-mounted dir)
+            continue
+
+        # Remote monitor entries keep current behavior: registered statically
+        # AND passed to create_source_manager (which logs the no-monitor notice).
+        if s.monitor:
+            monitored_sources.append(s)
+        to_expand.append(s)
+
+    # Expand only the non-monitored-dir entries. tolerant=True so one missing or
+    # broken static source is warned-and-skipped rather than killing the server.
+    sources = resolve_all_sources(
+        server_config, registry, sources=to_expand, tolerant=True
+    )
+
+    # Static sources: those NOT under a monitored directory (or remote sources).
+    # Still needed when a non-monitored entry's expansion lands under a
+    # monitored root. Remote sources are always static (no filesystem monitoring).
+    monitored_dirs = {
+        ms.local_path
+        for ms in monitored_sources
+        if not ms.is_remote and ms.local_path
+    }
+    static_sources = [
+        s for s in sources
+        if s.is_remote or (s.local_path and not any(
+            s.local_path.is_relative_to(md) for md in monitored_dirs
+        ))
+    ]
+    return static_sources, monitored_sources
 
 
 def _setup_flight_server(
@@ -223,26 +298,11 @@ def _setup_flight_server(
         )
         CacheManager.initialize(CacheConfig())
 
-    # Resolve and separate sources
-    sources = resolve_all_sources(server_config)
-    monitored_sources = [s for s in server_config.sources if s.monitor]
-
-    # Get monitored directory paths to filter out sources discovered from them
-    # Sources under monitored dirs will be discovered via rescan, not static registration
-    monitored_dirs = {
-        ms.local_path
-        for ms in monitored_sources
-        if not ms.is_remote and ms.local_path
-    }
-
-    # Static sources: those NOT under monitored directories (or remote sources)
-    # Remote sources are always static (no filesystem monitoring)
-    static_sources = [
-        s for s in sources
-        if s.is_remote or (s.local_path and not any(
-            s.local_path.is_relative_to(md) for md in monitored_dirs
-        ))
-    ]
+    # Resolve and separate sources (see _resolve_serve_sources)
+    registry = get_default_registry()
+    static_sources, monitored_sources = _resolve_serve_sources(
+        server_config, registry
+    )
 
     if not static_sources and not monitored_sources:
         console.print("[yellow]Warning: No data sources configured[/yellow]")
@@ -264,9 +324,6 @@ def _setup_flight_server(
         f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
         f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
     )
-
-    # Create registry for adapters
-    registry = get_default_registry()
 
     # Create metadata database if enabled
     metadata_db: Optional[MetadataDatabase] = None

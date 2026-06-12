@@ -65,6 +65,7 @@ credentials_profile = "aws-prod"
 from __future__ import annotations
 
 import getpass
+import logging
 import os
 import sys
 import tempfile
@@ -91,6 +92,8 @@ from biopb_tensor_server.remote import (
 
 # Alias for backward compatibility with internal usage
 _is_remote_url = is_remote_url
+
+logger = logging.getLogger(__name__)
 
 # Python 3.11+ has tomllib in stdlib
 if sys.version_info >= (3, 11):
@@ -1018,7 +1021,11 @@ def _claim_to_source_config(
 
 
 def resolve_all_sources(
-    config: ServerConfig, registry: Optional[AdapterRegistry] = None
+    config: ServerConfig,
+    registry: Optional[AdapterRegistry] = None,
+    *,
+    sources: Optional[List[SourceConfig]] = None,
+    tolerant: bool = False,
 ) -> List[SourceConfig]:
     """Resolve all sources in config, expanding directories.
 
@@ -1027,6 +1034,16 @@ def resolve_all_sources(
     Args:
         config: Server configuration
         registry: Optional adapter registry (uses default if None)
+        sources: Optional explicit list of source entries to expand. When None,
+            ``config.sources`` is used. The serve path passes a filtered subset
+            (local ``monitor=true`` directories are discovered by the rescan
+            instead, not expanded here) to avoid an extra pre-bind walk that also
+            crashes on a not-yet-mounted directory (biopb/biopb#54).
+        tolerant: When True, a source that fails to resolve (e.g. a missing
+            static path) is logged and skipped instead of aborting the whole
+            expansion. Used by the serve path so one bad entry cannot take down
+            the server; ``validate``/``list_tensors`` keep the default (False) so
+            a broken source is surfaced as a hard error.
 
     Returns:
         List of all concrete SourceConfig objects (one per data source)
@@ -1034,11 +1051,23 @@ def resolve_all_sources(
     if registry is None:
         registry = get_default_registry()
 
+    source_list = sources if sources is not None else config.sources
+
     all_sources = []
     hdf5_warnings = []
 
-    for source in config.sources:
-        discovered = discover_sources(source, registry)
+    for source in source_list:
+        try:
+            discovered = discover_sources(source, registry)
+        except Exception as e:
+            if not tolerant:
+                raise
+            logger.warning(
+                "Skipping source that could not be resolved: %s (%s)",
+                source.url,
+                e,
+            )
+            continue
         for src in discovered:
             # Track HDF5 sources that need dataset config
             if src.type == "hdf5" and src.dataset is None:
