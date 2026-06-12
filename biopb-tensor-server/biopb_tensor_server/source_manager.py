@@ -413,6 +413,17 @@ class SourceManager:
                 # matches the old resolved_path.stat() for the signature/identity.
                 is_symlink = dir_entry.is_symlink()
                 stat_result = dir_entry.stat()
+                # On Windows, DirEntry.stat() always reports st_ino/st_dev/st_nlink
+                # as zero (they are expensive to compute), so the cheap cached stat
+                # is missing the very fields the entry signature and file identity
+                # key on. The claim walk takes a real os.stat (real inode on NTFS),
+                # so a zeroed signature here would never match and every rescan would
+                # spuriously cycle the source (biopb/biopb#56). Pay one real stat to
+                # backfill the identity fields; POSIX DirEntry.stat() already does a
+                # real stat, so this only fires on Windows and the syscall-cut win is
+                # untouched.
+                if stat_result.st_ino == 0:
+                    stat_result = os.stat(dir_entry.path)
             else:
                 # Root: _refresh_entry_state hands it in pre-resolved, so it is
                 # canonical and not itself a symlink.
