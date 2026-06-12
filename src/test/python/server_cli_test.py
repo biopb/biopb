@@ -182,6 +182,115 @@ class TestStatusHealth:
         assert "starting" not in res.output and "waiting" not in res.output
 
 
+class TestLogLineHelpers:
+    """Pure helpers behind `server logs --level`: parsing a line's level and
+    filtering with carry-forward for off-format continuation lines."""
+
+    def test_line_level_parses_format(self):
+        line = "[2026-06-12 10:00:00] WARNING biopb_tensor_server.x: msg"
+        assert cli._line_level(line) == "WARNING"
+
+    def test_line_level_none_for_off_format(self):
+        assert cli._line_level("--- Started at 2026-06-12 10:00:00 ---") is None
+        assert cli._line_level("") is None
+        assert cli._line_level("    File \"foo.py\", line 3, in bar") is None
+        # A bracketed-but-unknown token is not a level.
+        assert cli._line_level("[2026-06-12 10:00:00] NOTALEVEL x: y") is None
+
+    def test_filter_none_keeps_all(self):
+        lines = ["[t] INFO a: x", "plain", "[t] ERROR a: y"]
+        assert cli._filter_lines(lines, None) == lines
+
+    def test_filter_drops_below_threshold(self):
+        lines = [
+            "[t] DEBUG a: d",
+            "[t] INFO a: i",
+            "[t] WARNING a: w",
+            "[t] ERROR a: e",
+        ]
+        assert cli._filter_lines(lines, "WARNING") == [
+            "[t] WARNING a: w",
+            "[t] ERROR a: e",
+        ]
+
+    def test_filter_carries_continuation_with_kept_record(self):
+        # A kept WARNING carries its off-format traceback continuation lines.
+        lines = [
+            "[t] INFO a: dropped",
+            "[t] WARNING a: boom",
+            "Traceback (most recent call last):",
+            "    raise ValueError",
+            "[t] DEBUG a: dropped-again",
+        ]
+        assert cli._filter_lines(lines, "WARNING") == [
+            "[t] WARNING a: boom",
+            "Traceback (most recent call last):",
+            "    raise ValueError",
+        ]
+
+    def test_filter_initial_decision_is_keep(self):
+        # Leading off-format banner before any leveled line is kept.
+        lines = ["--- Started ---", "[t] ERROR a: e"]
+        assert cli._filter_lines(lines, "ERROR") == lines
+
+
+class TestLogs:
+    """`server logs` reads ~/.local/share/biopb/logs/tensor-server.log."""
+
+    @pytest.fixture
+    def log_file(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        monkeypatch.setattr(cli, "LOG_DIR", log_dir)
+        return log_dir / "tensor-server.log"
+
+    def _run(self, *args):
+        res = CliRunner().invoke(cli.app, ["server", "logs", *args])
+        return res
+
+    def test_path_prints_and_exits(self, log_file):
+        res = self._run("--path")
+        assert res.exit_code == 0
+        assert str(log_file) in res.output
+
+    def test_missing_file_is_not_an_error(self, log_file):
+        res = self._run()
+        assert res.exit_code == 0
+        assert "No log file" in res.output
+
+    def test_tail_last_n_lines(self, log_file):
+        log_file.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
+        res = self._run("-n", "5")
+        assert res.exit_code == 0
+        out = res.output.strip().splitlines()
+        assert out == ["line 15", "line 16", "line 17", "line 18", "line 19"]
+
+    def test_level_filter_drops_below_threshold(self, log_file):
+        log_file.write_text(
+            "[t] INFO a: i\n[t] DEBUG a: d\n[t] WARNING a: w\n[t] ERROR a: e\n"
+        )
+        res = self._run("--level", "WARNING")
+        assert res.exit_code == 0
+        assert "WARNING a: w" in res.output and "ERROR a: e" in res.output
+        assert "INFO a: i" not in res.output and "DEBUG a: d" not in res.output
+
+    def test_level_filter_keeps_continuation(self, log_file):
+        log_file.write_text(
+            "[t] INFO a: i\n[t] WARNING a: boom\ncontinuation trace\n"
+        )
+        res = self._run("--level", "warning")  # case-insensitive
+        assert res.exit_code == 0
+        assert "WARNING a: boom" in res.output
+        assert "continuation trace" in res.output
+        assert "INFO a: i" not in res.output
+
+    def test_invalid_level_exits_1(self, log_file):
+        log_file.write_text("[t] INFO a: i\n")
+        res = self._run("--level", "FOO")
+        assert res.exit_code == 1
+        assert "Invalid --level" in res.output
+
+
 class TestWinRequestShutdown:
     def test_writes_fixed_sentinel_file(self, tmp_path, monkeypatch):
         # Redirect the biopb data dir to a temp location.

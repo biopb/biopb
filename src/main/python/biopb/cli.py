@@ -249,6 +249,51 @@ def _get_log_file() -> Path:
     return LOG_DIR / "tensor-server.log"
 
 
+# Severity ranks for the `--level` filter, matching the daemon's log format
+# `[asctime] LEVEL name: message` (DEFAULT_LOG_FORMAT in
+# biopb_tensor_server.logging_config).
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+def _line_level(line: str) -> Optional[str]:
+    """Return the log level of a formatted line, or None if it has none.
+
+    Lines look like `[2026-06-12 10:00:00] WARNING biopb_tensor_server.x: msg`.
+    Returns None for anything off-format - the `--- Started at ... ---` banners
+    the daemon writes, blank lines, and multi-line traceback continuations.
+    """
+    if not line.startswith("["):
+        return None
+    try:
+        after_ts = line.split("] ", 1)[1]
+    except IndexError:
+        return None
+    token = after_ts.split(" ", 1)[0]
+    return token if token in _LOG_LEVELS else None
+
+
+def _filter_lines(lines, min_level: Optional[str]):
+    """Keep lines at or above `min_level`. With min_level None, keep all.
+
+    Off-format lines (no parseable level) inherit the previous line's keep/drop
+    decision, so a kept WARNING record carries its traceback continuation lines
+    along and a dropped INFO record takes its continuations with it. The initial
+    decision (before any leveled line) is keep.
+    """
+    if min_level is None:
+        return list(lines)
+    threshold = _LOG_LEVELS[min_level]
+    kept = []
+    keeping = True
+    for line in lines:
+        lvl = _line_level(line)
+        if lvl is not None:
+            keeping = _LOG_LEVELS[lvl] >= threshold
+        if keeping:
+            kept.append(line)
+    return kept
+
+
 def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
     """Rotate log file if it exceeds max_bytes, keeping up to backup_count backups."""
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
@@ -627,6 +672,97 @@ def status(
     table.add_row("PID file", str(PID_FILE))
     table.add_row("Log file", str(_get_log_file()))
     console.print(table)
+
+
+@server_app.command("logs")
+def logs(
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Stream new log lines as they are written"
+    ),
+    lines: int = typer.Option(
+        200, "--lines", "-n", help="Number of lines from the end to show (0 = all)"
+    ),
+    level: Optional[str] = typer.Option(
+        None,
+        "--level",
+        help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+    ),
+    path: bool = typer.Option(
+        False, "--path", help="Print the log file path and exit"
+    ),
+):
+    """Show the TensorFlight server daemon log."""
+    log_file = _get_log_file()
+
+    if path:
+        print(log_file)
+        raise typer.Exit(0)
+
+    min_level: Optional[str] = None
+    if level is not None:
+        min_level = level.upper()
+        if min_level not in _LOG_LEVELS:
+            console.print(
+                f"[red]Invalid --level '{level}'.[/red] "
+                f"Choose one of: {', '.join(_LOG_LEVELS)}"
+            )
+            raise typer.Exit(1)
+
+    if not log_file.exists():
+        console.print(
+            f"[yellow]No log file at {log_file} - has the server ever started?[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    # Daemon logs rotate at 10 MB (see _rotate_log / RotatingFileHandler), so the
+    # current file is small enough to read whole and slice - no seek-based tail.
+    existing = log_file.read_text(errors="replace").splitlines()
+    tail = existing if lines <= 0 else existing[-lines:]
+    for line in _filter_lines(tail, min_level):
+        print(line)
+
+    if not follow:
+        raise typer.Exit(0)
+
+    # Follow: poll for appended lines, reopening if the file is rotated or
+    # truncated out from under us (a `restart` rotates it mid-follow). Track the
+    # inode + size so a replaced or shrunk file restarts from the top.
+    try:
+        f = open(log_file, "r", errors="replace")
+    except OSError:
+        raise typer.Exit(0)
+    try:
+        f.seek(0, os.SEEK_END)
+        last_ino = os.fstat(f.fileno()).st_ino
+        carry = ""  # buffer a partial final line until its newline arrives
+        while True:
+            chunk = f.read()
+            if chunk:
+                carry += chunk
+                parts = carry.split("\n")
+                carry = parts.pop()  # trailing partial (or "" if chunk ended on \n)
+                for line in _filter_lines(parts, min_level):
+                    print(line, flush=True)
+                continue
+            # No new data: check whether the file was rotated/truncated.
+            try:
+                st = os.stat(log_file)
+            except OSError:
+                st = None
+            if st is not None and (
+                st.st_ino != last_ino or st.st_size < f.tell()
+            ):
+                f.close()
+                f = open(log_file, "r", errors="replace")
+                last_ino = os.fstat(f.fileno()).st_ino
+                carry = ""
+                continue
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        f.close()
+    raise typer.Exit(0)
 
 
 if __name__ == "__main__":
