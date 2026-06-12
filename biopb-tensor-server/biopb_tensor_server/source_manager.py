@@ -453,6 +453,7 @@ class SourceManager:
             and not pending_scan
             and now - previous_entry[2] >= self._stability_window
             and stable_observations >= self._stable_rescans_required
+            and not self._subtree_has_pending_scan(path_str)
         ):
             skipped_dirs.add(path_str)
             self._copy_cached_subtree_entries(
@@ -478,6 +479,30 @@ class SourceManager:
                 )
         except OSError:
             return
+
+    def _subtree_has_pending_scan(self, root_path_str: str) -> bool:
+        """True when any cached descendant still needs a discovery pass.
+
+        A directory's own mtime/ctime signature is blind to writes deep in its
+        subtree (appending to a file does not bump any ancestor's mtime), so the
+        prune gate cannot rely on the signature alone. `pending_scan` is set on
+        any new/changed entry and cleared only when it passes a discovery walk
+        (age >= stability_window), so a still-settling or undiscovered descendant
+        keeps the flag — which is the signal to keep descending instead of
+        freezing the subtree out (biopb/biopb#53). The directory's own flag is
+        already covered by the `not pending_scan` clause in the prune gate, so it
+        is skipped here.
+        """
+        root_path = Path(root_path_str)
+        for cached_path, pending in self._entry_pending_scan.items():
+            if not pending or cached_path == root_path_str:
+                continue
+            try:
+                if Path(cached_path).is_relative_to(root_path):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _copy_cached_subtree_entries(
         self,
