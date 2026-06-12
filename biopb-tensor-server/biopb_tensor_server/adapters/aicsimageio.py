@@ -604,9 +604,21 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                     logger.debug("error closing persistent tiff store", exc_info=True)
 
     def close(self) -> None:
-        """Release the persistent file handle, if any (best-effort teardown)."""
+        """Release the persistent file handle, if any (best-effort teardown).
+
+        Cascades to the lazily-created scene-level adapters, which hold the
+        actual handles for a source-level adapter. Scene adapters share this
+        adapter's ``_io_lock`` (non-reentrant), so the cascade runs WITHOUT
+        holding it.
+        """
         with self._io_lock:
             self._close_persistent_store()
+        for adapter in list(getattr(self, "_tensor_adapters", {}).values()):
+            if adapter is not self:
+                try:
+                    adapter.close()
+                except Exception:
+                    logger.debug("error closing scene adapter", exc_info=True)
 
     def __del__(self):
         # GC backstop: release the handle even without an explicit close().

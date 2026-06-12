@@ -48,6 +48,20 @@ def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
     return count
 
 
+def _close_adapter(adapter) -> None:
+    """Best-effort release of an adapter's resources (e.g. open file handles).
+
+    Adapters that hold long-lived handles expose ``close()``; others don't.
+    Never raises -- shutdown/unregister must not fail on a balky adapter.
+    """
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # pragma: no cover - cleanup must not fail
+            logger.debug("error closing source adapter", exc_info=True)
+
+
 class _AuthMiddleware(flight.ServerMiddleware):
     """Per-call middleware that carries the caller's presented Bearer token.
 
