@@ -186,9 +186,15 @@
 					     the plugin only uploads a VALIDATED deployment that waits for a
 					     manual click; those pile up and eventually make new uploads fail
 					     with 403. waitUntil=published makes the build block (and fail)
-					     until the release is actually live on Central. -->
+					     until the release is actually live on Central. The wait
+					     timeout is raised above the plugin default (~30 min) so a slow
+					     but successful portal-side validation doesn't fail the deploy
+					     (see biopb v0.6.4 deploy: bundle uploaded fine, publish poll
+					     timed out). -->
 					<autoPublish>true</autoPublish>
 					<waitUntil>published</waitUntil>
+					<waitMaxTime>3600</waitMaxTime>
+					<waitPollingInterval>15</waitPollingInterval>
 				</configuration>
 			</plugin>
 			<plugin>
