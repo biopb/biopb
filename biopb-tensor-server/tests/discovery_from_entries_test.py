@@ -22,19 +22,38 @@ from biopb_tensor_server.discovery import (
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
 
+def _sig(stat_result, is_dir):
+    """The content-identity signature shape ``_build_entry_signature`` emits."""
+    if is_dir:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
 def _snapshot(root):
-    """A (resolved_path_str, is_dir) DFS parent-first snapshot of ``root``.
+    """A (resolved_path_str, is_dir, signature) DFS parent-first snapshot of ``root``.
 
     Mirrors what ``SourceManager._scan_tree_state`` records into ``next_state``:
-    resolved path strings, parent inserted before its children.
+    resolved path strings with their stat signature, parent before its children.
     """
     root = Path(root).resolve()
-    out = [(str(root), root.is_dir())]
+    out = [(str(root), root.is_dir(), _sig(root.stat(), root.is_dir()))]
 
     def rec(d):
         for entry in sorted(os.scandir(d), key=lambda e: e.path):
-            out.append((str(Path(entry.path)), entry.is_dir()))
-            if entry.is_dir() and not entry.is_symlink():
+            is_dir = entry.is_dir()
+            out.append((str(Path(entry.path)), is_dir, _sig(entry.stat(), is_dir)))
+            if is_dir and not entry.is_symlink():
                 rec(entry.path)
 
     if root.is_dir():
@@ -162,3 +181,30 @@ class TestCachedIsDirNoStat:
         assert ctx.is_file() is True
         assert ctx.is_dir() is False
         assert ClaimContext(tmp_path).is_dir() is True
+
+
+class TestSignaturePlumbing:
+    """The state walk's signature rides the snapshot onto the ClaimContext (#56 item 6)."""
+
+    def test_snapshot_signature_reaches_adapter(self, tmp_path):
+        f = tmp_path / "img.tif"
+        f.write_text("x")
+
+        sigs = {}
+
+        def spy(ctx, state):
+            sigs[str(ctx.path_str)] = ctx.signature
+            return []
+
+        registry = get_default_registry()
+        registry.get_claims_for_path = spy
+        discover_sources_from_entries(_snapshot(tmp_path), registry)
+
+        # Every probed entry carried a signature tuple shaped like the state walk's.
+        assert sigs[str(f)] is not None
+        assert isinstance(sigs[str(f)], tuple) and len(sigs[str(f)]) == 5
+
+    def test_live_walk_context_has_no_signature(self):
+        """Live-walk / join contexts carry no signature, so probes run uncached."""
+        assert ClaimContext("/some/file.tif").signature is None
+        assert ClaimContext("/d", is_dir=True).join("img.tif").signature is None
