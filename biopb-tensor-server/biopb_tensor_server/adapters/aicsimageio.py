@@ -24,7 +24,11 @@ Chunk ID format:
 Relies on OS page cache for raw data caching.
 """
 
+import logging
+import os
 import threading
+import time
+import weakref
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
@@ -37,6 +41,8 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
@@ -237,6 +243,80 @@ CORE_IMAGE_EXTENSIONS = frozenset(
 AICS_EXTENSIONS = CORE_IMAGE_EXTENSIONS
 
 
+# =============================================================================
+# Persistent aszarr-store pool (fast per-plane reads for tifffile-backed sources)
+# =============================================================================
+#
+# aicsimageio's TiffReader fetches every chunk via _get_image_data, which
+# *re-opens the file and rebuilds a tifffile aszarr store on every read* --
+# re-parsing the full OME-XML and a per-page dask graph each time. For a
+# many-plane OME-TIFF that is ~1-2 s of fixed overhead per single plane,
+# independent of bytes requested, so scrubbing a large T axis is dominated by
+# repeated OME-XML parsing rather than IO.
+#
+# The scene-level adapter instead opens the aszarr store *once* (see
+# _build_persistent_dask) and slices a persistent ``da.from_zarr`` view, taking
+# a single-plane read from ~1.4 s to a few ms. The trade-off is a long-lived
+# file handle. Because tifffile's handle is a single seek/read cursor and is
+# NOT thread-safe, every read goes through the adapter's ``_io_lock`` AND
+# computes with the synchronous scheduler, so the handle is only ever touched
+# by one thread at a time (the lock serializes separate calls; ``synchronous``
+# serializes pages within a call).
+#
+# Handles are bounded by a TTL: a daemon reaper closes any store idle longer
+# than ``_STORE_TTL_SECONDS`` (interactive scrubbing keeps a stack hot; moving
+# on releases it). The reaper closes a store only via a *non-blocking* acquire
+# of the owner's ``_io_lock``, so it never pulls a handle out from under an
+# in-flight read. FD-exhaustion (or any open failure) degrades gracefully to
+# the aicsimageio read path, so the peak handle count never crashes the server.
+_STORE_TTL_SECONDS = float(os.environ.get("BIOPB_TIFF_STORE_TTL", "300"))
+_open_store_adapters: "weakref.WeakSet" = weakref.WeakSet()
+_open_store_lock = threading.Lock()
+_reaper_started = False
+
+
+def _register_store_adapter(adapter: "_AicsImageIoAdapterBase") -> None:
+    """Track an adapter holding an open persistent store; start the reaper."""
+    global _reaper_started
+    if _STORE_TTL_SECONDS <= 0:
+        return
+    with _open_store_lock:
+        _open_store_adapters.add(adapter)
+        if not _reaper_started:
+            _reaper_started = True
+            threading.Thread(
+                target=_store_reaper_loop,
+                name="tiff-store-reaper",
+                daemon=True,
+            ).start()
+
+
+def _store_reaper_loop() -> None:
+    """Close persistent stores idle longer than the TTL (best-effort, never
+    blocks an in-flight read)."""
+    interval = max(1.0, min(_STORE_TTL_SECONDS / 4.0, 30.0))
+    while True:
+        time.sleep(interval)
+        try:
+            with _open_store_lock:
+                adapters = list(_open_store_adapters)
+            now = time.monotonic()
+            for adapter in adapters:
+                last = getattr(adapter, "_persistent_last_access", now)
+                if now - last <= _STORE_TTL_SECONDS:
+                    continue
+                # Only close when no read is in flight; recheck under the lock.
+                if adapter._io_lock.acquire(blocking=False):
+                    try:
+                        idle = time.monotonic() - adapter._persistent_last_access
+                        if idle > _STORE_TTL_SECONDS:
+                            adapter._close_persistent_store()
+                    finally:
+                        adapter._io_lock.release()
+        except Exception:  # pragma: no cover - reaper must never die
+            logger.debug("tiff-store reaper sweep failed", exc_info=True)
+
+
 class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
     """Base adapter for aicsimageio-supported vendor formats.
 
@@ -386,6 +466,16 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 None  # Cached on first list_tensor_descriptors call
             )
 
+        # Persistent aszarr-store fast path (built lazily on first get_data for
+        # tifffile-backed local sources; see the module-level pool docs). The
+        # descriptor still comes from aicsimageio's dask_data above; only reads
+        # use the persistent store.
+        self._persistent_dask = None
+        self._persistent_store = None
+        self._persistent_tiff = None
+        self._persistent_attempted = False
+        self._persistent_last_access = 0.0
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from aicsimageio dask array.
 
@@ -404,7 +494,138 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         super().get_data(bounds)
         slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
         with self._io_lock:
+            zdask = self._ensure_persistent_dask()
+            if zdask is not None:
+                self._persistent_last_access = time.monotonic()
+                # Single shared file handle: the synchronous scheduler keeps the
+                # read on this thread (no per-page thread fan-out), and the
+                # io_lock above serializes it against other reads -- so the
+                # handle is never touched concurrently.
+                return zdask[slices].compute(scheduler="synchronous")
             return self._dask_data[slices].compute()
+
+    def _ensure_persistent_dask(self):
+        """Return a persistent aszarr-backed dask view, or None to use the
+        aicsimageio read path. Built once; caller must hold ``self._io_lock``."""
+        if self._persistent_dask is not None:
+            return self._persistent_dask
+        if self._persistent_attempted:
+            return None
+        self._persistent_attempted = True
+        try:
+            self._persistent_dask = self._build_persistent_dask()
+        except Exception as exc:
+            # Non-tifffile reader, remote URL, dim mismatch, or FD exhaustion
+            # (EMFILE/OSError) -> fall back to aicsimageio for this source.
+            logger.debug(
+                "persistent aszarr store unavailable for %s: %r; "
+                "using aicsimageio read path",
+                self._source_url,
+                exc,
+            )
+            self._close_persistent_store()
+            self._persistent_dask = None
+        if self._persistent_dask is not None:
+            self._persistent_last_access = time.monotonic()
+            _register_store_adapter(self)
+        return self._persistent_dask
+
+    def _build_persistent_dask(self):
+        """Open the aszarr store once and return a dask view matching the
+        aicsimageio descriptor's shape/dim order, or None if not applicable.
+
+        Raises on open/read errors so the caller can fall back.
+        """
+        import dask.array as da
+        import tifffile
+
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None  # remote/fsspec source: persistent local handle N/A
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+
+        series_index = self.scene_index or 0
+        tiff = tifffile.TiffFile(path)
+        try:
+            series = tiff.series[series_index]
+            store = series.aszarr(level=0, chunkmode="page")
+            axes = series.axes
+            z = da.from_zarr(store)
+
+            # Reorder the store's axes into the canonical (aicsimageio) order,
+            # then insert singleton axes for the dims tifffile dropped.
+            canonical = list(self.dim_labels or [])
+            present = [ax for ax in canonical if ax in axes]
+            if len(present) != len(axes):
+                return None  # store has an axis not in the canonical labels
+            z = z.transpose([axes.index(ax) for ax in present])
+            for i, ax in enumerate(canonical):
+                if ax not in axes:
+                    z = da.expand_dims(z, axis=i)
+
+            # Correctness gate: must match the trusted aicsimageio descriptor.
+            if (
+                tuple(z.shape) != tuple(self._dask_data.shape)
+                or z.dtype != self._dask_data.dtype
+            ):
+                return None
+        except Exception:
+            tiff.close()
+            raise
+
+        self._persistent_tiff = tiff
+        self._persistent_store = store
+        return z
+
+    def _close_persistent_store(self):
+        """Close the persistent store/handle and allow a later reopen.
+
+        Caller holds ``self._io_lock`` (reaper/get_data) or is the GC finalizer
+        (no concurrent reads possible). Safe to call repeatedly.
+        """
+        store = self._persistent_store
+        tiff = self._persistent_tiff
+        self._persistent_dask = None
+        self._persistent_store = None
+        self._persistent_tiff = None
+        self._persistent_attempted = False  # permit reopen on the next read
+        try:
+            with _open_store_lock:
+                _open_store_adapters.discard(self)
+        except Exception:
+            pass
+        for obj in (store, tiff):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    logger.debug("error closing persistent tiff store", exc_info=True)
+
+    def close(self) -> None:
+        """Release the persistent file handle, if any (best-effort teardown).
+
+        Cascades to the lazily-created scene-level adapters, which hold the
+        actual handles for a source-level adapter. Scene adapters share this
+        adapter's ``_io_lock`` (non-reentrant), so the cascade runs WITHOUT
+        holding it.
+        """
+        with self._io_lock:
+            self._close_persistent_store()
+        for adapter in list(getattr(self, "_tensor_adapters", {}).values()):
+            if adapter is not self:
+                try:
+                    adapter.close()
+                except Exception:
+                    logger.debug("error closing scene adapter", exc_info=True)
+
+    def __del__(self):
+        # GC backstop: release the handle even without an explicit close().
+        try:
+            self._close_persistent_store()
+        except Exception:
+            pass
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter.
