@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import typer
 
@@ -74,6 +74,15 @@ LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
 DEFAULT_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
 DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 
+# biopb-mcp daemon management. The MCP server is a separate, optional process
+# (the `biopb-mcp` package) managed independently of the tensor server, so it
+# gets its own PID/log under biopb-mcp's XDG data dir (matching
+# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The log file
+# name is distinct so it never collides with the stdio bridge's `kernel.log`.
+MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
+MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
+MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
+
 @app.command()
 def version():
     """Show version information."""
@@ -90,27 +99,42 @@ def _ensure_dirs():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _read_pid() -> Optional[int]:
-    """Read PID from file, return None if missing or invalid."""
-    if not PID_FILE.exists():
+def _read_pid_file(pid_file: Path) -> Optional[int]:
+    """Read a PID from `pid_file`, return None if missing or invalid."""
+    if not pid_file.exists():
         return None
     try:
-        pid = int(PID_FILE.read_text().strip())
-        return pid
+        return int(pid_file.read_text().strip())
     except (ValueError, IOError):
         return None
 
 
+def _write_pid_file(pid_file: Path, pid: int):
+    """Write `pid` to `pid_file`, creating its parent directory."""
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(pid))
+
+
+def _remove_pid_file(pid_file: Path):
+    """Remove `pid_file` if present."""
+    if pid_file.exists():
+        pid_file.unlink()
+
+
+def _read_pid() -> Optional[int]:
+    """Read the tensor-server daemon PID, or None if missing/invalid."""
+    return _read_pid_file(PID_FILE)
+
+
 def _write_pid(pid: int):
-    """Write PID to file."""
+    """Write the tensor-server daemon PID."""
     _ensure_dirs()
-    PID_FILE.write_text(str(pid))
+    _write_pid_file(PID_FILE, pid)
 
 
 def _remove_pid():
-    """Remove PID file."""
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    """Remove the tensor-server daemon PID file."""
+    _remove_pid_file(PID_FILE)
 
 
 def _is_process_running(pid: int) -> bool:
@@ -272,13 +296,29 @@ def _line_level(line: str) -> Optional[str]:
     return token if token in _LOG_LEVELS else None
 
 
-def _filter_lines(lines, min_level: Optional[str]):
+def _mcp_line_level(line: str) -> Optional[str]:
+    """Best-effort log level of a biopb-mcp daemon log line, or None.
+
+    biopb-mcp logs through logging.basicConfig (`LEVEL:name:message`) and uvicorn
+    emits `LEVEL:    ...`: both lead with the level name, delimited by `:` or
+    whitespace. Native Qt/dask/gRPC stdout the daemon also captures has no level
+    token and is treated as a continuation (carried by _filter_lines). This is
+    best-effort - lines in other shapes (e.g. dask's `... - LEVEL - ...`) are
+    left unclassified - so it pairs with carry-forward, never hard filtering.
+    """
+    head = line.split(":", 1)[0].split(" ", 1)[0].strip()
+    return head if head in _LOG_LEVELS else None
+
+
+def _filter_lines(lines, min_level: Optional[str], level_of=_line_level):
     """Keep lines at or above `min_level`. With min_level None, keep all.
 
-    Off-format lines (no parseable level) inherit the previous line's keep/drop
-    decision, so a kept WARNING record carries its traceback continuation lines
-    along and a dropped INFO record takes its continuations with it. The initial
-    decision (before any leveled line) is keep.
+    `level_of` extracts a line's level (the tensor-server format by default;
+    `_mcp_line_level` for the MCP daemon). Off-format lines (no parseable level)
+    inherit the previous line's keep/drop decision, so a kept WARNING record
+    carries its traceback continuation lines along and a dropped INFO record
+    takes its continuations with it. The initial decision (before any leveled
+    line) is keep.
     """
     if min_level is None:
         return list(lines)
@@ -286,12 +326,97 @@ def _filter_lines(lines, min_level: Optional[str]):
     kept = []
     keeping = True
     for line in lines:
-        lvl = _line_level(line)
+        lvl = level_of(line)
         if lvl is not None:
             keeping = _LOG_LEVELS[lvl] >= threshold
         if keeping:
             kept.append(line)
     return kept
+
+
+def _validate_level(level: Optional[str]) -> Optional[str]:
+    """Normalize a `--level` value to upper-case, or exit(1) if unrecognized."""
+    if level is None:
+        return None
+    norm = level.upper()
+    if norm not in _LOG_LEVELS:
+        console.print(
+            f"[red]Invalid --level '{level}'.[/red] "
+            f"Choose one of: {', '.join(_LOG_LEVELS)}"
+        )
+        raise typer.Exit(1)
+    return norm
+
+
+def _tail_and_follow(
+    log_file: Path,
+    follow: bool,
+    lines: int,
+    min_level: Optional[str],
+    level_of=_line_level,
+):
+    """Print the last `lines` lines of `log_file` (0 = all) filtered by
+    `min_level`, then optionally stream appended lines until interrupted.
+
+    Shared by `server logs` and `mcp logs`; `level_of` selects the per-daemon
+    level parser. A missing file is reported (not an error) and exits 0. Follow
+    reopens the file when it is rotated or truncated out from under us.
+    """
+    if not log_file.exists():
+        console.print(
+            f"[yellow]No log file at {log_file} - has the server ever started?[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    # Daemon logs rotate at 10 MB (see _rotate_log / RotatingFileHandler), so the
+    # current file is small enough to read whole and slice - no seek-based tail.
+    existing = log_file.read_text(errors="replace").splitlines()
+    tail = existing if lines <= 0 else existing[-lines:]
+    for line in _filter_lines(tail, min_level, level_of):
+        print(line)
+
+    if not follow:
+        raise typer.Exit(0)
+
+    # Follow: poll for appended lines, reopening if the file is rotated or
+    # truncated out from under us (a `restart` rotates it mid-follow). Track the
+    # inode + size so a replaced or shrunk file restarts from the top.
+    try:
+        f = open(log_file, "r", errors="replace")
+    except OSError:
+        raise typer.Exit(0)
+    try:
+        f.seek(0, os.SEEK_END)
+        last_ino = os.fstat(f.fileno()).st_ino
+        carry = ""  # buffer a partial final line until its newline arrives
+        while True:
+            chunk = f.read()
+            if chunk:
+                carry += chunk
+                parts = carry.split("\n")
+                carry = parts.pop()  # trailing partial (or "" if chunk ended on \n)
+                for line in _filter_lines(parts, min_level, level_of):
+                    print(line, flush=True)
+                continue
+            # No new data: check whether the file was rotated/truncated.
+            try:
+                st = os.stat(log_file)
+            except OSError:
+                st = None
+            if st is not None and (
+                st.st_ino != last_ino or st.st_size < f.tell()
+            ):
+                f.close()
+                f = open(log_file, "r", errors="replace")
+                last_ino = os.fstat(f.fileno()).st_ino
+                carry = ""
+                continue
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        f.close()
+    raise typer.Exit(0)
 
 
 def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
@@ -304,6 +429,25 @@ def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count:
         if src.exists():
             src.rename(dst)
     log_file.rename(log_file.parent / f"{log_file.name}.1")
+
+
+def _detach_kwargs() -> dict:
+    """Popen kwargs that detach a spawned daemon from the launching console and
+    process group, so it survives this command returning and ignores console
+    control events (Ctrl+C, terminal close).
+
+    POSIX: start_new_session (setsid) gives it its own session/process group.
+    Windows: CREATE_NO_WINDOW runs it without a console *window* (so none pops);
+    CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's Ctrl+C does
+    not reach (start_new_session is a silent no-op on Windows).
+    """
+    if sys.platform == "win32":
+        return {
+            "creationflags": (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        }
+    return {"start_new_session": True}
 
 
 @server_app.command("start")
@@ -404,23 +548,10 @@ def start(
     console.print(f"  Config: {config}")
 
     # Detach the daemon from the launching console/process group so it survives
-    # this command returning and ignores console control events (Ctrl+C, close).
-    detach_kwargs: dict = {}
-    if sys.platform == "win32":
-        # start_new_session (setsid) is POSIX-only and a silent no-op on Windows.
-        # Use creationflags instead. CREATE_NO_WINDOW runs the daemon without a
-        # console *window*, so no visible console pops up (unlike DETACHED_PROCESS,
-        # where a later console-API call could AllocConsole a *visible* window).
-        # CREATE_NEW_PROCESS_GROUP makes it a group leader so the launching
-        # terminal's Ctrl+C doesn't propagate to it. Because it has no console the
-        # terminal can interact with, graceful `stop` can't use a console control
-        # event - it uses a named Win32 event instead (see _win_set_shutdown_event
-        # and biopb_tensor_server.http_server._install_windows_shutdown_listener).
-        detach_kwargs["creationflags"] = (
-            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        detach_kwargs["start_new_session"] = True  # setsid(): own process group
+    # this command returning. On Windows it then has no console for graceful
+    # `stop` to signal, so stop uses a named shutdown sentinel instead (see
+    # _win_request_shutdown / http_server._install_windows_shutdown_listener).
+    detach_kwargs = _detach_kwargs()
 
     with open(log_file, "a") as log:
         log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -714,76 +845,10 @@ def logs(
 ):
     """Show the TensorFlight server daemon log."""
     log_file = _get_log_file()
-
     if path:
         print(log_file)
         raise typer.Exit(0)
-
-    min_level: Optional[str] = None
-    if level is not None:
-        min_level = level.upper()
-        if min_level not in _LOG_LEVELS:
-            console.print(
-                f"[red]Invalid --level '{level}'.[/red] "
-                f"Choose one of: {', '.join(_LOG_LEVELS)}"
-            )
-            raise typer.Exit(1)
-
-    if not log_file.exists():
-        console.print(
-            f"[yellow]No log file at {log_file} - has the server ever started?[/yellow]"
-        )
-        raise typer.Exit(0)
-
-    # Daemon logs rotate at 10 MB (see _rotate_log / RotatingFileHandler), so the
-    # current file is small enough to read whole and slice - no seek-based tail.
-    existing = log_file.read_text(errors="replace").splitlines()
-    tail = existing if lines <= 0 else existing[-lines:]
-    for line in _filter_lines(tail, min_level):
-        print(line)
-
-    if not follow:
-        raise typer.Exit(0)
-
-    # Follow: poll for appended lines, reopening if the file is rotated or
-    # truncated out from under us (a `restart` rotates it mid-follow). Track the
-    # inode + size so a replaced or shrunk file restarts from the top.
-    try:
-        f = open(log_file, "r", errors="replace")
-    except OSError:
-        raise typer.Exit(0)
-    try:
-        f.seek(0, os.SEEK_END)
-        last_ino = os.fstat(f.fileno()).st_ino
-        carry = ""  # buffer a partial final line until its newline arrives
-        while True:
-            chunk = f.read()
-            if chunk:
-                carry += chunk
-                parts = carry.split("\n")
-                carry = parts.pop()  # trailing partial (or "" if chunk ended on \n)
-                for line in _filter_lines(parts, min_level):
-                    print(line, flush=True)
-                continue
-            # No new data: check whether the file was rotated/truncated.
-            try:
-                st = os.stat(log_file)
-            except OSError:
-                st = None
-            if st is not None and (
-                st.st_ino != last_ino or st.st_size < f.tell()
-            ):
-                f.close()
-                f = open(log_file, "r", errors="replace")
-                last_ino = os.fstat(f.fileno()).st_ino
-                carry = ""
-                continue
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        f.close()
-    raise typer.Exit(0)
+    _tail_and_follow(log_file, follow, lines, _validate_level(level), _line_level)
 
 
 def _fmt_mb(n_bytes: int) -> str:
@@ -874,6 +939,325 @@ def cache_stats(
         raise typer.Exit(0)
 
     _render_cache_stats(stats)
+
+
+# ---------------------------------------------------------------------------
+# biopb-mcp daemon management (`biopb mcp ...`)
+#
+# Manages the biopb-mcp MCP server (HTTP/streamable-http transport) as a
+# background daemon, mirroring the tensor-server daemon commands. The biopb-mcp
+# package is an optional dependency: every subcommand first calls
+# _require_biopb_mcp(), which surfaces a clear install hint (rather than a raw
+# ImportError) when it is absent. The server itself runs in a child process
+# (`python -m biopb_mcp.mcp --transport http`), so this CLI never imports the
+# heavy MCP/napari stack - only biopb_mcp._config, lazily, for the default port.
+# ---------------------------------------------------------------------------
+
+mcp_app = typer.Typer(
+    name="mcp",
+    help="biopb-mcp MCP server daemon management (start/stop/restart/status/logs)",
+)
+
+
+def _require_biopb_mcp() -> None:
+    """Exit(1) with an install hint if the biopb-mcp package is not importable.
+
+    Checks the import *spec* (not a real import) so the heavy MCP/napari stack is
+    never loaded into this CLI process just to gate a command.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("biopb_mcp") is None:
+        console.print(
+            "[red]The 'mcp' commands require the biopb-mcp package, which is "
+            "not installed.[/red]\n"
+            r"[yellow]Install it with: pip install 'biopb-mcp\[mcp]'[/yellow]"
+        )
+        raise typer.Exit(1)
+
+
+def _read_mcp_pid() -> Optional[int]:
+    """Read the MCP daemon PID, or None if missing/invalid."""
+    return _read_pid_file(MCP_PID_FILE)
+
+
+def _write_mcp_pid(pid: int):
+    """Write the MCP daemon PID."""
+    _write_pid_file(MCP_PID_FILE, pid)
+
+
+def _remove_mcp_pid():
+    """Remove the MCP daemon PID file."""
+    _remove_pid_file(MCP_PID_FILE)
+
+
+def _ensure_mcp_dirs():
+    """Ensure the MCP PID and log directories exist."""
+    MCP_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MCP_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_mcp_log_file() -> Path:
+    """Path of the MCP daemon's combined stdout/stderr log."""
+    return MCP_LOG_DIR / "mcp-server.log"
+
+
+def _mcp_default_port() -> int:
+    """Configured MCP transport port (biopb_mcp config), or the 8765 default.
+
+    Reads mcp.transport.port from biopb-mcp's config so `mcp start`/`status`
+    honor a user-set port; any failure (package absent, malformed config) falls
+    back to the documented default.
+    """
+    try:
+        from biopb_mcp._config import get_setting, load_config
+
+        return int(get_setting(load_config(), "mcp.transport.port"))
+    except Exception:
+        return MCP_DEFAULT_PORT
+
+
+def _mcp_url(port: int) -> str:
+    """Loopback streamable-http endpoint the MCP daemon serves."""
+    return f"http://127.0.0.1:{port}/mcp"
+
+
+def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Whether a TCP connection to (host, port) succeeds - a cheap liveness probe
+    for the daemon's HTTP listener (it binds before serving)."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _stop_mcp(pid: int, timeout: int) -> bool:
+    """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
+    wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
+    True if it exited gracefully. Assumes `pid` is running.
+
+    Unlike the tensor server there is no Windows shutdown-sentinel handshake: the
+    MCP launcher installs SIGTERM/SIGINT handlers, and on Windows os.kill maps
+    SIGTERM to TerminateProcess (an immediate, ungraceful stop) - acceptable for
+    a localhost dev daemon with no in-flight durability to protect.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+    graceful = False
+    for _ in range(timeout):
+        if not _is_process_running(pid):
+            graceful = True
+            break
+        time.sleep(1)
+
+    if not graceful:
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError:
+            pass
+        time.sleep(0.5)
+
+    _remove_mcp_pid()
+    return graceful
+
+
+@mcp_app.command("start")
+def mcp_start(
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="HTTP transport port (default: biopb-mcp config, else 8765)",
+    ),
+):
+    """Start the biopb-mcp MCP server (HTTP transport) as a background daemon."""
+    _require_biopb_mcp()
+    _ensure_mcp_dirs()
+
+    existing_pid = _read_mcp_pid()
+    if existing_pid and _is_process_running(existing_pid):
+        console.print(
+            f"[yellow]biopb-mcp server already running (PID {existing_pid})[/yellow]"
+        )
+        raise typer.Exit(0)
+    if existing_pid:
+        console.print(
+            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+        )
+        _remove_mcp_pid()
+
+    resolved_port = port if port is not None else _mcp_default_port()
+    log_file = _get_mcp_log_file()
+    _rotate_log(log_file)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp",
+        "--transport",
+        "http",
+        "--port",
+        str(resolved_port),
+    ]
+
+    console.print("[green]Starting biopb-mcp server...[/green]")
+    with open(log_file, "a") as log:
+        log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        process = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=log,
+            env=os.environ.copy(),
+            **_detach_kwargs(),
+        )
+
+    _write_mcp_pid(process.pid)
+
+    # Brief wait to surface an immediate crash (bad config, port in use).
+    time.sleep(0.5)
+    if not _is_process_running(process.pid):
+        console.print("[red]Failed to start biopb-mcp server[/red]")
+        console.print(f"Check logs: {log_file}")
+        _remove_mcp_pid()
+        raise typer.Exit(1)
+
+    console.print(f"[green]biopb-mcp server started (PID {process.pid})[/green]")
+    console.print(f"  MCP:  {_mcp_url(resolved_port)}")
+    console.print(f"  Logs: {log_file}")
+
+
+@mcp_app.command("stop")
+def mcp_stop(
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
+    ),
+):
+    """Stop the biopb-mcp server daemon."""
+    _require_biopb_mcp()
+    pid = _read_mcp_pid()
+
+    if not pid:
+        console.print("[yellow]No biopb-mcp server running[/yellow]")
+        raise typer.Exit(0)
+    if not _is_process_running(pid):
+        console.print(
+            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
+        )
+        _remove_mcp_pid()
+        raise typer.Exit(0)
+
+    console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
+    if _stop_mcp(pid, timeout):
+        console.print("[green]biopb-mcp server stopped[/green]")
+    else:
+        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
+    raise typer.Exit(0)
+
+
+@mcp_app.command("restart")
+def mcp_restart(
+    port: Optional[int] = typer.Option(
+        None, "--port", "-p", help="HTTP transport port (default: config, else 8765)"
+    ),
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
+    ),
+):
+    """Restart the biopb-mcp server daemon."""
+    _require_biopb_mcp()
+    pid = _read_mcp_pid()
+    if pid and _is_process_running(pid):
+        console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
+        _stop_mcp(pid, timeout)
+        time.sleep(1)
+    mcp_start(port=port)
+
+
+@mcp_app.command("status")
+def mcp_status(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Check biopb-mcp server daemon status and HTTP liveness."""
+    _require_biopb_mcp()
+    pid = _read_mcp_pid()
+    running = bool(pid and _is_process_running(pid))
+    stale = bool(pid and not running)
+
+    port = _mcp_default_port()
+    listening = _port_listening("127.0.0.1", port) if running else False
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "running": running,
+                    "pid": pid if running else None,
+                    "status": "running"
+                    if running
+                    else ("stale" if stale else "stopped"),
+                    "port": port,
+                    "listening": listening,
+                    "url": _mcp_url(port) if running else None,
+                }
+            )
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="biopb-mcp Server Status")
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="green")
+
+    if not running:
+        table.add_row("Status", "Not running (stale PID)" if stale else "Not running")
+        if stale:
+            table.add_row("PID file", str(MCP_PID_FILE) + " (stale)")
+        console.print(table)
+        raise typer.Exit(0)
+
+    table.add_row("Status", "Running")
+    table.add_row("PID", str(pid))
+    table.add_row("Port", str(port))
+    table.add_row("MCP", _mcp_url(port))
+    table.add_row("Listening", "yes" if listening else "no (not bound yet?)")
+    table.add_row("PID file", str(MCP_PID_FILE))
+    table.add_row("Log file", str(_get_mcp_log_file()))
+    console.print(table)
+
+
+@mcp_app.command("logs")
+def mcp_logs(
+    follow: bool = typer.Option(
+        False, "--follow", "-f", help="Stream new log lines as they are written"
+    ),
+    lines: int = typer.Option(
+        200, "--lines", "-n", help="Number of lines from the end to show (0 = all)"
+    ),
+    level: Optional[str] = typer.Option(
+        None,
+        "--level",
+        help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL "
+        "(best-effort; the MCP daemon log mixes formats)",
+    ),
+    path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
+):
+    """Show the biopb-mcp server daemon log."""
+    _require_biopb_mcp()
+    log_file = _get_mcp_log_file()
+    if path:
+        print(log_file)
+        raise typer.Exit(0)
+    _tail_and_follow(log_file, follow, lines, _validate_level(level), _mcp_line_level)
+
+
+app.add_typer(mcp_app, name="mcp")
 
 
 if __name__ == "__main__":
