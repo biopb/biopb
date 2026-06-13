@@ -53,6 +53,32 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = 0.2
 
 
+def _release_persistent_store(tensor_adapter) -> None:
+    """Close any persistent file handle the adapter opened while warming.
+
+    aicsimageio's tiff-backed adapters keep a persistent aszarr store open after
+    a read, reclaimed only by an idle reaper (``BIOPB_TIFF_STORE_TTL``, default
+    300 s). Precache sweeps the whole catalog back-to-back, so those stores never
+    go idle and accumulate across every source — the memory exhaustion behind the
+    precache OOM. We warm one source at a time, so releasing its store the instant
+    we finish bounds the resident store count to one instead of N. Effectively a
+    zero-TTL for precache-driven access. No-op for adapters with no persistent
+    store (e.g. nd2); best-effort and never raises.
+    """
+    close = getattr(tensor_adapter, "_close_persistent_store", None)
+    if close is None:
+        return
+    lock = getattr(tensor_adapter, "_io_lock", None)
+    try:
+        if lock is not None:
+            with lock:
+                close()
+        else:
+            close()
+    except Exception:  # pragma: no cover - teardown must never break precache
+        logger.debug("precache: persistent-store release failed", exc_info=True)
+
+
 class PrecacheWorker:
     """Daemon thread that warms the file cache for newly-added and existing
     sources."""
@@ -361,33 +387,41 @@ class PrecacheWorker:
 
         endpoints = read_plan.chunk_endpoints
         warmed = 0
-        for ce in endpoints:
-            if self._stop.is_set():
-                return False
-            if backlog:
-                # Yield to live work the instant any arrives.
-                if not self._queue.empty():
-                    return True
-                # Respect cache headroom: live traffic may have filled it.
-                if not self._has_headroom():
-                    return True
-            # Debounce + preempt between chunks: wait for the server to be idle
-            # before warming each chunk.
-            if not self._wait_until_idle():
-                return False
-            try:
-                tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
-                warmed += 1
-            except Exception as e:
-                # One bad chunk shouldn't abort the whole tensor.
-                logger.debug("precache: chunk warm failed for %s: %s", tensor_id, e)
+        try:
+            for ce in endpoints:
+                if self._stop.is_set():
+                    return False
+                if backlog:
+                    # Yield to live work the instant any arrives.
+                    if not self._queue.empty():
+                        return True
+                    # Respect cache headroom: live traffic may have filled it.
+                    if not self._has_headroom():
+                        return True
+                # Debounce + preempt between chunks: wait for the server to be
+                # idle before warming each chunk.
+                if not self._wait_until_idle():
+                    return False
+                try:
+                    tensor_adapter.resolve_chunk_data(ce.chunk_id, cache_manager)
+                    warmed += 1
+                except Exception as e:
+                    # One bad chunk shouldn't abort the whole tensor.
+                    logger.debug(
+                        "precache: chunk warm failed for %s: %s", tensor_id, e
+                    )
 
-        logger.info(
-            "precache: warmed %d/%d chunks for %s at scale=%s%s",
-            warmed,
-            len(endpoints),
-            tensor_id,
-            list(coarsest.scale_hint),
-            " (backlog)" if backlog else "",
-        )
-        return False
+            logger.info(
+                "precache: warmed %d/%d chunks for %s at scale=%s%s",
+                warmed,
+                len(endpoints),
+                tensor_id,
+                list(coarsest.scale_hint),
+                " (backlog)" if backlog else "",
+            )
+            return False
+        finally:
+            # Release this source's persistent store before moving to the next,
+            # so stores can't accumulate across the catalog sweep (the OOM). Runs
+            # on every exit path: completion, backlog preemption, stop, or error.
+            _release_persistent_store(tensor_adapter)

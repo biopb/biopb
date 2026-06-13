@@ -303,6 +303,51 @@ class TestWarming:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Persistent-store release after warming (precache OOM guard).
+# ---------------------------------------------------------------------------
+
+
+class TestPersistentStoreRelease:
+    """_release_persistent_store closes the adapter's store, under its io_lock,
+    so precache cannot accumulate one open store per source across the catalog."""
+
+    def test_closes_under_io_lock(self):
+        import threading
+        from biopb_tensor_server.precache import _release_persistent_store
+
+        lock = threading.Lock()
+        observed = []
+
+        class _Adapter:
+            _io_lock = lock
+
+            def _close_persistent_store(self):
+                # The contract: the io_lock is held while we close.
+                observed.append(lock.locked())
+
+        _release_persistent_store(_Adapter())
+        assert observed == [True]
+        assert not lock.locked()  # released afterwards
+
+    def test_noop_when_no_persistent_store(self):
+        from biopb_tensor_server.precache import _release_persistent_store
+
+        # Adapter without _close_persistent_store (e.g. nd2) -> silent no-op.
+        _release_persistent_store(object())
+
+    def test_swallows_close_errors(self):
+        from biopb_tensor_server.precache import _release_persistent_store
+
+        class _Adapter:
+            _io_lock = None
+
+            def _close_persistent_store(self):
+                raise RuntimeError("boom")
+
+        _release_persistent_store(_Adapter())  # must not propagate
+
+
+# ---------------------------------------------------------------------------
 # 4. Runtime-only enqueue gating (SourceManager hook).
 # ---------------------------------------------------------------------------
 
