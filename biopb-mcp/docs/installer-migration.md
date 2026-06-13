@@ -1,5 +1,10 @@
 # Migration note: biopb installer → biopb-mcp
 
+> **Historical / partly superseded.** This note predates the monorepo merge and
+> still describes a two-repo world (e.g. `RELEASE_REPO = biopb/biopb-mcp`). After
+> the merge the installer points at `biopb/biopb` and selects releases by the
+> `mcp-v*` tag prefix — see `monorepo-migration.md` for the current state.
+
 **Status:** **In progress.** Phase 0 + Phase 1 landed in this change; Phases 2–4
 are tracked in the linked issue. This note records the plan and the decisions
 behind it.

@@ -9,63 +9,57 @@ system or user-site Python can shadow the project env with a *different* (often
 older) `biopb`, which silently breaks tests that depend on newer client APIs
 (e.g. `make_cache_plugin`, added in `biopb >= 0.5.8`).
 
-After pulling changes — especially a bump to the `biopb[tensor]` pin in
-`pyproject.toml` — run `uv sync --extra mcp --group testing` to bring `.venv`
-back in line with `uv.lock`. If imports or versions look wrong, first check the
-interpreter (`which python` / `.venv/bin/python -c "import biopb; print(biopb.__version__)"`)
+biopb-mcp now lives in the **biopb monorepo** (`biopb/biopb-mcp/`) as a uv
+workspace member; see `docs/monorepo-migration.md`. `biopb` and
+`biopb-tensor-server` resolve to the sibling workspace members, so run uv from
+the **repo root**, selecting this package:
+
+```bash
+uv sync --package biopb-mcp --extra mcp --group testing
+```
+
+After pulling changes, re-run that to bring `.venv` back in line with the root
+`uv.lock`. If imports or versions look wrong, first check the interpreter
+(`which python` / `.venv/bin/python -c "import biopb; print(biopb.__version__)"`)
 before debugging the code; a stale `.venv` (missing `uv sync`) is the usual cause.
 
-Test/dev deps live in **PEP 735 dependency *groups*, not extras** (groups can
-pin direct-URL wheels that PyPI would reject in published metadata — see the
-comment in `pyproject.toml`). Two groups:
+Test/dev deps live in **PEP 735 dependency *groups*, not extras**, so they stay
+out of biopb-mcp's published metadata. Two groups:
 
 - **`integration`** — the runnable full stack with *no* test tooling: the MCP
-  server deps plus the `biopb-tensor-server` (Arrow Flight) wheel and the
-  **version-paired `biopb` dev wheel** from the latest biopb-tensor-server
-  GitHub release. Sync this for a checkout that needs a real local tensor server
-  (`biopb server start` / autostart) without pytest/tox:
-  `uv sync --extra mcp --group integration`.
-- **`testing`** — `integration` **plus** pytest/tox. This is the normal dev/CI
-  profile and what tox installs (`dependency_groups = testing`).
+  server deps plus the in-tree `biopb-tensor-server[web]` and `biopb[tensor]`
+  workspace members. Sync this for a checkout that needs a real local tensor
+  server (`biopb server start` / autostart) without pytest:
+  `uv sync --package biopb-mcp --extra mcp --group integration`.
+- **`testing`** — `integration` **plus** pytest. The normal dev/CI profile.
 
 Because these are groups, select them with `--group <name>`, *not*
-`--extra <name>`. The paired wheels pin `biopb` to the release's dev build
-rather than the latest PyPI release — that pairing is exactly how the server
-ships and how end users get it. To move to a newer server release, bump both
-release-asset URLs in `pyproject.toml`'s `[dependency-groups]` and re-run
-`uv lock`.
+`--extra <name>`. Version-pairing across the three packages is automatic from
+the checkout (the workspace resolves them from the tree) — there are no more
+release-asset URLs to bump.
 
 **Important — groups don't reach PyPI users.** A dependency group is not part of
-biopb-mcp's published wheel/sdist metadata, and `--group` resolves against this
-`pyproject.toml`, not a PyPI-installed package. So `pip install biopb-mcp[...]`
-can never pull the tensor server; the groups only help a source checkout (incl.
-the `release_bundle.yml` build, which could `pip install . --group integration`
-to bake a local server into the bundled app). Delivering the server to
-`pip install biopb-mcp` users would require publishing biopb-tensor-server to
-PyPI and exposing it as a real extra.
+biopb-mcp's published wheel/sdist metadata, and the workspace resolution applies
+only to a source checkout. So `pip install biopb-mcp[...]` can never pull the
+tensor server (it is not on PyPI); the groups + workspace only help a checkout.
 
 ## Build and Test Commands
 
 ```bash
-# Install the package in development mode (uv — preferred)
-uv sync --extra mcp --group testing
-# …or with pip >= 25.1 (dependency groups):
-pip install -e ".[mcp]" --group testing
+# Install the package in development mode (uv — run from the repo root)
+uv sync --package biopb-mcp --extra mcp --group testing
 
 # Run all tests with coverage
-pytest -v --cov=biopb_mcp --cov-report=xml
+uv run pytest -v --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
 
 # Run a single test file
-pytest src/biopb_mcp/_tests/test_mcp_kernel.py -v
+uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_mcp_kernel.py -v
 
 # Run a single test function
-pytest src/biopb_mcp/_tests/test_grpc.py::test_encode_image -v
-
-# Run tests via tox (tests across Python 3.10-3.12)
-tox
+uv run pytest biopb-mcp/src/biopb_mcp/_tests/test_grpc.py::test_encode_image -v
 
 # Format code with black (line-length 79)
-black src/
+black biopb-mcp/src/
 
 # Run pre-commit hooks on all files
 pre-commit run --all-files
@@ -475,7 +469,7 @@ Main (from `pyproject.toml`):
 Optional MCP extra (`pip install biopb-mcp[mcp]`):
 - `mcp >= 1.20`, `uvicorn >= 0.29`, `jupyter_client`, `ipykernel`, `psutil`
 
-Testing extra includes: tox, pytest, pytest-cov, pytest-qt, pytest-env, napari,
+Testing group includes: pytest, pytest-cov, pytest-qt, pytest-env, napari,
 pyqt6, jupyter_client, ipykernel, napari-skimage-regionprops.
 
 ## Development Notes
@@ -484,7 +478,7 @@ pyqt6, jupyter_client, ipykernel, napari-skimage-regionprops.
 - **Formatting/linting is gated by `pre-commit` only** — `pre-commit run
   --all-files` (or `--files <changed>`) is the single source of truth; there is
   no separate lint command to run, and there is no lint step in CI (CI runs only
-  tox/tests). Active hooks: `black` (line-length 79), `ruff` (lint), plus
+  the uv-based tests). Active hooks: `black` (line-length 79), `ruff` (lint), plus
   `check-docstring-first`, `end-of-file-fixer`, `trailing-whitespace`,
   `check-yaml`, and `napari-plugin-checks`. The `ruff` hook is **pinned at
   `v0.9.4`** in `.pre-commit-config.yaml` (a newer ruff adds rules that postdate

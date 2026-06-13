@@ -22,7 +22,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.10"
+# Upper bound mirrors biopb / biopb-tensor-server (both >=3.10,<3.13): biopb-mcp
+# depends on biopb[tensor], so without it a 3.13 install fails with a confusing
+# transitive resolution error instead of a clean requires-python message. Also
+# matches the classifiers above (3.10-3.12 only).
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy",
     "pandas",
@@ -56,24 +60,19 @@ mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "d
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
-# `testing` extra, because the group can pin direct-URL wheels (below) without
-# polluting biopb-mcp's published metadata: PyPI/twine reject any distributed
-# package whose Requires-Dist carries a direct reference, and biopb-mcp is
-# published on PyPI (see .github/workflows/test_and_deploy.yaml). Install with:
-#   uv sync --extra mcp --group testing            # uv
-#   pip install -e ".[mcp]" --group testing        # pip >= 25.1
-# tox pulls it via `dependency_groups = testing` (tox >= 4.22).
-# NB: dependency groups are NOT part of biopb-mcp's published metadata and
-# `--group` resolves against this pyproject, not a PyPI-installed package — so a
-# group can pin direct-URL wheels safely, but `pip install biopb-mcp[...]` can
-# NEVER pull one. These help only a *source checkout* (`uv sync --group ...` /
-# `pip install . --group ...`, incl. the release-bundle build). Delivering the
-# tensor server to PyPI `pip install` users would require publishing
-# biopb-tensor-server to PyPI and exposing it as a normal extra.
+# `testing` extra so they stay out of biopb-mcp's published metadata (groups are
+# never part of a distributed package's Requires-Dist). The groups pull
+# biopb-tensor-server, which is NOT on PyPI; they resolve it from the in-tree
+# workspace member (root [tool.uv.workspace] / [tool.uv.sources]), so install
+# with uv (CI uses uv too — tox/pip are not workspace-aware):
+#   uv sync --package biopb-mcp --extra mcp --group testing
+# A plain `pip install biopb-mcp[...]` can never pull the tensor server (not on
+# PyPI); that would require publishing biopb-tensor-server and exposing it as a
+# normal extra.
 [dependency-groups]
 # Runnable full stack, no test tooling: the MCP server deps plus the local
 # tensor server, giving a checkout a real `biopb server start` / autostart
-# target without pytest/tox.
+# target without pytest.
 #
 # Since the monorepo merge these are plain names, NOT pinned release wheels:
 # the root pyproject's [tool.uv.workspace] + [tool.uv.sources] resolve `biopb`
@@ -88,11 +87,10 @@ integration = [
     "biopb[tensor]",
     "biopb-tensor-server[web]",
 ]
-# Full stack + test tooling. = integration plus pytest/tox. (napari/pyqt6 come
-# in via biopb-mcp[mcp] in the integration group.)
+# Full stack + test tooling. = integration plus pytest. (napari/pyqt6 come in
+# via biopb-mcp[mcp] in the integration group.)
 testing = [
     {include-group = "integration"},
-    "tox",
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
     "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
