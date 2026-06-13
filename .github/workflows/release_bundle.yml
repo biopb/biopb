@@ -86,6 +86,52 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+          fetch-depth: 0 # full history + tags so setuptools_scm derives the version
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      # Collect ALL THREE wheels into one release so the installer/auto-updater
+      # has a single source of truth (issue: unify release location). The
+      # biopb-mcp wheel + sdist are built here from the tagged checkout; the
+      # version-paired biopb + biopb-tensor-server wheels are pulled from the
+      # exact direct-reference URLs pinned in pyproject's [dependency-groups]
+      # integration group — so bumping the server release only edits pyproject.
+      - name: Build biopb-mcp wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build .
+
+      - name: Collect paired biopb + tensor-server wheels + webapp
+        run: |
+          mkdir -p release-wheels
+          cp dist/*.whl dist/*.tar.gz release-wheels/
+          base=""
+          grep -oE 'https://github.com/biopb/biopb/releases/download/[^"]+\.whl' pyproject.toml \
+            | sort -u | while read -r url; do
+              echo "Downloading $url"
+              curl -fL --retry 3 -o "release-wheels/$(basename "$url")" "$url"
+            done
+          # The migrated installer pulls the data-browser webapp from THIS release
+          # too (single source of truth — docs/installer-migration.md). It lives on
+          # the same biopb server-v* release as the paired wheels, so derive that
+          # release's asset base from a pinned wheel URL and fetch webapp.tar.gz.
+          base=$(grep -oE 'https://github.com/biopb/biopb/releases/download/[^/]+' pyproject.toml | head -1)
+          if [ -n "$base" ]; then
+            echo "Downloading $base/webapp.tar.gz"
+            curl -fL --retry 3 -o "release-wheels/webapp.tar.gz" "$base/webapp.tar.gz"
+          else
+            echo "WARNING: could not derive webapp base URL from pyproject; skipping webapp" >&2
+          fi
+          echo "Release assets:"
+          ls -l release-wheels
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -114,6 +160,35 @@ jobs:
             **Note**: These are unsigned installers. On macOS, right-click and select "Open" to bypass Gatekeeper. On Windows, click "Run anyway" when prompted.
 
             This bundle includes napari with the biopb-mcp plugin pre-installed.
-          files: artifacts/*
+
+            ## One-line install
+
+            ```sh
+            curl -fsSL https://biopb.org/install.sh | bash      # Linux / macOS / WSL
+            irm https://biopb.org/install.ps1 | iex             # Windows PowerShell
+            ```
+
+            The installer (`install.sh` / `install.ps1`, also attached here) pulls
+            the matched triple of wheels + the data browser from this one release.
+
+            ## Bundled assets
+
+            Everything an installer/auto-updater needs from a single place, instead
+            of PyPI + the biopb-tensor-server release:
+
+            - `biopb_mcp-*.whl` — the MCP server / napari plugin (also on PyPI)
+            - `biopb-*.whl` — the version-paired biopb client (Arrow Flight tensor)
+            - `biopb_tensor_server-*.whl` — the local tensor server
+            - `webapp.tar.gz` — the data-browser web UI
+            - `install.sh` / `install.ps1` — the bootstrap installers
+
+            The biopb / biopb-tensor-server wheels and the webapp are the exact
+            builds from the server release pinned in this tag's `pyproject.toml`
+            `[dependency-groups].integration`.
+          files: |
+            artifacts/*
+            release-wheels/*
+            install/install.sh
+            install/install.ps1
           draft: false
           prerelease: false
