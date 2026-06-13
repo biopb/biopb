@@ -1,0 +1,208 @@
+# All-in-one product deployment, triggered by a single `release-v*` tag.
+# See docs/release-model.md. Produces, from the tagged commit:
+#   - a GitHub release (wheel triple + mcp sdist + webapp + installers) — the
+#     installer's single source of truth;
+#   - Docker images for biopb-tensor-server and biopb-image-base, each tagged
+#     with ITS OWN package version (+ :latest), published idempotently (skipped
+#     if that version is already in the registry).
+# PyPI is intentionally NOT part of this — biopb/biopb-mcp publish to PyPI on
+# their own v*/mcp-v* tags.
+name: Release (deployment)
+
+on:
+  push:
+    tags:
+      - 'release-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build from (dry run; no push/release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # create the GitHub release
+      packages: write   # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+          fetch-depth: 0  # tags for setuptools_scm
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # wheels/ feeds the Docker builds (both Dockerfiles COPY
+      # wheels/biopb-*.whl + wheels/biopb_tensor_server-*.whl). release-wheels/
+      # holds the GitHub-release assets (the triple + mcp sdist + webapp).
+      - name: Build wheels
+        run: |
+          uv build --package biopb --wheel --out-dir wheels
+          uv build --package biopb-tensor-server --wheel --out-dir wheels
+          uv build --package biopb-mcp --out-dir release-wheels
+          cp wheels/*.whl release-wheels/
+
+      - name: Build webapp
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm sync-version
+          pnpm --filter @biopb/tensor-flight-client build
+          VITE_TENSOR_API="" pnpm --filter @biopb/web build
+          tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
+
+      - name: Compute versions
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/release-v* ]]; then
+            REL="${GITHUB_REF#refs/tags/release-v}"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            REL="dryrun"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "release=$REL" >> "$GITHUB_OUTPUT"
+          # PEP 440 prerelease (a/b/rc) -> mark the GitHub release prerelease.
+          if [[ "$REL" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
+          echo "tensor=$tver" >> "$GITHUB_OUTPUT"
+          ibver=$(grep -E '^version[[:space:]]*=' biopb-image-runtime/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
+          echo "tensor-server=$tver  image-base=$ibver  release=$REL  prerelease check done"
+
+      - name: Login to ghcr.io
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Login to Docker Hub
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: jiyuuchc
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      # Idempotent publish: on a tag, build+push an image only if its version is
+      # not already in the registry (image-base, being stable, is normally
+      # skipped). On a dry run (workflow_dispatch), always build with --load to
+      # verify, never push.
+      - name: Decide which images to publish
+        id: gate
+        run: |
+          set -euo pipefail
+          owner="${{ github.repository_owner }}"
+          decide() {  # $1=image name  $2=version
+            if [[ "${{ steps.ver.outputs.is_tag }}" != "true" ]]; then echo verify; return; fi
+            if docker manifest inspect "ghcr.io/$owner/$1:$2" >/dev/null 2>&1; then echo skip; else echo push; fi
+          }
+          t=$(decide biopb-tensor-server "${{ steps.ver.outputs.tensor }}")
+          i=$(decide biopb-image-base "${{ steps.ver.outputs.imagebase }}")
+          echo "tensor=$t" >> "$GITHUB_OUTPUT"
+          echo "imagebase=$i" >> "$GITHUB_OUTPUT"
+          echo "tensor-server: $t   image-base: $i"
+
+      - name: tensor-server image
+        if: steps.gate.outputs.tensor != 'skip'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: biopb-tensor-server/Dockerfile
+          push: ${{ steps.gate.outputs.tensor == 'push' }}
+          load: ${{ steps.gate.outputs.tensor == 'verify' }}
+          build-args: |
+            MEMORY=4g
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor }}
+            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:latest
+            docker.io/jiyuuchc/biopb-tensor-server:${{ steps.ver.outputs.tensor }}
+            docker.io/jiyuuchc/biopb-tensor-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: image-base image
+        if: steps.gate.outputs.imagebase != 'skip'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: biopb-image-runtime/Dockerfile
+          push: ${{ steps.gate.outputs.imagebase == 'push' }}
+          load: ${{ steps.gate.outputs.imagebase == 'verify' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}
+            ghcr.io/${{ github.repository_owner }}/biopb-image-base:latest
+            docker.io/jiyuuchc/biopb-image-base:${{ steps.ver.outputs.imagebase }}
+            docker.io/jiyuuchc/biopb-image-base:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The GitHub release is the installer's source of truth. Explicit globs
+      # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
+      # uploaded. Installer scripts come from biopb-mcp/install/ for now; they
+      # move to the repo-root install/ after the first release (see
+      # docs/release-model.md).
+      - name: Create GitHub release
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: biopb ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          files: |
+            release-wheels/*.whl
+            release-wheels/*.tar.gz
+            biopb-mcp/install/install.sh
+            biopb-mcp/install/install.ps1
+          body: |
+            ## biopb deployment ${{ github.ref_name }}
+
+            All-in-one deployment built from this commit. Install:
+
+            ```sh
+            curl -fsSL https://biopb.org/install.sh | bash      # Linux / macOS / WSL
+            irm https://biopb.org/install.ps1 | iex             # Windows PowerShell
+            ```
+
+            ### Assets
+            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
+              version-paired wheel triple (installer `file://`-installs these)
+            - `webapp.tar.gz` — the data-browser web UI
+            - `install.sh` / `install.ps1` — bootstrap installers
+
+            ### Docker
+            - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor }}`
+            - `ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}`
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
