@@ -309,9 +309,10 @@ class TestWarming:
 
 class TestPersistentStoreRelease:
     """_release_persistent_store closes the adapter's store, under its io_lock,
-    so precache cannot accumulate one open store per source across the catalog."""
+    so precache cannot accumulate one open store per source across the catalog --
+    but only when a store is actually open."""
 
-    def test_closes_under_io_lock(self):
+    def test_closes_open_store_under_io_lock(self):
         import threading
         from biopb_tensor_server.precache import _release_persistent_store
 
@@ -320,6 +321,7 @@ class TestPersistentStoreRelease:
 
         class _Adapter:
             _io_lock = lock
+            _persistent_dask = object()  # a store is open
 
             def _close_persistent_store(self):
                 # The contract: the io_lock is held while we close.
@@ -329,10 +331,25 @@ class TestPersistentStoreRelease:
         assert observed == [True]
         assert not lock.locked()  # released afterwards
 
-    def test_noop_when_no_persistent_store(self):
+    def test_skips_when_no_store_open(self):
         from biopb_tensor_server.precache import _release_persistent_store
 
-        # Adapter without _close_persistent_store (e.g. nd2) -> silent no-op.
+        called = []
+
+        class _Adapter:
+            _io_lock = None
+            _persistent_dask = None  # nothing open -> must not touch state
+
+            def _close_persistent_store(self):
+                called.append(True)
+
+        _release_persistent_store(_Adapter())
+        assert called == []  # never closed -> _persistent_attempted left intact
+
+    def test_noop_when_adapter_has_no_store_api(self):
+        from biopb_tensor_server.precache import _release_persistent_store
+
+        # Adapter without the persistent-store attributes (e.g. nd2) -> no-op.
         _release_persistent_store(object())
 
     def test_swallows_close_errors(self):
@@ -340,6 +357,7 @@ class TestPersistentStoreRelease:
 
         class _Adapter:
             _io_lock = None
+            _persistent_dask = object()
 
             def _close_persistent_store(self):
                 raise RuntimeError("boom")

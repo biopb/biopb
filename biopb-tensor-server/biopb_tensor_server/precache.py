@@ -65,6 +65,10 @@ def _release_persistent_store(tensor_adapter) -> None:
     zero-TTL for precache-driven access. No-op for adapters with no persistent
     store (e.g. nd2); best-effort and never raises.
     """
+    # Nothing open -> leave adapter state untouched (don't reset _persistent_
+    # attempted, which non-tiff sources set to avoid re-probing a tiff store).
+    if getattr(tensor_adapter, "_persistent_dask", None) is None:
+        return
     close = getattr(tensor_adapter, "_close_persistent_store", None)
     if close is None:
         return
@@ -387,6 +391,12 @@ class PrecacheWorker:
 
         endpoints = read_plan.chunk_endpoints
         warmed = 0
+        # Only release a store precache itself opens. If another reader already
+        # has this source's persistent store open (mid idle-TTL countdown), leave
+        # it intact -- don't evict it or reset its TTL out from under that reader.
+        store_preexisted = (
+            getattr(tensor_adapter, "_persistent_dask", None) is not None
+        )
         try:
             for ce in endpoints:
                 if self._stop.is_set():
@@ -421,7 +431,9 @@ class PrecacheWorker:
             )
             return False
         finally:
-            # Release this source's persistent store before moving to the next,
-            # so stores can't accumulate across the catalog sweep (the OOM). Runs
-            # on every exit path: completion, backlog preemption, stop, or error.
-            _release_persistent_store(tensor_adapter)
+            # Release the store precache opened for this source before moving to
+            # the next, so stores can't accumulate across the sweep (the OOM).
+            # Skip when the store pre-existed -- that one belongs to another
+            # reader. Runs on every exit: completion, preemption, stop, or error.
+            if not store_preexisted:
+                _release_persistent_store(tensor_adapter)
