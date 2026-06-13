@@ -9,7 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
-import time
+import threading
 from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
@@ -22,7 +22,6 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -32,7 +31,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .._connection import ServerStarting, TensorConnection
+from .._connection import TensorConnection
 from .._tensor_utils import add_tensor_layer
 
 if TYPE_CHECKING:
@@ -335,6 +334,12 @@ class TensorBrowserWidget(QWidget):
     # thread; the queued connection marshals the tree rebuild back onto it.
     _sources_changed = Signal(object)
 
+    # Emitted (with the connect generation) from the background connect worker
+    # when an auto_connect attempt finishes. A Qt signal — not a direct call —
+    # because the worker runs off the Qt main thread; the queued connection
+    # marshals the tree render back onto it. See :meth:`_start_connect`.
+    _connect_done = Signal(int)
+
     def __init__(
         self,
         viewer: "napari.viewer.Viewer",
@@ -355,21 +360,15 @@ class TensorBrowserWidget(QWidget):
         self._selected_tensor_id: str | None = None
         self._expanded_folders: Set[str] = set()
 
-        # Non-blocking connect poller state (issue #12). The connect runs on the
-        # Qt main thread, so a STARTING (booting) server is polled via a
-        # self-rescheduling single-shot timer with capped exponential backoff
-        # rather than a blocking wait that would freeze the viewer.
-        self._connect_url: str = ""
-        self._connect_token: str | None = None
-        self._offer_autostart_on_fail: bool = False
-        self._connect_backoff_ms: int = 500
-        # Monotonic deadline until which a *connection failure* is tolerated as
-        # "still booting" (set only while waiting on a server we just launched);
-        # None means a down server fails fast.
-        self._connect_boot_deadline: float | None = None
-        # Supersession token: each new connect bumps it so any in-flight poll
-        # chain (e.g. an autostart boot wait) stops when the user retargets a
-        # different server. The old local server is left running.
+        # Connect runs the shared, non-blocking auto_connect policy on a worker
+        # thread (see :meth:`_start_connect`) so the viewer stays responsive and
+        # nothing blocks the kernel's Qt loop. ``_connecting`` is True while a
+        # worker is in flight (the source watcher skips re-rendering then, to
+        # avoid fighting the connect that is about to repaint). ``_connect_gen``
+        # is a supersession token: each new connect bumps it so a stale worker's
+        # result is dropped when the user retargets a different server (the old
+        # local server, if one was launched, is left running).
+        self._connecting: bool = False
         self._connect_gen: int = 0
 
         # Set up widget
@@ -385,6 +384,9 @@ class TensorBrowserWidget(QWidget):
         self._sources_changed.connect(self._on_sources_changed)
         self._conn.on_sources_changed = self._sources_changed.emit
         self._conn.start_source_watch()
+
+        # Render a background auto_connect's outcome on the Qt main thread.
+        self._connect_done.connect(self._on_connect_done)
 
         # Auto-connect on next event loop tick
         QTimer.singleShot(0, self._auto_connect)
@@ -497,71 +499,100 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._error_label)
 
     def _on_connect_clicked(self, *args):
-        """Connect button handler: connect without offering autostart on fail."""
-        self._offer_autostart_on_fail = False
-        self._connect()
+        """Connect button handler: retarget to the typed URL/token, connect."""
+        self._conn.url = self._server_input.text().strip()
+        self._conn.token = self._token_input.text().strip() or None
+        self._start_connect()
 
     def _auto_connect(self):
-        """Attempt to connect using resolved URL/token.
+        """Connect on startup using the resolved URL/token (no user prompt)."""
+        self._start_connect()
 
-        Connect runs as a non-blocking poller (see :meth:`_connect`); if it
-        ends up unreachable, the terminal "down" branch offers to start a local
-        biopb server as a last resort (see ``_maybe_offer_start_server``).
+    def _start_connect(self):
+        """Run the shared auto-connect policy on a worker thread.
+
+        Delegates to :meth:`TensorConnection.auto_connect` — the same
+        non-blocking policy the headless kernel uses (try the URL, wait through a
+        ``STARTING`` data-folder scan, and auto-start a local biopb server as a
+        last resort when the URL is local and the CLI is installed) — run off the
+        Qt main thread. Two reasons it must not run inline: the viewer stays
+        responsive while the server binds/scans, and, in the MCP context, the
+        widget lives in the kernel whose Qt loop ``start_kernel`` waits on, so a
+        blocking connect (or a modal prompt — now gone) here would wedge the
+        kernel. Completion is marshaled back via ``_connect_done``; a generation
+        token drops the result of any connect the user has since superseded.
         """
-        self._offer_autostart_on_fail = True
-        self._connect()
-
-    def _maybe_offer_start_server(self):
-        """Offer to start a local biopb server when startup connect failed.
-
-        Last-resort fallback: if the configured URL is local and the ``biopb``
-        CLI is installed, ask the user whether to launch a server for them and,
-        if so, start it and reconnect. Skipped in headless/offscreen sessions
-        (CI, tests) where there is no one to answer the prompt.
-        """
-        if QApplication.platformName() == "offscreen":
-            return
-        if not self._conn.can_autostart_server():
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Start biopb server?",
-            f"Could not connect to {self._conn.url}.\n\n"
-            "The 'biopb' command-line tool is installed. Start a local "
-            "tensor server now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        # Launch the daemon (quick — it detaches immediately), then hand off to
-        # the non-blocking poller so the viewer stays responsive while the
-        # server binds and scans its data folder. The user may type a different
-        # server URL and click Connect during the wait; that supersedes this
-        # poll (the local server is left running). See issue #12.
         self._clear_error()
-        timeout = self._conn.server_start_timeout()
-        try:
-            self._conn.launch_local_server(startup_timeout=timeout)
-        except Exception as exc:
-            # Launching a server we were asked to start failing is unexpected:
-            # show the underlying cause (e.g. port already in use) inline and
-            # also let it propagate to napari's notification_manager. See
-            # docs/troubleshooting.md for remedies.
-            self._show_error(f"Failed to start local biopb server: {exc}")
-            raise
+        self._clear_status()
+        self._tree_widget.clear()
+        self._metadata_label.setVisible(False)
+        self._selected_source_id = None
+        self._selected_tensor_id = None
 
-        self._server_input.setText(self._conn.url)
-        self._connect_url = self._conn.url
-        self._connect_token = self._conn.token
-        # Tolerate connection-refused as "still booting" until this deadline.
-        self._connect_boot_deadline = time.monotonic() + timeout
-        # Don't re-offer autostart from inside the boot poll.
-        self._offer_autostart_on_fail = False
-        self._show_status("Starting local biopb server…")
-        self._begin_poll()
+        self._connect_gen += 1
+        gen = self._connect_gen
+        self._connecting = True
+        self._connect_button.setEnabled(False)
+        self._show_status(f"Connecting to {self._conn.url}…")
+
+        def _worker():
+            # auto_connect is best-effort: it swallows its own failures and
+            # records last_status/last_message, so we only signal completion and
+            # let _on_connect_done read the outcome off the connection. The
+            # except is belt-and-suspenders — always signal, never let the
+            # worker thread die with an unhandled exception.
+            try:
+                self._conn.auto_connect()
+            except Exception:
+                logger.exception("Connect worker failed")
+            finally:
+                self._connect_done.emit(gen)
+
+        threading.Thread(
+            target=_worker, name="tbw-connect", daemon=True
+        ).start()
+
+    def _on_connect_done(self, gen: int):
+        """Render the outcome of a background ``auto_connect`` (main thread).
+
+        Queued from ``_connect_done``. A stale generation (the user retargeted a
+        different server while this one was still connecting) is dropped; the
+        superseding connect owns the UI.
+        """
+        if gen != self._connect_gen:
+            return
+        self._connecting = False
+        self._connect_button.setEnabled(True)
+        self._clear_status()
+
+        if not self._conn.is_connected:
+            # auto_connect recorded the friendly reason (down / still starting).
+            self._show_error(
+                self._conn.last_message
+                or f"Cannot reach tensor server at {self._conn.url} — "
+                "is it running?"
+            )
+            self._tree_widget.clear()
+            self._refresh_button.setEnabled(False)
+            return
+
+        sources = self._conn.sources
+        if not sources:
+            self._show_error("No sources found on server")
+            self._refresh_button.setEnabled(False)
+            return
+
+        if self._use_server_query:
+            self._filter_input.setPlaceholderText("Search (SQL filter)")
+            logger.info(
+                "Large catalog (%d sources), server-side SQL filter enabled",
+                len(sources),
+            )
+        else:
+            self._filter_input.setPlaceholderText("Search sources...")
+
+        self._build_and_display_tree()
+        self._refresh_button.setEnabled(True)
 
     def _toggle_token_visibility(self):
         """Toggle token field visibility between password and normal mode."""
@@ -591,114 +622,6 @@ class TensorBrowserWidget(QWidget):
         """Clear the status/progress message."""
         self._status_label.setVisible(False)
         self._status_label.setText("")
-
-    def _connect(self):
-        """Begin connecting to the server in the input field (non-blocking).
-
-        Wired (via :meth:`_on_connect_clicked`) to the Connect button and called
-        by :meth:`_auto_connect`. Reads the URL/token from the fields, drops out
-        of any boot wait (a down server fails fast here), and starts a fresh
-        poll chain — superseding any in-flight one, so the user can retarget a
-        different server mid-wait (issue #12).
-        """
-        self._clear_error()
-        self._clear_status()
-        self._tree_widget.clear()
-        self._metadata_label.setVisible(False)
-        self._selected_source_id = None
-        self._selected_tensor_id = None
-
-        self._connect_url = self._server_input.text().strip()
-        self._connect_token = self._token_input.text().strip() or None
-        self._connect_boot_deadline = None
-        self._begin_poll()
-
-    def _begin_poll(self):
-        """(Re)start the poll chain, superseding any in-flight one."""
-        self._connect_gen += 1
-        # Reset backoff so a fresh connect/retry starts snappy.
-        self._connect_backoff_ms = 500
-        self._connect_tick(self._connect_gen)
-
-    def _rearm(self, gen: int):
-        """Schedule the next poll tick with capped exponential backoff."""
-        QTimer.singleShot(
-            self._connect_backoff_ms, lambda: self._connect_tick(gen)
-        )
-        self._connect_backoff_ms = min(self._connect_backoff_ms * 2, 5000)
-
-    def _connect_tick(self, gen: int):
-        """One connect attempt; re-arms itself while the server is starting."""
-        if gen != self._connect_gen:
-            # Superseded by a newer connect (e.g. the user retargeted a
-            # different server). Stop this stale chain.
-            return
-        try:
-            # Connection service owns the client/sources and persists the URL.
-            sources = self._conn.connect(
-                self._connect_url, self._connect_token
-            )
-        except ServerStarting:
-            # Server is up but still scanning its data folder: keep waiting
-            # with progress feedback and capped exponential backoff.
-            self._show_status(self._conn.last_message)
-            self._rearm(gen)
-            return
-        except Exception as exc:
-            # Connection failed. While waiting on a server we just launched,
-            # tolerate this (the daemon may not have bound its port yet) until
-            # the boot deadline, then give up. Otherwise fail fast.
-            if self._connect_boot_deadline is not None:
-                if time.monotonic() < self._connect_boot_deadline:
-                    self._show_status("Starting local biopb server…")
-                    self._rearm(gen)
-                    return
-                # Boot timed out: this is unexpected (we launched it
-                # ourselves), so surface the underlying cause and let napari's
-                # notification_manager show it.
-                self._connect_boot_deadline = None
-                self._clear_status()
-                self._show_error(
-                    f"Local biopb server did not become ready in time: {exc}"
-                )
-                self._tree_widget.clear()
-                self._refresh_button.setEnabled(False)
-                raise
-            # An ordinary unreachable server is an expected condition, not an
-            # error to surface to napari: show a friendly inline hint instead.
-            self._clear_status()
-            self._show_error(
-                f"Cannot reach tensor server at {self._connect_url} — "
-                "is it running?"
-            )
-            logger.info("Tensor server unreachable at %s", self._connect_url)
-            self._tree_widget.clear()
-            self._refresh_button.setEnabled(False)
-            if self._offer_autostart_on_fail:
-                self._maybe_offer_start_server()
-            return
-
-        # Connected.
-        self._connect_boot_deadline = None
-        self._clear_status()
-        if self._use_server_query:
-            self._filter_input.setPlaceholderText("Search (SQL filter)")
-        else:
-            self._filter_input.setPlaceholderText("Search sources...")
-
-        if not sources:
-            self._show_error("No sources found on server")
-            self._refresh_button.setEnabled(False)
-            return
-
-        self._build_and_display_tree()
-        self._refresh_button.setEnabled(True)
-
-        if self._use_server_query:
-            logger.info(
-                "Large catalog (%d sources), server-side SQL filter enabled",
-                len(sources),
-            )
 
     def _refresh(self):
         """Refresh the source list from server."""
@@ -736,7 +659,7 @@ class TensorBrowserWidget(QWidget):
         only while connected and not mid-(re)connect, to avoid fighting a
         concurrent connect that is about to repaint anyway.
         """
-        if not self._conn.is_connected or self._connect_boot_deadline:
+        if not self._conn.is_connected or self._connecting:
             return
         self._clear_error()
         self._apply_filter()

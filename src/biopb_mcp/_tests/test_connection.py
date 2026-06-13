@@ -664,3 +664,118 @@ class TestStartLocalServer:
         conn = TensorConnection(config={})
         with pytest.raises(RuntimeError, match="failed"):
             conn.start_local_server()
+
+
+class TestAutoConnect:
+    """The shared connect policy used by both the kernel and the widget.
+
+    Both callers drive this off their own worker thread (the MCP bootstrap on a
+    daemon thread, the widget on a connect worker); here we call it directly with
+    ``connect`` and friends mocked.
+    """
+
+    def test_connects_on_first_try(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url, conn.token = "grpc://host:9", "tok"
+        connect = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect", connect)
+        booted = MagicMock()
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+        started = MagicMock()
+        monkeypatch.setattr(conn, "start_local_server", started)
+
+        conn.auto_connect()
+
+        connect.assert_called_once_with("grpc://host:9", "tok")
+        # A clean connect short-circuits — no boot wait, no autostart.
+        booted.assert_not_called()
+        started.assert_not_called()
+
+    def test_starting_waits_through_boot(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url, conn.token = "grpc://host:9", None
+        monkeypatch.setattr(
+            conn,
+            "connect",
+            MagicMock(side_effect=_connection.ServerStarting("STARTING")),
+        )
+        booted = MagicMock(return_value={"a": MagicMock()})
+        monkeypatch.setattr(conn, "connect_when_booted", booted)
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 42.0)
+        started = MagicMock()
+        monkeypatch.setattr(conn, "start_local_server", started)
+
+        conn.auto_connect()
+
+        # A STARTING server is waited through, not autostarted.
+        booted.assert_called_once_with("grpc://host:9", None, timeout=42.0)
+        started.assert_not_called()
+
+    def test_starting_then_boot_timeout_is_swallowed(self, monkeypatch):
+        conn = TensorConnection(config={})
+        monkeypatch.setattr(
+            conn,
+            "connect",
+            MagicMock(side_effect=_connection.ServerStarting("STARTING")),
+        )
+        monkeypatch.setattr(
+            conn,
+            "connect_when_booted",
+            MagicMock(side_effect=RuntimeError("did not become ready")),
+        )
+        monkeypatch.setattr(conn, "server_start_timeout", lambda: 1.0)
+        started = MagicMock()
+        monkeypatch.setattr(conn, "start_local_server", started)
+
+        # Best-effort: a boot timeout must not raise out of auto_connect.
+        conn.auto_connect()
+        # Already up (just slow), so we do NOT fall through to autostart.
+        started.assert_not_called()
+
+    def test_unreachable_autostarts_local(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            conn,
+            "connect",
+            MagicMock(side_effect=RuntimeError("connection refused")),
+        )
+        monkeypatch.setattr(conn, "can_autostart_server", lambda: True)
+        started = MagicMock()
+        monkeypatch.setattr(conn, "start_local_server", started)
+
+        conn.auto_connect()
+        started.assert_called_once_with()
+
+    def test_unreachable_no_autostart_is_swallowed(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url = "grpc://remote:9"
+        monkeypatch.setattr(
+            conn,
+            "connect",
+            MagicMock(side_effect=RuntimeError("connection refused")),
+        )
+        # Remote URL / no CLI -> cannot autostart; auto_connect just gives up.
+        monkeypatch.setattr(conn, "can_autostart_server", lambda: False)
+        started = MagicMock()
+        monkeypatch.setattr(conn, "start_local_server", started)
+
+        conn.auto_connect()  # must not raise
+        started.assert_not_called()
+
+    def test_autostart_failure_is_swallowed(self, monkeypatch):
+        conn = TensorConnection(config={})
+        conn.url = "grpc://localhost:8815"
+        monkeypatch.setattr(
+            conn,
+            "connect",
+            MagicMock(side_effect=RuntimeError("connection refused")),
+        )
+        monkeypatch.setattr(conn, "can_autostart_server", lambda: True)
+        monkeypatch.setattr(
+            conn,
+            "start_local_server",
+            MagicMock(side_effect=RuntimeError("boot failed")),
+        )
+        # A failed autostart must not propagate out of the best-effort policy.
+        conn.auto_connect()

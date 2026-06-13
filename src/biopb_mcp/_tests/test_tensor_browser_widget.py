@@ -1,9 +1,13 @@
-"""Tests for the TensorBrowserWidget non-blocking connect poller (issue #12).
+"""Tests for the TensorBrowserWidget connect flow.
 
-These exercise the connect/auto-connect state machine — readiness gating
-(STARTING), fail-fast on down, autostart hand-off, capped-backoff re-arm, and
-generation-based supersession — with a mocked ``TensorConnection`` and the tree
-renderer patched out, so they test the poller rather than tree rendering.
+The widget delegates connecting to ``TensorConnection.auto_connect`` — the
+single, GUI-independent connect policy shared with the headless kernel — run on
+a worker thread, then renders the outcome on the Qt main thread via the
+``_connect_done`` signal (no modal prompt; the old blocking autostart dialog is
+gone). These tests drive that flow deterministically: the worker thread is
+*captured* rather than really spawned, so the test runs it explicitly and can
+assert both the in-flight ("Connecting…") and completed states. The connection
+is a mock whose ``auto_connect`` sets the post-connect state the render reads.
 
 A real ``napari`` viewer (and thus a Qt/OpenGL context) is required, so the
 suite is skipped on macOS CI like the other viewer tests.
@@ -11,12 +15,9 @@ suite is skipped on macOS CI like the other viewer tests.
 
 import os
 import sys
-import time
 from unittest.mock import MagicMock
 
 import pytest
-
-from biopb_mcp._connection import ServerStarting
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "darwin" and os.getenv("CI") == "true",
@@ -28,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 def widget(make_napari_viewer, monkeypatch):
     from qtpy.QtCore import QTimer
 
+    from biopb_mcp.tensor_browser import _widget as widget_mod
     from biopb_mcp.tensor_browser._widget import TensorBrowserWidget
 
     viewer = make_napari_viewer(show=False)
@@ -35,180 +37,193 @@ def widget(make_napari_viewer, monkeypatch):
     conn.url = "grpc://localhost:8815"
     conn.token = None
     conn.use_server_query = False
-    conn.last_message = "Tensor server is starting — scanning its data folder."
-    # Neutralize QTimer.singleShot so neither the auto-connect-on-construction
-    # tick nor the poller's backoff re-arm fire on their own — the tests drive
-    # the poll chain explicitly for determinism.
+    # Default outcome: a connect that resolved to "not connected" (down). Tests
+    # that exercise a successful connect give auto_connect a side effect that
+    # flips these to the connected state the render reads.
+    conn.is_connected = False
+    conn.sources = {}
+    conn.last_message = ""
+
+    # Capture connect workers instead of spawning real threads so the tests run
+    # them explicitly (and can assert the in-flight state before completion).
+    workers = []
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            workers.append(self._target)
+
+    monkeypatch.setattr(widget_mod.threading, "Thread", _FakeThread)
+    # Neutralize the auto-connect-on-construction tick — the tests drive connect
+    # explicitly for determinism.
     monkeypatch.setattr(QTimer, "singleShot", lambda *a, **k: None)
+
     w = TensorBrowserWidget(viewer, connection=conn)
-    # Isolate the poller from tree rendering (which needs real descriptors).
+    # Isolate the render from tree building (which needs real descriptors).
     w._build_and_display_tree = MagicMock()
-    return w, conn
+    return w, conn, workers
 
 
-class TestConnectPoller:
-    def test_success_builds_tree(self, widget):
-        w, conn = widget
-        conn.connect.return_value = {"a": object()}
+def _connected_with(conn, sources, *, use_server_query=False):
+    """Make ``conn.auto_connect`` resolve to a connected state."""
 
-        w._connect()
+    def _side_effect():
+        conn.is_connected = True
+        conn.sources = sources
+        conn.use_server_query = use_server_query
 
-        conn.connect.assert_called_once_with("grpc://localhost:8815", None)
+    conn.auto_connect.side_effect = _side_effect
+
+
+class TestConnect:
+    def test_shows_connecting_then_builds_tree(self, widget):
+        w, conn, workers = widget
+        _connected_with(conn, {"a": object()})
+
+        w._auto_connect()
+
+        # In flight: status shown, button disabled, worker captured not yet run.
+        assert w._connecting is True
+        assert not w._connect_button.isEnabled()
+        assert "Connecting" in w._status_label.text()
+        assert len(workers) == 1
+        w._build_and_display_tree.assert_not_called()
+
+        workers.pop(0)()  # run the worker -> auto_connect + render
+
+        conn.auto_connect.assert_called_once()
         w._build_and_display_tree.assert_called_once()
         assert w._refresh_button.isEnabled()
         assert w._status_label.isHidden()
+        assert w._connect_button.isEnabled()
+        assert w._connecting is False
 
-    def test_down_fails_fast_no_autostart_offer(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = RuntimeError("connection refused")
-        w._maybe_offer_start_server = MagicMock()
+    def test_down_shows_error_no_prompt(self, widget):
+        w, conn, workers = widget
+        # auto_connect tried, failed, recorded the friendly reason. There is no
+        # dialog anymore — the failure just renders inline.
+        conn.last_message = (
+            "Cannot reach tensor server at grpc://localhost:8815 — "
+            "is it running?"
+        )
 
-        w._on_connect_clicked()  # manual connect -> offer flag False
+        w._auto_connect()
+        workers.pop(0)()
 
+        conn.auto_connect.assert_called_once()
         assert not w._error_label.isHidden()
         assert "Cannot reach" in w._error_label.text()
         assert not w._refresh_button.isEnabled()
-        w._maybe_offer_start_server.assert_not_called()
+        assert w._connecting is False
+        assert w._connect_button.isEnabled()
 
-    def test_down_offers_autostart_on_auto_connect(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = RuntimeError("connection refused")
-        w._maybe_offer_start_server = MagicMock()
+    def test_down_uses_generic_message_without_last_message(self, widget):
+        w, conn, workers = widget
+        conn.last_message = ""  # nothing recorded -> generic fallback
 
-        w._auto_connect()  # sets offer flag True
+        w._auto_connect()
+        workers.pop(0)()
 
-        w._maybe_offer_start_server.assert_called_once()
+        assert "Cannot reach tensor server" in w._error_label.text()
 
     def test_empty_catalog_shows_error(self, widget):
-        w, conn = widget
-        conn.connect.return_value = {}
+        w, conn, workers = widget
+        _connected_with(conn, {})  # connected, but no sources
 
-        w._connect()
+        w._auto_connect()
+        workers.pop(0)()
 
         assert "No sources found" in w._error_label.text()
         assert not w._refresh_button.isEnabled()
         w._build_and_display_tree.assert_not_called()
 
     def test_large_catalog_enables_sql_filter(self, widget):
-        w, conn = widget
-        conn.use_server_query = True
-        conn.connect.return_value = {"a": object()}
+        w, conn, workers = widget
+        _connected_with(conn, {"a": object()}, use_server_query=True)
 
-        w._connect()
+        w._auto_connect()
+        workers.pop(0)()
 
         w._build_and_display_tree.assert_called_once()
         assert w._refresh_button.isEnabled()
         assert "SQL filter" in w._filter_input.placeholderText()
 
-    def test_autostart_launch_failure_shows_error(self, widget, monkeypatch):
-        from qtpy.QtWidgets import QApplication, QMessageBox
+    def test_connect_button_retargets_to_typed_url(self, widget):
+        w, conn, workers = widget
+        w._server_input.setText("grpc://other:9")
+        w._token_input.setText("secret")
 
-        w, conn = widget
-        monkeypatch.setattr(QApplication, "platformName", lambda *a: "xcb")
-        monkeypatch.setattr(
-            QMessageBox, "question", lambda *a, **k: QMessageBox.Yes
-        )
-        conn.can_autostart_server.return_value = True
-        conn.server_start_timeout.return_value = 30.0
-        conn.launch_local_server.side_effect = RuntimeError("port in use")
+        w._on_connect_clicked()
 
-        # Launch failure is unexpected -> inline message + propagate to napari.
-        with pytest.raises(RuntimeError, match="port in use"):
-            w._maybe_offer_start_server()
+        # The typed URL/token are pushed onto the connection before connecting.
+        assert conn.url == "grpc://other:9"
+        assert conn.token == "secret"
+        assert len(workers) == 1  # a connect worker was started
 
-        assert "Failed to start local biopb server" in w._error_label.text()
-        # No poll started when the launch itself failed.
-        assert w._connect_boot_deadline is None
+    def test_stale_generation_is_dropped(self, widget):
+        w, conn, workers = widget
+        _connected_with(conn, {"a": object()})
 
-    def test_starting_then_ready(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = [
-            ServerStarting("STARTING"),
-            {"a": object()},
-        ]
+        w._auto_connect()  # gen 1, worker captured
+        stale_worker = workers.pop(0)
+        w._auto_connect()  # gen 2 supersedes; new worker captured
+        workers.pop(0)()  # gen 2 completes and renders
+        w._build_and_display_tree.assert_called_once()
 
-        w._connect()  # first tick: STARTING -> show status, re-arm
-        assert not w._status_label.isHidden()
-        assert "scanning" in w._status_label.text()
+        # The superseded (gen 1) worker finishing now must NOT re-render.
+        w._build_and_display_tree.reset_mock()
+        stale_worker()
         w._build_and_display_tree.assert_not_called()
 
-        # Simulate the backoff timer firing the next tick.
-        w._connect_tick(w._connect_gen)
-        w._build_and_display_tree.assert_called_once()
-        assert w._status_label.isHidden()
-
-    def test_stale_tick_is_superseded(self, widget):
-        w, conn = widget
-        w._connect_gen = 5
-
-        w._connect_tick(3)  # older generation
-
-        conn.connect.assert_not_called()
-
-    def test_retarget_supersedes_inflight_wait(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = ServerStarting("STARTING")
-
-        w._connect()  # enters the STARTING wait
-        gen_first = w._connect_gen
-
-        # User points at a different server and reconnects.
-        conn.connect.side_effect = None
-        conn.connect.return_value = {"a": object()}
-        w._server_input.setText("grpc://other:9")
-        w._on_connect_clicked()
-        assert w._connect_gen != gen_first
-
-        # A late tick from the original chain must no-op (local server is left
-        # running; we just stop polling it).
-        conn.connect.reset_mock()
-        w._connect_tick(gen_first)
-        conn.connect.assert_not_called()
-
-    def test_boot_tolerance_keeps_waiting(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = RuntimeError("connection refused")
-        w._connect_boot_deadline = time.monotonic() + 100
-
-        w._connect_tick(w._connect_gen)
-
-        assert "Starting local biopb server" in w._status_label.text()
-        assert w._error_label.isHidden()
-
-    def test_boot_timeout_gives_up(self, widget):
-        w, conn = widget
-        conn.connect.side_effect = RuntimeError("connection refused")
-        w._connect_boot_deadline = time.monotonic() - 1  # already elapsed
-
-        # A server we launched ourselves never coming up is unexpected -> the
-        # cause is surfaced inline and re-raised for napari's notifications.
-        with pytest.raises(RuntimeError, match="connection refused"):
-            w._connect_tick(w._connect_gen)
-
-        assert "did not become ready" in w._error_label.text()
-        assert "connection refused" in w._error_label.text()
-        assert w._connect_boot_deadline is None
-        assert not w._refresh_button.isEnabled()
-
-    def test_autostart_launches_and_polls_without_blocking(
-        self, widget, monkeypatch
+    def test_worker_signals_completion_even_if_auto_connect_raises(
+        self, widget
     ):
-        from qtpy.QtWidgets import QApplication, QMessageBox
+        w, conn, workers = widget
+        # auto_connect is documented best-effort, but the worker must still
+        # signal completion (and not die) if it ever leaks an exception.
+        conn.auto_connect.side_effect = RuntimeError("boom")
+        conn.is_connected = False
 
-        w, conn = widget
-        # Pretend we are not headless so the offer proceeds, and auto-accept.
-        monkeypatch.setattr(QApplication, "platformName", lambda *a: "xcb")
-        monkeypatch.setattr(
-            QMessageBox, "question", lambda *a, **k: QMessageBox.Yes
-        )
-        conn.can_autostart_server.return_value = True
-        conn.server_start_timeout.return_value = 30.0
-        # The just-launched server is not reachable yet -> boot mode tolerates.
-        conn.connect.side_effect = RuntimeError("connection refused")
+        w._auto_connect()
+        workers.pop(0)()  # must not raise
 
-        w._maybe_offer_start_server()
+        assert w._connecting is False
+        assert w._connect_button.isEnabled()
+        assert not w._error_label.isHidden()
 
-        conn.launch_local_server.assert_called_once()
-        assert w._connect_boot_deadline is not None
-        assert w._offer_autostart_on_fail is False
-        assert "Starting local biopb server" in w._status_label.text()
+
+class TestSourcesChangedGuard:
+    """The background source watcher's re-render is suppressed mid-connect."""
+
+    def test_skipped_while_connecting(self, widget):
+        w, conn, workers = widget
+        conn.is_connected = True
+        w._connecting = True
+        w._apply_filter = MagicMock()
+
+        w._on_sources_changed({"a": object()})
+
+        # A connect in flight owns the repaint; don't fight it.
+        w._apply_filter.assert_not_called()
+
+    def test_renders_when_idle(self, widget):
+        w, conn, workers = widget
+        conn.is_connected = True
+        w._connecting = False
+        w._apply_filter = MagicMock()
+
+        w._on_sources_changed({"a": object()})
+
+        w._apply_filter.assert_called_once()
+
+    def test_skipped_when_disconnected(self, widget):
+        w, conn, workers = widget
+        conn.is_connected = False
+        w._connecting = False
+        w._apply_filter = MagicMock()
+
+        w._on_sources_changed({"a": object()})
+
+        w._apply_filter.assert_not_called()

@@ -433,6 +433,60 @@ class TensorConnection:
         """The configured ``mcp.server_start_timeout`` boot-wait budget (s)."""
         return CONFIG.get("mcp.server_start_timeout")
 
+    def auto_connect(self) -> None:
+        """Connect using the resolved URL, with an automatic fallback policy.
+
+        The single connect policy shared by **both** faces: try the resolved
+        ``(url, token)``, wait the server through a ``STARTING`` data-folder
+        scan, and — with no prompt — auto-start a local biopb server as a last
+        resort when the URL is local and the ``biopb`` CLI is on PATH.
+
+        Lives here, on the GUI-independent service, rather than in the MCP
+        bootstrap or the widget so the policy is unit-testable without Qt/napari
+        and neither caller reimplements it. It is a *mechanism the caller
+        drives*, not something the constructor does: ``connect`` blocks on
+        network I/O and ``on_connect`` is wired only after construction, so
+        self-connecting in ``__init__`` would both stall the constructor and skip
+        the cache-plugin hook. Both callers run it **off their main thread** —
+        the MCP kernel on a daemon thread (``execute_code`` refreshes ``client``
+        from ``_conn.client`` per job, so a late connect is still picked up), the
+        widget on a worker thread that signals the tree render back to the Qt
+        main thread (``_start_connect``) — because a blocking connect on the
+        kernel's Qt loop would wedge ``start_kernel`` (and a modal prompt used
+        to, which is why the prompt is gone).
+
+        Fully best-effort: every failure path is swallowed (``last_status`` and
+        ``last_message`` already record the outcome for ``server_status`` and the
+        widget's error label), so a propagated error never aborts the caller.
+        """
+        url, token = self.url, self.token
+        try:
+            self.connect(url, token)
+            return
+        except ServerStarting:
+            # Server is up but still scanning its data folder: keep waiting with
+            # capped backoff until it reports SERVING (or the budget elapses).
+            try:
+                self.connect_when_booted(
+                    url, token, timeout=self.server_start_timeout()
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "auto_connect: %s did not finish starting", url
+                )
+            return
+        except Exception:  # noqa: BLE001
+            logger.info("auto_connect: %s unreachable", url)
+
+        # Unreachable and no dialog to offer autostart: start a local server
+        # ourselves when the URL is local and the biopb CLI is available.
+        if self.can_autostart_server():
+            try:
+                logger.info("auto_connect: auto-starting local biopb server")
+                self.start_local_server()
+            except Exception:  # noqa: BLE001
+                logger.exception("auto_connect: local server autostart failed")
+
     def launch_local_server(
         self,
         config_path: str | None = None,
@@ -484,13 +538,15 @@ class TensorConnection:
         separately so it can poll without freezing. Returns the source catalog
         on success; raises on failure.
         """
-        if startup_timeout is None:
-            startup_timeout = self.server_start_timeout()
+        # launch_local_server resolves a None timeout itself; we only need a
+        # concrete value for connect_when_booted's deadline arithmetic below.
         self.launch_local_server(
             config_path=config_path, startup_timeout=startup_timeout
         )
         # The daemon detaches immediately; poll until it is reachable AND past
         # its data-folder scan (SERVING), tolerating refused/STARTING meanwhile.
         return self.connect_when_booted(
-            self.url, self.token, timeout=startup_timeout
+            self.url,
+            self.token,
+            timeout=startup_timeout or self.server_start_timeout(),
         )

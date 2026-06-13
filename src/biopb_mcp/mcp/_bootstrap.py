@@ -303,6 +303,20 @@ def _bootstrap_impl():
     if headless:
         viewer = _HeadlessViewer()
         logger.info("Headless mode: no napari viewer (no display).")
+        # No widget exists to drive the initial connect (the GUI branch's
+        # TensorBrowserWidget runs the same conn.auto_connect policy off a
+        # worker thread), so drive it here. On a daemon thread: connect() blocks
+        # on network I/O and we must not stall kernel bring-up (this runs in
+        # exec_lines, ahead of start_kernel returning). execute_code refreshes
+        # `client` from `_conn.client` per job, so a connect that lands after the
+        # kernel is ready is still seen.
+        import threading
+
+        threading.Thread(
+            target=conn.auto_connect,
+            name="biopb-headless-connect",
+            daemon=True,
+        ).start()
     else:
         # Enable napari async slicing via its NAPARI_ASYNC env override, set
         # BEFORE importing napari. The settings singleton reads the env at load,

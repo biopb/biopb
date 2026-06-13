@@ -102,10 +102,20 @@ URL/token resolution fallback chain (`resolve_from_config`):
 2. **Config file**: `tensor_browser.server_url` in the config
 3. **Default**: `grpc://localhost:8815`
 
-If the initial connect fails and the URL is local *and* the `biopb` CLI is on
-PATH, `start_local_server()` can run `biopb server start` as a last-resort
-fallback (the widget drives this). Only the URL is persisted; the token is read
-from the environment, not saved.
+**Connect policy (`auto_connect`).** `auto_connect()` is the single connect
+policy shared by **both** faces: try the resolved `(url, token)`, wait the
+server through a `STARTING` data-folder scan, and — with no prompt — run
+`start_local_server()` (`biopb server start`) as a last resort when the URL is
+local *and* the `biopb` CLI is on PATH. It is best-effort (failures are recorded
+in `last_status`/`last_message`, never raised) and **must be driven off the
+caller's main thread** because `connect()` blocks on network I/O: the MCP kernel
+runs it on a daemon thread (`_bootstrap`'s headless branch), the
+`TensorBrowserWidget` on a connect worker that signals the tree render back to
+the Qt main thread (`_start_connect` → `_connect_done`). This replaced the
+widget's old QTimer poll chain **and** its modal autostart dialog — a modal on
+the kernel's Qt loop could wedge the synchronous `start_kernel` (which blocks on
+a kernel-main-thread readiness probe) until the user clicked. Only the URL is
+persisted; the token is read from the environment, not saved.
 
 **Self-healing catalog (`start_source_watch`, issue #44).** The catalog cached
 at connect time can be *partial* — the server reports `SERVING` (port bound)
