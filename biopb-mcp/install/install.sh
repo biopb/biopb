@@ -535,16 +535,23 @@ _ensure_local_bin_on_path() {
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
-    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null) || return 1
-    # `|| true`: a missing/error API response (no "tag_name") makes grep exit 1,
-    # which under `set -euo pipefail` would otherwise abort the whole installer
-    # from inside this command substitution. We want to return 1 and let the
-    # caller print a friendly message, so the empty-tag check below handles it.
-    RELEASE_TAG=$(printf '%s' "$RELEASE_JSON" \
-        | grep '"tag_name"' | head -1 \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/') || true
+    # The monorepo hosts several release lines, so /releases/latest is NOT
+    # component-specific. List releases (date-desc) and take the newest whose
+    # tag matches RELEASE_TAG_PREFIX, then fetch that release by tag.
+    local _releases
+    _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
+    # `|| true`: an error/empty response makes grep exit 1, which under
+    # `set -euo pipefail` would abort the installer from this command
+    # substitution. We want to return 1 and let the caller print a friendly
+    # message, so the empty-tag check below handles it.
+    RELEASE_TAG=$(printf '%s' "$_releases" \
+        | grep '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+        | grep -E "^${RELEASE_TAG_PREFIX:-}" | head -1) || true
     [ -n "${RELEASE_TAG:-}" ] || return 1
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
     if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
         _warn "Unexpected release tag format: $RELEASE_TAG"
         RELEASE_TAG=""
@@ -650,15 +657,20 @@ _start_data_server() {
 install_biopb() {
     set -euo pipefail
 
-    # Release mode pulls all three wheels (+ webapp) from ONE biopb-mcp release.
-    # Source mode builds from git: biopb-mcp from its own repo, biopb +
-    # biopb-tensor-server from the biopb monorepo (separate REPOs below).
-    MCP_REPO_URL="https://github.com/biopb/biopb-mcp"
-    MCP_REPO="git+$MCP_REPO_URL"
+    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
+    # (the mcp-v* line). Source mode builds from git: all three packages now
+    # live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # subdirectories), so there is a single REPO.
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
     BIOPB_REPO="git+$BIOPB_REPO_URL"
-    REPO_URL="$MCP_REPO_URL"          # webapp release-asset fallback URL
-    RELEASE_REPO="biopb/biopb-mcp"    # owner/name for the GitHub Releases API
+    MCP_REPO_URL="$BIOPB_REPO_URL"
+    MCP_REPO="$BIOPB_REPO"
+    REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
+    RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
+    # The monorepo hosts multiple release lines (mcp-v*, server-v*); the bundle
+    # the installer wants is the mcp-v* one, so the release fetch filters by
+    # this prefix instead of using /releases/latest (which is repo-wide).
+    RELEASE_TAG_PREFIX="mcp-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
 
@@ -867,9 +879,9 @@ install_biopb() {
     # one consistent set — no PyPI-vs-release version skew.
     local biopb_req tensor_req mcp_req
     if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
-        _info "Building from source: biopb-mcp HEAD of $MCP_REPO_URL,"
-        _info "  biopb + biopb-tensor-server HEAD of $BIOPB_REPO_URL"
-        mcp_req="biopb-mcp[mcp] @ $MCP_REPO"
+        _info "Building from source: biopb-mcp + biopb + biopb-tensor-server"
+        _info "  from HEAD of $BIOPB_REPO_URL (monorepo subdirectories)"
+        mcp_req="biopb-mcp[mcp] @ $MCP_REPO#subdirectory=biopb-mcp"
         biopb_req="biopb[tensor] @ $BIOPB_REPO"
         tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $BIOPB_REPO#subdirectory=biopb-tensor-server"
     else

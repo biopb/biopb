@@ -23,7 +23,7 @@ requires-python = ">=3.10"
 dependencies = ["biopb-mcp"]
 
 [project.urls]
-"Source Code" = "https://github.com/jiyuuchc/biopb-mcp"
+"Source Code" = "https://github.com/biopb/biopb/tree/main/biopb-mcp"
 
 [tool.setuptools]
 py-modules = ["napari_biopb"]

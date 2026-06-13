@@ -1,6 +1,6 @@
 # napari-biopb (deprecated)
 
-**`napari-biopb` has been renamed to [`biopb-mcp`](https://github.com/jiyuuchc/biopb-mcp).**
+**`napari-biopb` has been renamed to [`biopb-mcp`](https://github.com/biopb/biopb/tree/main/biopb-mcp).**
 
 This package is a backward-compatibility shim. Installing it pulls in
 `biopb-mcp` and re-exports its top-level API, so existing
