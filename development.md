@@ -1,8 +1,9 @@
 # The biopb Project — Architecture Overview
 
-A reference for readers new to biopb. It describes the whole project across its
-three repositories, the reasoning behind the major design decisions, and a few
-implementation details that are unusual enough to surprise a newcomer.
+A reference for readers new to biopb. It describes the whole project across the
+`biopb` monorepo and the `biopb-server` repo, the reasoning behind the major
+design decisions, and a few implementation details that are unusual enough to
+surprise a newcomer.
 
 ---
 
@@ -24,13 +25,16 @@ On top of those, it provides a **human/agent-facing client**: a napari plugin
 that browses the data plane, and an MCP server that lets an AI agent drive a
 live napari session.
 
-### The three repositories
+### The repositories
 
-| Repo | Role |
+The `biopb` repo is a **monorepo**. `biopb-mcp` was a separate repository and has
+been folded in as the `biopb-mcp/` subdirectory (see
+`biopb-mcp/docs/monorepo-migration.md`); only `biopb-server` remains external.
+
+| Repo / component | Role |
 |------|------|
-| **`biopb`** | The protocol itself (`proto/`), plus reference servers: the **tensor server** (`biopb-tensor-server`, the data plane) and the **image runtime** (`biopb-image-runtime`, the base for compute-plane servers). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. |
+| **`biopb`** (monorepo) | The protocol itself (`proto/`), plus reference servers and the client, each a top-level subdir: the **tensor server** (`biopb-tensor-server/`, the data plane), the **image runtime** (`biopb-image-runtime/`, the base for compute-plane servers), and the **client/agent** (`biopb-mcp/`, the napari plugin + MCP server). Polyglot: protobuf/Flight stubs are generated for Python, Java, and JS/TS. The Python packages form a **uv workspace** ([`tool.uv.workspace`] in the root `pyproject.toml`) so they resolve each other from the tree. Each still versions and releases independently off its own git-tag prefix: client `v*`, tensor server `server-v*`, mcp `mcp-v*`. |
 | **`biopb-server`** | Concrete algorithm servers implementing the compute plane: `cellpose`, `cellpose-sam`, `lacss`, `samcell`, `ucell`. Each is a thin model wrapper on the shared image-runtime base, shipped as a container. |
-| **`biopb-mcp`** | The client side: a napari plugin (Tensor Browser + demo algorithm widgets) and an MCP server that exposes a live napari viewer to an AI agent. |
 
 The intended deployment is **personal or small-lab** use, on localhost or a
 trusted intranet. Hardening for untrusted networks (TLS, authn/z, k8s) is
@@ -358,7 +362,9 @@ editing the code.
   `server.py`, `adapters/`, `discovery.py`, the metadata DB.
 - **Compute base:** `biopb/biopb-image-runtime/src/biopb_image_base/` —
   `BiopbServicerBase`, `return_lazy_or_eager`, the embedded cache.
-- **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`.
-- **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
+- **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`
+  (the only remaining separate repo).
+- **Client / agent:** `biopb/biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
   service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`).
+  `_server.py`). See `biopb/biopb-mcp/docs/monorepo-migration.md` for how this
+  was merged in and how it is built/released.
