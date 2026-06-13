@@ -1,4 +1,4 @@
-# BioPB Tensor Server Docker Deployment
+# BioPB Tensor Server Docker/Singularity Deployment
 
 ## Overview
 
@@ -9,6 +9,8 @@ This document describes how to deploy the BioPB Tensor Server as a Docker/Singul
 - **Webapp** - React-based image browser UI (served by FastAPI)
 
 ## Build Instructions
+
+_Pre-built docker image is uploaded to docker hub (docker://jiyuuchc/biopb-tensor-server). Skip this step if you only need the image for deployment._
 
 ### Prerequisites
 
@@ -58,8 +60,6 @@ docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb
 
 ## Docker Usage
 
-### Basic Run
-
 ```bash
 docker run -d \
     --name biopb-tensor \
@@ -74,61 +74,34 @@ docker run -d \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (none) | Path to TOML config file (if set and exists, uses this file; otherwise generates from env vars) |
-| `DATA_DIR` | `/data` | Directory containing microscopy files (used when generating config) |
-| `MONITOR` | `true` | Enable live filesystem monitoring (NFS/Lustre: set to false) |
-| `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
-| `COMPUTE_BACKEND` | `auto` | Compute backend: auto, cpu, or gpu |
-| `BIOPB_TENSOR_TOKEN` | (prompted) | Access token for webapp |
-| `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check) |
-| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind HTTP to localhost (Singularity/HPC only; ignored in Docker) |
-| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written. **Does not relocate the file cache** — see [Cache Storage](#cache-storage) |
-| `CACHE_MAX_TOTAL_GB` | `128` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
-| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB (same applicability as above) |
-| `TMPDIR` | (unset) | System temp dir; the file cache lives at `$TMPDIR/biopb-cache-<uid>`. Set this (or use a config file) to move the cache — see [Cache Storage](#cache-storage) |
+| `CONFIG_FILE` | (unset) | Path to TOML config file. If set, all other variables below are ignored |
+| `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
+| `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
+| `BIOPB_BASE_PORT` | `8810` | Base port in container - HTTP=BASE+4, gRPC=BASE+5 |
+| `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written. **Not to be confused with**  `$TMPDIR` |
+| `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
+| `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB |
+| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB |
 
 ### Cache Storage
 
-The server keeps a **file-backed cache of decoded chunks** (Arrow IPC segments)
-so repeat reads skip re-decoding TIFF/CZI/Zarr. You need to know **where it lives
-and how big it can get**, because the defaults differ between Docker and
-Singularity.
+The server keeps a **file-backed cache of decoded chunks** (Arrow IPC segments). You need to know **where it lives and how big it can get**.
 
-**Location.** The cache directory is *not* `BIOPB_TMP`. The generated config
-leaves `file_cache_dir` unset, so it falls back to the library default
-`<system temp dir>/biopb-cache-<uid>` (the system temp dir honors `$TMPDIR` /
-`$TEMP` / `$TMP`):
-
-- **Docker**: runs as root with a private `/tmp` and no `TMPDIR`, so the cache
-  lands at **`/tmp/biopb-cache-0` on the container's ephemeral writable layer**
-  (overlay2). It is **not** a mounted volume — it consumes the Docker graph
-  storage under `/var/lib/docker` and is discarded on `docker rm`.
-- **Singularity/HPC**: auto-binds the host `/tmp` and runs as your real user, so
-  the cache lands at **`/tmp/biopb-cache-<your-uid>` on host disk** — persistent,
-  per-user, on real storage. (This is why HPC deployments never see the writable-
-  layer growth that Docker can.)
+**Location.** `<system temp dir>/biopb-cache-<uid>` (the system temp dir honors `$TMPDIR` / `$TEMP` / `$TMP`). In **Docker**, this defaults to **`/tmp/biopb-cache-0` on the container's ephemeral writable layer** (overlay2). It is **not** a mounted volume — it consumes the Docker graph storage under `/var/lib/docker` and is discarded on `docker rm`.
 
 **Size.** When config is generated from env vars, the cap defaults to
-**`CACHE_MAX_TOTAL_GB=128`** (128 GB), with `CACHE_MAX_SEGMENT_MB=256` per
-segment. The cache is LRU-bounded — it evicts to stay at the cap rather than
-growing without limit — but under Docker that still means up to **128 GB can
-accumulate on the writable layer**. (The library default when constructing
-`CacheConfig` directly is 4 GB; the 128 GB figure is set by the container
-entrypoint.)
+**`CACHE_MAX_TOTAL_GB=16`** (16 GB). Under Docker that means up to **16 GB can
+accumulate on the writable layer**. 
 
-**Controlling it under Docker.** Pick one:
+**Safely increase cache size** by putting the cache on a mounted volume instead of the writable layer.
 
 ```bash
-# Lower the cap
-docker run ... -e CACHE_MAX_TOTAL_GB=16 biopb-tensor-server:latest
-
-# Put the cache on a mounted volume instead of the writable layer
-docker run ... -v tensor-cache:/cache -e TMPDIR=/cache biopb-tensor-server:latest
-#   → cache lands at /cache/biopb-cache-0 on the volume
-
-# Or pin it explicitly via a config file ([cache] file_cache_dir = "/cache")
-docker run ... -v tensor-cache:/cache -v ~/my-config.toml:/custom.toml \
-    -e CONFIG_FILE=/custom.toml biopb-tensor-server:latest
+docker run \
+    -v tensor-cache:/cache \
+    -e CACHE_MAX_TOTAL_GB=128 \
+    -e TMPDIR=/cache \
+    biopb-tensor-server:latest
 ```
 
 > Note: `CACHE_MAX_TOTAL_GB` / `CACHE_MAX_SEGMENT_MB` only apply when the
@@ -136,35 +109,10 @@ docker run ... -v tensor-cache:/cache -v ~/my-config.toml:/custom.toml \
 > `CONFIG_FILE`, set the limits in its `[cache]` block (`file_max_total_gb`,
 > `file_max_segment_mb`, `file_cache_dir`) instead.
 
-### Port Derivation
-
-All ports are derived from `BIOPB_BASE_PORT`:
-
-| Service | Port | Formula |
-|---------|------|---------|
-| HTTP (FastAPI + webapp) | 8814 | BASE + 4 |
-| gRPC (TensorFlightServer) | 8815 | BASE + 5 |
-
-Ports are auto-discovered to avoid conflicts (especially for Singularity on HPC where host network is shared).
-
-### Configuration Methods
-
-The container uses a unified entrypoint that supports two configuration methods:
-
-1. **Config file**: If `CONFIG_FILE` is set and the file exists, uses that TOML file
-2. **Environment variables**: Otherwise, generates config from `DATA_DIR`, `MONITOR`, etc.
-
-When `MONITOR=true`, initial dataset discovery follows the same stability checks as later rescans. On startup, the server may therefore come up healthy before newly written files under the monitored directory are exposed as sources. With the default settings, expect monitored datasets to appear only after they have remained unchanged for the configured stability window.
-
 ### Examples
 
 ```bash
-# Basic run (auto port discovery, default base 8810)
-docker run -d -p 8814:8814 -p 8815:8815 -v ~/data:/data \
-    -e BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server:latest
-
-# Custom base port (HTTP=9004, gRPC=9005, etc.)
+# Custom base port (HTTP=9004, gRPC=9005)
 docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
     -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
@@ -178,13 +126,88 @@ docker run -d -p 8814:8814 -p 8815:8815 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
-# Dev mode (localhost only, no token required)
-docker run -d -p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815 -v ~/data:/data \
-    -e BIOPB_WEB_DEV_BYPASS=true \
+# Localhost-only access. A token is still required.
+docker run -d \
+    -p 127.0.0.1:8814:8814 \
+    -p 127.0.0.1:8815:8815 \
+    -v ~/data:/data \
+    -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 ```
 
-### Health Checks
+## Singularity Usage (HPC)
+
+### Build from Docker Image
+
+```bash
+# From local Docker image
+singularity build biopb-tensor-server.sif docker-daemon://biopb-tensor-server:latest
+
+# Or from published Docker image
+singularity build biopb-tensor-server.sif docker://ghcr.io/jiyuuchc/biopb-tensor-server:latest
+```
+
+### Basic Usage
+
+```bash
+# Simple run - point DATA_DIR straight at the host path (no --bind needed).
+# Singularity auto-mounts $HOME, /tmp, $PWD (and usually /scratch, /project),
+# so data under those is already visible inside the container at the same path.
+singularity run \
+    --env DATA_DIR=$HOME/data \
+    --env BIOPB_TENSOR_TOKEN=your_secure_token \
+    biopb-tensor-server.sif
+```
+
+> Note: Ports are auto-discovered to avoid conflicts on shared HPC nodes. The container will print discovered ports on startup.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONFIG_FILE` | (unset) | Path to TOML config file (if set and exists, uses this file; otherwise config is generated from env vars) |
+| `DATA_DIR` | `/data` | Path of microscopy files. Singularity auto-mounts `$HOME`, `/tmp`, `$PWD` (and usually `/scratch`, `/project`). Use `--bind /host:/container` for locations the site doesn't auto-mount. |
+| `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
+| `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
+| `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
+| `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check). **Takes effect only together with `BIOPB_BIND_LOCALHOST=true`** — dev bypass is permitted only on a loopback `--web-host`. Use only on a trusted node reached via localhost. |
+| `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to localhost (useful on shared nodes; also the prerequisite for `BIOPB_WEB_DEV_BYPASS`). |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written |
+| `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
+| `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
+| `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB (same applicability as above) |
+
+### Examples
+
+```bash
+# Custom base port → HTTP=9004, gRPC=9005
+singularity run \
+    --env DATA_DIR=$HOME/data \
+    --env BIOPB_BASE_PORT=9000 \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+
+# Custom config file (point CONFIG_FILE at the host path directly; no --bind)
+singularity run \
+    --env CONFIG_FILE=$HOME/my-config.toml \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+
+# SLURM interactive session
+srun --pty singularity run \
+    --env DATA_DIR=/scratch/$USER/data \
+    --env BIOPB_TENSOR_TOKEN=mytoken \
+    biopb-tensor-server.sif
+
+# Dev mode for debugging (no token, localhost only on shared HPC node)
+singularity run \
+    --env DATA_DIR=$HOME/data \
+    --env BIOPB_WEB_DEV_BYPASS=true \
+    --env BIOPB_BIND_LOCALHOST=true \
+    biopb-tensor-server.sif
+```
+
+## Health Checks
 
 These checks report service readiness, not completion of monitored dataset discovery. A healthy container can still have zero visible monitored sources briefly after startup while stability gating defers initial registration.
 
@@ -199,89 +222,11 @@ curl http://localhost:8814/readyz
 # Use Flight's do_action("health") for gRPC health status
 ```
 
-### Access the Webapp
+## Access the Webapp
 
 1. Open `http://localhost:8814/` in browser
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
-
-## Singularity Usage (HPC)
-
-### Build from Docker Image
-
-```bash
-# From local Docker image
-singularity build biopb-tensor-server.sif docker-daemon://biopb-tensor-server:latest
-
-# Or from published Docker image
-singularity build biopb-tensor-server.sif docker://ghcr.io/jiyuuchc/biopb-tensor-server:latest
-```
-
-### Basic Singularity Run
-
-```bash
-# Simple run - auto port discovery from default base (8810)
-singularity run \
-    --bind ~/data:/data \
-    --env BIOPB_TENSOR_TOKEN=your_secure_token \
-    biopb-tensor-server.sif
-```
-
-Ports are auto-discovered to avoid conflicts on shared HPC nodes. The container will print discovered ports on startup.
-
-### Configuration Options
-
-**Method 1: Default (auto port discovery)**
-```bash
-singularity run \
-    --bind ~/data:/data \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-```
-
-**Method 2: Custom base port**
-```bash
-# Use BIOPB_BASE_PORT=9000 → HTTP=9004, gRPC=9005, Sidecar=9006, Flight=9007
-singularity run \
-    --bind ~/data:/data \
-    --env BIOPB_BASE_PORT=9000 \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-```
-
-**Method 3: Custom config file**
-```bash
-singularity run \
-    --bind ~/my-config.toml:/custom.toml \
-    --bind ~/data:/data \
-    --env CONFIG_FILE=/custom.toml \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-```
-
-### HPC Cluster Examples
-
-```bash
-# SLURM interactive session - auto port discovery
-srun --pty singularity run \
-    --bind /scratch/user/data:/data \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-
-# Custom base port range (avoid conflicts with other users)
-singularity run \
-    --bind ~/data:/data \
-    --env BIOPB_BASE_PORT=9000 \
-    --env BIOPB_TENSOR_TOKEN=mytoken \
-    biopb-tensor-server.sif
-
-# Dev mode for debugging (no token, localhost only on shared HPC node)
-singularity run \
-    --bind ~/data:/data \
-    --env BIOPB_WEB_DEV_BYPASS=true \
-    --env BIOPB_BIND_LOCALHOST=true \
-    biopb-tensor-server.sif
-```
 
 ## Architecture
 
@@ -302,26 +247,39 @@ FastAPI serves both the webapp and API endpoints on port 8814. TensorFlightServe
 
 ### Network Binding Control
 
-By default, FastAPI binds to all interfaces inside the container. Docker's port forwarding (`-p PORT:PORT`) then exposes the service to the host's network.
+By default, **both** the FastAPI HTTP server and the gRPC Flight server bind to
+all interfaces (`0.0.0.0`) inside the container. Docker's port forwarding
+(`-p PORT:PORT`) then exposes each service to the host's network; both are
+token-authenticated. The HTTP sidecar connects to the Flight server over loopback whenever it binds to a wildcard address — which is what this entrypoint always generates — so the bind change never affects the sidecar.
 
 **For localhost-only access:**
 - **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
-- **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind HTTP to localhost (useful on shared nodes)
+- **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind both HTTP and gRPC to localhost (useful on shared nodes)
 
 Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).
 
 ## Supported File Formats
 
-| Format | Extension | Notes |
-|--------|-----------|-------|
-| OME-TIFF | `.ome.tiff`, `.ome.tif` | Single file |
-| OME-Zarr | `.zarr/` | Multiscale pyramid |
-| Zarr | `.zarr/` | Generic zarr arrays |
+| Format | Extension(s) | Reader / notes |
+|--------|--------------|----------------|
+| OME-Zarr | `.zarr/` | Multiscale pyramid, incl. HCS plates; native |
+| OME-TIFF | `.ome.tiff`, `.ome.tif` | Single- and multi-file; native (`tifffile`) |
+| TIFF | `.tif`, `.tiff` | Standard TIFF and TIFF sequences; native |
+| Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
+| Zeiss | `.czi`, `.lsm` | Native (`aicspylibczi`; `.lsm` via `tifffile`) |
+| Leica | `.lif` | Native (`readlif`) |
+| Nikon | `.nd2` | Native (`aicsimageio[nd2]`) |
+| DeltaVision | `.dv` | Native (`aicsimageio[dv]`) |
+| Olympus | `.oif`, `.oib` | Native (`aicsimageio`) |
+| Imaris | `.ims` | Native (`aicsimageio`) |
 | HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
-| CZI | `.czi` | Via aicsimageio + bioformats-jar |
-| LIF | `.lif` | Via aicsimageio + bioformats-jar |
-| ND2 | `.nd2` | Via aicsimageio[nd2] + bioformats-jar (included) |
-| TIFF | `.tiff`, `.tif` | Standard TIFF |
+| DICOM | `.dcm` | Single files and multi-file series; native (`pydicom`) |
+| NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
+| Zeiss (legacy) | `.zvi` | No native Python reader — bundled Java Bio-Formats (`bioformats-jar`) |
+
+Other formats are also handled but omitted here for brevity: additional
+Bio-Formats types (`.lei`, `.vsi`) and assorted scientific/image formats via the
+`aicsimageio` fallback.
 
 ## Troubleshooting
 
@@ -333,35 +291,25 @@ docker logs biopb-tensor
 ```
 
 Common causes:
-- No data directory mounted: ensure `-v ~/data:/data`
-- Token not provided: set `BIOPB_TENSOR_TOKEN` or check logs for generated token
+- A mounted `CONFIG_FILE` that is malformed (TOML parse/validation error) — check `docker logs` for the traceback
+- A `CONFIG_FILE` with no `[[sources]]` → "No data sources configured" (exit 1)
+- A custom config whose sources are all invalid/unreachable (bad paths, or remote sources that all fail auth) → "No sources loaded successfully" (exit 1)
+- A port already in use inside the container (e.g. `--network host` colliding with a host process on 8814/8815)
 
 ### Webapp shows "unlock" page but token doesn't work
 
 - Verify token matches `BIOPB_TENSOR_TOKEN`
 - Check token is 16-128 characters, URL-safe (`[A-Za-z0-9_-]`)
-- Dev mode bypasses token check: use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` with `--env BIOPB_WEB_DEV_BYPASS=true`
+- Note: `BIOPB_WEB_DEV_BYPASS` (dev-mode no-token bypass) has **no effect in Docker** — the container always binds `0.0.0.0`, so token enforcement stays on. It works only under Singularity with `BIOPB_BIND_LOCALHOST=true`.
 
 ### Files not appearing in webapp
 
 - Check mount path matches `DATA_DIR`: `-v ~/data:/data` with default `DATA_DIR=/data`
-- On NFS/Lustre, set `MONITOR=false` and restart container to refresh catalog
+- New files take a moment to appear: they register only after the stability window passes and the next periodic rescan runs (this is poll-based and works on NFS/Lustre — no need to disable `MONITOR`)
 - Check file format is supported
 
-### ND2 files fail to load
+### Files fail to load
 
-The image now includes `bioformats-jar` and `aicsimageio[nd2]` for ND2 support. If issues persist:
+- Verify file format is supported (above)
 - Verify file is not corrupted
 - Check Docker logs for specific error
-- Try loading with Python directly: `aicsimageio.AICSImage('/data/your_file.nd2')`
-
-## Ports Summary
-
-All ports derived from `BIOPB_BASE_PORT` (default: 8810):
-
-| Port | Service | External Access | Formula |
-|------|---------|-----------------|---------|
-| BASE+4 | FastAPI HTTP | Yes (webapp + API + health) | `BIOPB_BASE_PORT + 4` |
-| BASE+5 | TensorFlightServer gRPC | Yes (tensor data) | `BIOPB_BASE_PORT + 5` |
-
-Ports are auto-discovered at startup to avoid conflicts. Expose HTTP (BASE+4) for webapp access and gRPC (BASE+5) for programmatic clients.

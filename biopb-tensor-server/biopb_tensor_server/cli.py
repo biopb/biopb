@@ -186,6 +186,18 @@ def _resolve_serve_sources(
     return static_sources, monitored_sources
 
 
+def _grpc_location(host: str, port: int) -> str:
+    """Build a ``grpc://`` URL, bracketing an IPv6 literal in the authority.
+
+    An IPv6 address contains ``:`` and must be wrapped in brackets to be a valid
+    URL authority, e.g. ``grpc://[::1]:8815``; IPv4 addresses and hostnames pass
+    through unchanged. Used for both the server bind location and the sidecar's
+    connect target so neither emits a malformed URL for an IPv6 host.
+    """
+    authority = f"[{host}]" if isinstance(host, str) and ":" in host else host
+    return f"grpc://{authority}:{port}"
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
@@ -349,7 +361,7 @@ def _setup_flight_server(
         )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
-    location = f"grpc://{host}:{port}"
+    location = _grpc_location(host, port)
     # 80MB max message size (slightly above 64MB chunk threshold)
     server = TensorFlightServer(
         location,
@@ -566,7 +578,7 @@ def serve(
         token=token,
     )
 
-    location = f"grpc://{host or server_config.host}:{port or server_config.port}"
+    location = _grpc_location(host or server_config.host, port or server_config.port)
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
@@ -857,16 +869,36 @@ def launch(
                 console.print("[yellow]Auto-generated secure access token.[/yellow]")
 
         console.print(
-            f"\n[bold green]Access URL (shown once — do not share):[/bold green]\n"
-            f"  {web_url}/?token={effective_token}\n"
+            "\n[bold green]Access URL (shown once — do not share):[/bold green]"
         )
+        # soft_wrap keeps the URL on one line so the token stays copy-pasteable
+        # even in a narrow / non-TTY log (e.g. `docker logs`, where Rich would
+        # otherwise hard-wrap to width 80 and split the token). markup=False so
+        # nothing in the URL is interpreted as Rich markup.
+        console.print(
+            f"{web_url}/?token={effective_token}",
+            soft_wrap=True,
+            markup=False,
+        )
+        console.print()
 
     # --- Start Flight server ---
     flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
         server_config, token=effective_token
     )
 
-    flight_location = f"grpc://{server_config.host}:{server_config.port}"
+    # The HTTP sidecar is co-located with the Flight server and reaches it over
+    # the loopback interface. A wildcard bind address is a bind target, not a
+    # valid connect target, so dial the matching loopback explicitly — and match
+    # the address family: the IPv4 wildcard maps to 127.0.0.1, the IPv6 wildcard
+    # to ::1. (A `::`-bound server with IPV6_V6ONLY set — the default on some
+    # hosts — would refuse an IPv4 127.0.0.1 connection.)
+    _flight_connect_host = server_config.host
+    if _flight_connect_host in ("0.0.0.0", ""):
+        _flight_connect_host = "127.0.0.1"
+    elif _flight_connect_host == "::":
+        _flight_connect_host = "::1"
+    flight_location = _grpc_location(_flight_connect_host, server_config.port)
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
     flight_thread.start()
 

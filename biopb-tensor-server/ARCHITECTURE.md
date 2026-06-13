@@ -763,7 +763,7 @@ a real `TensorFlightServer` + `ZarrAdapter` for the `TestIntegration` class.
 | `BIOPB_TENSOR_ENDPOINT` | TensorFlightClient (Python) | Arrow Flight server location (default `grpc://localhost:8815`) |
 | `BIOPB_TENSOR_TOKEN` | `biopb-tensor-server launch` (server) | Pre-set server token (skips CLI prompt) |
 | `BIOPB_WEB_DEV_BYPASS` | `biopb-tensor-server launch` (server) | Enable dev-mode token bypass (localhost only, enforced by CLI) |
-| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind HTTP to localhost (Singularity/HPC only; ignored in Docker) |
+| `BIOPB_BIND_LOCALHOST` | Docker/Singularity entrypoint | Bind both HTTP and gRPC to localhost (Singularity/HPC only; ignored in Docker) |
 | `VITE_TENSOR_API` | `ClientBootstrap` (build-time) | Base URL of the FastAPI server (default `http://localhost:8814`) |
 
 ---
