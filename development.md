@@ -362,7 +362,16 @@ The `mcp` section is grouped by concern:
   chunk cache instead of scattering across the distributed cluster's per-worker
   caches — issue #8. The viewer being serial makes this free; the agent's
   explicit `da` computes keep the distributed default. `synchronous` for fully
-  serial reads, `""` to disable wrapping).
+  serial reads, `""` to disable wrapping). `async_slicing` (default `True`)
+  fetches viewer slices *off* the Qt main thread (napari experimental async
+  slicing, enabled via the `NAPARI_ASYNC` env var set in `_bootstrap.py` before
+  `import napari` — the `_LayerSlicer` captures the flag once at construction),
+  so a zoom into a not-yet-cached pyramid level keeps the current coarse texture
+  on screen instead of freezing for the cold read; the read still uses the
+  wrapped serial scheduler, just off-thread. `take_screenshot` force-syncs the
+  current view first (`_helpers.resync_view_for_capture`) so the agent's capture
+  reflects the state it set, not a pre-load frame. Set `False` to restore fully
+  synchronous slicing.
 - **`mcp.services.process_image_servers`** — the `grpc://`/`grpcs://`
   ProcessImage URLs exposed as `ops`.
 - **`mcp.observe`** — the web observe UI (`_observe.py`): `enabled` (**on by

@@ -304,6 +304,21 @@ def _bootstrap_impl():
         viewer = _HeadlessViewer()
         logger.info("Headless mode: no napari viewer (no display).")
     else:
+        # Enable napari async slicing via its NAPARI_ASYNC env override, set
+        # BEFORE importing napari. The settings singleton reads the env at load,
+        # and the viewer's _LayerSlicer captures the flag once at construction
+        # (_layer_slicer.py: ``self._force_sync = not ...async_``) -- so the env
+        # var is the only reliable hook; assigning the settings object after
+        # import is too late (the settings load resets it). Async slicing
+        # fetches slices off the Qt main thread so a zoom into a not-yet-cached
+        # level doesn't freeze the viewer (vispy keeps the current coarse
+        # texture until the finer slice resolves); take_screenshot force-syncs a
+        # slice before capturing so the agent still sees the requested frame
+        # (resync_view_for_capture).
+        os.environ["NAPARI_ASYNC"] = (
+            "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
+        )
+
         import napari
 
         from ..tensor_browser import TensorBrowserWidget
@@ -359,7 +374,7 @@ def _bootstrap_impl():
     #    runner (the connection service connects asynchronously).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
-    from ._helpers import viewer_window_alive
+    from ._helpers import resync_view_for_capture, viewer_window_alive
 
     ip.user_ns.update(
         {
@@ -375,6 +390,7 @@ def _bootstrap_impl():
             "run_on_main": _jobs.run_on_main,
             "cancelled": _jobs.cancelled,
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
+            "_resync_view": lambda: resync_view_for_capture(viewer),
         }
     )
 

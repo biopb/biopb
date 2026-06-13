@@ -165,6 +165,10 @@ _SCREENSHOT_SNIPPET = (
     "if not _viewer_window_alive():\n"
     "    print('" + _WINDOW_CLOSED_DELIM + "')\n"
     "else:\n"
+    # Under async slicing, force-sync the current view so the capture reflects
+    # the state the agent just set, not a pre-load frame. No-op when async is
+    # off or the bootstrap predates the helper (defensive globals().get).
+    "    globals().get('_resync_view', lambda: None)()\n"
     "    _arr = viewer.screenshot(canvas_only={canvas_only})\n"
     "    _bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
     "    _ok, _buf = _cv2.imencode('.png', _bgra)\n"

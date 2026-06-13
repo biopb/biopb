@@ -253,6 +253,16 @@ DEFAULT_CONFIG = {
             # fully serial; "" disables wrapping (viewer slices compute on the
             # global default).
             "compute_scheduler": "threads",
+            # Fetch napari slices off the Qt main thread (napari experimental
+            # async slicing). A zoom into a not-yet-cached pyramid level can
+            # take seconds (a cold full-res tile read); synchronous slicing
+            # freezes the whole viewer for that long, while async slicing keeps
+            # the current (coarse, upscaled) texture on screen until the finer
+            # slice resolves. `take_screenshot` force-syncs a slice before
+            # capturing (see mcp/_helpers.resync_view_for_capture) so the agent
+            # still sees exactly the frame it requested. Set False to keep the
+            # old fully-synchronous slicing.
+            "async_slicing": True,
         },
         "services": {
             # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).

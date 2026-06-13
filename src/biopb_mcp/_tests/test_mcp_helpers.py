@@ -6,6 +6,7 @@ import pytest
 
 from biopb_mcp.mcp._helpers import (
     patch_viewer_add_tensor,
+    resync_view_for_capture,
     viewer_window_alive,
 )
 
@@ -276,3 +277,97 @@ class TestViewerWindowAlive:
                 raise RuntimeError("napari viewer unavailable: headless")
 
         assert viewer_window_alive(_Sentinel()) is False
+
+
+class _FakeLayer:
+    """A layer whose ``loaded`` walks a sequence (sticking on the last value),
+    so the resync pump loop can be driven deterministically."""
+
+    def __init__(self, loaded_values):
+        self._vals = list(loaded_values)
+
+    @property
+    def loaded(self):
+        v = self._vals[0]
+        if len(self._vals) > 1:
+            self._vals.pop(0)
+        return v
+
+
+@patch("qtpy.QtWidgets.QApplication.processEvents")
+class TestResyncViewForCapture:
+    """Before a screenshot, wait for the current view's async slice to load so
+    the capture reflects the requested state (not a pre-load frame)."""
+
+    def _viewer(self, layers, slicer=None):
+        v = MagicMock()
+        v.layers = layers
+        v._layer_slicer = MagicMock() if slicer is None else slicer
+        return v
+
+    @patch("napari.settings.get_settings")
+    def test_noop_when_async_off(self, get_settings, proc):
+        get_settings.return_value.experimental.async_ = False
+        v = self._viewer([_FakeLayer([False])])
+        resync_view_for_capture(v)
+        v._layer_slicer.submit.assert_not_called()
+        proc.assert_not_called()
+
+    @patch("napari.settings.get_settings")
+    def test_noop_when_no_layers(self, get_settings, proc):
+        get_settings.return_value.experimental.async_ = True
+        v = self._viewer([])
+        resync_view_for_capture(v)
+        v._layer_slicer.submit.assert_not_called()
+        proc.assert_not_called()
+
+    @patch("napari.settings.get_settings")
+    def test_submits_and_skips_pump_when_loaded(self, get_settings, proc):
+        get_settings.return_value.experimental.async_ = True
+        v = self._viewer([_FakeLayer([True])])
+        resync_view_for_capture(v)
+        v._layer_slicer.submit.assert_called_once_with(
+            layers=v.layers, dims=v.dims, force=True
+        )
+        proc.assert_not_called()  # already loaded -> loop body never runs
+
+    @patch("time.sleep")
+    @patch("napari.settings.get_settings")
+    def test_pumps_until_loaded(self, get_settings, sleep, proc):
+        get_settings.return_value.experimental.async_ = True
+        v = self._viewer([_FakeLayer([False, False, True])])
+        resync_view_for_capture(v, timeout=5)
+        assert proc.call_count >= 2
+        v._layer_slicer.submit.assert_called_once()
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    @patch("napari.settings.get_settings")
+    def test_breaks_at_timeout(self, get_settings, monotonic, sleep, proc):
+        get_settings.return_value.experimental.async_ = True
+        # Each call jumps 10s, so the deadline is exceeded almost immediately:
+        # the loop must break rather than hang on a never-loading layer.
+        ticks = [0.0]
+
+        def _mono():
+            ticks[0] += 10.0
+            return ticks[0]
+
+        monotonic.side_effect = _mono
+        v = self._viewer([_FakeLayer([False])])
+        resync_view_for_capture(v, timeout=5)  # returns, does not hang
+        assert proc.called
+
+    @patch("napari.settings.get_settings")
+    def test_no_slicer_skips_submit_but_pumps(self, get_settings, proc):
+        get_settings.return_value.experimental.async_ = True
+        v = self._viewer([_FakeLayer([True])], slicer=None)
+        v._layer_slicer = None
+        resync_view_for_capture(v)  # must not raise
+
+    @patch("napari.settings.get_settings")
+    def test_never_raises_on_submit_error(self, get_settings, proc):
+        get_settings.return_value.experimental.async_ = True
+        v = self._viewer([_FakeLayer([True])])
+        v._layer_slicer.submit.side_effect = RuntimeError("boom")
+        resync_view_for_capture(v)  # swallowed, no raise

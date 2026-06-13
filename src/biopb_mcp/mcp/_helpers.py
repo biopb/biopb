@@ -50,6 +50,66 @@ def viewer_window_alive(viewer) -> bool:
         return False
 
 
+def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
+    """Wait for the current view's slice to load before a screenshot.
+
+    With async slicing on (``mcp.viewer.async_slicing``) a dims/zoom change
+    fetches the new slice *off* the Qt main thread, so a screenshot taken right
+    after could capture the previous (pre-load) frame -- fine for an interactive
+    human, wrong for the agent, which expects ``take_screenshot`` to reflect the
+    state it just set. This (1) submits a fresh slice of the current view so a
+    slice is guaranteed in flight even if the triggering event hasn't dispatched
+    yet, then (2) pumps the Qt event loop until every layer reports ``loaded``
+    -- so the slice completes and is applied -- before the caller captures.
+
+    The re-submit reads the current view's chunk a second time, but that read
+    is a cache hit (the in-flight slice already warmed the server/client chunk
+    cache), so it is cheap; the guarantee it buys -- no stale capture when the
+    view changed but the slice wasn't requested yet -- is worth it. The pump,
+    not napari's bare ``submit``, is what actually *awaits* completion:
+    ``submit`` returns the async future without blocking, so ``layer.loaded`` +
+    ``processEvents`` is the await. Runs on the kernel main thread (where the
+    screenshot snippet already runs) so pumping lets the slice's main-thread
+    apply callback fire.
+
+    No-op when async slicing is off (synchronous slicing already left the view
+    loaded) or when there are no layers. Bounded by *timeout* so a genuinely
+    slow/stuck read degrades to a best-effort capture rather than hanging.
+    Best-effort: never raises."""
+    try:
+        import napari
+
+        if not napari.settings.get_settings().experimental.async_:
+            return
+    except Exception:
+        return
+    try:
+        import time
+
+        from qtpy.QtWidgets import QApplication
+
+        layers = list(getattr(viewer, "layers", None) or [])
+        if not layers:
+            return
+        # Guarantee a slice of the *current* view is in flight (closes the
+        # change->dispatch race); the extra read is a cache hit.
+        slicer = getattr(viewer, "_layer_slicer", None)
+        if slicer is not None:
+            try:
+                slicer.submit(layers=layers, dims=viewer.dims, force=True)
+            except Exception:
+                logger.debug("resync submit failed", exc_info=True)
+        # Await: pump the loop until the slice completes and is applied.
+        deadline = time.monotonic() + timeout
+        while not all(getattr(layer, "loaded", True) for layer in layers):
+            QApplication.processEvents()
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.005)
+    except Exception:
+        logger.debug("resync_view_for_capture failed", exc_info=True)
+
+
 def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
     """Monkey-patch ``add_tensor`` onto *viewer*, reading client/sources from
     the live ``TensorConnection`` *connection*.
