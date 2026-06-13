@@ -1,11 +1,12 @@
 #!/bin/bash
 #
-# Biopb Tensor Server Installer
+# biopb stack installer (biopb-mcp + biopb + biopb-tensor-server)
 # Usage: curl -fsSL https://biopb.org/install.sh | bash
 #
 # Idempotent: rerun to upgrade to latest version
 #
-# By default this installs prebuilt wheels from the latest GitHub release.
+# By default this installs prebuilt wheels from the latest biopb-mcp GitHub
+# release (the single release that carries all three mutually-paired wheels).
 # Set BIOPB_INSTALL_FROM_SOURCE=1 to instead build HEAD from a git checkout
 # (the fast path for development); that mode additionally needs git + a compiler.
 #
@@ -35,7 +36,7 @@ _confirm() {
     printf "  ${BOLD}%s${RESET} [Y/n]: " "$1" >/dev/tty
     read -r reply </dev/tty || reply=""
     reply="${reply%$'\r'}"
-    
+
     [[ -z "$reply" ]] && reply="y"
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
@@ -534,16 +535,26 @@ _ensure_local_bin_on_path() {
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
-    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$RELEASE_REPO/releases/latest" 2>/dev/null) || return 1
-    # `|| true`: a missing/error API response (no "tag_name") makes grep exit 1,
-    # which under `set -euo pipefail` would otherwise abort the whole installer
-    # from inside this command substitution. We want to return 1 and let the
-    # caller print a friendly message, so the empty-tag check below handles it.
-    RELEASE_TAG=$(printf '%s' "$RELEASE_JSON" \
-        | grep '"tag_name"' | head -1 \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/') || true
+    # The monorepo hosts several release lines, so /releases/latest is NOT
+    # component-specific. List releases (date-desc) and take the newest whose
+    # tag matches the deployment line, then fetch that release by tag. The match
+    # requires a CLEAN version (release-vX.Y.Z) so prerelease tags
+    # (release-v…a/b/rc — used for test releases) are skipped and never become
+    # the default download.
+    local _releases
+    _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
+    # `|| true`: an error/empty response makes grep exit 1, which under
+    # `set -euo pipefail` would abort the installer from this command
+    # substitution. We want to return 1 and let the caller print a friendly
+    # message, so the empty-tag check below handles it.
+    RELEASE_TAG=$(printf '%s' "$_releases" \
+        | grep '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+        | grep -E "^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$" | head -1) || true
     [ -n "${RELEASE_TAG:-}" ] || return 1
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
     if ! printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._+/-]+$'; then
         _warn "Unexpected release tag format: $RELEASE_TAG"
         RELEASE_TAG=""
@@ -649,9 +660,22 @@ _start_data_server() {
 install_biopb() {
     set -euo pipefail
 
-    REPO_URL="https://github.com/biopb/biopb"
-    REPO="git+$REPO_URL"
-    RELEASE_REPO="biopb/biopb"   # owner/name for the GitHub Releases API
+    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
+    # (the mcp-v* line). Source mode builds from git: all three packages now
+    # live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # subdirectories), so there is a single REPO.
+    BIOPB_REPO_URL="https://github.com/biopb/biopb"
+    BIOPB_REPO="git+$BIOPB_REPO_URL"
+    MCP_REPO_URL="$BIOPB_REPO_URL"
+    MCP_REPO="$BIOPB_REPO"
+    REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
+    RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
+    # The monorepo hosts multiple release lines (release-v*, v*, mcp-v*,
+    # server-v*). The all-in-one deployment the installer wants is the
+    # release-v* one (see docs/release-model.md), so the release fetch filters
+    # by this prefix (and requires a clean X.Y.Z, skipping prereleases) instead
+    # of using /releases/latest (which is repo-wide).
+    RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
 
@@ -672,7 +696,7 @@ install_biopb() {
     echo "/_____/_/\\____/_/   /_____/  "
     printf "%s\n" "${RESET}"
     echo ""
-    echo "      Tensor Server Installer"
+    echo "      biopb stack installer"
     echo ""
 
     # ===== 0. System Check =====
@@ -849,28 +873,35 @@ install_biopb() {
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
 
-    # Resolve where biopb + biopb-tensor-server come from. They must be installed
-    # as a matched pair from a single build: the tensor server is self-contained
-    # and may use proto fields newer than any biopb published on PyPI, so biopb is
-    # always pinned to the sibling artifact (a git ref in source mode, a local
-    # wheel in release mode) and the resolver is never allowed to pull it from PyPI.
-    local biopb_req tensor_req
+    # Resolve where the three packages come from. They must be installed as a
+    # matched set from a single build: the tensor server is self-contained and
+    # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
+    # coupled to both — so all three are pinned to sibling artifacts (git refs in
+    # source mode, local wheels in release mode) and the resolver is never allowed
+    # to pull biopb / biopb-tensor-server / biopb-mcp from PyPI. The single
+    # biopb-mcp release carries the mutually-paired triple (release CI bakes in
+    # the biopb + tensor-server wheels pinned in pyproject), so one download is
+    # one consistent set — no PyPI-vs-release version skew.
+    local biopb_req tensor_req mcp_req
     if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
-        _info "Building from source (HEAD of $REPO_URL)"
-        biopb_req="biopb[tensor] @ $REPO"
-        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $REPO#subdirectory=biopb-tensor-server"
+        _info "Building from source: biopb-mcp + biopb + biopb-tensor-server"
+        _info "  from HEAD of $BIOPB_REPO_URL (monorepo subdirectories)"
+        mcp_req="biopb-mcp[mcp] @ $MCP_REPO#subdirectory=biopb-mcp"
+        biopb_req="biopb[tensor] @ $BIOPB_REPO"
+        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $BIOPB_REPO#subdirectory=biopb-tensor-server"
     else
         if ! _fetch_latest_release; then
-            _err "Could not fetch the latest biopb release from $RELEASE_REPO."
+            _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
             _info "Check your network, or build from source instead:"
             _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
             exit 1
         fi
-        local sdk_url tensor_url
+        local mcp_url sdk_url tensor_url
+        mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
         sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
         tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-        if [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
-            _err "Release $RELEASE_TAG has no biopb wheels attached."
+        if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
+            _err "Release $RELEASE_TAG is missing one of the biopb wheels."
             _info "Build from source instead:"
             _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
             exit 1
@@ -879,12 +910,16 @@ install_biopb() {
         WHEELS_DIR=$(mktemp -d)
         # Remove the wheel download dir on any exit (success, error, or set -e).
         trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
+        local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
         local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
         local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+        curl -fsSL "$mcp_url" -o "$mcp_whl"
         curl -fsSL "$sdk_url" -o "$sdk_whl"
         curl -fsSL "$tensor_url" -o "$tensor_whl"
-        # Direct file:// references pin biopb to this exact wheel, so uv resolves
-        # the server's `biopb` dependency to it rather than to PyPI.
+        # Direct file:// references pin each package to this exact wheel, so uv
+        # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
+        # `biopb[tensor]`) to the downloaded set rather than to PyPI.
+        mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
         biopb_req="biopb[tensor] @ file://$sdk_whl"
         tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     fi
@@ -901,11 +936,11 @@ install_biopb() {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
-    # psutil) — without it `import mcp` fails. We require >=0.6.0: that release makes
-    # stdio the default transport (matching the MCP client config this installer
-    # writes) and also drops biopb-mcp's stray, unpinned grpcio-tools dependency,
-    # which otherwise collapses the shared solve to an unbuildable grpcio-tools==1.30.0.
-    # It comes from PyPI in both modes (no biopb-mcp wheel ships in the release).
+    # psutil) — without it `import mcp` fails; the extra is applied to the pinned
+    # wheel/ref ($mcp_req) just like the others. It now ships in the biopb-mcp
+    # release alongside biopb + tensor-server (one matched triple), so unlike the
+    # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
+    # dep still resolved from PyPI (it is decoupled and published normally).
     local install_args=(
         --upgrade
         --force
@@ -916,7 +951,7 @@ install_biopb() {
     )
     _info "  including biopb-mcp + napari"
     install_args+=(
-        --with "biopb-mcp[mcp]>=0.6.0"
+        --with "$mcp_req"
         --with "napari[all]"
         --with-executables-from biopb-mcp
     )
@@ -948,10 +983,19 @@ install_biopb() {
                 local webapp_url
                 webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
                 webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
-                curl -fsSL "$webapp_url" \
-                    | tar -xzf - -C "$WEBAPP_DIR" --strip-components=1
-                printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
-                _ok "Data browser installed to: $WEBAPP_DIR"
+                # mktemp (not "$WHEELS_DIR/...") because WHEELS_DIR is only set
+                # in release mode; under `set -u` it would abort a source-mode
+                # install with the webapp enabled.
+                local tmp
+                tmp=$(mktemp)
+                if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
+                    tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
+                    printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
+                    _ok "Data browser installed to: $WEBAPP_DIR"
+                else
+                    _warn "No webapp.tar.gz in release $RELEASE_TAG; server will run in API-only mode"
+                fi
+                rm -f "$tmp"
             fi
         else
             _warn "Could not fetch latest release, data browser not installed"

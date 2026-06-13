@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Biopb Tensor Server Installer (Windows / PowerShell)
+    biopb stack installer (Windows / PowerShell)
 
 .DESCRIPTION
     Windows port of install/install.sh.
@@ -351,7 +351,7 @@ function Set-McpClients {
     $script:McpNeedsManual = $needToShowMcpConfig
 }
 
-$ISSUE_URL = "https://github.com/biopb/biopb/issues/new"
+$ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 
 function Show-Banner {
     Write-Host ""
@@ -361,7 +361,7 @@ function Show-Banner {
     Write-Host " / /_/ / / /_/ / ____/ /_/ / " -ForegroundColor Cyan
     Write-Host "/_____/_/\____/_/   /_____/  " -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "      Tensor Server Installer"
+    Write-Host "      biopb stack installer"
     Write-Host ""
 }
 
@@ -397,12 +397,20 @@ function Invoke-Preflight {
 }
 
 # Fetch the latest GitHub release metadata (a parsed object with .tag_name and
-# .assets[].name / .browser_download_url). One call serves both the wheels and
-# the data browser. Throws on network/HTTP error; callers catch and fall back.
+# .assets[].name / .browser_download_url) for a given tag prefix. The monorepo
+# hosts several release lines (release-v*, v*, mcp-v*, server-v*), so
+# /releases/latest is NOT component-specific; list releases (date-desc) and take
+# the newest whose tag is a CLEAN $TagPrefix + X.Y.Z (prerelease tags like
+# release-v…a/b/rc are skipped). Throws on network/HTTP error; callers catch.
 function Get-LatestRelease {
-    param([string]$Repo)
-    return Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-        -Headers @{ "User-Agent" = "biopb-installer" }
+    param([string]$Repo, [string]$TagPrefix = "")
+    $headers = @{ "User-Agent" = "biopb-installer" }
+    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
+        -Headers $headers
+    $rx = "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
+    $match = $releases | Where-Object { $_.tag_name -match $rx } | Select-Object -First 1
+    if (-not $match) { throw "No clean release matching '$TagPrefix' X.Y.Z in $Repo" }
+    return $match
 }
 
 # Print the tail of the server log, indented, for diagnosing a bad startup.
@@ -496,9 +504,20 @@ function Start-DataServer {
 }
 
 function Install-Biopb {
-    $RepoUrl     = "https://github.com/biopb/biopb"
-    $Repo        = "git+$RepoUrl"
-    $ReleaseRepo = "biopb/biopb"             # owner/name for the GitHub Releases API
+    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
+    # (the release-v* deployment line). Source mode builds from git: all three
+    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # subdirectories), so there is a single repo.
+    $BiopbRepoUrl = "https://github.com/biopb/biopb"
+    $BiopbRepo    = "git+$BiopbRepoUrl"
+    $McpRepoUrl   = $BiopbRepoUrl
+    $McpRepo      = $BiopbRepo
+    $RepoUrl      = $BiopbRepoUrl             # webapp release-asset fallback URL
+    $ReleaseRepo  = "biopb/biopb"             # owner/name for the GitHub Releases API
+    # The monorepo hosts multiple release lines; the all-in-one deployment the
+    # installer wants is the release-v* one, so the release fetch filters by this
+    # prefix and requires a clean X.Y.Z (skipping prerelease tags).
+    $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
     $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
     $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
@@ -650,27 +669,33 @@ function Install-Biopb {
         Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"
     }
 
-    # Resolve where biopb + biopb-tensor-server come from. They must be installed
-    # as a matched pair from a single build: the tensor server is self-contained
-    # and may use proto fields newer than any biopb on PyPI, so biopb is pinned to
-    # the sibling artifact (a git ref in source mode, a local wheel in release
-    # mode) and the resolver is never allowed to pull it from PyPI.
+    # Resolve where the three packages come from. They must be installed as a
+    # matched set from a single build: the tensor server is self-contained and
+    # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
+    # coupled to both - so all three are pinned to sibling artifacts (git refs in
+    # source mode, local wheels in release mode) and the resolver is never allowed
+    # to pull biopb / biopb-tensor-server / biopb-mcp from PyPI. The single
+    # biopb-mcp release carries the mutually-paired triple, so one download is one
+    # consistent set - no PyPI-vs-release version skew.
     if ($InstallFromSource) {
-        Write-Inf "Building from source (HEAD of $RepoUrl)"
-        $biopbReq  = "biopb[tensor] @ $Repo"
-        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $Repo#subdirectory=biopb-tensor-server"
+        Write-Inf "Building from source: biopb-mcp + biopb + biopb-tensor-server"
+        Write-Inf "  from HEAD of $BiopbRepoUrl (monorepo subdirectories)"
+        $mcpReq    = "biopb-mcp[mcp] @ $McpRepo#subdirectory=biopb-mcp"
+        $biopbReq  = "biopb[tensor] @ $BiopbRepo"
+        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $BiopbRepo#subdirectory=biopb-tensor-server"
     } else {
-        try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null }
+        try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null }
         if (-not $release) {
-            Write-Err2 "Could not fetch the latest biopb release from $ReleaseRepo."
+            Write-Err2 "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo."
             Write-Inf "Check your network, or build from source by setting:"
             Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
             throw "release fetch failed"
         }
+        $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
         $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
         $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-        if (-not $sdkAsset -or -not $tensorAsset) {
-            Write-Err2 "Release $($release.tag_name) has no biopb wheels attached."
+        if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset) {
+            Write-Err2 "Release $($release.tag_name) is missing one of the biopb wheels."
             Write-Inf "Build from source by setting:"
             Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
             throw "release wheels missing"
@@ -679,12 +704,16 @@ function Install-Biopb {
         $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
         if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
         New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+        $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
         $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
         $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
+        Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
         Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
         Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
-        # Direct file:// references pin biopb to this exact wheel, so uv resolves
-        # the server's biopb dependency to it rather than to PyPI.
+        # Direct file:// references pin each package to this exact wheel, so uv
+        # resolves their inter-dependencies (the server's biopb, biopb-mcp's
+        # biopb[tensor]) to the downloaded set rather than to PyPI.
+        $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
         $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
         $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     }
@@ -700,11 +729,11 @@ function Install-Biopb {
     # console scripts onto PATH (plain --with does not expose executables).
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client,
-    # ipykernel, psutil) - without it `import mcp` fails. We require >=0.6.0:
-    # that release makes stdio the default transport (matching the MCP client
-    # config this installer writes) and also drops biopb-mcp's stray, unpinned
-    # grpcio-tools dependency, which otherwise collapses the shared solve to an
-    # unbuildable grpcio-tools==1.30.0. It comes from PyPI in both modes.
+    # ipykernel, psutil) - without it `import mcp` fails; the extra is applied to
+    # the pinned wheel/ref ($mcpReq) like the others. It now ships in the biopb-mcp
+    # release alongside biopb + tensor-server (one matched triple), so unlike the
+    # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
+    # dep still resolved from PyPI (it is decoupled and published normally).
     $installArgs = @(
         "tool", "install", "--upgrade", "--force",
         "--python", $pythonSpec,
@@ -714,7 +743,7 @@ function Install-Biopb {
     )
     Write-Inf "  including biopb-mcp + napari"
     $installArgs += @(
-        "--with", "biopb-mcp[mcp]>=0.6.0",
+        "--with", $mcpReq,
         "--with", "napari[all]",
         "--with-executables-from", "biopb-mcp"
     )
@@ -745,7 +774,7 @@ function Install-Biopb {
 
         # Reuse the release metadata already fetched for the wheels; in source
         # mode this is the first (and only) fetch.
-        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null } }
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null } }
         $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
@@ -765,11 +794,21 @@ function Install-Biopb {
                 $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
                 $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
                 $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
-                Invoke-WebRequest -Uri $webUrl -OutFile $tarball
-                tar -xzf $tarball -C $WebappDir --strip-components=1
-                Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
-                Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
-                Write-Ok "Data browser installed to: $WebappDir"
+                # Guard a missing asset: under $ErrorActionPreference='Stop' a
+                # failed download would abort the whole installer, and writing
+                # .version after a broken extract would stamp it "installed".
+                # Only mark success once the tarball is fetched and unpacked.
+                $webOk = $true
+                try { Invoke-WebRequest -Uri $webUrl -OutFile $tarball }
+                catch { $webOk = $false }
+                if ($webOk) {
+                    tar -xzf $tarball -C $WebappDir --strip-components=1
+                    Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
+                    Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
+                    Write-Ok "Data browser installed to: $WebappDir"
+                } else {
+                    Write-Warn2 "No webapp.tar.gz in release $latestTag; server will run in API-only mode"
+                }
             }
         } else {
             Write-Warn2 "Could not fetch latest release, data browser not installed"

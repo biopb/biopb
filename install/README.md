@@ -16,11 +16,14 @@ Both are **idempotent** — rerun to upgrade or to add components you skipped.
 
 ### Release (default)
 
-Downloads the prebuilt `biopb` and `biopb-tensor-server` wheels from the **latest
-GitHub release** and installs them into one shared `uv` tool environment. The two
-wheels are a matched pair built from the same commit, so the server always runs
-against the exact `biopb` it was tested with (the server wheel may use proto
-fields newer than any `biopb` on PyPI). `biopb-mcp` and `napari` come from PyPI.
+Downloads the prebuilt `biopb-mcp`, `biopb`, and `biopb-tensor-server` wheels
+from the **latest `biopb/biopb-mcp` GitHub release** — a single release that
+carries all three as a mutually-paired set — and installs them into one shared
+`uv` tool environment. Because the trio ships from one build, the server always
+runs against the exact `biopb` it was tested with and `biopb-mcp` against the
+exact pair it expects (the server wheel may use proto fields newer than any
+`biopb` on PyPI), with no PyPI-vs-release version skew. Only `napari` comes from
+PyPI.
 
 Requirements: `curl`/`tar` (POSIX) or built-in PowerShell tooling (Windows), plus
 `uv` (installed automatically). **No git, buf, or compiler needed** — the release
@@ -46,16 +49,17 @@ proto stubs at build time); on macOS it also needs the Xcode Command Line Tools.
 
 ## What gets installed
 
-- **biopb + biopb-tensor-server** — into a single `uv` tool environment so the
-  components can import and drive each other (`biopb server start`, etc.).
-- **Data browser** (optional) — `webapp.tar.gz` from the same GitHub release,
+- **biopb-mcp + biopb + biopb-tensor-server** — the matched triple from the one
+  biopb-mcp release, into a single `uv` tool environment so the components can
+  import and drive each other (`biopb server start`, the napari viewer, etc.).
+- **napari** — from PyPI, into the same environment.
+- **Data browser** (optional) — `webapp.tar.gz` from the same biopb-mcp release,
   unpacked to `~/.local/share/biopb/webapp`.
-- **biopb-mcp + napari** (optional) — from PyPI; the installer also registers the
-  biopb MCP server with any detected agent (Claude Code/Desktop, Cursor,
-  opencode, Hermes) and can install opencode if none is found. biopb-mcp speaks
-  MCP over **stdio**, so the agent spawns `biopb-mcp --transport stdio` itself
-  (which opens the napari window and brings up the data plane) — there is no
-  separate server to start by hand.
+- The installer also registers the biopb MCP server with any detected agent
+  (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
+  none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
+  `biopb-mcp --transport stdio` itself (which opens the napari window and brings
+  up the data plane) — there is no separate server to start by hand.
 
 ## Config & data locations
 
@@ -68,8 +72,12 @@ Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
 
 ## Notes
 
-- Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
-  release is a tensor-server (`server-v*`) release carrying both wheels and the
-  webapp tarball.
+- Release assets are read from the `biopb/biopb-mcp` GitHub Releases API; the
+  latest `v*` release carries all three wheels (`biopb-mcp`, `biopb`,
+  `biopb-tensor-server`) plus the webapp tarball. biopb-mcp's release CI bakes
+  in the `biopb` + `biopb-tensor-server` wheels (pinned in `pyproject.toml`) so
+  the trio is built and shipped together.
+- Migration rationale (why the installer and all three wheels now live in one
+  repo/release) lives in `../docs/installer-migration.md`.
 - Distribution rationale (why the server ships via Docker/GitHub release rather
   than PyPI) lives in the architecture overview, `../development.md`.

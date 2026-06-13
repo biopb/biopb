@@ -80,7 +80,9 @@ mcp-ci — it is the unified `release.yaml` on `release-v*` tags. The cross-plat
 PyInstaller "frozen app" bundles are disabled (everything installs via uv); the
 spec/hooks (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
 
-### Installer (`biopb-mcp/install/install.sh`, `install.ps1`)
+### Installer (`install/install.sh`, `install.ps1`)
+Originally staged under `biopb-mcp/install/`; promoted to the repo-root `install/`
+after the first `release-v*` (the transitional copy was removed).
 - `RELEASE_REPO` → `biopb/biopb`; release fetch filters to the deployment line
   (`release-v*`, clean `X.Y.Z` only, so prereleases are skipped).
 - Source-mode builds `biopb-mcp` from the monorepo with `#subdirectory=biopb-mcp`.
@@ -94,11 +96,16 @@ per-package (`v*`/`mcp-v*`); `release-v*` produces the GitHub release (wheel
 triple + webapp + installers) and the Docker images (tensor-server, image-base),
 with no PyPI.
 
-## Needs live-CI validation (cannot be checked from a local checkout)
+## Live-CI validation (all confirmed)
 
-- `uv sync --package biopb-mcp --extra mcp --group testing` resolving + building
-  the full Qt/napari stack on all matrix platforms.
-- `uv publish` to PyPI on an `mcp-v*` tag (token: `PYPI_API_TOKEN`).
-- The end-to-end installer against a real `mcp-v*` monorepo release (prefix
-  filtering, asset names, source-mode subdirectory installs).
-- First real `mcp-v*` tag produces a clean (non-`0.1.dev`) version.
+Everything below has now been exercised on real runs — the migration is fully
+validated end to end:
+
+- `uv sync --package biopb-mcp --extra mcp --group testing` resolves + builds the
+  full Qt/napari stack on all matrix platforms — green on `mcp-ci`.
+- `uv publish` to PyPI on `mcp-v*` tags (`PYPI_API_TOKEN`) — published
+  `biopb-mcp` 0.7.1a0 and 0.7.2.
+- The end-to-end installer against a real monorepo release — validated by a manual
+  docker install test against `release-v0.8.0` (the deployment line; the installer
+  now consumes `release-v*`, not `mcp-v*`).
+- A real tag produces a clean (non-`0.1.dev`) version — `mcp-v0.7.2` → `0.7.2`.
