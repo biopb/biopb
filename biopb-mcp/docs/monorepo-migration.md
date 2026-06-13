@@ -72,10 +72,14 @@ so the legacy `pip install -e` flow into the shared root `.venv` still works;
 The imported `biopb-mcp/.github/*` were inert (GitHub only runs root workflows).
 Replaced with:
 - **`mcp-ci.yaml`** — uv-based test matrix (path-filtered to `biopb-mcp/**` +
-  shared proto/server), PyPI publish on `mcp-v*`, then triggers the bundle.
+  shared proto/server), PyPI publish on `mcp-v*`, then triggers the release.
 - **`mcp-release.yaml`** — builds all three wheels + the webapp from the tagged
-  tree, then the cross-platform PyInstaller bundle (run from `biopb-mcp/`), and
-  assembles one GitHub release.
+  tree and assembles one GitHub release. Installation is **uv-based**: the
+  bootstrap installer pulls these wheels and runs them under uv.
+  - The cross-platform **PyInstaller "frozen app" bundles are disabled for now**
+    (everything installs via uv). The spec/hooks
+    (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree; re-enable
+    by restoring the per-platform `build` job from git history.
 
 ### Installer (`biopb-mcp/install/install.sh`, `install.ps1`)
 - `RELEASE_REPO` → `biopb/biopb`.
@@ -102,8 +106,6 @@ the `mcp-v*`/`server-v*` tag lines) are retired. The installer's
 
 - `uv sync --package biopb-mcp --extra mcp --group testing` resolving + building
   the full Qt/napari stack on all matrix platforms.
-- The PyInstaller bundle on linux/windows/macos-intel/macos-arm from the
-  `biopb-mcp/` working directory (the spec uses paths relative to its own dir).
 - `uv publish` to PyPI on an `mcp-v*` tag (token: `PYPI_API_TOKEN`).
 - The end-to-end installer against a real `mcp-v*` monorepo release (prefix
   filtering, asset names, source-mode subdirectory installs).

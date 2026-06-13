@@ -20,16 +20,15 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 These methods only install the mcp component without the rest of **[BioPB](https://github.com/biopb/biopb)**  system.
 
-### Bundled Installers
+### From PyPI
 
-Pre-built standalone installers are available from the [Releases](https://github.com/biopb/biopb/releases?q=mcp-v) page (the `mcp-v*` releases). These include napari with the biopb-mcp plugin pre-installed—no Python setup required.
+```
+pip install biopb-mcp        # or: uv pip install biopb-mcp
+```
 
-| Platform | Download |
-|----------|----------|
-| Windows | `biopb-mcp-windows.zip` |
-| macOS (Intel) | `biopb-mcp-macos-intel.tar.gz` |
-| macOS (Apple Silicon) | `biopb-mcp-macos-arm.tar.gz` |
-| Linux | `biopb-mcp-linux.tar.gz` |
+> Standalone PyInstaller app bundles (the per-platform `.zip`/`.tar.gz`
+> downloads) are temporarily disabled — installation is uv/pip-based for now.
+> Use the recommended one-liner above, or the methods here.
 
 ### Development Version
 

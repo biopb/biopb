@@ -1,12 +1,20 @@
-# Cross-platform bundled installer for biopb-mcp + the combined wheel triple.
+# biopb-mcp release: the combined wheel triple + webapp + bootstrap installers.
 # Triggered by mcp-ci.yaml's trigger-bundle job on an mcp-v* tag (or manually).
 #
 # Since the monorepo merge there is NO cross-repo wheel fetch: all three wheels
 # (biopb client, biopb-tensor-server, biopb-mcp) and the data-browser webapp are
 # built HERE from the tagged checkout, so the release is automatically internally
-# version-paired. This is the interim per-component release; the unified-release
-# workflow will eventually supersede both this and tensor-server's release.
-name: Build Bundled Installer (MCP)
+# version-paired. Installation is uv-based: the bootstrap installer pulls these
+# wheels and runs them under uv.
+#
+# NOTE: the cross-platform PyInstaller "frozen app" bundles are DISABLED for now
+# (everything installs via uv). The spec/hooks (biopb-mcp/biopb-mcp.spec,
+# biopb-mcp/hooks/) remain in the tree; to re-enable, restore the per-platform
+# `build` job from git history and add its bundle artifacts back to the release.
+#
+# This is the interim per-component release; the unified-release workflow will
+# eventually supersede both this and tensor-server's release.
+name: MCP Release (wheels + webapp)
 
 on:
   workflow_dispatch:
@@ -20,10 +28,10 @@ permissions:
   contents: read
 
 jobs:
-  # Build the platform-agnostic assets once: the three pure-python wheels +
-  # mcp sdist + the webapp tarball. Shared by the release job below.
-  wheels:
+  release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the GitHub release (no-op on non-tag runs)
     steps:
       - uses: actions/checkout@v6
         with:
@@ -62,155 +70,37 @@ jobs:
           VITE_TENSOR_API="" pnpm --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
 
-      - name: Upload wheels + webapp
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-wheels
-          path: release-wheels/*
-          retention-days: 7
-
-  # PyInstaller one-folder/.app bundle per platform. Embeds the in-tree biopb
-  # wheel (not PyPI) so the bundled app is paired with this SHA.
-  build:
-    name: Build ${{ matrix.platform }}
-    needs: wheels
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux
-          - os: windows-latest
-            platform: windows
-          - os: macos-15
-            platform: macos-intel
-          - os: macos-14
-            platform: macos-arm
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.ref || '' }}
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
-
-      - name: Download built wheels
-        uses: actions/download-artifact@v4
-        with:
-          name: release-wheels
-          path: release-wheels
-
-      - name: Setup headless display (Linux)
-        if: runner.os == 'Linux'
-        uses: pyvista/setup-headless-display-action@v4
-        with:
-          qt: true
-
-      # Install the bundle runtime: the in-tree biopb wheel pins the client to
-      # this SHA, then biopb-mcp[mcp] (+ napari[all]) from PyPI/its sibling.
-      # The local tensor server is NOT bundled — it ships as a wheel asset and
-      # the installer puts it in its own environment.
-      - name: Install runtime + PyInstaller
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller "napari[all]"
-          pip install release-wheels/biopb-*.whl
-          pip install "./biopb-mcp[mcp]"
-
-      - name: Build with PyInstaller
-        working-directory: biopb-mcp
-        run: pyinstaller --noconfirm --clean biopb-mcp.spec
-
-      - name: Create archive (Linux/macOS)
-        if: runner.os != 'Windows'
-        working-directory: biopb-mcp/dist
-        run: |
-          if [ -d "biopb-mcp.app" ]; then
-            tar -czvf biopb-mcp-${{ matrix.platform }}.tar.gz biopb-mcp.app
-          else
-            tar -czvf biopb-mcp-${{ matrix.platform }}.tar.gz biopb-mcp
-          fi
-
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        working-directory: biopb-mcp/dist
-        run: 7z a biopb-mcp-${{ matrix.platform }}.zip biopb-mcp
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: biopb-mcp-${{ matrix.platform }}
-          path: biopb-mcp/dist/biopb-mcp-${{ matrix.platform }}.*
-          retention-days: 7
-
-  # Assemble ONE GitHub release on the mcp-v* tag: the bundled installers, the
-  # paired wheel triple, the webapp, and the bootstrap installers.
-  release:
-    name: Create GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/mcp-v')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.ref || '' }}
-          fetch-depth: 0
-
-      - name: Download wheels + webapp
-        uses: actions/download-artifact@v4
-        with:
-          name: release-wheels
-          path: release-wheels
-
-      - name: Download platform bundles
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: biopb-mcp-*
-          merge-multiple: true
+      - name: List release assets
+        run: ls -l release-wheels
 
       - name: Get version from tag
         id: version
+        if: startsWith(github.ref, 'refs/tags/mcp-v')
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/mcp-v')
         uses: softprops/action-gh-release@v2
         with:
           name: biopb-mcp ${{ steps.version.outputs.VERSION }}
           fail_on_unmatched_files: true
           body: |
-            ## Installation
-
-            Download the appropriate installer for your platform:
-
-            - **Windows**: Download `biopb-mcp-windows.zip`, extract, and run `biopb-mcp.exe`
-            - **macOS (Intel)**: Download `biopb-mcp-macos-intel.tar.gz`, extract `biopb-mcp.app`, and open it
-            - **macOS (Apple Silicon)**: Download `biopb-mcp-macos-arm.tar.gz`, extract `biopb-mcp.app`, and open it
-            - **Linux**: Download `biopb-mcp-linux.tar.gz`, extract, and run `./biopb-mcp`
-
-            **Note**: These are unsigned installers. On macOS, right-click and select "Open" to bypass Gatekeeper. On Windows, click "Run anyway" when prompted.
-
-            This bundle includes napari with the biopb-mcp plugin pre-installed.
-
-            ## One-line install
+            ## Installation (uv)
 
             ```sh
             curl -fsSL https://biopb.org/install.sh | bash      # Linux / macOS / WSL
             irm https://biopb.org/install.ps1 | iex             # Windows PowerShell
             ```
 
+            The installer pulls the wheel triple + the data browser from this
+            release and runs them under uv.
+
+            > Standalone PyInstaller app bundles are temporarily unavailable;
+            > install via the one-liner above.
+
             ## Bundled assets
 
-            Everything an installer/auto-updater needs from one place:
+            Everything the installer/auto-updater needs from one place:
 
             - `biopb_mcp-*.whl` — the MCP server / napari plugin (also on PyPI)
             - `biopb-*.whl` — the version-paired biopb client (Arrow Flight tensor)
@@ -221,7 +111,6 @@ jobs:
             All three wheels and the webapp are built from this tag's commit, so
             they are internally version-paired.
           files: |
-            artifacts/*
             release-wheels/*
             biopb-mcp/install/install.sh
             biopb-mcp/install/install.ps1
