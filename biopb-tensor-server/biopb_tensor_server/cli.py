@@ -857,9 +857,18 @@ def launch(
                 console.print("[yellow]Auto-generated secure access token.[/yellow]")
 
         console.print(
-            f"\n[bold green]Access URL (shown once — do not share):[/bold green]\n"
-            f"  {web_url}/?token={effective_token}\n"
+            "\n[bold green]Access URL (shown once — do not share):[/bold green]"
         )
+        # soft_wrap keeps the URL on one line so the token stays copy-pasteable
+        # even in a narrow / non-TTY log (e.g. `docker logs`, where Rich would
+        # otherwise hard-wrap to width 80 and split the token). markup=False so
+        # nothing in the URL is interpreted as Rich markup.
+        console.print(
+            f"{web_url}/?token={effective_token}",
+            soft_wrap=True,
+            markup=False,
+        )
+        console.print()
 
     # --- Start Flight server ---
     flight_server, source_manager, watcher, precache_worker = _setup_flight_server(
