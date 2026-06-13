@@ -13,6 +13,14 @@ The repo provides the core harness framework of the biopb project. The goal is t
 curl -fsSL https://biopb.org/install.sh | bash
 ```
 
+## biopb-mcp
+
+The agent-facing client: an MCP server + napari plugin that hands an AI agent a live, shared napari session wired to the data and algorithm servers, so analysis is driven in plain Python instead of fixed GUI buttons. [Read More...](biopb-mcp/README.md)
+
+  - **Shared canvas**: the agent mutates the same viewer the scientist watches
+  - **One namespace, not an API**: `viewer`, `client`, `ops`, `np`/`da` live in a real Python kernel — any analysis expressible over them is reachable
+  - **Perceive → act → verify**: the agent runs code, then screenshots/inspects to confirm the result
+
 ## biopb-tensor
 
 A blazing-fast imaging data server for sharing your lab's petabyte-scale datasets to LLM agents and human team members alike. [Read More...](biopb-tensor-server/README.md)
@@ -50,10 +58,6 @@ pip install biopb[tensor]
 ```
 
 ## Related Projects in BioPB
-
-### biopb-mcp
-
-The MCP component that talks to the LLM agent directly and orchastrate the cooperation between the data/alogorthm servers, the LLM agent, the user, and napari display surface. [Read More...](https://github.com/biopb/biopb-mcp)
 
 ### biopb-servers
 
