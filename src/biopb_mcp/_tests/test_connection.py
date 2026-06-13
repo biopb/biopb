@@ -283,6 +283,171 @@ class TestConnectWhenBooted:
 
 
 # ---------------------------------------------------------------------------
+# background source watcher (issue #44)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStop:
+    """Deterministic stand-in for the watcher's stop Event.
+
+    ``wait`` returns ``False`` (not stopped) for the first *allow* calls so the
+    loop body runs exactly that many times, then the next ``is_set`` returns
+    ``True`` and the loop exits — no real sleeping, no thread, no timing races.
+    """
+
+    def __init__(self, allow):
+        self.allow = allow
+        self.waits = 0
+        self._set = False
+
+    def is_set(self):
+        return self._set or self.waits >= self.allow
+
+    def wait(self, _timeout):
+        if self.is_set():
+            return True
+        self.waits += 1
+        return False
+
+    def set(self):
+        self._set = True
+
+    def clear(self):
+        self._set = False
+
+
+def _connected_conn(monkeypatch, sources, health_results):
+    """A connected TensorConnection whose client serves *health_results*.
+
+    ``connect()`` consumes one ``health_check`` (its readiness probe) and one
+    ``list_sources``; we arm the per-poll health sequence and clear the call
+    history *after* connecting, so the watch-loop assertions see only loop
+    activity.
+    """
+    client = _fake_client(sources)
+    monkeypatch.setattr(
+        _connection, "TensorFlightClient", lambda url, token=None: client
+    )
+    monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+    conn = TensorConnection(config={})
+    conn.connect("grpc://host:9")
+    client.health_check.reset_mock()
+    client.list_sources.reset_mock()
+    client.health_check.side_effect = list(health_results)
+    return conn, client
+
+
+class TestSourceWatch:
+    def test_relists_when_count_changes(self, monkeypatch):
+        # Cached 2 sources; server grows to 3 -> the watcher re-lists once.
+        conn, client = _connected_conn(
+            monkeypatch,
+            {"a": MagicMock(), "b": MagicMock()},
+            [{"source_count": 2}, {"source_count": 3}],
+        )
+        grown = {"a": MagicMock(), "b": MagicMock(), "c": MagicMock()}
+        client.list_sources.return_value = grown
+        changed = []
+        conn.on_sources_changed = changed.append
+
+        conn._watch_stop = _FakeStop(allow=2)
+        conn._source_watch_loop(0.0, 0.0)
+
+        assert conn.sources is grown
+        assert changed == [grown]
+
+    def test_relists_on_connect_mid_index_partial(self, monkeypatch):
+        # Connected mid-index: cached 1 source, server already reports 18 ->
+        # re-list on the very first poll (issue #44 reconciliation).
+        conn, client = _connected_conn(
+            monkeypatch, {"a": MagicMock()}, [{"source_count": 18}]
+        )
+        full = {str(i): MagicMock() for i in range(18)}
+        client.list_sources.return_value = full
+
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)
+
+        assert len(conn.sources) == 18
+
+    def test_stable_count_does_not_relist(self, monkeypatch):
+        conn, client = _connected_conn(
+            monkeypatch,
+            {"a": MagicMock(), "b": MagicMock()},
+            [{"source_count": 2}, {"source_count": 2}],
+        )
+        conn._watch_stop = _FakeStop(allow=2)
+        conn._source_watch_loop(0.0, 0.0)
+
+        client.list_sources.assert_not_called()
+
+    def test_health_error_is_tolerated(self, monkeypatch):
+        conn, client = _connected_conn(
+            monkeypatch, {"a": MagicMock()}, [RuntimeError("blip")]
+        )
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)  # must not raise
+
+        client.list_sources.assert_not_called()
+
+    def test_disconnected_does_not_relist(self, monkeypatch):
+        conn, client = _connected_conn(monkeypatch, {"a": MagicMock()}, [])
+        conn.client = None
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)
+
+        client.list_sources.assert_not_called()
+        client.health_check.assert_not_called()
+
+    def test_missing_source_count_does_not_relist(self, monkeypatch):
+        # Older server without source_count in health: nothing to watch.
+        conn, client = _connected_conn(
+            monkeypatch, {"a": MagicMock()}, [{"status": "SERVING"}]
+        )
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)
+
+        client.list_sources.assert_not_called()
+
+    def test_relist_failure_keeps_watcher_alive(self, monkeypatch):
+        conn, client = _connected_conn(
+            monkeypatch,
+            {"a": MagicMock()},
+            [{"source_count": 2}, {"source_count": 3}],
+        )
+        client.list_sources.side_effect = RuntimeError("list boom")
+
+        conn._watch_stop = _FakeStop(allow=2)
+        conn._source_watch_loop(0.0, 0.0)  # must not raise
+
+        # Both polls ran despite the re-list error on the second.
+        assert client.health_check.call_count == 2
+
+    def test_start_is_idempotent(self, monkeypatch):
+        conn = TensorConnection(config={})
+        started = []
+        monkeypatch.setattr(
+            _connection.threading,
+            "Thread",
+            lambda *a, **k: started.append(k.get("name")) or MagicMock(),
+        )
+        conn.start_source_watch(min_interval=1.0, max_interval=2.0)
+        # The MagicMock thread reports alive -> a second start is a no-op.
+        conn.start_source_watch(min_interval=1.0, max_interval=2.0)
+        assert started == ["biopb-source-watch"]
+
+    def test_disabled_when_min_interval_zero(self, monkeypatch):
+        conn = TensorConnection(config={})
+        monkeypatch.setattr(
+            _connection.threading,
+            "Thread",
+            lambda *a, **k: pytest.fail("watcher must not start"),
+        )
+        conn.start_source_watch(min_interval=0, max_interval=10.0)
+        assert conn._watch_thread is None
+
+
+# ---------------------------------------------------------------------------
 # persist_url
 # ---------------------------------------------------------------------------
 

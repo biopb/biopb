@@ -107,6 +107,24 @@ PATH, `start_local_server()` can run `biopb server start` as a last-resort
 fallback (the widget drives this). Only the URL is persisted; the token is read
 from the environment, not saved.
 
+**Self-healing catalog (`start_source_watch`, issue #44).** The catalog cached
+at connect time can be *partial* — the server reports `SERVING` (port bound)
+before it finishes enumerating scenes, so a mid-index `list_sources()` looks
+complete but isn't. `start_source_watch()` spawns a **daemon thread** (not a
+`QTimer` — it must run headless with no Qt loop) that periodically
+`health_check()`s and re-lists (`refresh()`) whenever the server's
+`source_count` changes, reconciling against the count cached at connect on its
+first poll. The poll interval backs off exponentially from
+`mcp.tensor.health_poll_min_interval` to `health_poll_max_interval` while stable
+and snaps back to the min on a change. The watcher only ever *rebinds*
+`self.sources` to a fresh dict, so the agent (which reads `_conn.sources` live)
+and the widget (which wires `on_sources_changed` to a queued Qt signal to
+rebuild its tree) see no torn reads — no lock. Both the kernel bootstrap and the
+widget start it; the call is idempotent. Known limit: `source_count` doesn't
+grow when an existing source gains scenes (1→18 tensors), so that specific
+partial isn't caught by count alone — the common "sources still being
+discovered" case is.
+
 ### MCP Server Module (`mcp/`)
 
 The MCP server **is its own process** — it does *not* auto-start on plugin
@@ -204,9 +222,11 @@ output is not captured (code is exec'd, not run via `run_cell`).
   configures dask, constructs the `TensorConnection`, opens the napari viewer +
   Tensor Browser, builds `ops`, installs the job runner (`_jobs.install` +
   `wrap_viewer_for_threads`), wires the window-close hook (the viewer's
-  `destroyed` signal → a byte on `BIOPB_WINDOW_CLOSE_FD`), and populates the
-  `execute_code` namespace. On failure it prints a `BOOTSTRAP_ERROR` sentinel;
-  the host's health probe detects success via `'viewer' in dir()`.
+  `destroyed` signal → a byte on `BIOPB_WINDOW_CLOSE_FD`), starts the background
+  source watcher (`conn.start_source_watch`, issue #44 — covers headless, where
+  there is no widget to start it), and populates the `execute_code` namespace.
+  On failure it prints a `BOOTSTRAP_ERROR` sentinel; the host's health probe
+  detects success via `'viewer' in dir()`.
 - `_jobs.py` — runs *inside* the kernel. The async job runner: a `_jobs`
   registry, `submit`/`poll`/`cancel`/`cancel_current`/`interrupt_current`/
   `jobs_summary`, a thread-aware stdout dispatcher, `run_on_main` (Qt main-thread
@@ -331,7 +351,11 @@ The `mcp` section is grouped by concern:
   auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
   cluster-wide chunk cache (split across workers).
 - **`mcp.tensor`** — `cache_local` (let the data-plane client cache chunks even
-  for a localhost server; translated to `BIOPB_CACHE_LOCAL` in the kernel env).
+  for a localhost server; translated to `BIOPB_CACHE_LOCAL` in the kernel env)
+  and `health_poll_min_interval`/`health_poll_max_interval` (the background
+  source watcher's backoff bounds; the kernel re-lists when `source_count`
+  changes so a catalog cached mid-index self-heals — issue #44; min `<= 0`
+  disables it).
 - **`mcp.viewer`** — `compute_scheduler` (default `threads`; pins the napari
   viewer's *serial* slice reads to a single-process scheduler via
   `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`
@@ -393,6 +417,8 @@ Apply at the class level for test classes that require napari viewers. See
 
 - `src/biopb_mcp/` — main source
   - `_connection.py` — GUI-independent `TensorConnection` data-access service
+    (incl. `start_source_watch`, the background self-healing-catalog watcher —
+    issue #44)
   - `_config.py` — configuration management
   - `_tensor_utils.py` — pyramid-level building and dimension utilities
   - `_viewer_compute.py` — `wrap_levels` / `_ViewerArray`: pin viewer slice

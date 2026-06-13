@@ -293,7 +293,7 @@ class TestDefaultConfig:
         """tensor_disable_shm was removed (issue #10, no-op after biopb#9)."""
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]["tensor"]
-        assert DEFAULT_CONFIG["mcp"]["tensor"] == {"cache_local": True}
+        assert DEFAULT_CONFIG["mcp"]["tensor"]["cache_local"] is True
 
     def test_mcp_sub_sections_present(self):
         """The mcp section is grouped into its concern sub-sections."""
@@ -327,6 +327,17 @@ class TestDefaultConfig:
             assert key in dask
         # Dashboard binds loopback only, matching the server security model.
         assert dask["dashboard_address"].startswith("127.0.0.1")
+
+    def test_mcp_tensor_health_poll_defaults(self):
+        """The background source watcher's backoff bounds (issue #44)."""
+        tensor = DEFAULT_CONFIG["mcp"]["tensor"]
+        assert tensor["health_poll_min_interval"] == 2.0
+        assert tensor["health_poll_max_interval"] == 60.0
+        # A sane backoff window: min below max so the interval can grow.
+        assert (
+            tensor["health_poll_min_interval"]
+            < tensor["health_poll_max_interval"]
+        )
 
 
 class TestGetSetting:

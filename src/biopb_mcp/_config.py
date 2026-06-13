@@ -226,6 +226,17 @@ DEFAULT_CONFIG = {
             # structural fix that removes the underlying read amplification
             # (client-selectable read granularity) is tracked in biopb/biopb#8.
             "cache_local": True,
+            # Background source-catalog watcher (issue #44). A daemon thread in
+            # the kernel periodically health-checks the server and re-lists
+            # sources when its source_count changes, so a catalog cached while
+            # the server was still indexing (a partial scene list) self-heals
+            # without a manual refresh. The poll interval backs off
+            # exponentially from health_poll_min_interval to
+            # health_poll_max_interval while the count is stable, and snaps back
+            # to the min on a change so active indexing is tracked promptly. 0
+            # for health_poll_min_interval disables the watcher.
+            "health_poll_min_interval": 2.0,
+            "health_poll_max_interval": 60.0,
         },
         "viewer": {
             # Scheduler for the napari viewer's slice reads. The viewer scrubs

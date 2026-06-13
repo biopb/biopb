@@ -377,3 +377,22 @@ def _bootstrap_impl():
             "_viewer_window_alive": lambda: viewer_window_alive(viewer),
         }
     )
+
+    # 8. Background source-catalog watcher (issue #44): a daemon thread that
+    #    health-checks the server and re-lists sources when its source_count
+    #    changes, so a catalog cached while the server was still indexing
+    #    self-heals — for the agent (reads `_conn.sources` live) and, in a GUI
+    #    session, the widget (which wires its own tree rebuild and also starts
+    #    the watch; the call is idempotent). Thread-based, not a QTimer, so it
+    #    runs even headless where there is no Qt loop.
+    try:
+        conn.start_source_watch(
+            min_interval=get_setting(
+                config, "mcp.tensor.health_poll_min_interval"
+            ),
+            max_interval=get_setting(
+                config, "mcp.tensor.health_poll_max_interval"
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to start source watcher")

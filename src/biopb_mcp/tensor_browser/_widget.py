@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt, QTimer, Signal
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -329,6 +329,12 @@ class MetadataDialog(QDialog):
 class TensorBrowserWidget(QWidget):
     """Widget to browse and load tensors from a TensorFlight server."""
 
+    # Emitted (via the connection's on_sources_changed hook) when the background
+    # source watcher re-lists the catalog from its daemon thread. A Qt signal —
+    # not a direct call or QTimer — because the watcher fires off the Qt main
+    # thread; the queued connection marshals the tree rebuild back onto it.
+    _sources_changed = Signal(object)
+
     def __init__(
         self,
         viewer: "napari.viewer.Viewer",
@@ -369,6 +375,16 @@ class TensorBrowserWidget(QWidget):
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._setup_ui()
+
+        # Self-heal the tree when the background source watcher re-lists a
+        # catalog that was cached mid-index (issue #44). The watcher runs on a
+        # daemon thread, so it reaches the GUI through a queued signal. In the
+        # MCP context the kernel bootstrap also starts the watch on this same
+        # shared connection; start_source_watch is idempotent, so the duplicate
+        # call here (covering the standalone plugin) is harmless.
+        self._sources_changed.connect(self._on_sources_changed)
+        self._conn.on_sources_changed = self._sources_changed.emit
+        self._conn.start_source_watch()
 
         # Auto-connect on next event loop tick
         QTimer.singleShot(0, self._auto_connect)
@@ -710,6 +726,33 @@ class TensorBrowserWidget(QWidget):
         except Exception:
             self._show_error("Refresh failed")
             logger.exception("Failed to refresh source list")
+
+    def _on_sources_changed(self, sources):
+        """Rebuild the tree after the background watcher re-lists (issue #44).
+
+        Runs on the Qt main thread (queued from ``_sources_changed``). The
+        connection has already swapped in the fresh catalog, so we just re-render
+        — through ``_apply_filter`` so any active search text is preserved — and
+        only while connected and not mid-(re)connect, to avoid fighting a
+        concurrent connect that is about to repaint anyway.
+        """
+        if not self._conn.is_connected or self._connect_boot_deadline:
+            return
+        self._clear_error()
+        self._apply_filter()
+
+    def closeEvent(self, event):
+        """Detach our source-watch hook, but leave the watcher running.
+
+        The ``TensorConnection`` is shared with the kernel/agent (which reads
+        ``sources`` live and starts its own watch on the same connection), so we
+        must not stop the watcher when only this widget closes — that would kill
+        the agent's self-healing. We just drop our callback so the daemon thread
+        stops emitting into this soon-to-be-destroyed widget (issue #44).
+        """
+        if self._conn.on_sources_changed == self._sources_changed.emit:
+            self._conn.on_sources_changed = None
+        super().closeEvent(event)
 
     def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
         """Build tree from sources and display in widget."""

@@ -8,16 +8,22 @@ client.
 This module deliberately imports **no Qt and no napari** so it can be used (and
 unit-tested) without a GUI — only ``biopb.tensor`` and the local config module.
 
-Threading: a single ``TensorConnection`` instance is mutated on the Qt main
-thread (the widget's auto-connect tick and button handlers) and read in the same
-kernel process during ``execute_code``. There is no cross-thread access today, so
-no locking is used. A future off-thread connect would need synchronization.
+Threading: a ``TensorConnection`` instance is mutated on the Qt main thread (the
+widget's auto-connect tick and button handlers) and read in the same kernel
+process during ``execute_code``. The one off-thread writer is the background
+source watcher (:meth:`start_source_watch`, issue #44), which re-lists from its
+own daemon thread. It only ever *rebinds* ``self.sources`` to a fresh dict
+returned by ``list_sources()`` (never mutates the dict in place), so readers on
+other threads see either the whole old catalog or the whole new one under the
+GIL — no torn reads, hence no lock. ``connect()`` is still expected on one
+thread at a time.
 """
 
 import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Tuple
@@ -115,6 +121,20 @@ class TensorConnection:
         # plain callable so this service stays GUI/dask-free.
         self.on_connect = None
 
+        # Optional callback invoked (from the watcher's daemon thread) after the
+        # background source watcher re-lists the catalog, with the fresh sources
+        # dict. The widget wires this to a queued Qt signal to rebuild its tree;
+        # the kernel needs no callback since the agent reads ``sources`` live.
+        self.on_sources_changed = None
+
+        # Background source-catalog watcher state (issue #44). Started lazily by
+        # :meth:`start_source_watch`; a daemon thread, so it never blocks
+        # interpreter shutdown. The Event both signals the thread to stop and
+        # backs its interruptible sleep.
+        self._watch_thread: threading.Thread | None = None
+        self._watch_stop = threading.Event()
+        self._watch_lock = threading.Lock()
+
     @staticmethod
     def resolve_from_config(config: dict) -> Tuple[str, str | None]:
         """Resolve tensor server URL and token.
@@ -206,6 +226,144 @@ class TensorConnection:
         self.sources = sources
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources
+
+    def start_source_watch(
+        self,
+        min_interval: float | None = None,
+        max_interval: float | None = None,
+    ) -> None:
+        """Start the background source-catalog watcher (issue #44).
+
+        Spawns a daemon thread that periodically health-checks the connected
+        server and re-lists sources whenever its ``source_count`` changes — so a
+        catalog cached while the server was still indexing (a partial scene
+        list) self-heals without a manual :meth:`refresh`. The poll interval
+        backs off exponentially from *min_interval* to *max_interval* while the
+        count is stable and snaps back to *min_interval* on a change, so active
+        indexing is tracked promptly and a settled server is polled cheaply.
+
+        Idempotent: a second call while a watcher is alive is a no-op. The
+        thread is a daemon (never blocks interpreter shutdown); use
+        :meth:`stop_source_watch` to end it early. Intervals default to the
+        ``mcp.tensor.health_poll_*`` config; ``min_interval <= 0`` disables the
+        watcher.
+
+        Deliberately thread-based (not a ``QTimer``): it must run in the kernel
+        with no assumption of a Qt event loop (the kernel can be headless), and
+        its blocking ``health_check`` belongs off any GUI thread.
+        """
+        if min_interval is None:
+            min_interval = CONFIG.get("mcp.tensor.health_poll_min_interval")
+        if max_interval is None:
+            max_interval = CONFIG.get("mcp.tensor.health_poll_max_interval")
+        if not min_interval or min_interval <= 0:
+            logger.info(
+                "Source watch disabled (min_interval=%s)", min_interval
+            )
+            return
+        max_interval = max(max_interval or min_interval, min_interval)
+
+        with self._watch_lock:
+            if (
+                self._watch_thread is not None
+                and self._watch_thread.is_alive()
+            ):
+                return
+            self._watch_stop.clear()
+            thread = threading.Thread(
+                target=self._source_watch_loop,
+                args=(min_interval, max_interval),
+                name="biopb-source-watch",
+                daemon=True,
+            )
+            self._watch_thread = thread
+            thread.start()
+        logger.info(
+            "Source watch started (%.1fs..%.1fs)", min_interval, max_interval
+        )
+
+    def stop_source_watch(self) -> None:
+        """Signal the background source watcher to stop (best-effort)."""
+        self._watch_stop.set()
+
+    def _source_watch_loop(
+        self, min_interval: float, max_interval: float
+    ) -> None:
+        """Poll loop for the source watcher; runs on its own daemon thread.
+
+        ``last_count`` is the server ``source_count`` we last reconciled the
+        cached catalog against. It is reset to ``None`` whenever we observe no
+        client (disconnected or between connects); the next connected poll
+        adopts ``len(self.sources)`` — the size of the catalog cached at connect
+        — as the baseline, so a connect-mid-index partial (server already
+        reports more sources than we listed) re-lists on the very first tick.
+
+        Note (issue #44): ``source_count`` does not grow when an
+        already-listed source gains *scenes* (1 -> 18 tensors), so that specific
+        partial isn't caught by count alone; the common case — sources still
+        being discovered — is. A finer server-side readiness signal would
+        subsume this (tracked upstream).
+        """
+        interval = min_interval
+        last_count: int | None = None
+        while not self._watch_stop.is_set():
+            if self._watch_stop.wait(interval):
+                break
+
+            client = self.client
+            if client is None:
+                # Not connected (yet, or lost). Re-baseline on reconnect and
+                # poll at the floor so a fresh catalog is adopted promptly.
+                last_count = None
+                interval = min_interval
+                continue
+
+            try:
+                health = client.health_check()
+            except Exception:  # noqa: BLE001 - transient; back off and retry
+                interval = min(interval * 2, max_interval)
+                continue
+
+            count = (
+                health.get("source_count")
+                if isinstance(health, dict)
+                else None
+            )
+            if count is None:
+                # Server's health carries no source_count (older server) — there
+                # is nothing to watch; idle at the cap.
+                interval = max_interval
+                continue
+
+            if last_count is None:
+                # Reconcile against the catalog cached at connect time.
+                last_count = len(self.sources or {})
+
+            if count != last_count:
+                self._relist_from_watch()
+                last_count = count
+                interval = min_interval
+            else:
+                interval = min(interval * 2, max_interval)
+
+    def _relist_from_watch(self) -> None:
+        """Re-list sources from the watcher thread and fire the change hook."""
+        try:
+            sources = self.refresh()
+        except Exception:  # noqa: BLE001 - keep the watcher alive on a blip
+            logger.exception("Source watch: re-list failed")
+            return
+        logger.info(
+            "Source watch: catalog changed, re-listed %d sources", len(sources)
+        )
+        callback = self.on_sources_changed
+        if callback is not None:
+            try:
+                callback(sources)
+            except Exception:  # noqa: BLE001 - hook is best-effort
+                logger.exception(
+                    "Source watch: on_sources_changed hook failed"
+                )
 
     def query_sources(self, sql: str):
         """Server-side SQL filter passthrough."""
