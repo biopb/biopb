@@ -604,6 +604,19 @@ class ArrowFileBackend(CacheBackend):
             mmap = pa.memory_map(str(path), 'r')
             self._segment_mmaps[segment_id] = mmap
 
+            # The segment is now re-readable, so the in-memory RecordBatch copies
+            # of its entries are redundant. Drop those no longer referenced (the
+            # common sweep case: written, served, released while the segment was
+            # still filling). Entries still referenced keep their copy and are
+            # dropped on their own release() now that the segment is readable.
+            # This bounds resident decoded data to the open write segments plus
+            # what callers currently hold, instead of every chunk ever cached.
+            for k, info in self._metadata.items():
+                if info.segment_id == segment_id:
+                    entry = self._entries.get(k)
+                    if entry is not None and entry.is_evictable():
+                        self._entries.pop(k, None)
+
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
         total = 0
@@ -1220,12 +1233,51 @@ class ArrowFileBackend(CacheBackend):
             self._entries.pop(key, None)
 
     def release(self, key: bytes) -> int:
-        """Release reference to entry."""
+        """Release reference to entry.
+
+        When the last reference drops, evict the in-memory ``RecordBatch`` for an
+        entry that is redundantly persisted on a *readable* segment. Without this,
+        every chunk ever served stays mirrored in memory for the life of the
+        process, bounded only by the *disk* ``max_total_bytes`` (e.g. 96 GB),
+        which exhausts RAM on a large catalog or a precache sweep.
+
+        ``complete_entry`` writes the batch to its segment *and* keeps it on
+        ``entry.data`` so the computing/serving thread can return it without an
+        immediate re-read. Once no caller holds the entry, that copy is pure RAM
+        cost -- *provided the segment is closed and mmap-readable*, in which case
+        ``get_or_acquire``/``start_compute`` re-read it via
+        ``_read_batch_from_segment`` on the next hit. While the segment is still
+        the active write segment it is not yet re-readable, so ``entry.data`` is
+        the only readable copy and must be kept; those entries are dropped later,
+        at ``_close_segment`` or on a subsequent ``release`` once readable.
+        """
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 return 0
-            return entry.release()
+            count = entry.release()
+            self._maybe_drop_in_memory_batch(key, entry)
+            return count
+
+    def _maybe_drop_in_memory_batch(self, key: bytes, entry: CacheEntry) -> None:
+        """Drop an entry's in-memory copy when it is a redundant mirror of a
+        readable segment.
+
+        Safe to drop only when the entry is unreferenced (``is_evictable``) AND
+        its data is recoverable: persisted (``key in self._metadata``) on a
+        segment that is closed and mmap-readable (``segment_id in
+        self._segment_mmaps``). A caller that already read ``entry.data`` holds
+        its own reference, so the batch survives until it is done; only future
+        lookups change, and they rebuild from the segment. Caller holds
+        ``self._lock``. No-op for in-memory-only entries (e.g. oversized skips)
+        and for entries on the still-open write segment.
+        """
+        if not entry.is_evictable():
+            return
+        info = self._metadata.get(key)
+        if info is None or info.segment_id not in self._segment_mmaps:
+            return
+        self._entries.pop(key, None)
 
     def remove(self, key: bytes) -> bool:
         """Remove entry from in-memory tracking only.
