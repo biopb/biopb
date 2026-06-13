@@ -186,6 +186,18 @@ def _resolve_serve_sources(
     return static_sources, monitored_sources
 
 
+def _grpc_location(host: str, port: int) -> str:
+    """Build a ``grpc://`` URL, bracketing an IPv6 literal in the authority.
+
+    An IPv6 address contains ``:`` and must be wrapped in brackets to be a valid
+    URL authority, e.g. ``grpc://[::1]:8815``; IPv4 addresses and hostnames pass
+    through unchanged. Used for both the server bind location and the sidecar's
+    connect target so neither emits a malformed URL for an IPv6 host.
+    """
+    authority = f"[{host}]" if isinstance(host, str) and ":" in host else host
+    return f"grpc://{authority}:{port}"
+
+
 def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
@@ -349,7 +361,7 @@ def _setup_flight_server(
         )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
-    location = f"grpc://{host}:{port}"
+    location = _grpc_location(host, port)
     # 80MB max message size (slightly above 64MB chunk threshold)
     server = TensorFlightServer(
         location,
@@ -566,7 +578,7 @@ def serve(
         token=token,
     )
 
-    location = f"grpc://{host or server_config.host}:{port or server_config.port}"
+    location = _grpc_location(host or server_config.host, port or server_config.port)
     console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
     console.print("Press Ctrl+C to stop\n")
 
@@ -886,13 +898,7 @@ def launch(
         _flight_connect_host = "127.0.0.1"
     elif _flight_connect_host == "::":
         _flight_connect_host = "::1"
-    # Bracket an IPv6 literal for the URL authority, e.g. grpc://[::1]:8815.
-    _connect_authority = (
-        f"[{_flight_connect_host}]"
-        if ":" in _flight_connect_host
-        else _flight_connect_host
-    )
-    flight_location = f"grpc://{_connect_authority}:{server_config.port}"
+    flight_location = _grpc_location(_flight_connect_host, server_config.port)
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
     flight_thread.start()
 
