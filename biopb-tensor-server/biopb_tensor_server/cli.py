@@ -866,7 +866,14 @@ def launch(
         server_config, token=effective_token
     )
 
-    flight_location = f"grpc://{server_config.host}:{server_config.port}"
+    # The HTTP sidecar is co-located with the Flight server and reaches it over
+    # the loopback interface. When the Flight server binds to a wildcard address
+    # (0.0.0.0 / ::) that address is a bind target, not a valid connect target,
+    # so dial loopback explicitly rather than inheriting the wildcard.
+    _flight_connect_host = server_config.host
+    if _flight_connect_host in ("0.0.0.0", "::", ""):
+        _flight_connect_host = "127.0.0.1"
+    flight_location = f"grpc://{_flight_connect_host}:{server_config.port}"
     flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
     flight_thread.start()
 

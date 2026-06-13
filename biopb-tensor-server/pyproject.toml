@@ -15,6 +15,7 @@ dependencies = [
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0",
   "dask[array] >= 2024.0.0",
+  "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
   "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
   "tifffile >= 2021.8.30",
   "numpy < 2.0",
