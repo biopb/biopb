@@ -1,5 +1,6 @@
 import io
 import logging
+import math
 import re
 import threading
 import time
@@ -57,8 +58,11 @@ def _estimate_chunk_memory_mb(chunk) -> float:
     if not shape:
         return 0.0
 
-    # Calculate element count
-    n_elements = np.prod(shape)
+    # Calculate element count. Use Python's arbitrary-precision int via math.prod
+    # rather than np.prod: numpy's default integer is C long (32-bit on Windows),
+    # so np.prod overflows for large chunks (e.g. 4096*4096*256*3 wraps to 0),
+    # which would silently defeat the memory guard on Windows.
+    n_elements = math.prod(int(d) for d in shape)
 
     # Memory = elements * bytes per element
     bytes_per_element = dtype.itemsize
