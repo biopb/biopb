@@ -504,6 +504,97 @@ class TestArrowFileBackend:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_release_drops_in_memory_batch_but_keeps_disk(self):
+        """Releasing the last reference frees the in-RAM RecordBatch once its
+        segment is readable, while the on-disk data (and so the cache hit)
+        survives.
+
+        Regression test: complete_entry persists the batch to a segment AND
+        pins it on entry.data. Without dropping that copy, the file backend
+        mirrors every chunk ever served in memory for the life of the process --
+        bounded only by the *disk* max_total_bytes -- which exhausts RAM on a
+        large catalog / precache sweep. With a tiny max_segment_bytes each entry
+        closes its own segment immediately, so after release _entries must no
+        longer hold it, _metadata must still know it, and a fresh lookup must
+        rebuild correct data from the segment.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=1,  # close (and make readable) after every entry
+            max_total_bytes=10 * 1024 * 1024,
+        )
+        backend = ArrowFileBackend(config)
+
+        # Cache several entries. Each closes its segment on write, but the owner
+        # still holds a reference, so the batch stays in memory for now.
+        keys = [f"key{i}".encode() for i in range(5)]
+        for i, key in enumerate(keys):
+            backend.start_compute(key)
+            backend.complete_entry(key, self._make_data([i, i, i]), 24)
+            assert backend._entries[key].data is not None  # owner still holds it
+
+        # Release every reference -> segments are readable, so the in-memory
+        # mirror must be dropped...
+        for key in keys:
+            backend.release(key)
+        assert len(backend._entries) == 0, "in-RAM batches not freed on release"
+        # ...but the on-disk index is fully intact.
+        assert all(key in backend._metadata for key in keys)
+
+        # A subsequent lookup is still a hit and returns the correct data,
+        # rebuilt from the segment mmap rather than the freed in-RAM copy.
+        entry, is_owner = backend.start_compute(keys[2])
+        assert is_owner is False
+        assert entry.state == EntryState.READY
+        assert entry.data.column(0).to_pylist() == [[2, 2, 2]]
+        backend.release(keys[2])
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
+    def test_open_segment_entry_retained_until_readable(self):
+        """An entry on the still-open write segment keeps its in-memory copy on
+        release (it is the only readable copy), and is freed once the segment
+        closes and becomes mmap-readable.
+
+        Guards the readability gate: dropping a not-yet-readable entry would turn
+        a hot, freshly-written chunk into a miss/recompute (the SieveK-style
+        failure mode).
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=10 * 1024 * 1024,  # segment stays open
+            max_total_bytes=100 * 1024 * 1024,
+        )
+        backend = ArrowFileBackend(config)
+
+        backend.start_compute(b"open")
+        backend.complete_entry(b"open", self._make_data([7, 7, 7]), 24)
+        seg_id = backend._metadata[b"open"].segment_id
+        assert seg_id not in backend._segment_mmaps  # still the write segment
+
+        # Released, but not yet readable -> the only copy must be retained.
+        backend.release(b"open")
+        assert b"open" in backend._entries
+        assert backend._entries[b"open"].data is not None
+
+        # Closing the segment makes it readable and frees the redundant copy.
+        backend._close_segment(seg_id)
+        assert seg_id in backend._segment_mmaps
+        assert b"open" not in backend._entries
+        assert b"open" in backend._metadata
+
+        # Still a correct hit afterwards, served from the mmap.
+        entry, is_owner = backend.start_compute(b"open")
+        assert is_owner is False
+        assert entry.data.column(0).to_pylist() == [[7, 7, 7]]
+        backend.release(b"open")
+
+        backend.close()
+        shutil.rmtree(cache_dir)
+
     def test_segment_unlink_while_caller_holds_batch(self):
         """A segment can be evicted/unlinked while a caller still holds the
         RecordBatch read from it.
