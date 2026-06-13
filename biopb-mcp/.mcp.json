@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "biopb": {
+      "type": "stdio",
+      "command": "biopb-mcp",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}

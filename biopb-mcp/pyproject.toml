@@ -1,0 +1,193 @@
+[project]
+name = "biopb-mcp"
+dynamic = ["version"]
+description = "Performing image analysis by visiting biopb endpoints"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Ji Yu"},
+  {email = "jyu@uchc.edu"},
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "magicgui",
+    "qtpy",
+    "scikit-image",
+    # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
+    # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
+    # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
+    # budget used by mcp/_bootstrap._register_cache_plugin).
+    "biopb[tensor] >= 0.6.4",
+    "opencv-python-headless",
+    # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
+    # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
+    # NOT depend on grpcio-tools: it is a build-time codegen plugin, is never
+    # imported at runtime, and being unpinned it drags resolvers down to an
+    # ancient, unbuildable grpcio-tools when co-installed with biopb.
+    "grpcio-health-checking",
+]
+
+[project.optional-dependencies]
+tables = [
+    "napari-skimage-regionprops",  # For annotation table display
+]
+# The MCP server is a standalone process (not a plugin loaded inside a running
+# napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
+# must bring napari and a real Qt binding itself — qtpy in the core deps is only
+# a shim. napari>=0.7 keeps the resolver off the older napari 0.6.x line, which
+# pins vispy<0.16 and fails to init a GL canvas under Qt 6.11.
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed", "napari>=0.7", "pyqt6"]
+3d = ["vedo"] # 3d rendering from mesh
+
+# Test/dev dependencies live in a PEP 735 dependency *group* rather than a
+# `testing` extra, because the group can pin direct-URL wheels (below) without
+# polluting biopb-mcp's published metadata: PyPI/twine reject any distributed
+# package whose Requires-Dist carries a direct reference, and biopb-mcp is
+# published on PyPI (see .github/workflows/test_and_deploy.yaml). Install with:
+#   uv sync --extra mcp --group testing            # uv
+#   pip install -e ".[mcp]" --group testing        # pip >= 25.1
+# tox pulls it via `dependency_groups = testing` (tox >= 4.22).
+# NB: dependency groups are NOT part of biopb-mcp's published metadata and
+# `--group` resolves against this pyproject, not a PyPI-installed package — so a
+# group can pin direct-URL wheels safely, but `pip install biopb-mcp[...]` can
+# NEVER pull one. These help only a *source checkout* (`uv sync --group ...` /
+# `pip install . --group ...`, incl. the release-bundle build). Delivering the
+# tensor server to PyPI `pip install` users would require publishing
+# biopb-tensor-server to PyPI and exposing it as a normal extra.
+[dependency-groups]
+# Runnable full stack, no test tooling: the MCP server deps plus the prebuilt,
+# version-paired tensor-server + biopb wheels from the latest
+# biopb-tensor-server GitHub release. Gives a checkout a real local tensor
+# server (for `biopb server start` / autostart) without pytest/tox.
+#
+# The server ships ONLY on the GitHub release (never PyPI); the biopb wheel is
+# the version the release pairs it with (same monorepo SHA 40b10cc). Both are
+# built by release CI (which runs the `buf` codegen), so no buf/protoc toolchain
+# is needed to install them, and the biopb wheel overrides the registry
+# `biopb[tensor]` pin in [project.dependencies] to the exact paired build.
+# `[web]` pulls fastapi/uvicorn/pillow/simplejpeg — the server's CLI
+# (`biopb server start`) imports its HTTP server at module load, so without it
+# even importing the CLI raises ModuleNotFoundError: fastapi.
+# On a new `server-v*` release, bump BOTH URLs (new tag + new biopb wheel
+# filename — `gh release view server-vX.Y.Z --repo biopb/biopb`) and `uv lock`.
+integration = [
+    "biopb-mcp[mcp]",  # MCP server deps (napari>=0.7, pyqt6, jupyter_client, …)
+    "biopb[tensor] @ https://github.com/biopb/biopb/releases/download/server-v0.4.5/biopb-0.6.5-py3-none-any.whl",
+    "biopb-tensor-server[web] @ https://github.com/biopb/biopb/releases/download/server-v0.4.5/biopb_tensor_server-0.4.5-py3-none-any.whl",
+]
+# Full stack + test tooling. = integration plus pytest/tox. (napari/pyqt6 come
+# in via biopb-mcp[mcp] in the integration group.)
+testing = [
+    {include-group = "integration"},
+    "tox",
+    "pytest",  # https://docs.pytest.org/en/latest/contents.html
+    "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
+    "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
+    "pytest-env",  # https://github.com/qwertyquerty/pytest-env
+]
+
+[project.scripts]
+biopb-mcp = "biopb_mcp.mcp.__main__:main"
+
+[project.entry-points."napari.manifest"]
+biopb-mcp = "biopb_mcp:napari.yaml"
+
+[project.urls]
+"Bug Tracker" = "https://github.com/jiyuuchc/biopb-mcp/issues"
+"Documentation" = "https://github.com/jiyuuchc/biopb-mcp#README.md"
+"Source Code" = "https://github.com/jiyuuchc/biopb-mcp"
+"User Support" = "https://github.com/jiyuuchc/biopb-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.setuptools_scm]
+version_file = "src/biopb_mcp/_version.py"
+
+[tool.pytest.ini_options]
+qt_api = "pyqt6"
+addopts = "--ignore-glob='*_vendor*'"
+
+[tool.pytest_env]
+QT_QPA_PLATFORM = "offscreen"
+
+[tool.black]
+line-length = 79
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 79
+lint.select = [
+    "E", "F", "W", #flake8
+    "UP", # pyupgrade
+    "I", # isort
+    "BLE", # flake8-blind-exception
+    "B", # flake8-bugbear
+    "A", # flake8-builtins
+    "C4", # flake8-comprehensions
+    "ISC", # flake8-implicit-str-concat
+    "G", # flake8-logging-format
+    "PIE", # flake8-pie
+    "SIM", # flake8-simplify
+]
+lint.ignore = [
+    "E501", # line too long. let black handle this
+    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
+    "SIM117", # flake8-simplify - some merged with statements don't look great with black; revisit later
+    "BLE001", # blind-except - intentional best-effort cleanup paths (e.g. _kernel.py, _config.py, connect/autostart) that must never propagate.
+    "UP035", # deprecated-import - keep typing.List/Dict for magicgui runtime annotations, consistent with the UP006/UP007 ignores.
+    "G004", # logging-f-string - stylistic; the codebase mixes f-string and lazy %-style logs.
+    "SIM105", # suppressible-exception - keep explicit try/except/pass over contextlib.suppress in death-pipe / cleanup paths.
+    "B904", # raise-without-from-inside-except - one deliberate re-raise in image_processing/_grpc.py.
+]
+
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".mypy_cache",
+    ".pants.d",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+    "*vendored*",
+    "*_vendor*",
+]
+
+target-version = "py310"
+fix = true

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-biopb"
+# Final release of the old name. MUST be higher than the last published
+# napari-biopb on PyPI (last git tag was v0.5.0) — bump if needed before upload.
+version = "0.5.1"
+description = "Deprecated: renamed to 'biopb-mcp'. Installs biopb-mcp and re-exports it for backward compatibility."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+  {name = "Ji Yu"},
+  {email = "jyu@uchc.edu"},
+]
+classifiers = [
+    "Development Status :: 7 - Inactive",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.10"
+dependencies = ["biopb-mcp"]
+
+[project.urls]
+"Source Code" = "https://github.com/jiyuuchc/biopb-mcp"
+
+[tool.setuptools]
+py-modules = ["napari_biopb"]
