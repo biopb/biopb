@@ -1,0 +1,150 @@
+# CI/CD for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
+# biopb-mcp/; published to PyPI on its own `mcp-v*` tag prefix (kept distinct
+# from the client's `v*` and the server's `server-v*`).
+name: MCP CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'mcp-v*'
+    # No paths filter on push: an mcp-v* tag must always trigger the deploy
+    # regardless of which files the tagged commit changed. (A paths filter under
+    # push applies to tag pushes too, which would silently skip releases.)
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'biopb-mcp/**'
+      - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'src/main/python/**'
+      - 'biopb-tensor-server/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/mcp-ci.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Python suite. Sparse matrix mirroring the other monorepo CIs: all versions on
+  # Linux (where version bugs surface), plus one version on macOS/Windows (where
+  # platform/Qt bugs surface — the bundle ships on all three).
+  test:
+    name: ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.10'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: macos-latest
+            python-version: '3.12'
+          - os: windows-latest
+            python-version: '3.12'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      # vispy/napari need a GL context; provide a headless display + Qt libs.
+      - name: Setup headless display
+        uses: pyvista/setup-headless-display-action@v4
+        with:
+          qt: true
+
+      - name: Install Windows OpenGL
+        if: runner.os == 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
+          powershell gl-ci-helpers/appveyor/install_opengl.ps1
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Resolve the whole workspace so biopb[tensor] and biopb-tensor-server[web]
+      # come from the in-tree members (the server is never on PyPI). uv is the
+      # workspace-aware installer; this is why CI no longer uses tox+pip.
+      - name: Install (workspace, mcp extra + testing group)
+        run: uv sync --package biopb-mcp --extra mcp --group testing --python ${{ matrix.python-version }}
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --no-sync pytest -v --color=yes --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
+
+      - name: Coverage
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: ${{ matrix.os }}-py${{ matrix.python-version }}
+
+  # Publish biopb-mcp to PyPI on an mcp-v* tag. The wheel/sdist carry NO
+  # direct-reference deps (those live only in the dependency groups, which are
+  # not part of published metadata), so twine accepts them.
+  deploy:
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/mcp-v')
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # full history + tags so setuptools_scm derives the version
+
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build biopb-mcp wheel + sdist
+        run: uv build --package biopb-mcp --out-dir dist
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish dist/*
+
+  # Kick off the cross-platform PyInstaller bundle once the wheel is on PyPI.
+  trigger-bundle:
+    name: Trigger bundle build
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/mcp-v')
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger bundle workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'mcp-release.yaml',
+              ref: context.ref
+            })

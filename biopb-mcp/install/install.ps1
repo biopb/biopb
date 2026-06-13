@@ -397,12 +397,18 @@ function Invoke-Preflight {
 }
 
 # Fetch the latest GitHub release metadata (a parsed object with .tag_name and
-# .assets[].name / .browser_download_url). One call serves both the wheels and
-# the data browser. Throws on network/HTTP error; callers catch and fall back.
+# .assets[].name / .browser_download_url) for a given tag prefix. The monorepo
+# hosts several release lines (mcp-v*, server-v*), so /releases/latest is NOT
+# component-specific; list releases (date-desc) and take the newest whose tag
+# matches $TagPrefix. Throws on network/HTTP error; callers catch and fall back.
 function Get-LatestRelease {
-    param([string]$Repo)
-    return Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-        -Headers @{ "User-Agent" = "biopb-installer" }
+    param([string]$Repo, [string]$TagPrefix = "")
+    $headers = @{ "User-Agent" = "biopb-installer" }
+    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
+        -Headers $headers
+    $match = $releases | Where-Object { $_.tag_name -like "$TagPrefix*" } | Select-Object -First 1
+    if (-not $match) { throw "No release matching prefix '$TagPrefix' in $Repo" }
+    return $match
 }
 
 # Print the tail of the server log, indented, for diagnosing a bad startup.
@@ -496,15 +502,19 @@ function Start-DataServer {
 }
 
 function Install-Biopb {
-    # Release mode pulls all three wheels (+ webapp) from ONE biopb-mcp release.
-    # Source mode builds from git: biopb-mcp from its own repo, biopb +
-    # biopb-tensor-server from the biopb monorepo (separate repos below).
-    $McpRepoUrl   = "https://github.com/biopb/biopb-mcp"
-    $McpRepo      = "git+$McpRepoUrl"
+    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
+    # (the mcp-v* line). Source mode builds from git: all three packages now
+    # live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # subdirectories), so there is a single repo.
     $BiopbRepoUrl = "https://github.com/biopb/biopb"
     $BiopbRepo    = "git+$BiopbRepoUrl"
-    $RepoUrl      = $McpRepoUrl               # webapp release-asset fallback URL
-    $ReleaseRepo  = "biopb/biopb-mcp"         # owner/name for the GitHub Releases API
+    $McpRepoUrl   = $BiopbRepoUrl
+    $McpRepo      = $BiopbRepo
+    $RepoUrl      = $BiopbRepoUrl             # webapp release-asset fallback URL
+    $ReleaseRepo  = "biopb/biopb"             # owner/name for the GitHub Releases API
+    # The monorepo hosts multiple release lines; the bundle the installer wants
+    # is the mcp-v* one, so the release fetch filters by this prefix.
+    $ReleaseTagPrefix = "mcp-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
     $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
     $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
@@ -665,13 +675,13 @@ function Install-Biopb {
     # biopb-mcp release carries the mutually-paired triple, so one download is one
     # consistent set - no PyPI-vs-release version skew.
     if ($InstallFromSource) {
-        Write-Inf "Building from source: biopb-mcp HEAD of $McpRepoUrl;"
-        Write-Inf "  biopb + biopb-tensor-server HEAD of $BiopbRepoUrl"
-        $mcpReq    = "biopb-mcp[mcp] @ $McpRepo"
+        Write-Inf "Building from source: biopb-mcp + biopb + biopb-tensor-server"
+        Write-Inf "  from HEAD of $BiopbRepoUrl (monorepo subdirectories)"
+        $mcpReq    = "biopb-mcp[mcp] @ $McpRepo#subdirectory=biopb-mcp"
         $biopbReq  = "biopb[tensor] @ $BiopbRepo"
         $tensorReq = "biopb-tensor-server[$tensorExtras] @ $BiopbRepo#subdirectory=biopb-tensor-server"
     } else {
-        try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null }
+        try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null }
         if (-not $release) {
             Write-Err2 "Could not fetch the latest biopb-mcp release from $ReleaseRepo."
             Write-Inf "Check your network, or build from source by setting:"
@@ -761,7 +771,7 @@ function Install-Biopb {
 
         # Reuse the release metadata already fetched for the wheels; in source
         # mode this is the first (and only) fetch.
-        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo } catch { $release = $null } }
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null } }
         $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
