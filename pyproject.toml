@@ -25,9 +25,10 @@ dependencies = [
     "opencv-python-headless==4.10.0.84",
     # biopb-mcp is the optional dependency behind the `biopb mcp ...` daemon
     # commands; installed here so the gated subcommands' "available" path is
-    # exercised in the test environment. The base package is enough (the heavy
-    # `[mcp]` napari/pyqt stack is only needed to actually run the server, which
-    # the CLI launches in a child process, not in-test).
+    # exercised in the test environment. Resolves to the in-tree workspace
+    # member (see [tool.uv.sources]), not PyPI. The base package is enough (the
+    # heavy `[mcp]` napari/pyqt stack is only needed to actually run the server,
+    # which the CLI launches in a child process, not in-test).
     "biopb-mcp",
   ]
   tensor = [
@@ -66,3 +67,20 @@ tag_regex = "^v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+)$"
 
 [tool.setuptools_scm.scm.git]
 describe_command = "git describe --tags --match 'v*'"
+
+# ---------------------------------------------------------------------------
+# uv workspace. The monorepo's Python packages resolve each other from the tree
+# instead of PyPI/GitHub-release wheels. This is what lets biopb-mcp depend on
+# `biopb[tensor]` and `biopb-tensor-server[web]` by plain name (the latter is
+# never on PyPI) and stay automatically version-paired with this checkout —
+# replacing the old cross-repo direct-URL wheel pinning. [tool.uv] is ignored
+# by pip/setuptools, so the legacy `pip install -e` flow into the shared root
+# .venv keeps working; `uv sync` is the canonical setup.
+[tool.uv.workspace]
+members = ["biopb-image-runtime", "biopb-tensor-server", "biopb-mcp"]
+
+[tool.uv.sources]
+biopb = { workspace = true }
+biopb-image-base = { workspace = true }
+biopb-tensor-server = { workspace = true }
+biopb-mcp = { workspace = true }
