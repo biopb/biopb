@@ -80,7 +80,9 @@ mcp-ci — it is the unified `release.yaml` on `release-v*` tags. The cross-plat
 PyInstaller "frozen app" bundles are disabled (everything installs via uv); the
 spec/hooks (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
 
-### Installer (`biopb-mcp/install/install.sh`, `install.ps1`)
+### Installer (`install/install.sh`, `install.ps1`)
+Originally staged under `biopb-mcp/install/`; promoted to the repo-root `install/`
+after the first `release-v*` (the transitional copy was removed).
 - `RELEASE_REPO` → `biopb/biopb`; release fetch filters to the deployment line
   (`release-v*`, clean `X.Y.Z` only, so prereleases are skipped).
 - Source-mode builds `biopb-mcp` from the monorepo with `#subdirectory=biopb-mcp`.

@@ -81,13 +81,10 @@ via `biopb.org`) from the **latest `release-v*` GitHub release** of `biopb/biopb
 the `file://` install are unchanged.
 
 **Canonical location: the repo-root `install/`** — this is the copy users track.
-
-**Transition (in progress).** The new full-stack installer design currently lives
-in `biopb-mcp/install/` (it replaces the old root installer — see
-`biopb-mcp/docs/installer-migration.md`). Once this release model is settled and
-the **first `release-v*` is cut**, the new design is promoted into the root
-`install/`, `biopb-mcp/install/` is removed, and the root `install/` is the single
-copy. Until then both exist; the root one is the destination of record.
+The full-stack installer design (formerly staged in `biopb-mcp/install/`) was
+promoted into the root `install/` after the first `release-v*`; the transitional
+`biopb-mcp/install/` copy has been removed, so the root `install/` is now the
+single source of truth.
 
 ## Per-tag workflow summary
 
@@ -104,8 +101,8 @@ not publish** — publishing is consolidated in `release.yaml`. The old
 
 ## Open items
 
-- **Installer promotion (post-first-release):** move `biopb-mcp/install/` → root
-  `install/` (the new design replaces the old root copy), delete
-  `biopb-mcp/install/`, and confirm `biopb.org/install.sh` serves the root copy.
+- Confirm `biopb.org/install.sh` serves the repo-root `install/install.sh` (the
+  installer was promoted to root post-first-release; the host-side copy/redirect
+  should point at it).
 - Prerelease test tags (`release-v…a`, etc.) publish harmlessly; the installer
   skips them.

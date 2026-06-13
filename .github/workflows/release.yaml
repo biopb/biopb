@@ -170,9 +170,8 @@ jobs:
 
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
-      # uploaded. Installer scripts come from biopb-mcp/install/ for now; they
-      # move to the repo-root install/ after the first release (see
-      # docs/release-model.md).
+      # uploaded. Installer scripts come from the repo-root install/ (the
+      # canonical copy users track — see docs/release-model.md).
       - name: Create GitHub release
         if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2
@@ -183,8 +182,8 @@ jobs:
           files: |
             release-wheels/*.whl
             release-wheels/*.tar.gz
-            biopb-mcp/install/install.sh
-            biopb-mcp/install/install.ps1
+            install/install.sh
+            install/install.ps1
           body: |
             ## biopb deployment ${{ github.ref_name }}
 
