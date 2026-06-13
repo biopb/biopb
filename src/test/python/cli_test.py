@@ -7,11 +7,14 @@ requiring a live server.
 from typing import Dict
 from unittest.mock import MagicMock, patch
 import json
+import os
+import tempfile
 
+import numpy as np
 import pytest
 from typer.testing import CliRunner
 
-from biopb.tensor.cli import app, _parse_array_id, _parse_slice_hint
+from biopb.tensor.cli import app, _parse_slice_hint
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 
@@ -314,27 +317,44 @@ class TestParseSliceHint:
         assert result == (slice(10, 20),)
 
 
-class TestParseArrayId:
-    """Tests for _parse_array_id helper function."""
+class TestArrayIdFirstAddressing:
+    """The CLI must address tensors by array_id alone (identity policy), not the
+    deprecated ``(source_id, tensor_id)`` pair. See biopb/biopb#75."""
 
-    def test_parse_with_tensor_id(self):
-        """Test parsing array_id with explicit tensor_id."""
-        source_id, tensor_id = _parse_array_id("my-source/pos_0")
-        assert source_id == "my-source"
-        assert tensor_id == "pos_0"
+    def test_get_passes_array_id_as_single_argument(self):
+        """`get` forwards the raw array_id positionally to get_tensor."""
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_client = _build_mock_client()
+            # The pickle output path serializes the returned array, so hand back
+            # a real (picklable) array instead of the MagicMock default.
+            mock_client.get_tensor.return_value = np.zeros((4, 4), dtype="uint8")
+            mock_fc_class.return_value = mock_client
 
-    def test_parse_without_tensor_id(self):
-        """Test parsing array_id without tensor_id."""
-        source_id, tensor_id = _parse_array_id("my-source")
-        assert source_id == "my-source"
-        assert tensor_id is None
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out.pkl")
+                result = runner.invoke(app, ["get", "my-source/pos_0", "-o", out])
 
-    def test_parse_with_nested_path(self):
-        """Test parsing array_id with tensor_id containing slashes."""
-        # Only first slash is used as delimiter
-        source_id, tensor_id = _parse_array_id("my-source/sub/path")
-        assert source_id == "my-source"
-        assert tensor_id == "sub/path"
+            assert result.exit_code == 0, result.stderr
+            call_args = mock_client.get_tensor.call_args
+            # array_id passed as the single first positional argument; no
+            # deprecated source_id=/tensor_id= keywords.
+            assert call_args.args[0] == "my-source/pos_0"
+            assert "source_id" not in call_args.kwargs
+            assert "tensor_id" not in call_args.kwargs
+
+    def test_stats_passes_array_id_as_single_argument(self):
+        """`stats` forwards the raw array_id positionally to get_tensor."""
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_client = _build_mock_client()
+            mock_fc_class.return_value = mock_client
+
+            result = runner.invoke(app, ["stats", "my-source/pos_0"])
+
+            assert result.exit_code == 0, result.stderr
+            call_args = mock_client.get_tensor.call_args
+            assert call_args.args[0] == "my-source/pos_0"
+            assert "source_id" not in call_args.kwargs
+            assert "tensor_id" not in call_args.kwargs
 
 
 class TestCliIntegration:

@@ -253,6 +253,25 @@ def _tensor_matches(td_array_id: str, req_tensor_id: str, source_id: str) -> boo
     return field(td_array_id) == field(req_tensor_id)
 
 
+def _request_array_id(source_id: str, tensor_id: Optional[str]) -> str:
+    """Build the globally-unique array_id (identity policy) from a request's
+    separate ``(source_id, tensor_id)`` fields.
+
+    A tensor is addressed by its array_id ALONE -- ``source_id`` for a
+    single-tensor source or ``source_id/field`` for a multi-tensor one (see the
+    policy at the top of ``proto/biopb/tensor/descriptor.proto``). The TS client
+    sends the array_id verbatim in ``tensor_id``; a browser/HTTP caller may
+    tolerantly send a bare within-source ``field`` (or nothing). Normalize all
+    three to the qualified array_id so the read goes through the array_id-first
+    SDK path without the deprecated ``(source_id, tensor_id)`` addressing.
+    """
+    if not tensor_id or tensor_id == source_id:
+        return source_id
+    if tensor_id.startswith(f"{source_id}/"):
+        return tensor_id
+    return f"{source_id}/{tensor_id}"
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
@@ -695,8 +714,7 @@ def create_app(
         # Pass slice_hint to gRPC for optimized slicing (in world coordinates)
         # slice_hint is applied BEFORE scaling, so coordinates are in original tensor units
         arr_lazy = client.get_tensor(
-            source_id=req.source_id,
-            tensor_id=req.tensor_id,
+            _request_array_id(req.source_id, req.tensor_id),
             slice_hint=slice_hint,
             scale_hint=scale_hint,
             reduction_method=reduction_method,
@@ -758,8 +776,7 @@ def create_app(
             # Pass slice_hint to gRPC for optimized slicing (in world coordinates)
             # slice_hint is applied BEFORE scaling, so coordinates are in original tensor units
             arr_lazy = client.get_tensor(
-                source_id=req.source_id,
-                tensor_id=req.tensor_id,
+                _request_array_id(req.source_id, req.tensor_id),
                 slice_hint=slice_hint,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,
@@ -868,8 +885,7 @@ def create_app(
             reduction_method = req.reduction_method or None
 
             arr_lazy = client.get_tensor(
-                source_id=req.source_id,
-                tensor_id=req.tensor_id,
+                _request_array_id(req.source_id, req.tensor_id),
                 slice_hint=slice_hint,
                 scale_hint=scale_hint,
                 reduction_method=reduction_method,

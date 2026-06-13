@@ -87,23 +87,6 @@ def _parse_slice_hint(slice_hint: Optional[str]) -> Optional[Tuple[slice, ...]]:
         raise typer.BadParameter(f"Invalid slice format: {e}")
 
 
-def _parse_array_id(array_id: str) -> Tuple[str, Optional[str]]:
-    """Parse array_id into source_id and optional tensor_id.
-
-    Format: "source_id[/tensor_id]"
-    Examples:
-        "my-source" -> ("my-source", None)
-        "my-source/pos_0" -> ("my-source", "pos_0")
-
-    Returns:
-        Tuple of (source_id, tensor_id)
-    """
-    if "/" in array_id:
-        source_id, tensor_id = array_id.split("/", 1)
-        return source_id, tensor_id
-    return array_id, None
-
-
 def _infer_format(output: str, format: Optional[str]) -> Literal["pickle", "zarr", "pb"]:
     """Infer output format from filename or explicit format option.
 
@@ -365,7 +348,6 @@ def get(
     start_time = time.time()
     client = _create_flight_client(server, cache_bytes, token)
     try:
-        source_id, tensor_id = _parse_array_id(array_id)
         selection = _parse_slice_hint(slice_hint)
         fmt = _infer_format(output, format)
 
@@ -376,7 +358,7 @@ def get(
 
         if fmt == "pb":
             # Protobuf format: lazy SerializedTensor
-            serialized = client.get_tensor_pb(source_id, tensor_id, slice_hint=selection)
+            serialized = client.get_tensor_pb(array_id, slice_hint=selection)
             pb_bytes = serialized.SerializeToString()
 
             if output == "-":
@@ -398,7 +380,7 @@ def get(
                     f"zarr output requires the 'zarr' package (install biopb[tensor]): {exc}"
                 )
 
-            arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+            arr = client.get_tensor(array_id, slice_hint=selection)
             result = arr.compute()
 
             if output == "-":
@@ -409,7 +391,7 @@ def get(
 
         else:
             # Pickle format: lazy dask array (no compute)
-            arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+            arr = client.get_tensor(array_id, slice_hint=selection)
 
             if output == "-":
                 pickle.dump(arr, sys.stdout.buffer)
@@ -476,7 +458,6 @@ def stats(
     start_time = time.time()
     client = _create_flight_client(server, cache_bytes, token)
     try:
-        source_id, tensor_id = _parse_array_id(array_id)
         selection = _parse_slice_hint(slice_hint)
 
         stderr_console.print(
@@ -484,7 +465,7 @@ def stats(
             + (f" (region: {slice_hint})" if slice_hint else "")
         )
 
-        arr = client.get_tensor(source_id, tensor_id, slice_hint=selection)
+        arr = client.get_tensor(array_id, slice_hint=selection)
 
         # Compute all statistics in a single graph execution
         min_val, max_val, mean_val = dask.compute(arr.min(), arr.max(), arr.mean())

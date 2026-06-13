@@ -206,7 +206,6 @@ def _prime_sources(location: str, assignments: List[Dict]) -> None:
         try:
             arr = client.get_tensor(
                 spec["id"],
-                spec["expected_tensors"][0],
                 slice_hint=READ_WINDOW,
             )
             arr.compute()
@@ -293,7 +292,6 @@ def _create_prewarmed_arrays(clients, assignments: List[Dict]) -> List:
     for client, spec in zip(clients, assignments):
         arr = client.get_tensor(
             spec["id"],
-            spec["expected_tensors"][0],
             slice_hint=READ_WINDOW,
         )
         arrays.append(arr)

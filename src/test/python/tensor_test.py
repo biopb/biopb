@@ -689,11 +689,12 @@ class TestGetPhysicalScale:
     @staticmethod
     def _client():
         # Build without __init__ (no connection); the method only touches the
-        # in-memory caches and (in the fallback) get_source, which we stub.
+        # in-memory descriptor cache and (on a miss) _fetch_tensor_descriptor,
+        # which we stub.
         client = TensorFlightClient.__new__(TensorFlightClient)
         client._descriptors = {}
         client._sources = {}
-        client.get_source = Mock()
+        client._fetch_tensor_descriptor = Mock()
         return client
 
     @staticmethod
@@ -715,10 +716,11 @@ class TestGetPhysicalScale:
         )
         client._descriptors[client._descriptor_key("src", "t1")] = desc
 
-        scale, unit = client.get_physical_scale("src", "t1")
+        # Addressed by the qualified array_id; cache hit -> no fetch.
+        scale, unit = client.get_physical_scale("src/t1")
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["micrometer", "micrometer", "micrometer"]
-        client.get_source.assert_not_called()
+        client._fetch_tensor_descriptor.assert_not_called()
 
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
@@ -726,23 +728,34 @@ class TestGetPhysicalScale:
         desc, _ = self._desc("t1")  # no physical_scale set
         client._descriptors[client._descriptor_key("src", "t1")] = desc
 
-        assert client.get_physical_scale("src", "t1") is None
+        assert client.get_physical_scale("src/t1") is None
 
-    def test_falls_back_to_source_cache(self):
-        # Not in the descriptor cache: get_source is consulted (stubbed here),
-        # then the source's first tensor descriptor supplies the summary.
+    def test_fetches_descriptor_when_not_cached(self):
+        # Not in the descriptor cache: a GetFlightInfo fetch (stubbed here via
+        # _fetch_tensor_descriptor) supplies the summary. A bare source id
+        # resolves the source's default tensor. No get_source / _sources fallback
+        # (removed with the array_id-keyed accessor, #75).
         client = self._client()
-        desc, DataSourceDescriptor = self._desc(
+        desc, _ = self._desc(
             "t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"]
         )
-        client._sources["src"] = DataSourceDescriptor(
-            source_id="src", tensors=[desc]
-        )
+        client._fetch_tensor_descriptor.return_value = desc
 
-        scale, unit = client.get_physical_scale("src")  # tensor_id defaults
+        scale, unit = client.get_physical_scale("src")  # bare source id -> default
         assert scale == [1.0, 0.5, 0.5]
         assert unit == ["", "micrometer", "micrometer"]
-        client.get_source.assert_called_once_with("src", None)
+        client._fetch_tensor_descriptor.assert_called_once_with("src", None)
+
+    def test_fetch_error_propagates(self):
+        # A real fetch failure (server unreachable, source not found) must NOT be
+        # swallowed into None: that would make it indistinguishable from "no
+        # physical scale recorded". Only a fetched descriptor with an empty
+        # summary yields None (test_none_when_summary_empty).
+        client = self._client()
+        client._fetch_tensor_descriptor.side_effect = ConnectionError("unreachable")
+
+        with pytest.raises(ConnectionError):
+            client.get_physical_scale("src")
 
 
 if __name__ == '__main__':

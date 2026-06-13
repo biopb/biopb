@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from biopb_tensor_server.http_server import create_app
+from biopb_tensor_server.http_server import create_app, _request_array_id
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -577,6 +577,44 @@ class TestRedact:
         if last_msg:
             assert "/home/user/secret/data.zarr" not in last_msg
             assert "[REDACTED]" in last_msg
+
+
+class TestRequestArrayId:
+    """The sidecar must address tensors by array_id alone (identity policy), not
+    the deprecated ``(source_id, tensor_id)`` pair. See biopb/biopb#75."""
+
+    def test_qualified_array_id_passthrough(self):
+        # TS client sends descriptor.array_id verbatim in tensor_id.
+        assert _request_array_id("src", "src/fieldA") == "src/fieldA"
+
+    def test_bare_field_is_qualified(self):
+        # A browser/HTTP caller may send only the within-source field.
+        assert _request_array_id("src", "fieldA") == "src/fieldA"
+
+    def test_single_tensor_collapses_to_source_id(self):
+        # Single-tensor source: array_id == source_id (no sentinel field).
+        assert _request_array_id("src", "src") == "src"
+        assert _request_array_id("src", "") == "src"
+        assert _request_array_id("src", None) == "src"
+
+    def test_slice_endpoint_uses_array_id_first_form(self, auth_client):
+        """The slice endpoint passes array_id positionally, never the deprecated
+        source_id=/tensor_id= keywords."""
+        tc, mock_fc = auth_client
+        lazy = MagicMock()
+        lazy.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
+        mock_fc.get_tensor.return_value = lazy
+
+        r = tc.post(
+            "/api/slice",
+            json={"source_id": "src", "tensor_id": "src/fieldA"},
+            headers=_bearer(_TOKEN),
+        )
+        assert r.status_code == 200
+        call = mock_fc.get_tensor.call_args
+        assert call.args[0] == "src/fieldA"
+        assert "source_id" not in call.kwargs
+        assert "tensor_id" not in call.kwargs
 
 
 # ===========================================================================

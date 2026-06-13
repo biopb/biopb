@@ -59,7 +59,7 @@ def _capture_chunk_ids(location, shape):
     cmod._fetch_chunk_distributed = spy
     try:
         client = TensorFlightClient(location, cache_bytes=0)
-        client.get_tensor("d", "d").compute(scheduler="threads")
+        client.get_tensor("d").compute(scheduler="threads")
         client.close()
     finally:
         cmod._fetch_chunk_distributed = orig

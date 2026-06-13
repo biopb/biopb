@@ -74,7 +74,7 @@ def _bench(location, disable_cachefile, shape, trials=4):
         os.environ.pop("BIOPB_CACHEFILE_TRANSFER_DISABLED", None)
 
     cmod, client = _fresh_client(location)
-    darr = client.get_tensor("gt", "gt")
+    darr = client.get_tensor("gt")
     Z = shape[0]
     chunk_starts = list(range(0, Z, CHUNK_Z))
     mb = (CHUNK_Z * shape[1] * shape[2] * 2) / 1e6
