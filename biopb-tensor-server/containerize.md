@@ -112,7 +112,7 @@ docker run \
 ### Examples
 
 ```bash
-# Custom base port (HTTP=9004, gRPC=9005, etc.)
+# Custom base port (HTTP=9004, gRPC=9005)
 docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
     -e BIOPB_BASE_PORT=9000 \
     -e BIOPB_TENSOR_TOKEN=mytoken \
@@ -180,7 +180,7 @@ singularity run \
 ### Examples
 
 ```bash
-# Custom base port → HTTP=9004, gRPC=9005, Sidecar=9006, Flight=9007
+# Custom base port → HTTP=9004, gRPC=9005
 singularity run \
     --env DATA_DIR=$HOME/data \
     --env BIOPB_BASE_PORT=9000 \
