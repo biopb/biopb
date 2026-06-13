@@ -72,35 +72,27 @@ so the legacy `pip install -e` flow into the shared root `.venv` still works;
 The imported `biopb-mcp/.github/*` were inert (GitHub only runs root workflows).
 Replaced with:
 - **`mcp-ci.yaml`** — uv-based test matrix (path-filtered to `biopb-mcp/**` +
-  shared proto/server), PyPI publish on `mcp-v*`, then triggers the release.
-- **`mcp-release.yaml`** — builds all three wheels + the webapp from the tagged
-  tree and assembles one GitHub release. Installation is **uv-based**: the
-  bootstrap installer pulls these wheels and runs them under uv.
-  - The cross-platform **PyInstaller "frozen app" bundles are disabled for now**
-    (everything installs via uv). The spec/hooks
-    (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree; re-enable
-    by restoring the per-platform `build` job from git history.
+  shared proto/server) and PyPI publish on `mcp-v*`.
+
+PyPI publishing for biopb-mcp stays on its own `mcp-v*` tag. Product deployment
+(the GitHub release + Docker that the installer/operators consume) is **not** in
+mcp-ci — it is the unified `release.yaml` on `release-v*` tags. The cross-platform
+PyInstaller "frozen app" bundles are disabled (everything installs via uv); the
+spec/hooks (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
 
 ### Installer (`biopb-mcp/install/install.sh`, `install.ps1`)
-- `RELEASE_REPO` → `biopb/biopb`.
-- Release fetch now **filters by the `mcp-v` tag prefix** — the monorepo's
-  `/releases/latest` is repo-wide across `mcp-v*`/`server-v*`, so it lists
-  releases and takes the newest matching the prefix.
-- Source-mode builds `biopb-mcp` from the monorepo with
-  `#subdirectory=biopb-mcp`.
+- `RELEASE_REPO` → `biopb/biopb`; release fetch filters to the deployment line
+  (`release-v*`, clean `X.Y.Z` only, so prereleases are skipped).
+- Source-mode builds `biopb-mcp` from the monorepo with `#subdirectory=biopb-mcp`.
 
-## Toward a unified release (future work)
+## Unified release
 
-The interim keeps `mcp-v*` and `server-v*` separate. The planned end state is a
-single `unified-release.yaml` triggered by one tag (e.g. `release-vX.Y.Z`) that:
-- builds the client, tensor-server, and mcp wheels + the webapp once,
-- builds the PyInstaller bundles,
-- and publishes **one** GitHub release that is the single source of truth for the
-  installer and auto-updater.
-
-At that point `mcp-release.yaml` and `tensor-server-ci.yaml`'s publish job (and
-the `mcp-v*`/`server-v*` tag lines) are retired. The installer's
-`RELEASE_TAG_PREFIX` becomes the unified prefix.
+The interim per-component releases (`mcp-release.yaml`, `tensor-server-ci`'s
+publish job) have been **superseded** by a single `release.yaml` on `release-v*`
+tags — see **`docs/release-model.md`** (repo root) for the full model: PyPI stays
+per-package (`v*`/`mcp-v*`); `release-v*` produces the GitHub release (wheel
+triple + webapp + installers) and the Docker images (tensor-server, image-base),
+with no PyPI.
 
 ## Needs live-CI validation (cannot be checked from a local checkout)
 

@@ -537,7 +537,10 @@ _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
     # The monorepo hosts several release lines, so /releases/latest is NOT
     # component-specific. List releases (date-desc) and take the newest whose
-    # tag matches RELEASE_TAG_PREFIX, then fetch that release by tag.
+    # tag matches the deployment line, then fetch that release by tag. The match
+    # requires a CLEAN version (release-vX.Y.Z) so prerelease tags
+    # (release-v…a/b/rc — used for test releases) are skipped and never become
+    # the default download.
     local _releases
     _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
@@ -548,7 +551,7 @@ _fetch_latest_release() {
     RELEASE_TAG=$(printf '%s' "$_releases" \
         | grep '"tag_name"' \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-        | grep -E "^${RELEASE_TAG_PREFIX:-}" | head -1) || true
+        | grep -E "^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$" | head -1) || true
     [ -n "${RELEASE_TAG:-}" ] || return 1
     RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
@@ -667,10 +670,12 @@ install_biopb() {
     MCP_REPO="$BIOPB_REPO"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
-    # The monorepo hosts multiple release lines (mcp-v*, server-v*); the bundle
-    # the installer wants is the mcp-v* one, so the release fetch filters by
-    # this prefix instead of using /releases/latest (which is repo-wide).
-    RELEASE_TAG_PREFIX="mcp-v"
+    # The monorepo hosts multiple release lines (release-v*, v*, mcp-v*,
+    # server-v*). The all-in-one deployment the installer wants is the
+    # release-v* one (see docs/release-model.md), so the release fetch filters
+    # by this prefix (and requires a clean X.Y.Z, skipping prereleases) instead
+    # of using /releases/latest (which is repo-wide).
+    RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
 
@@ -886,7 +891,7 @@ install_biopb() {
         tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $BIOPB_REPO#subdirectory=biopb-tensor-server"
     else
         if ! _fetch_latest_release; then
-            _err "Could not fetch the latest biopb-mcp release from $RELEASE_REPO."
+            _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
             _info "Check your network, or build from source instead:"
             _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
             exit 1

@@ -1,15 +1,14 @@
-name: Tensor Server CI/CD
+name: Tensor Server CI
 
+# Test/build only. Publishing (GitHub release + Docker) moved to the unified
+# release.yaml on `release-v*` tags — see docs/release-model.md. `server-v*` is
+# now just a version-marker tag; a push of it runs these CI checks.
 on:
   push:
     branches:
       - main
     tags:
       - 'server-v*'
-    # No paths filter on push: a server-v* tag must always trigger the release
-    # regardless of which files the tagged commit changed. (A paths filter under
-    # push applies to tag pushes too, which would silently skip releases.)
-    # Path-based throttling lives on pull_request below — the high-volume path.
   pull_request:
     branches:
       - main
@@ -100,9 +99,9 @@ jobs:
       - name: Run Python tests
         run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
 
-  # CI build: assemble all release artifacts and verify the Docker image
-  # compiles. Runs on every trigger (PR, main, tag, manual dispatch) but NEVER
-  # pushes — publishing is the publish job below. workflow_dispatch is a dry run.
+  # CI build: verify the webapp + wheels + Docker image compile. Never pushes —
+  # the actual publish is release.yaml on `release-v*`. The uploaded artifacts
+  # are a convenience for inspecting a run, not a release input.
   build:
     needs: [js-test, test]
     runs-on: ubuntu-latest
@@ -177,80 +176,3 @@ jobs:
             webapp.tar.gz
             wheels/biopb*.whl
           retention-days: 1
-
-  # CD publish: ONLY on a server-v* tag push. Creates the GitHub release and
-  # pushes the Docker image (incl. :latest). Never runs on PRs or dispatch, so
-  # a dry-run build can never touch the registries or create a release.
-  publish:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/server-v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # create the GitHub release
-      packages: write   # push to ghcr.io
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#server-v}" >> $GITHUB_OUTPUT
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: release-artifacts
-
-      # The Docker build (below) COPYs biopb-tensor-server/packages/web/dist and
-      # wheels/ from the build context. The publish job never builds the webapp,
-      # so restore dist/ from the tarball produced by the build job. (wheels/ is
-      # already in place from the downloaded artifact.)
-      - name: Restore webapp build output
-        run: tar -xzf webapp.tar.gz -C biopb-tensor-server/packages/web
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Tensor Server ${{ steps.version.outputs.VERSION }}
-          fail_on_unmatched_files: true  # a typo'd asset path should fail, not silently drop
-          files: |
-            webapp.tar.gz
-            wheels/biopb*.whl
-            install/install.sh
-          body: |
-            ## biopb-tensor-server ${{ steps.version.outputs.VERSION }}
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: jiyuuchc
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: biopb-tensor-server/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.version.outputs.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:latest
-            docker.io/jiyuuchc/biopb-tensor-server:${{ steps.version.outputs.VERSION }}
-            docker.io/jiyuuchc/biopb-tensor-server:latest
-          build-args: |
-            MEMORY=4g
-          cache-from: type=gha

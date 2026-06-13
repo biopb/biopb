@@ -398,16 +398,18 @@ function Invoke-Preflight {
 
 # Fetch the latest GitHub release metadata (a parsed object with .tag_name and
 # .assets[].name / .browser_download_url) for a given tag prefix. The monorepo
-# hosts several release lines (mcp-v*, server-v*), so /releases/latest is NOT
-# component-specific; list releases (date-desc) and take the newest whose tag
-# matches $TagPrefix. Throws on network/HTTP error; callers catch and fall back.
+# hosts several release lines (release-v*, v*, mcp-v*, server-v*), so
+# /releases/latest is NOT component-specific; list releases (date-desc) and take
+# the newest whose tag is a CLEAN $TagPrefix + X.Y.Z (prerelease tags like
+# release-v…a/b/rc are skipped). Throws on network/HTTP error; callers catch.
 function Get-LatestRelease {
     param([string]$Repo, [string]$TagPrefix = "")
     $headers = @{ "User-Agent" = "biopb-installer" }
     $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
         -Headers $headers
-    $match = $releases | Where-Object { $_.tag_name -like "$TagPrefix*" } | Select-Object -First 1
-    if (-not $match) { throw "No release matching prefix '$TagPrefix' in $Repo" }
+    $rx = "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
+    $match = $releases | Where-Object { $_.tag_name -match $rx } | Select-Object -First 1
+    if (-not $match) { throw "No clean release matching '$TagPrefix' X.Y.Z in $Repo" }
     return $match
 }
 
@@ -503,8 +505,8 @@ function Start-DataServer {
 
 function Install-Biopb {
     # Release mode pulls all three wheels (+ webapp) from ONE biopb release
-    # (the mcp-v* line). Source mode builds from git: all three packages now
-    # live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # (the release-v* deployment line). Source mode builds from git: all three
+    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
     # subdirectories), so there is a single repo.
     $BiopbRepoUrl = "https://github.com/biopb/biopb"
     $BiopbRepo    = "git+$BiopbRepoUrl"
@@ -512,9 +514,10 @@ function Install-Biopb {
     $McpRepo      = $BiopbRepo
     $RepoUrl      = $BiopbRepoUrl             # webapp release-asset fallback URL
     $ReleaseRepo  = "biopb/biopb"             # owner/name for the GitHub Releases API
-    # The monorepo hosts multiple release lines; the bundle the installer wants
-    # is the mcp-v* one, so the release fetch filters by this prefix.
-    $ReleaseTagPrefix = "mcp-v"
+    # The monorepo hosts multiple release lines; the all-in-one deployment the
+    # installer wants is the release-v* one, so the release fetch filters by this
+    # prefix and requires a clean X.Y.Z (skipping prerelease tags).
+    $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
     $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
     $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
@@ -683,7 +686,7 @@ function Install-Biopb {
     } else {
         try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null }
         if (-not $release) {
-            Write-Err2 "Could not fetch the latest biopb-mcp release from $ReleaseRepo."
+            Write-Err2 "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo."
             Write-Inf "Check your network, or build from source by setting:"
             Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
             throw "release fetch failed"
