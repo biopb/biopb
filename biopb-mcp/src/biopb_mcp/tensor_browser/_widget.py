@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 from qtpy.QtCore import Qt, QTimer, Signal
+from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -84,6 +85,29 @@ def _tensor_short_name(array_id: str) -> str:
     """Get short name for tensor from its array_id."""
     parts = [p for p in array_id.split("/") if p]
     return parts[-1] if parts else array_id
+
+
+# Leading glyph and tooltip for the per-source residency indicator. A cloud
+# marks a source whose content is not local; resident sources stay unadorned.
+_RESIDENCY_GLYPH = "☁"
+_REMOTE_TOOLTIP = (
+    "Not resident — content is remote or not yet local; "
+    "reading it may be slow or block until it is hydrated"
+)
+_RESIDENT_TOOLTIP = "Resident — content is local and cheap to read"
+
+
+def _residency_state(src: DataSourceDescriptor) -> str | None:
+    """Residency of a source's content, or ``None`` when the server didn't report it.
+
+    Returns ``"resident"`` (content local, cheap to read), ``"remote"`` (not
+    local -- remote or dehydrated, slow or blocking to read), or ``None`` when
+    ``data_resident`` is unset (a server predating the field; residency unknown,
+    so the UI shows no indicator rather than guessing).
+    """
+    if not src.HasField("data_resident"):
+        return None
+    return "resident" if src.data_resident else "remote"
 
 
 def _build_tree(sources: Dict[str, DataSourceDescriptor]) -> _TreeNode:
@@ -289,6 +313,19 @@ class MetadataDialog(QDialog):
             dtype_label = QLabel(tensor_desc.dtype)
             dtype_label.setStyleSheet("color: #fbbf24;")
             header_layout.addWidget(dtype_label)
+
+        # Source-level residency badge (omitted when the server didn't report it)
+        residency = _residency_state(source)
+        if residency == "remote":
+            res_label = QLabel(f"{_RESIDENCY_GLYPH} remote")
+            res_label.setStyleSheet("color: #888;")
+            res_label.setToolTip(_REMOTE_TOOLTIP)
+            header_layout.addWidget(res_label)
+        elif residency == "resident":
+            res_label = QLabel("● local")
+            res_label.setStyleSheet("color: #34d399;")
+            res_label.setToolTip(_RESIDENT_TOOLTIP)
+            header_layout.addWidget(res_label)
 
         header_layout.addStretch()
         layout.addLayout(header_layout)
@@ -742,6 +779,19 @@ class TensorBrowserWidget(QWidget):
             elif len(src.tensors) > 1:
                 # Show tensor count
                 display_name = f"{node.name}  [{len(src.tensors)} tensors]"
+
+            # Residency indicator: flag non-resident (remote/dehydrated) sources
+            # with a leading cloud glyph and greyed text; resident sources stay
+            # plain. Both known states get an explanatory tooltip; an unknown
+            # state (old server) is left unmarked.
+            residency = _residency_state(src)
+            if residency == "remote":
+                display_name = f"{_RESIDENCY_GLYPH} {display_name}"
+                item.setForeground(0, QColor("#888"))
+                item.setToolTip(0, _REMOTE_TOOLTIP)
+            elif residency == "resident":
+                item.setToolTip(0, _RESIDENT_TOOLTIP)
+
             item.setText(0, display_name)
 
             # Add nested tensor items for multi-tensor sources

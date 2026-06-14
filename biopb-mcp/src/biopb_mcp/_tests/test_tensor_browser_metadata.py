@@ -6,9 +6,12 @@ needed beyond importing the module), so this suite runs on every platform —
 unlike the viewer-dependent ``test_tensor_browser_widget.py``.
 """
 
+from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
 from biopb_mcp.tensor_browser._widget import (
     _filter_empty_metadata,
     _is_empty_for_display,
+    _residency_state,
 )
 
 
@@ -71,3 +74,23 @@ class TestFilterEmptyMetadata:
             "zero": 0,
             "nested": {"inner": "value"},
         }
+
+
+class TestResidencyState:
+    """Tri-state residency indicator: resident / remote / unknown (unset)."""
+
+    def test_unset_is_unknown(self):
+        # Old server (field absent) -> None, so the UI shows no indicator.
+        src = DataSourceDescriptor(source_id="s")
+        assert src.HasField("data_resident") is False
+        assert _residency_state(src) is None
+
+    def test_true_is_resident(self):
+        src = DataSourceDescriptor(source_id="s", data_resident=True)
+        assert _residency_state(src) == "resident"
+
+    def test_false_is_remote(self):
+        src = DataSourceDescriptor(source_id="s", data_resident=False)
+        # Explicitly set false (present) -> remote, not unknown.
+        assert src.HasField("data_resident") is True
+        assert _residency_state(src) == "remote"
