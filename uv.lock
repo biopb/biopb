@@ -2,18 +2,22 @@ version = 1
 revision = 3
 requires-python = ">=3.10, <3.13"
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "(python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -321,6 +325,45 @@ wheels = [
 ]
 
 [[package]]
+name = "bermuda"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/50/ef/1ea989c334b59946e289ac580e8508a707fe6386095aaa294423f6563699/bermuda-0.1.7.tar.gz", hash = "sha256:a1a506e1425e099d405cb40f8d176260c594dd9bcc9cb97d24d674b93b660d74", size = 125474, upload-time = "2026-02-14T17:20:27.113Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/af/695e32bc4f94ed66dee91f168af6e0a6d470ed1cc6b44fa294b46e965928/bermuda-0.1.7-cp310-cp310-macosx_10_12_x86_64.whl", hash = "sha256:064e6031ef8800087eb57ea22d39a7ddf613b14b76c68c1ec043d8a8a484c20e", size = 368954, upload-time = "2026-02-14T17:18:51.102Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/f1/8b7a95152ca37717647688991efbe58b2f45c88528f0ef6bf1775de92f19/bermuda-0.1.7-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:b3ddc2e93a94f0bb4b97429ee99339ca34b991074ebdeec6bc5ade940f674b5b", size = 347968, upload-time = "2026-02-14T17:18:52.465Z" },
+    { url = "https://files.pythonhosted.org/packages/48/3e/54163974dc30ce12b4c053766cd80d367ef5a38bc4062d3b83e3a53b0532/bermuda-0.1.7-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:b8818e5dbe7f044c50b7ba72526d88d2871101f07da55aff8b132682a829f509", size = 383807, upload-time = "2026-02-14T17:18:53.705Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/4b/f0c42b39e6cec05fb6b9a496dee75cbc9ac1b2e5161567b108b3f9fabade/bermuda-0.1.7-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:ae9213311c5c5e7d2e4799e01a6b16ff9375526767b6ff539d9231a02953b69b", size = 407437, upload-time = "2026-02-14T17:18:54.937Z" },
+    { url = "https://files.pythonhosted.org/packages/88/36/e3702ced577059cab2f8214ad15f6cb7d93d8251ac8e15584dd562b7e11d/bermuda-0.1.7-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:ee1659dab1e496b6ba5cc0c7114eaa8166e822e07dd51687568fe69a51c0b715", size = 450050, upload-time = "2026-02-14T17:18:56.131Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/78/1cd4f6237eaf4d249605bb776112ef357ac511e1582b042dc62106dd356e/bermuda-0.1.7-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:55f9f420b17476fc37b5dfe731c9071f0a586cd554d3496a224775f8ef9679ad", size = 475500, upload-time = "2026-02-14T17:18:57.406Z" },
+    { url = "https://files.pythonhosted.org/packages/46/e6/25c472244883d8e07a844b19ed25f0bec294d8ef11ad3f0ca20f5c3ff16e/bermuda-0.1.7-cp310-cp310-win_amd64.whl", hash = "sha256:23eb99c92fcb09a5d20e47fdf87b957cf98743ea6485c3b0325eeda0e6ffb33b", size = 246199, upload-time = "2026-02-14T17:18:58.867Z" },
+    { url = "https://files.pythonhosted.org/packages/86/3d/79a8c5ec0d0f0d7d0dcdea904689a9cea7937e665b1ea43e13c2a70c9aa9/bermuda-0.1.7-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:3f29feed52119a132b66bb6deef47dd4d9052b45ace3ba44c66ccc35eb89a069", size = 368881, upload-time = "2026-02-14T17:19:00.201Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/67/8276c279b47e76288ffebaf5b1a69f06454c3a44241ea491165722bb0069/bermuda-0.1.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:f89e31392efddfb81dcfbf02afbdda44782d152be38c585ed90b28fa4ace69de", size = 348191, upload-time = "2026-02-14T17:19:01.443Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/23/5b905c87750cf1c94fcd6e56a1c41e06d73dc5ab7bfe11bb9831bba76f8f/bermuda-0.1.7-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:9189f44e6ffdfbcfd308751b720cfaed34b2b938a67422758fdf74287e48b6ab", size = 383919, upload-time = "2026-02-14T17:19:02.796Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/1a/ddf29519db0654be1533eab821be4134d85171763c215d36755431e29f3f/bermuda-0.1.7-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:c453bf122aef2685daf8562fe7fa620d0ec33f7aef7acd6b84614159798c4d75", size = 407620, upload-time = "2026-02-14T17:19:04.109Z" },
+    { url = "https://files.pythonhosted.org/packages/93/80/a2d5c5ab70182561ffce8a759a635a2c9f5e55b5f2fbebe6f83748f1f37d/bermuda-0.1.7-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:3e3b27808859a2952a19d1ffbb897d19e87dc1d08cbac09455c3d23a4f538fca", size = 450156, upload-time = "2026-02-14T17:19:05.772Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/6d/4695702a5d27c38a4e63311295acd18baca1d0891a6de0a0a145e76b9839/bermuda-0.1.7-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:0818a389ac3f5eab6697b83fd13f065b378dd73a086aed2d81333a50351c6538", size = 475622, upload-time = "2026-02-14T17:19:07.488Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/7f/2f97febfb90e235615dd6d9c86cb01ea774a31ae9238cee42570a2a97231/bermuda-0.1.7-cp311-cp311-win_amd64.whl", hash = "sha256:ef705f5c1d4f57fd826f2754ec147317f52a397122e34c33b8853bff3020c5e7", size = 246493, upload-time = "2026-02-14T17:19:09.113Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/d8/98c3277ff1813e3551ebc6b5196daa9c39d4d8ef427a78884ea8501c7297/bermuda-0.1.7-cp311-cp311-win_arm64.whl", hash = "sha256:71f987008acb4f9f60bc6e69a5fb3d253e683c6d9647b44fcb440363c0ecf5ce", size = 230162, upload-time = "2026-02-14T17:19:10.831Z" },
+    { url = "https://files.pythonhosted.org/packages/be/8f/4d63432358a1fa5bca63c028d459be227a111ad1345004f0d0fc4ca2fcf5/bermuda-0.1.7-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:2c4cd5710c30ab6bbf1243acc34b5994ca7c773b94b2186418cf3706c9ec80ec", size = 365861, upload-time = "2026-02-14T17:19:12.521Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/49/c456562a9bb30cb4cc6e6cf526e6fcce10bb733af490a1a30c068b192177/bermuda-0.1.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:aa2f9853bc8428eae6251bbc31805dde694b40015cd9ba54368d1861d4ca1e18", size = 344772, upload-time = "2026-02-14T17:19:13.864Z" },
+    { url = "https://files.pythonhosted.org/packages/99/23/bb89766549a7a4175fef6b5ba7b5c02ce80b49fba4e18dd41835655d9e26/bermuda-0.1.7-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b20479e480a7d1ad0824eb8235e975df88130455c0ead03b21ef6d4e5dea6416", size = 384343, upload-time = "2026-02-14T17:19:15.172Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/bd/73f124b35e5003dfe7a053e058270857e1d43cf05c0a4a0ca720905e3ee4/bermuda-0.1.7-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:90fe45f4d525bf7229f6b8cecd1e41a3f67cb695a758e1b1f6aaea254dd65532", size = 407635, upload-time = "2026-02-14T17:19:16.376Z" },
+    { url = "https://files.pythonhosted.org/packages/61/88/99376d51af55a819496d2517d9ff76f6815460afabb5ea9c554220b58054/bermuda-0.1.7-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:559abe71ca6fdca38ca07a514362667fcbf777d90b5393cd404ecac4c1cdec97", size = 450313, upload-time = "2026-02-14T17:19:17.65Z" },
+    { url = "https://files.pythonhosted.org/packages/08/ab/3657558a84d528d596a7778b5357bddc4f151eefce554ce6b5e397321375/bermuda-0.1.7-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:efdfdb33b5e183671983ad5209df4ed1d08bfb5249cf94cf0b2148e9ec01c310", size = 475096, upload-time = "2026-02-14T17:19:19.412Z" },
+    { url = "https://files.pythonhosted.org/packages/87/c2/286e485d1d948a6b36bed0a5bbae41115995fafc7520430e51f077d2fb0c/bermuda-0.1.7-cp312-cp312-win_amd64.whl", hash = "sha256:4a557c4de911380a952f6431c0794dd670787c53185d1e3c68a36fe8c497d8ba", size = 246553, upload-time = "2026-02-14T17:19:20.658Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/9f/1d6bfbf58d5a3401108e46d43f36fe37679671dd7a51cd2afe3feaa386e4/bermuda-0.1.7-cp312-cp312-win_arm64.whl", hash = "sha256:b7d6e4ac6abc4a53f3e42e07e4648b2e127ea3388e8980d679a5b96de1d919ee", size = 230107, upload-time = "2026-02-14T17:19:21.914Z" },
+    { url = "https://files.pythonhosted.org/packages/35/38/ee01890c3f8d7e00a7a7d41fb8dfb2a8a522f63ffd86a7055207c2ed5d1f/bermuda-0.1.7-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:add8530f2156508cb41965a1dfab42a90c6e89d501af0527e20b5895e5d081bf", size = 370089, upload-time = "2026-02-14T17:20:20.414Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/87/10ba73924e7d8e734fab13a62faa067383eb5acfdf392ad836ea186f2ba3/bermuda-0.1.7-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:72b999c419c35350da005ba437fb7036d22d7ee62a63899a307392d92de6e65c", size = 349550, upload-time = "2026-02-14T17:20:21.677Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/c1/aacff1334189600ef83ecc2a24ca96aa2c6b657d55bd05f0b3c94e076714/bermuda-0.1.7-pp311-pypy311_pp73-manylinux_2_28_aarch64.whl", hash = "sha256:de0902d970a60d175c22755cf8efad279b823ffea30665e2fc74cd9256f36455", size = 384668, upload-time = "2026-02-14T17:20:23.122Z" },
+    { url = "https://files.pythonhosted.org/packages/01/11/79d2790388bbdfbc7594f8340e3a35f9da92977642e8fa2d57eeb5de1326/bermuda-0.1.7-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:59a836681e84fcb712a77f359862396f069cc72ccc16805a33abf1bd73959385", size = 408064, upload-time = "2026-02-14T17:20:24.304Z" },
+    { url = "https://files.pythonhosted.org/packages/75/d5/dcd84b7641d9524547c13afa7a378722ff45302eda6d41b2eeb2f3154335/bermuda-0.1.7-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:d29bae03d360ab5db7ff18f029371ce5600a06173d56b91c2ea400533dbc0156", size = 247263, upload-time = "2026-02-14T17:20:25.945Z" },
+]
+
+[[package]]
 name = "bioformats-jar"
 version = "2020.5.27"
 source = { registry = "https://pypi.org/simple" }
@@ -447,7 +490,7 @@ mcp = [
     { name = "ipykernel" },
     { name = "jupyter-client" },
     { name = "mcp" },
-    { name = "napari" },
+    { name = "napari", extra = ["all"] },
     { name = "psutil" },
     { name = "pyqt6" },
     { name = "uvicorn" },
@@ -481,7 +524,7 @@ requires-dist = [
     { name = "jupyter-client", marker = "extra == 'mcp'" },
     { name = "magicgui" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20" },
-    { name = "napari", marker = "extra == 'mcp'", specifier = ">=0.7" },
+    { name = "napari", extras = ["all"], marker = "extra == 'mcp'", specifier = "==0.7.0" },
     { name = "napari-skimage-regionprops", marker = "extra == 'tables'" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
@@ -824,8 +867,10 @@ name = "contourpy"
 version = "1.3.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -879,12 +924,14 @@ name = "contourpy"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -1555,8 +1602,10 @@ name = "imagecodecs"
 version = "2025.3.30"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -1592,12 +1641,14 @@ name = "imagecodecs"
 version = "2026.1.14"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -1744,8 +1795,10 @@ name = "ipython"
 version = "8.39.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -1774,12 +1827,14 @@ name = "ipython"
 version = "9.14.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -2057,6 +2112,29 @@ wheels = [
 ]
 
 [[package]]
+name = "llvmlite"
+version = "0.45.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/99/8d/5baf1cef7f9c084fb35a8afbde88074f0d6a727bc63ef764fe0e7543ba40/llvmlite-0.45.1.tar.gz", hash = "sha256:09430bb9d0bb58fc45a45a57c7eae912850bedc095cd0810a57de109c69e1c32", size = 185600, upload-time = "2025-10-01T17:59:52.046Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/6d/585c84ddd9d2a539a3c3487792b3cf3f988e28ec4fa281bf8b0e055e1166/llvmlite-0.45.1-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:1b1af0c910af0978aa55fa4f60bbb3e9f39b41e97c2a6d94d199897be62ba07a", size = 43043523, upload-time = "2025-10-01T18:02:58.621Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/34/992bd12d3ff245e0801bcf6013961daa8c19c9b9c2e61cb4b8bce94566f9/llvmlite-0.45.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:02a164db2d79088bbd6e0d9633b4fe4021d6379d7e4ac7cc85ed5f44b06a30c5", size = 37253122, upload-time = "2025-10-01T18:03:55.159Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/7b/6d7585998a5991fa74dc925aae57913ba8c7c2efff909de9d34cc1cd3c27/llvmlite-0.45.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f2d47f34e4029e6df3395de34cc1c66440a8d72712993a6e6168db228686711b", size = 56288210, upload-time = "2025-10-01T18:00:41.978Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/e2/a4abea058633bfc82eb08fd69ce242c118fdb9b0abad1fdcbe0bc6aedab5/llvmlite-0.45.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f7319e5f9f90720578a7f56fbc805bdfb4bc071b507c7611f170d631c3c0f1e0", size = 55140958, upload-time = "2025-10-01T18:01:55.694Z" },
+    { url = "https://files.pythonhosted.org/packages/74/c0/233468e96ed287b953239c3b24b1d69df47c6ba9262bfdca98eda7e83a04/llvmlite-0.45.1-cp310-cp310-win_amd64.whl", hash = "sha256:4edb62e685867799e336723cb9787ec6598d51d0b1ed9af0f38e692aa757e898", size = 38132232, upload-time = "2025-10-01T18:04:41.538Z" },
+    { url = "https://files.pythonhosted.org/packages/04/ad/9bdc87b2eb34642c1cfe6bcb4f5db64c21f91f26b010f263e7467e7536a3/llvmlite-0.45.1-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:60f92868d5d3af30b4239b50e1717cb4e4e54f6ac1c361a27903b318d0f07f42", size = 43043526, upload-time = "2025-10-01T18:03:15.051Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/ea/c25c6382f452a943b4082da5e8c1665ce29a62884e2ec80608533e8e82d5/llvmlite-0.45.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:98baab513e19beb210f1ef39066288784839a44cd504e24fff5d17f1b3cf0860", size = 37253118, upload-time = "2025-10-01T18:04:06.783Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/af/85fc237de98b181dbbe8647324331238d6c52a3554327ccdc83ced28efba/llvmlite-0.45.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:3adc2355694d6a6fbcc024d59bb756677e7de506037c878022d7b877e7613a36", size = 56288209, upload-time = "2025-10-01T18:01:00.168Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/df/3daf95302ff49beff4230065e3178cd40e71294968e8d55baf4a9e560814/llvmlite-0.45.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2f3377a6db40f563058c9515dedcc8a3e562d8693a106a28f2ddccf2c8fcf6ca", size = 55140958, upload-time = "2025-10-01T18:02:11.199Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/56/4c0d503fe03bac820ecdeb14590cf9a248e120f483bcd5c009f2534f23f0/llvmlite-0.45.1-cp311-cp311-win_amd64.whl", hash = "sha256:f9c272682d91e0d57f2a76c6d9ebdfccc603a01828cdbe3d15273bdca0c3363a", size = 38132232, upload-time = "2025-10-01T18:04:52.181Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/7c/82cbd5c656e8991bcc110c69d05913be2229302a92acb96109e166ae31fb/llvmlite-0.45.1-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:28e763aba92fe9c72296911e040231d486447c01d4f90027c8e893d89d49b20e", size = 43043524, upload-time = "2025-10-01T18:03:30.666Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/bc/5314005bb2c7ee9f33102c6456c18cc81745d7055155d1218f1624463774/llvmlite-0.45.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1a53f4b74ee9fd30cb3d27d904dadece67a7575198bd80e687ee76474620735f", size = 37253123, upload-time = "2025-10-01T18:04:18.177Z" },
+    { url = "https://files.pythonhosted.org/packages/96/76/0f7154952f037cb320b83e1c952ec4a19d5d689cf7d27cb8a26887d7bbc1/llvmlite-0.45.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5b3796b1b1e1c14dcae34285d2f4ea488402fbd2c400ccf7137603ca3800864f", size = 56288211, upload-time = "2025-10-01T18:01:24.079Z" },
+    { url = "https://files.pythonhosted.org/packages/00/b1/0b581942be2683ceb6862d558979e87387e14ad65a1e4db0e7dd671fa315/llvmlite-0.45.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:779e2f2ceefef0f4368548685f0b4adde34e5f4b457e90391f570a10b348d433", size = 55140958, upload-time = "2025-10-01T18:02:30.482Z" },
+    { url = "https://files.pythonhosted.org/packages/33/94/9ba4ebcf4d541a325fd8098ddc073b663af75cc8b065b6059848f7d4dce7/llvmlite-0.45.1-cp312-cp312-win_amd64.whl", hash = "sha256:9e6c9949baf25d9aa9cd7cf0f6d011b9ca660dd17f5ba2b23bdbdb77cc86b116", size = 38132231, upload-time = "2025-10-01T18:05:03.664Z" },
+]
+
+[[package]]
 name = "locket"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2176,8 +2254,10 @@ name = "matplotlib"
 version = "3.10.9"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -2229,12 +2309,14 @@ name = "matplotlib"
 version = "3.11.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -2487,6 +2569,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9f/2b/cfea6788fd6963f7c5f07420dbd3f418821007f75072178edfa595a3154a/napari-0.7.0-py3-none-any.whl", hash = "sha256:026da90683f1f9ebb7b9f19e6ee146ac2d9b3328b3bc691ae7da821d829150fb", size = 3490107, upload-time = "2026-03-23T10:33:07.081Z" },
 ]
 
+[package.optional-dependencies]
+all = [
+    { name = "aiohttp" },
+    { name = "bermuda" },
+    { name = "napari-metadata" },
+    { name = "napari-plugin-manager" },
+    { name = "numba" },
+    { name = "pyqt6" },
+    { name = "triangle" },
+    { name = "zarr" },
+]
+
 [[package]]
 name = "napari-console"
 version = "0.1.4"
@@ -2504,12 +2598,45 @@ wheels = [
 ]
 
 [[package]]
+name = "napari-metadata"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pint", version = "0.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pint", version = "0.25.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "qtpy" },
+    { name = "superqt" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f4/70/dc2fc8e331308d4f5c9dcb9b0d92b5137e0aea68ad10633465ae49eb1544/napari_metadata-0.3.0.tar.gz", hash = "sha256:89ef0d7543dd0a8f74fc1bf5227907d9b5d821f82f380f69078d5a572677539b", size = 4534806, upload-time = "2026-03-20T02:52:34.959Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/9d/b7f94d33aff7e4d689e22d89fc8f51f85a43c682dd63928690b14e48389f/napari_metadata-0.3.0-py3-none-any.whl", hash = "sha256:907f38518e03dba10a82cc6857326e46e95726ff9b07abd9bcd536970d8b028c", size = 32442, upload-time = "2026-03-20T02:52:33.572Z" },
+]
+
+[[package]]
 name = "napari-plugin-engine"
 version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/72/c653308edaf7f7c84d82e388a1c46bc8f26c385027af58b5bf728f600b47/napari_plugin_engine-0.2.1.tar.gz", hash = "sha256:46829cf02f368c8f2f1aa8b998ec73bcf14a2c1f5c15abd94b82154d7aef510d", size = 55809, upload-time = "2026-02-10T08:31:20.385Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/06/bc/2509813cddd0e02736121e21bef54deeec7f0f89af2c6096d753ee1feb09/napari_plugin_engine-0.2.1-py3-none-any.whl", hash = "sha256:de30babe6fd9477816f037207938a2da7faeddc0e9e8663cb29f3d74235b6dc5", size = 33849, upload-time = "2026-02-10T08:31:19.037Z" },
+]
+
+[[package]]
+name = "napari-plugin-manager"
+version = "0.1.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "npe2" },
+    { name = "packaging" },
+    { name = "pip" },
+    { name = "qtpy" },
+    { name = "superqt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/29/ff/0a8a2985d252aa229a5032ca2f595a0dcb41209218107adb0960f2cf5fff/napari_plugin_manager-0.1.11.tar.gz", hash = "sha256:aab4c7564b9a56400ab452712cb0efdb956e6b1cbcdd1396707fe93e59c75c84", size = 1785222, upload-time = "2026-03-19T13:37:17.623Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/26/8252279412e915d0161c7f826e0378cfd77b50ed634bf04288d822146850/napari_plugin_manager-0.1.11-py3-none-any.whl", hash = "sha256:8d74909792726229144ecd4fa7226c2c5df495364fb71332850b5b2768b5fe92", size = 48220, upload-time = "2026-03-19T13:37:15.946Z" },
 ]
 
 [[package]]
@@ -2628,8 +2755,10 @@ name = "networkx"
 version = "3.4.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -2645,12 +2774,14 @@ name = "networkx"
 version = "3.6.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -2698,12 +2829,41 @@ wheels = [
 ]
 
 [[package]]
+name = "numba"
+version = "0.62.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llvmlite" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/20/33dbdbfe60e5fd8e3dbfde299d106279a33d9f8308346022316781368591/numba-0.62.1.tar.gz", hash = "sha256:7b774242aa890e34c21200a1fc62e5b5757d5286267e71103257f4e2af0d5161", size = 2749817, upload-time = "2025-09-29T10:46:31.551Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/27/a5a9a58f267ec3b72f609789b2a8eefd6156bd7117e41cc9b7cf5de30490/numba-0.62.1-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:a323df9d36a0da1ca9c592a6baaddd0176d9f417ef49a65bb81951dce69d941a", size = 2684281, upload-time = "2025-09-29T10:43:31.863Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/9d/ffc091c0bfd7b80f66df3887a7061b6af80c8c2649902444026ee1454391/numba-0.62.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:e1e1f4781d3f9f7c23f16eb04e76ca10b5a3516e959634bd226fc48d5d8e7a0a", size = 2687311, upload-time = "2025-09-29T10:43:54.441Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/13/9a27bcd0baeea236116070c7df458414336f25e9dd5a872b066cf36b74bf/numba-0.62.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:14432af305ea68627a084cd702124fd5d0c1f5b8a413b05f4e14757202d1cf6c", size = 3734548, upload-time = "2025-09-29T10:42:38.232Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/00/17a1ac4a60253c784ce59549375e047da98330b82de7df6ac7f4ecc90902/numba-0.62.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f180922adf159ae36c2fe79fb94ffaa74cf5cb3688cb72dba0a904b91e978507", size = 3441277, upload-time = "2025-09-29T10:43:06.124Z" },
+    { url = "https://files.pythonhosted.org/packages/86/94/20ae0ff78612c4697eaf942a639db01dd4e2d90f634ac41fa3e015c961fc/numba-0.62.1-cp310-cp310-win_amd64.whl", hash = "sha256:f41834909d411b4b8d1c68f745144136f21416547009c1e860cc2098754b4ca7", size = 2745647, upload-time = "2025-09-29T10:44:15.282Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/5f/8b3491dd849474f55e33c16ef55678ace1455c490555337899c35826836c/numba-0.62.1-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:f43e24b057714e480fe44bc6031de499e7cf8150c63eb461192caa6cc8530bc8", size = 2684279, upload-time = "2025-09-29T10:43:37.213Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/18/71969149bfeb65a629e652b752b80167fe8a6a6f6e084f1f2060801f7f31/numba-0.62.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:57cbddc53b9ee02830b828a8428757f5c218831ccc96490a314ef569d8342b7b", size = 2687330, upload-time = "2025-09-29T10:43:59.601Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/7d/403be3fecae33088027bc8a95dc80a2fda1e3beff3e0e5fc4374ada3afbe/numba-0.62.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:604059730c637c7885386521bb1b0ddcbc91fd56131a6dcc54163d6f1804c872", size = 3739727, upload-time = "2025-09-29T10:42:45.922Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/c3/3d910d08b659a6d4c62ab3cd8cd93c4d8b7709f55afa0d79a87413027ff6/numba-0.62.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d6c540880170bee817011757dc9049dba5a29db0c09b4d2349295991fe3ee55f", size = 3445490, upload-time = "2025-09-29T10:43:12.692Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/82/9d425c2f20d9f0a37f7cb955945a553a00fa06a2b025856c3550227c5543/numba-0.62.1-cp311-cp311-win_amd64.whl", hash = "sha256:03de6d691d6b6e2b76660ba0f38f37b81ece8b2cc524a62f2a0cfae2bfb6f9da", size = 2745550, upload-time = "2025-09-29T10:44:20.571Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/fa/30fa6873e9f821c0ae755915a3ca444e6ff8d6a7b6860b669a3d33377ac7/numba-0.62.1-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:1b743b32f8fa5fff22e19c2e906db2f0a340782caf024477b97801b918cf0494", size = 2685346, upload-time = "2025-09-29T10:43:43.677Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/d5/504ce8dc46e0dba2790c77e6b878ee65b60fe3e7d6d0006483ef6fde5a97/numba-0.62.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:90fa21b0142bcf08ad8e32a97d25d0b84b1e921bc9423f8dda07d3652860eef6", size = 2688139, upload-time = "2025-09-29T10:44:04.894Z" },
+    { url = "https://files.pythonhosted.org/packages/50/5f/6a802741176c93f2ebe97ad90751894c7b0c922b52ba99a4395e79492205/numba-0.62.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:6ef84d0ac19f1bf80431347b6f4ce3c39b7ec13f48f233a48c01e2ec06ecbc59", size = 3796453, upload-time = "2025-09-29T10:42:52.771Z" },
+    { url = "https://files.pythonhosted.org/packages/7e/df/efd21527d25150c4544eccc9d0b7260a5dec4b7e98b5a581990e05a133c0/numba-0.62.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9315cc5e441300e0ca07c828a627d92a6802bcbf27c5487f31ae73783c58da53", size = 3496451, upload-time = "2025-09-29T10:43:19.279Z" },
+    { url = "https://files.pythonhosted.org/packages/80/44/79bfdab12a02796bf4f1841630355c82b5a69933b1d50eb15c7fa37dabe8/numba-0.62.1-cp312-cp312-win_amd64.whl", hash = "sha256:44e3aa6228039992f058f5ebfcfd372c83798e9464297bdad8cc79febcf7891e", size = 2745552, upload-time = "2025-09-29T10:44:26.399Z" },
+]
+
+[[package]]
 name = "numcodecs"
 version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -2733,12 +2893,14 @@ name = "numcodecs"
 version = "0.15.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -2811,7 +2973,8 @@ name = "ome-zarr"
 version = "0.10.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version <= '3.10' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version <= '3.10' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
@@ -2836,17 +2999,20 @@ name = "ome-zarr"
 version = "0.11.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
     "(python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
@@ -2897,8 +3063,10 @@ name = "pandas"
 version = "2.3.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -2940,12 +3108,14 @@ name = "pandas"
 version = "3.0.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -3063,8 +3233,10 @@ name = "pint"
 version = "0.24.4"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -3086,12 +3258,14 @@ name = "pint"
 version = "0.25.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -3106,6 +3280,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/52/9d/b1379cdbd33a49d17d627bc24e2b63cca06a1c5343b38072d2889499e82e/pint-0.25.3.tar.gz", hash = "sha256:f8f5df6cf65314d74da1ade1bf96f8e3e4d0c41b51577ac53c49e7d44ca5acee", size = 255106, upload-time = "2026-03-19T21:57:08.72Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1b/dd/a9fe6a0a09512da23951c68bf36466aeecd89def3183dc095edbc807ddc5/pint-0.25.3-py3-none-any.whl", hash = "sha256:27eb25143bd5de9fcc4d5a4b484f16faf6b4615aa93ece6b3373a8c1a3c1b97d", size = 307488, upload-time = "2026-03-19T21:57:07.022Z" },
+]
+
+[[package]]
+name = "pip"
+version = "26.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/91/47e7d486260f618783899587af63ccf7980fb60245c3e63dd4571c6b57ad/pip-26.1.2.tar.gz", hash = "sha256:f49cd134c61cf2fd75e0ce2676db03e4054504a5a4986d00f8299ae632dc4605", size = 1840799, upload-time = "2026-05-31T17:33:58.56Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/pip-26.1.2-py3-none-any.whl", hash = "sha256:382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab", size = 1813144, upload-time = "2026-05-31T17:33:56.772Z" },
 ]
 
 [[package]]
@@ -3913,8 +4096,10 @@ name = "rpds-py"
 version = "0.30.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -3985,12 +4170,14 @@ name = "rpds-py"
 version = "2026.5.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -4061,8 +4248,10 @@ name = "scikit-image"
 version = "0.25.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -4107,12 +4296,14 @@ name = "scikit-image"
 version = "0.26.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -4158,8 +4349,10 @@ name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -4204,12 +4397,14 @@ name = "scipy"
 version = "1.17.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
@@ -4504,6 +4699,31 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/57/a9/a2584b8313b89f94869ddb3c4074617a691de1812a614d2d50e32ca5a7a6/traitlets-5.15.1.tar.gz", hash = "sha256:7b1c07854fe25acb39e009bae49f11b79ff6cbb2f27999104e9110e7a6b53722", size = 163344, upload-time = "2026-06-03T12:26:06.181Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/96/8d/1080ee4c231f361b6ce4470d556c8c435b67c7e0753aaa641497ee92f88b/traitlets-5.15.1-py3-none-any.whl", hash = "sha256:770a53705f84b81ac107e83a1b3328ff2dae16094d8fc3cfc004e4b22dfd8e92", size = 85858, upload-time = "2026-06-03T12:26:04.395Z" },
+]
+
+[[package]]
+name = "triangle"
+version = "20250106"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/44/c5b03ff3d806ea05f58e072919c1b002513fab3db17125e14ad70687edd9/triangle-20250106-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:5eb99ec1002f164b7a40bec47c9915818231c3563f3900d973b6a2cb2befef9d", size = 1438057, upload-time = "2025-01-07T04:53:58.112Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/8f/8585f9fa048ca4541e1b97562bd5518731af73a84739e852c27a9c58478f/triangle-20250106-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d32c36a7188234a225a41f98224e430eae48ba252942696f2a7c83693a41fd0f", size = 2059234, upload-time = "2025-01-07T04:55:58.791Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/f2/a5e0882f3a65f256f925b3034e0dfa1a40a6b9b70fb52cd2d04507b372ba/triangle-20250106-cp310-cp310-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:e08357d66a48d8742d25479f55478911750513f4d3875e836d5d6cc0ba9dbda1", size = 1985587, upload-time = "2025-01-07T04:56:01.34Z" },
+    { url = "https://files.pythonhosted.org/packages/45/ac/cad720cd3bbdd30c91529556ca1616fc34d4b94e9cd50bff15d9dd7bad2f/triangle-20250106-cp310-cp310-win32.whl", hash = "sha256:11a0b634af43789e4525f2f4247dda83043f9fdfd710b55bcb82b514471ab6d7", size = 1406838, upload-time = "2025-01-07T05:00:05.181Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/82/01827a6c872f7588f4252c05a542764f561c7cadcd564a4000e8afd2d33f/triangle-20250106-cp310-cp310-win_amd64.whl", hash = "sha256:8a31f67e3506cc3aa33f82f1f94ea365b9625a7737fa119d628580c8bac0b0bf", size = 1425912, upload-time = "2025-01-07T05:00:07.885Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/91/83167e3d0cd1912b46e61a2b3485bf9886e49b48cea4daa59e8de4058a1a/triangle-20250106-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:93bd02b3341b2e4452952cb7605cf239bddd788a6f410ea54aeeb7db61836ba5", size = 1438115, upload-time = "2025-01-07T04:54:01.302Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/de/2383f2cd1dcc93a7042fb4feedb551c29cc40a3dffdc00b0387a2c591456/triangle-20250106-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:80da149e4584cc599fc9bcff31dddd524528a41119f5af321911e599d82ad6e1", size = 2100052, upload-time = "2025-01-07T04:56:03.954Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/d9/30504df67bb5451097ad4cb67f558be41ed7bf780f300bae1fc7cb90ee05/triangle-20250106-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:c1a22e82701fe97c0cbfe9ecbfc394a4a36442f1fe2836a721ddb95be9cdb299", size = 2028993, upload-time = "2025-01-07T04:56:06.767Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/4b/b8b6e97452bbadb9d388a132c78b0b4e1eb9e61ffc7c3c8b4992342327ed/triangle-20250106-cp311-cp311-win32.whl", hash = "sha256:3097f96859c02c9e3f5a2c35b0016b28005e7e6f061059b9c7a412e2ad01eb86", size = 1406419, upload-time = "2025-01-07T05:00:10.279Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/18/2a5fe89c7b98501d1dbb267119a3ce993ab96f6f11abf9e879dbbe3297ac/triangle-20250106-cp311-cp311-win_amd64.whl", hash = "sha256:cbd195668be437cfdc8cf192cec5748ebbb5d3bff19201f8503495916dd54ded", size = 1425906, upload-time = "2025-01-07T05:00:12.201Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/ba/22c552b21aa5a7724e712372d29c9397db19086e99c62f876c1b73025df2/triangle-20250106-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:64106544f6d137b619f7f724abbb7c2c78353691cccfc163e9d0b2e2476e0853", size = 1439851, upload-time = "2025-01-07T04:54:03.857Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/93/ce4d0c46ff570993f4302ce55300dd310b7c957a8e66890ed00691229f5b/triangle-20250106-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:38c221bb6e403f81de49050899502a8326c9565f62c4d69171070b41dc25cb69", size = 2089547, upload-time = "2025-01-07T04:56:09.463Z" },
+    { url = "https://files.pythonhosted.org/packages/23/e0/bd0a7e624fc5fc8636d0ad281c5b0624027dc1855218ce6a251c581d7127/triangle-20250106-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:b582b342cddb660dffc6bd7d7233f66952d2a3d18ccbc097660a8e370ee38d0c", size = 2009167, upload-time = "2025-01-07T04:56:12.221Z" },
+    { url = "https://files.pythonhosted.org/packages/26/3f/7c79202ec374bd122b63250d768be34674043be9b97f6bb8c115df64e880/triangle-20250106-cp312-cp312-win32.whl", hash = "sha256:9532797a15687225a0ee67619ad6f3baeb72bf193541eb96f782e41c577cc81b", size = 1407116, upload-time = "2025-01-07T05:00:13.664Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/a5/4a09c3f9d2687d8752c912a97f2c5086cdd83721b3b13f8288f13b771fa7/triangle-20250106-cp312-cp312-win_amd64.whl", hash = "sha256:0327032a7984a7262180ef2ddd78b36dfdcdecbc79f0f9f173732ce7c670b8ed", size = 1426720, upload-time = "2025-01-07T05:00:17.789Z" },
 ]
 
 [[package]]
@@ -4878,8 +5098,10 @@ name = "xarray"
 version = "2025.6.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version > '3.10' and python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version <= '3.10' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
@@ -4900,12 +5122,14 @@ name = "xarray"
 version = "2026.4.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and sys_platform == 'emscripten'",
     "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
-    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'win32'",
     "python_full_version == '3.11.*' and sys_platform == 'emscripten'",

@@ -883,6 +883,12 @@ install_biopb() {
     # the biopb + tensor-server wheels pinned in pyproject), so one download is
     # one consistent set — no PyPI-vs-release version skew.
     local biopb_req tensor_req mcp_req
+    # napari is the one runtime dep resolved from PyPI. We pin it to the exact
+    # version biopb-mcp was built/tested against so the deployed object graph
+    # matches the graph-walk thread-safety test. The release carries that version
+    # in its versions.json attribute (read below in release mode); in source mode
+    # the `==` pin in biopb-mcp's [mcp] extra constrains the unversioned spec.
+    local napari_req="napari[all]"
     if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
         _info "Building from source: biopb-mcp + biopb + biopb-tensor-server"
         _info "  from HEAD of $BIOPB_REPO_URL (monorepo subdirectories)"
@@ -905,6 +911,18 @@ install_biopb() {
             _info "Build from source instead:"
             _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
             exit 1
+        fi
+        # Pin napari from the release's versions.json attribute so the installed
+        # napari is identical to the one this release was built/tested against
+        # (closes the last dev/deploy version-skew — and the napari[all] Qt
+        # binding, which is napari-version-dependent). Tolerant: an older release
+        # without the manifest falls back to the unversioned spec.
+        local versions_url napari_pin
+        versions_url=$(_release_asset_url 'versions\.json')
+        if [ -n "$versions_url" ]; then
+            napari_pin=$(curl -fsSL "$versions_url" 2>/dev/null \
+                | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+            [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
         fi
         _info "Installing from release $RELEASE_TAG"
         WHEELS_DIR=$(mktemp -d)
@@ -940,7 +958,8 @@ install_biopb() {
     # wheel/ref ($mcp_req) just like the others. It now ships in the biopb-mcp
     # release alongside biopb + tensor-server (one matched triple), so unlike the
     # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
-    # dep still resolved from PyPI (it is decoupled and published normally).
+    # dep still resolved from PyPI, but pinned to the release's versions.json
+    # version ($napari_req, set above) so it matches the tested build.
     local install_args=(
         --upgrade
         --force
@@ -949,10 +968,10 @@ install_biopb() {
         --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
-    _info "  including biopb-mcp + napari"
+    _info "  including biopb-mcp + $napari_req"
     install_args+=(
         --with "$mcp_req"
-        --with "napari[all]"
+        --with "$napari_req"
         --with-executables-from biopb-mcp
     )
 

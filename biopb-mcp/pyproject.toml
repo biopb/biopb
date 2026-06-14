@@ -54,9 +54,17 @@ tables = [
 # The MCP server is a standalone process (not a plugin loaded inside a running
 # napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
 # must bring napari and a real Qt binding itself — qtpy in the core deps is only
-# a shim. napari>=0.7 keeps the resolver off the older napari 0.6.x line, which
-# pins vispy<0.16 and fails to init a GL canvas under Qt 6.11.
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed", "napari>=0.7", "pyqt6"]
+# a shim. napari is pinned EXACTLY (not a floor) and is the single source of
+# truth for the version: dev/CI (`uv sync ... --extra mcp`), the published wheel,
+# and the installer all resolve the identical napari, so the graph-walk
+# thread-safety test certifies the same object graph that actually ships (see
+# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari — its
+# default Qt binding is version-dependent, so the exact pin freezes that too
+# (>=0.7 was also needed to stay off the 0.6.x line, which pins vispy<0.16 and
+# can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
+# version as a `versions.json` release attribute that install.sh reads to pin
+# `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed", "napari[all]==0.7.0", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
