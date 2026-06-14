@@ -51,6 +51,7 @@ from biopb_tensor_server.downsample import (
     get_output_dtype,
     normalize_reduction_method,
 )
+from biopb_tensor_server.errors import SourceUnresolvedError
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,22 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
+
+
+def require_resolved(desc: TensorDescriptor) -> None:
+    """Guard the read-planning boundary against an unresolved descriptor.
+
+    A descriptor is "resolved" iff it carries a concrete shape and dtype. An
+    unresolved one (e.g. a not-yet-hydrated cloud source) would otherwise crash
+    deep in the planner -- ``np.dtype("")`` in ``get_arrow_schema`` or the
+    pyramid/ndim logic in ``chunk`` -- with raw, illegible errors. Fail here
+    with a clean ``SourceUnresolvedError`` instead.
+    """
+    if not desc.shape or not desc.dtype:
+        raise SourceUnresolvedError(
+            f"tensor {desc.array_id!r} is unresolved (shape/dtype unknown) -- "
+            f"open the source to resolve it"
+        )
 
 
 class SourceAdapter(ABC):
@@ -185,7 +202,41 @@ class SourceAdapter(ABC):
             source_type=self._source_type,
             tensors=self.list_tensor_descriptors(),
             metadata_json="",  # filled by GetFlightInfo()
+            data_resident=self.is_resident(),
         )
+
+    def is_resident(self) -> bool:
+        """Best-effort, recall-free: is this source's content local and cheap to
+        read right now?
+
+        Remote (fsspec) sources are never resident until their pixels are
+        materialized into a local copy (a later phase); a local source is
+        resident unless it is an offline cloud placeholder. This is the
+        authoritative, point-in-time residency gate -- VOLATILE, so evaluate it
+        at the moment of use and never cache the result. ``data_resident`` on the
+        descriptor is only an advisory snapshot of this.
+        """
+        # Lazy import: base <-> discovery only cross-import under TYPE_CHECKING,
+        # so importing these at module scope would be circular.
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import (
+            _is_offline_placeholder,
+            is_remote_url,
+        )
+
+        if is_remote_url(self._source_url):
+            return False
+        path = Path(self._source_url)
+        # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
+        # -- discovery only consults it for files (see should_skip_walk_entry,
+        # which gates it on `not is_dir`). A directory-based source (zarr,
+        # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
+        # (e.g. macOS APFS), so applying the file check to it would wrongly flag
+        # an entirely local store as non-resident. Treat a directory as resident.
+        if path.is_dir():
+            return True
+        return not _is_offline_placeholder(path)
 
 
     def get_tensor_adapter(self, tensor_id: str|None) -> 'TensorAdapter':
@@ -361,6 +412,7 @@ class TensorAdapter(ABC):
         import importlib.metadata
 
         desc = desc or self.get_tensor_descriptor()
+        require_resolved(desc)
 
         dtype = np.dtype(desc.dtype)
         data_field = pa.field("data", pa.list_(pa.from_numpy_dtype(dtype)))
@@ -459,6 +511,7 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
     """
+    require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
     slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
 
