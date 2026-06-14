@@ -156,6 +156,11 @@ class SourceConfig:
         monitor: Enable live filesystem monitoring for this source (local directories only)
                  When True, the server will watch for file add/delete events and update
                  the catalog automatically.
+        cloud: Treat this root as cloud/synced-folder storage (OneDrive, Dropbox, ...).
+               When True, dehydrated (offline-placeholder) entries under this root are
+               admitted as *unresolved* sources instead of being skipped, and their
+               shape/dtype is resolved lazily on first access (cloud-storage phase 2).
+               Opt-in only -- it does not weaken the global placeholder guard elsewhere.
         credentials_profile: Name of credential profile for remote URLs (overrides global default)
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
@@ -176,6 +181,7 @@ class SourceConfig:
     dim_labels: Optional[List[str]] = None
     dataset: Optional[str] = None  # For HDF5
     monitor: bool = False  # Enable live filesystem monitoring
+    cloud: bool = False  # Treat as cloud/synced-folder root (admit unresolved sources)
     credentials_profile: Optional[str] = None  # Override global credential profile
     _is_remote: Optional[bool] = field(
         default=None, init=False
@@ -570,6 +576,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
             dim_labels=src_data.get("dim_labels"),
             dataset=src_data.get("dataset"),
             monitor=src_data.get("monitor", False),  # Optional - default False
+            cloud=src_data.get("cloud", False),  # Optional - default False
             credentials_profile=src_data.get("credentials_profile", None),  # NEW
         )
         sources.append(source)

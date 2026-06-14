@@ -377,8 +377,15 @@ The same conclusion recurs at every layer, hardening as it goes:
 1. **Descriptor contract** — `resolved` (already implicit) + `data_resident`
    advisory field; `SourceUnresolvedError`; legible failure at the
    `_get_read_plan` boundary. *Pure robustness, no cloud code, unblocks the rest.*
-2. **Unresolved adapter + lazy `get_tensor_descriptor()`** resolution hook;
-   per-source `cloud = true` opt-in; OME-TIFF sniff deferral.
+   **(done — cloud phase 1.)**
+2. **Unresolved adapter + lazy resolution** hook; per-source `cloud = true`
+   opt-in; recall-free `claim()` (residency-guarded defer in each reader adapter)
+   + OME-TIFF sniff deferral. Resolution = re-run claim + `create_from_config` on
+   the hydrated path on first `GetFlightInfo` (resolve-on-serve); the in-memory
+   metadata-DB row is backfilled via the `sync_source_added` upsert. **(done —
+   cloud phase 2; see `biopb-tensor-server/ARCHITECTURE.md` "Cloud / synced-folder
+   sources" and `tests/cloud_phase2_test.py`. Multi-file monolith member grouping
+   degrades on cloud, as designed.)**
 3. **Persistent metadata DB** keyed to roots; resolve-once write-through.
 4. **Pre-cache skip gate** on `is_resident()`; exclude cloud from the backlog.
 5. **Read tolerance mode** (`EXACT|BEST_EFFORT`) + best-effort status return;

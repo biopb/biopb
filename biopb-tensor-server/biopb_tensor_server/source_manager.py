@@ -16,10 +16,12 @@ from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.config import SourceConfig
+from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
     DiscoveryState,
     SourceClaim,
+    _is_offline_placeholder,
     discover_sources_from_entries,
     get_file_identity,
     is_remote_url,
@@ -65,12 +67,17 @@ class SourceManager:
         full_rescan_interval: float = 3600.0,
         stable_rescans_required: int = 0,
         aggressive_dir_pruning: bool = False,
+        cloud_roots: Optional[Set[Path]] = None,
     ):
         self._server = server
         self._registry = registry
         self._state = discovery_state
         self._watcher = watcher
         self._monitored_dirs = monitored_dirs
+        # Resolved roots opted into cloud/synced-folder handling (config cloud=true).
+        # Under these, dehydrated entries are admitted and registered as unresolved
+        # sources that resolve lazily on first access (cloud-storage phase 2).
+        self._cloud_roots: Set[Path] = cloud_roots or set()
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
         self._stability_window = stability_window
@@ -374,6 +381,7 @@ class SourceManager:
                 self._aggressive_dir_pruning,
                 visited_identities,
                 is_root=True,
+                cloud=monitored_dir.resolve() in self._cloud_roots,
             )
         if publish:
             self._entry_state = next_state
@@ -400,6 +408,7 @@ class SourceManager:
         visited_identities: Set[str],
         is_root: bool = False,
         dir_entry: Optional[os.DirEntry] = None,
+        cloud: bool = False,
     ) -> None:
         """Capture the current filesystem signature state for one subtree.
 
@@ -447,7 +456,11 @@ class SourceManager:
         # Shared skip policy (hidden / system / cloud-placeholder), identical to the
         # claim walk's. Pass the stat we already took so the offline-placeholder
         # check does not stat the entry a second time. Never applied to a root.
-        if not is_root and should_skip_walk_entry(path, is_directory, stat_result):
+        # Under a `cloud`-opted root, ``admit_nonresident`` keeps dehydrated files
+        # (they are admitted as unresolved sources instead of skipped).
+        if not is_root and should_skip_walk_entry(
+            path, is_directory, stat_result, admit_nonresident=cloud
+        ):
             return
 
         path_str = str(resolved_path)
@@ -490,6 +503,11 @@ class SourceManager:
             allow_prune
             and
             not force_full
+            # Never prune a cloud subtree on its mtime signature: cloud mtime is
+            # unreliable (doc S1.2), so a "stable" signature is not trustworthy and
+            # pruning could permanently hide a newly-archived dataset. A cloud root
+            # is always fully walked (cloud-storage phase 2).
+            and not cloud
             and previous_entry is not None
             and previous_entry[:2] == (is_directory, signature)
             and not pending_scan
@@ -524,6 +542,7 @@ class SourceManager:
                         True,
                         visited_identities,
                         dir_entry=entry,
+                        cloud=cloud,
                     )
         except OSError:
             return
@@ -645,6 +664,19 @@ class SourceManager:
         entry = self._entry_state.get(resolved_str)
         if entry is None:
             return False
+
+        # Cloud/synced-folder entries bypass the stability machinery entirely
+        # (cloud-storage phase 2). Two reasons, both load-bearing:
+        #   * the open-for-append probe below opens the file -- a whole-file recall
+        #     on a dehydrated placeholder, which is exactly what cloud handling must
+        #     avoid; and
+        #   * the mtime/ctime age + stable-rescan gate is unreliable on cloud
+        #     filesystems (doc S1.2), so a placeholder could never stabilize.
+        # Archived dehydrated data is inherently stable (never mid-write), so admit
+        # it immediately. The pending-scan clear side effect is preserved.
+        if self._is_under_cloud_root(resolved_str):
+            self._entry_pending_scan[resolved_str] = False
+            return True
 
         age = time.time() - entry[2]
         if age < self._stability_window:
@@ -935,6 +967,72 @@ class SourceManager:
             source_id,
         )
 
+    def _is_under_cloud_root(self, path: str) -> bool:
+        """True when *path* is a cloud-opted root or lives under one."""
+        if not self._cloud_roots:
+            return False
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        for root in self._cloud_roots:
+            if resolved == root or root in resolved.parents:
+                return True
+        return False
+
+    def _claim_is_unresolved(self, claim: SourceClaim) -> bool:
+        """Whether this claim must be registered as an unresolved cloud source.
+
+        Two triggers, both meaning "do not open the content now":
+        - the adapter's own ``claim.unresolved`` flag -- a reader adapter (OME-Zarr,
+          MicroManager, OME-TIFF, DICOM) recognized the source structurally and
+          deferred its sidecar/container read because it was non-resident; or
+        - under a ``cloud`` root, the source's content is a non-resident
+          placeholder. This catches the content-free *file* formats (NIfTI, CZI,
+          single OME-TIFF, ...) whose ``claim()`` never reads bytes but whose
+          ``create_from_config`` would hydrate the file to learn its shape.
+
+        Cloud-gated so a normal local source is never marked unresolved (and the
+        per-file placeholder stat -- which can false-positive on a resident tiny
+        file on some filesystems -- is only consulted for cloud roots).
+        """
+        if claim.unresolved:
+            return True
+        if not self._is_under_cloud_root(claim.primary_path):
+            return False
+        # A directory source (zarr store, ...) is born resolved from its resident
+        # sidecars; only a non-resident *content file* forces deferral. Guard on
+        # is_file so a directory's st_blocks==0 (macOS APFS) is never a false hit.
+        for member in claim.member_paths:
+            if is_remote_url(member):
+                continue
+            member_path = Path(member)
+            try:
+                if member_path.is_file() and _is_offline_placeholder(member_path):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
+        """Backfill the metadata DB when an unresolved cloud source resolves.
+
+        ``sync_source_added`` is an INSERT OR REPLACE upsert, so re-syncing the
+        now-resolved adapter overwrites the source's NULL shape/dtype row with the
+        concrete descriptor. Persistence across restart is phase 3 (file-backed
+        DB); here the backfill lives for the process lifetime.
+        """
+        if (
+            hasattr(self._server, "_metadata_db")
+            and self._server._metadata_db is not None
+        ):
+            try:
+                self._server._metadata_db.sync_source_added(source_id, adapter)
+            except Exception:
+                logger.exception(
+                    "metadata-DB backfill failed for resolved source %s", source_id
+                )
+
     def _register_source_claim(self, claim: SourceClaim) -> bool:
         """Create and register a source, rolling back on partial failure."""
         try:
@@ -946,20 +1044,31 @@ class SourceManager:
                 dataset=claim.extra_config.get("dataset"),
             )
 
-            adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
-            if adapter_cls is None:
-                self._log_source_failure(
-                    claim.source_id,
-                    "No adapter for type %s for source %s (%s)",
-                    claim.source_type,
-                    claim.source_id,
-                    claim.primary_path,
+            if self._claim_is_unresolved(claim):
+                # Cloud-storage phase 2: register a placeholder that resolves
+                # lazily on first access (re-claim + create_from_config on the
+                # hydrated path) instead of opening the source now.
+                adapter = UnresolvedSourceAdapter(
+                    source_config,
+                    self._registry,
+                    credentials_config=self._credentials_config,
+                    on_resolved=self._on_source_resolved,
                 )
-                return False
+            else:
+                adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
+                if adapter_cls is None:
+                    self._log_source_failure(
+                        claim.source_id,
+                        "No adapter for type %s for source %s (%s)",
+                        claim.source_type,
+                        claim.source_id,
+                        claim.primary_path,
+                    )
+                    return False
 
-            adapter = adapter_cls.create_from_config(
-                source_config, self._credentials_config
-            )
+                adapter = adapter_cls.create_from_config(
+                    source_config, self._credentials_config
+                )
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
@@ -1119,6 +1228,17 @@ def create_source_manager(
         logger.warning("No valid sources to serve")
         return None
 
+    # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
+    # across both monitored and static sources. Under a monitored cloud root the
+    # walk admits dehydrated entries; for any cloud source the registration path
+    # defers a non-resident dataset to lazy resolution (cloud-storage phase 2).
+    cloud_roots: Set[Path] = set()
+    for source in (*monitored_sources, *static_sources):
+        if source.cloud and not source.is_remote:
+            local_path = source.local_path
+            if local_path is not None:
+                cloud_roots.add(local_path)
+
     # Create discovery state (empty - will be populated after SourceManager is created)
     discovery_state = DiscoveryState()
 
@@ -1136,6 +1256,7 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         stable_rescans_required=stable_rescans_required,
         aggressive_dir_pruning=aggressive_dir_pruning,
+        cloud_roots=cloud_roots,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
@@ -1147,6 +1268,10 @@ def create_source_manager(
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             extra_config={"dataset": source.dataset} if source.dataset else {},
+            # A static source explicitly flagged cloud is always deferred: the
+            # user said "don't open it eagerly". If it is in fact resident, the
+            # first access still resolves it cheaply.
+            unresolved=bool(source.cloud),
         )
         manager._commit_add_claim(claim)
 
