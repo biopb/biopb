@@ -227,3 +227,54 @@ class TestSourcesChangedGuard:
         w._on_sources_changed({"a": object()})
 
         w._apply_filter.assert_not_called()
+
+
+class TestResidencyIndicator:
+    """`_add_tree_node` decorates a source row from its `data_resident` state."""
+
+    def _node(self, data_resident):
+        from biopb.tensor.descriptor_pb2 import (
+            DataSourceDescriptor,
+            TensorDescriptor,
+        )
+
+        from biopb_mcp.tensor_browser._widget import _TreeNode
+
+        src = DataSourceDescriptor(
+            source_id="s",
+            source_url="/data/s.zarr",
+            tensors=[TensorDescriptor(array_id="s", shape=[10, 10], dtype="uint8")],
+        )
+        if data_resident is not None:
+            src.data_resident = data_resident
+        return _TreeNode(
+            node_id="s", name="s.zarr", node_type="source", depth=0, source=src
+        )
+
+    def test_remote_source_marked_and_greyed(self, widget):
+        from biopb_mcp.tensor_browser._widget import _RESIDENCY_GLYPH
+
+        w, _, _ = widget
+        w._add_tree_node(w._tree_widget, self._node(False))
+        item = w._tree_widget.topLevelItem(0)
+        assert item.text(0).startswith(_RESIDENCY_GLYPH)
+        assert "Not resident" in item.toolTip(0)
+        assert item.foreground(0).color().name() == "#888888"
+
+    def test_resident_source_unmarked_with_tooltip(self, widget):
+        from biopb_mcp.tensor_browser._widget import _RESIDENCY_GLYPH
+
+        w, _, _ = widget
+        w._add_tree_node(w._tree_widget, self._node(True))
+        item = w._tree_widget.topLevelItem(0)
+        assert _RESIDENCY_GLYPH not in item.text(0)
+        assert "Resident" in item.toolTip(0)
+
+    def test_unknown_residency_has_no_indicator(self, widget):
+        from biopb_mcp.tensor_browser._widget import _RESIDENCY_GLYPH
+
+        w, _, _ = widget
+        w._add_tree_node(w._tree_widget, self._node(None))
+        item = w._tree_widget.topLevelItem(0)
+        assert _RESIDENCY_GLYPH not in item.text(0)
+        assert item.toolTip(0) == ""

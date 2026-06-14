@@ -36,6 +36,7 @@ from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import build_pyramid_plan, encode_chunk_id
 from biopb_tensor_server.config import PyramidConfig
+from biopb_tensor_server.errors import SourceUnresolvedError
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
@@ -824,6 +825,15 @@ class TensorFlightServer(flight.FlightServerBase):
                     read_plan.descriptor.metadata_json = json.dumps(
                         wrapped_metadata, cls=NumpyEncoder
                     )
+        except SourceUnresolvedError as e:
+            # Expected for a not-yet-hydrated source: surface a legible
+            # "open to resolve" message rather than burying it in "Metadata
+            # error". Unavailable (not Internal) -- it is not ready yet, not
+            # broken. Must precede the ValueError clause (SourceUnresolvedError
+            # subclasses ValueError).
+            raise flight.FlightUnavailableError(
+                f"Source unresolved (open to resolve): {e}"
+            ) from e
         except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
