@@ -794,6 +794,15 @@ class TensorBrowserWidget(QWidget):
             else:
                 self._selected_tensor_id = None
 
+            # Multi-tensor source: toggle its field list on click, like a folder
+            if item.childCount() > 0:
+                expanded = not item.isExpanded()
+                item.setExpanded(expanded)
+                if expanded:
+                    self._expanded_folders.add(source_id)
+                else:
+                    self._expanded_folders.discard(source_id)
+
         self._update_metadata_display()
 
     def _on_tree_item_double_clicked(
