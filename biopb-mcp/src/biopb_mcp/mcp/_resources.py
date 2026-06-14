@@ -16,10 +16,10 @@ GUIDE = """\
 | `np` | module | numpy |
 | `da` | module | dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
-| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the main thread and returns its result; required for viewer mutations from a job thread (no-op on the main thread) |
+| `run_on_main` | callable | `run_on_main(fn)` runs `fn` on the Qt main thread and returns its result (no-op on the main thread). Rarely needed — the `viewer` already auto-marshals every mutation. Use it only to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 | `cancelled` | callable | `cancelled()` -> True if the running job has been asked to cancel; poll it in long loops for cooperative cancellation |
 
-* The viewer is a live desktop window. Reads are safe from a job thread, but mutations must run on the main thread — wrap them in `run_on_main()`. `viewer.add_tensor()` and the `viewer.add_*()` family are already wrapped; everything else (layer properties, `viewer.dims`, `viewer.camera`, callback registration) is not.
+* The viewer is a live desktop window, and the `viewer` handle is **thread-safe**: every mutation (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`, the `add_*()` family, …) is automatically marshaled to the Qt main thread, so just mutate it directly from job code. Two caveats: raw Qt (`viewer.window`) still requires the main thread — off-thread access raises a clear error, so wrap it in `run_on_main()`; and to apply many mutations in one main-thread hop, batch them in a single `run_on_main()`.
 * Data from `TensorFlightClient` are lazy, thread-safe, picklable dask arrays.
 * `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
 
@@ -54,8 +54,8 @@ print([(l.name, type(l).__name__, type(l.data).__name__) for l in viewer.layers]
 dask_arr = client.get_tensor("my_source_id") # lazy, thread-safe, picklable
 np_arr = dask_arr.compute() # in memory
 
-# Take action then screenshot to verify
-run_on_main(lambda: setattr(viewer.dims, "ndisplay", 3))
+# Take action then screenshot to verify (mutations auto-marshal — call directly)
+viewer.dims.ndisplay = 3
 ```
 
 ## Iterative Workflow for _very_ large data
@@ -77,12 +77,13 @@ layer_name = viewer.add_tensor(source_id)
 VIEWER = """\
 # Viewer Operations
 
-**Threading:** reads are safe from a job thread, but every *mutation* must run on
-the Qt main thread. `viewer.add_*()` family are
-already wrapped for you. For anything else — layer properties, `viewer.dims`,
-`viewer.layers.remove()`, `viewer.camera`, registering callbacks — wrap the
-mutation in `run_on_main()` (a no-op when already on the main thread). Batch
-related mutations into one `run_on_main()` call.
+**Threading:** the `viewer` is thread-safe — every mutation (layer properties,
+`viewer.dims`, `viewer.layers.remove()`, `viewer.camera`, the `add_*()` family)
+is automatically marshaled to the Qt main thread, so mutate it directly from job
+code. `run_on_main()` is optional: use it to **batch** many mutations into one
+main-thread hop (one round-trip instead of one per mutation), or to touch raw Qt
+(`viewer.window`), which still requires the main thread and otherwise raises a
+clear error off-thread.
 
 **If the user closes the napari window**, the kernel is torn down to idle and
 any running job is stopped. `server_status` then reports the kernel `not
@@ -93,35 +94,38 @@ the teardown completes, a tool may instead see `window: CLOSED` with a note to
 
 ## Layers
 ```python
-# List all layers (read — no run_on_main needed)
+# List all layers (read)
 for layer in viewer.layers:
     print(f"{layer.name}: {type(layer).__name__} {layer.data.shape} {layer.data.dtype}")
 
 # Get specific layer (read)
 layer = viewer.layers["image_name"]
 
-# Remove layer (mutation — wrap it)
-run_on_main(lambda: viewer.layers.remove(viewer.layers["name"]))
+# Remove layer (auto-marshaled — call directly)
+viewer.layers.remove(viewer.layers["name"])
 
 # Load data to viewer; auto-handles pyramid. Accepts any valid source_id.
-# (already wrapped — call directly)
 layer_name = viewer.add_tensor(source_id="source_id", tensor_id=None, name=None)
 
-# Layer properties (mutations — batch into one run_on_main call)
+# Layer properties (auto-marshaled — set directly; each runs on the main thread)
+layer = viewer.layers["name"]
+layer.visible = False
+layer.opacity = 0.7
+layer.colormap = "viridis"
+layer.contrast_limits = [0, 255]
+layer.blending = "additive"     # "translucent", "additive", "minimum", "opaque"
+
+# To apply many at once in a single main-thread hop, batch with run_on_main:
 def _style():
     layer = viewer.layers["name"]
-    layer.visible = False
-    layer.opacity = 0.7
-    layer.colormap = "viridis"
-    layer.contrast_limits = [0, 255]
-    layer.blending = "additive"     # "translucent", "additive", "minimum", "opaque"
+    layer.visible, layer.opacity, layer.colormap = False, 0.7, "viridis"
 run_on_main(_style)
 ```
 
 ## Dimensions (sliders)
 ```python
-# Set slider position (mutation — wrap it; e.g. time axis=0 to frame 50)
-run_on_main(lambda: viewer.dims.set_point(axis=0, value=50))
+# Set slider position (auto-marshaled — call directly; e.g. time axis=0 to frame 50)
+viewer.dims.set_point(axis=0, value=50)
 
 # Get current position (read)
 print(viewer.dims.point)    # tuple of current positions
@@ -146,16 +150,16 @@ def on_click(viewer, event):
         coord = layer.world_to_data(event.position)  # full-ndim data coords (…,z,y,x)
         print(event.button, list(event.modifiers), coord)
 
-# Register from the main thread (mutation), and mutate the list in place (below)
-run_on_main(lambda: viewer.mouse_drag_callbacks.append(on_click))
+# Register by mutating the callback list in place — append, do not reassign (below)
+viewer.mouse_drag_callbacks.append(on_click)
 ```
 
 If a callback "doesn't fire", it is one of these — NOT a session/setup bug, and
 do **not** instrument vispy to investigate (that is the trap, see point 2):
 
-1. **Reassigning instead of mutating the list.** It is an evented pydantic
-   field; `viewer.mouse_drag_callbacks = [...]` raises `"Viewer" object has no
-   field`. Use `.append()` / `.remove()`.
+1. **Reassigning instead of mutating the list.** It is not a reassignable
+   attribute; `viewer.mouse_drag_callbacks = [...]` raises `"Viewer" object has
+   no field`. Use `.append()` / `.remove()`.
 2. **Tapping the vispy emitter** (`canvas._scene_canvas.events.*`). napari runs
    it with `ignore_callback_errors=False` and vispy `connect()` defaults to
    `position='first'`, so a tap landing ahead of napari's handler that raises

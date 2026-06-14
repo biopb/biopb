@@ -224,8 +224,9 @@ output is not captured (code is exec'd, not run via `run_cell`).
   idle when the user closes the viewer, recording a `_teardown_reason`.
 - `_bootstrap.py` — runs *inside* the kernel via `exec_lines`. Enables `%gui qt`,
   configures dask, constructs the `TensorConnection`, opens the napari viewer +
-  Tensor Browser, builds `ops`, installs the job runner (`_jobs.install` +
-  `wrap_viewer_for_threads`), wires the window-close hook (the viewer's
+  Tensor Browser, builds `ops`, installs the job runner (`_jobs.install`) and
+  the agent-facing viewer proxy (`_viewer_proxy.make_viewer_proxy`, see below),
+  wires the window-close hook (the viewer's
   `destroyed` signal → a byte on `BIOPB_WINDOW_CLOSE_FD`), starts the background
   source watcher (`conn.start_source_watch`, issue #44 — covers headless, where
   there is no widget to start it), and populates the `execute_code` namespace.
@@ -234,8 +235,8 @@ output is not captured (code is exec'd, not run via `run_cell`).
 - `_jobs.py` — runs *inside* the kernel. The async job runner: a `_jobs`
   registry, `submit`/`poll`/`cancel`/`cancel_current`/`interrupt_current`/
   `jobs_summary`, a thread-aware stdout dispatcher, `run_on_main` (Qt main-thread
-  marshaling with proper exception propagation), `cancelled()`, and
-  `wrap_viewer_for_threads`. The stop ladder: `cancel`/`cancel_current` is
+  marshaling with proper exception propagation), and `cancelled()`. The stop
+  ladder: `cancel`/`cancel_current` is
   cooperative (sets a flag the code polls via `cancelled()`) and also cancels
   in-flight distributed-dask futures; `interrupt_current` does that *plus* raises
   a `KeyboardInterrupt` directly into the job's worker thread via
@@ -245,6 +246,18 @@ output is not captured (code is exec'd, not run via `run_cell`).
   threads a human-readable `cancel_reason` into the job record (prefixed onto the
   finalized `error_text`), so a stop triggered by a *user* in the observe UI
   surfaces to the agent via `poll_job` instead of an unexplained cancellation.
+- `_viewer_proxy.py` — runs *inside* the kernel. The agent-facing `viewer` in the
+  `execute_code` namespace is a **transparent main-thread marshaling proxy** over
+  the real `napari.Viewer`. Because job code runs on a background thread but
+  napari/Qt are main-thread-only, any off-main viewer mutation can segfault the
+  whole kernel (biopb/biopb#100). The proxy marshals mutations (`__setattr__`)
+  and method calls to the Qt main thread via `_jobs.run_on_main`, **re-wraps**
+  every napari handle it returns (so `viewer.layers`, `viewer.dims`,
+  `viewer.layers[0]`, … never leak unwrapped — the gap the old `add_*`-only wrap
+  left), passes inert values (arrays/scalars) through, and **fail-loud**-guards
+  raw-Qt objects (`viewer.window`) so off-main access raises `ViewerThreadError`
+  instead of crashing. Handle-set completeness is enforced by a graph-walk test
+  (`_tests/test_viewer_proxy.py`); see `docs/viewer-thread-safety.md`.
 - `_observe.py` — runs *in the MCP server process* (not the kernel). The web
   "observe" UI (`mcp.observe.enabled`, **on by default / opt-out**): job history
   (the submitted code + truncated output) + global cancel/interrupt/restart

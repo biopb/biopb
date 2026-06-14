@@ -373,16 +373,22 @@ def _bootstrap_impl():
     # 6. Async job runner: execute_code runs in a background kernel thread so
     #    the main thread / Qt loop stays free for screenshot/status mid-job.
     #    install() stores the shell, installs the thread-aware stdout streams,
-    #    and clears any prior job state; wrap_viewer_for_threads marshals the
-    #    common viewer-mutating methods to the Qt main thread.
+    #    and clears any prior job state.
     _jobs.install(ip)
+    # The agent-facing `viewer` is a main-thread marshaling proxy so arbitrary
+    # job-thread code (viewer/layers/dims/camera mutations) can't segfault Qt --
+    # the real viewer is touched only on the Qt main thread. Internal subsystems
+    # (helpers, tools, the Tensor Browser widget) keep the real viewer. See
+    # docs/viewer-thread-safety.md. Headless has no Qt loop, so no proxy.
+    viewer_handle = viewer
     if not headless:
         from ._helpers import patch_viewer_add_tensor
+        from ._viewer_proxy import make_viewer_proxy
 
         patch_viewer_add_tensor(
             viewer, conn, compute_scheduler=compute_scheduler
         )
-        _jobs.wrap_viewer_for_threads(viewer)
+        viewer_handle = make_viewer_proxy(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
     #    runner (the connection service connects asynchronously).
@@ -392,7 +398,7 @@ def _bootstrap_impl():
 
     ip.user_ns.update(
         {
-            "viewer": viewer,
+            "viewer": viewer_handle,
             "np": np,
             "da": da,
             "client": None,
