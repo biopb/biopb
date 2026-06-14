@@ -96,6 +96,15 @@ jobs:
           fi
           tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
+          # When the release commit is NOT also tagged server-v*, setuptools_scm
+          # yields a PEP 440 dev/local version (e.g. 0.4.6.dev6+gf7f1075). The '+'
+          # local segment is legal in a wheel name but ILLEGAL in a Docker
+          # reference ([A-Za-z0-9_][A-Za-z0-9_.-]{0,127}), so tagging an image with
+          # it fails the build. Map any out-of-set char to '_' for the Docker tag;
+          # a clean X.Y.Z release is unchanged. The gate's manifest-inspect and the
+          # image tags both use this so they agree on the same reference.
+          tdocker=$(printf '%s' "$tver" | sed -E 's/[^A-Za-z0-9_.-]/_/g')
+          echo "tensor_docker=$tdocker" >> "$GITHUB_OUTPUT"
           ibver=$(grep -E '^version[[:space:]]*=' biopb-image-runtime/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
@@ -138,7 +147,7 @@ jobs:
             if [[ "${{ steps.ver.outputs.is_tag }}" != "true" ]]; then echo verify; return; fi
             if docker manifest inspect "ghcr.io/$owner/$1:$2" >/dev/null 2>&1; then echo skip; else echo push; fi
           }
-          t=$(decide biopb-tensor-server "${{ steps.ver.outputs.tensor }}")
+          t=$(decide biopb-tensor-server "${{ steps.ver.outputs.tensor_docker }}")
           i=$(decide biopb-image-base "${{ steps.ver.outputs.imagebase }}")
           echo "tensor=$t" >> "$GITHUB_OUTPUT"
           echo "imagebase=$i" >> "$GITHUB_OUTPUT"
@@ -155,9 +164,9 @@ jobs:
           build-args: |
             MEMORY=4g
           tags: |
-            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor }}
+            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}
             ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:latest
-            docker.io/jiyuuchc/biopb-tensor-server:${{ steps.ver.outputs.tensor }}
+            docker.io/jiyuuchc/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}
             docker.io/jiyuuchc/biopb-tensor-server:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -213,7 +222,7 @@ jobs:
             - `install.sh` / `install.ps1` — bootstrap installers
 
             ### Docker
-            - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor }}`
+            - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}`
             - `ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}`
         env:
           GITHUB_TOKEN: ${{ github.token }}
