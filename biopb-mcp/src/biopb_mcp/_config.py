@@ -260,9 +260,17 @@ DEFAULT_CONFIG = {
             # the current (coarse, upscaled) texture on screen until the finer
             # slice resolves. `take_screenshot` force-syncs a slice before
             # capturing (see mcp/_helpers.resync_view_for_capture) so the agent
-            # still sees exactly the frame it requested. Set False to keep the
-            # old fully-synchronous slicing.
-            "async_slicing": True,
+            # still sees exactly the frame it requested.
+            #
+            # DEFAULT False: napari ships async slicing OFF by default --
+            # `experimental.async_` defaults to False -- because the slice->GL
+            # texture handoff is a known, unresolved stability hazard (napari
+            # #8145 segfaults/deadlocks in upstream CI; #4738 tracks the
+            # main-thread-only Qt/vispy rule). On NVIDIA-proprietary + PyQt6 it
+            # segfaults `libQt6Gui` on routine dims/zoom changes and takes down
+            # the whole kernel (biopb/biopb#100). Match upstream's default;
+            # set True to opt back in to async slicing where it's known stable.
+            "async_slicing": False,
         },
         "services": {
             # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).
