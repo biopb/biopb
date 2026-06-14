@@ -98,7 +98,17 @@ jobs:
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
           ibver=$(grep -E '^version[[:space:]]*=' biopb-image-runtime/pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           echo "imagebase=$ibver" >> "$GITHUB_OUTPUT"
-          echo "tensor-server=$tver  image-base=$ibver  release=$REL  prerelease check done"
+          # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
+          # of truth). Surface it as a release attribute so the installer pins the
+          # same napari the wheel was built/tested against (see install/install.sh).
+          nver=$(grep -oE 'napari\[all\]==[0-9][^"]+' biopb-mcp/pyproject.toml | head -1 | sed -E 's/.*==//')
+          [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
+          echo "napari=$nver" >> "$GITHUB_OUTPUT"
+          # versions.json — the installer-readable release-attribute manifest.
+          cat > release-wheels/versions.json <<EOF
+          { "release": "$REL", "tensor_server": "$tver", "image_base": "$ibver", "napari": "$nver" }
+          EOF
+          echo "tensor-server=$tver  image-base=$ibver  napari=$nver  release=$REL  prerelease check done"
 
       - name: Login to ghcr.io
         if: steps.ver.outputs.is_tag == 'true'
@@ -182,6 +192,7 @@ jobs:
           files: |
             release-wheels/*.whl
             release-wheels/*.tar.gz
+            release-wheels/versions.json
             install/install.sh
             install/install.ps1
           body: |
@@ -198,6 +209,7 @@ jobs:
             - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
               version-paired wheel triple (installer `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
+            - `versions.json` — release manifest (pins `napari` for the installer)
             - `install.sh` / `install.ps1` — bootstrap installers
 
             ### Docker
