@@ -359,6 +359,12 @@ class TensorBrowserWidget(QWidget):
         self._selected_source_id: str | None = None
         self._selected_tensor_id: str | None = None
         self._expanded_folders: Set[str] = set()
+        # On the first unfiltered render, expand every top-level node so the
+        # user lands on the first level of leaves instead of a wall of
+        # collapsed roots. Flipped once, then ordinary expand-state tracking
+        # (``_expanded_folders``) takes over so later rebuilds respect the
+        # user's manual collapses.
+        self._initial_expand_done: bool = False
 
         # Connect runs the shared, non-blocking auto_connect policy on a worker
         # thread (see :meth:`_start_connect`) so the viewer stays responsive and
@@ -702,6 +708,14 @@ class TensorBrowserWidget(QWidget):
         # Populate tree widget
         for child in display_tree.children:
             self._add_tree_node(self._tree_widget, child)
+
+        # First unfiltered render: seed every top-level node as expanded so the
+        # first level of leaves is visible up front. Persisted via the normal
+        # expand-state set so it survives rebuilds and the user can collapse it.
+        if not self._initial_expand_done and not filtered_ids:
+            for child in display_tree.children:
+                self._expanded_folders.add(child.node_id)
+            self._initial_expand_done = True
 
         # Restore expanded state
         self._restore_expanded_state()
