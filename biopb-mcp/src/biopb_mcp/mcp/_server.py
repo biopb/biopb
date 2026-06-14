@@ -498,8 +498,10 @@ def execute_code(python_code: str) -> str:
     display() output is not captured; use print().
 
     * viewer mutations (see guide://viewer for more details):
-    Inside a job, wrap viewer mutations in run_on_main(fn) so they run on the Qt
-    main thread. Viewer's add_* methods are pre-wrapped.
+    The viewer is thread-safe: mutations are auto-marshaled to the Qt main
+    thread, so mutate it directly from job code. run_on_main(fn) is optional --
+    use it to batch many mutations into one main-thread hop, or to touch raw Qt
+    (viewer.window), which still requires the main thread.
 
     * data access (see guide://tensor for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
