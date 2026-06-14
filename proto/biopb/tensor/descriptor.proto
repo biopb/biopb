@@ -239,4 +239,12 @@ message DataSourceDescriptor {
 
   // Source-level OME/vendor metadata (JSON format)
   string metadata_json = 5;
+
+  // Advisory, point-in-time hint: this source's content is local and cheap to
+  // read right now. VOLATILE -- a synced-folder source can re-dehydrate under
+  // storage pressure, so the authoritative residency gate is a fresh stat
+  // (adapter.is_resident()), not this stored value. Defaults false for old
+  // servers; a resident local source sets it true, a remote (fsspec) source
+  // false until its pixels are materialized locally.
+  bool data_resident = 6;
 }
