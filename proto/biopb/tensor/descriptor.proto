@@ -243,8 +243,9 @@ message DataSourceDescriptor {
   // Advisory, point-in-time hint: this source's content is local and cheap to
   // read right now. VOLATILE -- a synced-folder source can re-dehydrate under
   // storage pressure, so the authoritative residency gate is a fresh stat
-  // (adapter.is_resident()), not this stored value. Defaults false for old
-  // servers; a resident local source sets it true, a remote (fsspec) source
-  // false until its pixels are materialized locally.
-  bool data_resident = 6;
+  // (adapter.is_resident()), not this stored value. `optional` so absence is
+  // distinguishable from false: servers predating this field leave it unset
+  // (residency unknown); a resident local source sets it true, a remote
+  // (fsspec) source false until its pixels are materialized locally.
+  optional bool data_resident = 6;
 }
