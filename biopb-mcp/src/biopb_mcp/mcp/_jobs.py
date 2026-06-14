@@ -452,45 +452,13 @@ def reset():
 
 
 # -- viewer wrapping --------------------------------------------------------
-
-_VIEWER_GUI_METHODS = (
-    "add_tensor",
-    "add_image",
-    "add_labels",
-    "add_points",
-    "add_shapes",
-    "add_vectors",
-    "add_surface",
-    "add_tracks",
-)
-
-
-def wrap_viewer_for_threads(viewer):
-    """Wrap the common viewer-mutating methods so a call from a background job
-    thread is marshaled to the Qt main thread (a no-op on the main thread).
-
-    Open-ended mutations (``layer.data = ...``, contrast limits, camera, dims)
-    are not wrapped — job code must use :func:`run_on_main` for those.
-    """
-    import functools
-
-    for name in _VIEWER_GUI_METHODS:
-        method = getattr(viewer, name, None)
-        if method is None:
-            continue
-
-        def make(bound):
-            @functools.wraps(bound)
-            def wrapper(*args, **kwargs):
-                if threading.current_thread() is threading.main_thread():
-                    return bound(*args, **kwargs)
-                return run_on_main(bound, *args, **kwargs)
-
-            return wrapper
-
-        # napari.Viewer is a pydantic evented model with validate_assignment;
-        # write through to the instance dict (same bypass _helpers.py uses).
-        object.__setattr__(viewer, name, make(method))
+#
+# The agent-facing ``viewer`` is wrapped by a full main-thread marshaling proxy
+# (``_viewer_proxy.make_viewer_proxy``) rather than the old method-by-method
+# wrap, which leaked any returned handle (``viewer.layers``, ``viewer.dims``,
+# ``viewer.layers[0]``) and let off-main mutations on it segfault Qt
+# (biopb/biopb#100). ``run_on_main`` above remains the marshaling primitive the
+# proxy uses, and is still exposed for power users.
 
 
 def install(ip):
