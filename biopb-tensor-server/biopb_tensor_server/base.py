@@ -227,7 +227,16 @@ class SourceAdapter(ABC):
 
         if is_remote_url(self._source_url):
             return False
-        return not _is_offline_placeholder(Path(self._source_url))
+        path = Path(self._source_url)
+        # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
+        # -- discovery only consults it for files (see should_skip_walk_entry,
+        # which gates it on `not is_dir`). A directory-based source (zarr,
+        # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
+        # (e.g. macOS APFS), so applying the file check to it would wrongly flag
+        # an entirely local store as non-resident. Treat a directory as resident.
+        if path.is_dir():
+            return True
+        return not _is_offline_placeholder(path)
 
 
     def get_tensor_adapter(self, tensor_id: str|None) -> 'TensorAdapter':
