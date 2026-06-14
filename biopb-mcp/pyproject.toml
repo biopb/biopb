@@ -38,6 +38,11 @@ dependencies = [
     # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
     # budget used by mcp/_bootstrap._register_cache_plugin).
     "biopb[tensor] >= 0.6.4",
+    # ome-zarr-py: backs the napari OME-Zarr writers (biopb_mcp._writers, the
+    # `contributions.writers` in napari.yaml). Already arrives transitively via
+    # biopb[tensor], but the writers hard-import it, so a direct dep makes the
+    # requirement explicit.
+    "ome-zarr >= 0.6.1",
     "opencv-python-headless",
     # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
     # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
