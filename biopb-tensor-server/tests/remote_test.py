@@ -1,12 +1,14 @@
 """Unit tests for remote storage abstraction."""
 
 import json
+import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import fsspec
 
+from biopb_tensor_server.discovery import generate_source_id
 from biopb_tensor_server.remote import (
     CredentialProfile,
     CredentialsConfig,
@@ -228,6 +230,53 @@ class TestIsRemoteUrl:
         assert is_remote_url("/local/path") == False
         assert is_remote_url("file:///local/path") == False
         assert is_remote_url("./relative/path") == False
+
+
+class TestGenerateSourceIdRemote:
+    """generate_source_id() must be cwd-independent for remote URLs.
+
+    Path().resolve() treats a URL as a relative path and prepends the cwd,
+    which made remote source_ids non-portable across deployments. Remote URLs
+    are now hashed directly.
+    """
+
+    def test_remote_id_is_cwd_independent(self, tmp_path):
+        url = "s3://bucket/x.zarr"
+        cwd = os.getcwd()
+        try:
+            first = generate_source_id(url, "ome-zarr")
+            os.chdir(tmp_path)
+            second = generate_source_id(url, "ome-zarr")
+        finally:
+            os.chdir(cwd)
+        assert first == second
+
+    def test_remote_id_has_type_prefix(self):
+        sid = generate_source_id("https://example.com/foo.zarr", "ome-zarr")
+        assert sid.startswith("ome-zarr_")
+
+    def test_remote_id_ignores_trailing_slash(self):
+        assert generate_source_id(
+            "s3://bucket/x.zarr", "ome-zarr"
+        ) == generate_source_id("s3://bucket/x.zarr/", "ome-zarr")
+
+    def test_distinct_remote_urls_get_distinct_ids(self):
+        a = generate_source_id("s3://bucket/a.zarr", "ome-zarr")
+        b = generate_source_id("s3://bucket/b.zarr", "ome-zarr")
+        assert a != b
+
+    def test_local_path_still_resolved(self, tmp_path):
+        # A relative local path is resolved against cwd, so it equals the
+        # absolute form of the same target.
+        target = tmp_path / "experiment.zarr"
+        cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            rel = generate_source_id("experiment.zarr", "zarr")
+        finally:
+            os.chdir(cwd)
+        absolute = generate_source_id(str(target), "zarr")
+        assert rel == absolute
 
 
 # =============================================================================

@@ -753,10 +753,17 @@ def generate_source_id(url: str, source_type: str) -> str:
     if url is None or url == "":
         raise ValueError("Cannot generate source_id from empty URL")
 
-    # For local paths, resolve to absolute path for consistency
-    abs_path = str(Path(url).resolve())
+    if is_remote_url(url):
+        # Remote URLs must NOT go through Path().resolve(): it treats the URL as
+        # a relative POSIX path, collapsing the scheme's "//" and prepending the
+        # server's cwd, which makes the id non-deterministic across deployments.
+        # Hash the raw URL (trailing slashes stripped so "x.zarr" == "x.zarr/").
+        key = url.rstrip("/")
+    else:
+        # For local paths, resolve to absolute path for consistency.
+        key = str(Path(url).resolve())
 
-    hash_hex = hashlib.sha256(abs_path.encode()).hexdigest()[:12]
+    hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
     return f"{source_type}_{hash_hex}"
 
 
