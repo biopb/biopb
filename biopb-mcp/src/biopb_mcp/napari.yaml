@@ -14,6 +14,12 @@ contributions:
     - id: biopb-mcp.make_image_processing_widget
       python_name: biopb_mcp.image_processing:ImageProcessingWidget
       title: Image Processing
+    - id: biopb-mcp.write_image_ome_zarr
+      python_name: biopb_mcp._writers:write_image_ome_zarr
+      title: Save Image as OME-Zarr
+    - id: biopb-mcp.write_labels_ome_zarr
+      python_name: biopb_mcp._writers:write_labels_ome_zarr
+      title: Save Labels as OME-Zarr
   widgets:
     - command: biopb-mcp.make_tensor_browser_widget
       display_name: Tensor Browser
@@ -21,3 +27,12 @@ contributions:
       display_name: Object Detection
     - command: biopb-mcp.make_image_processing_widget
       display_name: Image Processing
+  writers:
+    - command: biopb-mcp.write_image_ome_zarr
+      display_name: OME-Zarr (image)
+      layer_types: ["image"]
+      filename_extensions: [".zarr", ".ome.zarr"]
+    - command: biopb-mcp.write_labels_ome_zarr
+      display_name: OME-Zarr (labels)
+      layer_types: ["labels"]
+      filename_extensions: [".zarr", ".ome.zarr"]
