@@ -21,6 +21,16 @@ the layer's dtype preserved (integer for masks). This is simpler than the OME
 spec's nested ``labels/<name>`` group and is exactly what loads back as a
 first-class browsable source through ``OmeZarrAdapter``.
 
+MULTISCALE: a napari *multiscale* layer already holds a resolution pyramid (the
+Tensor Browser / ``add_tensor`` build one via ``_tensor_utils.build_pyramid_levels``).
+We persist those levels as-is -- one OME-Zarr dataset per level -- so the saved
+copy keeps its overviews and round-trips as a *native* pyramid through
+``OmeZarrAdapter`` (which reads each level's NGFF ``scale`` as an integer
+downsample factor). We never *synthesize* a pyramid: a single-resolution layer
+stays single-resolution, and the per-level arrays are written exactly as napari
+holds them (downsampled upstream with a label-safe reduction, so labels stay
+integer-exact without any work here).
+
 FUTURE EXTENSION POINT: the preferred next format is NDTiff (not OME-TIFF). To
 add it, register a new command + writer entry in ``napari.yaml`` pointing at a
 ``write_*_ndtiff`` function here, reusing the ``_derive_axes`` helper below.
@@ -89,13 +99,33 @@ def _derive_axes(ndim: int, meta: dict) -> list[dict[str, str]]:
     return [_axis_dict(name) for name in _derive_dim_labels(ndim, meta)]
 
 
-def _scale_transform(ndim: int, meta: dict) -> list[list[dict[str, Any]]]:
-    """coordinateTransformations from the layer's napari ``scale`` (physical
-    pixel size), defaulting to 1.0 per axis (matches the server convention)."""
+def _base_scale(ndim: int, meta: dict) -> list[float]:
+    """The layer's physical pixel size (napari ``scale``) for level 0, defaulting
+    to 1.0 per axis (matches the server convention)."""
     scale = meta.get("scale")
     if scale is None or len(scale) != ndim:
         scale = [1.0] * ndim
-    return [[{"type": "scale", "scale": [float(s) for s in scale]}]]
+    return [float(s) for s in scale]
+
+
+def _per_level_transforms(levels, meta: dict) -> list[list[dict[str, Any]]]:
+    """One ``coordinateTransformations`` block per pyramid level.
+
+    Level 0 carries the layer's physical pixel size (:func:`_base_scale`); each
+    deeper level multiplies it by the per-axis downsample factor *derived from the
+    real shape ratios* -- correct whichever axes the upstream pyramid shrank
+    (X/Y only, or X/Y/Z) and robust to ceil/floor rounding. With the common
+    unit base scale, the result is clean integer factors (``[1,1]``, ``[4,4]``,
+    ...) that ``OmeZarrAdapter`` reads back as a native pyramid.
+    """
+    base = _base_scale(levels[0].ndim, meta)
+    shape0 = levels[0].shape
+    out: list[list[dict[str, Any]]] = []
+    for lv in levels:
+        factor = [round(s0 / sl) for s0, sl in zip(shape0, lv.shape)]
+        scale = [b * f for b, f in zip(base, factor)]
+        out.append([{"type": "scale", "scale": scale}])
+    return out
 
 
 def _open_group(path: str):
@@ -109,29 +139,39 @@ def _open_group(path: str):
     return zarr.group(store=loc.store, overwrite=True)
 
 
-def _write(path: str, data, meta: dict) -> list[str]:
-    """Write a single napari layer to a standalone OME-Zarr directory at *path*.
+def _resolve_levels(data, meta: dict) -> list:
+    """Normalize napari writer ``data`` to a list of resolution levels.
 
-    ``data`` is the layer array (or a list of arrays for multiscale layers -- we
-    use the full-resolution level and let nothing else through, writing a single
-    resolution so the output matches the server's single-dataset convention and
-    keeps integer label arrays exact).
+    A multiscale layer is signalled by ``meta['multiscale']`` (set by napari's
+    ``Image``/``Labels._get_state``) -- *not* by ``data``'s type: napari passes a
+    ``napari.layers._multiscale_data.MultiScaleData``, a ``collections.abc.Sequence``
+    that is **not** a ``list``/``tuple``. ``list()`` recovers its levels (level 0
+    first); a plain layer yields ``[data]``. We never add levels, so a
+    single-resolution layer (or a 1-level list) stays single-resolution.
     """
-    from ome_zarr.scale import Scaler
-    from ome_zarr.writer import write_image
+    if meta.get("multiscale") or isinstance(data, (list, tuple)):
+        return list(data)
+    return [data]
 
-    level0 = np.asarray(data[0] if isinstance(data, (list, tuple)) else data)
-    ndim = level0.ndim
 
+def _write(path: str, data, meta: dict) -> list[str]:
+    """Write a napari layer to a standalone OME-Zarr directory at *path*.
+
+    Writes one dataset per resolution level the layer already holds (a single
+    dataset for a non-multiscale layer). ``write_multiscale`` handles both level
+    counts and both array kinds -- it streams dask levels via ``da.to_zarr`` (so
+    a large level 0 never materializes) and writes numpy levels directly --
+    keeping integer label arrays exact.
+    """
+    from ome_zarr.writer import write_multiscale
+
+    levels = _resolve_levels(data, meta)
     group = _open_group(path)
-    # max_layer=0 -> a single resolution level "0" (no downsampled pyramid),
-    # keeping axes/coordinateTransformations in lockstep and labels integer-exact.
-    write_image(
-        level0,
+    write_multiscale(
+        levels,
         group,
-        scaler=Scaler(max_layer=0),
-        axes=_derive_axes(ndim, meta),
-        coordinate_transformations=_scale_transform(ndim, meta),
+        axes=_derive_axes(levels[0].ndim, meta),
+        coordinate_transformations=_per_level_transforms(levels, meta),
     )
     return [path]
 
