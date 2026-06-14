@@ -5,9 +5,14 @@ mutations from a *background thread* are marshaled to the Qt main thread (the
 biopb/biopb#100 crash class), the fail-loud guard on raw-Qt objects, and a
 graph-walk tripwire that no napari handle leaks through the proxy unwrapped.
 
-A real napari.Viewer is used (offscreen Qt). To exercise marshaling we run a
-mutation on a worker thread while the (main) test thread pumps the Qt event loop
--- exactly the kernel's job-thread vs. main-thread arrangement.
+These tests deliberately use a headless ``napari.components.ViewerModel`` (pure
+pydantic -- the non-Qt base of ``napari.Viewer``) rather than a full
+``napari.Viewer``: constructing the real viewer's GL canvas segfaults on
+offscreen CI runners (macOS/Windows), and the proxy only needs evented
+models/layers to exercise. Marshaling is checked against a bare ``QApplication``
+(run a mutation on a worker thread while the main thread pumps the Qt loop --
+exactly the kernel's job-thread vs. main-thread arrangement); the raw-Qt guard
+is checked against a ``QObject`` directly, so no napari window is ever built.
 """
 
 import threading
@@ -15,28 +20,29 @@ import time
 
 import numpy as np
 import pytest
+from napari.components import ViewerModel
+from qtpy.QtCore import QObject
 from qtpy.QtWidgets import QApplication
 
 from biopb_mcp.mcp._viewer_proxy import (
     ViewerThreadError,
+    _GuardProxy,
     _is_proxy,
+    _proxy_cls,
     _unwrap,
     make_viewer_proxy,
+    wrap,
 )
 
 
 @pytest.fixture
-def viewer(qtbot):
-    import napari
-
-    v = napari.Viewer(show=False)
-    yield v
-    v.close()
+def vm():
+    return ViewerModel()
 
 
 @pytest.fixture
-def proxy(viewer):
-    return make_viewer_proxy(viewer)
+def proxy(vm):
+    return make_viewer_proxy(vm)
 
 
 def _run_in_worker(fn, timeout=10.0):
@@ -44,6 +50,8 @@ def _run_in_worker(fn, timeout=10.0):
 
     Returns fn's result, or re-raises its exception. Raises TimeoutError if the
     worker never finishes -- which is what a marshaling deadlock would look like.
+    A QApplication must already exist (request the ``qapp`` fixture) so
+    ``run_on_main`` actually marshals instead of falling back to inline.
     """
     box = {}
 
@@ -53,11 +61,13 @@ def _run_in_worker(fn, timeout=10.0):
         except BaseException as exc:  # noqa: BLE001 - relay to the test
             box["error"] = exc
 
+    app = QApplication.instance()
     t = threading.Thread(target=target, daemon=True)
     t.start()
     deadline = time.monotonic() + timeout
     while t.is_alive():
-        QApplication.processEvents()
+        if app is not None:
+            app.processEvents()
         time.sleep(0.005)
         if time.monotonic() > deadline:
             raise TimeoutError("worker did not finish (marshaling deadlock?)")
@@ -70,13 +80,12 @@ def _run_in_worker(fn, timeout=10.0):
 # -- transparency / identity ------------------------------------------------
 
 
-def test_isinstance_transparency(proxy, viewer):
-    import napari
+def test_isinstance_transparency(proxy, vm):
     from napari.components.layerlist import LayerList
 
-    assert isinstance(proxy, napari.components.ViewerModel)
+    assert isinstance(proxy, ViewerModel)
     assert isinstance(proxy.layers, LayerList)
-    assert isinstance(proxy.dims, type(viewer.dims))
+    assert isinstance(proxy.dims, type(vm.dims))
     # type() still reveals the proxy, so internal detection stays reliable.
     assert _is_proxy(proxy)
     assert _is_proxy(proxy.layers)
@@ -84,9 +93,9 @@ def test_isinstance_transparency(proxy, viewer):
 
 
 def test_layer_isinstance(proxy):
-    proxy.add_image(np.zeros((8, 8), dtype=np.uint8))
     import napari.layers
 
+    proxy.add_image(np.zeros((8, 8), dtype=np.uint8))
     layer = proxy.layers[0]
     assert _is_proxy(layer)
     assert isinstance(layer, napari.layers.Image)
@@ -110,53 +119,6 @@ def test_reads_pass_through(proxy):
     assert not _is_proxy(data)
 
 
-# -- marshaling from a worker thread (the #100 crash class) ------------------
-
-
-def test_layers_clear_from_worker(proxy, viewer):
-    """The exact biopb/biopb#100 repro: layers.clear() off the main thread.
-
-    Previously this ran the layer-removal cascade -> QtDims widget mutation on
-    the worker thread and segfaulted the process. Now it must be marshaled.
-    """
-    proxy.add_image(np.zeros((8, 8)))
-    proxy.add_image(np.zeros((8, 8)))
-    assert len(viewer.layers) == 2
-
-    _run_in_worker(proxy.layers.clear)
-    assert len(viewer.layers) == 0
-
-
-def test_assorted_mutations_from_worker(proxy, viewer):
-    # add_image from a worker returns a wrapped layer
-    layer = _run_in_worker(lambda: proxy.add_image(np.zeros((6, 6), np.uint8)))
-    assert _is_proxy(layer)
-    assert len(viewer.layers) == 1
-
-    # attribute mutation (the kind the add_*-only wrap missed)
-    _run_in_worker(lambda: setattr(layer, "opacity", 0.25))
-    assert viewer.layers[0].opacity == pytest.approx(0.25)
-
-    # data replacement
-    new = np.ones((10, 10), np.uint8)
-    _run_in_worker(lambda: setattr(layer, "data", new))
-    assert viewer.layers[0].data.shape == (10, 10)
-
-    # dims mutation (scrubbing)
-    proxy.add_image(np.zeros((3, 6, 6)))
-    _run_in_worker(lambda: proxy.dims.set_current_step(0, 2))
-    assert viewer.dims.current_step[0] == 2
-
-    # a layer-type-specific mutating method, reached via __getattr__
-    pts = _run_in_worker(lambda: proxy.add_points(np.array([[1.0, 1.0]])))
-    _run_in_worker(lambda: pts.add(np.array([[2.0, 2.0]])))
-    assert len(viewer.layers[-1].data) == 2
-
-    # del viewer.layers[i]
-    _run_in_worker(lambda: proxy.layers.__delitem__(0))
-    assert len(viewer.layers) == 2
-
-
 def test_container_iteration_wraps(proxy):
     proxy.add_image(np.zeros((4, 4)))
     proxy.add_image(np.zeros((4, 4)))
@@ -164,19 +126,84 @@ def test_container_iteration_wraps(proxy):
     assert all(_is_proxy(layer) for layer in proxy.layers[:])
 
 
+# -- marshaling from a worker thread (the #100 crash class) ------------------
+
+
+def test_run_on_main_marshals(qapp):
+    from biopb_mcp.mcp._jobs import run_on_main
+
+    box = {}
+
+    def worker():
+        box["ran_on"] = run_on_main(lambda: threading.current_thread())
+        box["worker"] = threading.current_thread()
+
+    _run_in_worker(worker)
+    assert box["ran_on"] is threading.main_thread()
+    assert box["worker"] is not threading.main_thread()
+
+
+def test_layers_clear_from_worker(qapp, proxy, vm):
+    """The biopb/biopb#100 crash shape: layers.clear() off the main thread.
+
+    On a real viewer this ran the layer-removal cascade -> QtDims widget
+    mutation on the worker thread and segfaulted; with the proxy it must be
+    marshaled to the main thread (here verified functionally on a ViewerModel).
+    """
+    proxy.add_image(np.zeros((8, 8)))
+    proxy.add_image(np.zeros((8, 8)))
+    assert len(vm.layers) == 2
+
+    _run_in_worker(proxy.layers.clear)
+    assert len(vm.layers) == 0
+
+
+def test_assorted_mutations_from_worker(qapp, proxy, vm):
+    # add_image from a worker returns a wrapped layer
+    layer = _run_in_worker(lambda: proxy.add_image(np.zeros((6, 6), np.uint8)))
+    assert _is_proxy(layer)
+    assert len(vm.layers) == 1
+
+    # attribute mutation (the kind the add_*-only wrap missed)
+    _run_in_worker(lambda: setattr(layer, "opacity", 0.25))
+    assert vm.layers[0].opacity == pytest.approx(0.25)
+
+    # data replacement
+    new = np.ones((10, 10), np.uint8)
+    _run_in_worker(lambda: setattr(layer, "data", new))
+    assert vm.layers[0].data.shape == (10, 10)
+
+    # dims mutation (scrubbing)
+    proxy.add_image(np.zeros((3, 6, 6)))
+    _run_in_worker(lambda: proxy.dims.set_current_step(0, 2))
+    assert vm.dims.current_step[0] == 2
+
+    # a layer-type-specific mutating method, reached via __getattr__
+    pts = _run_in_worker(lambda: proxy.add_points(np.array([[1.0, 1.0]])))
+    _run_in_worker(lambda: pts.add(np.array([[2.0, 2.0]])))
+    assert len(vm.layers[-1].data) == 2
+
+    # del viewer.layers[i]
+    _run_in_worker(lambda: proxy.layers.__delitem__(0))
+    assert len(vm.layers) == 2
+
+
 # -- fail-loud guard on raw Qt ----------------------------------------------
 
 
-def test_window_guard_off_thread_raises(proxy):
-    # Reaching into the raw Qt widget tree from a worker must raise, not segfault.
-    with pytest.raises(ViewerThreadError):
-        _run_in_worker(lambda: proxy.window.qt_viewer)
+def test_qt_object_is_guarded(qapp):
+    # A Qt object is classified for the fail-loud guard, not passed through.
+    assert _proxy_cls(QObject()) is _GuardProxy
 
 
-def test_window_accessible_on_main(proxy):
+def test_guard_passthrough_on_main_raises_off_thread(qapp):
+    guard = wrap(QObject())
+    assert _is_proxy(guard)
     # On the main thread the guard passes through (e.g. inside run_on_main).
-    assert proxy.window is not None
-    _ = proxy.window.qt_viewer  # no raise on the main thread
+    assert guard.objectName() == ""
+    # Off the main thread any access raises instead of touching raw Qt.
+    with pytest.raises(ViewerThreadError):
+        _run_in_worker(lambda: guard.objectName())
 
 
 # -- tripwire: no napari handle leaks through the proxy ----------------------
@@ -219,7 +246,7 @@ def test_no_handle_leaks_through_proxy(proxy):
         for name in getattr(type(real), "model_fields", {}):
             try:
                 child = getattr(value, name)
-            except Exception:  # noqa: BLE001 - some fields are not always live
+            except Exception:  # noqa: BLE001 - some fields aren't always live
                 continue
             visit(child, f"{path}.{name}")
         if isinstance(real, (EventedList, Selection)):
