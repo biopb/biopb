@@ -66,6 +66,32 @@ public class TensorFlightClientUtilTest {
         assertEquals("plate_x", TensorFlightClient.sourceIdFromArrayId("plate_x/A01/0"));
     }
 
+    @Test
+    public void testResolveArrayIdBareSource() {
+        // bare source_id -> {source_id, null}: tensorId unset so getTensor
+        // resolves the source's sole/default tensor
+        String[] route = TensorFlightClient.resolveArrayId("zarr_a3f2");
+        assertEquals("zarr_a3f2", route[0]);
+        assertNull(route[1]);
+    }
+
+    @Test
+    public void testResolveArrayIdQualified() {
+        // qualified source_id/field -> {source_id, full-array_id}
+        String[] route = TensorFlightClient.resolveArrayId("aics_7f3/Image:0");
+        assertEquals("aics_7f3", route[0]);
+        assertEquals("aics_7f3/Image:0", route[1]);
+    }
+
+    @Test
+    public void testResolveArrayIdHierarchicalField() {
+        // HCS field carries its own '/': source boundary is the FIRST '/', and
+        // the full array_id is preserved as the tensorId
+        String[] route = TensorFlightClient.resolveArrayId("plate_x/A01/0");
+        assertEquals("plate_x", route[0]);
+        assertEquals("plate_x/A01/0", route[1]);
+    }
+
     // We can test bytesPerElement and createType by examining the types they create
 
     @Test
