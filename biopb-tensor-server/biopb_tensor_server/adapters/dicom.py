@@ -13,7 +13,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.discovery import (
+    ClaimContext,
+    SourceClaim,
+    _is_offline_placeholder,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -111,6 +115,19 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
         name = ctx.name.lower()
         if not (name.endswith('.dcm') or name.endswith('.dicom')):
             return None
+
+        # Cloud-storage phase 2: reading the DICOM header (even
+        # stop_before_pixels) recalls a non-resident placeholder. Defer the
+        # header read + Rows/Columns validation; claim by extension and resolve
+        # on first access.
+        if not ctx.is_resident():
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type="dicom",
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+                unresolved=True,
+            )
 
         try:
             import pydicom
@@ -389,6 +406,21 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         # Need at least 2 files for a series
         if len(dcm_files) < 2:
             return None
+
+        # Cloud-storage phase 2: the series scan dcmread's EVERY slice header to
+        # group by SeriesInstanceUID -- N whole-file recalls on a cloud-placeholder
+        # directory (the doc's worst case). If any slice is non-resident, defer:
+        # claim the directory provisionally as a dicom-series (recognized by >=2
+        # .dcm files) and rebuild the SeriesInstanceUID grouping on first access.
+        if any(_is_offline_placeholder(f) for f in dcm_files):
+            state.try_claim_path(ctx.path_str)
+            for f in dcm_files:
+                state.try_claim_path(f)
+            return SourceClaim(
+                source_type="dicom-series",
+                primary_path=ctx.path_str,
+                unresolved=True,
+            )
 
         try:
             import pydicom

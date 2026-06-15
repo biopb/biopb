@@ -166,6 +166,33 @@ class TestConnect:
         assert len(result) == 2
         assert conn.sources == result
 
+    def test_resolve_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.resolve_source("cloud_x")
+
+    def test_resolve_source_delegates_and_refreshes(self, monkeypatch):
+        # resolve() returns the resolved descriptor; the connection then re-lists
+        # so its snapshot carries the now-populated field set.
+        resolved = MagicMock(name="resolved-descriptor")
+        client = _fake_client({"cloud_x": MagicMock()})
+        client.resolve.return_value = resolved
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        full = {"cloud_x": MagicMock(), "other": MagicMock()}
+        client.list_sources.return_value = full
+
+        out = conn.resolve_source("cloud_x")
+
+        client.resolve.assert_called_once_with("cloud_x")
+        assert out is resolved  # the resolved descriptor is returned verbatim
+        assert conn.sources == full  # snapshot refreshed via list_sources()
+
 
 # ---------------------------------------------------------------------------
 # readiness gating (issue #12): STARTING vs SERVING vs down

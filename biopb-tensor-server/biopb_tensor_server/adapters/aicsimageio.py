@@ -887,6 +887,18 @@ class OmeTiffAdapter(_AicsImageIoAdapterBase):
             except ImportError:
                 return None
 
+            # Cloud-storage phase 2: a non-resident companion placeholder cannot be
+            # read without a recall. A .companion.ome unambiguously marks an
+            # OME-TIFF set, so claim it provisionally and defer member enumeration
+            # (the multi-file grouping) to first access.
+            if not ctx.is_resident():
+                state.try_claim_path(ctx.path_str)
+                return SourceClaim(
+                    source_type=cls.SOURCE_TYPE,
+                    primary_path=ctx.path_str,
+                    unresolved=True,
+                )
+
             ome_metadata = ctx.read_text()
             if ome_metadata:
                 related_files = _extract_files_from_ome_xml(
@@ -909,6 +921,13 @@ class OmeTiffAdapter(_AicsImageIoAdapterBase):
             not ctx.is_remote
             and ctx._path is not None
             and (name.endswith(".tif") or name.endswith(".tiff"))
+            # Cloud-storage phase 2: the embedded-OME-XML sniff opens the whole
+            # TIFF (a recall on a non-resident placeholder). Skip it when the file
+            # is not resident: the generic extension-only AicsImageIoAdapter then
+            # claims the .tif as an unresolved image. Any multi-file OME-TIFF
+            # grouping degrades to per-file (a documented cloud limitation -- the
+            # recommended cloud path is to transcode to OME-Zarr).
+            and ctx.is_resident()
         ):
             ome_metadata = _get_ome_metadata_from_tiff(ctx._path, ctx.signature)
 

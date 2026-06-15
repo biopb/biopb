@@ -430,6 +430,80 @@ monitor = true  # Enable live filesystem monitoring
 
 Only local directories can be monitored (remote URLs not supported).
 
+#### Cloud / synced-folder sources (`cloud = true`, cloud-storage phase 2)
+
+```toml
+[[sources]]
+url = "/home/u/OneDrive/microscopy/"
+cloud = true   # admit dehydrated (offline-placeholder) data as *unresolved* sources
+```
+
+On a synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand"), data appears as
+local paths but content is *dehydrated* until accessed — and reading any byte
+recalls the **whole** file (slow, refills the disk, blocks offline). The default
+discovery guard therefore **skips** every offline placeholder
+(`_is_offline_placeholder`, `discovery.py`), so cloud data is normally never
+catalogued. `cloud = true` opts one configured root into the phase-2 model:
+
+- **Admit, don't skip.** Under a cloud root the walk passes `admit_nonresident`
+  to `should_skip_walk_entry`, so dehydrated entries reach `claim()` instead of
+  being pruned. The hidden/system-dir prunes still apply.
+- **Recall-free claim.** Every `claim()` recognizes a source from name + `stat` +
+  `exists` + directory layout only. The adapters that *read* a sidecar/container
+  to recognize a format (OME-Zarr `.zattrs`, MicroManager `metadata.txt`,
+  OME-TIFF sniff, DICOM single + series) guard that read with
+  `ClaimContext.is_resident()` and, when the target is non-resident, emit a
+  **provisional, `unresolved=True`** claim that defers the read. (`is_resident()`
+  is recall-free — the same stat signal — and treats directories as resident, so
+  it never opens content. The content-free extension-only adapters need no
+  change; a `cloud_phase2_test` guard pins that they stay read-free.)
+- **Register unresolved.** `SourceManager._claim_is_unresolved` registers such a
+  source behind an `UnresolvedSourceAdapter` (`adapters/unresolved.py`) — a
+  catalog row with empty `tensors` / `data_resident = false`. This is also how a
+  content-free *file* source (NIfTI, CZI, …) under a cloud root is deferred: its
+  `claim()` never reads, but a non-resident content file (member-path placeholder
+  stat, `is_file`-guarded so a directory's `st_blocks == 0` is never a false hit)
+  flags it. The check is cloud-gated, so a normal local source is never marked
+  unresolved.
+- **Full-scan, no stability gate (the watcher path).** A cloud directory root is
+  driven through the same periodic monitored rescan as `monitor = true` (routed in
+  `cli.py`), but cloud-gated: `_scan_tree_state` passes `admit_nonresident`,
+  **never prunes a cloud subtree** on its (unreliable) mtime signature, and
+  `_should_scan_resolved` **bypasses the stability window and the
+  open-for-append probe** for cloud entries. The probe (`_can_open_for_append`)
+  opens the file — a whole-file recall on a placeholder — so skipping it is
+  load-bearing, not an optimization; the mtime/age gate is skipped because
+  archived dehydrated data is inherently stable and cloud mtime is untrustworthy
+  (§1.2). A fresh cloud dataset is therefore catalogued on the first rescan.
+- **Pre-cache stays out of cloud (natural protection).** The background pre-cache
+  worker loops `list_tensor_descriptors()` and consults `has_native_pyramid()` —
+  both empty/False on the unresolved proxy — so `_process_source` returns before
+  it ever reaches the resolving `get_tensor_adapter`. An unresolved source is thus
+  never warmed/hydrated in the background. (The explicit `is_resident()` skip gate
+  for the *post-resolution* re-warm backfire is phase 4; it cannot manifest in
+  phase 2, whose resolution is in-memory and consented.)
+- **Resolve on serve.** The proxy splits into a *catalog* surface
+  (`list_tensor_descriptors`/`get_source_descriptor`/`has_native_pyramid`) that
+  never resolves — keeping ListFlights, the metadata-DB sync, and the precache
+  worker cheap (precache loops the empty tensor list and skips before any serving
+  call) — and a *serve* surface (`get_tensor_adapter`) that **is** the consented
+  resolution hook. The first `GetFlightInfo` hydrates: it re-runs the real claim
+  + `create_from_config` on the now-resident path (the recorded `source_type` was
+  a recall-free guess; the authoritative one comes from the hydrated content),
+  caches the real adapter, fires `on_resolved` (the metadata-DB backfill —
+  `sync_source_added` is an upsert, so the NULL-shape row is overwritten in
+  place), and delegates thereafter. Resolution runs once under a lock; failure
+  raises `SourceUnresolvedError` → `FlightUnavailableError` at the read boundary.
+
+**Known limitation (accepted).** Multi-file monolithic formats — multi-file
+OME-TIFF (members enumerated from the deferred OME-XML sniff) and DICOM series
+(grouped by reading every slice header) — degrade on cloud: at scan their member
+*grouping* is deferred, so sibling files may be claimed individually until first
+access reconstructs the set. This matches §9 of `docs/cloud-storage-support.md`
+(pyramidal/chunked OME-Zarr is the supported cloud path; **transcode monoliths
+to OME-Zarr at archive time**). Phase-2 resolution is in-memory only; surviving a
+restart (file-backed metadata DB) is phase 3.
+
 #### Shutdown Sequence
 
 ```python

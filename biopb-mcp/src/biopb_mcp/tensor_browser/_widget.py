@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-from qtpy.QtCore import Qt, QTimer, Signal
+from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QApplication,
@@ -23,6 +23,8 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -95,6 +97,41 @@ _REMOTE_TOOLTIP = (
     "reading it may be slow or block until it is hydrated"
 )
 _RESIDENT_TOOLTIP = "Resident — content is local and cheap to read"
+
+
+def _is_unresolved(src: DataSourceDescriptor) -> bool:
+    """A source whose content has not been resolved yet: its field list is empty,
+    so shape/dtype are unknown until the server hydrates it (the cloud / synced-
+    folder case). Resolving such a source downloads its whole file, so it is an
+    explicit, blocking action rather than something browsing triggers."""
+    return len(src.tensors) == 0
+
+
+class _ResolveWorker(QThread):
+    """Runs the blocking ``TensorConnection.resolve_source`` off the GUI thread.
+
+    Resolving a cloud source downloads the whole file (a recall that can take
+    minutes), so it must not run on the Qt event loop. This thread does the work
+    and reports back via signals; the widget keeps a modal progress dialog up
+    until one fires, so the user is blocked (cannot act elsewhere) but the app
+    stays painted and responsive — leaving room to add a progress bar / cancel.
+    """
+
+    resolved = Signal(object)  # the refreshed DataSourceDescriptor
+    failed = Signal(str)
+
+    def __init__(self, conn: TensorConnection, source_id: str):
+        super().__init__()
+        self._conn = conn
+        self._source_id = source_id
+
+    def run(self):
+        try:
+            descriptor = self._conn.resolve_source(self._source_id)
+        except Exception as exc:  # surface the SDK/server message to the user
+            self.failed.emit(str(exc))
+            return
+        self.resolved.emit(descriptor)
 
 
 def _residency_state(src: DataSourceDescriptor) -> str | None:
@@ -416,6 +453,12 @@ class TensorBrowserWidget(QWidget):
 
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # In-flight resolve workers, owned by thread lifetime: a worker is held
+        # here from start() until its `finished` fires (then discarded +
+        # deleteLater'd). A set, not a single slot, so overlapping resolves can't
+        # clobber each other's only ref and get the QThread GC'd / destroyed while
+        # still running -- important once a non-modal progress/cancel lets two run.
+        self._resolve_workers: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -888,6 +931,11 @@ class TensorBrowserWidget(QWidget):
         else:
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             src = self._sources.get(source_id)
+            if src and _is_unresolved(src):
+                # Cloud / unresolved source: double-click triggers an explicit,
+                # consented resolve (downloads the file), not a viewer add.
+                self._resolve_source(source_id)
+                return
             if src and len(src.tensors) == 1 and src.tensors[0]:
                 self._selected_source_id = source_id
                 self._selected_tensor_id = src.tensors[0].array_id
@@ -914,14 +962,16 @@ class TensorBrowserWidget(QWidget):
             tensor_id = item.data(0, Qt.ItemDataRole.UserRole)
             source_id = item.data(0, Qt.ItemDataRole.UserRole + 2)
             is_multi_tensor_source = False
+            is_unresolved_source = False
         else:
             source_id = item.data(0, Qt.ItemDataRole.UserRole)
             src = self._sources.get(source_id)
+            is_unresolved_source = src is not None and _is_unresolved(src)
             if src and len(src.tensors) == 1 and src.tensors[0]:
                 tensor_id = src.tensors[0].array_id
                 is_multi_tensor_source = False
             else:
-                # Multi-tensor source
+                # Multi-tensor or unresolved source
                 tensor_id = None
                 is_multi_tensor_source = (
                     src is not None and len(src.tensors) > 1
@@ -929,8 +979,14 @@ class TensorBrowserWidget(QWidget):
 
         menu = QMenu(self)
 
-        # View action - single tensor or "View all" for multi-tensor source
-        if is_multi_tensor_source:
+        # Primary action: Resolve (unresolved/cloud), "View all" (multi-tensor),
+        # or "View" (single tensor).
+        if is_unresolved_source:
+            resolve_action = menu.addAction("Resolve (downloads file)…")
+            resolve_action.triggered.connect(
+                lambda: self._resolve_source(source_id)
+            )
+        elif is_multi_tensor_source:
             view_action = menu.addAction("View all")
             view_action.triggered.connect(
                 lambda: self._view_all_tensors(source_id)
@@ -951,6 +1007,76 @@ class TensorBrowserWidget(QWidget):
         )
 
         menu.exec_(self._tree_widget.mapToGlobal(pos))
+
+    def _resolve_source(self, source_id: str):
+        """Warn, then resolve an unresolved (cloud) source off the GUI thread.
+
+        Resolving downloads the source's whole file, so we (1) take explicit
+        consent via a modal warning, then (2) run the blocking resolve in a worker
+        thread behind a modal progress dialog — the user is blocked from other
+        actions but the UI stays painted — and (3) on success repopulate the tree
+        from the now-resolved field list. The repopulate is necessary because
+        resolution does not change the server ``source_count``, so the background
+        watcher won't pick it up (issue #44); we refresh explicitly here.
+        """
+        src = self._sources.get(source_id)
+        if not src or not self._conn.is_connected:
+            return
+
+        parts = _get_path_parts(src.source_url)
+        name = parts[-1] if parts else source_id
+
+        confirm = QMessageBox.warning(
+            self,
+            "Resolve cloud source",
+            f"Resolving “{name}” downloads the entire file from remote "
+            f"storage.\n\nThis may take several minutes, use local disk space, "
+            f"and will not work offline. Continue?",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if confirm != QMessageBox.Ok:
+            return
+
+        self._clear_error()
+
+        # Indeterminate, modal, no cancel button (room to add a real progress bar
+        # / cancel once the SDK can report/abort the download).
+        progress = QProgressDialog(
+            f"Resolving “{name}”…", None, 0, 0, self
+        )
+        progress.setWindowTitle("Resolving")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        worker = _ResolveWorker(self._conn, source_id)
+        # Own the worker by its thread lifetime (held until `finished`), so a
+        # later/overlapping resolve can't drop its only ref and have the QThread
+        # destroyed mid-run.
+        self._resolve_workers.add(worker)
+
+        def _on_resolved(_descriptor):
+            progress.close()
+            # The connection snapshot was refreshed by resolve_source(); re-render
+            # through _apply_filter so any active search text is preserved and the
+            # resolved source now shows its shape badge / field children.
+            self._apply_filter()
+
+        def _on_failed(message):
+            progress.close()
+            self._show_error(f"Resolve failed: {message}")
+
+        worker.resolved.connect(_on_resolved)
+        worker.failed.connect(_on_failed)
+        worker.finished.connect(lambda: self._resolve_workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        # Modal: blocks here (event loop still runs, dialog stays painted) until a
+        # slot above calls progress.close(). The worker's queued signal is
+        # delivered inside this exec_, so a fast finish can't deadlock.
+        progress.exec_()
 
     def _view_tensor(self, source_id: str, tensor_id: str):
         """Add single tensor to viewer."""
