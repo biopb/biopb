@@ -20,10 +20,63 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import sys
 import tempfile
 
 logger = logging.getLogger(__name__)
+
+
+def _port_listening(port, timeout=0.5):
+    """Whether something already accepts TCP connections on 127.0.0.1:<port>."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _write_pidfile(port):
+    """Best-effort: record this daemon's PID so `biopb mcp status` finds it.
+
+    The PID file is the one signal `status` trusts, and the stdio shim spawns
+    the daemon detached without writing it — so the daemon registers itself
+    here, covering every launch path uniformly. Best-effort: a write failure
+    only costs `status` visibility, never the server.
+
+    Concurrent first-run shims can each spawn a daemon; only the one that binds
+    the port survives (the rest die on EADDRINUSE). Re-checking the port
+    immediately before writing keeps a soon-to-die loser from clobbering the
+    winner's PID; pid-safe removal (see :func:`_remove_pidfile`) keeps a loser's
+    exit from deleting the winner's file.
+    """
+    from .._config import get_pid_file
+
+    pidfile = get_pid_file()
+    try:
+        if _port_listening(port):
+            # Someone already owns the port; we are about to lose the bind.
+            return None
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text(str(os.getpid()))
+        return pidfile
+    except OSError:
+        logger.warning("Could not write PID file %s", pidfile, exc_info=True)
+        return None
+
+
+def _remove_pidfile(pidfile):
+    """Remove our PID file, but only if it still names this process.
+
+    Pid-safe so a losing daemon's exit never deletes the winner's file.
+    """
+    if pidfile is None:
+        return
+    try:
+        if pidfile.read_text().strip() == str(os.getpid()):
+            pidfile.unlink()
+    except (OSError, ValueError):
+        pass
 
 
 def _parse_args(argv, default_transport, default_port):
@@ -287,9 +340,16 @@ def _serve_http(config, port):
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
+    # Register the daemon's PID so `biopb mcp status` can detect it no matter
+    # how it was launched (CLI, stdio shim, or manual). Written just before the
+    # bind below; removed pid-safely on every exit path.
+    pidfile = _write_pidfile(port)
+    atexit.register(_remove_pidfile, pidfile)
+
     def _handle_signal(signum, frame):
         logger.info("Received signal %s, shutting down.", signum)
         host.shutdown()
+        _remove_pidfile(pidfile)
         _cleanup_dask_dir()
         # Skip Python finalization: this process still has a live asyncio/epoll
         # event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -315,6 +375,7 @@ def _serve_http(config, port):
     # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
     # os._exit, so shut down explicitly here).
     host.shutdown()
+    _remove_pidfile(pidfile)
     _cleanup_dask_dir()
     os._exit(0)
 
