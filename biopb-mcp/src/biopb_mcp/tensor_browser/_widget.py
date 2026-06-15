@@ -453,6 +453,12 @@ class TensorBrowserWidget(QWidget):
 
         # Set up widget
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # In-flight resolve workers, owned by thread lifetime: a worker is held
+        # here from start() until its `finished` fires (then discarded +
+        # deleteLater'd). A set, not a single slot, so overlapping resolves can't
+        # clobber each other's only ref and get the QThread GC'd / destroyed while
+        # still running -- important once a non-modal progress/cancel lets two run.
+        self._resolve_workers: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -1046,7 +1052,10 @@ class TensorBrowserWidget(QWidget):
         progress.setValue(0)
 
         worker = _ResolveWorker(self._conn, source_id)
-        self._resolve_worker = worker  # keep a ref so it isn't GC'd mid-run
+        # Own the worker by its thread lifetime (held until `finished`), so a
+        # later/overlapping resolve can't drop its only ref and have the QThread
+        # destroyed mid-run.
+        self._resolve_workers.add(worker)
 
         def _on_resolved(_descriptor):
             progress.close()
@@ -1061,6 +1070,7 @@ class TensorBrowserWidget(QWidget):
 
         worker.resolved.connect(_on_resolved)
         worker.failed.connect(_on_failed)
+        worker.finished.connect(lambda: self._resolve_workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
         # Modal: blocks here (event loop still runs, dialog stays painted) until a

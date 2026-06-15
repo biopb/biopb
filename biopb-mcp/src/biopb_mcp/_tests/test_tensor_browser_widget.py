@@ -405,6 +405,51 @@ class TestResolveAction:
         w._show_error.assert_called_once()
         assert "offline" in w._show_error.call_args[0][0]
 
+    def test_overlapping_workers_are_each_retained(self, widget, monkeypatch):
+        # Two in-flight workers must not clobber each other's only ref (which
+        # would let a still-running QThread be GC'd / destroyed mid-run). We hold
+        # them by thread lifetime in a set, discarded on `finished`.
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w, conn, _ = widget
+        conn.is_connected = True
+        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+        monkeypatch.setattr(
+            widget_mod.QMessageBox,
+            "warning",
+            staticmethod(lambda *a, **k: widget_mod.QMessageBox.Ok),
+        )
+        monkeypatch.setattr(widget_mod, "QProgressDialog", _FakeProgress)
+
+        made = []
+
+        class _PendingWorker:
+            """Starts but never emits resolved/failed/finished (stays in flight)."""
+
+            def __init__(self, conn_, source_id):
+                self.resolved = _Sig()
+                self.failed = _Sig()
+                self.finished = _Sig()
+                made.append(self)
+
+            def start(self):
+                pass
+
+            def deleteLater(self):
+                pass
+
+        monkeypatch.setattr(widget_mod, "_ResolveWorker", _PendingWorker)
+
+        w._resolve_source("cloud_x")
+        w._resolve_source("cloud_x")
+
+        # Both workers are alive (neither dropped); discard happens on `finished`.
+        assert len(made) == 2
+        assert set(made) == w._resolve_workers
+        for worker in made:  # finishing one removes only itself
+            worker.finished.emit()
+        assert w._resolve_workers == set()
+
     def test_double_click_routes_unresolved_to_resolve(self, widget, monkeypatch):
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
