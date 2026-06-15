@@ -205,6 +205,23 @@ class SourceAdapter(ABC):
             data_resident=self.is_resident(),
         )
 
+    def resolve(self) -> DataSourceDescriptor:
+        """Hydrate this source if needed, then return its full descriptor.
+
+        This is the ONE consented entry point that may perform an extended,
+        blocking recall (e.g. downloading a whole cloud / synced-folder file).
+        It is the sole resolution trigger: the serve paths (get_tensor_adapter ->
+        GetFlightInfo / DoGet) never resolve on their own -- they raise
+        SourceUnresolvedError on an unresolved source so the only thing that
+        downloads is an explicit ``resolve``.
+
+        For an already-resident source this is a cheap no-op that just returns the
+        current descriptor (idempotent), so the server's ``resolve`` action works
+        uniformly across all source kinds. ``UnresolvedSourceAdapter`` overrides
+        it to actually hydrate.
+        """
+        return self.get_source_descriptor()
+
     def is_resident(self) -> bool:
         """Best-effort, recall-free: is this source's content local and cheap to
         read right now?

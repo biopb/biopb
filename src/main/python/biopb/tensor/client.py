@@ -1373,9 +1373,12 @@ class TensorFlightClient:
 
         Backs the public ``get_descriptor`` (the array_id-keyed primitive) and
         the deprecated ``get_source``. Uses the per-tensor ``GetFlightInfo`` RPC,
-        so it resolves a source even when it is beyond the (truncatable)
+        which works even when the source is beyond the (truncatable)
         ``list_sources()`` cap. ``tensor_id`` unset/empty -> the source's default
-        (first) tensor, resolved server-side (#44).
+        (first) tensor (#44). This is a CHEAP probe: it does NOT resolve. An
+        unresolved (cloud / synced-folder) source raises the directive
+        ``_unresolved_source_error`` steering the caller to :meth:`resolve`,
+        rather than triggering a download.
 
         The descriptor is cached in ``self._descriptors`` (keyed by the
         echoed-back array_id). ``self._sources`` is intentionally NOT touched, so
@@ -1393,7 +1396,18 @@ class TensorFlightClient:
             read_opt.tensor_id = tensor_id
         cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
         fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._client.get_flight_info(fd, options=self._call_options)
+        try:
+            info = self._client.get_flight_info(fd, options=self._call_options)
+        except flight.FlightUnavailableError as exc:
+            # GetFlightInfo no longer resolves on serve: an unresolved (cloud /
+            # synced-folder) source now refuses with FlightUnavailableError
+            # ("Source unresolved ...") instead of silently downloading. Make this
+            # a cheap steering probe -- restate it as the shared directive so
+            # get_descriptor / get_source point the caller at the explicit,
+            # consented resolve(), consistent with get_tensor / get_physical_scale.
+            if "unresolved" in str(exc).lower():
+                raise _unresolved_source_error(source_id) from exc
+            raise
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
         self._descriptors[
             self._descriptor_key(source_id, tensor_desc.array_id)
@@ -1413,8 +1427,13 @@ class TensorFlightClient:
         Works even when the source is beyond the (truncatable) ``list_sources()``
         cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
         source, or to anchor on a multi-tensor source's default/first tensor) is
-        accepted and resolves server-side. To enumerate ALL tensors/scenes of a
-        source, use ``list_sources()[source_id].tensors`` -- NOT this method.
+        accepted. To enumerate ALL tensors/scenes of a source, use
+        ``list_sources()[source_id].tensors`` -- NOT this method.
+
+        This is a CHEAP probe -- it does NOT resolve. On an unresolved (cloud /
+        synced-folder) source it raises a directive error pointing at
+        :meth:`resolve`, never triggering a download. Call :meth:`resolve` first
+        to read such a source.
 
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
@@ -1448,25 +1467,30 @@ class TensorFlightClient:
             source_id: The source to resolve (e.g. ``"onedrive_a3f2"``).
 
         Returns:
-            The full ``DataSourceDescriptor`` with every tensor/field enumerated.
-            (:meth:`get_descriptor` alone returns only the default/first tensor;
-            this re-lists so the complete field set is populated.)
+            The full ``DataSourceDescriptor`` with every tensor/field enumerated
+            -- the complete field set in one call, regardless of catalog size.
         """
-        # Trigger server-side resolve-on-serve via a per-tensor GetFlightInfo on
-        # the default tensor (empty tensor_id, #44). This hydrates the source and
-        # backfills the server catalog. The returned single-tensor descriptor is
-        # cached, but is not the full picture: a multi-field source enumerates its
-        # scenes only through list_flights, so re-list to populate them all.
-        td = self._fetch_tensor_descriptor(source_id)
-        full = self.list_sources().get(source_id)
-        if full is not None:
-            return full
-        # Catalog truncated past this source (max_list_flights_results): fall back
-        # to the single resolved tensor so the source is at least usable, and seed
-        # the cache so a following get_tensor() resolves without re-fetching.
-        fallback = DataSourceDescriptor(source_id=source_id, tensors=[td])
-        self._sources[source_id] = fallback
-        return fallback
+        # One dedicated, streaming ``resolve`` action: it is the SINGLE server
+        # entry point that performs the (possibly minutes-long) recall, and it
+        # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
+        # list_sources two-step, so no truncation hole for multi-field sources
+        # beyond the list cap. The action streams empty-body heartbeat Results to
+        # keep the connection warm under proxy idle timeouts; the single
+        # non-empty terminal Result carries the serialized descriptor.
+        action = flight.Action("resolve", source_id.encode("utf-8"))
+        payload = b""
+        for result in self._client.do_action(action, options=self._call_options):
+            body = result.body.to_pybytes()
+            if body:  # non-empty == terminal descriptor; empty == heartbeat
+                payload = body
+        if not payload:
+            raise RuntimeError(
+                f"resolve('{source_id}') returned no descriptor "
+                "(server closed the stream without a result)"
+            )
+        desc = DataSourceDescriptor.FromString(payload)
+        self._sources[source_id] = desc
+        return desc
 
     def get_source(
         self,

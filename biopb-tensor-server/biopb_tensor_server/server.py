@@ -41,6 +41,12 @@ from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
 
+# How often the ``resolve`` action emits an (empty-body) heartbeat Result while a
+# resolution is in flight. Kept well under common proxy idle read timeouts
+# (nginx ``grpc_read_timeout`` defaults to 60s) so a minutes-long recall doesn't
+# get its stream reset.
+_RESOLVE_HEARTBEAT_SECONDS = 15.0
+
 
 def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
     count = 1
@@ -567,8 +573,60 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError("Cache not initialized")
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
+        elif action.type == "resolve":
+            source_id = action.body.to_pybytes().decode("utf-8")
+            self._authorize_source(context, source_id)
+            yield from self._handle_resolve(source_id)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
+        """Stream the result of resolving a source.
+
+        Resolution is the ONE consented, possibly minutes-long recall (it may
+        download a whole cloud / synced-folder file). It runs on a daemon thread
+        so this handler can emit empty-body heartbeat Results while it blocks --
+        a silent multi-minute response would otherwise trip proxy idle read
+        timeouts (e.g. nginx ``grpc_read_timeout``, default 60s) and reset the
+        stream. The single non-empty terminal Result carries the serialized,
+        now-resolved ``DataSourceDescriptor``.
+
+        Resolving an already-resident source is a cheap no-op (returns its
+        descriptor). If the client disconnects mid-resolve the daemon thread runs
+        to completion and caches the result on the adapter, so a retry coalesces
+        onto the finished work rather than downloading again.
+        """
+        adapter = self._get_source_adapter(source_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
+
+        result: dict = {}
+
+        def _run() -> None:
+            try:
+                result["desc"] = adapter.resolve()
+            except BaseException as exc:  # surfaced on the stream below
+                result["err"] = exc
+
+        worker = threading.Thread(
+            target=_run, name=f"resolve-{source_id}", daemon=True
+        )
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=_RESOLVE_HEARTBEAT_SECONDS)
+            if worker.is_alive():
+                yield b""  # heartbeat: keeps the stream warm, carries no data
+
+        if "err" in result:
+            exc = result["err"]
+            if isinstance(exc, SourceUnresolvedError):
+                raise flight.FlightUnavailableError(
+                    f"Source unresolved (open to resolve): {exc}"
+                ) from exc
+            raise flight.FlightServerError(
+                f"resolve failed for {source_id!r}: {exc}"
+            ) from exc
+        yield result["desc"].SerializeToString()
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes

@@ -295,7 +295,27 @@ class TestUnresolvedProxy:
         assert desc.source_type == "ome-zarr"
         assert proxy.is_resolved is False
 
-    def test_resolves_on_serve_and_delegates(self):
+    def test_serve_surface_refuses_until_resolved(self):
+        # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
+        # on its own -- it refuses with SourceUnresolvedError until resolve() has
+        # run, so the only thing that downloads is the explicit resolve action.
+        from biopb_tensor_server.errors import SourceUnresolvedError
+
+        import zarr
+
+        with tempfile.TemporaryDirectory() as d:
+            zpath = os.path.join(d, "img.zarr")
+            zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
+            proxy = self._make_proxy(zpath)
+            with pytest.raises(SourceUnresolvedError):
+                proxy.get_tensor_adapter("s1")
+            assert proxy.is_resolved is False  # the refusal did not hydrate
+            # After an explicit resolve the serve surface delegates normally.
+            proxy.resolve()
+            ta = proxy.get_tensor_adapter("s1")
+            assert list(ta.get_tensor_descriptor().shape) == [8, 8]
+
+    def test_resolve_hydrates_and_delegates(self):
         import zarr
 
         with tempfile.TemporaryDirectory() as d:
@@ -309,9 +329,10 @@ class TestUnresolvedProxy:
                 source_type="ome-zarr",  # provisional guess; real type is "zarr"
                 on_resolved=lambda sid, ad: fired.update(sid=sid, type=ad._source_type),
             )
-            ta = proxy.get_tensor_adapter("s1")
-            desc = ta.get_tensor_descriptor()
-            assert list(desc.shape) == [64, 128]
+            # resolve() returns the full, now-resolved descriptor directly.
+            desc = proxy.resolve()
+            assert [list(t.shape) for t in desc.tensors] == [[64, 128]]
+            assert desc.data_resident is True
             assert proxy.is_resolved is True
             # The authoritative type came from re-probing the hydrated content.
             assert fired == {"sid": "s1", "type": "zarr"}
@@ -321,7 +342,7 @@ class TestUnresolvedProxy:
             ]
             assert proxy.is_resident() is True
 
-    def test_resolves_once_under_repeated_serve(self):
+    def test_resolves_once_under_repeated_resolve(self):
         import zarr
 
         with tempfile.TemporaryDirectory() as d:
@@ -331,9 +352,9 @@ class TestUnresolvedProxy:
             proxy = self._make_proxy(
                 zpath, on_resolved=lambda sid, ad: calls.append(sid)
             )
-            proxy.get_tensor_adapter("s1")
+            proxy.resolve()
             first = proxy._resolved
-            proxy.get_tensor_adapter("s1")
+            proxy.resolve()
             assert proxy._resolved is first  # not rebuilt
             assert calls == ["s1"]  # on_resolved fired exactly once
 
@@ -342,7 +363,7 @@ class TestUnresolvedProxy:
 
         proxy = self._make_proxy("/nonexistent/path.zarr", source_type="ome-zarr")
         with pytest.raises(SourceUnresolvedError):
-            proxy.get_tensor_adapter("s1")
+            proxy.resolve()
 
 
 # --------------------------------------------------------------------------- #
@@ -457,9 +478,9 @@ class TestCloudRegistrationEndToEnd:
         assert server._metadata_db.added[-1][0] == "cloud1"
         assert adapter.get_source_descriptor().data_resident is False
 
-        # First serve resolves -> backfills the DB with the concrete descriptor.
-        ta = adapter.get_tensor_adapter("cloud1")
-        assert list(ta.get_tensor_descriptor().shape) == [32, 48]
+        # An explicit resolve -> backfills the DB with the concrete descriptor.
+        desc = adapter.resolve()
+        assert [list(t.shape) for t in desc.tensors] == [[32, 48]]
         # on_resolved fired a second sync_source_added (the upsert backfill).
         assert [sid for sid, _ in server._metadata_db.added].count("cloud1") == 2
         resolved_adapter = server._metadata_db.added[-1][1]
@@ -585,3 +606,88 @@ class TestCloudRescanGating:
         mgr = _make_manager(server, cloud_roots=set(), monitored={root})
         mgr._handle_rescan()
         assert server.registered == {}
+
+
+# --------------------------------------------------------------------------- #
+# Server `resolve` action (streaming do_action)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestResolveAction:
+    """The dedicated streaming `resolve` do_action: the SOLE resolution entry
+    point. Emits empty-body heartbeats while the recall runs, then one non-empty
+    terminal Result carrying the full DataSourceDescriptor."""
+
+    def _server(self, source_id, adapter):
+        from biopb_tensor_server.server import TensorFlightServer
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source(source_id, adapter)
+        return server
+
+    def test_resolve_action_streams_full_descriptor(self):
+        import zarr
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        from biopb_tensor_server.adapters import get_default_registry
+        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+
+        with tempfile.TemporaryDirectory() as d:
+            zpath = os.path.join(d, "img.zarr")
+            zarr.open_array(
+                zpath, mode="w", shape=(16, 24), chunks=(8, 12), dtype="uint8"
+            )
+            cfg = SourceConfig(url=zpath, type="ome-zarr", source_id="cloud1")
+            proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
+            server = self._server("cloud1", proxy)
+
+            action = flight.Action("resolve", b"cloud1")
+            # do_action yields raw bytes (the Flight framework wraps each in a Result).
+            bodies = [bytes(r) for r in server.do_action(None, action)]
+            terminal = [b for b in bodies if b]
+            assert len(terminal) == 1  # exactly one descriptor
+            desc = DataSourceDescriptor.FromString(terminal[0])
+            assert desc.source_id == "cloud1"
+            assert [list(t.shape) for t in desc.tensors] == [[16, 24]]
+            assert desc.data_resident is True
+            assert proxy.is_resolved is True
+
+    def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
+        # With a tiny heartbeat interval and a slow resolve, the stream must carry
+        # empty-body keep-alives BEFORE the terminal descriptor -- this is what
+        # keeps a minutes-long recall under a proxy's idle read timeout.
+        import time as _time
+        import pyarrow.flight as flight
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        from biopb_tensor_server import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
+
+        class _SlowAdapter:
+            def resolve(self):
+                _time.sleep(0.06)  # ~6 heartbeat intervals
+                return DataSourceDescriptor(source_id="slow")
+
+        server = self._server("slow", _SlowAdapter())
+        action = flight.Action("resolve", b"slow")
+        bodies = [bytes(r) for r in server.do_action(None, action)]
+
+        assert bodies.count(b"") >= 1  # at least one heartbeat
+        assert bodies[-1] != b""  # terminal is the descriptor
+        assert DataSourceDescriptor.FromString(bodies[-1]).source_id == "slow"
+
+    def test_resolve_action_unknown_source_errors(self):
+        import pyarrow.flight as flight
+
+        server = self._server("cloud1", _SlowSentinel())
+        action = flight.Action("resolve", b"missing")
+        with pytest.raises(flight.FlightServerError, match="Source not found"):
+            list(server.do_action(None, action))
+
+
+class _SlowSentinel:
+    """A registered placeholder so the server has a (different) source; the
+    `resolve` test above targets a *missing* id to exercise the not-found path."""
+
+    token = None
