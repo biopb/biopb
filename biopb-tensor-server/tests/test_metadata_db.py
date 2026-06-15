@@ -19,12 +19,15 @@ from biopb_tensor_server.metadata_db import MetadataDatabase
 class MockAdapter:
     """Mock adapter for testing metadata sync."""
 
-    def __init__(self, source_id, source_url, source_type, shape, dtype):
+    def __init__(
+        self, source_id, source_url, source_type, shape, dtype, data_resident=True
+    ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
         self._shape = shape
         self._dtype = dtype
+        self._data_resident = data_resident
 
     def get_source_descriptor(self):
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
@@ -33,6 +36,7 @@ class MockAdapter:
             source_id=self.source_id,
             source_url=self._source_url,
             source_type=self._source_type,
+            data_resident=self._data_resident,
             tensors=[
                 TensorDescriptor(
                     array_id=self.source_id,
@@ -673,3 +677,117 @@ class TestListFlightsTruncation:
         results = list(server.list_flights(None, b""))
 
         assert len(results) == 2
+
+
+class TestDataResidentColumn:
+    """The `data_resident` column (#110): a queryable residency signal so
+    unresolved (cloud) sources can be filtered on purpose, not hidden by NULLs."""
+
+    class _UnresolvedAdapter:
+        """A cloud / synced-folder source catalogued by URL only: no tensors
+        (so NULL dtype/shape_summary) and not resident until resolved."""
+
+        def __init__(self, source_id, source_url):
+            self.source_id = source_id
+            self._source_url = source_url
+
+        def get_source_descriptor(self):
+            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
+            return DataSourceDescriptor(
+                source_id=self.source_id,
+                source_url=self._source_url,
+                source_type="unresolved",
+                data_resident=False,  # not local yet
+                # no tensors -> NULL dtype / shape_summary
+            )
+
+        def get_metadata(self):
+            return {}
+
+    def test_resident_local_source_is_true(self):
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "local-1",
+            MockAdapter(
+                "local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8",
+                data_resident=True,
+            ),
+        )
+        row = db._get_connection().execute(
+            "SELECT data_resident FROM sources WHERE source_id='local-1'"
+        ).fetchone()
+        assert row[0] is True
+
+    def test_unresolved_source_is_false_and_filterable(self):
+        # An unresolved source has NULL dtype, so a dtype predicate hides it;
+        # data_resident makes it filterable on purpose instead.
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "local-1",
+            MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
+        )
+        db.sync_source_added(
+            "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
+        )
+        conn = db._get_connection()
+
+        resident = conn.execute(
+            "SELECT data_resident FROM sources WHERE source_id='cloud-1'"
+        ).fetchone()
+        assert resident[0] is False
+
+        # The footgun: a dtype filter silently drops the unresolved source...
+        by_dtype = conn.execute(
+            "SELECT source_id FROM sources WHERE dtype='uint8'"
+        ).fetchall()
+        assert [r[0] for r in by_dtype] == ["local-1"]
+
+        # ...but residency makes the unresolved one discoverable on purpose.
+        unresolved = conn.execute(
+            "SELECT source_id FROM sources WHERE NOT data_resident"
+        ).fetchall()
+        assert [r[0] for r in unresolved] == ["cloud-1"]
+
+    def test_initial_sync_populates_residency(self):
+        db = MetadataDatabase(enabled=True)
+        db.initial_sync(
+            {
+                "local-1": MockAdapter(
+                    "local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"
+                ),
+                "cloud-1": self._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
+            }
+        )
+        rows = dict(
+            db._get_connection()
+            .execute("SELECT source_id, data_resident FROM sources")
+            .fetchall()
+        )
+        assert rows == {"local-1": True, "cloud-1": False}
+
+    def test_column_is_not_null_with_false_default(self):
+        # The NOT NULL DEFAULT FALSE constraint: an insert omitting data_resident
+        # gets FALSE (future insert paths can't accidentally leave it NULL), and
+        # an explicit NULL is rejected -- so the column always partitions cleanly.
+        import duckdb
+
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "seed", MockAdapter("seed", "/s.zarr", "ome-zarr", [4, 4], "uint8")
+        )
+        conn = db._get_connection()
+
+        conn.execute(
+            "INSERT INTO sources (source_id, source_url) VALUES ('partial', '/p')"
+        )
+        row = conn.execute(
+            "SELECT data_resident FROM sources WHERE source_id='partial'"
+        ).fetchone()
+        assert row[0] is False  # DEFAULT filled it, not NULL
+
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO sources (source_id, data_resident) "
+                "VALUES ('bad', NULL)"
+            )

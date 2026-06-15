@@ -210,6 +210,15 @@ if not src.data_resident:                    # unresolved / not local
     src = client.resolve("source_id")        # downloads + resolves (may take minutes)
     tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
 ```
+Filter footgun: an unresolved source has NULL `dtype`/`shape_summary` in the
+`sources` table, so `query_sources("... WHERE dtype='uint8'")` silently *drops*
+it -- it's hidden for being unresolved, not for not matching. The table carries
+a `data_resident` column so you can filter on residency on purpose:
+```python
+# what hasn't been resolved (downloaded) yet?
+client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_resident",
+                     format="pandas")
+```
 
 ## Load into Viewer
 ```python
