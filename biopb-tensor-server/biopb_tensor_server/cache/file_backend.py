@@ -899,8 +899,13 @@ class ArrowFileBackend(CacheBackend):
         first message). Instead we derive them by walking the flushed file,
         matching messages to keys via the per-batch cache_key column, and fill
         ``byte_offset`` / ``byte_length`` on the existing metadata entries. The
-        caller holds ``self._lock`` (which also excludes concurrent writes to
-        the active segment, so the walk never races a torn append).
+        caller (``locate_entry``) holds both ``self._write_lock`` and
+        ``self._lock``: ``_write_lock`` excludes concurrent appends by
+        ``complete_entry`` so the walk never races a torn append (since #119 the
+        write critical section no longer holds ``_lock``), and ``_lock`` guards
+        the ``_metadata`` mutations below. A trailing message can still be torn
+        by a *prior* failed/partial write (its slack persists in the segment),
+        so the read loop stops on any unreadable message rather than raising.
         """
         path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         try:
@@ -922,7 +927,10 @@ class ArrowFileBackend(CacheBackend):
                 pos = mm.tell()
                 try:
                     msg = pa.ipc.read_message(mm)
-                except (pa.ArrowInvalid, EOFError, StopIteration):
+                except (pa.ArrowInvalid, EOFError, StopIteration, OSError):
+                    # OSError "Expected to be able to read N bytes for message
+                    # body" = a torn trailing message (a prior partial write's
+                    # slack). Treat it as end-of-readable-region.
                     break
                 if msg is None:
                     break
@@ -948,38 +956,69 @@ class ArrowFileBackend(CacheBackend):
         key isn't cached or its byte offset can't be resolved, signalling the
         caller to fall back to do_get.
         """
+        # Fast path: an already-indexed entry needs only the read lock.
         with self._lock:
             entry_info = self._metadata.get(key)
             if entry_info is None:
                 return None
             # byte_offset == 0 is never a real entry — the schema message always
             # occupies the start of the segment — so 0 means "not yet indexed".
-            # Derive offsets lazily by walking the flushed segment file.
-            if not entry_info.byte_offset:
-                self._fill_byte_offsets_for_segment(entry_info.segment_id)
+            if entry_info.byte_offset and entry_info.byte_length:
+                return self._build_chunk_location(entry_info)
+
+        # Slow path: derive offsets by walking the flushed segment file. This
+        # must hold ``_write_lock`` so the walk cannot race a concurrent append
+        # by ``complete_entry`` -- a torn append leaves a trailing message whose
+        # header advertises a body the file doesn't yet contain, and
+        # ``pa.ipc.read_message`` then raises (on Windows: OSError "Expected to
+        # be able to read N bytes for message body"). The lock order here is
+        # ``_write_lock`` -> ``_lock``, matching ``complete_entry``, so there is
+        # no ABBA deadlock; ``_write_lock`` blocks at most concurrent writes,
+        # never the cached-read path. (Only the *first* locate of an unindexed
+        # entry pays this; the fast path above takes neither write lock.)
+        with self._write_lock:
+            with self._lock:
                 entry_info = self._metadata.get(key)
-            if entry_info is None or not entry_info.byte_offset or not entry_info.byte_length:
-                return None
+                if entry_info is None:
+                    return None
+                if not entry_info.byte_offset:
+                    self._fill_byte_offsets_for_segment(entry_info.segment_id)
+                    entry_info = self._metadata.get(key)
+                if (
+                    entry_info is None
+                    or not entry_info.byte_offset
+                    or not entry_info.byte_length
+                ):
+                    return None
+                return self._build_chunk_location(entry_info)
 
-            segment_path = (
-                self._config.cache_dir / "segments"
-                / f"seg_{entry_info.segment_id:04d}.arrow"
-            )
-            try:
-                generation_id = os.stat(segment_path).st_ino
-            except OSError:
-                return None
+    def _build_chunk_location(
+        self, entry_info: "SegmentEntryInfo"
+    ) -> Optional[ChunkLocation]:
+        """Build a ``ChunkLocation`` for an already-indexed entry.
 
-            # The client is about to map this segment; treat the locate as a hit
-            # so Sieve-K doesn't evict it out from under the reader.
-            self._update_segment_frequency(entry_info.segment_id)
+        Caller must hold ``self._lock``. Returns None if the segment file has
+        gone away (evicted/unlinked) since indexing.
+        """
+        segment_path = (
+            self._config.cache_dir / "segments"
+            / f"seg_{entry_info.segment_id:04d}.arrow"
+        )
+        try:
+            generation_id = os.stat(segment_path).st_ino
+        except OSError:
+            return None
 
-            return ChunkLocation(
-                segment_path=str(segment_path),
-                byte_offset=entry_info.byte_offset,
-                byte_length=entry_info.byte_length,
-                generation_id=generation_id,
-            )
+        # The client is about to map this segment; treat the locate as a hit
+        # so Sieve-K doesn't evict it out from under the reader.
+        self._update_segment_frequency(entry_info.segment_id)
+
+        return ChunkLocation(
+            segment_path=str(segment_path),
+            byte_offset=entry_info.byte_offset,
+            byte_length=entry_info.byte_length,
+            generation_id=generation_id,
+        )
 
     def get_or_acquire(
         self,

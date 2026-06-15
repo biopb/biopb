@@ -146,6 +146,53 @@ class TestLocateEntry:
         loc = file_backend.locate_entry(b"g")
         assert loc.generation_id == os.stat(loc.segment_path).st_ino
 
+    def test_torn_trailing_message_does_not_crash_locate(self):
+        """A torn trailing message must not crash the offset walk.
+
+        Regression for the Windows-only CI failure ``OSError: Expected to be
+        able to read N bytes for message body`` raised from
+        ``_fill_byte_offsets_for_segment``: a prior partial/failed write can
+        leave slack at the segment tail, and the lazy offset walk must treat it
+        as end-of-region rather than propagate. Reproduced cross-platform by
+        appending a truncated copy of a real message to the segment file.
+        """
+        d = tempfile.mkdtemp()
+        cfg = dict(max_segment_bytes=64 * 1024 * 1024,
+                   max_total_bytes=256 * 1024 * 1024)
+        be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
+        try:
+            arrs = {}
+            for i in range(3):
+                a = ((np.arange(1500, dtype=np.uint16) + i) % 509).astype(np.uint16)
+                arrs[i] = a
+                key = f"good-{i}".encode()
+                be.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+                be.release(key)
+
+            # Capture a real framed message and append a truncated copy: header
+            # intact (advertises a full body) but the body cut short, exactly
+            # what a partial write leaves behind.
+            loc0 = be.locate_entry(b"good-0")
+            seg_path = Path(loc0.segment_path)
+            raw = seg_path.read_bytes()
+            full = raw[loc0.byte_offset:loc0.byte_offset + loc0.byte_length]
+            with open(seg_path, "ab") as f:
+                f.write(full[: len(full) // 2])
+
+            # Drop cached offsets so locate re-walks the now-torn segment.
+            for info in be._metadata.values():
+                info.byte_offset = 0
+                info.byte_length = 0
+
+            # Must not raise; every good entry ahead of the torn tail resolves.
+            for i in range(3):
+                loc = be.locate_entry(f"good-{i}".encode())
+                assert loc is not None, f"good-{i} should still locate"
+                assert np.array_equal(_read_via_location(loc), arrs[i])
+        finally:
+            be.close()
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class TestLocateViaManager:
     def test_memory_backend_returns_none(self):
