@@ -8,12 +8,14 @@
 
     Idempotent: rerun to upgrade to latest version.
 
-    By default this installs prebuilt wheels from the latest GitHub release.
-    Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to instead build HEAD from a git
-    checkout (the development fast path); that mode additionally needs git.
+    This installs prebuilt wheels from the latest biopb release-v* GitHub
+    deployment. By default it tracks the latest STABLE release (clean X.Y.Z).
+    Set $env:BIOPB_INSTALL_RC = "1" to instead track the latest release
+    candidate (a/b/rc prerelease, typically cut off the dev branch) — the fast
+    path for testing an upcoming release before it lands on main.
 
-    Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+);
-                  git is needed only for BIOPB_INSTALL_FROM_SOURCE=1.
+    Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
+                  No git, buf, or compiler needed — release wheels ship prebuilt.
 
     Paths follow the same home-relative XDG layout the Python packages read
     (config under ~/.config, data under ~/.local/share); on Windows these
@@ -400,16 +402,22 @@ function Invoke-Preflight {
 # .assets[].name / .browser_download_url) for a given tag prefix. The monorepo
 # hosts several release lines (release-v*, v*, mcp-v*, server-v*), so
 # /releases/latest is NOT component-specific; list releases (date-desc) and take
-# the newest whose tag is a CLEAN $TagPrefix + X.Y.Z (prerelease tags like
-# release-v…a/b/rc are skipped). Throws on network/HTTP error; callers catch.
+# the newest whose tag is a CLEAN $TagPrefix + X.Y.Z. By default prerelease tags
+# (release-v…a/b/rc — release candidates cut off dev) are skipped; with -AllowRc
+# the regex also admits a PEP 440 prerelease suffix so the newest candidate wins.
+# Throws on network/HTTP error; callers catch.
 function Get-LatestRelease {
-    param([string]$Repo, [string]$TagPrefix = "")
+    param([string]$Repo, [string]$TagPrefix = "", [bool]$AllowRc = $false)
     $headers = @{ "User-Agent" = "biopb-installer" }
     $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
         -Headers $headers
-    $rx = "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
+    $rx = if ($AllowRc) {
+        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+((a|b|rc)\d+)?$"
+    } else {
+        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
+    }
     $match = $releases | Where-Object { $_.tag_name -match $rx } | Select-Object -First 1
-    if (-not $match) { throw "No clean release matching '$TagPrefix' X.Y.Z in $Repo" }
+    if (-not $match) { throw "No release matching '$TagPrefix' X.Y.Z in $Repo" }
     return $match
 }
 
@@ -504,28 +512,27 @@ function Start-DataServer {
 }
 
 function Install-Biopb {
-    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
-    # (the release-v* deployment line). Source mode builds from git: all three
+    # All three wheels (+ webapp) are pulled from ONE biopb release-v*
+    # deployment — a mutually-paired set built from the tagged commit. All three
     # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
-    # subdirectories), so there is a single repo.
+    # subdirectories of biopb/biopb).
     $BiopbRepoUrl = "https://github.com/biopb/biopb"
-    $BiopbRepo    = "git+$BiopbRepoUrl"
-    $McpRepoUrl   = $BiopbRepoUrl
-    $McpRepo      = $BiopbRepo
     $RepoUrl      = $BiopbRepoUrl             # webapp release-asset fallback URL
     $ReleaseRepo  = "biopb/biopb"             # owner/name for the GitHub Releases API
     # The monorepo hosts multiple release lines; the all-in-one deployment the
     # installer wants is the release-v* one, so the release fetch filters by this
-    # prefix and requires a clean X.Y.Z (skipping prerelease tags).
+    # prefix (see docs/release-model.md).
     $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
     $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
     $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
     $LocalBin    = Join-Path $BiopbHome ".local\bin"
 
-    # Default: install prebuilt wheels from the latest GitHub release (no git/buf
-    # build). Set $env:BIOPB_INSTALL_FROM_SOURCE = "1" to build HEAD from git.
-    $InstallFromSource = ($env:BIOPB_INSTALL_FROM_SOURCE) -and ($env:BIOPB_INSTALL_FROM_SOURCE -ne '0')
+    # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
+    # Set $env:BIOPB_INSTALL_RC = "1" to also admit the latest release candidate
+    # (a/b/rc prerelease, typically cut off dev). Both channels install prebuilt
+    # wheels; neither builds from git.
+    $AllowRc = ($env:BIOPB_INSTALL_RC) -and ($env:BIOPB_INSTALL_RC -ne '0')
     $release = $null   # cached release metadata, fetched on demand below
 
     # ===== 0. System Check =====
@@ -533,8 +540,8 @@ function Install-Biopb {
 
     $arch = $env:PROCESSOR_ARCHITECTURE
     switch ($arch) {
-        "AMD64" { $bufArch = "x86_64" }
-        "ARM64" { $bufArch = "arm64" }
+        "AMD64" { }
+        "ARM64" { }
         default {
             Write-Err2 "Unsupported architecture: $arch"
             Write-Inf "Supported: x86_64 (AMD64), arm64 (ARM64)"
@@ -544,15 +551,13 @@ function Install-Biopb {
     }
     Write-Ok "Platform: Windows ($arch)"
 
-    # Required tools. curl/Invoke-WebRequest is built in; we always need tar, and
-    # git only when building from a source checkout.
+    # Required tools. curl/Invoke-WebRequest is built in; the release install just
+    # downloads prebuilt wheels, so only tar is needed (no git, buf, or compiler).
     $requiredTools = @("tar")
-    if ($InstallFromSource) { $requiredTools += "git" }
     foreach ($tool in $requiredTools) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
             Write-Err2 "$tool not found"
             switch ($tool) {
-                "git"  { Write-Inf "Install: winget install Git.Git  (then reopen PowerShell)" }
                 "tar"  { Write-Inf "tar ships with Windows 10 1803+; please update Windows" }
             }
             Wait-ForExit
@@ -574,7 +579,7 @@ function Install-Biopb {
     $InstallBioformats = $sel[1]
     Write-Host ""
 
-    # ===== 1. Install uv + buf (if needed) =====
+    # ===== 1. Install uv (if needed) =====
     Write-Step "[1/7] Ensuring build tools..."
 
     # uv's installer (piped in below) voluntarily aborts unless the effective
@@ -605,25 +610,6 @@ function Install-Biopb {
         Write-Ok "uv installed"
     } else {
         Write-Ok "uv already installed ($(uv --version))"
-    }
-
-    # buf generates the protobuf/Flight stubs at build time, so it is only needed
-    # when building from a source checkout. Release wheels ship the stubs prebuilt.
-    if ($InstallFromSource) {
-        $bufVersion = "1.70.0"
-        $bufPath = Join-Path $LocalBin "buf.exe"
-        $bufCurrent = ""
-        if (Get-Command buf -ErrorAction SilentlyContinue) { $bufCurrent = (buf --version 2>$null) }
-        if ($bufCurrent -ne $bufVersion) {
-            Write-Inf "Installing buf $bufVersion..."
-            if (-not (Test-Path -LiteralPath $LocalBin)) { New-Item -ItemType Directory -Force -Path $LocalBin | Out-Null }
-            if (Test-Path -LiteralPath $bufPath) { Remove-Item -LiteralPath $bufPath -Force }
-            $bufUrl = "https://github.com/bufbuild/buf/releases/download/v$bufVersion/buf-Windows-$bufArch.exe"
-            Invoke-WebRequest -Uri $bufUrl -OutFile $bufPath
-            Write-Ok "buf $bufVersion installed"
-        } else {
-            Write-Ok "buf already installed ($bufCurrent)"
-        }
     }
 
     # ===== 2. Python =====
@@ -672,51 +658,46 @@ function Install-Biopb {
     # Resolve where the three packages come from. They must be installed as a
     # matched set from a single build: the tensor server is self-contained and
     # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
-    # coupled to both - so all three are pinned to sibling artifacts (git refs in
-    # source mode, local wheels in release mode) and the resolver is never allowed
-    # to pull biopb / biopb-tensor-server / biopb-mcp from PyPI. The single
-    # biopb-mcp release carries the mutually-paired triple, so one download is one
-    # consistent set - no PyPI-vs-release version skew.
-    if ($InstallFromSource) {
-        Write-Inf "Building from source: biopb-mcp + biopb + biopb-tensor-server"
-        Write-Inf "  from HEAD of $BiopbRepoUrl (monorepo subdirectories)"
-        $mcpReq    = "biopb-mcp[mcp] @ $McpRepo#subdirectory=biopb-mcp"
-        $biopbReq  = "biopb[tensor] @ $BiopbRepo"
-        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $BiopbRepo#subdirectory=biopb-tensor-server"
-    } else {
-        try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null }
-        if (-not $release) {
-            Write-Err2 "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo."
-            Write-Inf "Check your network, or build from source by setting:"
-            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
-            throw "release fetch failed"
+    # coupled to both - so all three are pinned to the sibling wheels from one
+    # release-v* deployment (release CI builds the mutually-paired triple from the
+    # tagged commit) and the resolver is never allowed to pull biopb /
+    # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
+    # set - no PyPI-vs-release version skew.
+    try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null }
+    if (-not $release) {
+        Write-Err2 "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo."
+        if ($AllowRc) {
+            Write-Inf "No release candidate found. Check your network, or install the stable release (unset BIOPB_INSTALL_RC)."
+        } else {
+            Write-Inf "Check your network and rerun. To try the latest release candidate, set:"
+            Write-Cmd '$env:BIOPB_INSTALL_RC = "1"'
         }
-        $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
-        $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
-        $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-        if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset) {
-            Write-Err2 "Release $($release.tag_name) is missing one of the biopb wheels."
-            Write-Inf "Build from source by setting:"
-            Write-Cmd '$env:BIOPB_INSTALL_FROM_SOURCE = "1"'
-            throw "release wheels missing"
-        }
-        Write-Inf "Installing from release $($release.tag_name)"
-        $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
-        if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
-        New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-        $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
-        $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
-        $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
-        Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
-        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
-        Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
-        # Direct file:// references pin each package to this exact wheel, so uv
-        # resolves their inter-dependencies (the server's biopb, biopb-mcp's
-        # biopb[tensor]) to the downloaded set rather than to PyPI.
-        $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-        $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
-        $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
+        throw "release fetch failed"
     }
+    $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
+    $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
+    $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
+    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset) {
+        Write-Err2 "Release $($release.tag_name) is missing one of the biopb wheels."
+        Write-Inf "Try again later, or report this against $ReleaseRepo."
+        throw "release wheels missing"
+    }
+    Write-Inf "Installing from release $($release.tag_name)"
+    $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
+    if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+    $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
+    $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
+    $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
+    Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
+    Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
+    Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
+    # Direct file:// references pin each package to this exact wheel, so uv
+    # resolves their inter-dependencies (the server's biopb, biopb-mcp's
+    # biopb[tensor]) to the downloaded set rather than to PyPI.
+    $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
+    $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
+    $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
 
     # Install everything into ONE uv tool environment so the components can
     # import and drive each other at runtime:
@@ -772,9 +753,8 @@ function Install-Biopb {
     if ($InstallWebapp) {
         if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
 
-        # Reuse the release metadata already fetched for the wheels; in source
-        # mode this is the first (and only) fetch.
-        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix } catch { $release = $null } }
+        # Reuse the release metadata already fetched for the wheels (cached).
+        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
         $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
