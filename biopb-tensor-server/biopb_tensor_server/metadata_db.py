@@ -186,7 +186,14 @@ class MetadataDatabase:
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
                 shape_summary TEXT,
-                data_resident BOOLEAN
+                -- NOT NULL DEFAULT FALSE: every source has a residency value
+                -- (both insert sites write the descriptor's data_resident bit),
+                -- and a non-null column lets `WHERE data_resident` /
+                -- `WHERE NOT data_resident` partition ALL rows cleanly -- no
+                -- three-valued-logic gap where a NULL row silently drops from
+                -- both. FALSE is the conservative default (unknown -> treat as
+                -- non-resident; still discoverable via `WHERE NOT data_resident`).
+                data_resident BOOLEAN NOT NULL DEFAULT FALSE
             )
         """)
         # Index on source_url for path filtering

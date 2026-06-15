@@ -765,3 +765,29 @@ class TestDataResidentColumn:
             .fetchall()
         )
         assert rows == {"local-1": True, "cloud-1": False}
+
+    def test_column_is_not_null_with_false_default(self):
+        # The NOT NULL DEFAULT FALSE constraint: an insert omitting data_resident
+        # gets FALSE (future insert paths can't accidentally leave it NULL), and
+        # an explicit NULL is rejected -- so the column always partitions cleanly.
+        import duckdb
+
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "seed", MockAdapter("seed", "/s.zarr", "ome-zarr", [4, 4], "uint8")
+        )
+        conn = db._get_connection()
+
+        conn.execute(
+            "INSERT INTO sources (source_id, source_url) VALUES ('partial', '/p')"
+        )
+        row = conn.execute(
+            "SELECT data_resident FROM sources WHERE source_id='partial'"
+        ).fetchone()
+        assert row[0] is False  # DEFAULT filled it, not NULL
+
+        with pytest.raises(duckdb.ConstraintException):
+            conn.execute(
+                "INSERT INTO sources (source_id, data_resident) "
+                "VALUES ('bad', NULL)"
+            )
