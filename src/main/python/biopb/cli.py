@@ -79,6 +79,10 @@ DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 # gets its own PID/log under biopb-mcp's XDG data dir (matching
 # biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The log file
 # name is distinct so it never collides with the stdio bridge's `kernel.log`.
+# The running daemon writes this same PID file itself (biopb_mcp._config
+# .get_pid_file()) regardless of who launched it — including the stdio shim,
+# which spawns it detached without going through `mcp start` — so `status`
+# detects it uniformly. Keep this path in sync with get_pid_file().
 MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)

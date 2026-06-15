@@ -379,6 +379,18 @@ def get_log_dir() -> Path:
     return log_dir
 
 
+def get_pid_file() -> Path:
+    """Path to the http daemon's PID file (~/.local/share/biopb-mcp/mcp-server.pid).
+
+    The running http daemon writes its own PID here once it is up, regardless of
+    who launched it (the `biopb mcp` CLI, the stdio shim, or a manual
+    `python -m biopb_mcp.mcp`), so `biopb mcp status` can detect it uniformly.
+    The biopb CLI hardcodes the same path (``biopb.cli.MCP_PID_FILE``); keep the
+    two in sync.
+    """
+    return Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* in place, returning *base*.
 

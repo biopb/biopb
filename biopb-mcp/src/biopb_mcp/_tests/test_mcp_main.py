@@ -5,16 +5,20 @@ and the stdio-vs-http dispatch) without starting a real kernel, viewer, or
 daemon.
 """
 
+import os
 import sys
 
 import pytest
 
+from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
     _parse_args,
+    _remove_pidfile,
     _resolve_headless,
     _setup_observe,
+    _write_pidfile,
     main,
 )
 
@@ -187,3 +191,53 @@ class TestSetupObserve:
         cfg = {"mcp": {"observe": {"enabled": True}}}
         # An observe failure must never propagate out of the launcher.
         assert _setup_observe(cfg) is False
+
+
+class TestPidfile:
+    """The daemon registers its own PID so `biopb mcp status` finds it
+    regardless of launch path (CLI, stdio shim, or manual)."""
+
+    @pytest.fixture
+    def pidfile(self, tmp_path, monkeypatch):
+        path = tmp_path / "mcp-server.pid"
+        # _write_pidfile resolves the path lazily via _config.get_pid_file.
+        monkeypatch.setattr(
+            "biopb_mcp._config.get_pid_file", lambda: path
+        )
+        return path
+
+    def test_writes_own_pid_when_port_free(self, pidfile, monkeypatch):
+        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
+        returned = _write_pidfile(8765)
+        assert returned == pidfile
+        assert pidfile.read_text() == str(os.getpid())
+
+    def test_skips_write_when_port_taken(self, pidfile, monkeypatch):
+        # A racing loser sees the winner already on the port: don't clobber it.
+        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: True)
+        assert _write_pidfile(8765) is None
+        assert not pidfile.exists()
+
+    def test_write_failure_is_swallowed(self, pidfile, monkeypatch):
+        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only fs")
+
+        monkeypatch.setattr(type(pidfile), "write_text", _boom)
+        # A write failure costs `status` visibility, never the server.
+        assert _write_pidfile(8765) is None
+
+    def test_remove_is_pid_safe(self, pidfile):
+        pidfile.write_text(str(os.getpid()))
+        _remove_pidfile(pidfile)
+        assert not pidfile.exists()
+
+    def test_remove_leaves_other_pids(self, pidfile):
+        # A losing daemon's exit must not delete the winner's PID file.
+        pidfile.write_text("999999999")
+        _remove_pidfile(pidfile)
+        assert pidfile.exists()
+
+    def test_remove_none_is_noop(self):
+        _remove_pidfile(None)  # write was skipped/failed; nothing to undo
