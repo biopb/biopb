@@ -185,7 +185,8 @@ class MetadataDatabase:
                 dtype TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
-                shape_summary TEXT
+                shape_summary TEXT,
+                data_resident BOOLEAN
             )
         """)
         # Index on source_url for path filtering
@@ -368,8 +369,8 @@ class MetadataDatabase:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     [
                         source_id,
@@ -379,6 +380,7 @@ class MetadataDatabase:
                         indexed_at,
                         metadata_json,
                         shape_summary,
+                        source_desc.data_resident,
                     ],
                 )
 
@@ -449,6 +451,7 @@ class MetadataDatabase:
                         datetime.now(),
                         json.dumps(metadata, cls=NumpyEncoder) if metadata else None,
                         shape_summary,
+                        source_desc.data_resident,
                     ]
                 )
             except Exception as e:
@@ -461,8 +464,8 @@ class MetadataDatabase:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     batch,
                 )
