@@ -227,6 +227,24 @@ class TensorConnection:
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources
 
+    def resolve_source(self, source_id: str) -> DataSourceDescriptor:
+        """Resolve an unresolved (cloud / synced-folder) source, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
+        server to hydrate the source (for a dehydrated placeholder this **downloads
+        the whole file**, so it is slow and blocking and must be called off the GUI
+        thread) and returns the now-populated ``DataSourceDescriptor``. The local
+        catalog snapshot (:attr:`sources`) is then refreshed so callers re-render
+        from the resolved field list. Returns the resolved descriptor.
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        descriptor = self.client.resolve(source_id)
+        # resolve() already re-listed server-side; mirror it into our snapshot so
+        # the widget/agent see the full field set without a second round-trip.
+        self.refresh()
+        return descriptor
+
     def start_source_watch(
         self,
         min_interval: float | None = None,

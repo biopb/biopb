@@ -197,6 +197,20 @@ meta = client.get_source_metadata("source_id")
 print(meta)
 ```
 
+## Cloud / unresolved sources
+Some sources (cloud / synced-folder, e.g. OneDrive "Files-On-Demand") are
+catalogued by URL only: their shape/dtype/fields are *unknown* until first read.
+They list with `data_resident == False` and an empty `tensors`, and reading one
+(`get_tensor`/`add_tensor`) raises until you resolve it. Resolving asks the
+server to **download the whole file** (slow, uses disk, fails offline), so it is
+explicit -- never triggered by browsing.
+```python
+src = client.list_sources()["source_id"]
+if not src.data_resident:                    # unresolved / not local
+    src = client.resolve("source_id")        # downloads + resolves (may take minutes)
+    tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
+```
+
 ## Load into Viewer
 ```python
 # Auto-handles the multiscale pyramid for large images.
