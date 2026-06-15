@@ -130,18 +130,37 @@ class UnresolvedSourceAdapter(SourceAdapter):
             return self._resolved.get_physical_scale(tensor_id)
         return None
 
-    # --- serve surface (the consented resolution hook) ----------------------
+    # --- serve surface (NEVER resolves) -------------------------------------
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        resolved = self._resolve()
-        # An unresolved source advertises no tensors, so a client opening it has
-        # no array_id to send and falls back to the source_id / empty default.
-        # Now that we know the real tensors, map that to the resolved default.
+        # The serve paths (GetFlightInfo / DoGet) must never trigger a recall:
+        # resolution is a single, explicit, consented operation (the server's
+        # ``resolve`` action -> ``self.resolve()``), not a side effect of asking
+        # to read. Until that has run, refuse with a legible error -- server.py's
+        # get_flight_info translates SourceUnresolvedError to a clean
+        # FlightUnavailableError ("open to resolve").
+        if self._resolved is None:
+            raise SourceUnresolvedError(
+                f"source {self.source_id!r} is unresolved (cloud / synced-folder); "
+                f"resolve it before reading"
+            )
+        # Already resolved: delegate. An unresolved source advertised no tensors,
+        # so a client may still send the source_id / empty default -- map that to
+        # the resolved default tensor.
         if not tensor_id or tensor_id == self.source_id:
-            descriptors = resolved.list_tensor_descriptors()
+            descriptors = self._resolved.list_tensor_descriptors()
             if descriptors:
                 tensor_id = descriptors[0].array_id
-        return resolved.get_tensor_adapter(tensor_id)
+        return self._resolved.get_tensor_adapter(tensor_id)
+
+    # --- resolution (the consented hook) ------------------------------------
+
+    def resolve(self) -> DataSourceDescriptor:
+        """Hydrate the source (downloading it if dehydrated) and return its full,
+        now-resolved ``DataSourceDescriptor``. The sole resolution trigger; safe
+        to call repeatedly (the underlying hydrate is once-only)."""
+        self._resolve()
+        return self.get_source_descriptor()  # delegates -> full tensor list
 
     @classmethod
     def create_from_config(

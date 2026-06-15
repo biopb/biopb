@@ -416,13 +416,32 @@ The same conclusion recurs at every layer, hardening as it goes:
        both metadata-DB insert sites, and the `guide://tensor` / MCP catalog docs
        call out the footgun. Still open: **#109** (`wait_for_upload_ready` hangs to
        timeout on a non-upload source). `get_tensor`/`get_tensor_pb` already raise
-       the directive error; `get_descriptor`/`resolve`/`get_source` intentionally
-       resolve.
+       the directive error; after the 2c redesign `get_descriptor`/`get_source` are
+       cheap probes that steer to `resolve()` too — only `resolve()` resolves.
      - **Polyglot parity.** The Java SDK (`TensorFlightClient.java`, ImageJ-facing)
        still lacks `resolve()` / the directive error and shares the same empty-tensors
        gaps; tracked as **#111** to mirror the Python change. (JS/TS is the
        lightweight viewer and refuses cloud data server-side — §7/phase 5 — so no
        resolve path is needed there.)
+   - **2c. Resolve-path redesign — one dedicated, streaming entry point (#112).**
+     The original "resolve-on-serve via `GetFlightInfo`" smuggled the (minutes-long)
+     hydrate into a descriptor RPC, which forced three problems: `resolve()` needed a
+     `GetFlightInfo` + `list_sources()` two-step that **silently dropped fields** for a
+     multi-field source beyond the list cap; every accessor built on `GetFlightInfo`
+     (`get_descriptor`/`get_source`) inherited a surprise download; and a silent
+     multi-minute block trips proxy idle read timeouts (nginx `grpc_read_timeout`,
+     60s). Replaced with a **single dedicated `do_action("resolve")`**: it is the
+     SOLE resolution trigger. `UnresolvedSourceAdapter.get_tensor_adapter` no longer
+     auto-resolves — it raises `SourceUnresolvedError` (the phase-1 guard, now live),
+     so `GetFlightInfo`/`DoGet` and the SDK probes (`get_descriptor`/`get_source`)
+     become **cheap, recall-free** and steer to `resolve()`. The action **streams**:
+     empty-body heartbeat Results keep the connection warm under proxy timeouts, then
+     one terminal Result carries the full `DataSourceDescriptor` (all fields, in one
+     call — kills the truncation hole). `client.resolve()` is a thin blocking façade
+     over the stream; the napari modal's worker can consume the heartbeats for a
+     progress bar / cancel later. Disconnect-resilient: the recall runs on a daemon
+     thread and caches on the adapter, so a retry coalesces. **(closes #112; tightens
+     #111 — Java/TS must implement the action to resolve at all.)**
 3. **Persistent metadata DB** keyed to roots; resolve-once write-through.
 4. **Pre-cache skip gate** on `is_resident()`; exclude cloud from the backlog.
 5. **Read tolerance mode** (`EXACT|BEST_EFFORT`) + best-effort status return;

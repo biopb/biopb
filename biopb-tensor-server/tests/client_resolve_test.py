@@ -18,6 +18,7 @@ def _bare_client():
     client = object.__new__(TensorFlightClient)
     client._sources = {}
     client._descriptors = {}
+    client._call_options = None
     return client
 
 
@@ -25,45 +26,74 @@ def _resolved_tensor(array_id):
     return TensorDescriptor(array_id=array_id, shape=[4, 4], dtype="<f4")
 
 
+class _Buf:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def to_pybytes(self) -> bytes:
+        return self._body
+
+
+class _FakeResult:
+    """Mimics a pyarrow.flight.Result: ``result.body.to_pybytes()``."""
+
+    def __init__(self, body: bytes):
+        self.body = _Buf(body)
+
+
+class _FakeFlight:
+    """Records the action and replays a fixed stream of Results from do_action."""
+
+    def __init__(self, results):
+        self._results = results
+        self.action = None
+
+    def do_action(self, action, options=None):
+        self.action = action
+        return iter(self._results)
+
+
 class TestResolve:
-    def test_returns_full_source_descriptor_from_relist(self, monkeypatch):
-        # resolve() triggers a per-tensor fetch, then re-lists to enumerate ALL
-        # fields (get_descriptor alone returns only the default tensor).
+    def test_returns_full_descriptor_from_resolve_action(self):
+        # resolve() makes a single streaming `resolve` do_action and returns the
+        # terminal descriptor directly -- ALL fields, no list_sources, no cap.
         client = _bare_client()
-        fetched = []
-        monkeypatch.setattr(
-            client,
-            "_fetch_tensor_descriptor",
-            lambda sid, tid=None: fetched.append(sid) or _resolved_tensor(sid),
-        )
         full = DataSourceDescriptor(
             source_id="cloud_x",
             tensors=[_resolved_tensor("cloud_x/f0"), _resolved_tensor("cloud_x/f1")],
         )
-        monkeypatch.setattr(client, "list_sources", lambda: {"cloud_x": full})
+        client._client = _FakeFlight([_FakeResult(full.SerializeToString())])
 
         out = client.resolve("cloud_x")
 
-        assert fetched == ["cloud_x"]  # resolve-on-serve was triggered
-        assert out is full
-        assert len(out.tensors) == 2  # the complete field set, not just default
-
-    def test_truncated_catalog_falls_back_to_single_tensor(self, monkeypatch):
-        # When the source is beyond the list_sources() cap, resolve() still yields
-        # a usable descriptor (the resolved default tensor) and seeds the cache so
-        # a following get_tensor() doesn't re-fetch.
-        client = _bare_client()
-        td = _resolved_tensor("cloud_x")
-        monkeypatch.setattr(
-            client, "_fetch_tensor_descriptor", lambda sid, tid=None: td
-        )
-        monkeypatch.setattr(client, "list_sources", lambda: {})  # truncated
-
-        out = client.resolve("cloud_x")
-
+        assert client._client.action.type == "resolve"
+        assert bytes(client._client.action.body) == b"cloud_x"
         assert out.source_id == "cloud_x"
-        assert list(out.tensors) == [td]
+        assert len(out.tensors) == 2  # complete field set, never truncated
         assert client._sources["cloud_x"] is out  # cache seeded for reuse
+
+    def test_heartbeats_are_skipped_and_terminal_is_taken(self):
+        # Empty-body Results are keep-alive heartbeats; the single non-empty one
+        # is the descriptor. resolve() must ignore the former and return the latter.
+        client = _bare_client()
+        full = DataSourceDescriptor(
+            source_id="cloud_x", tensors=[_resolved_tensor("cloud_x")]
+        )
+        client._client = _FakeFlight(
+            [_FakeResult(b""), _FakeResult(b""), _FakeResult(full.SerializeToString())]
+        )
+
+        out = client.resolve("cloud_x")
+
+        assert list(out.tensors) == list(full.tensors)
+
+    def test_no_terminal_result_raises(self):
+        # A stream of only heartbeats (server closed without a descriptor) is an
+        # error, not a silent empty descriptor.
+        client = _bare_client()
+        client._client = _FakeFlight([_FakeResult(b""), _FakeResult(b"")])
+        with pytest.raises(RuntimeError, match="no descriptor"):
+            client.resolve("cloud_x")
 
 
 class TestUnresolvedDirectiveError:
