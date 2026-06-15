@@ -5,12 +5,14 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
-# By default this installs prebuilt wheels from the latest biopb-mcp GitHub
-# release (the single release that carries all three mutually-paired wheels).
-# Set BIOPB_INSTALL_FROM_SOURCE=1 to instead build HEAD from a git checkout
-# (the fast path for development); that mode additionally needs git + a compiler.
+# This installs prebuilt wheels from the latest biopb GitHub release-v*
+# deployment (the single release that carries all three mutually-paired wheels).
+# By default it tracks the latest STABLE release (clean X.Y.Z). Set
+# BIOPB_INSTALL_RC=1 to instead track the latest release candidate (a/b/rc
+# prerelease, typically cut off the dev branch) — the fast path for testing an
+# upcoming release before it lands on main.
 #
-# Requirements: curl, tar (+ git for BIOPB_INSTALL_FROM_SOURCE=1)
+# Requirements: curl, tar
 #
 
 # ANSI colors — suppressed when stdout is not a terminal
@@ -537,13 +539,17 @@ _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
     # The monorepo hosts several release lines, so /releases/latest is NOT
     # component-specific. List releases (date-desc) and take the newest whose
-    # tag matches the deployment line, then fetch that release by tag. The match
-    # requires a CLEAN version (release-vX.Y.Z) so prerelease tags
-    # (release-v…a/b/rc — used for test releases) are skipped and never become
-    # the default download.
+    # tag matches the deployment line, then fetch that release by tag. By default
+    # the match requires a CLEAN version (release-vX.Y.Z) so prerelease tags
+    # (release-v…a/b/rc — release candidates cut off dev) are skipped and never
+    # become the default download. With BIOPB_INSTALL_RC=1 the regex also admits
+    # a PEP 440 prerelease suffix, so the newest candidate wins.
     local _releases
     _releases=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100" 2>/dev/null) || return 1
+    local _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$"
+    [ "${ALLOW_RC:-0}" = "1" ] && \
+        _tag_re="^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$"
     # `|| true`: an error/empty response makes grep exit 1, which under
     # `set -euo pipefail` would abort the installer from this command
     # substitution. We want to return 1 and let the caller print a friendly
@@ -551,7 +557,7 @@ _fetch_latest_release() {
     RELEASE_TAG=$(printf '%s' "$_releases" \
         | grep '"tag_name"' \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-        | grep -E "^${RELEASE_TAG_PREFIX:-release-v}[0-9]+\.[0-9]+\.[0-9]+$" | head -1) || true
+        | grep -E "$_tag_re" | head -1) || true
     [ -n "${RELEASE_TAG:-}" ] || return 1
     RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$RELEASE_TAG" 2>/dev/null) || return 1
@@ -660,32 +666,30 @@ _start_data_server() {
 install_biopb() {
     set -euo pipefail
 
-    # Release mode pulls all three wheels (+ webapp) from ONE biopb release
-    # (the mcp-v* line). Source mode builds from git: all three packages now
-    # live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
-    # subdirectories), so there is a single REPO.
+    # All three wheels (+ webapp) are pulled from ONE biopb release-v*
+    # deployment — a mutually-paired set built from the tagged commit. All three
+    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
+    # subdirectories of biopb/biopb).
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
-    BIOPB_REPO="git+$BIOPB_REPO_URL"
-    MCP_REPO_URL="$BIOPB_REPO_URL"
-    MCP_REPO="$BIOPB_REPO"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
     # The monorepo hosts multiple release lines (release-v*, v*, mcp-v*,
     # server-v*). The all-in-one deployment the installer wants is the
     # release-v* one (see docs/release-model.md), so the release fetch filters
-    # by this prefix (and requires a clean X.Y.Z, skipping prereleases) instead
-    # of using /releases/latest (which is repo-wide).
+    # by this prefix instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
     CONFIG_DIR="$HOME/.config/biopb"
 
-    # Install path: default is prebuilt wheels from the latest GitHub release
-    # (no git checkout, no buf/proto build). BIOPB_INSTALL_FROM_SOURCE=1 switches
-    # to building HEAD from git — the fast path for development/testing.
-    if [ -n "${BIOPB_INSTALL_FROM_SOURCE:-}" ] && [ "${BIOPB_INSTALL_FROM_SOURCE}" != "0" ]; then
-        INSTALL_FROM_SOURCE=1
+    # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
+    # BIOPB_INSTALL_RC=1 also admits the latest release candidate (a/b/rc
+    # prerelease, typically cut off dev) — the fast path for testing an upcoming
+    # release before it lands on main. Both channels install prebuilt wheels;
+    # neither builds from git.
+    if [ -n "${BIOPB_INSTALL_RC:-}" ] && [ "${BIOPB_INSTALL_RC}" != "0" ]; then
+        ALLOW_RC=1
     else
-        INSTALL_FROM_SOURCE=0
+        ALLOW_RC=0
     fi
 
     printf "\n%s" "${CYAN}"
@@ -736,24 +740,9 @@ install_biopb() {
 
     _ok "Platform: $PLATFORM ($ARCH)"
 
-    # On a fresh Mac /usr/bin/git is only a stub that triggers (or fails to trigger)
-    # the Command Line Tools install; it passes `command -v git` below but real
-    # git/cc are absent, so the later `uv tool install … @ git+…` dies with a
-    # cryptic `xcrun: error: invalid active developer path`. Check for the actual
-    # toolchain up front and give an actionable message instead.
-    if [ "$PLATFORM" = "macOS" ] && [ "$INSTALL_FROM_SOURCE" = "1" ] && ! xcode-select -p &>/dev/null; then
-        _err "Xcode Command Line Tools not found."
-        _info "biopb needs them for git and the C compiler/headers used to build packages."
-        _info "Install them, then rerun this script:"
-        _cmd "xcode-select --install"
-        _info "A system dialog will appear — click Install, wait for it to finish, then rerun."
-        exit 1
-    fi
-
-    # Check required tools. git is only needed to build from a source checkout;
-    # the default release install just downloads prebuilt wheels (curl + tar).
+    # The install downloads prebuilt wheels (release-v* deployment), so only
+    # curl + tar are needed — no git, buf, or compiler.
     required_tools=(curl tar)
-    [ "$INSTALL_FROM_SOURCE" = "1" ] && required_tools+=(git)
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
             _err "$tool not found"
@@ -779,7 +768,7 @@ install_biopb() {
     unset CHECKBOX_DEFAULTS
     echo ""
 
-    # ===== 1. Install uv + buf (if needed) =====
+    # ===== 1. Install uv (if needed) =====
     _step "[1/7] Ensuring build tools..."
 
     # Remember the user's real shell PATH before we prepend ~/.local/bin for our
@@ -793,30 +782,6 @@ install_biopb() {
         _ok "uv installed"
     else
         _ok "uv already installed ($(uv --version))"
-    fi
-
-    # buf generates the protobuf/Flight stubs at build time, so it is only needed
-    # when building from a source checkout. Release wheels ship the stubs prebuilt.
-    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
-        BUF_VERSION="1.70.0"
-        # Install into the user's ~/.local/bin (already prepended to PATH above), not
-        # /usr/local/bin: the latter is root-owned on a normal account, so curl -o
-        # there fails with "failed to write to destination". Keeps buf user-local and
-        # consistent with uv's tool bin dir and the Windows installer.
-        BUF_BIN="$HOME/.local/bin"
-        if ! command -v buf &>/dev/null || [ "$(buf --version 2>/dev/null)" != "$BUF_VERSION" ]; then
-            _info "Installing buf $BUF_VERSION..."
-            mkdir -p "$BUF_BIN"
-            rm -f "$BUF_BIN/buf"
-            curl -sSL \
-                "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-$(uname -s)-$(uname -m)" \
-                -o "$BUF_BIN/buf"
-            chmod +x "$BUF_BIN/buf"
-            _ok "buf $BUF_VERSION installed"
-        else
-            _ok "buf already installed ($(buf --version))"
-        fi
-        unset BUF_VERSION BUF_BIN
     fi
 
     # ===== 2. Python =====
@@ -876,71 +841,65 @@ install_biopb() {
     # Resolve where the three packages come from. They must be installed as a
     # matched set from a single build: the tensor server is self-contained and
     # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
-    # coupled to both — so all three are pinned to sibling artifacts (git refs in
-    # source mode, local wheels in release mode) and the resolver is never allowed
-    # to pull biopb / biopb-tensor-server / biopb-mcp from PyPI. The single
-    # biopb-mcp release carries the mutually-paired triple (release CI bakes in
-    # the biopb + tensor-server wheels pinned in pyproject), so one download is
-    # one consistent set — no PyPI-vs-release version skew.
+    # coupled to both — so all three are pinned to the sibling wheels from one
+    # release-v* deployment (release CI builds the mutually-paired triple from
+    # the tagged commit) and the resolver is never allowed to pull biopb /
+    # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
+    # set — no PyPI-vs-release version skew.
     local biopb_req tensor_req mcp_req
     # napari is the one runtime dep resolved from PyPI. We pin it to the exact
-    # version biopb-mcp was built/tested against so the deployed object graph
-    # matches the graph-walk thread-safety test. The release carries that version
-    # in its versions.json attribute (read below in release mode); in source mode
-    # the `==` pin in biopb-mcp's [mcp] extra constrains the unversioned spec.
+    # version this release was built/tested against (carried in its versions.json
+    # attribute, read below) so the deployed object graph matches the graph-walk
+    # thread-safety test — and so the napari[all] Qt binding is the tested one.
     local napari_req="napari[all]"
-    if [ "$INSTALL_FROM_SOURCE" = "1" ]; then
-        _info "Building from source: biopb-mcp + biopb + biopb-tensor-server"
-        _info "  from HEAD of $BIOPB_REPO_URL (monorepo subdirectories)"
-        mcp_req="biopb-mcp[mcp] @ $MCP_REPO#subdirectory=biopb-mcp"
-        biopb_req="biopb[tensor] @ $BIOPB_REPO"
-        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ $BIOPB_REPO#subdirectory=biopb-tensor-server"
-    else
-        if ! _fetch_latest_release; then
-            _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
-            _info "Check your network, or build from source instead:"
-            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
-            exit 1
+    if ! _fetch_latest_release; then
+        _err "Could not fetch the latest biopb release-v* deployment from $RELEASE_REPO."
+        if [ "$ALLOW_RC" = "1" ]; then
+            _info "No release candidate found. Check your network, or install the stable release:"
+            _cmd "curl -fsSL https://biopb.org/install.sh | bash"
+        else
+            _info "Check your network and rerun. To try the latest release candidate:"
+            _cmd "BIOPB_INSTALL_RC=1 curl -fsSL https://biopb.org/install.sh | bash"
         fi
-        local mcp_url sdk_url tensor_url
-        mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
-        sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
-        tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-        if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
-            _err "Release $RELEASE_TAG is missing one of the biopb wheels."
-            _info "Build from source instead:"
-            _cmd "BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash"
-            exit 1
-        fi
-        # Pin napari from the release's versions.json attribute so the installed
-        # napari is identical to the one this release was built/tested against
-        # (closes the last dev/deploy version-skew — and the napari[all] Qt
-        # binding, which is napari-version-dependent). Tolerant: an older release
-        # without the manifest falls back to the unversioned spec.
-        local versions_url napari_pin
-        versions_url=$(_release_asset_url 'versions\.json')
-        if [ -n "$versions_url" ]; then
-            napari_pin=$(curl -fsSL "$versions_url" 2>/dev/null \
-                | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-            [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
-        fi
-        _info "Installing from release $RELEASE_TAG"
-        WHEELS_DIR=$(mktemp -d)
-        # Remove the wheel download dir on any exit (success, error, or set -e).
-        trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
-        local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
-        local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
-        local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
-        curl -fsSL "$mcp_url" -o "$mcp_whl"
-        curl -fsSL "$sdk_url" -o "$sdk_whl"
-        curl -fsSL "$tensor_url" -o "$tensor_whl"
-        # Direct file:// references pin each package to this exact wheel, so uv
-        # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
-        # `biopb[tensor]`) to the downloaded set rather than to PyPI.
-        mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
-        biopb_req="biopb[tensor] @ file://$sdk_whl"
-        tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
+        exit 1
     fi
+    local mcp_url sdk_url tensor_url
+    mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
+    sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
+    tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
+    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ]; then
+        _err "Release $RELEASE_TAG is missing one of the biopb wheels."
+        _info "Try again later, or report this against $RELEASE_REPO."
+        exit 1
+    fi
+    # Pin napari from the release's versions.json attribute so the installed
+    # napari is identical to the one this release was built/tested against
+    # (closes the last dev/deploy version-skew — and the napari[all] Qt
+    # binding, which is napari-version-dependent). Tolerant: an older release
+    # without the manifest falls back to the unversioned spec.
+    local versions_url napari_pin
+    versions_url=$(_release_asset_url 'versions\.json')
+    if [ -n "$versions_url" ]; then
+        napari_pin=$(curl -fsSL "$versions_url" 2>/dev/null \
+            | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
+    fi
+    _info "Installing from release $RELEASE_TAG"
+    WHEELS_DIR=$(mktemp -d)
+    # Remove the wheel download dir on any exit (success, error, or set -e).
+    trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
+    local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
+    local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+    local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
+    curl -fsSL "$mcp_url" -o "$mcp_whl"
+    curl -fsSL "$sdk_url" -o "$sdk_whl"
+    curl -fsSL "$tensor_url" -o "$tensor_whl"
+    # Direct file:// references pin each package to this exact wheel, so uv
+    # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
+    # `biopb[tensor]`) to the downloaded set rather than to PyPI.
+    mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
+    biopb_req="biopb[tensor] @ file://$sdk_whl"
+    tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
 
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
@@ -988,8 +947,7 @@ install_biopb() {
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
 
-        # Reuses the release metadata already fetched for the wheels (cached);
-        # in source mode this is the first and only call.
+        # Reuses the release metadata already fetched for the wheels (cached).
         if _fetch_latest_release; then
             INSTALLED_TAG=""
             [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
@@ -1002,9 +960,6 @@ install_biopb() {
                 local webapp_url
                 webapp_url=$(_release_asset_url 'webapp\.tar\.gz')
                 webapp_url="${webapp_url:-$REPO_URL/releases/download/$RELEASE_TAG/webapp.tar.gz}"
-                # mktemp (not "$WHEELS_DIR/...") because WHEELS_DIR is only set
-                # in release mode; under `set -u` it would abort a source-mode
-                # install with the webapp enabled.
                 local tmp
                 tmp=$(mktemp)
                 if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then

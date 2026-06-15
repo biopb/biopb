@@ -12,40 +12,47 @@ config, and wire biopb-mcp into any detected AI agent.
 
 Both are **idempotent** — rerun to upgrade or to add components you skipped.
 
-## Install modes
+## Release channels
 
-### Release (default)
-
-Downloads the prebuilt `biopb-mcp`, `biopb`, and `biopb-tensor-server` wheels
-from the **latest `biopb/biopb-mcp` GitHub release** — a single release that
-carries all three as a mutually-paired set — and installs them into one shared
-`uv` tool environment. Because the trio ships from one build, the server always
-runs against the exact `biopb` it was tested with and `biopb-mcp` against the
-exact pair it expects (the server wheel may use proto fields newer than any
-`biopb` on PyPI), with no PyPI-vs-release version skew. Only `napari` comes from
-PyPI.
+Both installers download the prebuilt `biopb-mcp`, `biopb`, and
+`biopb-tensor-server` wheels from a single **`biopb/biopb` `release-v*` GitHub
+deployment** — one release that carries all three as a mutually-paired set — and
+install them into one shared `uv` tool environment. Because the trio ships from
+one build, the server always runs against the exact `biopb` it was tested with
+and `biopb-mcp` against the exact pair it expects (the server wheel may use proto
+fields newer than any `biopb` on PyPI), with no PyPI-vs-release version skew.
+Only `napari` comes from PyPI.
 
 Requirements: `curl`/`tar` (POSIX) or built-in PowerShell tooling (Windows), plus
 `uv` (installed automatically). **No git, buf, or compiler needed** — the release
 wheels ship the generated protobuf/Flight stubs.
 
-### Source (opt-in)
+### Stable (default)
 
-Set `BIOPB_INSTALL_FROM_SOURCE=1` to build the bleeding-edge `main` from a git
-checkout instead. This is the fast path for development/testing.
+Tracks the latest **stable** release — a clean `release-vX.Y.Z` tag. Prerelease
+tags are skipped.
+
+### Release candidate (opt-in)
+
+Set `BIOPB_INSTALL_RC=1` to also admit the latest **release candidate** — a PEP
+440 prerelease (`…rc1`/`…a1`/`…b1`, typically cut off the `dev` branch to
+validate a deployment before it lands on `main`). The newest matching release
+wins, so if an RC is newer than the current stable you get the RC. This replaces
+the old build-from-source path as the fast way to test an upcoming release — it
+still installs prebuilt wheels, so no git/buf/compiler is needed.
 
 ```sh
 # Linux / macOS / WSL
-BIOPB_INSTALL_FROM_SOURCE=1 curl -fsSL https://biopb.org/install.sh | bash
+BIOPB_INSTALL_RC=1 curl -fsSL https://biopb.org/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-$env:BIOPB_INSTALL_FROM_SOURCE = "1"; irm https://biopb.org/install.ps1 | iex
+$env:BIOPB_INSTALL_RC = "1"; irm https://biopb.org/install.ps1 | iex
 ```
 
-Source mode additionally requires **git** and installs **buf** (to generate the
-proto stubs at build time); on macOS it also needs the Xcode Command Line Tools.
+See `../docs/release-model.md` for how `release-v*` tags and release candidates
+are produced.
 
 ## What gets installed
 
@@ -72,11 +79,11 @@ Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
 
 ## Notes
 
-- Release assets are read from the `biopb/biopb-mcp` GitHub Releases API; the
-  latest `v*` release carries all three wheels (`biopb-mcp`, `biopb`,
-  `biopb-tensor-server`) plus the webapp tarball. biopb-mcp's release CI bakes
-  in the `biopb` + `biopb-tensor-server` wheels (pinned in `pyproject.toml`) so
-  the trio is built and shipped together.
+- Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
+  `release-v*` deployment carries all three wheels (`biopb-mcp`, `biopb`,
+  `biopb-tensor-server`) plus the webapp tarball. The `release.yaml` CI builds
+  the trio from the tagged commit so they are shipped together as one matched
+  set (see `../docs/release-model.md`).
 - Migration rationale (why the installer and all three wheels now live in one
   repo/release) lives in `../docs/installer-migration.md`.
 - Distribution rationale (why the server ships via Docker/GitHub release rather

@@ -49,8 +49,9 @@ the data-browser webapp, writes default config
 (`~/.config/biopb/biopb.toml`, `~/.config/biopb-mcp/config.json`,
 `~/.config/biopb/mcp.json`), wires biopb-mcp into any detected AI agent
 (Claude Code/Desktop, Cursor, opencode, Hermes) as a **stdio** MCP server, and
-starts the data server. Idempotent; rerun to upgrade. `BIOPB_INSTALL_FROM_SOURCE=1`
-builds from git instead of release wheels.
+starts the data server. Idempotent; rerun to upgrade. By default it tracks the
+latest stable `release-v*`; `BIOPB_INSTALL_RC=1` tracks the latest release
+candidate (a/b/rc prerelease) instead — both install prebuilt release wheels.
 
 ## The sourcing change (the heart of Phases 0–1)
 
