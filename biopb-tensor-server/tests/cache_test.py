@@ -1,5 +1,6 @@
 """Thread-safety tests for cache module."""
 
+import errno
 import shutil
 import tempfile
 import threading
@@ -1496,3 +1497,131 @@ class TestSieveKEviction:
 
         backend.close()
         shutil.rmtree(cache_dir)
+
+
+class _WriterProxy:
+    """Wraps a segment writer so a test can make ``write_batch`` block or fail.
+
+    Only ``write_batch`` / ``close`` are used by the backend, so delegating
+    those is enough.
+    """
+
+    def __init__(self, inner, backend):
+        self._inner = inner
+        self._backend = backend
+
+    def write_batch(self, batch):
+        b = self._backend
+        if b.fail_next_write:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        if b.block_next_write:
+            b.write_in_progress.set()
+            # Block as a stalled flush on a full filesystem would, while holding
+            # _write_lock but NOT _lock.
+            b.release_write.wait(timeout=10)
+        return self._inner.write_batch(batch)
+
+    def close(self):
+        return self._inner.close()
+
+
+class _InstrumentedBackend(ArrowFileBackend):
+    """ArrowFileBackend whose segment writes can be stalled or failed on demand."""
+
+    def __init__(self, config):
+        self.block_next_write = False
+        self.fail_next_write = False
+        self.write_in_progress = threading.Event()
+        self.release_write = threading.Event()
+        super().__init__(config)
+
+    def _create_segment_for_pool(self, pool_key, schema):
+        seg_id = super()._create_segment_for_pool(pool_key, schema)
+        self._pool_writers[seg_id] = _WriterProxy(self._pool_writers[seg_id], self)
+        return seg_id
+
+
+class TestWriteLockDoesNotWedgeReads:
+    """Regression: a stalled/failed segment write must not hold the lock the
+    read path needs. A full /tmp once stalled a write inside complete_entry
+    while it held the global lock, wedging every read server-wide."""
+
+    def _data(self, values):
+        return pa.RecordBatch.from_arrays(
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
+        )
+
+    def _backend(self):
+        cache_dir = Path(tempfile.mkdtemp(prefix="biopb-cache-wedge-test-"))
+        config = ArrowFileConfig(
+            cache_dir=cache_dir,
+            max_segment_bytes=10 * 1024 * 1024,   # big: keep one segment open
+            max_total_bytes=100 * 1024 * 1024,
+        )
+        return _InstrumentedBackend(config), cache_dir
+
+    def test_stalled_write_does_not_block_reads(self):
+        backend, cache_dir = self._backend()
+        try:
+            # Seed a READY entry (normal, unblocked write).
+            backend.start_compute(b"ready")
+            backend.complete_entry(b"ready", self._data([1, 2, 3]), 24)
+
+            # Arm the next write to stall mid-flush.
+            backend.block_next_write = True
+            blocked = threading.Thread(
+                target=lambda: backend.get_or_acquire(
+                    b"stall", lambda: (self._data([9, 9]), 16)
+                ),
+                daemon=True,
+            )
+            blocked.start()
+            assert backend.write_in_progress.wait(timeout=5), "stalled write never started"
+
+            # While that write is stalled (holding _write_lock, not _lock), a
+            # read of the already-cached key must still complete promptly.
+            done = []
+            reader = threading.Thread(
+                target=lambda: done.append(backend.get_or_acquire(b"ready", None)),
+                daemon=True,
+            )
+            reader.start()
+            reader.join(timeout=3)
+            assert not reader.is_alive(), "read was wedged behind the stalled write"
+            assert done and done[0].state == EntryState.READY
+            assert done[0].data.column(0).to_pylist() == [[1, 2, 3]]
+            backend.release(b"ready")
+        finally:
+            backend.release_write.set()   # let the stalled write finish
+            blocked.join(timeout=5)
+            backend.close()
+            shutil.rmtree(cache_dir)
+
+    def test_enospc_fails_entry_without_wedging(self):
+        backend, cache_dir = self._backend()
+        try:
+            backend.start_compute(b"ready")
+            backend.complete_entry(b"ready", self._data([1, 2, 3]), 24)
+
+            # A write that hits ENOSPC must surface as an error and leave the
+            # entry failed (not stuck PENDING, which would time out every waiter).
+            backend.fail_next_write = True
+            with pytest.raises(OSError):
+                backend.get_or_acquire(b"boom", lambda: (self._data([7]), 8))
+            # Entry is gone (failed), not stuck PENDING.
+            assert b"boom" not in backend._entries
+
+            # The backend is not wedged: reads and fresh writes still work.
+            backend.fail_next_write = False
+            hit, _ = backend.start_compute(b"ready")
+            assert hit.state == EntryState.READY
+            backend.release(b"ready")
+            backend.start_compute(b"after")
+            backend.complete_entry(b"after", self._data([5, 5]), 16)
+            got, _ = backend.start_compute(b"after")
+            assert got.state == EntryState.READY
+            backend.release(b"after")
+        finally:
+            backend.close()
+            shutil.rmtree(cache_dir)

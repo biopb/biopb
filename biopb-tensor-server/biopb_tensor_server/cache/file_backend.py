@@ -259,7 +259,19 @@ class ArrowFileBackend(CacheBackend):
 
     def __init__(self, config: ArrowFileConfig):
         self._config = config
+        # ``_lock`` guards the in-memory index (``_entries``, ``_metadata``,
+        # ``_pool_*``, ``_segment_mmaps``). It is held ONLY for short in-memory
+        # mutations and must NEVER be held across a blocking disk write
+        # (``write_batch``/``flush``/``writer.close``) -- doing so once wedged the
+        # entire server's read path when a write stalled on a full filesystem
+        # (the lock was orphaned when the RPC was torn down). Reads take only
+        # ``_lock``, so they stay live even if a write stalls.
         self._lock = threading.Lock()
+        # ``_write_lock`` serializes the segment-write critical section
+        # (``complete_entry`` and the eviction/segment-close it drives -- the
+        # sole mutators of writer/segment state). Readers never take it, so a
+        # stalled or orphaned write can block only future writes, not reads.
+        self._write_lock = threading.Lock()
 
         # In-memory entries for pending/ready/error state management
         # Only stores small metadata; actual data is in segment files
@@ -587,35 +599,51 @@ class ArrowFileBackend(CacheBackend):
             sink.close()
 
     def _close_segment(self, segment_id: int) -> None:
-        """Close a specific segment's writer and open mmap for reading."""
-        self._close_writer(segment_id)
+        """Close a full segment's writer and reopen it read-only as an mmap.
 
-        path = self._pool_paths.pop(segment_id, None)
-        schema = self._pool_schemas.pop(segment_id, None)
+        Caller must hold ``self._write_lock`` (serializes against other mutators)
+        but must NOT hold ``self._lock``: ``writer.close()`` flushes buffered
+        bytes (a blocking disk op), so it runs with ``self._lock`` released and
+        the lock is taken only for the surrounding in-memory index mutations.
+        """
+        # Detach writer/sink/path from the index under the lock (in-memory only).
+        with self._lock:
+            writer = self._pool_writers.pop(segment_id, None)
+            sink = self._pool_sinks.pop(segment_id, None)
+            path = self._pool_paths.pop(segment_id, None)
+            self._pool_schemas.pop(segment_id, None)
+            self._open_pools = {
+                k: v for k, v in self._open_pools.items()
+                if v != segment_id
+            }
 
-        # Remove from open pools
-        self._open_pools = {
-            k: v for k, v in self._open_pools.items()
-            if v != segment_id
-        }
+        # Flush + close the handles WITHOUT self._lock (this is the blocking I/O;
+        # both must close -- close() leaves the OSFile sink open, issue #5).
+        if writer is not None:
+            writer.close()
+        if sink is not None:
+            sink.close()
 
-        # Open mmap for reading
-        if path and path.exists():
-            mmap = pa.memory_map(str(path), 'r')
-            self._segment_mmaps[segment_id] = mmap
+        # Reopen read-only (mmap is a non-blocking read map) and drop redundant
+        # in-memory copies, under the lock.
+        with self._lock:
+            if path and path.exists():
+                mmap = pa.memory_map(str(path), 'r')
+                self._segment_mmaps[segment_id] = mmap
 
-            # The segment is now re-readable, so the in-memory RecordBatch copies
-            # of its entries are redundant. Drop those no longer referenced (the
-            # common sweep case: written, served, released while the segment was
-            # still filling). Entries still referenced keep their copy and are
-            # dropped on their own release() now that the segment is readable.
-            # This bounds resident decoded data to the open write segments plus
-            # what callers currently hold, instead of every chunk ever cached.
-            for k, info in self._metadata.items():
-                if info.segment_id == segment_id:
-                    entry = self._entries.get(k)
-                    if entry is not None and entry.is_evictable():
-                        self._entries.pop(k, None)
+                # The segment is now re-readable, so the in-memory RecordBatch
+                # copies of its entries are redundant. Drop those no longer
+                # referenced (the common sweep case: written, served, released
+                # while the segment was still filling). Entries still referenced
+                # keep their copy and are dropped on their own release() now that
+                # the segment is readable. This bounds resident decoded data to
+                # the open write segments plus what callers currently hold,
+                # instead of every chunk ever cached.
+                for k, info in list(self._metadata.items()):
+                    if info.segment_id == segment_id:
+                        entry = self._entries.get(k)
+                        if entry is not None and entry.is_evictable():
+                            self._entries.pop(k, None)
 
     def _get_total_size(self) -> int:
         """Get total size across all segments."""
@@ -1099,7 +1127,14 @@ class ArrowFileBackend(CacheBackend):
         data: pa.RecordBatch,
         size_bytes: int,
     ) -> None:
-        """Mark pending entry as ready and write to segment."""
+        """Mark a pending entry as ready and persist it to a segment.
+
+        The blocking disk writes (``write_batch`` / ``flush``, and the rotation
+        ``writer.close()``) run WITHOUT ``self._lock`` held -- serialized instead
+        by ``self._write_lock``, which readers never take. So a write that stalls
+        (e.g. a full filesystem) blocks only future writes, never the read path;
+        ``self._lock`` is taken only for short in-memory index mutations.
+        """
         # Check for oversized chunks
         if size_bytes > MAX_ARROW_BATCH_BYTES:
             self._oversized_skips += 1
@@ -1114,111 +1149,111 @@ class ArrowFileBackend(CacheBackend):
                 entry.set_ready(data, size_bytes)
             return
 
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None or entry.state != EntryState.PENDING:
-                return
+        # Serialize the whole write/evict/close critical section. complete_entry
+        # is the only mutator of writer/segment state, so holding _write_lock
+        # keeps the selected segment stable across the unlocked write below.
+        with self._write_lock:
+            # ---- PHASE 1: in-memory bookkeeping + segment selection ----
+            # Everything here is in-memory or non-blocking-on-ENOSPC (dict
+            # mutations, segment-file create, eviction unlink), so it is safe to
+            # hold self._lock. NOTE: a residual blocking flush can occur if the
+            # eviction sweep closes the currently-open write segment; Sieve-K
+            # keeps the newest (active) segment, so this is rare -- the common,
+            # every-chunk write+flush below is the path that matters.
+            with self._lock:
+                entry = self._entries.get(key)
+                if entry is None or entry.state != EntryState.PENDING:
+                    return
 
-            # Determine pool for this entry
-            size_class = _get_size_class(size_bytes)
+                size_class = _get_size_class(size_bytes)
 
-            # All chunks <= MAX_ARROW_BATCH_BYTES (64MB) are cached
-            # "large" pool (32-64MB) is cached too, just pooled separately
+                # Evict if needed before storing
+                while self._get_total_size() + size_bytes > self._config.max_total_bytes:
+                    if not self._evict_segment_sieve_k():
+                        break
 
-            # Evict if needed before storing
-            while self._get_total_size() + size_bytes > self._config.max_total_bytes:
-                if not self._evict_segment_sieve_k():
-                    break
+                # Cast to unified schema (all dtypes share a pool) and attach the
+                # cache key as a per-row column (NOT schema metadata): Arrow IPC
+                # persists the schema once per segment, so schema metadata can't
+                # identify individual batches on rebuild.
+                unified_batch = _cast_to_unified_schema(data)
+                key_col = pa.array([key], type=pa.binary())
+                batch_with_key = pa.RecordBatch.from_arrays(
+                    list(unified_batch.columns) + [key_col],
+                    names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
+                )
 
-            # Log pending write to WAL
+                schema_key = "unified"
+                pool_key = (schema_key, size_class)
+                pool_queue = self._pool_queues.get(pool_key)
+                if pool_queue is None:
+                    pool_queue = PoolQueueInfo(pool_key=pool_key)
+                    self._pool_queues[pool_key] = pool_queue
+                pool_queue.misses += 1
+
+                # Find or create the open segment for this pool
+                segment_id = self._open_pools.get(pool_key)
+                if segment_id is None or segment_id not in self._pool_writers:
+                    segment_id = self._create_segment_for_pool(
+                        pool_key, batch_with_key.schema
+                    )
+                writer = self._pool_writers.get(segment_id)
+                if writer is None:
+                    segment_id = self._create_segment_for_pool(
+                        pool_key, batch_with_key.schema
+                    )
+                    writer = self._pool_writers[segment_id]
+                sink = self._pool_sinks.get(segment_id)
+
+            # ---- PHASE 2: blocking disk write, self._lock RELEASED ----
+            # Flush so the bytes are durable in the page cache; the localhost
+            # cache-file handoff (issue #9) derives byte offsets lazily by walking
+            # the flushed file in locate_entry(). A failure here (e.g. ENOSPC)
+            # propagates out: get_or_acquire's owner branch turns it into
+            # fail_entry() + re-raise. That is now safe -- the `with` blocks
+            # release both locks on the way out, so a failed (or stalled) write
+            # can no longer leave a lock held across the read path.
             if self._wal:
                 self._wal.log_pending(key)
-
-            # Cast to unified schema for caching (all dtypes share same pool)
-            unified_batch = _cast_to_unified_schema(data)
-
-            # Attach the cache key as a per-row column (NOT schema metadata).
-            # Arrow IPC streams persist the schema only once per segment, so
-            # schema metadata cannot identify individual batches on rebuild.
-            key_col = pa.array([key], type=pa.binary())
-            batch_with_key = pa.RecordBatch.from_arrays(
-                list(unified_batch.columns) + [key_col],
-                names=list(unified_batch.schema.names) + [CACHE_KEY_FIELD],
-            )
-
-            # Use unified schema for pool_key (all dtypes now share same pool per size_class)
-            schema_key = "unified"
-            pool_key = (schema_key, size_class)
-
-            # Get or create pool queue
-            pool_queue = self._pool_queues.get(pool_key)
-            if pool_queue is None:
-                pool_queue = PoolQueueInfo(pool_key=pool_key)
-                self._pool_queues[pool_key] = pool_queue
-
-            # Track miss for pool (new entry)
-            pool_queue.misses += 1
-
-            # Find or create segment for this pool
-            segment_id = self._open_pools.get(pool_key)
-
-            if segment_id is None:
-                # No segment for this pool - create one
-                segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
-            elif segment_id not in self._pool_writers:
-                # Pool's segment was closed (shouldn't happen, but handle it)
-                segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
-
-            # Get the writer for this segment
-            writer = self._pool_writers.get(segment_id)
-            if writer is None:
-                # Shouldn't happen, but create if missing
-                path = self._pool_paths.get(segment_id)
-                if path is None:
-                    segment_id = self._create_segment_for_pool(pool_key, batch_with_key.schema)
-                    writer = self._pool_writers[segment_id]
-                else:
-                    sink = pa.OSFile(str(path), 'wb')
-                    writer = pa.RecordBatchStreamWriter(sink, batch_with_key.schema)
-                    self._pool_writers[segment_id] = writer
-                    self._pool_sinks[segment_id] = sink
-
-            # Write batch (in unified schema) and flush so the bytes are durable
-            # in the page cache. The localhost cache-file handoff (issue #9)
-            # needs the entry's byte range, but the stream writer buffers the
-            # schema until the first batch so the live sink cursor can't bracket
-            # the first message; offsets are derived lazily by walking the
-            # flushed file in locate_entry() instead.
             writer.write_batch(batch_with_key)
-            sink = self._pool_sinks.get(segment_id)
             if sink is not None:
                 sink.flush()
 
-            # Update segment info in pool queue
-            seg_info = pool_queue.segments.get(segment_id)
-            if seg_info:
-                seg_info.size_bytes += size_bytes
-                seg_info.entry_count += 1
-                seg_info.last_access_time = time.time()
+            # ---- PHASE 3: in-memory commit ----
+            need_close = False
+            with self._lock:
+                entry = self._entries.get(key)
+                if entry is None or entry.state != EntryState.PENDING:
+                    # Raced away (failed/evicted while we wrote). The written
+                    # bytes are harmless slack in the segment.
+                    return
 
-            # Update metadata index
-            self._metadata[key] = SegmentEntryInfo(
-                segment_id=segment_id,
-                offset=seg_info.entry_count - 1 if seg_info else 0,
-                size_bytes=size_bytes,
-                metadata=entry.metadata,
-                created_at=time.time(),
-                last_access_time=time.time(),
-            )
+                seg_info = pool_queue.segments.get(segment_id)
+                if seg_info:
+                    seg_info.size_bytes += size_bytes
+                    seg_info.entry_count += 1
+                    seg_info.last_access_time = time.time()
 
-            # Check if segment exceeds max size - close it
-            if seg_info and seg_info.size_bytes >= self._config.max_segment_bytes:
+                self._metadata[key] = SegmentEntryInfo(
+                    segment_id=segment_id,
+                    offset=seg_info.entry_count - 1 if seg_info else 0,
+                    size_bytes=size_bytes,
+                    metadata=entry.metadata,
+                    created_at=time.time(),
+                    last_access_time=time.time(),
+                )
+                entry.set_ready(data, size_bytes)
+                need_close = bool(
+                    seg_info
+                    and seg_info.size_bytes >= self._config.max_segment_bytes
+                )
+
+            # Rotate a full segment. _close_segment flushes the writer (blocking),
+            # so it manages its own locking and runs with self._lock NOT held
+            # (still under _write_lock, so the segment state is stable).
+            if need_close:
                 self._close_segment(segment_id)
 
-            # Mark entry as ready
-            entry.set_ready(data, size_bytes)
-
-            # Commit WAL
             if self._wal:
                 self._wal.log_committed(key)
 
