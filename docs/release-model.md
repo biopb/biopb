@@ -37,6 +37,22 @@ filename still pins the exact provenance.
 a **static** version in `biopb-image-runtime/pyproject.toml`, and is bumped by
 hand only when it actually changes (see idempotent publish below). It has no tag.
 
+### Release candidates (prereleases, e.g. off `dev`)
+
+A `release-v*` tag whose version is a **PEP 440 prerelease** (`…rc1`, `…a1`,
+`…b1`) is treated as a candidate, not a stable release. Tags are branch-agnostic,
+so an RC is typically cut on a `dev` commit to validate the full deployment
+before it lands on `main`. On a prerelease tag, `release.yaml`:
+
+- marks the **GitHub release** `prerelease: true` (the installer skips
+  prereleases — see below);
+- pushes each Docker image's **version-pinned** tag (e.g.
+  `biopb-tensor-server:0.5.0rc1`) but **does not move `:latest`** — `:latest`
+  only tracks a clean `X.Y.Z` release, so an RC never becomes the default pull.
+
+The per-package `v*`/`mcp-v*` PyPI tags follow PyPI's own prerelease rules: a
+`…rc1` version uploads as a prerelease, which `pip` ignores unless `--pre`.
+
 ## What `release-v*` produces (`release.yaml`)
 
 One pipeline, built from the tagged commit:
@@ -104,5 +120,6 @@ not publish** — publishing is consolidated in `release.yaml`. The old
 - Confirm `biopb.org/install.sh` serves the repo-root `install/install.sh` (the
   installer was promoted to root post-first-release; the host-side copy/redirect
   should point at it).
-- Prerelease test tags (`release-v…a`, etc.) publish harmlessly; the installer
-  skips them.
+- Prerelease test tags (`release-v…rc1`, etc.) publish harmlessly: the installer
+  skips the GitHub release and the Docker `:latest` tag is left on the last
+  stable image (see "Release candidates" above).

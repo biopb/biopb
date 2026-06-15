@@ -7,11 +7,13 @@ on:
   push:
     branches:
       - main
+      - dev
     tags:
       - 'server-v*'
   pull_request:
     branches:
       - main
+      - dev
     paths:
       - 'biopb-tensor-server/**'
       - 'proto/**'
