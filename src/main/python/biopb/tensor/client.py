@@ -510,19 +510,16 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
 def configure_cache(
     location: str, token: Optional[str], cache_bytes: int
 ) -> int:
-    """Pin this process's chunk-cache budget for a connection namespace.
+    """Pin this process's chunk-cache budget for a connection, authoritatively.
 
-    Authoritative and idempotent, unlike the lazy first-touch creation in
-    ``_get_shared_cache``: it (re)sizes the pooled cache to the *resolved*
-    ``cache_bytes`` and is honored by every later fetch, regardless of what
-    those fetch calls request. Call it once per worker process (e.g. from a
-    dask worker-init plugin, see :func:`make_cache_plugin`) to fix the budget
-    deterministically across a dynamically-sized cluster.
+    Sets the per-process chunk cache to ``cache_bytes`` and keeps it there: every
+    later fetch honors this budget regardless of the ``cache_bytes`` it requests.
+    Idempotent. Call it once per worker process (e.g. from a dask worker-init
+    plugin, see :func:`make_cache_plugin`) to fix the budget deterministically
+    across a dynamically-sized cluster.
 
-    The size is run through :func:`_resolve_cache_bytes`, so a localhost server
-    (default) or ``cache_bytes <= 0`` pins the cache OFF: it records a sentinel
-    so later fetches skip caching instead of recreating one from their own
-    ``cache_bytes``.
+    A localhost server (the default) or ``cache_bytes <= 0`` pins the cache OFF;
+    later fetches then skip caching rather than recreating one of their own.
 
     Args:
         location: Flight server location string
@@ -532,6 +529,9 @@ def configure_cache(
     Returns:
         The effective (resolved) cache size that was pinned, in bytes.
     """
+    # Unlike the lazy first-touch creation in _get_shared_cache, this (re)sizes
+    # the pooled cache now and records a None sentinel for the disabled case, so
+    # a later fetch can't undo the decision from its own cache_bytes.
     effective = _resolve_cache_bytes(location, cache_bytes)
     key = (location, token)
     current_pid = os.getpid()
@@ -1019,12 +1019,13 @@ class TensorFlightClient:
         data = arr[0:100, 0:100].compute()   # Load slice
 
     Note:
-        This client IS compatible with dask.distributed. The dask arrays
-        returned by get_tensor() use a pickle-safe design where FlightClient
-        connections are created lazily in each worker from stored connection
-        parameters. Each worker maintains its own connection pool and LRU
-        cache keyed by (location, token).
+        The dask arrays returned by get_tensor() are picklable and work with
+        dask.distributed: each worker fetches chunks over its own connection,
+        so you can scatter an array across a cluster and compute on it.
     """
+    # The arrays are pickle-safe because the fetch functions hold no FlightClient
+    # in their closure -- connections, caches, and call options are recreated
+    # lazily per worker process from module-level pools keyed by (location, token).
 
     def __init__(
         self,
@@ -1251,19 +1252,18 @@ class TensorFlightClient:
         return df
 
     def get_source_metadata(self, source_id: str) -> dict:
-        """Get source-level OME/vendor metadata.
-
-        Fetches metadata via GetFlightInfo for the first tensor in the source,
-        since metadata_json is populated in the response TensorDescriptor.
+        """Get source-level OME/vendor metadata as a dict.
 
         Args:
             source_id: Source identifier
 
         Returns:
-            Parsed metadata from GetFlightInfo response.
-            The server wraps metadata in {"type": ..., "dim_label": [...], "metadata": {...}},
-            this method returns the inner "metadata" dict,
-            or empty dict if no metadata.
+            The source's metadata dict (the format-specific OME/vendor metadata),
+            or an empty dict if the source carries none.
+
+        Raises:
+            ValueError: If the source is unknown, or unresolved (cloud /
+                synced-folder) -- call :meth:`resolve` first.
         """
         import json
 
@@ -1284,7 +1284,8 @@ class TensorFlightClient:
             # resolve-on-serve probe (get_descriptor) would.
             raise _unresolved_source_error(source_id)
 
-        # Get metadata from first tensor via GetFlightInfo
+        # metadata_json is populated on the descriptor GetFlightInfo returns, so
+        # we fetch it via the source's first tensor.
         first_tensor = source_desc.tensors[0]
         cmd = FlightCmd(
             source_id=source_id,
@@ -1298,8 +1299,9 @@ class TensorFlightClient:
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         if response_desc.metadata_json:
+            # The server wraps it as {"type": ..., "dim_label": [...],
+            # "metadata": {...}}; return just the inner metadata dict.
             wrapped = json.loads(response_desc.metadata_json)
-            # Unwrap to return just the metadata dict
             return wrapped.get("metadata", {})
         return {}
 
@@ -1313,20 +1315,17 @@ class TensorFlightClient:
         """Per-dimension physical pixel size + unit for a tensor.
 
         Returns ``(scale, unit)``: two lists aligned with the tensor's
-        ``dim_labels`` (source axis order), or ``None`` when the server
-        advertised no physical sizes (an older server, or a format that carries
-        none). This is the compact summary the server folds onto the descriptor
-        ``GetFlightInfo`` already returns (issue #31), so the common case avoids
-        the much larger ``get_source_metadata`` round trip.
-
-        Reads the descriptor cached by a prior ``get_tensor()`` when available
-        (no extra RPC); otherwise issues one cheap ``GetFlightInfo``.
+        ``dim_labels`` (source axis order), or ``None`` when no physical sizes
+        are known (an older server, or a format that carries none). This is a
+        compact summary carried on the tensor descriptor, so it is much cheaper
+        than reading the full :meth:`get_source_metadata`. When a prior
+        :meth:`get_tensor` already cached the descriptor it costs no extra RPC.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
                 ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``. A bare single-tensor
                 source id resolves to its sole tensor. A bare *multi*-tensor
-                source id anchors on the source's default (first) tensor (#44) --
+                source id anchors on the source's default (first) tensor --
                 unlike ``get_tensor``, which requires the field be named; pass the
                 qualified ``source_id/field`` to target a specific scene.
             tensor_id: DEPRECATED. The legacy ``(source_id, tensor_id)`` form;
@@ -1417,23 +1416,19 @@ class TensorFlightClient:
     def get_descriptor(self, array_id: str) -> "TensorDescriptor":
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
-        This is the policy-conformant single-tensor probe: a tensor is identified
-        by its ``array_id`` ALONE (see the tensor identity policy at the top of
-        ``proto/biopb/tensor/descriptor.proto``), so this takes that one
-        identifier rather than a ``(source_id, tensor_id)`` pair. The source is
-        derived as the slash-free prefix ``array_id.split('/', 1)[0]`` and the
-        full ``array_id`` is sent as the request ``tensor_id``.
-
+        A tensor is identified by its ``array_id`` alone (see the tensor identity
+        policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
+        takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
         Works even when the source is beyond the (truncatable) ``list_sources()``
         cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
         source, or to anchor on a multi-tensor source's default/first tensor) is
         accepted. To enumerate ALL tensors/scenes of a source, use
         ``list_sources()[source_id].tensors`` -- NOT this method.
 
-        This is a CHEAP probe -- it does NOT resolve. On an unresolved (cloud /
-        synced-folder) source it raises a directive error pointing at
-        :meth:`resolve`, never triggering a download. Call :meth:`resolve` first
-        to read such a source.
+        This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
+        synced-folder) source it raises an error pointing at :meth:`resolve`,
+        never triggering a download. Call :meth:`resolve` first to read such a
+        source.
 
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
@@ -1442,6 +1437,7 @@ class TensorFlightClient:
         Returns:
             The ``TensorDescriptor`` for that tensor.
         """
+        # source_id is the slash-free prefix; the full array_id is the tensor_id.
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(source_id, array_id)
 
@@ -1508,7 +1504,7 @@ class TensorFlightClient:
         returned ``.tensors`` holds ONLY the resolved tensor (or the source's
         default/first tensor when ``tensor_id`` is None), never the full scene
         list. For a multi-scene source, ``get_source(id).tensors`` is length-1
-        and scenes 2..N are NOT enumerated here -- that was issue #75. Use
+        and scenes 2..N are NOT enumerated here. Use
         ``list_sources()[id].tensors`` for the complete enumeration.
 
         Args:
