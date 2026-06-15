@@ -56,7 +56,10 @@ _BASE_INSTRUCTIONS = (
     "(server-side DuckDB, complete), not `client.list_sources()` "
     "(server-capped for large catalogs); the `sources` columns are source_id, "
     "source_url, source_type, dtype, indexed_at, metadata_json, "
-    "shape_summary.\n"
+    "shape_summary, data_resident. Unresolved (cloud / synced-folder) sources "
+    "have NULL dtype/shape_summary, so a predicate like `WHERE dtype='uint8'` "
+    "silently drops them; filter on `data_resident` to opt them in/out on "
+    "purpose (`WHERE NOT data_resident` finds what hasn't been resolved yet).\n"
     "- Prefer lazy dask operations; only `.compute()` the final result.\n"
     "- Put intermediate results back on `viewer` for the user to validate at "
     "each step.\n"
@@ -506,9 +509,12 @@ def execute_code(python_code: str) -> str:
     * data access (see guide://tensor for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
-      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary
-      (note source_url, not "url"). Prefer this over client.list_sources()
-      (server-capped for large catalogs).
+      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
+      data_resident (note source_url, not "url"). Prefer this over
+      client.list_sources() (server-capped for large catalogs). Unresolved
+      (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
+      predicate hides them; use `data_resident` to filter on residency on
+      purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
       (auto-handles the multiscale pyramid). client.get_tensor(source_id,
       tensor_id=None) returns a lazy dask array without adding a layer.

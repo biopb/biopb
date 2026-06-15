@@ -185,7 +185,15 @@ class MetadataDatabase:
                 dtype TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
-                shape_summary TEXT
+                shape_summary TEXT,
+                -- NOT NULL DEFAULT FALSE: every source has a residency value
+                -- (both insert sites write the descriptor's data_resident bit),
+                -- and a non-null column lets `WHERE data_resident` /
+                -- `WHERE NOT data_resident` partition ALL rows cleanly -- no
+                -- three-valued-logic gap where a NULL row silently drops from
+                -- both. FALSE is the conservative default (unknown -> treat as
+                -- non-resident; still discoverable via `WHERE NOT data_resident`).
+                data_resident BOOLEAN NOT NULL DEFAULT FALSE
             )
         """)
         # Index on source_url for path filtering
@@ -368,8 +376,8 @@ class MetadataDatabase:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     [
                         source_id,
@@ -379,6 +387,7 @@ class MetadataDatabase:
                         indexed_at,
                         metadata_json,
                         shape_summary,
+                        source_desc.data_resident,
                     ],
                 )
 
@@ -449,6 +458,7 @@ class MetadataDatabase:
                         datetime.now(),
                         json.dumps(metadata, cls=NumpyEncoder) if metadata else None,
                         shape_summary,
+                        source_desc.data_resident,
                     ]
                 )
             except Exception as e:
@@ -461,8 +471,8 @@ class MetadataDatabase:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     batch,
                 )
