@@ -13,6 +13,7 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.Ticket;
@@ -63,16 +64,23 @@ import net.imglib2.view.Views;
  * endpoint layout matches the descriptor chunk grid. In that case, imglib2's
  * internal cell cache is the primary cache for repeated reads.
  *
+ * <p>A tensor is identified by its globally-unique {@code array_id} (the tensor
+ * identity policy; see the top of {@code proto/biopb/tensor/descriptor.proto}):
+ * either {@code source_id} for a single-tensor source or {@code source_id/field}
+ * for a multi-tensor one. The array_id-first methods ({@link #getTensor(String)},
+ * {@link #getDescriptor(String)}, {@link #getPhysicalScale(String)}) take that one
+ * identifier; the older {@code (sourceId, tensorId)} overloads remain available.
+ *
  * Usage:
- * 
+ *
  * <pre>
  * TensorFlightClient client = new TensorFlightClient("localhost:8815");
  *
  * // List data sources (each may contain multiple tensors)
  * Map&lt;String, DataSourceDescriptor&gt; sources = client.listSources();
  *
- * // Access a specific tensor within a source
- * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source", "tensor-0");
+ * // Access a tensor by its array_id ("source_id" or "source_id/field")
+ * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source/tensor-0");
  * long[] pos = { 10, 20, 30 };
  * UnsignedByteType pixel = arr.getAt(pos);
  * client.close();
@@ -368,16 +376,14 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Get source-level OME/vendor metadata.
-     *
-     * Fetches metadata via GetFlightInfo for the first tensor in the source,
-     * since metadataJson is populated in the response TensorDescriptor.
-     * The server wraps metadata in {"type": ..., "dim_label": [...], "metadata":
-     * {...}},
-     * this method returns the inner "metadata" dict.
+     * Get source-level OME/vendor metadata as a map.
      *
      * @param sourceId Source identifier
-     * @return Parsed metadata as Map, or empty map if no metadata
+     * @return The source's metadata map, or an empty map if it carries none
+     * @throws IllegalArgumentException if the source is unknown
+     * @throws IllegalStateException    if the source is unresolved (cloud /
+     *                                  synced-folder) -- call {@link #resolve}
+     *                                  first
      */
     public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
         if (!sources.containsKey(sourceId)) {
@@ -388,10 +394,16 @@ public class TensorFlightClient implements AutoCloseable {
             throw new IllegalArgumentException("Source not found: " + sourceId);
         }
         if (sourceDesc.getTensorsList().isEmpty()) {
-            return new HashMap<>();
+            // Unresolved (cloud / synced-folder) source: tensors are unknown until
+            // resolve. Don't return {} -- that conflates "unresolved" with
+            // "resolved, no metadata". Steer to the explicit, consented resolve().
+            throw unresolvedSourceError(sourceId);
         }
 
-        // Get metadata from first tensor via GetFlightInfo
+        // metadata_json is populated on the descriptor GetFlightInfo returns, so
+        // we fetch it via the source's first tensor. The server wraps it as
+        // {"type": ..., "dim_label": [...], "metadata": {...}}; we return the
+        // inner "metadata" map.
         TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
         FlightCmd cmd = FlightCmd.newBuilder()
                 .setSourceId(sourceId)
@@ -413,6 +425,183 @@ public class TensorFlightClient implements AutoCloseable {
             return (Map<String, Object>) metadataValue;
         }
         return wrapped;
+    }
+
+    /**
+     * Resolve an unresolved source and return its full {@link DataSourceDescriptor}.
+     *
+     * <p>An <i>unresolved</i> source is catalogued by URL only -- its
+     * shape/dtype/field list are unknown until first access (it lists with
+     * {@code data_resident} false and an empty {@code tensors}). The canonical
+     * case is a cloud / synced-folder ("Files-On-Demand") source.
+     *
+     * <p>Resolving asks the server to hydrate it. For a dehydrated placeholder
+     * this <b>downloads the whole file</b> -- a recall that can take minutes,
+     * consume local disk, and fail when offline -- then reads its real shape,
+     * dtype, and field list. This is the heavyweight, <i>consenting</i> operation
+     * that catalog browsing ({@link #listSources} / {@link #querySources})
+     * deliberately avoids; call it only when you intend to read the data.
+     * Afterwards {@link #getTensor} and friends work normally. Idempotent.
+     *
+     * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
+     * @return The full DataSourceDescriptor with every tensor/field enumerated
+     * @throws IOException If the action fails or the server returns no descriptor
+     */
+    public DataSourceDescriptor resolve(String sourceId) throws IOException {
+        // One dedicated, streaming "resolve" action -- the single server entry
+        // point that performs the (possibly minutes-long) recall and returns the
+        // full descriptor directly. The action streams empty-body heartbeat
+        // Results to keep the connection warm under proxy idle timeouts; the
+        // single non-empty terminal Result carries the serialized descriptor.
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+                "resolve",
+                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        byte[] payload = null;
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        while (iter.hasNext()) {
+            byte[] body = iter.next().getBody();
+            if (body != null && body.length > 0) { // non-empty == terminal; empty == heartbeat
+                payload = body;
+            }
+        }
+        if (payload == null) {
+            throw new IOException("resolve('" + sourceId
+                    + "') returned no descriptor (server closed the stream without a result)");
+        }
+        DataSourceDescriptor desc = DataSourceDescriptor.parseFrom(payload);
+        sources.put(sourceId, desc);
+        return desc;
+    }
+
+    /**
+     * Fetch one tensor's {@link TensorDescriptor} by its globally-unique array_id.
+     *
+     * <p>A tensor is identified by its {@code array_id} alone (see the tensor
+     * identity policy at the top of {@code proto/biopb/tensor/descriptor.proto}),
+     * so this takes that one identifier rather than a {@code (sourceId, tensorId)}
+     * pair. Works even when the source is beyond the (truncatable)
+     * {@link #listSources} cap, and the result is cached. A bare {@code source_id}
+     * (single-tensor source, or to anchor on a multi-tensor source's default/first
+     * tensor) is accepted. To enumerate ALL tensors/scenes of a source, use
+     * {@code listSources().get(sourceId).getTensorsList()} -- NOT this method.
+     *
+     * <p>This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
+     * synced-folder) source it raises an error pointing at {@link #resolve}.
+     *
+     * @param arrayId Globally-unique tensor id, e.g. {@code "zarr_a3f2"} or
+     *                {@code "aics_7f3/Image:0"}
+     * @return The TensorDescriptor for that tensor
+     */
+    public TensorDescriptor getDescriptor(String arrayId) {
+        // source_id is the slash-free prefix; the full array_id is the tensor_id.
+        return fetchTensorDescriptor(sourceIdFromArrayId(arrayId), arrayId);
+    }
+
+    /**
+     * Per-dimension physical pixel size + unit for a tensor.
+     *
+     * <p>Returns a {@link PhysicalScale} whose {@code scale} and {@code unit}
+     * arrays are aligned with the tensor's {@code dim_labels} (source axis order),
+     * or {@code null} when no physical sizes are known (an older server, or a
+     * format that carries none). This is a compact summary carried on the tensor
+     * descriptor, so it is much cheaper than reading the full
+     * {@link #getSourceMetadata}. When a prior {@link #getTensor} already cached
+     * the descriptor it costs no extra RPC.
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field}). A bare source id anchors on the
+     *                source's default (first) tensor.
+     * @return A PhysicalScale, or {@code null} if no physical scale is known
+     */
+    public PhysicalScale getPhysicalScale(String arrayId) {
+        String sourceId = sourceIdFromArrayId(arrayId);
+        TensorDescriptor desc = descriptors.get(arrayId);
+        if (desc == null) {
+            // Don't silently recall a whole cloud file just to read its pixel
+            // size: if the source is known-unresolved, steer to resolve().
+            DataSourceDescriptor cached = sources.get(sourceId);
+            if (cached != null && cached.getTensorsList().isEmpty()) {
+                throw unresolvedSourceError(sourceId);
+            }
+            desc = fetchTensorDescriptor(sourceId, arrayId);
+        }
+        if (desc.getPhysicalScaleCount() == 0) {
+            return null;
+        }
+        double[] scale = new double[desc.getPhysicalScaleCount()];
+        for (int i = 0; i < scale.length; i++) {
+            scale[i] = desc.getPhysicalScale(i);
+        }
+        String[] unit = desc.getPhysicalUnitList().toArray(new String[0]);
+        return new PhysicalScale(scale, unit);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor by its globally-unique array_id.
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field})
+     * @param <T>     The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(String arrayId) {
+        return getTensor(arrayId, (SliceHint) null);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with a slice hint.
+     *
+     * @param arrayId   Globally-unique tensor id ({@code source_id} or
+     *                  {@code source_id/field})
+     * @param sliceHint Optional slice hint
+     * @param <T>       The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            SliceHint sliceHint) {
+        return getTensor(arrayId, sliceHint, null, null);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with scaled reads.
+     *
+     * @param arrayId         Globally-unique tensor id ({@code source_id} or
+     *                        {@code source_id/field})
+     * @param scaleHint       Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @param <T>             The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            long[] scaleHint,
+            String reductionMethod) {
+        return getTensor(arrayId, (SliceHint) null, scaleHint, reductionMethod);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with all options.
+     *
+     * @param arrayId         Globally-unique tensor id ({@code source_id} or
+     *                        {@code source_id/field})
+     * @param sliceHint       Optional slice hint
+     * @param scaleHint       Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @param <T>             The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            SliceHint sliceHint,
+            long[] scaleHint,
+            String reductionMethod) {
+        // array_id-first addressing: "source_id/field" routes to source_id with
+        // the full array_id as tensor_id; a bare "source_id" leaves tensorId null
+        // so getTensorContext resolves the source's sole/default tensor.
+        String[] route = resolveArrayId(arrayId);
+        return getTensor(route[0], route[1], sliceHint, scaleHint, reductionMethod);
     }
 
     /**
@@ -488,6 +677,11 @@ public class TensorFlightClient implements AutoCloseable {
         RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
         RandomAccessibleInterval<T> rai = createArray(context);
 
+        // tensorId may have arrived null (the bare-source_id array_id path);
+        // pin it to the server-resolved array_id so the serializable wrapper can
+        // re-fetch independently in another process.
+        String resolvedTensorId = context.descriptor.getArrayId();
+
         // Crop to the originally requested region.
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         // descriptor.shape may be larger than the requested extent.
@@ -523,7 +717,7 @@ public class TensorFlightClient implements AutoCloseable {
         }
 
         // Return SerializableTensorImg wrapper for serialization support
-        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, tensorId,
+        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, resolvedTensorId,
                 sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
     }
 
@@ -1154,8 +1348,9 @@ public class TensorFlightClient implements AutoCloseable {
 
         LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
-        // Ensure sources are loaded
-        if (sources.isEmpty()) {
+        // Ensure sources are loaded; fall back to a direct server fetch when
+        // listSources() didn't return this source (e.g. a truncated catalog).
+        if (!sources.containsKey(sourceId)) {
             try {
                 listSources();
             } catch (IOException e) {
@@ -1165,10 +1360,42 @@ public class TensorFlightClient implements AutoCloseable {
 
         DataSourceDescriptor sourceDesc = sources.get(sourceId);
         if (sourceDesc == null) {
+            // Not in the (capped) listing -- probe the server directly so sources
+            // beyond the list cap still resolve. Swallow a fetch failure and let
+            // the clean "Source not found" below surface (matches the Python
+            // client). An unresolved source still lists with empty tensors, so its
+            // directive is raised from the tensorId==null branch, not here.
+            try {
+                TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
+                sourceDesc = DataSourceDescriptor.newBuilder()
+                        .setSourceId(sourceId)
+                        .addTensors(td)
+                        .build();
+                sources.put(sourceId, sourceDesc);
+            } catch (RuntimeException ignored) {
+                // fall through to the clean error below
+            }
+        }
+        if (sourceDesc == null) {
             throw new IllegalArgumentException("Source not found: " + sourceId);
         }
 
-        // Find tensor descriptor to get shape for validation
+        // Resolve a null tensorId (the bare-source_id array_id path).
+        if (tensorId == null) {
+            int n = sourceDesc.getTensorsCount();
+            if (n == 1) {
+                tensorId = sourceDesc.getTensors(0).getArrayId();
+            } else if (n == 0) {
+                throw unresolvedSourceError(sourceId);
+            } else {
+                throw new IllegalArgumentException(
+                        "Source '" + sourceId + "' has multiple tensors (" + n
+                                + "); a within-source field must be specified (use \"source_id/field\")");
+            }
+        }
+
+        // Find tensor descriptor to get shape for validation; fall back to a
+        // direct server fetch when the cached source descriptor is stale/partial.
         TensorDescriptor baseDescriptor = null;
         for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
             if (desc.getArrayId().equals(tensorId)) {
@@ -1177,7 +1404,17 @@ public class TensorFlightClient implements AutoCloseable {
             }
         }
         if (baseDescriptor == null) {
-            throw new IllegalArgumentException("Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
+            // Stale/partial cached descriptor -- probe the server. Swallow a fetch
+            // failure and surface the clean "not found" below (matches Python).
+            try {
+                baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
+            } catch (RuntimeException ignored) {
+                // fall through to the clean error below
+            }
+        }
+        if (baseDescriptor == null) {
+            throw new IllegalArgumentException(
+                    "Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
         }
 
         // Validate scale hint dimensionality if provided
@@ -1688,6 +1925,109 @@ public class TensorFlightClient implements AutoCloseable {
     static String sourceIdFromArrayId(String arrayId) {
         int slash = arrayId.indexOf('/');
         return slash < 0 ? arrayId : arrayId.substring(0, slash);
+    }
+
+    /**
+     * Split an array_id into a {@code {sourceId, tensorId}} route for getTensor.
+     *
+     * <p>A qualified {@code "source_id/field"} routes to
+     * {@code {source_id, full-array_id}}; a bare {@code "source_id"} returns
+     * {@code {source_id, null}}, leaving the tensorId unset so getTensorContext
+     * resolves the source's sole/default tensor.
+     *
+     * <p>Package-private for unit testing.
+     */
+    static String[] resolveArrayId(String arrayId) {
+        if (arrayId.indexOf('/') >= 0) {
+            return new String[] { sourceIdFromArrayId(arrayId), arrayId };
+        }
+        return new String[] { arrayId, null };
+    }
+
+    /**
+     * Directive error for reading an unresolved (cloud / synced-folder) source.
+     *
+     * <p>Shared by every read entry point so the guidance is uniform: name the
+     * cure ({@link #resolve}) instead of leaking a bare internal "no tensors",
+     * and -- for metadata queries like {@link #getPhysicalScale} -- raise rather
+     * than silently recalling (downloading) the whole file. Resolving is the
+     * heavyweight, consenting act; reads must not trigger it implicitly.
+     */
+    private static IllegalStateException unresolvedSourceError(String sourceId) {
+        return new IllegalStateException(
+                "Source '" + sourceId + "' is unresolved (no tensors listed yet). If "
+                        + "this is a cloud / synced-folder source, call resolve('"
+                        + sourceId + "') first to download and resolve it, then read it.");
+    }
+
+    /**
+     * Fetch one tensor's descriptor directly from the server.
+     *
+     * <p>Backs {@link #getDescriptor} and {@link #getPhysicalScale}. Uses the
+     * per-tensor GetFlightInfo RPC, which works even when the source is beyond
+     * the (truncatable) {@link #listSources} cap. A null/empty tensorId, or a
+     * tensorId equal to the sourceId, anchors on the source's default (first)
+     * tensor via the empty-tensor_id path (the server resolves it, #44); a
+     * within-source field is sent verbatim. This is a CHEAP probe: it does NOT
+     * resolve -- an unresolved (cloud / synced-folder) source is restated as the
+     * {@link #unresolvedSourceError} directive steering the caller to
+     * {@link #resolve}, rather than triggering a download.
+     *
+     * <p>The descriptor is cached in {@code descriptors}, keyed by the
+     * echoed-back array_id.
+     */
+    private TensorDescriptor fetchTensorDescriptor(String sourceId, String tensorId) {
+        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
+                .setWithMetadata(true);
+        if (tensorId != null && !tensorId.equals(sourceId)) {
+            readBuilder.setTensorId(tensorId);
+        }
+        FlightCmd cmd = FlightCmd.newBuilder()
+                .setSourceId(sourceId)
+                .setTensorRead(readBuilder.build())
+                .build();
+        FlightInfo info;
+        try {
+            info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
+        } catch (FlightRuntimeException exc) {
+            // GetFlightInfo no longer resolves on serve: an unresolved (cloud /
+            // synced-folder) source refuses with an "unresolved" error instead of
+            // silently downloading. Restate it as the shared directive so the
+            // caller is pointed at the explicit, consented resolve().
+            String msg = exc.getMessage();
+            if (msg != null && msg.toLowerCase().contains("unresolved")) {
+                throw unresolvedSourceError(sourceId);
+            }
+            throw exc;
+        }
+        TensorDescriptor tensorDesc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+        return tensorDesc;
+    }
+
+    /**
+     * Per-dimension physical pixel size + unit for a tensor, as returned by
+     * {@link #getPhysicalScale}. Both arrays are aligned with the tensor's
+     * {@code dim_labels} (source axis order).
+     */
+    public static final class PhysicalScale {
+        private final double[] scale;
+        private final String[] unit;
+
+        PhysicalScale(double[] scale, String[] unit) {
+            this.scale = scale;
+            this.unit = unit;
+        }
+
+        /** Physical pixel size per dimension, aligned with dim_labels. */
+        public double[] getScale() {
+            return scale;
+        }
+
+        /** Physical unit per dimension, aligned with dim_labels. */
+        public String[] getUnit() {
+            return unit;
+        }
     }
 
     private static class EndpointIndex {
