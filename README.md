@@ -6,7 +6,7 @@
 [![Python Tests](https://github.com/biopb/biopb/actions/workflows/python-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
 [![Java Tests](https://github.com/biopb/biopb/actions/workflows/java-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions)
 
-The repo provides the core harness framework of the biopb project. The goal is to estabish a standardized way to serve multi-dimensional image datasets, analysis algorithms, and computational results in a network-transparent and language-agnostic manner. 
+The repo provides the core harness framework of the biopb project. The goal is to coordinate a LLM agent with a user in an interactive session to perform complex image ananlysis tasks relavent to scientific researches. 
 
 ## Quick Start
 ```sh
@@ -15,10 +15,10 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 ## biopb-mcp
 
-The agent-facing client: an MCP server + napari plugin that hands an AI agent a live, shared napari session wired to the data and algorithm servers, so analysis is driven in plain Python instead of fixed GUI buttons. [Read More...](biopb-mcp/README.md)
+An MCP server + napari plugin that hands an AI agent a live, shared napari session wired to the data and algorithm servers, so analysis is driven in plain Python instead of fixed GUI buttons. [Read More...](biopb-mcp/README.md)
 
-  - **Shared canvas**: the agent mutates the same viewer the scientist watches
-  - **One namespace, not an API**: `viewer`, `client`, `ops`, `np`/`da` live in a real Python kernel — any analysis expressible over them is reachable
+  - **Shared canvas**: napari viewer is accessible and mutable by both the agent and the user
+  - **Persistent kernel**: agent code runs in a real ipython kernel with namespace persistence and full observability
   - **Perceive → act → verify**: the agent runs code, then screenshots/inspects to confirm the result
 
 ## biopb-tensor
