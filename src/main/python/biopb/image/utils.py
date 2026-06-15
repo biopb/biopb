@@ -541,7 +541,6 @@ def deserialize_image_data(
     Args:
         image_data: protobuf ImageData message
     Keyword Args:
-        output_dim_order: Output dimension order string for eager_data deserialization. Default to input order.
         cache_bytes: Cache size for lazy_data chunk cache (default 1GB).
 
     Returns:
