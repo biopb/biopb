@@ -278,3 +278,153 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
         assert item.toolTip(0) == ""
+
+
+def _descriptor(source_id, *, tensors):
+    from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
+    return DataSourceDescriptor(
+        source_id=source_id,
+        source_url=f"/cloud/{source_id}.zarr",
+        tensors=[
+            TensorDescriptor(array_id=tid, shape=[8, 8], dtype="uint8")
+            for tid in tensors
+        ],
+    )
+
+
+class _Sig:
+    """Minimal stand-in for a Qt signal: connect()/emit() on the calling thread."""
+
+    def __init__(self):
+        self._cbs = []
+
+    def connect(self, cb):
+        self._cbs.append(cb)
+
+    def emit(self, *args):
+        for cb in self._cbs:
+            cb(*args)
+
+
+class _FakeProgress:
+    """Non-blocking QProgressDialog stand-in (exec_ returns immediately)."""
+
+    def __init__(self, *a, **k):
+        self.closed = False
+
+    def setWindowTitle(self, *a):
+        pass
+
+    setWindowModality = setMinimumDuration = setCancelButton = setValue = (
+        lambda self, *a: None
+    )
+
+    def close(self):
+        self.closed = True
+
+    def exec_(self):
+        pass
+
+
+class TestUnresolvedHelper:
+    def test_empty_tensors_is_unresolved(self):
+        from biopb_mcp.tensor_browser._widget import _is_unresolved
+
+        assert _is_unresolved(_descriptor("c", tensors=[]))
+        assert not _is_unresolved(_descriptor("c", tensors=["c"]))
+        assert not _is_unresolved(_descriptor("c", tensors=["c/a", "c/b"]))
+
+
+class TestResolveAction:
+    """Double-click / context-menu on an unresolved source resolves it off-thread."""
+
+    def _arm(self, widget, monkeypatch, *, accept, outcome):
+        """Wire a widget so _resolve_source runs without Qt threads/modals.
+
+        ``accept`` chooses the warning-dialog answer; ``outcome`` is the fake
+        worker's result: ("resolved", desc) or ("failed", message).
+        """
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w, conn, _ = widget
+        conn.is_connected = True
+        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+
+        answer = (
+            widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
+        )
+        monkeypatch.setattr(
+            widget_mod.QMessageBox, "warning", staticmethod(lambda *a, **k: answer)
+        )
+        monkeypatch.setattr(widget_mod, "QProgressDialog", _FakeProgress)
+
+        started = {"n": 0}
+
+        class _FakeWorker:
+            def __init__(self, conn_, source_id):
+                self.resolved = _Sig()
+                self.failed = _Sig()
+                self.finished = _Sig()
+
+            def start(self):
+                started["n"] += 1
+                kind, payload = outcome
+                getattr(self, kind).emit(payload)
+
+            def deleteLater(self):
+                pass
+
+        monkeypatch.setattr(widget_mod, "_ResolveWorker", _FakeWorker)
+        w._apply_filter = MagicMock()
+        w._show_error = MagicMock()
+        return w, started
+
+    def test_declined_warning_does_nothing(self, widget, monkeypatch):
+        w, started = self._arm(
+            widget, monkeypatch, accept=False, outcome=("resolved", object())
+        )
+        w._resolve_source("cloud_x")
+        assert started["n"] == 0  # no worker spawned
+        w._apply_filter.assert_not_called()
+
+    def test_accepted_resolves_then_repopulates(self, widget, monkeypatch):
+        w, started = self._arm(
+            widget, monkeypatch, accept=True, outcome=("resolved", object())
+        )
+        w._resolve_source("cloud_x")
+        assert started["n"] == 1  # resolve ran off-thread
+        w._apply_filter.assert_called_once()  # tree repopulated from fresh catalog
+        w._show_error.assert_not_called()
+
+    def test_failure_surfaces_error(self, widget, monkeypatch):
+        w, _ = self._arm(
+            widget, monkeypatch, accept=True, outcome=("failed", "offline")
+        )
+        w._resolve_source("cloud_x")
+        w._show_error.assert_called_once()
+        assert "offline" in w._show_error.call_args[0][0]
+
+    def test_double_click_routes_unresolved_to_resolve(self, widget, monkeypatch):
+        from biopb_mcp.tensor_browser._widget import _TreeNode
+
+        w, conn, _ = widget
+        conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
+        w._add_tree_node(
+            w._tree_widget,
+            _TreeNode(
+                node_id="cloud_x",
+                name="cloud_x.zarr",
+                node_type="source",
+                depth=0,
+                source=conn.sources["cloud_x"],
+            ),
+        )
+        item = w._tree_widget.topLevelItem(0)
+        w._resolve_source = MagicMock()
+        w._add_to_viewer = MagicMock()
+
+        w._on_tree_item_double_clicked(item, 0)
+
+        w._resolve_source.assert_called_once_with("cloud_x")
+        w._add_to_viewer.assert_not_called()  # unresolved never hits the add path

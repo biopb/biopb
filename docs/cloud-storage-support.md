@@ -386,6 +386,37 @@ The same conclusion recurs at every layer, hardening as it goes:
    cloud phase 2; see `biopb-tensor-server/ARCHITECTURE.md` "Cloud / synced-folder
    sources" and `tests/cloud_phase2_test.py`. Multi-file monolith member grouping
    degrades on cloud, as designed.)**
+   - **2b. Client-side resolve trigger (the consenting front door).** Resolve-on-
+     serve is *reachable* on the server via `GetFlightInfo`, but the Python SDK's
+     read methods (`get_tensor`/`get_tensor_pb`/`get_source_metadata`) short-circuit
+     on a zero-tensor cached descriptor, so "first read resolves" never actually
+     fires through them — an unresolved source is unreadable with a bare
+     `ValueError`. Fix: an explicit **`TensorFlightClient.resolve(source_id)`**
+     (raw per-tensor `GetFlightInfo` to trigger the hydrate, then re-list to
+     enumerate all fields), a **directive** unresolved error pointing at it, and a
+     `guide://tensor` stanza so the agent discovers it. The napari browser gets the
+     human twin: double-click / "Resolve…" → modal **download warning** →
+     consented, blocking resolve on a worker thread → repopulate. Keeps resolution
+     a foreground, consented act (§2) on both the agent and human paths.
+     `get_descriptor` already existed as the array_id-keyed single-tensor probe;
+     `resolve()` wraps it for the source-level, full-field case. **(done — cloud
+     phase 2; SDK `client.py`, `biopb-mcp` `_connection.py`/`tensor_browser`.)**
+     - **API audit vs. unresolved sources.** Swept every public `TensorFlightClient`
+       method (every identifier-taking one, since a bare `source_id` is a valid
+       `array_id`). Fixed **F1**: `get_physical_scale` silently recalled (downloaded)
+       a whole cloud file via the unguarded `_fetch_tensor_descriptor` — now raises
+       the shared `_unresolved_source_error` when the source is known-unresolved,
+       keeping reads recall-free. Remaining inconsistencies tracked: **#108**
+       (`get_source_metadata` returns `{}` instead of the directive error), **#109**
+       (`wait_for_upload_ready` hangs to timeout on a non-upload source), **#110**
+       (`query_sources`/`list_sources` hide unresolved sources behind NULL
+       shape/dtype filters). `get_tensor`/`get_tensor_pb` already raise the directive
+       error; `get_descriptor`/`resolve`/`get_source` intentionally resolve.
+     - **Polyglot parity.** The Java SDK (`TensorFlightClient.java`, ImageJ-facing)
+       still lacks `resolve()` / the directive error and shares the same empty-tensors
+       gaps; tracked as **#111** to mirror the Python change. (JS/TS is the
+       lightweight viewer and refuses cloud data server-side — §7/phase 5 — so no
+       resolve path is needed there.)
 3. **Persistent metadata DB** keyed to roots; resolve-once write-through.
 4. **Pre-cache skip gate** on `is_resident()`; exclude cloud from the backlog.
 5. **Read tolerance mode** (`EXACT|BEST_EFFORT`) + best-effort status return;

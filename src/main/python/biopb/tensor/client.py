@@ -980,6 +980,22 @@ def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
     return source_id
 
 
+def _unresolved_source_error(source_id: str) -> ValueError:
+    """Directive error for reading an *unresolved* (cloud / synced-folder) source.
+
+    Shared by every read entry point so the guidance is uniform: name the cure
+    (``client.resolve``) instead of leaking a bare internal "no tensors", and --
+    critically for methods like ``get_physical_scale`` -- raise this rather than
+    silently recalling (downloading) the whole file just to answer a metadata
+    query. Resolving is the heavyweight, *consenting* act; reads must not trigger
+    it implicitly."""
+    return ValueError(
+        f"Source '{source_id}' is unresolved (no tensors listed yet). If this "
+        f"is a cloud / synced-folder source, call client.resolve('{source_id}') "
+        f"first to download and resolve it, then read it."
+    )
+
+
 class TensorFlightClient:
     """Client for accessing tensors from a TensorFlightServer.
 
@@ -1321,6 +1337,16 @@ class TensorFlightClient:
             else None
         )
         if desc is None:
+            # Don't silently recall (download) a whole cloud file just to read its
+            # pixel size: if the source is known-unresolved, steer the caller to
+            # resolve() explicitly -- consistent with get_tensor, and faithful to
+            # resolution being a consented act, not a side effect of a metadata
+            # probe. (Only catches sources already in the catalog cache; a
+            # never-listed id still falls through to the fetch below, same as
+            # every other entry point.)
+            cached = self._sources.get(source_id)
+            if cached is not None and not cached.tensors:
+                raise _unresolved_source_error(source_id)
             # tensor_id None -> the source's default (first) tensor. A real fetch
             # error (server unreachable, source not found) propagates to the
             # caller -- it must stay distinguishable from "no physical scale
@@ -1392,6 +1418,48 @@ class TensorFlightClient:
         """
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(source_id, array_id)
+
+    def resolve(self, source_id: str) -> "DataSourceDescriptor":
+        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
+
+        An *unresolved* source is catalogued by URL only -- its shape/dtype/field
+        list are unknown until first access (it lists with ``data_resident`` False
+        and an empty ``list_sources()[source_id].tensors``). The canonical case is
+        a cloud / synced-folder ("Files-On-Demand") source.
+
+        Resolving asks the server to hydrate it. For a dehydrated placeholder this
+        **downloads the whole file** -- a recall that can take minutes, consume
+        local disk, and fail when offline -- then reads its real shape, dtype, and
+        field list. This is the heavyweight, *consenting* operation that catalog
+        browsing (:meth:`list_sources` / :meth:`query_sources`) deliberately
+        avoids; call it only when you intend to read the data. After it returns,
+        :meth:`get_tensor` and friends work normally.
+
+        Idempotent: resolving an already-resolved source just re-fetches it.
+
+        Args:
+            source_id: The source to resolve (e.g. ``"onedrive_a3f2"``).
+
+        Returns:
+            The full ``DataSourceDescriptor`` with every tensor/field enumerated.
+            (:meth:`get_descriptor` alone returns only the default/first tensor;
+            this re-lists so the complete field set is populated.)
+        """
+        # Trigger server-side resolve-on-serve via a per-tensor GetFlightInfo on
+        # the default tensor (empty tensor_id, #44). This hydrates the source and
+        # backfills the server catalog. The returned single-tensor descriptor is
+        # cached, but is not the full picture: a multi-field source enumerates its
+        # scenes only through list_flights, so re-list to populate them all.
+        td = self._fetch_tensor_descriptor(source_id)
+        full = self.list_sources().get(source_id)
+        if full is not None:
+            return full
+        # Catalog truncated past this source (max_list_flights_results): fall back
+        # to the single resolved tensor so the source is at least usable, and seed
+        # the cache so a following get_tensor() resolves without re-fetching.
+        fallback = DataSourceDescriptor(source_id=source_id, tensors=[td])
+        self._sources[source_id] = fallback
+        return fallback
 
     def get_source(
         self,
@@ -1492,7 +1560,7 @@ class TensorFlightClient:
             if len(source_desc.tensors) == 1:
                 tensor_id = source_desc.tensors[0].array_id
             elif len(source_desc.tensors) == 0:
-                raise ValueError(f"Source '{source_id}' has no tensors")
+                raise _unresolved_source_error(source_id)
             else:
                 raise ValueError(
                     f"Source '{source_id}' has multiple tensors ({len(source_desc.tensors)}), "
