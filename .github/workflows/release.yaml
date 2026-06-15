@@ -90,10 +90,11 @@ jobs:
           echo "release=$REL" >> "$GITHUB_OUTPUT"
           # PEP 440 prerelease (a/b/rc) -> mark the GitHub release prerelease.
           if [[ "$REL" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            PRERELEASE=false
           else
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            PRERELEASE=true
           fi
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           tver=$(ls wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
           # When the release commit is NOT also tagged server-v*, setuptools_scm
@@ -124,7 +125,30 @@ jobs:
           cat > release-wheels/versions.json <<EOF
           { "release": "$REL", "tensor_server": "$tver", "image_base": "$ibver", "napari": "$nver" }
           EOF
-          echo "tensor-server=$tver  image-base=$ibver  napari=$nver  release=$REL  prerelease check done"
+          # Docker tag lists. A version-pinned tag always; :latest is moved ONLY
+          # for a clean X.Y.Z release. An rc/a/b prerelease (e.g. cut off `dev`)
+          # publishes its pinned tag but must NOT clobber :latest — same guard the
+          # GitHub release / installer already apply to prereleases.
+          owner="${{ github.repository_owner }}"
+          {
+            echo "tensor_tags<<TAGS_EOF"
+            echo "ghcr.io/$owner/biopb-tensor-server:$tdocker"
+            echo "docker.io/jiyuuchc/biopb-tensor-server:$tdocker"
+            if [[ "$PRERELEASE" == "false" ]]; then
+              echo "ghcr.io/$owner/biopb-tensor-server:latest"
+              echo "docker.io/jiyuuchc/biopb-tensor-server:latest"
+            fi
+            echo "TAGS_EOF"
+            echo "imagebase_tags<<TAGS_EOF"
+            echo "ghcr.io/$owner/biopb-image-base:$ibver"
+            echo "docker.io/jiyuuchc/biopb-image-base:$ibver"
+            if [[ "$PRERELEASE" == "false" ]]; then
+              echo "ghcr.io/$owner/biopb-image-base:latest"
+              echo "docker.io/jiyuuchc/biopb-image-base:latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "tensor-server=$tver  image-base=$ibver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
 
       - name: Login to ghcr.io
         if: steps.ver.outputs.is_tag == 'true'
@@ -170,11 +194,7 @@ jobs:
           load: ${{ steps.gate.outputs.tensor == 'verify' }}
           build-args: |
             MEMORY=4g
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}
-            ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:latest
-            docker.io/jiyuuchc/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}
-            docker.io/jiyuuchc/biopb-tensor-server:latest
+          tags: ${{ steps.ver.outputs.tensor_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -186,11 +206,7 @@ jobs:
           file: biopb-image-runtime/Dockerfile
           push: ${{ steps.gate.outputs.imagebase == 'push' }}
           load: ${{ steps.gate.outputs.imagebase == 'verify' }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}
-            ghcr.io/${{ github.repository_owner }}/biopb-image-base:latest
-            docker.io/jiyuuchc/biopb-image-base:${{ steps.ver.outputs.imagebase }}
-            docker.io/jiyuuchc/biopb-image-base:latest
+          tags: ${{ steps.ver.outputs.imagebase_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
