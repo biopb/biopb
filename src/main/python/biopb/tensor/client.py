@@ -1275,7 +1275,14 @@ class TensorFlightClient:
             raise ValueError(f"Source not found: {source_id}")
 
         if not source_desc.tensors:
-            return {}
+            # Unresolved (cloud / synced-folder) source: tensors are unknown
+            # until resolve. Don't silently return {} -- that conflates
+            # "unresolved" with "resolved, no metadata" (the line below). Steer
+            # the caller to the explicit, consented resolve() instead, matching
+            # get_physical_scale / get_tensor (#108). Crucially this stays a
+            # cheap read: it must NOT silently recall the whole file the way a
+            # resolve-on-serve probe (get_descriptor) would.
+            raise _unresolved_source_error(source_id)
 
         # Get metadata from first tensor via GetFlightInfo
         first_tensor = source_desc.tensors[0]
