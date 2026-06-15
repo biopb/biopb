@@ -406,12 +406,18 @@ The same conclusion recurs at every layer, hardening as it goes:
        `array_id`). Fixed **F1**: `get_physical_scale` silently recalled (downloaded)
        a whole cloud file via the unguarded `_fetch_tensor_descriptor` — now raises
        the shared `_unresolved_source_error` when the source is known-unresolved,
-       keeping reads recall-free. Remaining inconsistencies tracked: **#108**
-       (`get_source_metadata` returns `{}` instead of the directive error), **#109**
-       (`wait_for_upload_ready` hangs to timeout on a non-upload source), **#110**
-       (`query_sources`/`list_sources` hide unresolved sources behind NULL
-       shape/dtype filters). `get_tensor`/`get_tensor_pb` already raise the directive
-       error; `get_descriptor`/`resolve`/`get_source` intentionally resolve.
+       keeping reads recall-free. **#108 fixed** (PR #113): `get_source_metadata`
+       now raises the directive error on an unresolved source (recall-free) rather
+       than returning `{}`. **#110 fixed**: the `sources` table gained a
+       `data_resident BOOLEAN` column so unresolved (cloud) sources — which carry
+       NULL `dtype`/`shape_summary` and are silently dropped by a `WHERE dtype=…`
+       predicate — are now filterable on purpose (`WHERE NOT data_resident` finds
+       what isn't resolved yet); the column is populated from `is_resident()` at
+       both metadata-DB insert sites, and the `guide://tensor` / MCP catalog docs
+       call out the footgun. Still open: **#109** (`wait_for_upload_ready` hangs to
+       timeout on a non-upload source). `get_tensor`/`get_tensor_pb` already raise
+       the directive error; `get_descriptor`/`resolve`/`get_source` intentionally
+       resolve.
      - **Polyglot parity.** The Java SDK (`TensorFlightClient.java`, ImageJ-facing)
        still lacks `resolve()` / the directive error and shares the same empty-tensors
        gaps; tracked as **#111** to mirror the Python change. (JS/TS is the
