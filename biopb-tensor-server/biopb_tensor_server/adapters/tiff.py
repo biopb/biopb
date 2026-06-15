@@ -15,7 +15,11 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.discovery import (
+    ClaimContext,
+    SourceClaim,
+    _is_offline_placeholder,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
@@ -463,6 +467,27 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
 
         if v1_metadata is None:
             return None
+
+        # Cloud-storage phase 2: a non-resident metadata.txt placeholder cannot be
+        # read+parsed without a whole-file recall (or it blocks offline). Defer
+        # format validation and the coordinate-map build: the directory was
+        # recognized structurally (a metadata.txt plus img_* TIFFs, all recall-
+        # free), so claim it provisionally and resolve on first access. The member
+        # glob below is best-effort; the authoritative Coords map is rebuilt then.
+        if _is_offline_placeholder(v1_metadata):
+            search_dir = v2_data_dir if v2_data_dir else ctx._path
+            state.try_claim_path(ctx.path_str)
+            state.try_claim_path(str(v1_metadata))
+            if v2_data_dir:
+                state.try_claim_path(str(v2_data_dir))
+            for pattern in ("img_*.tif", "img_*.tiff"):
+                for f in search_dir.glob(pattern):
+                    state.try_claim_path(f)
+            return SourceClaim(
+                source_type="micromanager-legacy",
+                primary_path=ctx.path_str,
+                unresolved=True,
+            )
 
         # Parse metadata to confirm it's MicroManager v1 format
         try:

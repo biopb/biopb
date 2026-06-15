@@ -182,7 +182,10 @@ def _is_offline_placeholder(
 
 
 def should_skip_walk_entry(
-    path: Path, is_dir: bool, stat_result: Optional[os.stat_result] = None
+    path: Path,
+    is_dir: bool,
+    stat_result: Optional[os.stat_result] = None,
+    admit_nonresident: bool = False,
 ) -> bool:
     """Shared per-entry skip policy for discovery tree walks.
 
@@ -211,12 +214,20 @@ def should_skip_walk_entry(
     it is forwarded to the offline-placeholder check so a walk that has already
     stat'd the entry (the state walk) does not stat it a second time
     (biopb/biopb#56).
+
+    ``admit_nonresident`` flips the offline-placeholder rule for a ``cloud``-opted
+    root (cloud-storage phase 2): instead of skipping a dehydrated file, the walk
+    admits it so ``claim()`` can register it as an *unresolved* source. The
+    hidden-entry and system/cloud-directory prunes still apply -- only the
+    file-residency skip is lifted, and only under an explicitly configured root.
     """
     name = path.name
     if name.startswith("."):
         return True
     if is_dir:
         return _is_skippable_system_dir(name)
+    if admit_nonresident:
+        return False
     return _is_offline_placeholder(path, stat_result)
 
 
@@ -362,12 +373,39 @@ class ClaimContext:
         """
         return self._signature
 
+    def is_resident(self) -> bool:
+        """Recall-free: is this path's content local and cheap to read right now?
+
+        This is the per-read residency gate an adapter's ``claim()`` consults
+        before opening a sidecar or container: when it returns False the read
+        would trigger a whole-file cloud recall (or block offline), so the adapter
+        defers and emits an *unresolved* claim instead (cloud-storage phase 2).
+
+        Remote contexts read via cheap range requests, so they are always treated
+        as resident -- remote claim behavior is unchanged. A local path is
+        resident unless it is an offline cloud placeholder, detected by
+        ``_is_offline_placeholder`` (a stat-only check that never opens content).
+        """
+        if self._store is not None:
+            return True
+        # The placeholder signal (st_blocks == 0) is a per-file concept; a
+        # directory legitimately reports zero blocks on some filesystems (macOS
+        # APFS), so treat a directory as resident -- mirrors SourceAdapter
+        # .is_resident and should_skip_walk_entry (which gates on `not is_dir`).
+        try:
+            if self._path.is_dir():
+                return True
+        except OSError:
+            return False
+        return not _is_offline_placeholder(self._path)
+
 
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
     path_filter: Optional[Callable[[Path], bool]] = None,
     should_descend: Optional[Callable[[Path], bool]] = None,
+    admit_nonresident: bool = False,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
@@ -399,7 +437,9 @@ def walk_with_identity_tracking(
             # (AppData, OneDrive, Windows, …), and offline/placeholder files
             # whose content recalls on read. Pruned by name/metadata so the whole
             # subtree is skipped without a content open that could hang.
-            if should_skip_walk_entry(path, is_dir):
+            if should_skip_walk_entry(
+                path, is_dir, admit_nonresident=admit_nonresident
+            ):
                 logger.debug("walk: skipping %s", path)
                 continue
 
@@ -432,6 +472,7 @@ def walk_with_identity_tracking(
                     visited_identities,
                     path_filter=path_filter,
                     should_descend=should_descend,
+                    admit_nonresident=admit_nonresident,
                 )
     except OSError:
         # Permission issue reading directory
@@ -453,6 +494,11 @@ class SourceClaim:
         dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
         is_remote: Flag indicating if this is a remote source
+        unresolved: True when the adapter recognized this source by recall-free
+            signals only (a non-resident cloud/synced-folder target) and deferred
+            its content read. Such a claim carries no shape/dtype yet; the server
+            registers it behind an UnresolvedSourceAdapter and resolves it lazily
+            on first access (cloud-storage phase 2).
     """
 
     __slots__ = (
@@ -463,6 +509,7 @@ class SourceClaim:
         "extra_config",
         "is_remote",
         "member_paths",
+        "unresolved",
     )
 
     def __init__(
@@ -474,6 +521,7 @@ class SourceClaim:
         extra_config: Optional[dict] = None,
         is_remote: bool = False,
         member_paths: Optional[Set[str] | List[str]] = None,
+        unresolved: bool = False,
     ):
         self.source_type = source_type
         self.primary_path = (
@@ -483,6 +531,7 @@ class SourceClaim:
         self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
         self.is_remote = is_remote
+        self.unresolved = unresolved
         normalized_member_paths = {self.primary_path}
         if member_paths is not None:
             normalized_member_paths.update(str(path) for path in member_paths)
@@ -493,7 +542,8 @@ class SourceClaim:
             f"SourceClaim(source_type={self.source_type!r}, "
             f"primary_path={self.primary_path!r}, "
             f"source_id={self.source_id!r}, "
-            f"is_remote={self.is_remote!r})"
+            f"is_remote={self.is_remote!r}, "
+            f"unresolved={self.unresolved!r})"
         )
 
 
@@ -773,6 +823,7 @@ def discover_sources(
     state: Optional[DiscoveryState] = None,
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[Path], bool]] = None,
+    admit_nonresident: bool = False,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -827,6 +878,7 @@ def discover_sources(
         # probing interior files (e.g. zarr chunk stores) is pure waste
         # (biopb/biopb#55).
         should_descend=lambda p: not state.is_path_claimed(str(p)),
+        admit_nonresident=admit_nonresident,
     ):
         paths_scanned += 1
         path_str = str(path)

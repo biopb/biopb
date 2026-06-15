@@ -127,7 +127,12 @@ def _resolve_serve_sources(
     monitored_sources: List[SourceConfig] = []
 
     for s in server_config.sources:
-        if s.monitor and not s.is_remote:
+        # A cloud root is driven through the same monitored-scan pipeline as a
+        # monitor=true root, but with cloud gating: the walk admits dehydrated
+        # entries and full-scans the subtree (no mtime stability gate / open-probe,
+        # which would recall placeholders -- cloud-storage phase 2). So treat
+        # cloud like monitor for the directory-routing decision.
+        if (s.monitor or s.cloud) and not s.is_remote:
             local_path = s.local_path
             # local_path cannot be None here -- both is_remote and local_path
             # derive from _is_remote_url(url), so `not is_remote` guarantees a

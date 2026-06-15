@@ -88,6 +88,21 @@ class OmeZarrAdapter(ZarrAdapter):
         if not zattrs_ctx.exists():
             return None
 
+        # Cloud-storage phase 2: if the .zattrs sidecar is a non-resident cloud
+        # placeholder, reading it would trigger a whole-file recall (or block
+        # offline). Defer the read: recognize the store structurally (a .zarr dir
+        # with a .zattrs) and claim it provisionally as ome-zarr -- the type that
+        # owns .zarr dirs. The exact subtype (ome-zarr vs ome-zarr-hcs), dim
+        # labels, and any HCS field set are resolved on first access.
+        if not zattrs_ctx.is_resident():
+            state.try_claim_path(ctx.path_str)
+            return SourceClaim(
+                source_type="ome-zarr",
+                primary_path=ctx.path_str,
+                is_remote=ctx.is_remote,
+                unresolved=True,
+            )
+
         try:
             zattrs = json.loads(ctx.read_text('.zattrs'))
 
