@@ -81,6 +81,31 @@ class TestUnresolvedDirectiveError:
         assert "client.resolve('cloud_x')" in msg
 
 
+class TestSourceMetadataUnresolvedGuard:
+    """F2 (#108): get_source_metadata must steer to resolve(), not return {}."""
+
+    def test_unresolved_source_raises_instead_of_returning_empty(self, monkeypatch):
+        # An unresolved source has empty tensors; the old behavior returned {},
+        # conflating "unresolved" with "resolved, no metadata". It must instead
+        # raise the directive error -- and without any GetFlightInfo recall.
+        client = _bare_client()
+        client._sources = {
+            "cloud_x": DataSourceDescriptor(source_id="cloud_x")  # no tensors
+        }
+        recalled = []
+        client._client = type(
+            "FakeFlight",
+            (),
+            {"get_flight_info": lambda *a, **k: recalled.append(a)},
+        )()
+        with pytest.raises(ValueError) as exc:
+            client.get_source_metadata("cloud_x")
+        msg = str(exc.value)
+        assert "unresolved" in msg
+        assert "client.resolve('cloud_x')" in msg
+        assert recalled == []  # no GetFlightInfo / download was triggered
+
+
 class TestPhysicalScaleUnresolvedGuard:
     """F1: get_physical_scale must not silently recall a whole cloud file."""
 
