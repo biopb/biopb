@@ -472,11 +472,14 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
     DICOM **series** via per-slice `SeriesInstanceUID`): these cannot be deferred
     safely — a directory can hold several such datasets, so the dir is not the
     boundary and the deferred member set could diverge at resolve. They are gated
-    on the new **`ClaimContext.cloud_root`** flag (plumbed from `_handle_rescan`'s
-    `cloud_filter` and from `UnresolvedSourceAdapter` at resolve, so it holds at
-    *both* scan and resolve — residency cannot gate resolve, where the file is
-    resident): under cloud `OmeTiffAdapter`/`DicomSeriesAdapter` **return `None`**,
-    so each `.tif`/`.dcm` falls back to its own single-file source.
+    on the new **`ClaimContext.cloud_root`** flag (at scan the rescan walk records
+    each entry's cloud-ness once — `_scan_tree_state` already knows it per
+    monitored root — into a per-path map the claim phase reads via
+    `discover_sources_from_entries(cloud_by_path=…)`; at resolve it comes from
+    `UnresolvedSourceAdapter`, so it holds at *both* scan and resolve — residency
+    cannot gate resolve, where the file is resident): under cloud
+    `OmeTiffAdapter`/`DicomSeriesAdapter` **return `None`**, so each `.tif`/`.dcm`
+    falls back to its own single-file source.
   - The content-free extension-only adapters need no change; a `cloud_phase2_test`
     guard pins that they (and the deferring readers) stay read-free.
 - **Dir-claiming policy.** The five genuine one-dir-one-dataset formats (zarr,
