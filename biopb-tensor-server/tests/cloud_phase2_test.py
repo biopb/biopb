@@ -935,14 +935,16 @@ class TestResolveErrorSurfacing:
         proxy = self._make_proxy(zpath, source_type="ome-zarr")
 
         # Force the open/hydrate step (create_from_config of the resolved adapter
-        # class) to raise an OSError -> retriable, not permanent. The default
-        # registry resolves this store via OmeZarrAdapter (the guessed type).
-        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        # class) to raise an OSError -> retriable, not permanent. A bare zarr array
+        # (.zarray present) resolves via ZarrAdapter: OmeZarrAdapter declines a
+        # non-multiscales store, so the re-claim refines the guessed "ome-zarr" to
+        # the authoritative "zarr".
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
         def _boom(cls, cfg, creds=None):
             raise OSError("disk vanished mid-recall")
 
-        monkeypatch.setattr(OmeZarrAdapter, "create_from_config", classmethod(_boom))
+        monkeypatch.setattr(ZarrAdapter, "create_from_config", classmethod(_boom))
         with pytest.raises(SourceResolveRetriableError):
             proxy.resolve()
 
@@ -959,3 +961,85 @@ class TestResolveErrorSurfacing:
         with pytest.raises(SourceUnresolvedError) as exc_info:
             proxy.resolve()
         assert not isinstance(exc_info.value, SourceResolveRetriableError)
+
+
+# --------------------------------------------------------------------------- #
+# Plain Zarr enabled: OME-Zarr keeps priority; bare arrays resolve to zarr
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestZarrOmeZarrPriority:
+    """ZarrAdapter is registered after OmeZarrAdapter. Order is load-bearing
+    (callers take claims[0]); a real OME-Zarr stays ome-zarr, a bare zarr array
+    resolves to plain zarr, and under cloud both defer with OME-Zarr winning."""
+
+    def _registry(self):
+        from biopb_tensor_server.adapters import get_default_registry
+
+        return get_default_registry()
+
+    def test_registry_orders_ome_zarr_before_zarr(self):
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        adapters = self._registry()._adapters
+        assert OmeZarrAdapter in adapters and ZarrAdapter in adapters
+        assert adapters.index(OmeZarrAdapter) < adapters.index(ZarrAdapter)
+
+    def test_real_ome_zarr_claimed_as_ome_zarr(self, tmp_path):
+        import zarr
+
+        store = tmp_path / "img.zarr"
+        g = zarr.open_group(str(store), mode="w")
+        g.attrs["multiscales"] = [{"datasets": [{"path": "0"}]}]
+        g.create_dataset("0", shape=(4, 4), chunks=(4, 4), dtype="uint8")
+
+        claims = self._registry().get_claims_for_path(
+            ClaimContext(store), DiscoveryState()
+        )
+        assert claims and claims[0].source_type == "ome-zarr"
+
+    def test_bare_zarr_array_claimed_as_zarr(self, tmp_path):
+        import zarr
+
+        store = tmp_path / "arr.zarr"
+        zarr.open_array(str(store), mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
+
+        claims = self._registry().get_claims_for_path(
+            ClaimContext(store), DiscoveryState()
+        )
+        assert claims and claims[0].source_type == "zarr"
+        assert claims[0].unresolved is False  # resident -> not deferred
+
+    def test_nonresident_bare_array_defers_as_zarr_not_ome_zarr(
+        self, tmp_path, force_nonresident
+    ):
+        # A top-level .zarray makes this a definite plain array: OmeZarrAdapter
+        # declines (recall-free), ZarrAdapter defers it, so claims[0] is the
+        # certain "zarr" -- not a provisional "ome-zarr" guess. Reads explode to
+        # prove neither adapter opened content.
+        store = tmp_path / "arr.zarr"
+        store.mkdir()
+        (store / ".zarray").write_text("ignored")
+
+        claims = self._registry().get_claims_for_path(
+            _RaisingReadCtx(store), DiscoveryState()
+        )
+        assert claims and claims[0].source_type == "zarr"
+        assert claims[0].unresolved is True
+
+    def test_nonresident_zattrs_only_defers_as_ome_zarr(
+        self, tmp_path, force_nonresident
+    ):
+        # Only .zattrs (no .zarray): both adapters defer, and OmeZarr's priority
+        # wins claims[0]. Resolution refines it once the store is resident.
+        store = tmp_path / "grp.zarr"
+        store.mkdir()
+        (store / ".zattrs").write_text("}{ not json")
+
+        claims = self._registry().get_claims_for_path(
+            _RaisingReadCtx(store), DiscoveryState()
+        )
+        assert claims and claims[0].source_type == "ome-zarr"
+        assert claims[0].unresolved is True

@@ -53,13 +53,20 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         has_zarr_json = ctx.join('zarr.json').exists()
         has_zattrs = ctx.join('.zattrs').exists()
 
-        # Zarr v2: has .zarray (array metadata)
+        # Zarr v2/v3: has .zarray / zarr.json (array metadata). The marker's
+        # existence is a stat (recall-free), but if it is a non-resident cloud
+        # placeholder the source must still be deferred -- registering it resolved
+        # would let create_from_config read the metadata AND make it eligible for
+        # background precache warming, which would recall the whole array. So under
+        # non-residency claim it provisionally and let resolution hydrate it.
         if has_zarray or has_zarr_json:
+            marker = ctx.join('.zarray') if has_zarray else ctx.join('zarr.json')
             state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type="zarr",
                 primary_path=ctx.path_str,
                 is_remote=ctx.is_remote,
+                unresolved=not marker.is_resident(),
             )
 
         # If only .zattrs exists, check if it's NOT an OME-Zarr

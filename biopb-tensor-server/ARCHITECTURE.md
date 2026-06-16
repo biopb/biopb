@@ -317,6 +317,16 @@ Registration order (by priority/specificity):
 5. `OmeTiffAdapter` — Single-file OME-TIFF
 6. `Hdf5Adapter` — HDF5 (requires explicit config)
 
+**OME-Zarr before plain Zarr is load-bearing.** A `.zarr` dir can be claimed by
+both; `get_claims_for_path` returns claims in registration order and callers take
+`claims[0]`, so the specific adapter must win. The two stay disjoint once the store
+is resident: `OmeZarrAdapter` declines a non-multiscales store, and `ZarrAdapter`
+declines a real OME-Zarr — so the resident re-claim (e.g. at cloud resolve) lands
+`claims[0]` on the right type even though the provisional guess was made blind.
+`OmeZarrAdapter` also declines early when a top-level `.zarray`/`zarr.json` exists
+(a bare array is never an OME multiscales group), so `ZarrAdapter`'s read-free,
+definite claim wins for bare arrays — including deferred ones under cloud.
+
 #### DiscoveryState
 
 Bidirectional mappings for efficient source add/remove operations:
