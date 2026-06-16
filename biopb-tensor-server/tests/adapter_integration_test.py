@@ -517,14 +517,18 @@ class TestMultiSeriesOmeTiffIntegration:
 
 
 class TestCompanionOmeIntegration:
-    """Integration tests for companion OME files (now handled by AicsImageIoAdapter)."""
+    """Integration tests for companion OME files (claimed by OmeTiffAdapter; read
+    via aicsimageio/bioformats)."""
 
     @pytest.mark.skipif(
         not _bioformats_available(), reason="bioformats_jar not available"
     )
     def test_companion_claim(self, companion_ome_dataset):
         """Test claiming companion.ome file."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        # .companion.ome is handled by OmeTiffAdapter (the generic
+        # AicsImageIoAdapter excludes it); the claim parses the OME-XML and groups
+        # the referenced TIFFs into one multi-file source.
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
         from pathlib import Path
 
         companion_path, tiff_files, metadata_info = companion_ome_dataset
@@ -534,12 +538,15 @@ class TestCompanionOmeIntegration:
 
         ctx = ClaimContext(Path(companion_path))
         state = DiscoveryState()
-        claim = AicsImageIoAdapter.claim(ctx, state)
+        claim = OmeTiffAdapter.claim(ctx, state)
         assert claim is not None
-        assert claim.source_type == "aics"
-        # Primary path is the companion file itself for companion.ome claims
-        assert str(claim.primary_path) == companion_path
-        # All TIFF files should be in consumed paths (tracked via try_claim_path)
+        assert claim.source_type == "ome-tiff"
+        # Primary path is the first referenced TIFF (the master), not the
+        # companion sidecar.
+        assert str(claim.primary_path) == tiff_files[0]
+        # The companion sidecar and every referenced TIFF are consumed (tracked
+        # via try_claim_path).
+        assert companion_path in state.consumed_paths
         for tiff_file in tiff_files:
             assert tiff_file in state.consumed_paths
 
@@ -560,16 +567,23 @@ class TestCompanionOmeIntegration:
         descriptors = adapter.list_tensor_descriptors()
         assert len(descriptors) > 0
 
-        # Read data
+        # Read data. The companion OME-XML yields a full TCZYX tensor (the
+        # referenced TIFFs stack along Z), so read by the descriptor's own shape
+        # and locate the Z axis by label rather than assuming a 3-D layout.
         desc = descriptors[0]
         series_adapter = adapter.get_tensor_adapter(desc.array_id)
 
-        bounds = ChunkBounds(start=[0, 0, 0], stop=[metadata_info["n_files"], 64, 64])
+        shape = list(desc.shape)
+        dim_labels = list(desc.dim_labels)
+        bounds = ChunkBounds(start=[0] * len(shape), stop=shape)
         data = series_adapter.get_data(bounds)
+        assert tuple(data.shape) == tuple(shape)
 
-        assert data.shape[0] == metadata_info["n_files"]
-        # First file has value 1
-        assert data[0].mean() == 1
+        z_axis = dim_labels.index("Z")
+        assert shape[z_axis] == metadata_info["n_files"]
+        # The first plane along Z comes from data_001.tif (filled with value 1).
+        first_plane = data.take(indices=0, axis=z_axis)
+        assert first_plane.mean() == 1
 
 
 class TestHdf5Integration:
