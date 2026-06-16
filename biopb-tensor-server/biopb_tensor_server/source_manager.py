@@ -230,6 +230,7 @@ class SourceManager:
             next_stable_observations,
             next_pending_scan,
             skipped_dirs,
+            next_cloud,
         ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
         previous_state = self._entry_state
         previous_stable_observations = self._entry_stable_observations
@@ -260,7 +261,7 @@ class SourceManager:
                 dim_labels=self._dim_labels,
                 path_filter=self._should_scan_resolved,
                 skipped_dirs=skipped_dirs,
-                cloud_filter=self._is_under_cloud_root,
+                cloud_by_path=next_cloud,
             )
 
             self._preserve_skipped_claims(discovered_state, skipped_dirs)
@@ -346,12 +347,16 @@ class SourceManager:
         Dict[str, int],
         Dict[str, bool],
         Set[str],
+        Dict[str, bool],
     ]:
         """Refresh cached filesystem signatures for all monitored trees."""
         now = time.time()
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
         next_stable_observations: Dict[str, int] = {}
         next_pending_scan: Dict[str, bool] = {}
+        # path -> whether it is under a cloud root (carried to the claim phase so
+        # cloud-ness is computed once, in the walk, not re-derived per entry).
+        next_cloud: Dict[str, bool] = {}
         skipped_dirs: Set[str] = set()
         # One identity set across all monitored roots for this refresh: breaks
         # directory loops (symlink, Windows junction, hardlink, bind mount) and
@@ -377,6 +382,7 @@ class SourceManager:
                 next_state,
                 next_stable_observations,
                 next_pending_scan,
+                next_cloud,
                 skipped_dirs,
                 force_full,
                 self._aggressive_dir_pruning,
@@ -394,6 +400,7 @@ class SourceManager:
             next_stable_observations,
             next_pending_scan,
             skipped_dirs,
+            next_cloud,
         )
 
     def _scan_tree_state(
@@ -403,6 +410,7 @@ class SourceManager:
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
         next_stable_observations: Dict[str, int],
         next_pending_scan: Dict[str, bool],
+        next_cloud: Dict[str, bool],
         skipped_dirs: Set[str],
         force_full: bool,
         allow_prune: bool,
@@ -483,6 +491,12 @@ class SourceManager:
         next_state[path_str] = (is_directory, signature, last_changed)
         next_stable_observations[path_str] = stable_observations
         next_pending_scan[path_str] = pending_scan
+        # Record cloud-ness once, here, where the walk already knows it (inherited
+        # per monitored root, see _refresh_entry_state). The claim phase reads this
+        # instead of re-deriving it per entry, so there is a single source of truth
+        # for "is this path under a cloud root" -- consistent with the signature
+        # above, which is also computed with this same `cloud`.
+        next_cloud[path_str] = cloud
 
         # Only real directories are walked further. Never follow a symlinked
         # directory; and break every *other* kind of loop — Windows junction,
@@ -538,6 +552,7 @@ class SourceManager:
                         next_state,
                         next_stable_observations,
                         next_pending_scan,
+                        next_cloud,
                         skipped_dirs,
                         force_full,
                         True,

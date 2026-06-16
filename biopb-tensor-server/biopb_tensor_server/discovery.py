@@ -919,7 +919,7 @@ def discover_sources_from_entries(
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[str], bool]] = None,
     skipped_dirs: Optional[Set[str]] = None,
-    cloud_filter: Optional[Callable[[str], bool]] = None,
+    cloud_by_path: Optional[Dict[str, bool]] = None,
 ) -> DiscoveryState:
     """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
 
@@ -992,7 +992,9 @@ def discover_sources_from_entries(
             Path(path_str),
             is_dir=is_dir,
             signature=signature,
-            cloud_root=cloud_filter(path_str) if cloud_filter is not None else False,
+            cloud_root=cloud_by_path.get(path_str, False)
+            if cloud_by_path is not None
+            else False,
         )
         claims = registry.get_claims_for_path(ctx, state)
         if claims:

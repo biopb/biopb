@@ -338,6 +338,7 @@ class TestSourceManagerRegressions:
                     manager._entry_stable_observations,
                     manager._entry_pending_scan,
                     manager._skipped_stable_dirs,
+                    {},  # next_cloud (empty: no cloud roots in this test)
                 )
             return original_refresh(force_full=force_full, publish=publish)
 
@@ -1134,7 +1135,7 @@ def _make_signature_manager(monitored_dirs):
 
 def _scan(manager):
     """Run one signature refresh and return its {resolved_path_str: ...} map."""
-    next_state, _obs, _pending, _skipped = manager._refresh_entry_state(
+    next_state, _obs, _pending, _skipped, _cloud = manager._refresh_entry_state(
         force_full=True, publish=False
     )
     return next_state

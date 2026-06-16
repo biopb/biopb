@@ -703,8 +703,9 @@ class TestCloudRootFlag:
         assert ClaimContext(tmp_path).cloud_root is False
 
     def test_discover_from_entries_sets_cloud_root_per_entry(self, tmp_path):
-        # The cloud_filter callback decides cloud-ness per path; the flag must
-        # reach the adapter's claim() via its ClaimContext.
+        # cloud_by_path carries the per-path cloud flag the walk computed once; it
+        # must reach the adapter's claim() via its ClaimContext. A path absent from
+        # the map defaults to False.
         from biopb_tensor_server.discovery import (
             AdapterRegistry,
             discover_sources_from_entries,
@@ -727,7 +728,7 @@ class TestCloudRootFlag:
         discover_sources_from_entries(
             entries,
             registry,
-            cloud_filter=lambda p: p == cloud_dir,
+            cloud_by_path={cloud_dir: True},  # plain_dir absent -> defaults False
         )
         assert seen[cloud_dir] is True
         assert seen[plain_dir] is False
