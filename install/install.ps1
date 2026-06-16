@@ -253,8 +253,8 @@ function Set-McpClients {
         # editing the config. Default is Yes (Enter = enable).
         Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
         Write-Inf "certain computations, e.g. cell segmentation. The servers are"
-        Write-Inf "hosted at UConn Health and log user IPs. Answer No below if you"
-        Write-Inf "do not want these turned on by default."
+        Write-Inf "hosted at UConn Health and log client IP addresses."
+        Write-Host ""
         $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
         if ($plug -notmatch '^(n|no)$') {
             $processImageServers = '        "grpcs://cellpose.biopb.org:443"'

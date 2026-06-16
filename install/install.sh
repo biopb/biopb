@@ -404,8 +404,8 @@ _setup_mcp() {
         # editing the config. _confirm defaults to Yes (Enter = enable).
         _info "BioPB ships with algorithm plugins that use remote servers for"
         _info "certain computations, e.g. cell segmentation. The servers are"
-        _info "hosted at UConn Health and log user IPs. Answer No below if you"
-        _info "do not want these turned on by default."
+        _info "hosted at UConn Health and log client IP addresses."
+        _info ""
         local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
         if _confirm "Enable the remote algorithm plugins?"; then
             _ok "Remote algorithm plugins enabled"
