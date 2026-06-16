@@ -168,6 +168,47 @@ class TestResolveServeSources:
         assert monitored_sources == []
         assert [s.local_path for s in static_sources] == [good.resolve()]
 
+    def test_cloud_without_monitor_is_static_not_monitored(self, tmp_path):
+        """`cloud = true` no longer forces monitoring: with monitor unset (false),
+        a cloud directory is scanned once via the static-expand path, exactly like
+        any other monitor=false directory. The monitor flag is the only switch."""
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        _write_tiff(str(root / "image.tif"))
+
+        cfg = _config(SourceConfig(url=str(root), cloud=True, monitor=False))
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert monitored_sources == []  # cloud alone does NOT monitor anymore
+        assert [s.local_path for s in static_sources] == [(root / "image.tif").resolve()]
+        # cloud gating rides along: the expanded source keeps cloud=True so it is
+        # still deferred as an unresolved source downstream.
+        assert all(s.cloud for s in static_sources)
+
+    def test_cloud_with_monitor_is_monitored_not_expanded(self, tmp_path, monkeypatch):
+        """`cloud = true, monitor = true` follows the same monitored path as any
+        monitored directory: routed to monitored_sources, never pre-walked."""
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        _write_tiff(str(root / "image.tif"))
+        cfg = _config(SourceConfig(url=str(root), cloud=True, monitor=True))
+
+        seen_urls = []
+        real_discover = config_mod.discover_sources
+
+        def spy(source, registry=None):
+            seen_urls.append(source.url)
+            return real_discover(source, registry)
+
+        monkeypatch.setattr(config_mod, "discover_sources", spy)
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert str(root) not in seen_urls  # not pre-walked
+        assert static_sources == []
+        assert [s.url for s in monitored_sources] == [str(root)]
+
 
 class TestResolveAllSourcesOverrides:
     def test_sources_override_expands_only_the_subset(self, tmp_path):

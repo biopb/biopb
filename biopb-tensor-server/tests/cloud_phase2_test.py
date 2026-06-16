@@ -544,11 +544,14 @@ class TestPrecacheSkipsUnresolved:
 
 
 class TestCloudRescanGating:
-    """A cloud root is full-scanned with no mtime stability gate and no open-probe.
+    """A cloud root is walked only on a ``force_full`` rescan -- with no mtime
+    stability gate and no open-probe when it IS walked.
 
     Drives the real ``_handle_rescan`` pipeline (not ``_register_source_claim``
     directly) over a simulated dehydrated dataset, proving the dehydrated content
-    is registered unresolved without ever being opened (no recall).
+    is registered unresolved without ever being opened (no recall), and that an
+    incremental (non-force_full) rescan silently skips the cloud subtree while
+    preserving its claims.
     """
 
     def test_rescan_registers_unresolved_without_opening_content(
@@ -605,6 +608,43 @@ class TestCloudRescanGating:
         mgr = _make_manager(server, cloud_roots=set(), monitored={root})
         mgr._handle_rescan()
         assert server.registered == {}
+
+    def test_incremental_rescan_skips_cloud_force_full_rewalks(
+        self, tmp_path, force_nonresident, monkeypatch
+    ):
+        # A cloud subtree is scanned only on a force_full pass: the first rescan
+        # (last-full == -inf) is force_full and registers it; a subsequent
+        # incremental rescan silently SKIPS the cloud root (recorded in
+        # _skipped_stable_dirs) and preserves the claim untouched; a later
+        # force_full rescan re-walks it.
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        store = root / "img.zarr"
+        store.mkdir()
+        (store / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+        (store / ".zattrs").write_text(json.dumps({"multiscales": [{"datasets": []}]}))
+
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
+        root_key = str(root.resolve())
+
+        # First rescan: force_full -> cloud walked and registered.
+        mgr._handle_rescan()
+        assert len(server.registered) == 1
+        sid = next(iter(server.registered))
+        assert root_key not in mgr._skipped_stable_dirs
+
+        # Incremental (non-force_full) rescan: cloud subtree skipped, claim kept.
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
+        mgr._handle_rescan()
+        assert root_key in mgr._skipped_stable_dirs
+        assert set(server.registered) == {sid}  # preserved, not torn down/re-added
+
+        # force_full rescan: cloud re-walked (no longer skipped), claim stable.
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
+        mgr._handle_rescan()
+        assert root_key not in mgr._skipped_stable_dirs
+        assert set(server.registered) == {sid}
 
 
 # --------------------------------------------------------------------------- #
@@ -809,6 +849,40 @@ class TestCloudMultiFileBan:
         assert claim is not None
         assert claim.source_type == "dicom"
         assert claim.unresolved is True
+
+    def test_static_discover_path_applies_multifile_ban(
+        self, tmp_path, force_nonresident, monkeypatch
+    ):
+        # End-to-end through the *static* one-shot discover path (a monitor=false
+        # cloud directory): it must hand cloud_root=True to the claim probes so the
+        # multi-file ban fires there too, not only on the monitored rescan. Spy on
+        # the series adapter to capture the cloud_root it is handed.
+        from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
+        from biopb_tensor_server.config import discover_sources
+
+        d = tmp_path / "series"
+        d.mkdir()
+        for i in range(3):
+            (d / f"{i}.dcm").write_bytes(b"not a real dicom")
+
+        seen_cloud_root = []
+        real = DicomSeriesAdapter.claim.__func__
+
+        def spy(cls, ctx, state):
+            seen_cloud_root.append(ctx.cloud_root)
+            return real(cls, ctx, state)
+
+        monkeypatch.setattr(DicomSeriesAdapter, "claim", classmethod(spy))
+
+        results = discover_sources(SourceConfig(url=str(d), cloud=True, monitor=False))
+
+        # The static path handed cloud_root=True to the series adapter (the plumbing)
+        assert seen_cloud_root and all(seen_cloud_root)
+        # ...so it bowed out and each slice became its own deferred single-file
+        # source, with cloud propagated to the expanded configs.
+        assert len(results) == 3
+        assert {r.type for r in results} == {"dicom"}
+        assert all(r.cloud for r in results)
 
 
 # --------------------------------------------------------------------------- #

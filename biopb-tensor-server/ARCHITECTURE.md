@@ -498,16 +498,29 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
   stat, `is_file`-guarded so a directory's `st_blocks == 0` is never a false hit)
   flags it. The check is cloud-gated, so a normal local source is never marked
   unresolved.
-- **Full-scan, no stability gate (the watcher path).** A cloud directory root is
-  driven through the same periodic monitored rescan as `monitor = true` (routed in
-  `cli.py`), but cloud-gated: `_scan_tree_state` passes `admit_nonresident`,
-  **never prunes a cloud subtree** on its (unreliable) mtime signature, and
-  `_should_scan_resolved` **bypasses the stability window and the
-  open-for-append probe** for cloud entries. The probe (`_can_open_for_append`)
-  opens the file — a whole-file recall on a placeholder — so skipping it is
-  load-bearing, not an optimization; the mtime/age gate is skipped because
-  archived dehydrated data is inherently stable and cloud mtime is untrustworthy
-  (§1.2). A fresh cloud dataset is therefore catalogued on the first rescan.
+- **Monitoring is governed by `monitor`, identically to non-cloud roots.** `cloud`
+  only controls *gating* (admit placeholders, defer unresolved, set
+  `ClaimContext.cloud_root`); it no longer forces a root onto the monitored
+  pipeline — `cli.py` routes on `monitor` alone. A `monitor = true` cloud root is
+  live-monitored; a `monitor = false` cloud root is scanned **once at startup**
+  through the static-expand path, which is cloud-gated too: `config.discover_sources`
+  threads `admit_nonresident` **and** `cloud_root` from `source.cloud`, so the
+  one-shot scan admits placeholders and applies the multi-file OME-TIFF / DICOM
+  ban exactly like the monitored path (the expanded configs also keep `cloud`, so
+  they defer as unresolved).
+- **Cloud subtrees are walked only on a `force_full` rescan (the monitored path).**
+  `_scan_tree_state` **skips a cloud subtree entirely** on an incremental
+  (non-`force_full`) rescan — carrying its cached claims forward untouched — and
+  re-walks it only on the periodic `force_full` pass (`full_rescan_interval`,
+  default 1h). The first rescan is `force_full` (last-full = −∞), so a cloud root
+  is still catalogued at startup, and a brand-new cloud dataset surfaces on the
+  next `force_full`. When a cloud subtree *is* walked (a `force_full` rescan, or
+  the one-shot static scan), it is fully walked with no stability gate:
+  `_should_scan_resolved` **bypasses the stability window and the open-for-append
+  probe** for cloud entries. The probe (`_can_open_for_append`) opens the file — a
+  whole-file recall on a placeholder — so skipping it is load-bearing, not an
+  optimization; the mtime/age gate is skipped because archived dehydrated data is
+  inherently stable and cloud mtime is untrustworthy (§1.2).
 - **Pre-cache stays out of cloud (natural protection).** The background pre-cache
   worker loops `list_tensor_descriptors()` and consults `has_native_pyramid()` —
   both empty/False on the unresolved proxy — so `_process_source` returns before
