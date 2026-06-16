@@ -848,6 +848,14 @@ class SourceManager:
     ) -> Dict[str, Tuple[Any, ...]]:
         """Collect cached member-path signatures for a claim."""
         signatures: Dict[str, Tuple[Any, ...]] = {}
+        # Cloud-root membership is a property of the *source*, not the individual
+        # member: every member lives under ``claim.primary_path``, so they share
+        # one cloud status. Resolve it once -- both to skip a redundant
+        # ``Path.resolve()`` + roots scan per member, and so the whole source's
+        # signatures use one uniform cloud-invariance policy (matching the cached
+        # branch, whose signatures ``_scan_tree_state`` built with a per-tree
+        # ``cloud`` flag).
+        cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
             entry = self._entry_state.get(member_path)
             if entry is not None:
@@ -861,13 +869,12 @@ class SourceManager:
                 continue
 
             # The cached-entry path above already carries the cloud-invariant
-            # signature (``_scan_tree_state`` built it with ``cloud=``). This
-            # re-stat fallback has no cloud context, so recompute it from the
-            # cloud roots so hydration/eviction does not flap a resolved source.
+            # signature. This re-stat fallback has no cloud context, so reuse the
+            # per-claim flag so hydration/eviction does not flap a resolved source.
             signatures[member_path] = self._build_entry_signature(
                 stat_result,
                 resolved_path.is_dir(),
-                cloud=self._is_under_cloud_root(member_path),
+                cloud=cloud,
             )
         return signatures
 
