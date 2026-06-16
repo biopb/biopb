@@ -174,10 +174,13 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         if sorted_files is None:
             return None
 
-        # Claim directory + all TIFF files
+        # Dir-claiming policy (biopb/biopb): the directory IS the dataset
+        # boundary. ``_group_tiff_sequence`` above is still needed to *decide*
+        # whether to claim, but its file list need not be recorded as members:
+        # claiming the dir already prunes its whole subtree, so the interior
+        # TIFFs are never independently walked. Recording the glob would only
+        # duplicate that prune and pin a brittle membership.
         state.try_claim_path(ctx.path_str)
-        for img_file in sorted_files:
-            state.try_claim_path(img_file)
 
         return SourceClaim(
             source_type="tiff-sequence",
@@ -472,17 +475,18 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         # read+parsed without a whole-file recall (or it blocks offline). Defer
         # format validation and the coordinate-map build: the directory was
         # recognized structurally (a metadata.txt plus img_* TIFFs, all recall-
-        # free), so claim it provisionally and resolve on first access. The member
-        # glob below is best-effort; the authoritative Coords map is rebuilt then.
+        # free), so claim it provisionally and resolve on first access. The
+        # authoritative Coords map is rebuilt then.
         if _is_offline_placeholder(v1_metadata):
-            search_dir = v2_data_dir if v2_data_dir else ctx._path
+            # Dir-claiming policy: claim the dir (+ metadata.txt marker) only.
+            # The dir claim prunes its whole subtree, so the interior img_*
+            # TIFFs are never independently walked -- no need to enumerate them
+            # as members (which under cloud would also be a recall-free but
+            # divergent best-effort glob vs the Coords map).
             state.try_claim_path(ctx.path_str)
             state.try_claim_path(str(v1_metadata))
             if v2_data_dir:
                 state.try_claim_path(str(v2_data_dir))
-            for pattern in ("img_*.tif", "img_*.tiff"):
-                for f in search_dir.glob(pattern):
-                    state.try_claim_path(f)
             return SourceClaim(
                 source_type="micromanager-legacy",
                 primary_path=ctx.path_str,
@@ -524,13 +528,13 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
         if not tiff_files:
             return None
 
-        # Claim root directory + metadata + TIFF files
+        # Dir-claiming policy: the glob above is kept only to *confirm* this is a
+        # real MicroManager dataset (TIFFs present); the dir claim prunes the
+        # subtree, so the interior TIFFs need not be recorded as members.
         state.try_claim_path(ctx.path_str)
         state.try_claim_path(str(v1_metadata))
         if v2_data_dir:
             state.try_claim_path(str(v2_data_dir))
-        for img_file in tiff_files:
-            state.try_claim_path(img_file)
 
         return SourceClaim(
             source_type="micromanager-legacy",

@@ -449,14 +449,34 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
   to `should_skip_walk_entry`, so dehydrated entries reach `claim()` instead of
   being pruned. The hidden/system-dir prunes still apply.
 - **Recall-free claim.** Every `claim()` recognizes a source from name + `stat` +
-  `exists` + directory layout only. The adapters that *read* a sidecar/container
-  to recognize a format (OME-Zarr `.zattrs`, MicroManager `metadata.txt`,
-  OME-TIFF sniff, DICOM single + series) guard that read with
-  `ClaimContext.is_resident()` and, when the target is non-resident, emit a
-  **provisional, `unresolved=True`** claim that defers the read. (`is_resident()`
-  is recall-free — the same stat signal — and treats directories as resident, so
-  it never opens content. The content-free extension-only adapters need no
-  change; a `cloud_phase2_test` guard pins that they stay read-free.)
+  `exists` + directory layout only. Two mechanisms keep it read-free under cloud,
+  by *why* a format would otherwise read content:
+  - *Single-source format recognition* (OME-Zarr/plain-Zarr `.zattrs`,
+    MicroManager `metadata.txt`, single DICOM header): the read is guarded by
+    `ClaimContext.is_resident()` and, when non-resident, the adapter emits a
+    **provisional, `unresolved=True`** claim that defers it. (`is_resident()` is
+    recall-free — the same stat signal — and treats directories as resident.)
+    Resolution refines the *same* source in place, so there is nothing to
+    reconcile.
+  - *Content-derived membership* (multi-file OME-TIFF via the OME-XML file list,
+    DICOM **series** via per-slice `SeriesInstanceUID`): these cannot be deferred
+    safely — a directory can hold several such datasets, so the dir is not the
+    boundary and the deferred member set could diverge at resolve. They are gated
+    on the new **`ClaimContext.cloud_root`** flag (plumbed from `_handle_rescan`'s
+    `cloud_filter` and from `UnresolvedSourceAdapter` at resolve, so it holds at
+    *both* scan and resolve — residency cannot gate resolve, where the file is
+    resident): under cloud `OmeTiffAdapter`/`DicomSeriesAdapter` **return `None`**,
+    so each `.tif`/`.dcm` falls back to its own single-file source.
+  - The content-free extension-only adapters need no change; a `cloud_phase2_test`
+    guard pins that they (and the deferring readers) stay read-free.
+- **Dir-claiming policy.** The five genuine one-dir-one-dataset formats (zarr,
+  ome-zarr, ndtiff, micromanager, tiff-sequence) record **the directory** as the
+  sole claim member, not an enumerated per-file glob. A claimed dir already prunes
+  its whole subtree, so interior files are never independently walked; recording
+  `member_paths = {dir}` makes the bookkeeping match that prune and removes the
+  glob-vs-content membership divergence (so resolution never needs to reconcile a
+  member set). Change-detection then keys on the dir signature (add/remove of an
+  interior file bumps dir mtime).
 - **Register unresolved.** `SourceManager._claim_is_unresolved` registers such a
   source behind an `UnresolvedSourceAdapter` (`adapters/unresolved.py`) — a
   catalog row with empty `tensors` / `data_resident = false`. This is also how a
@@ -492,17 +512,26 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
   a recall-free guess; the authoritative one comes from the hydrated content),
   caches the real adapter, fires `on_resolved` (the metadata-DB backfill —
   `sync_source_added` is an upsert, so the NULL-shape row is overwritten in
-  place), and delegates thereafter. Resolution runs once under a lock; failure
-  raises `SourceUnresolvedError` → `FlightUnavailableError` at the read boundary.
+  place), and delegates thereafter. Resolution runs once under a lock; failure is
+  classified: a transient recall/IO failure raises `SourceResolveRetriableError`
+  (→ `FlightUnavailableError`/UNAVAILABLE, "retry"), a permanent one raises bare
+  `SourceUnresolvedError` (→ `FlightInternalError` from the resolve action, so the
+  client does not retry forever). The re-claim `except` is narrowed to **not**
+  swallow an `OSError` into the claim-time guess — a recall blip can no longer be
+  laundered into a wrong type.
 
-**Known limitation (accepted).** Multi-file monolithic formats — multi-file
-OME-TIFF (members enumerated from the deferred OME-XML sniff) and DICOM series
-(grouped by reading every slice header) — degrade on cloud: at scan their member
-*grouping* is deferred, so sibling files may be claimed individually until first
-access reconstructs the set. This matches §9 of `docs/cloud-storage-support.md`
-(pyramidal/chunked OME-Zarr is the supported cloud path; **transcode monoliths
-to OME-Zarr at archive time**). Phase-2 resolution is in-memory only; surviving a
-restart (file-backed metadata DB) is phase 3.
+**Known limitation (accepted).** Multi-file content-membership formats — multi-file
+OME-TIFF (member set lives in the OME-XML) and DICOM **series** (grouped by the
+per-slice `SeriesInstanceUID`) — are **not reconstructed on cloud**. Their
+membership is intrinsically a content read and a directory can hold several such
+datasets, so the dir is not the dataset boundary; deferring the grouping would
+force a catalog reconciliation at resolve (forbidden — a claim is immutable once
+made). Under a cloud root they therefore degrade to **N independent single-file
+sources** (each `.tif`/`.dcm` its own source), permanently — there is no later
+reconstruction. This matches §9 of `docs/cloud-storage-support.md` (pyramidal/
+chunked OME-Zarr is the supported cloud path; **transcode monoliths to OME-Zarr
+at archive time**). Phase-2 resolution is in-memory only; surviving a restart
+(file-backed metadata DB) is phase 3.
 
 #### Shutdown Sequence
 

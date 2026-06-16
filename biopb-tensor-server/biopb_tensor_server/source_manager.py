@@ -260,6 +260,7 @@ class SourceManager:
                 dim_labels=self._dim_labels,
                 path_filter=self._should_scan_resolved,
                 skipped_dirs=skipped_dirs,
+                cloud_filter=self._is_under_cloud_root,
             )
 
             self._preserve_skipped_claims(discovered_state, skipped_dirs)
@@ -464,7 +465,7 @@ class SourceManager:
             return
 
         path_str = str(resolved_path)
-        signature = self._build_entry_signature(stat_result, is_directory)
+        signature = self._build_entry_signature(stat_result, is_directory, cloud=cloud)
         previous_entry = self._entry_state.get(path_str)
         last_changed = self._get_entry_change_time(stat_result, now)
         stable_observations = 0
@@ -606,8 +607,21 @@ class SourceManager:
         self,
         stat_result: Any,
         is_directory: bool,
+        cloud: bool = False,
     ) -> Tuple[Any, ...]:
-        """Build a stable signature tuple for a file or directory."""
+        """Build a stable signature tuple for a file or directory.
+
+        Under a ``cloud = true`` root the signature is **residency-invariant** --
+        keyed on identity (``st_dev``, ``st_ino``) only. Hydrating a placeholder
+        (a consented recall) bumps ``st_size``/``st_mtime_ns``/``st_ctime_ns``;
+        including those would make the next rescan see the just-resolved source as
+        "changed" and destructively remove+re-add it (and re-dehydration/eviction
+        would flap it). Archived cloud data is stable and cloud mtime is
+        untrustworthy anyway, so identity is the right key there. Non-cloud
+        entries keep the full mtime/size-sensitive signature.
+        """
+        if cloud:
+            return (stat_result.st_dev, stat_result.st_ino)
         if is_directory:
             return (
                 stat_result.st_dev,
@@ -817,9 +831,14 @@ class SourceManager:
             except OSError:
                 continue
 
+            # The cached-entry path above already carries the cloud-invariant
+            # signature (``_scan_tree_state`` built it with ``cloud=``). This
+            # re-stat fallback has no cloud context, so recompute it from the
+            # cloud roots so hydration/eviction does not flap a resolved source.
             signatures[member_path] = self._build_entry_signature(
                 stat_result,
                 resolved_path.is_dir(),
+                cloud=self._is_under_cloud_root(member_path),
             )
         return signatures
 
@@ -1053,6 +1072,7 @@ class SourceManager:
                     self._registry,
                     credentials_config=self._credentials_config,
                     on_resolved=self._on_source_resolved,
+                    cloud_root=self._is_under_cloud_root(claim.primary_path),
                 )
             else:
                 adapter_cls = self._registry.get_adapter_for_type(claim.source_type)

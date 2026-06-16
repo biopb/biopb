@@ -64,6 +64,23 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
 
         # If only .zattrs exists, check if it's NOT an OME-Zarr
         if has_zattrs:
+            # Cloud-storage phase 2: reading .zattrs to disambiguate plain-zarr
+            # from OME-Zarr would recall a non-resident sidecar placeholder (or
+            # block offline). Defer the read exactly as OmeZarrAdapter does: a
+            # .zarr dir with a .zattrs is structurally a zarr store, so claim it
+            # provisionally as plain zarr and let resolution re-derive the exact
+            # type from the hydrated content. (OmeZarrAdapter runs first and, when
+            # it also defers, wins claims[0]; this branch only owns the .zattrs
+            # store OmeZarr did not provisionally claim.)
+            zattrs_ctx = ctx.join('.zattrs')
+            if not zattrs_ctx.is_resident():
+                state.try_claim_path(ctx.path_str)
+                return SourceClaim(
+                    source_type="zarr",
+                    primary_path=ctx.path_str,
+                    is_remote=ctx.is_remote,
+                    unresolved=True,
+                )
             try:
                 zattrs = json.loads(ctx.read_text('.zattrs'))
                 # If no multiscales, it might be a plain zarr group or array

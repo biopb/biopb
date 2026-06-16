@@ -244,6 +244,7 @@ class ClaimContext:
         store: Optional["RemoteStore"] = None,
         is_dir: Optional[bool] = None,
         signature: Optional[Tuple] = None,
+        cloud_root: bool = False,
     ):
         self._path = Path(path) if store is None else None
         self._store = store
@@ -265,6 +266,18 @@ class ClaimContext:
         # headers from memory instead of disk (biopb/biopb#56, item 6). Local,
         # top-level contexts only; ``join()`` sub-contexts carry no signature.
         self._signature = signature if store is None else None
+        # True when this entry lives under a ``cloud = true`` root. Lets an
+        # adapter's ``claim()`` (and the resolve-time re-claim) suppress
+        # content-membership multi-file grouping under cloud regardless of
+        # per-file residency -- residency can't gate the resolve path, where the
+        # file is already resident. Remote contexts are never "cloud roots" in
+        # this sense (they have their own fetch model), so force False there.
+        self._cloud_root = cloud_root if store is None else False
+
+    @property
+    def cloud_root(self) -> bool:
+        """Whether this path is under a configured ``cloud = true`` root."""
+        return self._cloud_root
 
     def is_dir(self) -> bool:
         """Check if path is directory."""
@@ -906,6 +919,7 @@ def discover_sources_from_entries(
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[str], bool]] = None,
     skipped_dirs: Optional[Set[str]] = None,
+    cloud_filter: Optional[Callable[[str], bool]] = None,
 ) -> DiscoveryState:
     """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
 
@@ -974,7 +988,12 @@ def discover_sources_from_entries(
                 prune_stack.append(path_str)
             continue
 
-        ctx = ClaimContext(Path(path_str), is_dir=is_dir, signature=signature)
+        ctx = ClaimContext(
+            Path(path_str),
+            is_dir=is_dir,
+            signature=signature,
+            cloud_root=cloud_filter(path_str) if cloud_filter is not None else False,
+        )
         claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]
