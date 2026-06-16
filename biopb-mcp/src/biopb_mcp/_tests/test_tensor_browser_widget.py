@@ -280,12 +280,13 @@ class TestResidencyIndicator:
         assert item.toolTip(0) == ""
 
 
-def _descriptor(source_id, *, tensors):
+def _descriptor(source_id, *, tensors, source_type=""):
     from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
     return DataSourceDescriptor(
         source_id=source_id,
         source_url=f"/cloud/{source_id}.zarr",
+        source_type=source_type,
         tensors=[
             TensorDescriptor(array_id=tid, shape=[8, 8], dtype="uint8")
             for tid in tensors
@@ -329,6 +330,9 @@ class _FakeProgress:
         self.closed = True
 
     def exec_(self):
+        pass
+
+    def show(self):  # non-modal path (warm/hydrate)
         pass
 
 
@@ -400,8 +404,12 @@ class TestResolveAction:
         w._apply_filter.assert_not_called()
 
     def test_accepted_resolves_then_repopulates(self, widget, monkeypatch):
+        # A plain (non-multifile) resolved descriptor: repopulate, no hydrate offer.
         w, started = self._arm(
-            widget, monkeypatch, accept=True, outcome=("resolved", object())
+            widget,
+            monkeypatch,
+            accept=True,
+            outcome=("resolved", _descriptor("cloud_x", tensors=["cloud_x"])),
         )
         w._resolve_source("cloud_x")
         assert started["n"] == 1  # resolve ran off-thread
@@ -477,6 +485,22 @@ class TestResolveAction:
             worker.finished.emit()
         assert w._resolve_workers == set()
 
+    def test_multifile_resolve_offers_hydrate(self, widget, monkeypatch):
+        # Resolving a multi-file (dir-backed) source pops the hydrate-ahead offer;
+        # a plain single-file one (test above) does not.
+        w, started = self._arm(
+            widget,
+            monkeypatch,
+            accept=True,
+            outcome=(
+                "resolved",
+                _descriptor("cloud_x", tensors=["cloud_x"], source_type="zarr"),
+            ),
+        )
+        w._offer_hydrate = MagicMock()
+        w._resolve_source("cloud_x")
+        w._offer_hydrate.assert_called_once()
+
     def test_double_click_routes_unresolved_to_resolve(self, widget, monkeypatch):
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
@@ -500,3 +524,145 @@ class TestResolveAction:
 
         w._resolve_source.assert_called_once_with("cloud_x")
         w._add_to_viewer.assert_not_called()  # unresolved never hits the add path
+
+
+def _warm_progress(files_done=1, files_total=3, bytes_done=10, bytes_total=30, name="c"):
+    from biopb.tensor.descriptor_pb2 import WarmProgress
+
+    return WarmProgress(
+        files_total=files_total,
+        files_done=files_done,
+        bytes_total=bytes_total,
+        bytes_done=bytes_done,
+        current_name=name,
+    )
+
+
+class TestMultifileHelper:
+    def test_multifile_types_detected(self):
+        from biopb_mcp.tensor_browser._widget import _is_multifile_source
+
+        assert _is_multifile_source(_descriptor("z", tensors=["z"], source_type="zarr"))
+        assert _is_multifile_source(
+            _descriptor("o", tensors=["o"], source_type="ome-zarr")
+        )
+        # single-file / unknown type -> no warm offer
+        assert not _is_multifile_source(
+            _descriptor("t", tensors=["t"], source_type="ome-tiff")
+        )
+        assert not _is_multifile_source(_descriptor("p", tensors=["p"]))
+        # unresolved (no tensors) is never "multifile" regardless of type
+        assert not _is_multifile_source(
+            _descriptor("u", tensors=[], source_type="zarr")
+        )
+
+
+class TestHydrateAction:
+    """`_warm_source` runs hydrate-ahead off-thread behind a NON-modal dialog."""
+
+    def _arm(self, widget, monkeypatch, *, events):
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w, conn, _ = widget
+        conn.is_connected = True
+        conn.sources = {"m": _descriptor("m", tensors=["m"], source_type="zarr")}
+
+        made_progress = []
+
+        class _RecordingProgress(_FakeProgress):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                made_progress.append(self)
+
+        monkeypatch.setattr(widget_mod, "QProgressDialog", _RecordingProgress)
+
+        made_workers = []
+
+        class _FakeWarmWorker:
+            def __init__(self, conn_, source_id):
+                self.warmed = _Sig()
+                self.failed = _Sig()
+                self.cancelled = _Sig()
+                self.progress = _Sig()
+                self.finished = _Sig()
+                self.cancel_requested = False
+                made_workers.append(self)
+
+            def request_cancel(self):
+                self.cancel_requested = True
+
+            def start(self):
+                for kind, payload in events:
+                    sig = getattr(self, kind)
+                    sig.emit(payload) if payload is not None else sig.emit()
+
+            def deleteLater(self):
+                pass
+
+        monkeypatch.setattr(widget_mod, "_WarmWorker", _FakeWarmWorker)
+        w._show_error = MagicMock()
+        return w, made_progress, made_workers
+
+    def test_progress_updates_label_then_warmed_closes(self, widget, monkeypatch):
+        w, progs, _ = self._arm(
+            widget,
+            monkeypatch,
+            events=[("progress", _warm_progress()), ("warmed", object())],
+        )
+        w._warm_source("m")
+        assert progs and progs[0].closed  # dialog closed on completion
+        assert "1/3 files" in progs[0].label  # files progress rendered
+        w._show_error.assert_not_called()
+
+    def test_failure_surfaces_error(self, widget, monkeypatch):
+        w, progs, _ = self._arm(
+            widget, monkeypatch, events=[("failed", "disk full")]
+        )
+        w._warm_source("m")
+        assert progs[0].closed
+        w._show_error.assert_called_once()
+        assert "disk full" in w._show_error.call_args[0][0]
+
+    def test_cancelled_closes_quietly(self, widget, monkeypatch):
+        w, progs, _ = self._arm(
+            widget, monkeypatch, events=[("cancelled", None)]
+        )
+        w._warm_source("m")
+        assert progs[0].closed
+        w._show_error.assert_not_called()
+
+    def test_cancel_button_requests_worker_cancel(self, widget, monkeypatch):
+        # No events -> worker stays "in flight"; firing the dialog's Cancel asks
+        # the worker to stop and shows a Cancelling… state.
+        w, progs, workers = self._arm(widget, monkeypatch, events=[])
+        w._warm_source("m")
+        assert workers and not workers[0].cancel_requested
+        progs[0].canceled.emit()
+        assert workers[0].cancel_requested
+        assert progs[0].label == "Cancelling…"
+
+    def test_offer_accepted_starts_warm(self, widget, monkeypatch):
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w, _conn, _ = widget
+        monkeypatch.setattr(
+            widget_mod.QMessageBox,
+            "question",
+            staticmethod(lambda *a, **k: widget_mod.QMessageBox.Yes),
+        )
+        w._warm_source = MagicMock()
+        w._offer_hydrate("m", "m.zarr")
+        w._warm_source.assert_called_once_with("m")
+
+    def test_offer_declined_does_nothing(self, widget, monkeypatch):
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w, _conn, _ = widget
+        monkeypatch.setattr(
+            widget_mod.QMessageBox,
+            "question",
+            staticmethod(lambda *a, **k: widget_mod.QMessageBox.No),
+        )
+        w._warm_source = MagicMock()
+        w._offer_hydrate("m", "m.zarr")
+        w._warm_source.assert_not_called()

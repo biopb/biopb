@@ -748,6 +748,187 @@ class _SlowSentinel:
 
 
 # --------------------------------------------------------------------------- #
+# Server `warm` action (streaming do_action): hydrate-ahead a resolved source
+# --------------------------------------------------------------------------- #
+
+
+class _DirAdapter:
+    """Minimal registered adapter exposing only ``_source_url`` -- all `warm`
+    needs (it walks that directory and reads files; format-agnostic)."""
+
+    token = None
+
+    def __init__(self, url):
+        self._source_url = url
+
+
+class _Ctx:
+    """Fake ServerCallContext: counts ``is_cancelled`` polls; can flip True after
+    a fixed number so a test can exercise the cooperative-cancel break."""
+
+    def __init__(self, cancel_after=None):
+        self.calls = 0
+        self._cancel_after = cancel_after
+
+    def is_cancelled(self):
+        self.calls += 1
+        if self._cancel_after is None:
+            return False
+        return self.calls > self._cancel_after
+
+
+class TestWarmAction:
+    """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
+    walks the resolved source directory and reads every file (forcing recall),
+    emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
+
+    def _server(self, source_id, adapter):
+        from biopb_tensor_server.server import TensorFlightServer
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source(source_id, adapter)
+        return server
+
+    @staticmethod
+    def _parse(bodies):
+        from biopb.tensor.descriptor_pb2 import WarmStreamMessage
+
+        msgs = [WarmStreamMessage.FromString(b) for b in bodies]
+        return msgs, [m.WhichOneof("payload") for m in msgs]
+
+    @staticmethod
+    def _no_throttle(monkeypatch):
+        # Force a progress message at every file/block boundary (the default
+        # 0.5s throttle would suppress them for tiny fast files).
+        from biopb_tensor_server import server as server_mod
+
+        monkeypatch.setattr(server_mod, "_WARM_PROGRESS_MIN_INTERVAL", -1.0)
+
+    def _make_files(self, root, sizes):
+        paths = []
+        for name, size in sizes.items():
+            p = os.path.join(root, name)
+            with open(p, "wb") as fh:
+                fh.write(b"\xa5" * size)
+            paths.append(p)
+        return paths
+
+    def test_warm_streams_progress_and_terminal_done(self, tmp_path, monkeypatch):
+        import pyarrow.flight as flight
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        sizes = {"a.bin": 50, "b.bin": 10, "c.bin": 30}
+        self._make_files(root, sizes)
+        total = sum(sizes.values())
+
+        server = self._server("s1", _DirAdapter(root))
+        action = flight.Action("warm", b"s1")
+        bodies = [bytes(r) for r in server.do_action(_Ctx(), action)]
+        msgs, kinds = self._parse(bodies)
+
+        assert kinds[-1] == "done"  # exactly one terminal, last
+        assert kinds.count("done") == 1
+        done = msgs[-1].done
+        assert done.files_total == 3
+        assert done.files_done == 3  # every file read
+        assert done.bytes_total == total
+        assert done.bytes_done == total  # every byte recalled
+        # progress arms report a monotonically non-decreasing files_done
+        prog_files = [m.progress.files_done for m, k in zip(msgs, kinds) if k == "progress"]
+        assert prog_files == sorted(prog_files)
+        # guard cleaned up
+        assert server._warming == set()
+
+    def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
+        import pyarrow.flight as flight
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {"big": 90, "small": 10, "mid": 40})
+
+        server = self._server("s2", _DirAdapter(root))
+        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s2"))]
+        msgs, kinds = self._parse(bodies)
+
+        # The current_name as each file finishes, in order (dedupe consecutive
+        # repeats from per-block progress): smallest first.
+        names = []
+        for m, k in zip(msgs, kinds):
+            if k == "progress" and m.progress.current_name:
+                if not names or names[-1] != m.progress.current_name:
+                    names.append(m.progress.current_name)
+        assert names == ["small", "mid", "big"]
+
+    def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):
+        import pyarrow.flight as flight
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "store")
+        nested = os.path.join(root, "0", "0")
+        os.makedirs(nested)
+        self._make_files(root, {".zattrs": 20})
+        self._make_files(nested, {"chunk": 64})  # interior chunk file
+
+        server = self._server("s3", _DirAdapter(root))
+        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s3"))]
+        msgs, kinds = self._parse(bodies)
+        done = msgs[-1].done
+        assert done.files_total == 2  # nested file counted
+        assert done.bytes_total == 84
+        assert done.bytes_done == 84
+
+    def test_warm_single_file_source_is_noop(self, tmp_path):
+        import pyarrow.flight as flight
+
+        f = tmp_path / "one.tif"
+        f.write_bytes(b"x" * 100)
+        server = self._server("s4", _DirAdapter(str(f)))  # _source_url is a FILE
+        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s4"))]
+        msgs, kinds = self._parse(bodies)
+        assert kinds == ["done"]
+        assert msgs[-1].done.files_total == 0  # nothing to warm
+
+    def test_warm_cancel_stops_early_with_partial_done(self, tmp_path, monkeypatch):
+        import pyarrow.flight as flight
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {f"f{i}.bin": 8 for i in range(12)})
+
+        server = self._server("s5", _DirAdapter(root))
+        # Flip cancelled True after a couple of polls -> break mid-recall.
+        ctx = _Ctx(cancel_after=2)
+        bodies = [bytes(r) for r in server.do_action(ctx, flight.Action("warm", b"s5"))]
+        msgs, kinds = self._parse(bodies)
+        assert kinds[-1] == "done"  # still emits a terminal snapshot
+        done = msgs[-1].done
+        assert done.files_done < done.files_total  # did not finish all 12
+        assert server._warming == set()  # guard released even on cancel
+
+    def test_warm_rejects_concurrent_warm_of_same_source(self, tmp_path):
+        import pyarrow.flight as flight
+
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {"a.bin": 8})
+        server = self._server("s6", _DirAdapter(root))
+        server._warming.add("s6")  # simulate an in-flight warm
+        with pytest.raises(flight.FlightServerError, match="already in progress"):
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s6")))
+
+    def test_warm_unknown_source_errors(self):
+        import pyarrow.flight as flight
+
+        server = self._server("s7", _DirAdapter("/nonexistent"))
+        with pytest.raises(flight.FlightServerError, match="Source not found"):
+            list(server.do_action(_Ctx(), flight.Action("warm", b"missing")))
+
+
+# --------------------------------------------------------------------------- #
 # Change A: cloud-root flag plumbing (ClaimContext -> claim() -> resolve)
 # --------------------------------------------------------------------------- #
 

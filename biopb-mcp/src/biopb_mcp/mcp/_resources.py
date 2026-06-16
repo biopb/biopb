@@ -210,6 +210,18 @@ if not src.data_resident:                    # unresolved / not local
     src = client.resolve("source_id")        # downloads + resolves (may take minutes)
     tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
 ```
+Hydrate-ahead (optional): `resolve()` fetches a multi-file source's *metadata*
+only -- the bulk data files (e.g. zarr/ome-zarr chunks) still recall one-by-one,
+slowly, the first time a read touches them, which makes the first pass over a big
+image stall repeatedly. If you're about to work through the whole source, warm it
+up front so the server pulls every member file resident in one go (server-side;
+no pixels cross to the kernel). It's idempotent and reports progress:
+```python
+done = client.warm("source_id",
+                   on_progress=lambda p: print(f"{p.files_done}/{p.files_total}"))
+# Long-running; interrupt_kernel cancels it (the stream closes, the server stops).
+# Single-file sources are a no-op (resolve already recalled the one file).
+```
 Filter footgun: an unresolved source has NULL `dtype`/`shape_summary` in the
 `sources` table, so `query_sources("... WHERE dtype='uint8'")` silently *drops*
 it -- it's hidden for being unresolved, not for not matching. The table carries
