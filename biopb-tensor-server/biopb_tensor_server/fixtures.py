@@ -209,7 +209,11 @@ def create_multifile_ome_dataset(
 """
     for i in range(n_files):
         filename = f"img_{i+1:03d}.tif"
-        uuid = f"urn:uuid:test-{i}"
+        # Conformant urn:uuid (RFC 4122 8-4-4-4-12 hex). ome_types >= 0.6 strictly
+        # validates this against the OME XSD UniversallyUniqueIdentifier pattern,
+        # so a placeholder like "urn:uuid:test-0" raises a ValidationError when the
+        # OME-XML is round-tripped through aicsimageio/bioformats.
+        uuid = f"urn:uuid:00000000-0000-4000-8000-{i:012d}"
         ome_xml += f"""    <TiffData FirstC="{i}" FirstT="0" FirstZ="0">
       <UUID FileName="{filename}">{uuid}</UUID>
     </TiffData>
@@ -479,7 +483,11 @@ def create_companion_ome_dataset(
 
     for i in range(n_files):
         filename = f"data_{i+1:03d}.tif"
-        uuid = f"urn:uuid:data-{i+1}"
+        # Conformant urn:uuid (RFC 4122 8-4-4-4-12 hex). ome_types >= 0.6 strictly
+        # validates this against the OME XSD UniversallyUniqueIdentifier pattern,
+        # so a placeholder like "urn:uuid:data-1" raises a ValidationError when the
+        # companion OME-XML is round-tripped through aicsimageio/bioformats.
+        uuid = f"urn:uuid:00000000-0000-4000-8000-{i+1:012d}"
         ome_xml += f"""      <TiffData FirstZ="{i}" FirstC="0" FirstT="0" IFD="0">
         <UUID FileName="{filename}">{uuid}</UUID>
       </TiffData>
