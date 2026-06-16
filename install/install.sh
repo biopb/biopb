@@ -396,15 +396,33 @@ _setup_mcp() {
     if [ -f "$mcp_config" ]; then
         _ok "biopb-mcp config exists at $mcp_config (preserved)"
     else
+        # The default algorithm plugins point at remote, off-site servers (cell
+        # segmentation, etc.) hosted at UConn Health. Those servers log client
+        # IPs, so we ask for consent before enabling them by default rather than
+        # quietly shipping a third-party network dependency. Declining just
+        # leaves process_image_servers empty; the user can add servers later by
+        # editing the config. _confirm defaults to Yes (Enter = enable).
+        _info "BioPB ships with algorithm plugins that use remote servers for"
+        _info "certain computations, e.g. cell segmentation. The servers are"
+        _info "hosted at UConn Health and log client IP addresses."
+        _info ""
+        local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
+        if _confirm "Enable the remote algorithm plugins?"; then
+            _ok "Remote algorithm plugins enabled"
+        else
+            process_image_servers=''
+            _ok "Remote algorithm plugins disabled (add servers later in $mcp_config)"
+        fi
+
         # The tensor server's localhost fast path is now the file-cache mmap
         # handoff (biopb/biopb#9), which beats the gRPC socket and is enabled by
         # default, so no shm opt-out is seeded here anymore.
-        cat > "$mcp_config" << 'EOF'
+        cat > "$mcp_config" << EOF
 {
   "mcp": {
     "services": {
       "process_image_servers": [
-        "grpcs://cellpose.biopb.org:443"
+$process_image_servers
       ]
     }
   }

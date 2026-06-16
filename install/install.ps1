@@ -245,17 +245,35 @@ function Set-McpClients {
     if (Test-Path -LiteralPath $mcpConfig) {
         Write-Ok "biopb-mcp config exists at $mcpConfig (preserved)"
     } else {
-        $mcpConfigContent = @'
+        # The default algorithm plugins point at remote, off-site servers (cell
+        # segmentation, etc.) hosted at UConn Health. Those servers log client
+        # IPs, so we ask for consent before enabling them by default rather than
+        # quietly shipping a third-party network dependency. Declining just
+        # leaves process_image_servers empty; the user can add servers later by
+        # editing the config. Default is Yes (Enter = enable).
+        Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
+        Write-Inf "certain computations, e.g. cell segmentation. The servers are"
+        Write-Inf "hosted at UConn Health and log client IP addresses."
+        Write-Host ""
+        $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
+        if ($plug -notmatch '^(n|no)$') {
+            $processImageServers = '        "grpcs://cellpose.biopb.org:443"'
+            Write-Ok "Remote algorithm plugins enabled"
+        } else {
+            $processImageServers = ''
+            Write-Ok "Remote algorithm plugins disabled (add servers later in $mcpConfig)"
+        }
+        $mcpConfigContent = @"
 {
   "mcp": {
     "services": {
       "process_image_servers": [
-        "grpcs://cellpose.biopb.org:443"
+$processImageServers
       ]
     }
   }
 }
-'@
+"@
         Set-FileUtf8NoBom -Path $mcpConfig -Content $mcpConfigContent
         Write-Ok "Created biopb-mcp config: $mcpConfig"
     }
