@@ -19,7 +19,7 @@ import time
 import warnings
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import threading
 
 from dataclasses import dataclass
@@ -39,10 +39,22 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
     MetadataQueryOption,
     DataSourceDescriptor,
+    ResolveProgress,
+    ResolveStreamMessage,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
 logger = logging.getLogger(__name__)
+
+
+class ResolveCancelled(Exception):
+    """Raised by :meth:`TensorFlightClient.resolve` when its ``should_cancel``
+    callback asks it to stop.
+
+    The client stops consuming the resolve stream and unwinds; the server's
+    recall daemon thread runs to completion and caches its result, so a later
+    :meth:`resolve` coalesces onto the finished work rather than re-downloading.
+    """
 
 
 # ==============================================================================
@@ -1441,7 +1453,13 @@ class TensorFlightClient:
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(source_id, array_id)
 
-    def resolve(self, source_id: str) -> "DataSourceDescriptor":
+    def resolve(
+        self,
+        source_id: str,
+        *,
+        on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "DataSourceDescriptor":
         """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
@@ -1461,30 +1479,62 @@ class TensorFlightClient:
 
         Args:
             source_id: The source to resolve (e.g. ``"onedrive_a3f2"``).
+            on_progress: Optional callback invoked with a ``ResolveProgress``
+                (elapsed seconds, target name, target size in bytes) on each
+                server heartbeat, so a caller can display progress. Called on the
+                calling thread; keep it cheap and non-blocking.
+            should_cancel: Optional predicate polled on each heartbeat; when it
+                returns True the client stops consuming the stream and raises
+                :class:`ResolveCancelled`. The server-side recall continues to
+                completion and is cached, so a later ``resolve`` reuses it.
 
         Returns:
             The full ``DataSourceDescriptor`` with every tensor/field enumerated
             -- the complete field set in one call, regardless of catalog size.
+
+        Raises:
+            ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
         """
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
         # entry point that performs the (possibly minutes-long) recall, and it
         # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
         # list_sources two-step, so no truncation hole for multi-field sources
-        # beyond the list cap. The action streams empty-body heartbeat Results to
-        # keep the connection warm under proxy idle timeouts; the single
-        # non-empty terminal Result carries the serialized descriptor.
+        # beyond the list cap. The action streams ``ResolveStreamMessage``
+        # heartbeats (a ``progress`` arm) to keep the connection warm under proxy
+        # idle timeouts; the single terminal message carries the descriptor in
+        # its ``result`` arm. ``should_cancel`` / ``on_progress`` are polled once
+        # per received message, i.e. roughly once per server heartbeat.
         action = flight.Action("resolve", source_id.encode("utf-8"))
-        payload = b""
+        desc: Optional[DataSourceDescriptor] = None
         for result in self._client.do_action(action, options=self._call_options):
+            if should_cancel is not None and should_cancel():
+                raise ResolveCancelled(
+                    f"resolve('{source_id}') cancelled by caller"
+                )
             body = result.body.to_pybytes()
-            if body:  # non-empty == terminal descriptor; empty == heartbeat
-                payload = body
-        if not payload:
+            if not body:
+                continue  # legacy empty-body heartbeat (server predating progress)
+            msg = ResolveStreamMessage()
+            try:
+                msg.ParseFromString(body)
+                which = msg.WhichOneof("payload")
+            except Exception:  # noqa: BLE001
+                which = None
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "result":
+                desc = DataSourceDescriptor()
+                desc.CopyFrom(msg.result)
+            else:
+                # Legacy server: a non-empty body IS a bare serialized
+                # DataSourceDescriptor (pre-envelope protocol).
+                desc = DataSourceDescriptor.FromString(body)
+        if desc is None:
             raise RuntimeError(
                 f"resolve('{source_id}') returned no descriptor "
                 "(server closed the stream without a result)"
             )
-        desc = DataSourceDescriptor.FromString(payload)
         self._sources[source_id] = desc
         return desc
 

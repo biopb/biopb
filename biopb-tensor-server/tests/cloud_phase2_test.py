@@ -655,8 +655,9 @@ class TestCloudRescanGating:
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestResolveAction:
     """The dedicated streaming `resolve` do_action: the SOLE resolution entry
-    point. Emits empty-body heartbeats while the recall runs, then one non-empty
-    terminal Result carrying the full DataSourceDescriptor."""
+    point. Emits ``ResolveStreamMessage`` progress heartbeats while the recall
+    runs, then one terminal message carrying the full DataSourceDescriptor in its
+    ``result`` arm."""
 
     def _server(self, source_id, adapter):
         from biopb_tensor_server.server import TensorFlightServer
@@ -665,10 +666,16 @@ class TestResolveAction:
         server.register_source(source_id, adapter)
         return server
 
+    @staticmethod
+    def _parse(bodies):
+        from biopb.tensor.descriptor_pb2 import ResolveStreamMessage
+
+        msgs = [ResolveStreamMessage.FromString(b) for b in bodies]
+        return msgs, [m.WhichOneof("payload") for m in msgs]
+
     def test_resolve_action_streams_full_descriptor(self):
         import zarr
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
@@ -684,9 +691,11 @@ class TestResolveAction:
             action = flight.Action("resolve", b"cloud1")
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
             bodies = [bytes(r) for r in server.do_action(None, action)]
-            terminal = [b for b in bodies if b]
-            assert len(terminal) == 1  # exactly one descriptor
-            desc = DataSourceDescriptor.FromString(terminal[0])
+            msgs, kinds = self._parse(bodies)
+            results = [m.result for m, k in zip(msgs, kinds) if k == "result"]
+            assert len(results) == 1  # exactly one terminal descriptor
+            assert kinds[-1] == "result"
+            desc = results[0]
             assert desc.source_id == "cloud1"
             assert [list(t.shape) for t in desc.tensors] == [[16, 24]]
             assert desc.data_resident is True
@@ -694,8 +703,9 @@ class TestResolveAction:
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
         # With a tiny heartbeat interval and a slow resolve, the stream must carry
-        # empty-body keep-alives BEFORE the terminal descriptor -- this is what
-        # keeps a minutes-long recall under a proxy's idle read timeout.
+        # progress keep-alives BEFORE the terminal descriptor -- this is what keeps
+        # a minutes-long recall under a proxy's idle read timeout, and the elapsed
+        # field lets a client show progress.
         import time as _time
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
@@ -711,10 +721,15 @@ class TestResolveAction:
         server = self._server("slow", _SlowAdapter())
         action = flight.Action("resolve", b"slow")
         bodies = [bytes(r) for r in server.do_action(None, action)]
+        msgs, kinds = self._parse(bodies)
 
-        assert bodies.count(b"") >= 1  # at least one heartbeat
-        assert bodies[-1] != b""  # terminal is the descriptor
-        assert DataSourceDescriptor.FromString(bodies[-1]).source_id == "slow"
+        assert kinds.count("progress") >= 1  # at least one heartbeat
+        assert kinds[-1] == "result"  # terminal is the descriptor
+        assert msgs[-1].result.source_id == "slow"
+        # progress heartbeats carry a monotonically non-decreasing elapsed clock
+        elapsed = [m.progress.elapsed_seconds for m, k in zip(msgs, kinds) if k == "progress"]
+        assert elapsed == sorted(elapsed)
+        assert elapsed[-1] >= 0.0
 
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight

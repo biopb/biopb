@@ -13,6 +13,7 @@ import threading
 from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
 
+from biopb.tensor import ResolveCancelled
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 from qtpy.QtCore import Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
@@ -113,25 +114,52 @@ class _ResolveWorker(QThread):
     Resolving a cloud source downloads the whole file (a recall that can take
     minutes), so it must not run on the Qt event loop. This thread does the work
     and reports back via signals; the widget keeps a modal progress dialog up
-    until one fires, so the user is blocked (cannot act elsewhere) but the app
-    stays painted and responsive — leaving room to add a progress bar / cancel.
+    until one fires, so the user is blocked from other actions but the app stays
+    painted. Server heartbeats are relayed via :attr:`progress`, and the dialog's
+    Cancel button calls :meth:`request_cancel` — a cooperative stop checked at
+    each heartbeat (so it takes effect within one heartbeat interval; the
+    server-side recall finishes and is cached, so a later resolve coalesces).
     """
 
     resolved = Signal(object)  # the refreshed DataSourceDescriptor
     failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(object)  # ResolveProgress
 
     def __init__(self, conn: TensorConnection, source_id: str):
         super().__init__()
         self._conn = conn
         self._source_id = source_id
+        self._cancel = threading.Event()
+
+    def request_cancel(self):
+        """Ask the running resolve to stop (thread-safe, idempotent)."""
+        self._cancel.set()
 
     def run(self):
         try:
-            descriptor = self._conn.resolve_source(self._source_id)
+            descriptor = self._conn.resolve_source(
+                self._source_id,
+                on_progress=self.progress.emit,
+                should_cancel=self._cancel.is_set,
+            )
+        except ResolveCancelled:
+            self.cancelled.emit()
+            return
         except Exception as exc:  # surface the SDK/server message to the user
             self.failed.emit(str(exc))
             return
         self.resolved.emit(descriptor)
+
+
+def _human_bytes(n: int) -> str:
+    """Compact human-readable byte size (e.g. ``4.2 GB``)."""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
 def _residency_state(src: DataSourceDescriptor) -> str | None:
@@ -1040,15 +1068,20 @@ class TensorBrowserWidget(QWidget):
 
         self._clear_error()
 
-        # Indeterminate, modal, no cancel button (room to add a real progress bar
-        # / cancel once the SDK can report/abort the download).
+        # Modal, indeterminate (no byte-level progress available), with a working
+        # Cancel button. The label is refreshed from server heartbeats with
+        # elapsed time + target size so the user can judge whether to wait. We
+        # manage close ourselves (autoClose/autoReset off) so that hitting Cancel
+        # shows a "Cancelling…" state and the dialog stays up until the worker
+        # confirms the stop — which also blocks a second resolve in the meantime.
         progress = QProgressDialog(
-            f"Resolving “{name}”…", None, 0, 0, self
+            f"Resolving “{name}”…", "Cancel", 0, 0, self
         )
         progress.setWindowTitle("Resolving")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
-        progress.setCancelButton(None)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
         progress.setValue(0)
 
         worker = _ResolveWorker(self._conn, source_id)
@@ -1056,6 +1089,13 @@ class TensorBrowserWidget(QWidget):
         # later/overlapping resolve can't drop its only ref and have the QThread
         # destroyed mid-run.
         self._resolve_workers.add(worker)
+
+        def _on_progress(p):
+            elapsed = int(p.elapsed_seconds)
+            label = f"Resolving “{p.target_name or name}”… {elapsed}s"
+            if p.target_bytes:
+                label += f" ({_human_bytes(p.target_bytes)})"
+            progress.setLabelText(label)
 
         def _on_resolved(_descriptor):
             progress.close()
@@ -1068,8 +1108,22 @@ class TensorBrowserWidget(QWidget):
             progress.close()
             self._show_error(f"Resolve failed: {message}")
 
+        def _on_cancelled():
+            # User-initiated stop; the server recall continues + caches, so a
+            # later resolve coalesces. Close quietly, no error banner.
+            progress.close()
+
+        def _on_cancel_clicked():
+            # Cooperative request; keep the dialog up showing "Cancelling…" until
+            # the worker confirms (within one heartbeat) via the cancelled signal.
+            progress.setLabelText(f"Cancelling “{name}”…")
+            worker.request_cancel()
+
+        worker.progress.connect(_on_progress)
         worker.resolved.connect(_on_resolved)
         worker.failed.connect(_on_failed)
+        worker.cancelled.connect(_on_cancelled)
+        progress.canceled.connect(_on_cancel_clicked)
         worker.finished.connect(lambda: self._resolve_workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()

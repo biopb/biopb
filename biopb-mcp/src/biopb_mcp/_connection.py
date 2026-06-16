@@ -227,7 +227,13 @@ class TensorConnection:
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources
 
-    def resolve_source(self, source_id: str) -> DataSourceDescriptor:
+    def resolve_source(
+        self,
+        source_id: str,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ) -> DataSourceDescriptor:
         """Resolve an unresolved (cloud / synced-folder) source, then refresh.
 
         Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
@@ -236,10 +242,17 @@ class TensorConnection:
         thread) and returns the now-populated ``DataSourceDescriptor``. The local
         catalog snapshot (:attr:`sources`) is then refreshed so callers re-render
         from the resolved field list. Returns the resolved descriptor.
+
+        ``on_progress`` (called with a ``ResolveProgress`` per server heartbeat)
+        and ``should_cancel`` (polled per heartbeat; raising
+        :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
+        verbatim so a GUI can show progress and offer a Cancel button.
         """
         if self.client is None:
             raise RuntimeError("Not connected")
-        descriptor = self.client.resolve(source_id)
+        descriptor = self.client.resolve(
+            source_id, on_progress=on_progress, should_cancel=should_cancel
+        )
         # resolve() already re-listed server-side; mirror it into our snapshot so
         # the widget/agent see the full field set without a second round-trip.
         self.refresh()
