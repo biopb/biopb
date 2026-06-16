@@ -16,7 +16,6 @@ from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import (
     ClaimContext,
     SourceClaim,
-    _is_offline_placeholder,
 )
 
 if TYPE_CHECKING:
@@ -400,27 +399,25 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         if ctx.is_remote or not ctx.is_dir():
             return None
 
+        # Cloud-storage policy (biopb/biopb): DICOM-series *membership* is derived
+        # by dcmread'ing every slice header and grouping by SeriesInstanceUID --
+        # a directory routinely holds several distinct series, so the dir is NOT
+        # the dataset boundary and the grouping cannot be deferred without a
+        # content read. Under a cloud root we therefore do NOT group: return None
+        # so the single-file DicomAdapter claims each .dcm as its own source
+        # (deferred to unresolved by its own residency gate). This must hold at
+        # resolve too (slices are resident by then), which is why the gate is
+        # ctx.cloud_root, not residency. A DICOM series degrades to N single-file
+        # sources under cloud (transcode to OME-Zarr for proper support).
+        if ctx.cloud_root:
+            return None
+
         # Find DICOM files
         dcm_files = list(ctx._path.glob('*.dcm')) + list(ctx._path.glob('*.DICOM')) + list(ctx._path.glob('*.dicom'))
 
         # Need at least 2 files for a series
         if len(dcm_files) < 2:
             return None
-
-        # Cloud-storage phase 2: the series scan dcmread's EVERY slice header to
-        # group by SeriesInstanceUID -- N whole-file recalls on a cloud-placeholder
-        # directory (the doc's worst case). If any slice is non-resident, defer:
-        # claim the directory provisionally as a dicom-series (recognized by >=2
-        # .dcm files) and rebuild the SeriesInstanceUID grouping on first access.
-        if any(_is_offline_placeholder(f) for f in dcm_files):
-            state.try_claim_path(ctx.path_str)
-            for f in dcm_files:
-                state.try_claim_path(f)
-            return SourceClaim(
-                source_type="dicom-series",
-                primary_path=ctx.path_str,
-                unresolved=True,
-            )
 
         try:
             import pydicom

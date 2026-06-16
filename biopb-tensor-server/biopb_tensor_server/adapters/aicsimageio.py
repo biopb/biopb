@@ -879,6 +879,22 @@ class OmeTiffAdapter(_AicsImageIoAdapterBase):
 
         name = ctx.name.lower()
 
+        # Cloud-storage policy (biopb/biopb): OME-TIFF *membership* is derived by
+        # reading the OME-XML (a .tif's embedded XML or a .companion.ome), which
+        # lists sibling files. Under a cloud root that read is deferred, so the
+        # member set would be a guess that can diverge at resolve -- and a single
+        # directory can hold several unrelated OME-TIFF sets, so the dir is not
+        # the dataset boundary. We therefore do NOT group under cloud: return
+        # None so the generic AicsImageIoAdapter claims each .tif as its own
+        # single-file source (deferred to unresolved by _claim_is_unresolved),
+        # and skip the metadata-only .companion.ome entirely. This must hold at
+        # resolve too (the file is resident by then), which is why the gate is
+        # ctx.cloud_root, not residency. Multi-file OME-TIFF therefore degrades
+        # to N single-file sources under cloud (transcode to OME-Zarr for proper
+        # support).
+        if ctx.cloud_root:
+            return None
+
         # Case 1: Companion OME file - parse XML to find all TIFF files
         # Requires bioformats_jar dependency
         if name.endswith(".companion.ome"):

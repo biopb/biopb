@@ -34,7 +34,10 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.errors import SourceUnresolvedError
+from biopb_tensor_server.errors import (
+    SourceResolveRetriableError,
+    SourceUnresolvedError,
+)
 
 if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -59,10 +62,16 @@ class UnresolvedSourceAdapter(SourceAdapter):
         registry: "AdapterRegistry",
         credentials_config: Optional[Any] = None,
         on_resolved: Optional[OnResolved] = None,
+        cloud_root: bool = False,
     ):
         self._config = source_config
         self.source_id = source_config.source_id
         self._source_url = source_config.url
+        # Whether this source came from a ``cloud = true`` root. Carried onto the
+        # resolve-time re-claim ``ClaimContext`` so content-membership grouping
+        # (multi-file OME-TIFF / DICOM series) stays suppressed at resolve --
+        # the file is resident by then, so residency can no longer gate it.
+        self._cloud_root = cloud_root
         # Recall-free name/structure guess from claim time; the authoritative
         # type is re-derived from the hydrated content at resolution.
         self._source_type = source_config.type or "unknown"
@@ -215,9 +224,17 @@ class UnresolvedSourceAdapter(SourceAdapter):
         dataset = self._config.dataset
 
         try:
-            ctx = ClaimContext(Path(self._source_url))
+            ctx = ClaimContext(Path(self._source_url), cloud_root=self._cloud_root)
             claims = self._registry.get_claims_for_path(ctx, DiscoveryState())
-        except Exception as e:  # claim probing should not be fatal on its own
+        except OSError as e:
+            # An IO/recall failure while probing the now-resident path is
+            # transient -- do NOT silently degrade to the claim-time guess (that
+            # launders a network blip into a wrong type). Surface it as retriable.
+            raise SourceResolveRetriableError(
+                f"source {self.source_id!r} could not be resolved "
+                f"(re-claim recall/IO failed): {e}"
+            ) from e
+        except Exception as e:  # a non-IO claim error: no claim, keep the guess
             logger.debug("re-claim during resolution failed for %s: %s", self.source_id, e)
             claims = []
         if claims:
@@ -247,7 +264,15 @@ class UnresolvedSourceAdapter(SourceAdapter):
             return adapter_cls.create_from_config(config, self._credentials_config)
         except SourceUnresolvedError:
             raise
+        except OSError as e:
+            # Recall/IO failure opening the (now-resident) content: transient,
+            # a retry may succeed once the sync engine delivers the bytes.
+            raise SourceResolveRetriableError(
+                f"source {self.source_id!r} could not be resolved "
+                f"(open/hydrate recall/IO failed): {e}"
+            ) from e
         except Exception as e:
+            # A parse/format failure on resident bytes is permanent.
             raise SourceUnresolvedError(
                 f"source {self.source_id!r} could not be resolved "
                 f"(open/hydrate failed): {e}"

@@ -59,8 +59,11 @@ class TestTiffSequenceClaim:
             assert claim is not None
             assert claim.source_type == "tiff-sequence"
             assert claim.primary_path == str(tmpdir)
-            for f in files:
-                assert str(f) in state.consumed_paths
+            # Dir-claiming policy: the directory is the dataset boundary and the
+            # only recorded member; the interior TIFFs are covered by the dir's
+            # subtree prune, not enumerated individually.
+            assert str(tmpdir) in state.consumed_paths
+            assert claim.member_paths == {str(tmpdir)}
 
     def test_claim_with_differing_file_sizes(self):
         """Compressed sequence with all-distinct file sizes is still claimed."""
@@ -135,8 +138,10 @@ class TestTiffSequenceClaim:
 
             claim, state = _claim(tmpdir)
             assert claim is not None
-            for f in seq:
-                assert str(f) in state.consumed_paths
+            # Dir-claiming: the directory is the recorded member; the digit-less
+            # readme.tif neither rejects the claim nor is itself catalogued (the
+            # dir-claim prunes the whole subtree).
+            assert claim.member_paths == {str(tmpdir)}
             assert str(readme) not in state.consumed_paths
 
     def test_regression_end_number_pattern(self):
