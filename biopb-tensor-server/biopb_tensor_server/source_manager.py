@@ -514,15 +514,29 @@ class SourceManager:
             return
         visited_identities.add(identity)
 
+        # Cloud subtree: re-walked only on a force_full pass. Enumerating a cloud
+        # root is expensive and its mtime signature is unreliable (doc S1.2), so the
+        # frequent incremental rescans silently skip it -- carrying the cached claims
+        # forward untouched -- and only the periodic force_full rescan re-walks it.
+        # The first rescan is force_full (last-full == -inf), so a cloud root is still
+        # catalogued at startup, and a brand-new cloud dataset surfaces on the next
+        # force_full pass. (Replaces the earlier "always full-walk cloud, never prune"
+        # behavior.)
+        if cloud and not force_full:
+            skipped_dirs.add(path_str)
+            self._copy_cached_subtree_entries(
+                path_str,
+                next_state,
+                next_stable_observations,
+                next_pending_scan,
+            )
+            return
+
         if (
             allow_prune
-            and
-            not force_full
-            # Never prune a cloud subtree on its mtime signature: cloud mtime is
-            # unreliable (doc S1.2), so a "stable" signature is not trustworthy and
-            # pruning could permanently hide a newly-archived dataset. A cloud root
-            # is always fully walked (cloud-storage phase 2).
-            and not cloud
+            and not force_full
+            # Cloud is handled by the dedicated branch above (a cloud subtree never
+            # reaches this signature-based prune), so no cloud guard is needed here.
             and previous_entry is not None
             and previous_entry[:2] == (is_directory, signature)
             and not pending_scan
