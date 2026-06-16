@@ -156,14 +156,13 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
         if not index_file.exists():
             return None
 
-        # Claim directory + index file
+        # Dir-claiming policy (biopb/biopb): the directory IS the dataset
+        # boundary. Claim the dir (+ the recall-free NDTiff.index marker) only;
+        # claiming the dir already prunes its whole subtree, so the interior
+        # NDTiffStack_*.tif files are never independently walked. Recording them
+        # as members would just duplicate that prune and pin a brittle glob.
         state.try_claim_path(ctx.path_str)
         state.try_claim_path(index_file.path_str)
-
-        # Also claim any NDTiffStack_*.tif files
-        tiff_files = ctx.glob("NDTiffStack_*.tif")
-        for tiff in tiff_files:
-            state.try_claim_path(tiff.path_str)
 
         return SourceClaim(
             source_type=cls.SOURCE_TYPE,

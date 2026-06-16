@@ -36,7 +36,10 @@ from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import build_pyramid_plan, encode_chunk_id
 from biopb_tensor_server.config import PyramidConfig
-from biopb_tensor_server.errors import SourceUnresolvedError
+from biopb_tensor_server.errors import (
+    SourceResolveRetriableError,
+    SourceUnresolvedError,
+)
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
@@ -619,9 +622,19 @@ class TensorFlightServer(flight.FlightServerBase):
 
         if "err" in result:
             exc = result["err"]
-            if isinstance(exc, SourceUnresolvedError):
+            # Retriable subclass first (it IS a SourceUnresolvedError): a transient
+            # recall/IO failure -> UNAVAILABLE so the client may retry the resolve.
+            if isinstance(exc, SourceResolveRetriableError):
                 raise flight.FlightUnavailableError(
-                    f"Source unresolved (open to resolve): {exc}"
+                    f"Source resolve failed transiently (retry): {exc}"
+                ) from exc
+            # A bare SourceUnresolvedError here is a permanent resolution failure
+            # (unsupported type / parse error) -> INTERNAL so the client does not
+            # retry forever. (Contrast: an *unresolved-but-resolvable* source is
+            # caught in get_flight_info and mapped to UNAVAILABLE "open to resolve".)
+            if isinstance(exc, SourceUnresolvedError):
+                raise flight.FlightInternalError(
+                    f"Source could not be resolved: {exc}"
                 ) from exc
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"

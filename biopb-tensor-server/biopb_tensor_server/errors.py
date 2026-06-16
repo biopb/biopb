@@ -16,4 +16,22 @@ class SourceUnresolvedError(ValueError):
     the existing ``except ValueError`` guards in the server still catch it and
     turn it into a Flight error rather than a 500; the server adds explicit
     handling to surface a legible "open to resolve" message.
+
+    A bare ``SourceUnresolvedError`` is **permanent** -- the source cannot be
+    resolved as-is (unsupported type, parse/format failure, no adapter). Use
+    ``SourceResolveRetriableError`` for transient causes where a retry may
+    succeed.
+    """
+
+
+class SourceResolveRetriableError(SourceUnresolvedError):
+    """Resolution failed *transiently* -- a retry may succeed.
+
+    Raised when hydrating/resolving a cloud source fails for a recall/IO/offline
+    reason (an ``OSError`` opening or probing the now-resident path) rather than
+    a permanent one (bad format, no adapter). Subclasses
+    ``SourceUnresolvedError`` so every existing ``except SourceUnresolvedError``
+    / ``except ValueError`` guard still catches it; the server boundary checks
+    for this subclass *first* and maps it to a retriable status (UNAVAILABLE),
+    while a bare ``SourceUnresolvedError`` maps to a permanent status.
     """

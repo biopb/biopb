@@ -84,6 +84,15 @@ class OmeZarrAdapter(ZarrAdapter):
         if not ctx.is_dir() or not ctx.name.endswith('.zarr'):
             return None
 
+        # A top-level .zarray / zarr.json means a bare zarr *array*, never an
+        # OME-Zarr multiscales group (those are a .zgroup of arrays). Decline so
+        # ZarrAdapter's definitive, read-free claim wins -- otherwise a
+        # non-resident bare array would be deferred as a provisional "ome-zarr"
+        # guess (the .zattrs residency defer below), shadowing the certain "zarr"
+        # type until resolve. Existence is a stat, so this stays recall-free.
+        if ctx.join('.zarray').exists() or ctx.join('zarr.json').exists():
+            return None
+
         zattrs_ctx = ctx.join('.zattrs')
         if not zattrs_ctx.exists():
             return None

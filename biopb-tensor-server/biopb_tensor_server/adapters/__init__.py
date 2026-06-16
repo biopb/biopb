@@ -132,11 +132,17 @@ def get_default_registry() -> AdapterRegistry:
     if AicsImageIoAdapter is not None:
         registry.register_with_type("aics", AicsImageIoAdapter)
 
-    # OME-Zarr
+    # OME-Zarr (specific) before plain Zarr (generic fallback). Order is
+    # load-bearing: get_claims_for_path returns claims in registration order and
+    # callers take claims[0], so for a .zarr both adapters could claim/defer and
+    # OmeZarrAdapter must win. OmeZarrAdapter declines a real plain zarr (no
+    # multiscales) and ZarrAdapter declines a real OME-Zarr, so claims[0] lands on
+    # the right adapter once the store is resident (e.g. at cloud resolve).
     registry.register_with_type("ome-zarr", OmeZarrAdapter)
     registry.register_with_type(
         "ome-zarr-hcs", OmeZarrAdapter
     )  # HCS plates use same adapter
+    registry.register_with_type("zarr", ZarrAdapter)
 
     # TIFF/MicroManager - NDTiff before Legacy (newer format)
     if NdTiffAdapter is not None:
