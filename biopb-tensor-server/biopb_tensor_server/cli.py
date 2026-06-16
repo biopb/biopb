@@ -127,12 +127,13 @@ def _resolve_serve_sources(
     monitored_sources: List[SourceConfig] = []
 
     for s in server_config.sources:
-        # A cloud root is driven through the same monitored-scan pipeline as a
-        # monitor=true root, but with cloud gating: the walk admits dehydrated
-        # entries and full-scans the subtree (no mtime stability gate / open-probe,
-        # which would recall placeholders -- cloud-storage phase 2). So treat
-        # cloud like monitor for the directory-routing decision.
-        if (s.monitor or s.cloud) and not s.is_remote:
+        # The ``monitor`` flag alone decides live monitoring -- identically for
+        # cloud and non-cloud roots. ``cloud`` only controls *gating* (admit
+        # dehydrated placeholders as unresolved sources); it no longer forces a
+        # root onto the monitored pipeline. So a cloud root with monitor=false is
+        # scanned once at startup via the static-expand path (cloud-gated there
+        # too), exactly like any other monitor=false directory.
+        if s.monitor and not s.is_remote:
             local_path = s.local_path
             # local_path cannot be None here -- both is_remote and local_path
             # derive from _is_remote_url(url), so `not is_remote` guarantees a

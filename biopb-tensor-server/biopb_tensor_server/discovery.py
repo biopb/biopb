@@ -837,6 +837,7 @@ def discover_sources(
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[Path], bool]] = None,
     admit_nonresident: bool = False,
+    cloud_root: bool = False,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -848,6 +849,13 @@ def discover_sources(
         registry: Adapter registry for claims
         state: Existing DiscoveryState to update (creates new if None)
         dim_labels: Optional dimension labels to apply to all claims
+        admit_nonresident: Under a cloud root, admit dehydrated placeholders
+            instead of skipping them.
+        cloud_root: Under a cloud root, set ``ClaimContext.cloud_root`` so the
+            content-membership adapters (multi-file OME-TIFF / DICOM series) fall
+            back to single-file sources instead of grouping -- the same ban the
+            monitored rescan applies. Keeps the static one-shot scan of a
+            ``monitor=false`` cloud directory consistent with the monitored path.
 
     Returns:
         DiscoveryState with all discovered sources
@@ -870,7 +878,7 @@ def discover_sources(
         return state
 
     # Check if root itself is a data source (e.g., a .zarr directory)
-    ctx = ClaimContext(root)
+    ctx = ClaimContext(root, cloud_root=cloud_root)
     claims = registry.get_claims_for_path(ctx, state)
     if claims:
         claim = claims[0]
@@ -898,7 +906,7 @@ def discover_sources(
         if state.is_path_claimed(path_str):
             continue
 
-        ctx = ClaimContext(path)
+        ctx = ClaimContext(path, cloud_root=cloud_root)
         claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]

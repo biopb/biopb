@@ -944,8 +944,10 @@ def discover_sources(
 
     # Case 2: File with no type - try claim-based detection
     if local_path.is_file():
-        # Try claim-based detection first
-        ctx = ClaimContext(local_path)
+        # Try claim-based detection first. cloud_root carries the multi-file ban
+        # (OME-TIFF/DICOM-series -> single file) onto a directly-configured cloud
+        # file, matching the monitored path.
+        ctx = ClaimContext(local_path, cloud_root=source.cloud)
         state = DiscoveryState()
         try:
             identity = get_file_identity(local_path)
@@ -983,7 +985,7 @@ def discover_sources(
 
     # Case 4: Directory with no type and no source_id - use claim-based discovery
     # First check if the directory itself is a data source
-    ctx = ClaimContext(local_path)
+    ctx = ClaimContext(local_path, cloud_root=source.cloud)
     state = DiscoveryState()
     try:
         identity = get_file_identity(local_path)
@@ -996,8 +998,18 @@ def discover_sources(
         claim = claims[0]
         return [_claim_to_source_config(claim, source)]
 
-    # Directory is not itself a data source - do recursive claim-based scan
-    state = claim_based_discover(local_path, registry, dim_labels=source.dim_labels)
+    # Directory is not itself a data source - do recursive claim-based scan. Under
+    # a cloud root, admit dehydrated placeholders so the one-shot startup scan of a
+    # monitor=false cloud directory still catalogues offline data as unresolved
+    # sources, and set cloud_root so the multi-file OME-TIFF / DICOM-series ban
+    # applies -- the same gating the monitored rescan uses (cloud-storage phase 2).
+    state = claim_based_discover(
+        local_path,
+        registry,
+        dim_labels=source.dim_labels,
+        admit_nonresident=source.cloud,
+        cloud_root=source.cloud,
+    )
     return [_claim_to_source_config(claim, source) for claim in state.get_all_claims()]
 
 
@@ -1033,6 +1045,7 @@ def _claim_to_source_config(
         dim_labels=claim.dim_labels or original_source.dim_labels,
         dataset=dataset,
         credentials_profile=original_source.credentials_profile,  # preserve credentials_profile
+        cloud=original_source.cloud,  # propagate cloud gating to expanded sources
     )
 
 
