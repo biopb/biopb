@@ -189,7 +189,11 @@ class TestConnect:
 
         out = conn.resolve_source("cloud_x")
 
-        client.resolve.assert_called_once_with("cloud_x")
+        # progress/cancel hooks are forwarded verbatim (None when the caller,
+        # e.g. the headless agent, supplies neither).
+        client.resolve.assert_called_once_with(
+            "cloud_x", on_progress=None, should_cancel=None
+        )
         assert out is resolved  # the resolved descriptor is returned verbatim
         assert conn.sources == full  # snapshot refreshed via list_sources()
 

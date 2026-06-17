@@ -450,26 +450,40 @@ public class TensorFlightClient implements AutoCloseable {
     public DataSourceDescriptor resolve(String sourceId) throws IOException {
         // One dedicated, streaming "resolve" action -- the single server entry
         // point that performs the (possibly minutes-long) recall and returns the
-        // full descriptor directly. The action streams empty-body heartbeat
-        // Results to keep the connection warm under proxy idle timeouts; the
-        // single non-empty terminal Result carries the serialized descriptor.
+        // full descriptor directly. The action streams ResolveStreamMessage
+        // progress heartbeats to keep the connection warm under proxy idle
+        // timeouts; the terminal message carries the descriptor in its `result`
+        // arm. (An empty body / bare serialized descriptor is also accepted for
+        // back-compat with a server predating the progress envelope.)
         org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
                 "resolve",
                 sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
-        byte[] payload = null;
+        DataSourceDescriptor desc = null;
         java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
         while (iter.hasNext()) {
             byte[] body = iter.next().getBody();
-            if (body != null && body.length > 0) { // non-empty == terminal; empty == heartbeat
-                payload = body;
+            if (body == null || body.length == 0) {
+                continue; // legacy empty-body heartbeat (pre-envelope server)
+            }
+            try {
+                ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
+                if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.RESULT) {
+                    desc = msg.getResult();
+                } else if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.PROGRESS) {
+                    continue; // heartbeat (no progress callback on the Java client yet)
+                } else {
+                    // Legacy server: a non-empty body IS a bare serialized descriptor.
+                    desc = DataSourceDescriptor.parseFrom(body);
+                }
+            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                desc = DataSourceDescriptor.parseFrom(body); // legacy bare descriptor
             }
         }
-        if (payload == null) {
+        if (desc == null) {
             throw new IOException("resolve('" + sourceId
                     + "') returned no descriptor (server closed the stream without a result)");
         }
-        DataSourceDescriptor desc = DataSourceDescriptor.parseFrom(payload);
         sources.put(sourceId, desc);
         return desc;
     }

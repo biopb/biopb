@@ -26,6 +26,8 @@ import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
     FlightCmd,
+    ResolveProgress,
+    ResolveStreamMessage,
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
@@ -588,11 +590,12 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Resolution is the ONE consented, possibly minutes-long recall (it may
         download a whole cloud / synced-folder file). It runs on a daemon thread
-        so this handler can emit empty-body heartbeat Results while it blocks --
-        a silent multi-minute response would otherwise trip proxy idle read
-        timeouts (e.g. nginx ``grpc_read_timeout``, default 60s) and reset the
-        stream. The single non-empty terminal Result carries the serialized,
-        now-resolved ``DataSourceDescriptor``.
+        so this handler can emit ``ResolveStreamMessage`` progress heartbeats
+        while it blocks -- a silent multi-minute response would otherwise trip
+        proxy idle read timeouts (e.g. nginx ``grpc_read_timeout``, default 60s)
+        and reset the stream, and the elapsed/size fields let a client show
+        progress and decide whether to cancel. The single terminal message
+        carries the now-resolved ``DataSourceDescriptor`` in its ``result`` arm.
 
         Resolving an already-resident source is a cheap no-op (returns its
         descriptor). If the client disconnects mid-resolve the daemon thread runs
@@ -602,6 +605,29 @@ class TensorFlightServer(flight.FlightServerBase):
         adapter = self._get_source_adapter(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
+
+        # Name/size of what is being recalled, computed once (stat is recall-free).
+        # Best-effort: an unresolved adapter exposes its URL; a directory or a
+        # remote URL has no single file size, so target_bytes stays 0 (unknown).
+        source_url = getattr(adapter, "_source_url", None) or source_id
+        target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
+        target_bytes = 0
+        try:
+            if os.path.isfile(source_url):
+                target_bytes = os.path.getsize(source_url)
+        except OSError:
+            pass
+
+        started = time.monotonic()
+
+        def _progress() -> bytes:
+            return ResolveStreamMessage(
+                progress=ResolveProgress(
+                    elapsed_seconds=time.monotonic() - started,
+                    target_name=target_name,
+                    target_bytes=target_bytes,
+                )
+            ).SerializeToString()
 
         result: dict = {}
 
@@ -618,7 +644,7 @@ class TensorFlightServer(flight.FlightServerBase):
         while worker.is_alive():
             worker.join(timeout=_RESOLVE_HEARTBEAT_SECONDS)
             if worker.is_alive():
-                yield b""  # heartbeat: keeps the stream warm, carries no data
+                yield _progress()  # heartbeat: warm + progress, carries no pixels
 
         if "err" in result:
             exc = result["err"]
@@ -639,7 +665,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
-        yield result["desc"].SerializeToString()
+        yield ResolveStreamMessage(result=result["desc"]).SerializeToString()
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes

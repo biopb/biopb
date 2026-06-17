@@ -249,3 +249,33 @@ message DataSourceDescriptor {
   // (fsspec) source false until its pixels are materialized locally.
   optional bool data_resident = 6;
 }
+
+// Progress heartbeat for an in-flight "resolve" Flight action. Resolving a
+// dehydrated cloud / synced-folder source is a whole-file recall that can take
+// minutes; the action streams these periodically so a client can show progress
+// and decide whether to cancel, and so the empty-looking response does not trip
+// proxy idle read timeouts. Informational only -- carries no pixels.
+message ResolveProgress {
+  // Seconds elapsed since resolution began on the server.
+  double elapsed_seconds = 1;
+
+  // Human-readable name of the recall target (file / directory basename), or
+  // empty when the server cannot name it.
+  string target_name = 2;
+
+  // Size in bytes of the recall target, or 0 when unknown (e.g. a directory, a
+  // remote URL, or a stat failure).
+  int64 target_bytes = 3;
+}
+
+// One message in the "resolve" action's result stream. The server emits zero or
+// more `progress` heartbeats followed by exactly one terminal `result` carrying
+// the resolved DataSourceDescriptor. (Replaces the older convention of an empty
+// body for a heartbeat and a bare serialized descriptor for the result, so a
+// heartbeat can now carry progress -- clients must read this envelope.)
+message ResolveStreamMessage {
+  oneof payload {
+    ResolveProgress progress = 1;
+    DataSourceDescriptor result = 2;
+  }
+}

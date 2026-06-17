@@ -27,6 +27,7 @@ from biopb.tensor.descriptor_pb2 import (
     FlightCmd,
     TensorReadOption,
     MetadataQueryOption,
+    ResolveProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
@@ -35,7 +36,11 @@ from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 # AMD Opterons). PEP 562 module __getattr__ keeps `from biopb.tensor import
 # TensorFlightClient` working while deferring the pyarrow import until the client
 # (i.e. the lazy/Flight data path) is actually used.
-_LAZY_CLIENT_EXPORTS = ("TensorFlightClient", "make_debug_serialized_tensor")
+_LAZY_CLIENT_EXPORTS = (
+    "TensorFlightClient",
+    "make_debug_serialized_tensor",
+    "ResolveCancelled",
+)
 
 
 def __getattr__(name):
@@ -58,9 +63,11 @@ __all__ = [
     'FlightCmd',
     'TensorReadOption',
     'MetadataQueryOption',
+    'ResolveProgress',
     'SerializedTensor',
     'SerializedEndpoint',
     # Client
     'TensorFlightClient',
     'make_debug_serialized_tensor',
+    'ResolveCancelled',
 ]
