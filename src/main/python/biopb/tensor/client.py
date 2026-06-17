@@ -41,6 +41,8 @@ from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
     ResolveProgress,
     ResolveStreamMessage,
+    WarmProgress,
+    WarmStreamMessage,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
@@ -1537,6 +1539,85 @@ class TensorFlightClient:
             )
         self._sources[source_id] = desc
         return desc
+
+    def warm(
+        self,
+        source_id: str,
+        *,
+        on_progress: Optional[Callable[["WarmProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "WarmProgress":
+        """Hydrate-ahead: recall a resolved source's member files on the server.
+
+        :meth:`resolve` populates a source's *metadata* but, for a multi-file
+        cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
+        leaves the bulk pixel data dehydrated -- each member file then recalls
+        one-at-a-time, slowly, the first time a read touches it (the viewer
+        scrubbing planes is the worst case). ``warm`` opts into pulling them all
+        resident up front so later reads never stall.
+
+        The recall happens **entirely server-side** (the server walks the source
+        directory and reads each file to force the sync engine's recall); no
+        pixels cross the wire, only progress. It is idempotent -- already-resident
+        files are cheap local reads -- so a ``warm`` re-run after a cancel simply
+        finishes the remainder. Only meaningful for multi-file sources; a
+        single-file source returns immediately (resolve already recalled it).
+
+        Args:
+            source_id: The (already-resolved) source to warm.
+            on_progress: Optional callback invoked with a ``WarmProgress``
+                (files/bytes done vs total, current file name, elapsed) on each
+                progress message. Called on the calling thread; keep it cheap.
+            should_cancel: Optional predicate polled per message; when it returns
+                True the client closes the stream -- which the server observes and
+                stops the recall promptly -- and this raises
+                :class:`ResolveCancelled`. Files already recalled stay resident.
+
+        Returns:
+            The terminal ``WarmProgress`` snapshot (``files_done`` /
+            ``bytes_done`` reflect what was made resident; on a no-op source
+            ``files_total == 0``).
+
+        Raises:
+            ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
+            RuntimeError: if the server predates the ``warm`` action (too old for
+                hydrate-ahead), or closes the stream without a terminal status.
+        """
+        action = flight.Action("warm", source_id.encode("utf-8"))
+        done: Optional[WarmProgress] = None
+        try:
+            for result in self._client.do_action(action, options=self._call_options):
+                if should_cancel is not None and should_cancel():
+                    raise ResolveCancelled(
+                        f"warm('{source_id}') cancelled by caller"
+                    )
+                body = result.body.to_pybytes()
+                if not body:
+                    continue
+                msg = WarmStreamMessage()
+                msg.ParseFromString(body)
+                which = msg.WhichOneof("payload")
+                if which == "progress":
+                    if on_progress is not None:
+                        on_progress(msg.progress)
+                elif which == "done":
+                    done = WarmProgress()
+                    done.CopyFrom(msg.done)
+        except flight.FlightServerError as exc:
+            # New-client / old-server: the server has no `warm` action.
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    "Hydrate-ahead is unavailable: the tensor server is too old "
+                    "to support the 'warm' action. Upgrade the server, or just "
+                    "read the data on demand (it will recall lazily)."
+                ) from exc
+            raise
+        if done is None:
+            raise RuntimeError(
+                f"warm('{source_id}') returned no terminal status "
+                "(server closed the stream without a 'done')"
+            )
+        return done
 
     def get_source(
         self,

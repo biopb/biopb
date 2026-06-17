@@ -489,6 +489,50 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
+     * Hydrate-ahead: ask the server to recall all of a resolved multi-file
+     * source's member files, so later reads are warm and never stall.
+     *
+     * <p>{@link #resolve} populates a source's metadata but, for a multi-file
+     * cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
+     * leaves the bulk pixel data dehydrated -- each member file then recalls
+     * one-at-a-time, slowly, the first time a read touches it. This walks the
+     * source directory server-side and reads every file to force the sync
+     * engine's recall; no pixels cross the wire, only progress. It is idempotent
+     * (already-resident files are cheap local reads) and a no-op for a
+     * single-file source (resolve already recalled it).
+     *
+     * @param sourceId The (already-resolved) source to warm.
+     * @return The terminal {@link WarmProgress} snapshot (files/bytes made
+     *         resident; {@code filesTotal == 0} for a no-op source).
+     * @throws IOException If the action fails, the server is too old to support
+     *         the {@code warm} action, or it returns no terminal status.
+     */
+    public WarmProgress warm(String sourceId) throws IOException {
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+                "warm",
+                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        WarmProgress done = null;
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        while (iter.hasNext()) {
+            byte[] body = iter.next().getBody();
+            if (body == null || body.length == 0) {
+                continue;
+            }
+            WarmStreamMessage msg = WarmStreamMessage.parseFrom(body);
+            if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
+                done = msg.getDone();
+            }
+            // PROGRESS arms are ignored (no progress callback on the Java client yet).
+        }
+        if (done == null) {
+            throw new IOException("warm('" + sourceId
+                    + "') returned no terminal status (server closed the stream without a 'done')");
+        }
+        return done;
+    }
+
+    /**
      * Fetch one tensor's {@link TensorDescriptor} by its globally-unique array_id.
      *
      * <p>A tensor is identified by its {@code array_id} alone (see the tensor

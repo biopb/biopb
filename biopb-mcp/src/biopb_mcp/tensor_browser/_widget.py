@@ -166,6 +166,63 @@ class _ResolveWorker(QThread):
         self.resolved.emit(descriptor)
 
 
+# Source types whose data lives across many files under one directory (the
+# dir-claimed formats). Only these benefit from hydrate-ahead; a single-file
+# source's bytes were already recalled by resolve, so warm is a server-side
+# no-op there and we don't bother offering it.
+_MULTIFILE_SOURCE_TYPES = frozenset(
+    {"zarr", "ome-zarr", "ome-zarr-hcs", "ndtiff", "tiff-sequence", "micromanager-legacy"}
+)
+
+
+def _is_multifile_source(src: DataSourceDescriptor) -> bool:
+    """A resolved, directory-backed multi-file source -- the case where member
+    data files recall lazily onto the read path, so hydrate-ahead helps."""
+    return not _is_unresolved(src) and src.source_type in _MULTIFILE_SOURCE_TYPES
+
+
+class _WarmWorker(QThread):
+    """Runs the blocking ``TensorConnection.warm_source`` off the GUI thread.
+
+    Warming asks the server to recall all of a resolved source's member files
+    (server-side; no pixels cross the wire), which can take minutes, so it must
+    not run on the Qt event loop. Unlike resolve, warm is presented *non-modally*
+    -- the user keeps browsing while it runs. Server progress (files/bytes) is
+    relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops it
+    (the client closes the stream, the server halts the recall).
+    """
+
+    warmed = Signal(object)  # terminal WarmProgress
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(object)  # WarmProgress
+
+    def __init__(self, conn: TensorConnection, source_id: str):
+        super().__init__()
+        self._conn = conn
+        self._source_id = source_id
+        self._cancel = threading.Event()
+
+    def request_cancel(self):
+        """Ask the running warm to stop (thread-safe, idempotent)."""
+        self._cancel.set()
+
+    def run(self):
+        try:
+            done = self._conn.warm_source(
+                self._source_id,
+                on_progress=self.progress.emit,
+                should_cancel=self._cancel.is_set,
+            )
+        except ResolveCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:  # surface the SDK/server message to the user
+            self.failed.emit(str(exc))
+            return
+        self.warmed.emit(done)
+
+
 def _human_bytes(n: int) -> str:
     """Compact human-readable byte size (e.g. ``4.2 GB``)."""
     size = float(n)
@@ -501,6 +558,9 @@ class TensorBrowserWidget(QWidget):
         # clobber each other's only ref and get the QThread GC'd / destroyed while
         # still running -- important once a non-modal progress/cancel lets two run.
         self._resolve_workers: set = set()
+        # In-flight warm (hydrate-ahead) workers, owned the same way. Warm runs
+        # non-modally (the user keeps browsing), so several can overlap.
+        self._warm_workers: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -1042,6 +1102,17 @@ class TensorBrowserWidget(QWidget):
             else:
                 view_action.setEnabled(False)
 
+        # Hydrate-ahead: always available on a resolved multi-file source so a
+        # user can (re)trigger it -- e.g. after dismissing/cancelling the
+        # post-resolve offer. Harmless to re-run (idempotent); a single-file
+        # source is excluded (warm is a no-op there).
+        menu_src = self._sources.get(source_id)
+        if menu_src is not None and _is_multifile_source(menu_src):
+            warm_action = menu.addAction("Hydrate all files…")
+            warm_action.triggered.connect(
+                lambda: self._warm_source(source_id)
+            )
+
         # Metadata action
         meta_action = menu.addAction("Metadata")
         meta_action.triggered.connect(
@@ -1111,12 +1182,17 @@ class TensorBrowserWidget(QWidget):
                 label += f" ({_human_bytes(p.target_bytes)})"
             progress.setLabelText(label)
 
-        def _on_resolved(_descriptor):
+        def _on_resolved(descriptor):
             progress.close()
             # The connection snapshot was refreshed by resolve_source(); re-render
             # through _apply_filter so any active search text is preserved and the
             # resolved source now shows its shape badge / field children.
             self._apply_filter()
+            # A multi-file source's member data files are still dehydrated -- they
+            # recall lazily (and slowly) onto the read path. Offer to hydrate them
+            # ahead of time now; the user can also (re)trigger via the context menu.
+            if descriptor is not None and _is_multifile_source(descriptor):
+                self._offer_hydrate(source_id, name)
 
         def _on_failed(message):
             progress.close()
@@ -1145,6 +1221,95 @@ class TensorBrowserWidget(QWidget):
         # slot above calls progress.close(). The worker's queued signal is
         # delivered inside this exec_, so a fast finish can't deadlock.
         progress.exec_()
+
+    def _offer_hydrate(self, source_id: str, name: str):
+        """After resolving a multi-file source, offer to hydrate its files now.
+
+        A quick yes/no; the long-running warm itself runs non-modally
+        (:meth:`_warm_source`) so the user keeps browsing. Declining is fine --
+        the data still recalls lazily on read, and the context menu re-offers.
+        """
+        choice = QMessageBox.question(
+            self,
+            "Hydrate data files?",
+            f"“{name}” is resolved. Its image data is stored across many files "
+            f"that are still in the cloud and will download one-by-one (slowly) "
+            f"the first time you view them.\n\nDownload them all now in the "
+            f"background? You can keep working, and cancel anytime.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice == QMessageBox.Yes:
+            self._warm_source(source_id)
+
+    def _warm_source(self, source_id: str):
+        """Hydrate-ahead a resolved multi-file source's member files.
+
+        Runs the blocking warm in a worker behind a *non-modal* progress dialog
+        (``show()``, not ``exec_()``), so the user keeps browsing/viewing while
+        the server recalls files. The dialog shows live files/bytes progress and
+        a working Cancel button (cooperative: the client closes the stream and the
+        server stops). Idempotent, so re-triggering after a cancel just finishes
+        the remainder; several sources can warm at once.
+        """
+        src = self._sources.get(source_id)
+        if not src or not self._conn.is_connected:
+            return
+
+        self._clear_error()
+
+        parts = _get_path_parts(src.source_url)
+        name = parts[-1] if parts else source_id
+
+        progress = QProgressDialog(
+            f"Hydrating “{name}”…", "Cancel", 0, 0, self
+        )
+        progress.setWindowTitle("Hydrating")
+        progress.setWindowModality(Qt.NonModal)  # user keeps browsing
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        worker = _WarmWorker(self._conn, source_id)
+        self._warm_workers.add(worker)
+
+        def _on_progress(p):
+            label = f"Hydrating “{p.current_name or source_id}”…"
+            if p.files_total:
+                label = (
+                    f"Hydrating {p.files_done}/{p.files_total} files "
+                    f"({_human_bytes(p.bytes_done)}"
+                )
+                if p.bytes_total:
+                    label += f" / {_human_bytes(p.bytes_total)}"
+                label += ")…"
+            progress.setLabelText(label)
+
+        def _on_warmed(_done):
+            progress.close()
+
+        def _on_failed(message):
+            progress.close()
+            self._show_error(f"Hydrate failed: {message}")
+
+        def _on_cancelled():
+            progress.close()
+
+        def _on_cancel_clicked():
+            progress.setLabelText("Cancelling…")
+            worker.request_cancel()
+
+        worker.progress.connect(_on_progress)
+        worker.warmed.connect(_on_warmed)
+        worker.failed.connect(_on_failed)
+        worker.cancelled.connect(_on_cancelled)
+        progress.canceled.connect(_on_cancel_clicked)
+        worker.finished.connect(lambda: self._warm_workers.discard(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        # Non-modal: returns immediately, dialog floats while the user works.
+        progress.show()
 
     def _view_tensor(self, source_id: str, tensor_id: str):
         """Add single tensor to viewer."""
