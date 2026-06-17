@@ -75,6 +75,7 @@ class _Job:
         "interrupted",
         "thread",
         "started",
+        "started_wall",
         "finished",
     )
 
@@ -101,6 +102,9 @@ class _Job:
         self.cancel_reason = None
         self.thread = None
         self.started = time.monotonic()
+        # Wall-clock epoch at submit, for human-readable audit timestamps in the
+        # notebook export (`started` is monotonic and not displayable).
+        self.started_wall = time.time()
         self.finished = None
 
     def elapsed(self):
@@ -117,6 +121,7 @@ class _Job:
             "error_text": self.error_text,
             "cancel_reason": self.cancel_reason,
             "elapsed": self.elapsed(),
+            "created": self.started_wall,
         }
 
 
@@ -360,20 +365,6 @@ def _running_job():
     return None
 
 
-def cancel_current(reason=None):
-    """Cancel the current running job (global; the kernel runs one at a time).
-
-    The observe web UI has no per-job handle — controls act on "the current
-    execution". Delegates to :func:`cancel` so the dask-future cancellation and
-    cooperative-flag behaviour are identical. ``{"cancelled": False}`` when the
-    kernel is idle.
-    """
-    job = _running_job()
-    if job is None:
-        return {"job_id": None, "cancelled": False, "status": "idle"}
-    return cancel(job.job_id, reason=reason)
-
-
 def _raise_in_thread(ident, exctype):
     """Asynchronously raise *exctype* in the thread with *ident*.
 
@@ -442,6 +433,16 @@ def jobs_summary():
         }
         for j in _jobs.values()
     ]
+
+
+def export():
+    """Full snapshots of all retained jobs, oldest-first, for notebook export.
+
+    A read like :func:`jobs_summary` (round-tripped on the kernel main thread, no
+    background job thread), but carrying each job's *full* source and captured
+    output so the observe UI can serialize the session to a Jupyter notebook.
+    """
+    return [j.snapshot() for j in _jobs.values()]
 
 
 def reset():
