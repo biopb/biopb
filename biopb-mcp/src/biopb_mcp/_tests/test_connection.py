@@ -197,6 +197,33 @@ class TestConnect:
         assert out is resolved  # the resolved descriptor is returned verbatim
         assert conn.sources == full  # snapshot refreshed via list_sources()
 
+    def test_warm_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.warm_source("cloud_x")
+
+    def test_warm_source_delegates(self, monkeypatch):
+        # warm() returns the terminal WarmProgress; the connection forwards the
+        # progress/cancel hooks verbatim and does NOT refresh (warm changes
+        # residency, not the descriptor).
+        terminal = MagicMock(name="warm-done")
+        client = _fake_client({"cloud_x": MagicMock()})
+        client.warm.return_value = terminal
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+
+        out = conn.warm_source("cloud_x")
+
+        client.warm.assert_called_once_with(
+            "cloud_x", on_progress=None, should_cancel=None
+        )
+        assert out is terminal
+
 
 # ---------------------------------------------------------------------------
 # readiness gating (issue #12): STARTING vs SERVING vs down

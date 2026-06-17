@@ -29,6 +29,8 @@ from biopb.tensor.descriptor_pb2 import (
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
+    WarmProgress,
+    WarmStreamMessage,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
@@ -51,6 +53,15 @@ logger = logging.getLogger(__name__)
 # (nginx ``grpc_read_timeout`` defaults to 60s) so a minutes-long recall doesn't
 # get its stream reset.
 _RESOLVE_HEARTBEAT_SECONDS = 15.0
+
+# Block size for the ``warm`` action's recall reads, and the minimum interval
+# between its progress messages. The min interval throttles the stream to a
+# smooth UI cadence (rather than one message per file) while staying well under
+# the proxy idle timeout, so it doubles as the heartbeat during a single large
+# file's read. Enumeration (a long recall-free stat walk) falls back to the
+# resolve heartbeat cadence.
+_WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
+_WARM_PROGRESS_MIN_INTERVAL = 0.5
 
 
 def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
@@ -208,6 +219,11 @@ class TensorFlightServer(flight.FlightServerBase):
         self._activity_lock = threading.Lock()
         self._inflight = 0
         self._last_active = 0.0  # time.monotonic() of last do_get completion
+
+        # Source ids with a "warm" (hydrate-ahead) recall in flight, so a second
+        # concurrent warm of the same source is rejected rather than doubling the
+        # disk/recall pressure. Guarded by the activity lock (cheap, uncontended).
+        self._warming: set = set()
 
     @contextlib.contextmanager
     def _serving_request(self):
@@ -528,6 +544,7 @@ class TensorFlightServer(flight.FlightServerBase):
             flight.ActionType("upload_status", "Upload status for a writable source"),
             flight.ActionType("chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"),
             flight.ActionType("cache_stats", "Cache statistics - returns backend CacheStats JSON"),
+            flight.ActionType("warm", "Hydrate-ahead: recall a resolved cloud source's member files server-side"),
         ]
 
     def do_action(
@@ -582,6 +599,10 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize_source(context, source_id)
             yield from self._handle_resolve(source_id)
+        elif action.type == "warm":
+            source_id = action.body.to_pybytes().decode("utf-8")
+            self._authorize_source(context, source_id)
+            yield from self._handle_warm(source_id, context)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -666,6 +687,168 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
         yield ResolveStreamMessage(result=result["desc"]).SerializeToString()
+
+    def _handle_warm(
+        self, source_id: str, context: flight.ServerCallContext
+    ) -> Iterator[bytes]:
+        """Stream the progress of *warming* (hydrate-ahead) a resolved source.
+
+        After ``resolve`` populates a multi-file cloud source's metadata, its
+        member data files are still dehydrated and recall one-at-a-time onto the
+        lazy ``do_get`` read path (the canonical case is zarr/ome-zarr: resolve
+        reads only ``.zattrs``/``.zarray``, so every chunk file recalls the first
+        time the viewer scrubs to it). ``warm`` opts into pulling them all
+        resident up front: it walks the source directory and reads every file to
+        force the sync engine's recall -- entirely server-side, so no pixels
+        cross the wire, only the ``WarmStreamMessage`` progress.
+
+        Unlike ``resolve`` (one opaque blocking call wrapped on a daemon thread),
+        warming is our own loop, so it runs inline in this generator: progress is
+        yielded between files (throttled to ``_WARM_PROGRESS_MIN_INTERVAL``) and
+        ``context.is_cancelled()`` is polled between files and read blocks, so a
+        client closing the stream halts the recall promptly. Warming is a pure
+        side-effect (residency), so a cancel genuinely stops -- there is no result
+        to preserve.
+
+        Properties:
+        - **No-op for non-directory sources** -- a single-file source's one file
+          was already recalled by resolve, so this emits one terminal ``done``
+          with ``files_total == 0`` and returns.
+        - **Read every file unconditionally** -- residency is volatile (eviction /
+          re-dehydration can flip it underneath us), so a "skip already-resident"
+          check would be a TOCTOU trap; an unconditional read is idempotent
+          (already-warm files are cheap local reads, cold files recall).
+        - **Counts as Flight activity** (wrapped in ``_serving_request``) so the
+          background precache worker yields to it for the duration.
+        - Does **not** hold the adapter's per-source IO lock -- these are plain
+          filesystem reads, concurrency-safe with real reads, so warming never
+          blocks a live viewer read.
+        """
+        adapter = self._get_source_adapter(source_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
+
+        root = getattr(adapter, "_source_url", None)
+        # Single-file / remote / non-directory source: nothing to warm beyond what
+        # resolve already recalled. One terminal `done`, files_total == 0.
+        if not root or not os.path.isdir(root):
+            yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
+            return
+
+        # Reject a second concurrent warm of the same source (avoid doubling the
+        # disk/recall pressure); the browser also disables re-trigger while running.
+        with self._activity_lock:
+            if source_id in self._warming:
+                raise flight.FlightServerError(
+                    f"warm already in progress for {source_id!r}"
+                )
+            self._warming.add(source_id)
+
+        started = time.monotonic()
+        last_yield = 0.0
+        buf = bytearray(_WARM_READ_BLOCK_BYTES)
+
+        def _progress(
+            files_total: int,
+            files_done: int,
+            bytes_total: int,
+            bytes_done: int,
+            current_name: str,
+        ) -> bytes:
+            return WarmStreamMessage(
+                progress=WarmProgress(
+                    files_total=files_total,
+                    files_done=files_done,
+                    bytes_total=bytes_total,
+                    bytes_done=bytes_done,
+                    current_name=current_name,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            ).SerializeToString()
+
+        try:
+            # Warming registers as in-flight activity so the precache worker parks.
+            with self._serving_request():
+                # 1. Enumerate + stat (recursive, recall-free). os.walk separates
+                #    directories from `names`, so `names` are the data files we
+                #    want; stat does not recall a placeholder.
+                entries: List[Tuple[int, str]] = []
+                bytes_total = 0
+                for dirpath, _dirs, names in os.walk(root):
+                    if context.is_cancelled():
+                        yield WarmStreamMessage(
+                            done=WarmProgress(elapsed_seconds=time.monotonic() - started)
+                        ).SerializeToString()
+                        return
+                    for name in names:
+                        fpath = os.path.join(dirpath, name)
+                        try:
+                            size = os.stat(fpath).st_size
+                        except OSError:
+                            continue  # vanished/unreadable between walk and stat
+                        entries.append((size, fpath))
+                        bytes_total += size
+                    now = time.monotonic()
+                    if now - last_yield >= _RESOLVE_HEARTBEAT_SECONDS:
+                        last_yield = now
+                        yield _progress(0, 0, 0, 0, "")  # still enumerating
+
+                # 2. Ascending size: for pyramidal data this approximates
+                #    coarsest-level-first (coarse levels are the small files) so the
+                #    viewer becomes responsive earliest; otherwise a harmless tie.
+                entries.sort(key=lambda e: e[0])
+                files_total = len(entries)
+                files_done = 0
+                bytes_done = 0
+
+                # Immediately surface the total before the first (possibly long) read.
+                last_yield = time.monotonic()
+                yield _progress(files_total, files_done, bytes_total, bytes_done, "")
+
+                # 3. Recall loop: read every file to completion (forces residency).
+                for _size, fpath in entries:
+                    if context.is_cancelled():
+                        break
+                    name = os.path.basename(fpath)
+                    try:
+                        with open(fpath, "rb", buffering=0) as fh:
+                            while True:
+                                if context.is_cancelled():
+                                    break
+                                n = fh.readinto(buf)
+                                if not n:
+                                    break
+                                bytes_done += n
+                                now = time.monotonic()
+                                if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                                    last_yield = now
+                                    yield _progress(
+                                        files_total, files_done,
+                                        bytes_total, bytes_done, name,
+                                    )
+                    except OSError as exc:
+                        logger.warning("warm: skipping %s: %s", fpath, exc)
+                    files_done += 1
+                    now = time.monotonic()
+                    if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                        last_yield = now
+                        yield _progress(
+                            files_total, files_done, bytes_total, bytes_done, name,
+                        )
+
+                # 4. Terminal done (partial counts if cancelled mid-loop).
+                yield WarmStreamMessage(
+                    done=WarmProgress(
+                        files_total=files_total,
+                        files_done=files_done,
+                        bytes_total=bytes_total,
+                        bytes_done=bytes_done,
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                ).SerializeToString()
+        finally:
+            with self._activity_lock:
+                self._warming.discard(source_id)
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes

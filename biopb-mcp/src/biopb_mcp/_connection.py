@@ -258,6 +258,35 @@ class TensorConnection:
         self.refresh()
         return descriptor
 
+    def warm_source(
+        self,
+        source_id: str,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ):
+        """Hydrate-ahead a resolved multi-file source, recalling its member files.
+
+        Delegates to :meth:`TensorFlightClient.warm` — the server walks the
+        source directory and reads every file to force the sync engine's recall,
+        so later reads are warm and never stall. The recall is entirely
+        server-side (no pixels cross the wire); this is slow and blocking, so call
+        it off the GUI thread. Only meaningful for multi-file (directory) sources;
+        a single-file source returns immediately.
+
+        ``on_progress`` (called with a ``WarmProgress`` per message) and
+        ``should_cancel`` (polled per message; raising
+        :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
+        verbatim so a GUI can show a non-modal progress + Cancel affordance.
+        Returns the terminal ``WarmProgress`` snapshot. No catalog refresh — warm
+        changes residency, not the descriptor.
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        return self.client.warm(
+            source_id, on_progress=on_progress, should_cancel=should_cancel
+        )
+
     def start_source_watch(
         self,
         min_interval: float | None = None,

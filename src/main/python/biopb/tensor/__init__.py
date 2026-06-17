@@ -28,6 +28,7 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
     MetadataQueryOption,
     ResolveProgress,
+    WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
 
@@ -64,6 +65,7 @@ __all__ = [
     'TensorReadOption',
     'MetadataQueryOption',
     'ResolveProgress',
+    'WarmProgress',
     'SerializedTensor',
     'SerializedEndpoint',
     # Client

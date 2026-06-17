@@ -279,3 +279,44 @@ message ResolveStreamMessage {
     DataSourceDescriptor result = 2;
   }
 }
+
+// Progress for an in-flight "warm" (hydrate-ahead) Flight action. After a
+// source is resolved, a multi-file cloud source's member data files are still
+// dehydrated and recall one-at-a-time onto the lazy read path. "warm" opts into
+// pulling them all resident on the server up front: it walks the source
+// directory and reads each file to force the sync engine's recall, streaming
+// these so a client can show progress (files / bytes) and cancel. The recall
+// happens server-side -- no pixels cross the wire, only this progress.
+// Informational only.
+message WarmProgress {
+  // Total regular files discovered under the source (the recall-free stat
+  // pass). 0 while still enumerating.
+  int32 files_total = 1;
+
+  // Files fully read (made resident) so far.
+  int32 files_done = 2;
+
+  // Sum of file sizes in bytes (stat is recall-free), or 0 while enumerating.
+  int64 bytes_total = 3;
+
+  // Bytes read (recalled) so far.
+  int64 bytes_done = 4;
+
+  // Basename of the file currently being recalled, or empty.
+  string current_name = 5;
+
+  // Seconds elapsed since warming began on the server.
+  double elapsed_seconds = 6;
+}
+
+// One message in the "warm" action's result stream. The server emits zero or
+// more `progress` updates followed by exactly one terminal `done` snapshot. On
+// normal completion `done.files_done == done.files_total`; on cancellation (the
+// client closing the stream) the `done` reflects partial progress. A
+// single-file or non-directory source yields one `done` with files_total == 0.
+message WarmStreamMessage {
+  oneof payload {
+    WarmProgress progress = 1;
+    WarmProgress done = 2;
+  }
+}
