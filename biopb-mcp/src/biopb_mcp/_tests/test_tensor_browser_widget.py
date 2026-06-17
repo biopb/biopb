@@ -312,13 +312,18 @@ class _FakeProgress:
 
     def __init__(self, *a, **k):
         self.closed = False
+        self.label = ""
+        self.canceled = _Sig()  # user Cancel button -> request_cancel
 
     def setWindowTitle(self, *a):
         pass
 
+    def setLabelText(self, text):
+        self.label = text
+
     setWindowModality = setMinimumDuration = setCancelButton = setValue = (
-        lambda self, *a: None
-    )
+        setAutoClose
+    ) = setAutoReset = lambda self, *a: None
 
     def close(self):
         self.closed = True
@@ -366,11 +371,17 @@ class TestResolveAction:
                 self.resolved = _Sig()
                 self.failed = _Sig()
                 self.finished = _Sig()
+                self.cancelled = _Sig()
+                self.progress = _Sig()
+
+            def request_cancel(self):
+                pass
 
             def start(self):
                 started["n"] += 1
                 kind, payload = outcome
-                getattr(self, kind).emit(payload)
+                sig = getattr(self, kind)
+                sig.emit(payload) if payload is not None else sig.emit()
 
             def deleteLater(self):
                 pass
@@ -405,6 +416,17 @@ class TestResolveAction:
         w._show_error.assert_called_once()
         assert "offline" in w._show_error.call_args[0][0]
 
+    def test_cancelled_closes_quietly(self, widget, monkeypatch):
+        # A user-cancelled resolve is not an error: no banner, no repopulate (the
+        # server recall finishes + caches, so a later resolve coalesces).
+        w, started = self._arm(
+            widget, monkeypatch, accept=True, outcome=("cancelled", None)
+        )
+        w._resolve_source("cloud_x")
+        assert started["n"] == 1
+        w._show_error.assert_not_called()
+        w._apply_filter.assert_not_called()
+
     def test_overlapping_workers_are_each_retained(self, widget, monkeypatch):
         # Two in-flight workers must not clobber each other's only ref (which
         # would let a still-running QThread be GC'd / destroyed mid-run). We hold
@@ -430,7 +452,12 @@ class TestResolveAction:
                 self.resolved = _Sig()
                 self.failed = _Sig()
                 self.finished = _Sig()
+                self.cancelled = _Sig()
+                self.progress = _Sig()
                 made.append(self)
+
+            def request_cancel(self):
+                pass
 
             def start(self):
                 pass
