@@ -1,73 +1,65 @@
-# biopb-image-runtime
+# The algorithm plane
 
-Base Docker image and utilities for gRPC services implementing the `biopb.image` protocol.
+Base Docker image and utilities for implementing algorithm plugins using the `biopb.image` protocol.
 
-## Overview
+## Build a custom algorithm plugin
 
-This subproject provides:
-- **Base Docker image** for ObjectDetection/ProcessImage gRPC services
-- **Mock service** for pytest and explicit infrastructure testing without real ML models
-- **Embedded tensor cache** for larger-than-memory data handling
-- **Utilities** for image encoding/decoding, authentication, and lazy data handling
-- **Test client** for verifying gRPC connectivity
+### Overview
+`biopb-image-runtime` creates a base image for adding algorithm plugins, so the agent has more tools to use.
 
-## Architecture
+The base image does not define a default entrypoint and is not meant to be run directly without specifying a servicer. It also does not define a default health check. Health checks belong in `docker-compose.yaml` for the mock workflow or in derived service images that declare their own runtime contract.
 
-### Single Process with Embedded Tensor Cache
+For real servicers, enable and expose the gRPC health service from your own service process. The base utilities already support this through `create_server()` and `run_server()`; derived images should add the container-level health probe that matches their runtime entrypoint.
 
-The `run_server()` helper optionally starts an embedded TensorFlightServer for ephemeral cache. Large results are uploaded to the file-based cache and returned as `SerializedTensor` references.
+### Example servicer
+```python
+# my_servicer.py
+import biopb.image as proto
 
+from biopb_image_base import (
+    run_server,            # Run server (optionally with embedded cache)
+    decode_image_data,     # Decode ImageData to numpy/dask
+    return_lazy_or_eager,  # Return result as lazy or eager data
+    BiopbServicerBase,     # Base class for servicers
+)
+
+
+class MyServicer(BiopbServicerBase):
+    def Run(self, request, context):
+        with self._server_context(context):
+            img = decode_image_data(request.image_data)
+            result = ...  # your result (numpy or dask array)
+            return proto.ProcessResponse(
+                image_data=return_lazy_or_eager(result, self._tensor_cache)
+            )
+
+
+# Run the service (no cache server; results are returned eagerly)
+run_server(MyServicer(), port=50051)
 ```
-┌─────────────────────────────────────────────┐
-│  image-server (single process)              │
-│                                             │
-│  ┌─────────────┐      ┌─────────────────┐   │
-│  │ gRPC server │      │ embedded Flight │   │
-│  │ port 50051  │◀────▶│ cache server    │   │
-│  │             │      │ port 8817       │   │
-│  └─────────────┘      └─────────────────┘   │
-│                              │              │
-│                              ▼              │
-│                       /data/cache/          │
-│                       (file-based)          │
-└─────────────────────────────────────────────┘
-```
+See [biopb-server](https://github.com/biopb/biopb-server) project for fully functional implementation examples.
 
-## Usage
-
-### Build Docker Images
-
-Run from repo root:
-
+### Run the new servicer
 ```bash
-cd /path/to/biopb  # repo root
-./biopb-image-runtime/scripts/build.sh
-
-# Force rebuild without cache
-./biopb-image-runtime/scripts/build.sh --no-cache
+docker run --rm -p 50051:50051 \
+    -v /path/to/my_servicer.py:/opt/biopb/my_servicer.py \
+    biopb-image-base \
+    python /opt/biopb/my_servicer.py
 ```
 
-Or manually (requires pre-built wheel):
+### Update biopb-mcp config
 
-```bash
-cd /path/to/biopb  # repo root
-
-# Build wheel first
-pip wheel . --no-deps -w wheels/
-
-# Build Docker image
-docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
+Update the field `mcp.services.process_image_servers`
+to include your new server:
+``` json
+"mcp": {
+    "services": {
+        "process_image_servers": ["grpc://your_ip_address:50051"]
+    }
+}
 ```
 
-### Run a Derived Service
-
-`biopb-image-base` is a base image. It does not define a default entrypoint and is not meant to be run directly without specifying a servicer.
-
-It also does not define a default health check. Health checks belong in `docker-compose.yaml` for the mock workflow or in derived service images that declare their own runtime contract.
-
-For real servicers, enable and expose the gRPC health service from your own service process. The base utilities already support this through `create_server()` and `run_server()` with `health_check=True` and optional readiness checks; derived images should add the container-level health probe that matches their runtime entrypoint.
-
-Build a derived image that adds your servicer and sets an entrypoint:
+### Alternative: build a docker image for your servicer
 
 ```dockerfile
 FROM biopb-image-base
@@ -81,7 +73,11 @@ CMD ["--cache-dir", "/data/cache"]
 Then run it:
 
 ```bash
-# For deployment: use externally reachable hostname/IP
+docker run --rm \
+  -p 50051:50051 \
+  my-biopb-servicer
+
+# With cache server and lazy I/O
 docker run --rm \
   -p 50051:50051 \
   -p 8817:8817  \
@@ -92,7 +88,7 @@ docker run --rm \
     --tensor-external-location \
     grpc://$(hostname):8817
 
-# For local testing only (clients on same host):
+# For local deployment/testing
 docker run --rm \
   -p 50051:50051 \
   -p 8817:8817  \
@@ -108,6 +104,69 @@ docker run --rm \
 Using `localhost` only works when clients run on the same host machine.
 For deployment, use the server's hostname or IP (e.g., `grpc://server-host:8817`).
 
+
+## Architecture
+This subproject provides:
+- **Base Docker image** for ProcessImage/ObjectDetection gRPC services
+- **Mock service** for pytest and explicit infrastructure testing without real ML models
+- **Embedded tensor cache** for larger-than-memory data handling
+- **Utilities** for image encoding/decoding, authentication, and lazy data handling
+- **Test client** for verifying gRPC connectivity
+
+### Single Process with Embedded Tensor Cache
+
+The `run_server()` helper optionally starts an embedded TensorFlightServer for ephemeral cache. Large results are uploaded to the file-based cache and returned as `SerializedTensor` references.
+
+```
+┌─────────────────────────────────────────────┐
+│  image-server (single process)              │
+│                                             │
+│  ┌─────────────┐      ┌─────────────────┐   │
+│  │ gRPC server │      │ embedded Flight │   │
+│  │ port 50051  │◀───▶│ cache server    │   │
+│  │             │      │ port 8817       │   │
+│  └─────────────┘      └─────────────────┘   │
+│                              │              │
+│                              ▼              │
+│                       /data/cache/          │
+│                       (file-based)          │
+└─────────────────────────────────────────────┘
+
+run_server(
+    servicer,
+    port=50051,               # main grpc port
+    cache_dir="/data/cache",  # Enables lazy data handling
+    cache_size="32GB",
+    health_check=True,
+)
+
+```
+
+## Development
+
+### Build Base Docker Images
+
+Run from repo root:
+
+```bash
+cd /path/to/biopb  # repo root
+./biopb-image-runtime/scripts/build.sh
+
+# Force rebuild without cache
+./biopb-image-runtime/scripts/build.sh --no-cache
+```
+Or manually (build wheels yourself):
+
+```bash
+cd /path/to/biopb  # repo root
+
+# Build wheel first
+pip wheel . --no-deps -w wheels/
+
+# Build Docker image
+docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
+```
+
 ### Run the Mock Service Explicitly
 
 The mock servicer is available for pytest and explicit development workflows. Run it by providing the Python module explicitly:
@@ -119,14 +178,6 @@ docker run --rm -p 50051:50051 -p 50052:8817 -v tensor-cache:/data/cache \
     biopb-image-base \
     python -m biopb_image_base.mock_servicer \
     --cache-dir /data/cache --cache-size 32GB
-```
-
-**Standalone (eager data only, no lazy support):**
-
-```bash
-docker run --rm -p 50051:50051 \
-    biopb-image-base \
-    python -m biopb_image_base.mock_servicer --local
 ```
 
 **With docker-compose:**
@@ -165,17 +216,13 @@ pip install -e .[test]
 pytest tests/ -v
 ```
 
-### Build Options
-
-## Environment Variables
+### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `BIOPB_LOG_LEVEL` | Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 
-## Python API
-
-### Base Utilities
+### Python API
 
 ```python
 from biopb_image_base import (
@@ -187,81 +234,16 @@ from biopb_image_base import (
     return_lazy_or_eager,  # Return large results as lazy data
     BiopbServicerBase,   # Base class for servicers
 )
-
-# Example servicer
-class MyServicer(BiopbServicerBase):
-    def RunDetection(self, request, context):
-        with self._server_context(context):
-            img = decode_image_data(request.image_data)
-            # ... process ...
-            detections = [...]  # your detections
-            return DetectionResponse(detections=detections)
-
-    def Run(self, request, context):
-        with self._server_context(context):
-            img = decode_image_data(request.image_data)
-            result = ...  # your result (numpy or dask array)
-            return ProcessResponse(
-                image_data=return_lazy_or_eager(result, self._tensor_cache)
-            )
 ```
 
-### Running a Service
-
-```python
-from biopb_image_base import run_server
-
-servicer = MyServicer()
-
-# With embedded tensor cache (recommended)
-run_server(
-    servicer,
-    port=50051,
-    cache_dir="/data/cache",  # Enables lazy data handling
-    cache_size="32GB",
-    health_check=True,
-)
-
-# Or without cache (eager data only)
-run_server(servicer, port=50051)
-```
-
-## Dockerfile for Derived Services
-
-Provide your servicer entrypoint in the derived image:
-
-```dockerfile
-FROM biopb-image-base
-
-# Install your ML dependencies
-RUN pip install torch cellpose
-
-# Copy your servicer
-COPY my_servicer.py /opt/biopb/my_servicer.py
-
-ENTRYPOINT ["python", "/opt/biopb/my_servicer.py"]
-CMD ["--cache-dir", "/data/cache"]
-
-# Add a service-specific health probe in the derived image
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD grpc_health_probe -addr=localhost:50051 || exit 1
-```
-
-Or run directly without custom Dockerfile:
-
-```bash
-docker run --rm -p 50051:50051 \
-    -v /path/to/my_servicer.py:/opt/biopb/my_servicer.py \
-    biopb-image-base \
-    python /opt/biopb/my_servicer.py --cache-dir /data/cache
-```
-
-## biopb.image Protocol
+### biopb.image Protocol
 
 | Service | Methods |
 |---------|---------|
 | ObjectDetection | RunDetection, RunDetectionStream, RunDetectionOnGrid, RunModelAdaptation, GetOpNames |
 | ProcessImage | Run, RunStream, GetOpNames |
+
+See [buf.build](https://buf.build/jiyuuchc/biopb/docs/main%3Abiopb.image) for full definition.
 
 ## Files
 
