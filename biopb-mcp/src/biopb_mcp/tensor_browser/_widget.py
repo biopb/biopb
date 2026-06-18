@@ -9,6 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
+import re
 import threading
 from typing import TYPE_CHECKING, Dict, List, Set
 from urllib.parse import urlparse
@@ -65,14 +66,27 @@ class _TreeNode:
 
 
 def _get_path_parts(url: str) -> List[str]:
-    """Extract path parts from source_url."""
+    """Extract path parts from source_url.
+
+    Splits on both POSIX (``/``) and Windows (``\\``) separators so a catalog
+    indexed on Windows — whose ``source_url`` is a backslash path like
+    ``C:\\Users\\me\\img.tif`` — builds the same folder tree as a POSIX one
+    instead of collapsing into a single flat leaf (the whole path as one name).
+    A leading drive-letter token (``C:``) is dropped: ``urlparse`` reads it as a
+    URL scheme so it is usually already gone, but when it survives it is just
+    noise in the folder hierarchy.
+    """
     if not url:
         return []
     try:
         parsed = urlparse(url)
-        return [p for p in parsed.path.split("/") if p]
+        raw = parsed.path or url
     except Exception:
-        return [p for p in url.split("/") if p]
+        raw = url
+    parts = [p for p in re.split(r"[\\/]+", raw) if p]
+    if parts and re.fullmatch(r"[A-Za-z]:", parts[0]):
+        parts = parts[1:]
+    return parts
 
 
 def _format_shape(shape: List[int]) -> str:
