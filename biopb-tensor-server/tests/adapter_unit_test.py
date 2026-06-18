@@ -121,6 +121,17 @@ class TestTensorConfig:
         assert config.probe_open_files is True
         assert config.aggressive_dir_pruning is False
 
+    def test_claim_generic_images_defaults_off(self):
+        config = parse_config({'server': {}, 'sources': []})
+        assert config.claim_generic_images is False
+
+    def test_parse_claim_generic_images(self):
+        config = parse_config({
+            'server': {'claim_generic_images': True},
+            'sources': [],
+        })
+        assert config.claim_generic_images is True
+
 
 class TestComputeBackendSelection:
     """Tests for internal CPU/GPU backend heuristics."""

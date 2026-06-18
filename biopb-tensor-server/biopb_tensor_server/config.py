@@ -349,6 +349,12 @@ class ServerConfig:
         aggressive_dir_pruning: When True, allow unchanged monitored roots to be
             pruned in addition to descendant subdirectories. This reduces scan
             cost further but may defer root-level file updates until a later scan.
+        claim_generic_images: When True, recursive directory discovery also
+            claims generic raster/video files (.png/.jpg/.jpeg/.gif/.bmp and
+            .avi/.mov/.mp4/.mpeg/.mpg) as aics sources. Off by default: these
+            are almost never microscopy tensors and flood the catalog with
+            screenshots/icons/thumbnails (biopb/biopb#40). Explicitly configured
+            sources (type set, or a single-file url) are unaffected.
         writable: Enable write mode for source creation and data upload
         write_dir: Directory for zarr-backed uploaded sources (None = no zarr uploads)
         cache: Cache configuration
@@ -373,6 +379,7 @@ class ServerConfig:
     stable_rescans_required: int = 0
     probe_open_files: bool = True
     aggressive_dir_pruning: bool = False
+    claim_generic_images: bool = False  # Claim generic raster/video in discovery (#40)
     writable: bool = False  # Enable write mode
     write_dir: Optional[Path] = None  # Directory for zarr-backed sources
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -437,6 +444,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     stable_rescans_required = server_data.get("stable_rescans_required", 0)
     probe_open_files = server_data.get("probe_open_files", True)
     aggressive_dir_pruning = server_data.get("aggressive_dir_pruning", False)
+    claim_generic_images = server_data.get("claim_generic_images", False)
     writable = server_data.get("writable", False)
     write_dir_str = server_data.get("write_dir", None)
     write_dir = Path(write_dir_str) if write_dir_str else None
@@ -586,6 +594,7 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         stable_rescans_required=max(0, int(stable_rescans_required)),
         probe_open_files=bool(probe_open_files),
         aggressive_dir_pruning=bool(aggressive_dir_pruning),
+        claim_generic_images=bool(claim_generic_images),
         compute_backend=compute_backend,
         gpu_min_input_mb=float(gpu_min_input_mb),
         gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),

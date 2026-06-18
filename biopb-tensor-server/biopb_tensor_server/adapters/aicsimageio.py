@@ -191,28 +191,40 @@ def _get_ome_metadata_from_tiff(
     return result
 
 
-# Core microscopy/image extensions for AicsImageIoAdapter fallback
-# These are genuine image formats that are NOT handled by format-specific subclasses
-# Format-specific adapters handle: .czi, .lsm, .lif, .nd2, .dv, .oif, .oib, .companion.ome
-#
-# This curated set avoids claiming generic file types (txt, csv, cfg, htm, etc.)
-# that bioformats technically supports but are not microscopy images.
-CORE_IMAGE_EXTENSIONS = frozenset(
+# Generic raster/video formats that aicsimageio/bioformats technically read but
+# are almost never microscopy *tensor* sources in practice (screenshots, icons,
+# UI assets, thumbnails, movies). Claiming these during recursive directory
+# discovery floods the catalog with junk (biopb/biopb#40), so they are claimed
+# only when explicitly opted in via the ``claim_generic_images`` server config
+# flag (see :func:`set_claim_generic_images`). An explicitly configured
+# ``type = "aics"`` source bypasses claim() entirely and is unaffected.
+GENERIC_IMAGE_EXTENSIONS = frozenset(
     [
-        # Standard image formats
+        # Standard raster formats
         ".png",
         ".jpg",
         ".jpeg",
         ".gif",
         ".bmp",
-        ".tif",
-        ".tiff",
         # Video formats
         ".avi",
         ".mov",
         ".mp4",
         ".mpeg",
         ".mpg",
+    ]
+)
+
+# Microscopy / scientific image formats not handled by a format-specific subclass
+# (those handle .czi, .lsm, .lif, .nd2, .dv, .oif, .oib, .companion.ome). Always
+# eligible for a discovery claim. .tif/.tiff stay here: plain TIFFs are
+# legitimate microscopy sources, and OME-TIFFs are claimed earlier by
+# OmeTiffAdapter.
+MICROSCOPY_EXTENSIONS = frozenset(
+    [
+        # TIFF (plain; OME-TIFF handled by OmeTiffAdapter)
+        ".tif",
+        ".tiff",
         # Microscopy-specific formats (not handled by specific adapters)
         ".mrc",
         ".mrcs",  # MRC electron microscopy
@@ -239,8 +251,40 @@ CORE_IMAGE_EXTENSIONS = frozenset(
     ]
 )
 
-# Use core set for claim scope (not dynamic discovery which is too broad when bioformats is installed)
+# Full curated set (microscopy + generic). Retained for back-compat with callers
+# that reference the union; the actual claim scope is decided per-call by
+# :func:`_claim_extensions`, which honors the generic-images opt-in.
+CORE_IMAGE_EXTENSIONS = MICROSCOPY_EXTENSIONS | GENERIC_IMAGE_EXTENSIONS
 AICS_EXTENSIONS = CORE_IMAGE_EXTENSIONS
+
+
+# Whether recursive directory discovery may claim GENERIC_IMAGE_EXTENSIONS. Off
+# by default (biopb/biopb#40); set from ``ServerConfig.claim_generic_images`` at
+# server startup (see cli.serve). The ``BIOPB_CLAIM_GENERIC_IMAGES`` env var
+# seeds the initial default so the toggle also applies to discovery paths that
+# never load a ServerConfig (e.g. ad-hoc tooling).
+_CLAIM_GENERIC_IMAGES: bool = os.environ.get(
+    "BIOPB_CLAIM_GENERIC_IMAGES", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_claim_generic_images(enabled: bool) -> None:
+    """Enable/disable claiming generic raster/video during directory discovery.
+
+    Process-wide policy (one ServerConfig per process), mirroring the other
+    module-level startup toggles. Off by default: generic raster/video pollute
+    the catalog during recursive walks (biopb/biopb#40). Does not affect an
+    explicitly configured ``type = "aics"`` source, which never consults claim().
+    """
+    global _CLAIM_GENERIC_IMAGES
+    _CLAIM_GENERIC_IMAGES = bool(enabled)
+
+
+def _claim_extensions() -> frozenset:
+    """Extensions eligible for a discovery claim, honoring the generic-images flag."""
+    if _CLAIM_GENERIC_IMAGES:
+        return CORE_IMAGE_EXTENSIONS
+    return MICROSCOPY_EXTENSIONS
 
 
 # =============================================================================
@@ -1099,10 +1143,12 @@ class BioformatsAdapter(_AicsImageIoAdapterBase):
 class AicsImageIoAdapter(_AicsImageIoAdapterBase):
     """Fallback adapter for remaining aicsimageio-supported formats.
 
-    Claims files with extensions in CORE_IMAGE_EXTENSIONS that are not handled
-    by format-specific subclasses. Uses a curated set of microscopy and
-    scientific image formats, excluding generic file types (txt, csv, cfg, etc.)
-    that bioformats technically supports.
+    Claims microscopy/scientific image files not handled by format-specific
+    subclasses. By default the claim set is MICROSCOPY_EXTENSIONS; generic
+    raster/video (GENERIC_IMAGE_EXTENSIONS) are claimed during recursive
+    discovery only when the ``claim_generic_images`` server config flag is on
+    (biopb/biopb#40). Generic file types (txt, csv, cfg, etc.) that bioformats
+    technically supports are never claimed.
 
     Note: Some formats handled by specific adapters:
     - .companion.ome → OmeTiffAdapter
@@ -1139,8 +1185,10 @@ class AicsImageIoAdapter(_AicsImageIoAdapterBase):
             if name.endswith(ext):
                 return None  # Let the specific adapter handle this
 
-        # Check for remaining aicsimageio extensions
-        for ext in AICS_EXTENSIONS:
+        # Check for remaining aicsimageio extensions. Microscopy/scientific
+        # formats are always eligible; generic raster/video are included only
+        # when the generic-images opt-in is on (biopb/biopb#40).
+        for ext in _claim_extensions():
             if name.endswith(ext):
                 state.try_claim_path(ctx.path_str)
                 return SourceClaim(

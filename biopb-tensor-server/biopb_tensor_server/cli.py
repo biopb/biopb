@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
+from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
 from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
@@ -259,6 +260,10 @@ def _setup_flight_server(
         gpu_min_merged_chunks=gpu_min_merged_chunks
         or server_config.gpu_min_merged_chunks,
     )
+
+    # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
+    # Off by default so recursive scans don't register screenshots/icons/movies.
+    set_claim_generic_images(server_config.claim_generic_images)
 
     # Initialize cache manager for virtual chunks
     cache_config = server_config.cache
