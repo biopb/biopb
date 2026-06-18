@@ -135,17 +135,66 @@ def test_api_job_detail(client, host):
     assert body["window_alive"] is True
 
 
-def test_api_cancel_global(client, host):
+def test_api_notebook_downloads_ipynb(client, host):
     host.execute.return_value = _reply(
-        {"job_id": "job-1", "cancelled": True, "status": "running"}
+        [
+            {
+                "job_id": "job-1",
+                "code": "x = 1\nx",
+                "status": "ok",
+                "stdout": "",
+                "result_text": "1",
+                "error_text": "",
+                "cancel_reason": None,
+                "elapsed": 0.1,
+                "created": 1_700_000_000.0,
+            },
+            {
+                "job_id": "job-2",
+                "code": "while True: pass",
+                "status": "interrupted",
+                "stdout": "",
+                "result_text": "",
+                "error_text": "Interrupted by user via the observe web UI.",
+                "cancel_reason": "Interrupted by user via the observe web UI.",
+                "elapsed": 4.0,
+                "created": 1_700_000_004.0,
+            },
+        ]
     )
-    r = client.post("/api/cancel")
+    r = client.get("/api/notebook")
     assert r.status_code == 200
-    assert r.json()["cancelled"] is True
-    # The global cancel snippet carries the user-attribution reason.
-    snippet = host.execute.call_args[0][0]
-    assert "cancel_current(" in snippet
-    assert _observe._USER_CANCEL_MSG in snippet
+    # The export round-trip asks the kernel for the full job history.
+    assert "export()" in host.execute.call_args[0][0]
+    assert r.headers["content-type"].startswith("application/x-ipynb+json")
+    assert ".ipynb" in r.headers["content-disposition"]
+    assert r.headers["x-filename"].endswith(".ipynb")
+
+    nb = json.loads(r.text)
+    assert nb["nbformat"] == 4
+    # title (markdown) + bootstrap (code) + one cell per job.
+    code = [c for c in nb["cells"] if c["cell_type"] == "code"]
+    assert len(code) == 3  # bootstrap + 2 jobs
+    assert any("build_ops" in "".join(c["source"]) for c in code)  # bootstrap
+    # The interrupted job is a live code cell flagged in its header + outputs.
+    job2 = code[-1]
+    assert "interrupted" in "".join(job2["source"])
+    assert job2["metadata"]["biopb"]["status"] == "interrupted"
+    assert any(
+        o.get("name") == "stderr" for o in job2["outputs"]
+    )
+
+
+def test_api_notebook_empty_session(client, host):
+    host.execute.return_value = _reply([])
+    r = client.get("/api/notebook")
+    assert r.status_code == 200
+    nb = json.loads(r.text)
+    # Still a valid notebook: title + bootstrap, no job cells.
+    assert nb["nbformat"] == 4
+    assert any(c["cell_type"] == "code" for c in nb["cells"])
+
+
 
 
 def test_api_interrupt_targets_running_job(client, host):
@@ -191,7 +240,7 @@ def test_api_503_without_host(client):
     for method, path in [
         ("get", "/api/jobs"),
         ("get", "/api/jobs/job-1"),
-        ("post", "/api/cancel"),
+        ("get", "/api/notebook"),
         ("post", "/api/kernel/interrupt"),
         ("post", "/api/kernel/restart"),
         ("get", "/api/status"),
@@ -237,15 +286,6 @@ def test_detail_unknown_job_404(client, host):
         {"job_id": "nope", "status": "unknown", "error_text": ""}
     )
     assert client.get("/api/jobs/nope").status_code == 404
-
-
-def test_cancel_idle_returns_false(client, host):
-    host.execute.return_value = _reply(
-        {"job_id": None, "cancelled": False, "status": "idle"}
-    )
-    r = client.post("/api/cancel")
-    assert r.status_code == 200
-    assert r.json()["cancelled"] is False
 
 
 # -- Host/Origin guard ------------------------------------------------------

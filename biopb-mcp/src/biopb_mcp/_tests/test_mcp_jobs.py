@@ -158,15 +158,15 @@ class TestJobRunnerUnit:
         _jobs.reset()
         assert _jobs.jobs_summary() == []
 
-    # -- user-action attribution (observe web UI) ---------------------------
+    # -- user-action attribution --------------------------------------------
 
-    def test_cancel_current_attributes_reason(self, runner):
+    def test_cancel_attributes_reason(self, runner):
         jid = _jobs.submit(
             "import time\nwhile not cancelled():\n    time.sleep(0.02)"
         )["job_id"]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
-        out = _jobs.cancel_current(reason="stopped by Alice")
+        out = _jobs.cancel(jid, reason="stopped by Alice")
         assert out["cancelled"] is True
         assert out["job_id"] == jid
         snap = self._wait(jid)
@@ -174,12 +174,6 @@ class TestJobRunnerUnit:
         assert snap["cancel_reason"] == "stopped by Alice"
         # The reason is surfaced in error_text so poll_job/execute_code render it.
         assert "stopped by Alice" in snap["error_text"]
-
-    def test_cancel_current_when_idle(self):
-        # No runner fixture -> no running job in a fresh registry.
-        _jobs.reset()
-        out = _jobs.cancel_current(reason="x")
-        assert out == {"job_id": None, "cancelled": False, "status": "idle"}
 
     def test_interrupt_current_stops_uncooperative_job(self, runner):
         # A loop that NEVER checks cancelled() -> only a KeyboardInterrupt raised

@@ -1,9 +1,10 @@
 """Minimal loopback web UI for observing and controlling the kernel.
 
 A small web interface (``/observe`` + ``/api/*``) that shows ``execute_code``
-job history with truncated output and exposes global control knobs — cancel the
-current job, interrupt (force a KeyboardInterrupt into its thread), hard-restart
-the kernel. On by default (opt-out via ``mcp.observe.enabled``).
+job history with truncated output and exposes global control knobs — interrupt
+the current job (force a KeyboardInterrupt into its thread), hard-restart the
+kernel, and save the session as a notebook. On by default (opt-out via
+``mcp.observe.enabled``).
 
 It is hosted in the *MCP server process* (the one that owns the
 :class:`~biopb_mcp.mcp._kernel.KernelHost`), so controls are direct method calls
@@ -30,21 +31,26 @@ is the whole boundary (same trust model as the MCP server).
 """
 
 import functools
+import json
 import logging
 
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
 from starlette.routing import Route
 
-from . import _server
+from . import _notebook, _server
 
 logger = logging.getLogger(__name__)
 
-# Reason strings threaded into the job record (via _jobs.cancel_current /
-# interrupt_current) so the agent sees, through its normal poll_job /
-# execute_code result, that a *user* — not it — stopped the work.
-_USER_CANCEL_MSG = "Cancelled by user via the observe web UI."
+# Reason string threaded into the job record (via _jobs.interrupt_current) so the
+# agent sees, through its normal poll_job / execute_code result, that a *user* —
+# not it — stopped the work.
 _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 
 # Launcher-tunable settings (defaults mirror _config DEFAULT_CONFIG). Set by
@@ -218,16 +224,28 @@ async def _api_job_detail(request):
     return JSONResponse(snap)
 
 
-async def _api_cancel(request):
+async def _api_notebook(request):
     host, err = _require_host()
     if err is not None:
         return err
-    data, res, _w = _server._run_job_call(
-        host, "cancel_current(" + repr(_USER_CANCEL_MSG) + ")"
-    )
-    if data is None:
+    # Read the full job history on the kernel main thread (a plain read like
+    # jobs_summary(), no background job thread), then serialize to a notebook in
+    # this process.
+    jobs, res, _w = _server._run_job_call(host, "export()")
+    if jobs is None:
         return _kernel_error(res)
-    return JSONResponse(data)
+    nb = _notebook.build_notebook(jobs, headless=_server._headless)
+    filename = _notebook.suggested_filename()
+    return Response(
+        json.dumps(nb, indent=1),
+        media_type="application/x-ipynb+json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # Exposed for the fetch+blob download path (Content-Disposition is
+            # not readable from a same-origin fetch in all browsers).
+            "X-Filename": filename,
+        },
+    )
 
 
 async def _api_interrupt(request):
@@ -268,7 +286,7 @@ _ROUTES = [
     ("/observe", ["GET"], _route(_observe_page)),
     ("/api/jobs", ["GET"], _route(_api_jobs)),
     ("/api/jobs/{job_id}", ["GET"], _route(_api_job_detail)),
-    ("/api/cancel", ["POST"], _route(_api_cancel)),
+    ("/api/notebook", ["GET"], _route(_api_notebook)),
     ("/api/kernel/interrupt", ["POST"], _route(_api_interrupt)),
     ("/api/kernel/restart", ["POST"], _route(_api_restart)),
     ("/api/status", ["GET"], _route(_api_status)),
@@ -341,6 +359,9 @@ _OBSERVE_HTML = """<!DOCTYPE html>
            background: #222; color: #ddd; cursor: pointer; }
   button:hover { background: #2c2c2c; }
   button.danger { border-color: #844; }
+  button.primary { background: #1d6b3f; border-color: #2a5; color: #eafff0;
+                   font-weight: 600; margin-right: 6px; }
+  button.primary:hover { background: #25804b; }
   main { padding: 12px 16px; }
   .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
   .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
@@ -371,7 +392,7 @@ _OBSERVE_HTML = """<!DOCTYPE html>
 <header>
   <h1>biopb-mcp · observe</h1>
   <span id="status">…</span>
-  <button id="cancel">Cancel job</button>
+  <button id="save" class="primary">⤓ Save notebook</button>
   <button id="interrupt">Interrupt</button>
   <button id="restart" class="danger">Restart kernel</button>
 </header>
@@ -523,10 +544,40 @@ async function pollStatus() {
   } catch (e) { setStatus('unreachable'); }
 }
 
-document.getElementById('cancel').onclick = async () => {
-  const d = await jpost('/api/cancel');
-  if (!d.cancelled) alert(d.status === 'idle' ? 'No running job.' : ('Cancel: ' + JSON.stringify(d)));
-  poll();
+document.getElementById('save').onclick = async () => {
+  let r;
+  try { r = await fetch('/api/notebook'); }
+  catch (e) { alert('Save failed: ' + e); return; }
+  if (!r.ok) { alert('Save failed (' + r.status + ')'); return; }
+  const blob = await r.blob();
+  const name = r.headers.get('X-Filename') || 'biopb-mcp-session.ipynb';
+
+  // Chromium (secure context, and 127.0.0.1 counts): native Save-As dialog so
+  // the user picks the folder + filename. Firefox/Safari lack it -> prompt for a
+  // name (preset as default) and save to the default download location.
+  if (window.showSaveFilePicker) {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{description: 'Jupyter notebook',
+                 accept: {'application/x-ipynb+json': ['.ipynb']}}],
+      });
+    } catch (e) { if (e.name === 'AbortError') return; }   // user cancelled
+    if (handle) {
+      const w = await handle.createWritable();
+      await w.write(blob); await w.close();
+      return;
+    }
+  }
+  const chosen = prompt('Save notebook as:', name);
+  if (chosen === null) return;                              // user cancelled
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = chosen || name;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
 };
 document.getElementById('interrupt').onclick = async () => {
   const d = await jpost('/api/kernel/interrupt');
