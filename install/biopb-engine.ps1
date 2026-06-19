@@ -789,23 +789,20 @@ function Invoke-BiopbInstall {
 
     Report-Info "Installing biopb into one shared environment..."
     try {
-        # Capture uv's own stdout+stderr so a failure is diagnosable. A native
+        # Stream uv's own stdout+stderr through the reporter so the live install
+        # detail is BOTH visible (the GUI shows it in its scrolling log; the
+        # console prints it) and captured in the diagnostic transcript. A native
         # child run UNPIPED writes straight to the console handle, which
-        # Start-Transcript does not intercept -- so previously uv's real error
-        # (e.g. the os-error-5 lock above) was lost and only the generic "exit
-        # code 2" survived. Piping through Write-Host routes every line through the
-        # PowerShell host, which the transcript ($LogFile.full.log) DOES capture --
-        # and, deliberately, NOT through Emit-Gui, so the verbose uv/pip output
-        # stays OUT of the structured ::biopb:: stream the wizard polls. (Teeing
-        # the hundreds of napari[all] lines into that stream swamped the GUI's
-        # per-line memo updates and froze the progress gauge at the step boundary.)
-        # In console mode Write-Host simply prints, matching the original installer.
-        # 2>&1 under EAP='Stop' can turn a benign uv stderr line into a terminating
-        # NativeCommandError, so soften EAP for the call and gate on the real exit
-        # code explicitly via Assert-LastExit.
+        # Start-Transcript does not intercept -- so the real error (e.g. the
+        # os-error-5 lock above) would otherwise be lost and only the generic
+        # "exit code 2" survive. The wizard now uses this streaming detail as its
+        # primary progress feedback (it no longer drives a determinate gauge, so
+        # the volume of uv/pip lines is no longer a problem). 2>&1 under EAP='Stop'
+        # can turn a benign uv stderr line into a terminating NativeCommandError,
+        # so soften EAP for the call and gate on the real exit code via Assert-LastExit.
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        uv @installArgs 2>&1 | ForEach-Object { Write-Host "$_" }
+        uv @installArgs 2>&1 | ForEach-Object { Report-Detail "$_" }
         $ErrorActionPreference = $prevEAP
         Assert-LastExit "biopb install"
     } finally {

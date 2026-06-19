@@ -10,10 +10,13 @@
 ;   Inno's Exec() blocks and cannot stream a child's stdout. So the engine is
 ;   told -LogFile <path>: it appends each tagged record to that file (no BOM,
 ;   UTF-8). We launch the engine with ewNoWait (non-blocking) and poll the file
-;   on a Sleep loop, parsing new lines into the progress gauge, the status text,
-;   and a scrolling log memo. The engine's terminal ::biopb::DONE|<code> record
-;   ends the loop. A full transcript (incl. uv output) is written to
-;   <LogFile>.full.log for diagnosing failures.
+;   on a Sleep loop, appending each new line to a scrolling log memo -- the
+;   PRIMARY progress feedback -- under an indeterminate (marquee) bar plus a
+;   one-line status. (We dropped the determinate n/total gauge: its updates were
+;   finicky and could skip a step. The streaming console log -- every step plus
+;   the raw uv/pip detail -- gives a truer sense of progress and surfaces the
+;   diagnostics in view.) The engine's terminal ::biopb::DONE|<code> record ends
+;   the loop. A full transcript is also written to <LogFile>.full.log.
 ;
 ; Compiles with Inno Setup 6.x (iscc). See docs/windows-installer.md.
 ;
@@ -77,7 +80,7 @@ var
   CbBioformats: TNewCheckBox;
   CbRemote:     TNewCheckBox;
   DataDirPage:  TInputDirWizardPage;
-  ProgressPage: TOutputProgressWizardPage;
+  ProgressPage: TOutputMarqueeProgressWizardPage;
   LogMemo:      TNewMemo;
 
   { Existing-config detection (mirrors the console "keep current config" path) }
@@ -99,6 +102,15 @@ var
 { Win32 millisecond tick counter -- not a built-in Inno identifier. }
 function GetTickCount: DWord;
   external 'GetTickCount@kernel32.dll stdcall';
+
+{ Win32 SendMessage + scroll constants: TNewMemo has no built-in "scroll to
+  bottom", so we post a WM_VSCROLL/SB_BOTTOM after each line for console-style
+  auto-follow (the newest line stays visible). }
+const
+  WM_VSCROLL = $0115;
+  SB_BOTTOM  = 7;
+function SendMessage(hWnd: HWND; Msg: UINT; wParam: Longint; lParam: Longint): Longint;
+  external 'SendMessageW@user32.dll stdcall';
 
 { Add one option to the custom page: a checkbox at the current Y, then its
   description wrapped on the line(s) directly underneath (indented under the
@@ -175,10 +187,15 @@ begin
     hang the server's directory scan. Matches the console installer's fallback. }
   DataDirPage.Values[0] := AddBackslash(GetEnv('USERPROFILE')) + 'Microscopy';
 
-  { Custom progress page: gauge + two status lines (native) plus a scrolling log
-    memo we parent onto the page surface, below the gauge. }
-  ProgressPage := CreateOutputProgressPage('Installing biopb',
-    'Setting up the biopb stack on your computer.');
+  { Progress page. We deliberately DROP the step-counting determinate gauge -- its
+    n/total updates proved finicky and could skip a step -- in favor of an
+    indeterminate MARQUEE page that simply animates "working...", with the REAL
+    feedback being the scrolling log memo below. The memo streams the engine's full
+    console output live (every step plus the raw uv/pip detail), so the user gets a
+    genuine sense of progress and the diagnostic detail is in plain view instead of
+    buried in the log file. The marquee is pumped via .Animate in the poll loop. }
+  ProgressPage := CreateOutputMarqueeProgressPage('Installing biopb',
+    'Setting up the biopb stack on your computer. This can take several minutes.');
 
   LogMemo := TNewMemo.Create(WizardForm);
   LogMemo.Parent     := ProgressPage.Surface;
@@ -221,8 +238,10 @@ end;
 procedure AddLog(const S: String);
 begin
   LogMemo.Lines.Add(S);
-  { Mirror the most recent line under the gauge so the user always sees activity
-    even without scrolling the memo. }
+  { Console-style auto-follow: keep the newest line visible without the user
+    having to scroll. }
+  SendMessage(LogMemo.Handle, WM_VSCROLL, SB_BOTTOM, 0);
+  { Mirror the most recent line as the one-line status above the log. }
   ProgressPage.SetText(CurStepText, S);
 end;
 
@@ -257,10 +276,10 @@ begin
 
     if tag = 'STEP' then
     begin
-      { rest = n|total|msg }
+      { rest = n|total|msg. The marquee page has no determinate position to set;
+        we render the step as a header line + the one-line status. }
       p := Pos('|', rest); nStr := Copy(rest, 1, p - 1); rem := Copy(rest, p + 1, Length(rest));
       p := Pos('|', rem);  totStr := Copy(rem, 1, p - 1); msg := Copy(rem, p + 1, Length(rem));
-      ProgressPage.SetProgress(StrToIntDef(nStr, 0), StrToIntDef(totStr, 7));
       CurStepText := '[' + nStr + '/' + totStr + ']  ' + msg;
       ProgressPage.SetText(CurStepText, '');
       AddLog(CurStepText);
@@ -311,7 +330,6 @@ begin
   CurStepText := 'Starting the biopb installer...';
 
   ProgressPage.SetText(CurStepText, '');
-  ProgressPage.SetProgress(0, 7);
   ProgressPage.Show;
   try
     if not Exec('powershell.exe', BuildEngineArgs(LogPath), '', SW_HIDE, ewNoWait, ResultCode) then
@@ -320,6 +338,9 @@ begin
     StartTick := GetTickCount;
     repeat
       Sleep(200);
+      { Advance the indeterminate marquee so it visibly animates during this
+        blocking poll loop (the bar is not driven by a message pump here). }
+      ProgressPage.Animate;
       try
         if LoadStringsFromFile(LogPath, Lines) then
         begin
