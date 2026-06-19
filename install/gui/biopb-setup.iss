@@ -39,6 +39,14 @@ AppPublisherURL={#AppURL}
 ; Per-user, no admin: no UAC prompt, works on locked-down lab machines.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+; Native x64 only. x64os refuses to run on ARM64 (and 32-bit x86), so we never
+; reach a doomed install: key deps (pyarrow, the napari Qt stack) lack win-arm64
+; wheels. InstallIn64BitMode makes the (always-32-bit) setup.exe run in 64-bit
+; mode on x64, so Exec("powershell.exe") launches the 64-bit PowerShell rather
+; than the WOW64 32-bit one (which reports PROCESSOR_ARCHITECTURE=x86). Needs
+; Inno Setup 6.3+. (Requires Inno 6.3+ for the x64os identifier.)
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
 DefaultDirName={localappdata}\biopb
 DisableProgramGroupPage=yes
 OutputBaseFilename=biopb-setup-{#AppVersion}

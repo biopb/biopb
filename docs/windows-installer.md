@@ -25,6 +25,14 @@ have**, not replace it.
 |---|---|---|
 | Distribution | **Online bootstrapper** | Ship a tiny signed `.exe` that stages the engine `.ps1`; the engine downloads wheels at run time (same as today). No fat bundle to sign per-arch. |
 | Scope | **Per-user, no admin** | `%USERPROFILE%` / `%LOCALAPPDATA%`, user PATH, no UAC. Works for grad students on locked-down machines. → **Inno Setup**, not WiX/MSI. |
+| Architecture | **Native x64 only** | ARM64 is rejected (not silently attempted): key deps (pyarrow, the napari Qt stack) lack win-arm64 wheels, so a native ARM64 install would fail downstream. Inno `ArchitecturesAllowed=x64os` refuses ARM64/x86 at launch; the engine also gates on the true arch. |
+
+**WOW64 note:** Inno's `setup.exe` is always 32-bit, so a launched `powershell.exe`
+gets WOW64-redirected to the 32-bit PowerShell, where `PROCESSOR_ARCHITECTURE`
+reads `x86` even on x64. Two defenses: `ArchitecturesInstallIn64BitMode=x64os`
+makes Exec launch the **64-bit** PowerShell, and the engine reads
+`PROCESSOR_ARCHITEW6432` (the true arch) before falling back to
+`PROCESSOR_ARCHITECTURE`.
 
 Per-machine / GPO mass-deployment for managed lab fleets (WiX/MSI) is explicitly
 *out of scope for v1* — kept in reserve for that audience.

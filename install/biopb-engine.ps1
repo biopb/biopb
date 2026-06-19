@@ -613,11 +613,17 @@ function Invoke-BiopbInstall {
     # ===== 0. System Check =====
     Report-Step 0 "Checking system..."
 
-    $arch = $env:PROCESSOR_ARCHITECTURE
+    # A 32-bit (WOW64) PowerShell -- which a 32-bit installer launches -- reports
+    # PROCESSOR_ARCHITECTURE = "x86" even on a 64-bit OS; the real arch is in
+    # PROCESSOR_ARCHITEW6432. Prefer the latter so we detect the true machine.
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
     switch ($arch) {
         "AMD64" { }
-        "ARM64" { }
-        default { throw "Unsupported architecture: $arch (supported: AMD64, ARM64)" }
+        "ARM64" {
+            throw "Windows on ARM64 is not supported yet: key dependencies (pyarrow, the napari Qt stack) do not ship native Windows ARM64 wheels. Use an x64 (Intel/AMD) Windows machine."
+        }
+        default { throw "Unsupported architecture: $arch (supported: AMD64 / x64)" }
     }
     Report-Ok "Platform: Windows ($arch)"
 
