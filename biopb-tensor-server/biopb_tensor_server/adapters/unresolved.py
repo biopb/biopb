@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter, to_catalog_url
 from biopb_tensor_server.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
@@ -108,7 +108,7 @@ class UnresolvedSourceAdapter(SourceAdapter):
             return self._resolved.get_source_descriptor()
         return DataSourceDescriptor(
             source_id=self.source_id,
-            source_url=self._source_url,
+            source_url=to_catalog_url(self._source_url),
             source_type=self._source_type,
             tensors=[],
             metadata_json="",
