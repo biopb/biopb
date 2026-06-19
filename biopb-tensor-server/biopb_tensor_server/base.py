@@ -20,6 +20,7 @@ Caching behavior depends on the configured CacheManager backend:
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import lcm
@@ -59,6 +60,43 @@ if TYPE_CHECKING:
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
+
+
+# A real URL scheme is 2+ chars followed by "://" (so a bare Windows drive
+# "C:\..." — one char then ":" then "\" — never matches).
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]+://")
+# A forward-slashed Windows absolute path: "C:/Users/...".
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def to_catalog_url(raw: str) -> str:
+    """Normalize a source's URL for the catalog (the descriptor's ``source_url``).
+
+    Local filesystem paths are rewritten to a forward-slash ``file://`` form so a
+    Windows-indexed catalog is byte-for-byte consistent with a POSIX one and every
+    consumer can split on ``/`` alone (biopb/biopb#131)::
+
+        C:\\Users\\me\\Screenshots 1\\img.png  ->  file:///C:/Users/me/Screenshots 1/img.png
+        /data/cells/img.tif                    ->  file:///data/cells/img.tif
+
+    Separators only: spaces / unicode are left literal for readability, not
+    percent-encoded. Already-schemed URLs are returned unchanged — remote stores
+    (s3://, http://, …), an existing ``file://``, and virtual schemes (cache://).
+
+    This is display/catalog only and must not be fed back to the filesystem
+    (callers keep the raw path for that). ``source_id`` is unaffected: it hashes
+    the resolved path, not this string, so the normalization needs no re-index.
+    """
+    if not raw:
+        return raw
+    if _URL_SCHEME_RE.match(raw):
+        return raw  # already a URL (remote / file:// / cache:// / …)
+    fwd = raw.replace("\\", "/")
+    if _WIN_DRIVE_RE.match(fwd):
+        return "file:///" + fwd  # Windows absolute -> file:///C:/...
+    if fwd.startswith("/"):
+        return "file://" + fwd  # POSIX absolute -> file:///data/... (// + /data)
+    return "file:///" + fwd.lstrip("/")  # relative / other: best effort
 
 
 @dataclass
@@ -198,7 +236,7 @@ class SourceAdapter(ABC):
         """
         return DataSourceDescriptor(
             source_id=self.source_id,
-            source_url=self._source_url,
+            source_url=to_catalog_url(self._source_url),
             source_type=self._source_type,
             tensors=self.list_tensor_descriptors(),
             metadata_json="",  # filled by GetFlightInfo()
