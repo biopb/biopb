@@ -791,14 +791,13 @@ class TestAicsImageIoAdapterClaim:
 
                 assert claim is None, f"AicsImageIoAdapter should not claim {ext} files"
 
-    def test_claim_image_files_accepted(self):
-        """Standard image file types should be claimed."""
+    def test_microscopy_files_always_claimed(self):
+        """Microscopy/scientific extensions are claimed regardless of the flag."""
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Test standard image formats (extensions only, content doesn't matter for claim)
-            for ext in [".png", ".jpg", ".gif", ".bmp"]:
+            for ext in [".tif", ".tiff", ".mrc", ".ims", ".fits", ".nrrd"]:
                 path = Path(tmpdir) / f"test{ext}"
                 path.write_bytes(b"\x00")  # Dummy content
 
@@ -808,3 +807,49 @@ class TestAicsImageIoAdapterClaim:
 
                 assert claim is not None, f"AicsImageIoAdapter should claim {ext} files"
                 assert claim.source_type == "aics"
+
+    def test_generic_images_rejected_by_default(self):
+        """Generic raster/video must NOT be claimed during discovery by default
+        (biopb/biopb#40) — they flood the catalog with screenshots/icons/movies."""
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for ext in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".mp4", ".mov"]:
+                path = Path(tmpdir) / f"test{ext}"
+                path.write_bytes(b"\x00")
+
+                ctx = ClaimContext(path)
+                state = DiscoveryState()
+                claim = AicsImageIoAdapter.claim(ctx, state)
+
+                assert claim is None, (
+                    f"AicsImageIoAdapter should not claim generic {ext} by default"
+                )
+
+    def test_generic_images_claimed_when_opted_in(self):
+        """With claim_generic_images enabled, generic raster/video are claimed."""
+        from biopb_tensor_server.adapters.aicsimageio import (
+            AicsImageIoAdapter,
+            set_claim_generic_images,
+        )
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        set_claim_generic_images(True)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for ext in [".png", ".jpg", ".gif", ".bmp", ".mp4"]:
+                    path = Path(tmpdir) / f"test{ext}"
+                    path.write_bytes(b"\x00")
+
+                    ctx = ClaimContext(path)
+                    state = DiscoveryState()
+                    claim = AicsImageIoAdapter.claim(ctx, state)
+
+                    assert claim is not None, (
+                        f"AicsImageIoAdapter should claim {ext} when opted in"
+                    )
+                    assert claim.source_type == "aics"
+        finally:
+            # Restore the process-wide default so other tests are unaffected.
+            set_claim_generic_images(False)
