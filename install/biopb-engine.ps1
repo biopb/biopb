@@ -99,15 +99,19 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 $script:ReportMode = $Mode
 $script:TotalSteps = 7
 $script:McpNeedsManual = $false
-$script:LogWriter = $null   # StreamWriter to the structured -LogFile (gui mode)
+$script:LogFilePath = $null   # structured -LogFile path (gui mode); appended per record
 
 # Emit one tagged record in gui mode: to stdout (for parents that can read it)
-# AND, when a -LogFile writer is open, to that file (the transport Inno polls).
+# AND, when a -LogFile is active, APPENDED to that file. We append-and-close per
+# record (no persistent handle) rather than holding a StreamWriter open, because
+# the Inno wizard polls the file with a deny-write share that a held-open write
+# handle blocks -- which froze the progress bar until the install finished. With
+# per-record appends the file is unlocked between writes, so reads succeed live.
 function Emit-Gui {
     param([string]$Record)
     Write-Output $Record
-    if ($script:LogWriter) {
-        try { $script:LogWriter.WriteLine($Record); $script:LogWriter.Flush() } catch { }
+    if ($script:LogFilePath) {
+        try { [System.IO.File]::AppendAllText($script:LogFilePath, $Record + "`r`n", (New-Object System.Text.UTF8Encoding($false))) } catch { }
     }
 }
 
@@ -567,9 +571,12 @@ function Invoke-BiopbInstall {
     # for diagnosing a failure. Both best-effort -- never block the install.
     $transcriptOn = $false
     if ($Mode -eq 'gui' -and $LogFile) {
+        # Truncate/create the structured log fresh, then append per record (see
+        # Emit-Gui) so the wizard can read it live without a share conflict.
         try {
-            $script:LogWriter = New-Object System.IO.StreamWriter($LogFile, $false, (New-Object System.Text.UTF8Encoding($false)))
-        } catch { $script:LogWriter = $null }
+            [System.IO.File]::WriteAllText($LogFile, '', (New-Object System.Text.UTF8Encoding($false)))
+            $script:LogFilePath = $LogFile
+        } catch { $script:LogFilePath = $null }
         try { Start-Transcript -Path "$LogFile.full.log" -Force | Out-Null; $transcriptOn = $true } catch { }
     }
 
@@ -918,13 +925,9 @@ monitor = true
         if ($Mode -eq 'gui') { Emit-Gui "::biopb::DONE|1" }
         throw
     } finally {
-        # Always flush/close the structured log and stop the transcript, even if a
-        # step threw -- DONE has already been emitted above, so it lands in a
-        # closed, complete file the wizard can trust.
-        if ($script:LogWriter) {
-            try { $script:LogWriter.Flush(); $script:LogWriter.Close() } catch { }
-            $script:LogWriter = $null
-        }
+        # Nothing to close -- records are appended per line (no held handle), and
+        # DONE was emitted above so the file is already complete for the wizard.
+        $script:LogFilePath = $null
         if ($transcriptOn) { try { Stop-Transcript | Out-Null } catch { } }
     }
 }
@@ -953,7 +956,10 @@ function Invoke-BiopbUninstall {
     )
 
     if ($Mode -eq 'gui' -and $LogFile) {
-        try { $script:LogWriter = New-Object System.IO.StreamWriter($LogFile, $false, (New-Object System.Text.UTF8Encoding($false))) } catch { $script:LogWriter = $null }
+        try {
+            [System.IO.File]::WriteAllText($LogFile, '', (New-Object System.Text.UTF8Encoding($false)))
+            $script:LogFilePath = $LogFile
+        } catch { $script:LogFilePath = $null }
     }
     try {
         Report-Step 1 "Stopping data server..."
@@ -994,10 +1000,8 @@ function Invoke-BiopbUninstall {
         if ($Mode -eq 'gui') { Emit-Gui "::biopb::DONE|1" }
         throw
     } finally {
-        if ($script:LogWriter) {
-            try { $script:LogWriter.Flush(); $script:LogWriter.Close() } catch { }
-            $script:LogWriter = $null
-        }
+        # Nothing to close -- records are appended per line (no held handle).
+        $script:LogFilePath = $null
     }
 }
 
