@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Inno Setup local build output (the GUI installer .exe is produced by CI)
+install/gui/Output/
+
 # C extensions
 *.so
 
