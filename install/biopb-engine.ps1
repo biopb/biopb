@@ -260,6 +260,14 @@ function Merge-McpJson {
 function Set-McpClients {
     param([string]$BiopbHome, [string]$ConfigDir, [switch]$NoRemotePlugins)
 
+    # Best-effort agent wiring must never abort the install. Under the script's
+    # ErrorActionPreference='Stop', a native CLI that writes to stderr -- e.g.
+    # `claude mcp get biopb` when biopb is not registered yet -- raises a
+    # TERMINATING NativeCommandError in Windows PowerShell 5.1, even with *>$null.
+    # Soften it for this function only (function-scoped) so that probe can't kill
+    # the install; we gate on $LASTEXITCODE explicitly below.
+    $ErrorActionPreference = 'SilentlyContinue'
+
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
@@ -392,6 +400,11 @@ $processImageServers
 # Best-effort and idempotent: a client that was never registered is a no-op.
 function Remove-McpClients {
     param([string]$BiopbHome)
+
+    # Best-effort (see Set-McpClients): soften EAP for this function so a native
+    # CLI writing to stderr (e.g. removing a server that isn't registered) can't
+    # raise a terminating error under the script's ErrorActionPreference='Stop'.
+    $ErrorActionPreference = 'SilentlyContinue'
 
     # Claude Code (via the CLI).
     if (Get-Command claude -ErrorAction SilentlyContinue) {
