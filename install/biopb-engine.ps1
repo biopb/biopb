@@ -327,19 +327,21 @@ $processImageServers
 
     # --- Claude Code (managed through the `claude` CLI) ---
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        & claude mcp get biopb *> $null
+        # Register idempotently with config-only commands. Do NOT probe with
+        # `claude mcp get`: it runs a live CONNECTION test, which makes the claude
+        # CLI spawn `biopb-mcp`. claude is a Node app and launches that console
+        # child WITHOUT hiding its window, so under the GUI installer (engine runs
+        # hidden) a stray console window pops up and lingers after the install.
+        # `remove` (a harmless no-op when absent) followed by `add` only edits
+        # claude's config -- neither connects -- so it is idempotent and windowless.
+        & claude mcp remove biopb -s user *> $null
+        & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
         if ($LASTEXITCODE -eq 0) {
-            Report-Ok "Claude Code: biopb already registered"
+            Report-Ok "Claude Code: registered biopb (user scope)"
             $needToShowMcpConfig = $false
         } else {
-            & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
-            if ($LASTEXITCODE -eq 0) {
-                Report-Ok "Claude Code: registered biopb (user scope)"
-                $needToShowMcpConfig = $false
-            } else {
-                Report-Warn "Claude Code detected but registration failed - add it manually:"
-                Report-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
-            }
+            Report-Warn "Claude Code detected but registration failed - add it manually:"
+            Report-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
         }
     }
 
@@ -716,6 +718,21 @@ function Invoke-BiopbInstall {
     # ===== 3. Install biopb packages =====
     Report-Step 3 "Installing biopb packages..."
 
+    # On Windows a running biopb process keeps its executables under the uv tool
+    # dir open, so `uv tool install --force` cannot delete that dir to reinstall
+    # and aborts with "Access is denied" (os error 5) -> uv exit code 2. Stop any
+    # previously installed biopb daemons -- the data server AND the biopb-mcp
+    # server (which also owns a detached napari kernel) -- so the upgrade can
+    # replace the locked binaries. Best-effort (try/catch swallows the benign
+    # "nothing running" stderr that would otherwise raise a terminating
+    # NativeCommandError) and a no-op on a clean machine. Done before the downloads
+    # so the OS has time to release the handles.
+    if (Get-Command biopb -ErrorAction SilentlyContinue) {
+        try { & biopb server stop *> $null } catch { }
+        try { & biopb mcp stop    *> $null } catch { }
+        Report-Detail "stopped any running biopb daemons (data + mcp) so their files can be replaced"
+    }
+
     $tensorExtras = "web,aics,medical,ndtiff,hdf5"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
@@ -772,7 +789,24 @@ function Invoke-BiopbInstall {
 
     Report-Info "Installing biopb into one shared environment..."
     try {
-        uv @installArgs
+        # Capture uv's own stdout+stderr so a failure is diagnosable. A native
+        # child run UNPIPED writes straight to the console handle, which
+        # Start-Transcript does not intercept -- so previously uv's real error
+        # (e.g. the os-error-5 lock above) was lost and only the generic "exit
+        # code 2" survived. Piping through Write-Host routes every line through the
+        # PowerShell host, which the transcript ($LogFile.full.log) DOES capture --
+        # and, deliberately, NOT through Emit-Gui, so the verbose uv/pip output
+        # stays OUT of the structured ::biopb:: stream the wizard polls. (Teeing
+        # the hundreds of napari[all] lines into that stream swamped the GUI's
+        # per-line memo updates and froze the progress gauge at the step boundary.)
+        # In console mode Write-Host simply prints, matching the original installer.
+        # 2>&1 under EAP='Stop' can turn a benign uv stderr line into a terminating
+        # NativeCommandError, so soften EAP for the call and gate on the real exit
+        # code explicitly via Assert-LastExit.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        uv @installArgs 2>&1 | ForEach-Object { Write-Host "$_" }
+        $ErrorActionPreference = $prevEAP
         Assert-LastExit "biopb install"
     } finally {
         if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
@@ -963,8 +997,14 @@ function Invoke-BiopbUninstall {
     }
     try {
         Report-Step 1 "Stopping data server..."
-        if (Get-Command biopb -ErrorAction SilentlyContinue) { try { & biopb server stop *> $null } catch { } }
-        Report-Ok "Data server stopped (if it was running)"
+        # Stop the data server AND the biopb-mcp server (+ its napari kernel):
+        # both lock executables under the uv tool dir, so a still-running daemon
+        # would make `uv tool uninstall` fail to remove the dir on Windows.
+        if (Get-Command biopb -ErrorAction SilentlyContinue) {
+            try { & biopb server stop *> $null } catch { }
+            try { & biopb mcp stop    *> $null } catch { }
+        }
+        Report-Ok "Data server and MCP server stopped (if they were running)"
 
         Report-Step 2 "Removing biopb packages..."
         if (Get-Command uv -ErrorAction SilentlyContinue) {
