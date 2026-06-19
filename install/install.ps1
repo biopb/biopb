@@ -225,6 +225,14 @@ function Merge-McpJson {
 function Set-McpClients {
     param([string]$BiopbHome, [string]$ConfigDir)
 
+    # Best-effort agent wiring must never abort the install. Under the script's
+    # ErrorActionPreference='Stop', a native CLI that writes to stderr -- e.g.
+    # `claude mcp get biopb` when biopb is not registered yet -- raises a
+    # TERMINATING NativeCommandError in Windows PowerShell 5.1, even with *>$null.
+    # Soften it for this function only (function-scoped) so that probe can't kill
+    # the install; we gate on $LASTEXITCODE explicitly below.
+    $ErrorActionPreference = 'SilentlyContinue'
+
     $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
     if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
 
