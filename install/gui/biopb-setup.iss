@@ -80,6 +80,11 @@ var
   ProgressPage: TOutputProgressWizardPage;
   LogMemo:      TNewMemo;
 
+  { Existing-config detection (mirrors the console "keep current config" path) }
+  ConfigPath:   String;
+  ConfigExists: Boolean;
+  KeepConfig:   Boolean;
+
   { Parser/loop state }
   CurStepText:  String;
   EngineDone:   Boolean;
@@ -152,13 +157,23 @@ begin
     True, ScaleY(50));
 
   { Data-directory page -> engine -DataDir, placed right after the options page. }
+  { Detect a previous install the same way the engine/console do: the config is
+    at a fixed home-relative path (covers both GUI and `irm|iex` console
+    installs). If present, we offer to keep it (see NextButtonClick). }
+  ConfigPath   := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.toml';
+  ConfigExists := FileExists(ConfigPath);
+  KeepConfig   := False;
+
   DataDirPage := CreateInputDirPage(OptionsPage.ID,
     'Microscopy data directory',
     'Where are the images biopb should serve?',
     'biopb will index this folder. You can change it later in biopb.toml.',
     False, '');
   DataDirPage.Add('');
-  DataDirPage.Values[0] := ExpandConstant('{userdocs}\Microscopy');
+  { Default under the profile root, NOT the Documents folder: Documents is
+    frequently OneDrive-redirected, and OneDrive "Files On-Demand" placeholders
+    hang the server's directory scan. Matches the console installer's fallback. }
+  DataDirPage.Values[0] := AddBackslash(GetEnv('USERPROFILE')) + 'Microscopy';
 
   { Custom progress page: gauge + two status lines (native) plus a scrolling log
     memo we parent onto the page surface, below the gauge. }
@@ -185,7 +200,12 @@ begin
   Args := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\biopb-engine.ps1') + '"';
   Args := Args + ' -Mode gui';
   Args := Args + ' -LogFile "' + LogPath + '"';
-  Args := Args + ' -DataDir "' + DataDirPage.Values[0] + '"';
+  { Keep -> leave biopb.toml untouched (engine honors -KeepConfig); otherwise
+    (re)write it pointing at the chosen folder. }
+  if KeepConfig then
+    Args := Args + ' -KeepConfig'
+  else
+    Args := Args + ' -DataDir "' + DataDirPage.Values[0] + '"';
   if CbViewer.Checked     then Args := Args + ' -Webapp';
   if CbBioformats.Checked then Args := Args + ' -Bioformats';
   { Default ON; unchecking it disables the off-site cellpose server (IP logging). }
@@ -340,13 +360,27 @@ begin
     RunEngine;
 end;
 
-{ Surface the engine's results on the final page. }
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if CurPageID = wpFinished then
-    { no-op hook; reserved for opening the data browser, etc. }
-    ;
+  { Leaving the options page with an existing config present: ask whether to keep
+    it -- the GUI equivalent of the console/Linux "Keep my current config file
+    (default)" choice. Yes -> keep untouched and skip the data-dir page; No ->
+    pick a new data folder (the engine backs up the old config and rewrites). }
+  if (CurPageID = OptionsPage.ID) and ConfigExists then
+    KeepConfig := (MsgBox(
+      'An existing biopb configuration was found:' + #13#10 +
+      ConfigPath + #13#10#13#10 +
+      'Keep your current configuration (data folder and settings)?' + #13#10#13#10 +
+      'Yes  -  keep it unchanged' + #13#10 +
+      'No   -  choose a new microscopy data folder (the old config is backed up)',
+      mbConfirmation, MB_YESNO) = IDYES);
+end;
+
+{ Skip the data-directory page when the user chose to keep their current config. }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = DataDirPage.ID) and KeepConfig;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);

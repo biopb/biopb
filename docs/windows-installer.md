@@ -110,10 +110,23 @@ release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring h
 | Wizard page | Feeds | Replaces |
 |---|---|---|
 | Welcome / license | — | — |
-| Components | `-Webapp`, `-Bioformats` | `Select-Components` |
+| Options (custom page) | `-Webapp`, `-Bioformats`, `-NoRemotePlugins` | `Select-Components` + remote-plugins consent |
+| Keep-config dialog | `-KeepConfig` (or proceed to data dir) | `Select-DataDir -KeepOption` |
 | Data directory | `-DataDir` | `Select-DataDir` |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
+
+**Existing config / keep behavior.** On leaving the Options page the wizard
+checks for `%USERPROFILE%\.config\biopb\biopb.toml` (a fixed path, so it catches
+both prior GUI *and* `irm|iex` console installs). If present, a Yes/No dialog
+offers to keep the current configuration — the GUI equivalent of the
+console/Linux "Keep my current config file (default)". **Yes** passes
+`-KeepConfig` (engine leaves `biopb.toml` untouched) and skips the data-dir page;
+**No** shows the data-dir page and the engine backs up + rewrites. We do not
+pre-read the existing data dir (a config may hold multiple `[[sources]]` and the
+engine rewrites a fixed template anyway, so "keep" means *don't touch the file*).
+The data-dir default is `%USERPROFILE%\Microscopy`, not Documents, matching the
+console's OneDrive-avoiding choice.
 
 Inno gives the **uninstaller + Add/Remove Programs entry for free** — something
 the CLI install can't offer today.
