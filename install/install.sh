@@ -675,6 +675,29 @@ _start_data_server() {
     _ok "Data server ready — $count data source(s) found; pre-caching overviews"
 }
 
+# Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
+# effect. UNLIKE the data server we deliberately do NOT restart it: the MCP
+# daemon owns a *visible* napari viewer and is brought up on demand by each AI
+# client's stdio bridge, so a plain stop is enough — the next agent reconnect
+# spawns a fresh (new-code) daemon via ensure_daemon, without the installer
+# popping a viewer window the user never asked for. Stopping does close any open
+# viewer and drops live agent sessions, so we announce it, and only act when a
+# daemon is actually running (a first install / not-running case stays silent).
+_stop_mcp_server() {
+    command -v biopb >/dev/null 2>&1 || return 0
+
+    # `biopb mcp status --json` -> {"running": true|false, ...}. Only proceed on
+    # a live daemon so nothing is printed (or torn down) when none is up.
+    if ! biopb mcp status --json 2>/dev/null \
+        | grep -q '"running"[[:space:]]*:[[:space:]]*true'; then
+        return 0
+    fi
+
+    _info "Stopping the biopb MCP server so the update takes effect"
+    _info "  (this closes any open napari viewer; it restarts on demand)"
+    biopb mcp stop >/dev/null 2>&1 || true
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -992,6 +1015,11 @@ install_biopb() {
         --with "$napari_req"
         --with-executables-from biopb-mcp
     )
+
+    # Retire any running old-code MCP daemon before the new wheels land, so the
+    # next agent reconnect brings up the just-installed code (the daemon is
+    # spawned on demand, so there is nothing to restart here).
+    _stop_mcp_server
 
     _info "Installing biopb into one shared environment..."
     uv tool install "${install_args[@]}"
