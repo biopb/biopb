@@ -328,6 +328,33 @@ class TestDefaultConfig:
         # Dashboard binds loopback only, matching the server security model.
         assert dask["dashboard_address"].startswith("127.0.0.1")
 
+    def test_platform_dependent_bringup_defaults(self):
+        """startup_timeout / num_workers defaults track the platform.
+
+        Windows has no fork(), so dask LocalCluster workers cold-spawn (a full
+        stack re-import each); the defaults widen the startup budget and cap the
+        worker count there, while POSIX keeps the lean values. Asserted against
+        the module's own platform constants so the test is correct on whichever
+        OS runs it, and guards that DEFAULT_CONFIG is actually wired to them.
+        """
+        import os
+
+        from biopb_mcp import _config
+
+        kernel = DEFAULT_CONFIG["mcp"]["kernel"]
+        dask = DEFAULT_CONFIG["mcp"]["dask"]
+        if os.name == "nt":
+            assert _config._IS_WINDOWS is True
+            assert kernel["startup_timeout"] == 120.0
+            assert dask["num_workers"] == 4
+        else:
+            assert _config._IS_WINDOWS is False
+            assert kernel["startup_timeout"] == 60.0
+            assert dask["num_workers"] == 0
+        # Either way DEFAULT_CONFIG uses the computed constants, not literals.
+        assert kernel["startup_timeout"] == _config._DEFAULT_STARTUP_TIMEOUT
+        assert dask["num_workers"] == _config._DEFAULT_DASK_NUM_WORKERS
+
     def test_mcp_tensor_health_poll_defaults(self):
         """The background source watcher's backoff bounds (issue #44)."""
         tensor = DEFAULT_CONFIG["mcp"]["tensor"]
