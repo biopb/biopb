@@ -74,20 +74,19 @@ def _daemon_command(port):
 def _open_daemon_log(config):
     """Open the file the detached daemon's stdout/stderr is sent to.
 
-    Reuses ``mcp.transport.kernel_log`` (empty -> <log dir>/kernel.log): the
-    daemon's fds are inherited by its child kernel, so this file carries the
-    same native Qt/GL/dask/gRPC output the key always named — plus the
-    daemon's own logs. Binary, append, unbuffered, for the same reason the
-    kernel redirection always was: native writers emit arbitrary bytes. On
-    failure, falls back to the shim's stderr buffer so the daemon still
-    starts (its output then interleaves with the shim's logging — harmless,
-    stderr is not a protocol channel).
+    The canonical daemon log (``mcp.transport.kernel_log``, empty ->
+    <log dir>/kernel.log) shared with the ``biopb mcp`` CLI so `mcp logs` /
+    `status` read whatever this writes: the daemon's fds are inherited by its
+    child kernel, so this file carries the same native Qt/GL/dask/gRPC output
+    the key always named — plus the daemon's own logs. Binary, append,
+    unbuffered, for the same reason the kernel redirection always was: native
+    writers emit arbitrary bytes. On failure, falls back to the shim's stderr
+    buffer so the daemon still starts (its output then interleaves with the
+    shim's logging — harmless, stderr is not a protocol channel).
     """
-    from .._config import get_log_dir, get_setting
+    from .._config import get_daemon_log_file
 
-    path = get_setting(config, "mcp.transport.kernel_log") or str(
-        get_log_dir() / "kernel.log"
-    )
+    path = str(get_daemon_log_file(config))
     try:
         return open(path, "ab", buffering=0)
     except OSError:

@@ -31,7 +31,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -377,6 +377,28 @@ def get_log_dir() -> Path:
     log_dir = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+def get_daemon_log_file(config: Optional[dict] = None) -> Path:
+    """Path of the http daemon's combined stdout/stderr log.
+
+    The daemon logs to stderr (``logging.basicConfig`` in ``biopb_mcp.mcp``);
+    whoever launches it redirects that stream into this file. A *single*
+    canonical location so every launcher (the stdio shim's ``ensure_daemon``,
+    the ``biopb mcp start`` CLI, a manual ``python -m biopb_mcp.mcp``) and every
+    reader (``biopb mcp logs`` / ``status``) agree on one file regardless of who
+    started the daemon -- otherwise a shim-spawned daemon logs to ``kernel.log``
+    while the CLI reads ``mcp-server.log`` and wrongly reports the server "never
+    started". Honors ``mcp.transport.kernel_log`` if set, else
+    ``<log dir>/kernel.log``. ``config`` is loaded (cached singleton) when not
+    supplied; the shim passes the dict it already holds.
+    """
+    if config is None:
+        config = load_config()
+    override = get_setting(config, "mcp.transport.kernel_log")
+    if override:
+        return Path(override)
+    return get_log_dir() / "kernel.log"
 
 
 def get_pid_file() -> Path:
