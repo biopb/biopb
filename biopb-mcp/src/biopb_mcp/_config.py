@@ -37,6 +37,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Platform-dependent defaults for the two kernel-bring-up knobs that Windows
+# pays a structural penalty on. Windows has no fork(): dask's multi-process
+# LocalCluster must *spawn* every worker -- a fresh interpreter that re-imports
+# the whole numpy/dask/distributed stack cold -- where Linux/macOS fork near-
+# free via copy-on-write. With num_workers=0 (dask picks ~n_cores) that
+# spawn+reimport storm both lengthens kernel bring-up (risking startup_timeout)
+# and multiplies memory. So on Windows we cap the worker count and widen the
+# startup budget; POSIX keeps the lean defaults. A user config.json still
+# overrides either leaf on any platform (deep-merge), so this only sets the
+# floor for an unconfigured install.
+_IS_WINDOWS = os.name == "nt"
+_DEFAULT_STARTUP_TIMEOUT = 120.0 if _IS_WINDOWS else 60.0
+_DEFAULT_DASK_NUM_WORKERS = 4 if _IS_WINDOWS else 0
+
 # Default configuration values
 DEFAULT_CONFIG = {
     # Experimental napari demo widgets (image_processing/). Only those widgets
@@ -154,7 +168,10 @@ DEFAULT_CONFIG = {
         },
         "kernel": {
             "name": "python3",
-            "startup_timeout": 60.0,
+            # 60.0 on POSIX; 120.0 on Windows, where the cold spawn+reimport of
+            # dask workers makes bring-up legitimately slower (see
+            # _DEFAULT_STARTUP_TIMEOUT).
+            "startup_timeout": _DEFAULT_STARTUP_TIMEOUT,
             # execute_timeout now bounds only the *quick* in-band kernel snippets
             # (screenshot / status / inspect / job submit+poll), not long jobs:
             # execute_code runs agent code in a background thread that may run
@@ -193,7 +210,10 @@ DEFAULT_CONFIG = {
             "scheduler": "distributed",
             # n_workers for the auto-spun LocalCluster (0 -> let dask pick,
             # ~n_cores). When connecting to an external scheduler this is ignored.
-            "num_workers": 0,
+            # 0 on POSIX (fork makes ~n_cores workers cheap); capped at 4 on
+            # Windows, where each worker is a cold spawn (see
+            # _DEFAULT_DASK_NUM_WORKERS).
+            "num_workers": _DEFAULT_DASK_NUM_WORKERS,
             # Non-empty -> connect to this external scheduler address; empty ->
             # spin a kernel-local LocalCluster.
             "address": "",
