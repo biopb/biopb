@@ -75,7 +75,7 @@ def _open_daemon_log(config):
     """Open the file the detached daemon's stdout/stderr is sent to.
 
     The canonical daemon log (``mcp.transport.kernel_log``, empty ->
-    <log dir>/kernel.log) shared with the ``biopb mcp`` CLI so `mcp logs` /
+    <log dir>/mcp-server.log) shared with the ``biopb mcp`` CLI so `mcp logs` /
     `status` read whatever this writes: the daemon's fds are inherited by its
     child kernel, so this file carries the same native Qt/GL/dask/gRPC output
     the key always named — plus the daemon's own logs. Binary, append,

@@ -146,7 +146,7 @@ client configs keep working unchanged), but stdio no longer serves MCP from
 the launcher process: it runs the **shim** (`mcp/_shim.py`) — a featherweight
 bridge that probes `127.0.0.1:<port>`, spawns the http daemon detached if
 nothing is listening (daemon + kernel output goes to `transport.kernel_log`,
-default `~/.local/share/biopb-mcp/log/kernel.log`), and pumps stdio JSON-RPC
+default `~/.local/share/biopb-mcp/log/mcp-server.log`), and pumps stdio JSON-RPC
 to `/mcp` until the client closes stdin. Concurrent shims race benignly (the
 port bind picks one daemon; losers exit on EADDRINUSE and every shim converges
 on the winner). The shim process owns fd 1 as a protocol channel but imports
@@ -324,7 +324,7 @@ both contexts — napari's `notification_manager` in the standalone plugin (set 
 never called — the kernel's `%gui qt` inputhook drives the loop and `run()`
 early-returns under an IPython loop — so napari's hooks are absent but the kernel's
 own hook covers it). The only difference is *where the error surfaces*: a GUI
-notification in the plugin vs. a printed traceback in the kernel output (kernel.log
+notification in the plugin vs. a printed traceback in the kernel output (mcp-server.log
 under stdio) for MCP. Verified empirically: a slot exception aborts with SIGABRT
 only under the default hook and exits cleanly under any override, and the ipykernel
 hook stays non-default through `enable_gui("qt")` and `napari.Viewer()`. Caveat:
@@ -351,7 +351,7 @@ The `mcp` section is grouped by concern:
 - **`mcp.transport`** — `kind` (`stdio`/`http`, default `stdio`; chosen at
   startup, also via `--transport`), `port` (8765), `display_mode`, `kernel_log`
   (stdio-only; where the kernel's native stdout/stderr is redirected so it can't
-  corrupt fd 1, default `~/.local/share/biopb-mcp/log/kernel.log`), and
+  corrupt fd 1, default `~/.local/share/biopb-mcp/log/mcp-server.log`), and
   `allowed_origins`/`allowed_hosts` (extra Host/Origin values appended to the
   loopback DNS-rebinding allowlist for a reverse-proxy front; http only).
 - **`mcp.kernel`** — `name`, `startup_timeout`, `execute_timeout` (120s; now

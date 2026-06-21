@@ -79,7 +79,7 @@ DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 # gets its own PID/log under biopb-mcp's XDG data dir (matching
 # biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The daemon
 # logs to ONE canonical file (biopb_mcp._config.get_daemon_log_file() ->
-# kernel.log) shared with the stdio shim, so `mcp logs` / `status` show the
+# mcp-server.log) shared with the stdio shim, so `mcp logs` / `status` show the
 # right log no matter who launched the daemon (the CLI's `mcp start`, or the
 # shim spawning it on demand for an AI client). The running daemon writes this
 # same PID file itself (biopb_mcp._config.get_pid_file()) regardless of who
@@ -1010,20 +1010,21 @@ def _get_mcp_log_file() -> Path:
     Unified with the stdio shim via biopb_mcp._config.get_daemon_log_file(), so
     `mcp start` (which redirects the daemon here) writes the SAME file the shim
     does -- and `mcp logs`/`status` therefore read the right one regardless of
-    launcher. Falls back to the in-package default (the same kernel.log name) if
-    biopb_mcp is somehow unavailable.
+    launcher. Falls back to the in-package default (the same mcp-server.log
+    name) if biopb_mcp is somehow unavailable.
     """
     try:
         from biopb_mcp._config import get_daemon_log_file
 
         return get_daemon_log_file()
     except Exception:
-        return MCP_LOG_DIR / "kernel.log"
+        return MCP_LOG_DIR / "mcp-server.log"
 
 
 def _resolve_mcp_log_for_read() -> Path:
     """The daemon log to display: the canonical file, or the legacy
-    `mcp-server.log` from older `mcp start` runs if only that one exists.
+    `kernel.log` a pre-unification shim-spawned daemon wrote, if only that one
+    exists.
 
     Keeps a pre-unification log readable instead of falsely reporting "never
     started"; when neither exists, returns the canonical path so the
@@ -1032,7 +1033,7 @@ def _resolve_mcp_log_for_read() -> Path:
     canonical = _get_mcp_log_file()
     if canonical.exists():
         return canonical
-    legacy = MCP_LOG_DIR / "mcp-server.log"
+    legacy = MCP_LOG_DIR / "kernel.log"
     if legacy.exists():
         return legacy
     return canonical
