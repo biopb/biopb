@@ -74,7 +74,7 @@ class TestOpenDaemonLog:
         monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
         f = _shim._open_daemon_log(_cfg(kernel_log=""))
         try:
-            assert (tmp_path / "kernel.log").exists()
+            assert (tmp_path / "mcp-server.log").exists()
         finally:
             f.close()
 
@@ -306,7 +306,7 @@ class TestEndToEnd:
             # daemon log, which the spawned-detached daemon writes under the
             # isolated HOME).
             log = (
-                (tmp_path / ".local/share/biopb-mcp/log/kernel.log")
+                (tmp_path / ".local/share/biopb-mcp/log/mcp-server.log")
                 .read_bytes()
                 .decode(errors="replace")
             )

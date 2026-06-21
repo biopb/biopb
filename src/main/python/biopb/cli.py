@@ -77,12 +77,15 @@ DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it
 # gets its own PID/log under biopb-mcp's XDG data dir (matching
-# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The log file
-# name is distinct so it never collides with the stdio bridge's `kernel.log`.
-# The running daemon writes this same PID file itself (biopb_mcp._config
-# .get_pid_file()) regardless of who launched it — including the stdio shim,
-# which spawns it detached without going through `mcp start` — so `status`
-# detects it uniformly. Keep this path in sync with get_pid_file().
+# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The daemon
+# logs to ONE canonical file (biopb_mcp._config.get_daemon_log_file() ->
+# mcp-server.log) shared with the stdio shim, so `mcp logs` / `status` show the
+# right log no matter who launched the daemon (the CLI's `mcp start`, or the
+# shim spawning it on demand for an AI client). The running daemon writes this
+# same PID file itself (biopb_mcp._config.get_pid_file()) regardless of who
+# launched it — including the stdio shim, which spawns it detached without going
+# through `mcp start` — so `status` detects it uniformly. Keep this path in sync
+# with get_pid_file().
 MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
@@ -1002,8 +1005,38 @@ def _ensure_mcp_dirs():
 
 
 def _get_mcp_log_file() -> Path:
-    """Path of the MCP daemon's combined stdout/stderr log."""
-    return MCP_LOG_DIR / "mcp-server.log"
+    """Canonical path the MCP daemon's stdout/stderr is written to.
+
+    Unified with the stdio shim via biopb_mcp._config.get_daemon_log_file(), so
+    `mcp start` (which redirects the daemon here) writes the SAME file the shim
+    does -- and `mcp logs`/`status` therefore read the right one regardless of
+    launcher. Falls back to the in-package default (the same mcp-server.log
+    name) if biopb_mcp is somehow unavailable.
+    """
+    try:
+        from biopb_mcp._config import get_daemon_log_file
+
+        return get_daemon_log_file()
+    except Exception:
+        return MCP_LOG_DIR / "mcp-server.log"
+
+
+def _resolve_mcp_log_for_read() -> Path:
+    """The daemon log to display: the canonical file, or the legacy
+    `kernel.log` a pre-unification shim-spawned daemon wrote, if only that one
+    exists.
+
+    Keeps a pre-unification log readable instead of falsely reporting "never
+    started"; when neither exists, returns the canonical path so the
+    not-found message names where the daemon will log.
+    """
+    canonical = _get_mcp_log_file()
+    if canonical.exists():
+        return canonical
+    legacy = MCP_LOG_DIR / "kernel.log"
+    if legacy.exists():
+        return legacy
+    return canonical
 
 
 def _mcp_default_port() -> int:
@@ -1232,7 +1265,7 @@ def mcp_status(
     table.add_row("MCP", _mcp_url(port))
     table.add_row("Listening", "yes" if listening else "no (not bound yet?)")
     table.add_row("PID file", str(MCP_PID_FILE))
-    table.add_row("Log file", str(_get_mcp_log_file()))
+    table.add_row("Log file", str(_resolve_mcp_log_for_read()))
     console.print(table)
 
 
@@ -1254,7 +1287,7 @@ def mcp_logs(
 ):
     """Show the biopb-mcp server daemon log."""
     _require_biopb_mcp()
-    log_file = _get_mcp_log_file()
+    log_file = _resolve_mcp_log_for_read()
     if path:
         print(log_file)
         raise typer.Exit(0)

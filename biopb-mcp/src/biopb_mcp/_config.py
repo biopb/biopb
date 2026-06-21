@@ -31,7 +31,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -140,7 +140,7 @@ DEFAULT_CONFIG = {
             # Where the stdio bridge sends the spawned daemon's stdout/stderr
             # (inherited by its child kernel, so this still carries the native
             # Qt/GL/dask/gRPC output the key always named). Empty ->
-            # ~/.local/share/biopb-mcp/log/kernel.log. Unused when the daemon
+            # ~/.local/share/biopb-mcp/log/mcp-server.log. Unused when the daemon
             # is launched directly with --transport http (output stays on the
             # launching terminal/service manager).
             "kernel_log": "",
@@ -377,6 +377,29 @@ def get_log_dir() -> Path:
     log_dir = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+def get_daemon_log_file(config: Optional[dict] = None) -> Path:
+    """Path of the http daemon's combined stdout/stderr log.
+
+    The daemon logs to stderr (``logging.basicConfig`` in ``biopb_mcp.mcp``);
+    whoever launches it redirects that stream into this file. A *single*
+    canonical location so every launcher (the stdio shim's ``ensure_daemon``,
+    the ``biopb mcp start`` CLI, a manual ``python -m biopb_mcp.mcp``) and every
+    reader (``biopb mcp logs`` / ``status``) agree on one file regardless of who
+    started the daemon -- otherwise the launchers disagree on the filename (a
+    shim-spawned daemon and a ``mcp start`` CLI writing different files) and one
+    reader wrongly reports the server "never started". Honors
+    ``mcp.transport.kernel_log`` if set, else ``<log dir>/mcp-server.log``.
+    ``config`` is loaded (cached singleton) when not supplied; the shim passes
+    the dict it already holds.
+    """
+    if config is None:
+        config = load_config()
+    override = get_setting(config, "mcp.transport.kernel_log")
+    if override:
+        return Path(override)
+    return get_log_dir() / "mcp-server.log"
 
 
 def get_pid_file() -> Path:
