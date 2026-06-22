@@ -43,7 +43,7 @@ still installs prebuilt wheels, so no git/buf/compiler is needed.
 
 ```sh
 # Linux / macOS / WSL
-BIOPB_INSTALL_RC=1 curl -fsSL https://biopb.org/install.sh | bash
+curl -fsSL https://biopb.org/install.sh | BIOPB_INSTALL_RC=1 bash
 ```
 
 ```powershell

@@ -900,7 +900,7 @@ install_biopb() {
             _cmd "curl -fsSL https://biopb.org/install.sh | bash"
         else
             _info "Check your network and rerun. To try the latest release candidate:"
-            _cmd "BIOPB_INSTALL_RC=1 curl -fsSL https://biopb.org/install.sh | bash"
+            _cmd "curl -fsSL https://biopb.org/install.sh | BIOPB_INSTALL_RC=1 bash"
         fi
         exit 1
     fi
