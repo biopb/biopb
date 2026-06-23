@@ -110,7 +110,14 @@ jobs:
           # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the
           # same napari the wheel was built/tested against (see install/install.sh).
-          nver=$(grep -oE 'napari\[all\]==[0-9][^"]+' biopb-mcp/pyproject.toml | head -1 | sed -E 's/.*==//')
+          # Read it from the PRISTINE committed blob, not the working tree: the
+          # earlier `uv build --package biopb-mcp` step invokes setuptools, which
+          # normalizes (rewrites) biopb-mcp/pyproject.toml in place and drops the
+          # `mcp = [... "napari[all]==…" …]` line, so a working-tree grep finds
+          # nothing and `set -e` aborts the step silently. `git show HEAD:` is
+          # immune to that mutation. (Tag push & dry-run both checkout a commit, so
+          # HEAD resolves to it.)
+          nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
           [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
           # versions.json — the installer-readable release-attribute manifest.
