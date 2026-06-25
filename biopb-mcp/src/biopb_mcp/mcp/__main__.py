@@ -36,6 +36,60 @@ def _port_listening(port, timeout=0.5):
         return False
 
 
+def _self_create_time():
+    """This process's creation-time token, or None if it can't be determined.
+
+    Mirrors biopb.cli._process_create_time but for os.getpid(): a per-process
+    identity that lets `biopb mcp stop`/`status` tell our daemon apart from an
+    unrelated process that later inherits a reused PID (Windows never cleans the
+    PID file at logout and recycles PIDs aggressively). None -> the CLI falls
+    back to a liveness-only check, the pre-fix behavior.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        creation, exit_t, kernel_t, user_t = (
+            _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME(),
+        )
+        # GetCurrentProcess() is a pseudo-handle (-1); no OpenProcess/CloseHandle.
+        if not kernel32.GetProcessTimes(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(creation),
+            ctypes.byref(exit_t),
+            ctypes.byref(kernel_t),
+            ctypes.byref(user_t),
+        ):
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{os.getpid()}/stat", "rb") as f:
+                data = f.read()
+            # comm (field 2) is parenthesized and may contain spaces/parens; parse
+            # after the last ')'. starttime is field 22 -> index 19 of the rest.
+            return int(data[data.rfind(b")") + 2:].split()[19])
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def _pidfile_contents():
+    """The text to write into the PID file: `pid` plus, when known, a `pid\\ntoken`
+    create-time identity. Read back by biopb.cli._read_pid_record (two whitespace-
+    separated ints, tolerant of the legacy bare-pid form)."""
+    pid = os.getpid()
+    token = _self_create_time()
+    return f"{pid}\n{token}" if token is not None else str(pid)
+
+
 def _write_pidfile(port):
     """Best-effort: record this daemon's PID so `biopb mcp status` finds it.
 
@@ -43,6 +97,10 @@ def _write_pidfile(port):
     the daemon detached without writing it — so the daemon registers itself
     here, covering every launch path uniformly. Best-effort: a write failure
     only costs `status` visibility, never the server.
+
+    Records a create-time identity token alongside the PID (see
+    :func:`_self_create_time`) so the CLI can distinguish this daemon from an
+    unrelated process that later inherits a reused PID.
 
     Concurrent first-run shims can each spawn a daemon; only the one that binds
     the port survives (the rest die on EADDRINUSE). Re-checking the port
@@ -58,7 +116,7 @@ def _write_pidfile(port):
             # Someone already owns the port; we are about to lose the bind.
             return None
         pidfile.parent.mkdir(parents=True, exist_ok=True)
-        pidfile.write_text(str(os.getpid()))
+        pidfile.write_text(_pidfile_contents())
         return pidfile
     except OSError:
         logger.warning("Could not write PID file %s", pidfile, exc_info=True)
@@ -68,14 +126,16 @@ def _write_pidfile(port):
 def _remove_pidfile(pidfile):
     """Remove our PID file, but only if it still names this process.
 
-    Pid-safe so a losing daemon's exit never deletes the winner's file.
+    Pid-safe so a losing daemon's exit never deletes the winner's file. Compares
+    only the first whitespace-separated field (the PID), ignoring any trailing
+    create-time token, so the match holds regardless of token presence.
     """
     if pidfile is None:
         return
     try:
-        if pidfile.read_text().strip() == str(os.getpid()):
+        if pidfile.read_text().split()[0] == str(os.getpid()):
             pidfile.unlink()
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
 
 
