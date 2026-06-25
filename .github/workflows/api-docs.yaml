@@ -36,6 +36,14 @@ jobs:
           fetch-depth: 0   # tags for setuptools_scm
 
       # ---- Python API docs (mkdocstrings) ---------------------------------
+      # buf is needed before `uv sync`: installing the biopb package runs its
+      # build_py hook (build_proto.py), which shells out to `buf generate` to
+      # emit the *_pb2 stubs the SDK modules import. Without it `uv sync` aborts.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
 
