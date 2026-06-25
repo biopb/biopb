@@ -26,17 +26,16 @@ from biopb_image_base import (
 
 class MyServicer(BiopbServicerBase):
     def Run(self, request, context):
-        with self._server_context(context):
-            img = decode_image_data(request.image_data)
-            result = ...  # your result (numpy or dask array)
-            return proto.ProcessResponse(
-                image_data=return_lazy_or_eager(result, self._tensor_cache)
-            )
-
+        img = decode_image_data(request.image_data)
+        result = ...  # your result (numpy or dask array)
+        return proto.ProcessResponse(
+            image_data=return_lazy_or_eager(result, self._tensor_cache)
+        )
 
 # Run the service (no cache server; results are returned eagerly)
 run_server(MyServicer(), port=50051)
 ```
+
 See [biopb-server](https://github.com/biopb/biopb-server) project for fully functional implementation examples.
 
 ### Run the new servicer
