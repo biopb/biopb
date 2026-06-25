@@ -91,6 +91,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 
+# Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
+# (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
+# napari/Qt process -- machine-specific state that has no business in a roaming
+# profile (which on managed machines is synced/redirected, inviting locks and slow
+# logons). This matches the rest of the installer, which is deliberately Local (the
+# Inno GUI installs under {localappdata}\biopb; see docs/windows-installer.md). Set
+# at script scope so it is inherited by every `uv` invocation in install AND
+# uninstall. An explicit user UV_TOOL_DIR wins. Runs on dot-source too, so the
+# console front-end (which dot-sources this engine) gets it before it drives uv.
+if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
+    $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
+}
+
 # ============================================================================
 # Reporter -- the integration seam between the engine and either front-end.
 # Both modes go through the SAME calls; only the rendering differs, so the
@@ -178,6 +191,44 @@ function Set-FileUtf8NoBom {
 function Assert-LastExit {
     param([string]$What)
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
+}
+
+# Force-terminate any process running from a biopb uv tool environment so its
+# locked binaries under <tooldir>\biopb\Scripts can be deleted. The graceful
+# `biopb server stop` / `biopb mcp stop` only reach daemons THIS install's pidfiles
+# track; a data server launched ad-hoc from a shell, a detached napari kernel, or
+# an agent-spawned stdio biopb-mcp keep the *_pb2/python.exe binaries open and make
+# `uv tool install --force` (and `uv tool uninstall`) fail with "Access is denied
+# (os error 5)". We match by executable path, covering the current UV_TOOL_DIR AND
+# the legacy %APPDATA% (Roaming) default, so an upgrade from an older Roaming
+# install -- whose orphaned server may still be running -- also unlocks cleanly.
+# Returns the number of processes stopped.
+function Stop-BiopbToolProcesses {
+    $dirs = New-Object System.Collections.Generic.List[string]
+    if ($env:UV_TOOL_DIR)  { $dirs.Add((Join-Path $env:UV_TOOL_DIR 'biopb'))           | Out-Null }
+    if ($env:LOCALAPPDATA) { $dirs.Add((Join-Path $env:LOCALAPPDATA 'uv\tools\biopb')) | Out-Null }
+    if ($env:APPDATA)      { $dirs.Add((Join-Path $env:APPDATA 'uv\tools\biopb'))      | Out-Null }
+    $prefixes = @($dirs | ForEach-Object { $_.TrimEnd('\').ToLowerInvariant() + '\' } | Select-Object -Unique)
+
+    $killed = 0
+    foreach ($proc in Get-Process -ErrorAction SilentlyContinue) {
+        $path = $null
+        try { $path = $proc.Path } catch { $path = $null }   # access-denied on some PIDs
+        if (-not $path) { continue }
+        $lp = $path.ToLowerInvariant()
+        foreach ($pre in $prefixes) {
+            if ($lp.StartsWith($pre)) {
+                try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop; $killed++ } catch { }
+                break
+            }
+        }
+    }
+    if ($killed -gt 0) {
+        Report-Detail "force-stopped $killed leftover biopb process(es) holding the tool dir open"
+        # Let Windows release the file handles before uv deletes the directory.
+        Start-Sleep -Milliseconds 800
+    }
+    return $killed
 }
 
 # Ensure a directory is on the user PATH (persisted) and the current session.
@@ -732,6 +783,12 @@ function Invoke-BiopbInstall {
         try { & biopb mcp stop    *> $null } catch { }
         Report-Detail "stopped any running biopb daemons (data + mcp) so their files can be replaced"
     }
+    # Belt-and-suspenders: the graceful stops above miss servers launched ad-hoc
+    # from a shell, detached napari kernels, and agent-spawned stdio biopb-mcp --
+    # any of which keeps the tool dir locked and triggers os error 5. Force-stop
+    # anything still running out of a biopb tool env (runs even if the biopb shim
+    # is absent/broken, since the lock can outlive it).
+    Stop-BiopbToolProcesses | Out-Null
 
     $tensorExtras = "web,aics,medical,ndtiff,hdf5"
     if ($InstallBioformats) {
@@ -1001,6 +1058,10 @@ function Invoke-BiopbUninstall {
             try { & biopb server stop *> $null } catch { }
             try { & biopb mcp stop    *> $null } catch { }
         }
+        # Force-stop any leftover process holding the tool dir open, else the
+        # `uv tool uninstall` below fails to delete it with os error 5 (same as
+        # the install path -- see Stop-BiopbToolProcesses).
+        Stop-BiopbToolProcesses | Out-Null
         Report-Ok "Data server and MCP server stopped (if they were running)"
 
         Report-Step 2 "Removing biopb packages..."

@@ -51,24 +51,24 @@ function Wait-ForExit {
     }
 }
 
-# Locate (or download) the headless engine and dot-source it so its functions --
-# Invoke-BiopbInstall, Get-DataDirCandidates, the Report-* renderers -- are
-# available in this session. Dot-sourcing (not running) means the engine's
-# auto-run block is skipped; we drive it explicitly via Invoke-BiopbInstall.
-function Import-Engine {
+# Locate (or download) the headless engine and return the path to dot-source.
+# The caller must dot-source the returned path at SCRIPT scope -- dot-sourcing
+# inside this function would define the engine's functions (Invoke-BiopbInstall,
+# Get-DataDirCandidates, the Report-* renderers) in this function's child scope,
+# where they vanish on return and are unavailable to Main. Returning the path and
+# dot-sourcing in Main keeps them alive for the whole session. Dot-sourcing (not
+# running) also skips the engine's auto-run block; we drive it via Invoke-BiopbInstall.
+function Resolve-EnginePath {
     # $PSScriptRoot is empty under `irm | iex` (no file on disk) -> download.
     $local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { $null }
     if ($local -and (Test-Path -LiteralPath $local)) {
-        . $local
-        return
+        return $local
     }
     Write-Inf "Fetching install engine..."
     $engineSrc = Invoke-RestMethod -Uri $EngineUrl
-    # Dot-source the downloaded text in THIS scope so its functions persist.
-    # (`iex` in a function would define them in the function's child scope.)
     $tmp = Join-Path $env:TEMP "biopb-engine.ps1"
     Set-Content -LiteralPath $tmp -Value $engineSrc -Encoding UTF8
-    . $tmp
+    return $tmp
 }
 
 # Interactive component selector (replaces the engine's parameters with prompts).
@@ -250,7 +250,9 @@ Show-Banner
 $reportOnFailure = Invoke-Preflight
 
 try {
-    Import-Engine   # defines Invoke-BiopbInstall, Get-DataDirCandidates, Report-*
+    # Dot-source at SCRIPT scope (not inside a helper) so the engine's functions --
+    # Invoke-BiopbInstall, Get-DataDirCandidates, Report-* -- persist through Main.
+    . (Resolve-EnginePath)
 
     $BiopbHome  = $env:USERPROFILE
     $configFile = Join-Path $BiopbHome ".config\biopb\biopb.toml"
