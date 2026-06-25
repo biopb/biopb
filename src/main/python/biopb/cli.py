@@ -116,10 +116,40 @@ def _read_pid_file(pid_file: Path) -> Optional[int]:
         return None
 
 
-def _write_pid_file(pid_file: Path, pid: int):
-    """Write `pid` to `pid_file`, creating its parent directory."""
+def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
+    """Read (pid, identity_token) from `pid_file`.
+
+    The file holds one or two whitespace-separated integers: the PID and, since
+    the PID-identity fix, a process create-time token (see _process_create_time)
+    that distinguishes our daemon from an unrelated process that later inherited
+    a reused PID. Tolerates the legacy bare-PID format (token None -> identity
+    unverifiable, callers fall back to a liveness-only check) so a pre-upgrade
+    file still reads. Returns (None, None) if missing or unparseable.
+    """
+    if not pid_file.exists():
+        return None, None
+    try:
+        parts = pid_file.read_text().split()
+        pid = int(parts[0])
+    except (ValueError, IOError, IndexError):
+        return None, None
+    token: Optional[int] = None
+    if len(parts) > 1:
+        try:
+            token = int(parts[1])
+        except ValueError:
+            token = None
+    return pid, token
+
+
+def _write_pid_file(pid_file: Path, pid: int, token: Optional[int] = None):
+    """Write `pid` (and, when known, its create-time `token`) to `pid_file`.
+
+    The two-line `pid\\ntoken` form is read back by _read_pid_record; a None token
+    falls back to the legacy bare-PID form (callers then verify by liveness only).
+    """
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(pid))
+    pid_file.write_text(f"{pid}\n{token}" if token is not None else str(pid))
 
 
 def _remove_pid_file(pid_file: Path):
@@ -134,9 +164,9 @@ def _read_pid() -> Optional[int]:
 
 
 def _write_pid(pid: int):
-    """Write the tensor-server daemon PID."""
+    """Write the tensor-server daemon PID (+ its create-time identity token)."""
     _ensure_dirs()
-    _write_pid_file(PID_FILE, pid)
+    _write_pid_file(PID_FILE, pid, _process_create_time(pid))
 
 
 def _remove_pid():
@@ -180,6 +210,99 @@ def _is_process_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _process_create_time(pid: int) -> Optional[int]:
+    """A per-process-unique creation-time token for `pid`, or None if it can't be
+    determined.
+
+    Comparing a token recorded at launch with the live value detects PID reuse:
+    a recycled PID gets a different creation time. This is what makes the PID file
+    an *identity* check, not just a liveness check -- crucial on Windows, which
+    hard-kills the daemon at logout (so the PID file is never cleaned) and reuses
+    PIDs aggressively, letting a stale PID name an unrelated process that `stop`
+    would otherwise TerminateProcess.
+
+    Returns None when unavailable -- the process is gone, or the platform has no
+    cheap source (e.g. macOS) -- and callers then degrade to a liveness-only check
+    (the pre-fix behavior), never a false "stopped".
+    """
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        # GetProcessTimes -> creation FILETIME (100ns ticks since 1601), unique
+        # enough per (PID, lifetime). PROCESS_QUERY_LIMITED_INFORMATION suffices.
+        import ctypes
+        from ctypes import wintypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            creation, exit_t, kernel_t, user_t = (
+                _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME(),
+            )
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_t),
+                ctypes.byref(kernel_t),
+                ctypes.byref(user_t),
+            ):
+                return None
+            return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        # /proc/<pid>/stat field 22 = starttime (clock ticks since boot). comm
+        # (field 2) is parenthesized and may itself contain spaces/parens, so
+        # parse the fields after the LAST ')': index 19 of those is starttime.
+        try:
+            data = Path(f"/proc/{pid}/stat").read_bytes()
+            fields = data[data.rfind(b")") + 2:].split()
+            return int(fields[19])
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
+    """Whether `pid` is alive AND is the daemon we recorded -- not a reused PID.
+
+    Returns False only when the PID can be PROVEN to be someone else (alive but a
+    different creation time), so `stop`/`restart` never force-kill, and `status`
+    never trusts, an unrelated process. When identity can't be established -- a
+    legacy bare-PID file, or a platform/moment with no create-time -- it falls
+    back to liveness, matching the pre-fix behavior rather than risk a false
+    "stopped" (which would strand a running daemon).
+    """
+    if not pid or not _is_process_running(pid):
+        return False
+    if token is None:
+        return True
+    current = _process_create_time(pid)
+    if current is None:
+        return True
+    return current == token
 
 
 # Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
@@ -241,10 +364,15 @@ def _request_graceful_stop(pid: int) -> bool:
         return False
 
 
-def _graceful_stop(pid: int, timeout: int) -> bool:
+def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
     """Stop a running daemon: request graceful shutdown, wait up to `timeout`
     seconds, then force-kill. Removes the PID file. Returns True if it exited
     gracefully, False if it had to be force-killed. Assumes `pid` is running.
+
+    `token` is the recorded create-time identity (see _process_create_time): the
+    wait loop and the force-kill are gated on it so that if the daemon exits and
+    its PID is reused mid-stop, we neither keep waiting on nor TerminateProcess
+    the innocent new owner.
     """
     delivered = _request_graceful_stop(pid)
     if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
@@ -255,19 +383,21 @@ def _graceful_stop(pid: int, timeout: int) -> bool:
 
     graceful = False
     for _ in range(timeout):
-        if not _is_process_running(pid):
+        if not _is_our_daemon(pid, token):
             graceful = True
             break
         time.sleep(1)
 
     if not graceful:
         # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to
-        # SIGTERM, which os.kill maps to an unconditional TerminateProcess.
-        try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except OSError:
-            pass
-        time.sleep(0.5)
+        # SIGTERM, which os.kill maps to an unconditional TerminateProcess. Re-verify
+        # identity first: a reused PID must never take this unconditional kill.
+        if _is_our_daemon(pid, token):
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+            time.sleep(0.5)
 
     _remove_pid()
     if sys.platform == "win32":
@@ -495,9 +625,10 @@ def start(
     """Start TensorFlight server as a background daemon."""
     _ensure_dirs()
 
-    # Check if already running
-    existing_pid = _read_pid()
-    if existing_pid and _is_process_running(existing_pid):
+    # Check if already running (identity-checked, so a reused stale PID does not
+    # masquerade as a live server and silently block a real start).
+    existing_pid, existing_token = _read_pid_record(PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
         console.print(f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]")
         raise typer.Exit(0)
 
@@ -597,20 +728,20 @@ def stop(
     ),
 ):
     """Stop TensorFlight server daemon."""
-    pid = _read_pid()
+    pid, token = _read_pid_record(PID_FILE)
 
     if not pid:
         console.print("[yellow]No TensorFlight server running[/yellow]")
         raise typer.Exit(0)
 
-    if not _is_process_running(pid):
+    if not _is_our_daemon(pid, token):
         console.print(f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]")
         _remove_pid()
         raise typer.Exit(0)
 
     console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
 
-    if _graceful_stop(pid, timeout):
+    if _graceful_stop(pid, timeout, token):
         console.print("[green]TensorFlight server stopped[/green]")
     else:
         console.print(
@@ -662,10 +793,10 @@ def restart(
 ):
     """Restart TensorFlight server daemon."""
     # Stop first
-    pid = _read_pid()
-    if pid and _is_process_running(pid):
+    pid, token = _read_pid_record(PID_FILE)
+    if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        _graceful_stop(pid, timeout)
+        _graceful_stop(pid, timeout, token)
         time.sleep(1)
 
     # Start with same options
@@ -752,8 +883,8 @@ def status(
     ),
 ):
     """Check TensorFlight server daemon status and live health."""
-    pid = _read_pid()
-    running = bool(pid and _is_process_running(pid))
+    pid, token = _read_pid_record(PID_FILE)
+    running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
 
     # When running, ask the daemon for its Flight health (status + source_count),
@@ -926,8 +1057,8 @@ def cache_stats(
     ),
 ):
     """Show cache hit/miss diagnostics from the running server."""
-    pid = _read_pid()
-    if not pid or not _is_process_running(pid):
+    pid, token = _read_pid_record(PID_FILE)
+    if not _is_our_daemon(pid, token):
         console.print("[yellow]TensorFlight server is not running.[/yellow]")
         raise typer.Exit(1)
 
@@ -989,8 +1120,13 @@ def _read_mcp_pid() -> Optional[int]:
 
 
 def _write_mcp_pid(pid: int):
-    """Write the MCP daemon PID."""
-    _write_pid_file(MCP_PID_FILE, pid)
+    """Write the MCP daemon PID (+ its create-time identity token).
+
+    The biopb-mcp daemon also writes this file itself (biopb_mcp.mcp.__main__),
+    with the same pid+token format; whoever writes last is authoritative and both
+    are read by _read_pid_record.
+    """
+    _write_pid_file(MCP_PID_FILE, pid, _process_create_time(pid))
 
 
 def _remove_mcp_pid():
@@ -1071,7 +1207,7 @@ def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
         return False
 
 
-def _stop_mcp(pid: int, timeout: int) -> bool:
+def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
     """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
     wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
     True if it exited gracefully. Assumes `pid` is running.
@@ -1080,25 +1216,30 @@ def _stop_mcp(pid: int, timeout: int) -> bool:
     MCP launcher installs SIGTERM/SIGINT handlers, and on Windows os.kill maps
     SIGTERM to TerminateProcess (an immediate, ungraceful stop) - acceptable for
     a localhost dev daemon with no in-flight durability to protect.
+
+    `token` is the recorded create-time identity: the wait loop and force-kill are
+    gated on it so a PID reused mid-stop is neither waited on nor TerminateProcess'd.
     """
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
+    if _is_our_daemon(pid, token):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
 
     graceful = False
     for _ in range(timeout):
-        if not _is_process_running(pid):
+        if not _is_our_daemon(pid, token):
             graceful = True
             break
         time.sleep(1)
 
     if not graceful:
-        try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except OSError:
-            pass
-        time.sleep(0.5)
+        if _is_our_daemon(pid, token):
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+            time.sleep(0.5)
 
     _remove_mcp_pid()
     return graceful
@@ -1117,8 +1258,8 @@ def mcp_start(
     _require_biopb_mcp()
     _ensure_mcp_dirs()
 
-    existing_pid = _read_mcp_pid()
-    if existing_pid and _is_process_running(existing_pid):
+    existing_pid, existing_token = _read_pid_record(MCP_PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
         console.print(
             f"[yellow]biopb-mcp server already running (PID {existing_pid})[/yellow]"
         )
@@ -1177,12 +1318,12 @@ def mcp_stop(
 ):
     """Stop the biopb-mcp server daemon."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
+    pid, token = _read_pid_record(MCP_PID_FILE)
 
     if not pid:
         console.print("[yellow]No biopb-mcp server running[/yellow]")
         raise typer.Exit(0)
-    if not _is_process_running(pid):
+    if not _is_our_daemon(pid, token):
         console.print(
             f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
         )
@@ -1190,7 +1331,7 @@ def mcp_stop(
         raise typer.Exit(0)
 
     console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-    if _stop_mcp(pid, timeout):
+    if _stop_mcp(pid, timeout, token):
         console.print("[green]biopb-mcp server stopped[/green]")
     else:
         console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
@@ -1208,10 +1349,10 @@ def mcp_restart(
 ):
     """Restart the biopb-mcp server daemon."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
-    if pid and _is_process_running(pid):
+    pid, token = _read_pid_record(MCP_PID_FILE)
+    if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-        _stop_mcp(pid, timeout)
+        _stop_mcp(pid, timeout, token)
         time.sleep(1)
     mcp_start(port=port)
 
@@ -1224,8 +1365,8 @@ def mcp_status(
 ):
     """Check biopb-mcp server daemon status and HTTP liveness."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
-    running = bool(pid and _is_process_running(pid))
+    pid, token = _read_pid_record(MCP_PID_FILE)
+    running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
 
     port = _mcp_default_port()
