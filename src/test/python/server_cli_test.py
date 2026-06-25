@@ -529,7 +529,13 @@ class TestMcpLogs:
     def log_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
         monkeypatch.setattr(cli, "MCP_LOG_DIR", tmp_path)
-        return tmp_path / "mcp-server.log"
+        # `mcp logs` resolves its path via _get_mcp_log_file(), which prefers
+        # biopb_mcp._config.get_daemon_log_file() whenever biopb-mcp is importable
+        # -- bypassing MCP_LOG_DIR and reading the user's REAL daemon log. Patch the
+        # actual seam so the test reads the temp file regardless of environment.
+        log = tmp_path / "mcp-server.log"
+        monkeypatch.setattr(cli, "_get_mcp_log_file", lambda: log)
+        return log
 
     def _run(self, *args):
         return CliRunner().invoke(cli.app, ["mcp", "logs", *args])
