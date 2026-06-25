@@ -7,9 +7,9 @@ Base Docker image and utilities for implementing algorithm plugins using the `bi
 ### Overview
 `biopb-image-runtime` creates a base image for adding algorithm plugins, so the agent has more tools to use.
 
-The base image does not define a default entrypoint and is not meant to be run directly without specifying a servicer. It also does not define a default health check. Health checks belong in `docker-compose.yaml` for the mock workflow or in derived service images that declare their own runtime contract.
+The base image does not define a default entrypoint and is not meant to be run directly without specifying a servicer.
 
-For real servicers, enable and expose the gRPC health service from your own service process. The base utilities already support this through `create_server()` and `run_server()`; derived images should add the container-level health probe that matches their runtime entrypoint.
+For real servicers derive from the `BiopbServicerBase` class with your custom algorithm. You can also enable and expose the gRPC health service through the convenient function `run_server()`.
 
 ### Example servicer
 ```python
@@ -19,31 +19,44 @@ import biopb.image as proto
 from biopb_image_base import (
     run_server,            # Run server (optionally with embedded cache)
     decode_image_data,     # Decode ImageData to numpy/dask
-    return_lazy_or_eager,  # Return result as lazy or eager data
+    encode_image,          # Encode numpy array to ImageData (eager)
     BiopbServicerBase,     # Base class for servicers
 )
 
-
 class MyServicer(BiopbServicerBase):
+
+    def GetOpNames(self, request, context):
+        """Description of your algorithm"""
+        with self._server_context(context):
+            return proto.OpNames(
+                names=["my_algorithm"],
+                op_schemas={
+                    "my_algorithm": proto.OpSchema(
+                        description="Best image processing algorithm",
+                    ),
+                }
+            )
+
     def Run(self, request, context):
+        """Define the logic of your algorithm"""
         with self._server_context(context):
             img = decode_image_data(request.image_data)
-            result = ...  # your result (numpy or dask array)
+            result = ...  # your result (numpy array)
             return proto.ProcessResponse(
-                image_data=return_lazy_or_eager(result, self._tensor_cache)
+                image_data=encode_image(result)
             )
 
 
-# Run the service (no cache server; results are returned eagerly)
+# Run the service
 run_server(MyServicer(), port=50051)
 ```
-See [biopb-server](https://github.com/biopb/biopb-server) project for fully functional implementation examples.
+See [biopb-server](https://github.com/biopb/biopb-server) project for examples of fully fleshed-out servicer implementations.
 
 ### Run the new servicer
 ```bash
 docker run --rm -p 50051:50051 \
     -v /path/to/my_servicer.py:/opt/biopb/my_servicer.py \
-    biopb-image-base \
+    jiyuuchc/biopb-image-base \
     python /opt/biopb/my_servicer.py
 ```
 
@@ -58,52 +71,6 @@ to include your new server:
     }
 }
 ```
-
-### Alternative: build a docker image for your servicer
-
-```dockerfile
-FROM biopb-image-base
-
-COPY my_servicer.py /opt/biopb/my_servicer.py
-
-ENTRYPOINT ["python", "/opt/biopb/my_servicer.py"]
-CMD ["--cache-dir", "/data/cache"]
-```
-
-Then run it:
-
-```bash
-docker run --rm \
-  -p 50051:50051 \
-  my-biopb-servicer
-
-# With cache server and lazy I/O
-docker run --rm \
-  -p 50051:50051 \
-  -p 8817:8817  \
-  -v tensor-cache:/data/cache \
-  my-biopb-servicer \
-    --cache-dir /data/cache \
-    --cache-size 32GB \
-    --tensor-external-location \
-    grpc://$(hostname):8817
-
-# For local deployment/testing
-docker run --rm \
-  -p 50051:50051 \
-  -p 8817:8817  \
-  -v tensor-cache:/data/cache \
-  my-biopb-servicer \
-    --cache-dir /data/cache \
-    --cache-size 32GB \
-    --tensor-external-location \
-    grpc://localhost:8817
-```
-
-**Note:** `--tensor-external-location` must be an address that clients can reach.
-Using `localhost` only works when clients run on the same host machine.
-For deployment, use the server's hostname or IP (e.g., `grpc://server-host:8817`).
-
 
 ## Architecture
 This subproject provides:
@@ -244,6 +211,52 @@ from biopb_image_base import (
 | ProcessImage | Run, RunStream, GetOpNames |
 
 See [buf.build](https://buf.build/jiyuuchc/biopb/docs/main%3Abiopb.image) for full definition.
+
+### Build a docker image for your servicer
+
+```dockerfile
+# Dockerfile
+FROM biopb-image-base
+
+COPY my_servicer.py /opt/biopb/my_servicer.py
+
+ENTRYPOINT ["python", "/opt/biopb/my_servicer.py"]
+CMD ["--cache-dir", "/data/cache"]
+```
+
+Then run it:
+
+```bash
+docker run --rm \
+  -p 50051:50051 \
+  my-biopb-servicer
+
+# With cache server and lazy I/O
+docker run --rm \
+  -p 50051:50051 \
+  -p 8817:8817  \
+  -v tensor-cache:/data/cache \
+  my-biopb-servicer \
+    --cache-dir /data/cache \
+    --cache-size 32GB \
+    --tensor-external-location \
+    grpc://$(hostname):8817
+
+# For local deployment/testing
+docker run --rm \
+  -p 50051:50051 \
+  -p 8817:8817  \
+  -v tensor-cache:/data/cache \
+  my-biopb-servicer \
+    --cache-dir /data/cache \
+    --cache-size 32GB \
+    --tensor-external-location \
+    grpc://localhost:8817
+```
+
+**Note:** `--tensor-external-location` must be an address that clients can reach.
+Using `localhost` only works when clients run on the same host machine.
+For deployment, use the server's hostname or IP (e.g., `grpc://server-host:8817`).
 
 ## Files
 
