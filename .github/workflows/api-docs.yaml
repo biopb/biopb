@@ -1,0 +1,97 @@
+# Publish the SDK API reference to biopb.org/docs/api/ on each v* release.
+#
+# Two generators, two namespaces (latest-version-only; each rsync --delete
+# replaces the previous release's docs):
+#   - Python -> /docs/api/python/  (mkdocstrings; see docs-api/)
+#   - Java   -> /docs/api/java/    (maven-javadoc-plugin)
+#
+# These live UNDER the docs site but are owned here, not by biopb-site: that
+# repo's deploy excludes api/ from its --delete so a push-to-main site deploy
+# never wipes them (see biopb-site/.github/workflows/deploy.yml).
+#
+# workflow_dispatch is a dry run: it builds both doc sets to verify, but never
+# touches SSH or the server.
+name: API docs (publish)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: api-docs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags for setuptools_scm
+
+      # ---- Python API docs (mkdocstrings) ---------------------------------
+      # buf is needed before `uv sync`: installing the biopb package runs its
+      # build_py hook (build_proto.py), which shells out to `buf generate` to
+      # emit the *_pb2 stubs the SDK modules import. Without it `uv sync` aborts.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build Python API docs
+        run: |
+          uv sync --extra doc
+          uv run mkdocs build -f docs-api/mkdocs.yml
+          test -f docs-api/site/index.html
+
+      # ---- Java API docs (javadoc) ----------------------------------------
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build Java API docs
+        run: |
+          # Forks the lifecycle to generate-sources, so the protoc-generated
+          # gRPC classes are documented alongside the hand-written ones.
+          mvn -B -ntp javadoc:javadoc
+          # Output dir differs across javadoc-plugin versions; find it.
+          JD=$(find target -type d -name apidocs | head -n1)
+          test -n "$JD" && test -f "$JD/index.html" \
+            || { echo "::error::javadoc output (apidocs/index.html) not found"; exit 1; }
+          echo "JAVADOC_DIR=$JD" >> "$GITHUB_ENV"
+
+      # ---- Publish (tag pushes only; dispatch is a build-only dry run) -----
+      - name: Set up SSH key
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
+
+      - name: Publish API docs with rsync
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Ensure the target namespaces exist (the site deploy never creates
+          # them), then mirror each generator's output. --delete keeps each
+          # namespace to the latest release only.
+          ssh -i ~/.ssh/id_ed25519 jyu@biopb.org \
+            'mkdir -p /var/www/biopb.org/docs/api/python /var/www/biopb.org/docs/api/java'
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            docs-api/site/ jyu@biopb.org:/var/www/biopb.org/docs/api/python/
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            "$JAVADOC_DIR/" jyu@biopb.org:/var/www/biopb.org/docs/api/java/
