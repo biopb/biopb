@@ -7,6 +7,8 @@ Provides:
 - Lazy data handling utilities for co-deployed tensor server
 """
 
+import functools
+import inspect
 import logging
 import threading
 import time
@@ -377,13 +379,100 @@ class TokenValidationInterceptor(grpc.ServerInterceptor):
 # =============================================================================
 
 
-class BiopbServicerBase(proto.ObjectDetectionServicer, proto.ProcessImageServicer):
+# Resolved lazily and memoized: the set of RPC handler method names declared by
+# the generated gRPC servicer interfaces. Only these names are auto-wrapped by
+# the metaclass; __init__, _server_context, and other helpers are left alone.
+_RPC_METHOD_NAMES: Optional[frozenset] = None
+
+
+def _grpc_rpc_method_names() -> frozenset:
+    """Names of the RPC handlers declared by the gRPC servicer interfaces."""
+    global _RPC_METHOD_NAMES
+    if _RPC_METHOD_NAMES is None:
+        names = set()
+        for servicer_cls in (proto.ObjectDetectionServicer, proto.ProcessImageServicer):
+            for attr, member in vars(servicer_cls).items():
+                if not attr.startswith("_") and inspect.isfunction(member):
+                    names.add(attr)
+        _RPC_METHOD_NAMES = frozenset(names)
+    return _RPC_METHOD_NAMES
+
+
+def _wrap_rpc_method(func):
+    """Wrap an RPC handler so its body runs inside ``self._server_context``.
+
+    Generator (streaming) handlers are wrapped with ``yield from`` so the
+    context spans the entire stream rather than just the creation of the
+    generator object (a plain ``return func(...)`` would enter and exit the
+    context before any streaming work ran). Note that for streaming handlers
+    the context -- and the lock, when ``use_lock`` is enabled -- is therefore
+    held for the full duration of the stream.
+
+    The wrapper is flagged with ``__biopb_wrapped__`` so it is never wrapped a
+    second time as the method is inherited down a class hierarchy.
+    """
+    if inspect.isgeneratorfunction(func):
+
+        @functools.wraps(func)
+        def wrapper(self, request, context):
+            with self._server_context(context):
+                yield from func(self, request, context)
+
+    else:
+
+        @functools.wraps(func)
+        def wrapper(self, request, context):
+            with self._server_context(context):
+                return func(self, request, context)
+
+    wrapper.__biopb_wrapped__ = True
+    return wrapper
+
+
+class _ServerContextMeta(type):
+    """Metaclass that wraps gRPC RPC handlers in ``_server_context``.
+
+    Lets servicer subclasses implement RPC methods (RunDetection, Run, etc.)
+    without the boilerplate ``with self._server_context(context):`` block.
+    Methods are matched by name against the generated gRPC servicer interfaces,
+    so helpers and ``__init__`` are never touched.
+
+    Wrapping is idempotent, and because ``_server_context`` is reentrant, an
+    explicit in-body ``with self._server_context(context):`` (as written by the
+    existing servicers) simply becomes a transparent pass-through. Existing
+    servicers therefore keep working unchanged whether or not they drop the
+    line.
+    """
+
+    def __new__(mcs, name, bases, namespace, **kwargs):
+        rpc_names = _grpc_rpc_method_names()
+        for attr in list(namespace):
+            value = namespace[attr]
+            if (
+                attr in rpc_names
+                and inspect.isfunction(value)
+                and not getattr(value, "__biopb_wrapped__", False)
+            ):
+                namespace[attr] = _wrap_rpc_method(value)
+        return super().__new__(mcs, name, bases, namespace, **kwargs)
+
+
+class BiopbServicerBase(
+    proto.ObjectDetectionServicer,
+    proto.ProcessImageServicer,
+    metaclass=_ServerContextMeta,
+):
     """Base class for biopb servicers with error handling and logging.
 
     Provides:
     - Optional thread-safe request handling via lock
     - Error handling with proper gRPC status codes and correlation IDs
     - Full traceback logging for all errors
+    - Automatic wrapping of RPC handlers in ``_server_context`` via the
+      ``_ServerContextMeta`` metaclass, so subclasses may implement
+      RunDetection / Run / RunStream / etc. *without* the boilerplate
+      ``with self._server_context(context):`` block. Writing the block
+      explicitly still works -- it becomes a harmless reentrant pass-through.
 
     Subclasses should implement RunDetection and Run methods.
 
@@ -406,12 +495,33 @@ class BiopbServicerBase(proto.ObjectDetectionServicer, proto.ProcessImageService
     def _server_context(self, context):
         """Context manager for request handling with error handling.
 
-        Usage:
+        Subclasses normally do not need to use this directly -- the metaclass
+        (``_ServerContextMeta``) wraps every RPC handler in it automatically.
+        It remains safe to write the block explicitly::
+
             def RunDetection(self, request, context):
                 with self._server_context(context):
                     # ... process request ...
                     return response
+
+        The reentrancy guard below makes such an inner block a transparent
+        pass-through so that locking and error translation happen exactly once.
         """
+        # Reentrancy guard: only the outermost _server_context on a given call
+        # locks and translates errors; any nested entry is a pass-through. This
+        # keeps the metaclass wrapper and an explicit in-body `with` block from
+        # double-translating (which would clobber the status code, since
+        # context.abort() raises a bare Exception -- see the handler below).
+        #
+        # The flag lives on the per-RPC gRPC context object, so it is scoped to
+        # a single call and remains correct under use_lock=False, where
+        # concurrent calls share the servicer instance but get distinct
+        # contexts.
+        if getattr(context, "_biopb_ctx_active", False):
+            yield
+            return
+
+        context._biopb_ctx_active = True
         try:
             if self._use_lock:
                 with self._lock:
@@ -442,6 +552,15 @@ class BiopbServicerBase(proto.ObjectDetectionServicer, proto.ProcessImageService
             )
 
         except Exception as e:
+            # A handler that called context.abort() itself raises a bare
+            # Exception *after* gRPC has already recorded the final status code
+            # (grpc._server._Context.abort). Detect that via the status code and
+            # re-raise, so an explicit abort (e.g. INVALID_ARGUMENT from
+            # abort_invalid_argument) is preserved rather than downgraded to
+            # INTERNAL here.
+            if context.code() is not None:
+                raise
+
             error_id = uuid.uuid4().hex[:8]
             logger.error(f"[{error_id}] Prediction failed: {e}")
             logger.error(f"[{error_id}] Traceback:\n{traceback.format_exc()}")
@@ -465,6 +584,9 @@ class BiopbServicerBase(proto.ObjectDetectionServicer, proto.ProcessImageService
                 grpc.StatusCode.INTERNAL,
                 f"Prediction failed with error: {repr(e)} (error_id: {error_id})",
             )
+
+        finally:
+            context._biopb_ctx_active = False
 
     def RunDetectionStream(self, request_iterator, context):
         """Handle streaming detection requests.
