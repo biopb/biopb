@@ -31,6 +31,23 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # close_hook (kept in sync by this comment, like _deathwatch.ENV_FD).
 ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 
+# Env var carrying the inherited *write* end of the token-report pipe (issue
+# #86). On every successful tensor-server connect the in-kernel bootstrap writes
+# one "url\ttoken\n" line to this fd; the launcher's reader thread caches the
+# latest (url, token) in the MCP-server process. Because that process outlives a
+# kernel restart, the cached token is re-injected into the next kernel's env as
+# BIOPB_TENSOR_TOKEN (see _launch) -- so a token the user typed into the Tensor
+# Browser survives restart_kernel / close-window->start_kernel without ever
+# touching disk. The literal is mirrored in _bootstrap._make_token_report_hook.
+ENV_TOKEN_REPORT_FD = "BIOPB_TOKEN_REPORT_FD"
+
+# Env vars the kernel's TensorConnection.resolve_from_config reads to seed its
+# (url, token) before auto_connect. Re-injecting the remembered token through the
+# same env path means the kernel needs no special "restored token" code -- it is
+# indistinguishable from a token set in the launch environment.
+_TENSOR_TOKEN_ENV = "BIOPB_TENSOR_TOKEN"
+_TENSOR_URL_ENV = "BIOPB_TENSOR_URL"
+
 # Prepended exec-line that installs the in-kernel parent-death watcher before
 # the (possibly slow) napari bootstrap runs. Paired with the inherited read-end
 # fd passed in BIOPB_PARENT_DEATH_FD; see _deathwatch and KernelHost._launch.
@@ -165,6 +182,21 @@ class KernelHost:
         self._window_close_pipe = window_close_pipe and os.name == "posix"
         self._window_r = None
         self._window_thread = None
+        # Token-report pipe (issue #86): the *kernel* holds the write end and
+        # writes "url\ttoken" on each successful connect; the launcher holds this
+        # read end and a reader thread caches the latest (url, token) so the next
+        # _launch re-injects it. POSIX-only, like the death/window pipes (it uses
+        # the same inherited-fd plumbing); on Windows a GUI-entered token is not
+        # persisted across a kernel restart.
+        self._token_report_pipe = os.name == "posix"
+        self._token_r = None
+        self._token_thread = None
+        # Latest tensor (url, token) reported by a connected kernel, remembered
+        # in this (server) process across kernel restarts and re-injected into the
+        # next kernel's env (issue #86). Deliberately kept across teardown -- that
+        # is the whole point. Never written to disk.
+        self._tensor_url = None
+        self._tensor_token = None
         # Liveness watchdog (failure mode 2): respawn an unexpectedly-dead
         # kernel after reaping its orphaned dask group, bounded to avoid a
         # crash-respawn thrash loop.
@@ -245,6 +277,17 @@ class KernelHost:
         extra_args = list(self._extra_arguments)
         popen_kwargs = {}
 
+        # Re-inject a remembered tensor token (issue #86) so a kernel rebuilt by
+        # restart_kernel / start_kernel reconnects with the token the user entered
+        # before -- which lived only in the now-dead prior kernel. The kernel's
+        # resolve_from_config already reads BIOPB_TENSOR_TOKEN, so this is the same
+        # env path, just sourced from this process's memory instead of the shell.
+        if self._tensor_token:
+            env = dict(env)
+            env[_TENSOR_TOKEN_ENV] = self._tensor_token
+            if self._tensor_url:
+                env[_TENSOR_URL_ENV] = self._tensor_url
+
         # Redirect the kernel subprocess' native stdout/stderr fds. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher
         # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
@@ -277,6 +320,16 @@ class KernelHost:
             env[ENV_WINDOW_CLOSE_FD] = str(win_w)
             pass_fds.append(win_w)
 
+        # Token-report pipe (issue #86): same direction as the window pipe — the
+        # kernel inherits the *write* end and reports its (url, token) on connect;
+        # the launcher keeps the read end and caches the token for re-injection.
+        token_w = None
+        if self._token_report_pipe:
+            self._token_r, token_w = os.pipe()
+            env = dict(env)
+            env[ENV_TOKEN_REPORT_FD] = str(token_w)
+            pass_fds.append(token_w)
+
         if pass_fds:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
@@ -298,7 +351,8 @@ class KernelHost:
                 # keeps the opposite end so a closure reaches across the pipe.
                 # Death pipe: launcher keeps the write end. Window pipe: launcher
                 # keeps the read end, so close its copy of the write end here.
-                for _fd in (death_r, win_w):
+                # (The token pipe is the same direction as the window pipe.)
+                for _fd in (death_r, win_w, token_w):
                     if _fd is not None:
                         try:
                             os.close(_fd)
@@ -309,6 +363,7 @@ class KernelHost:
             self._kc.start_channels()
             self._kc.wait_for_ready(timeout=self._startup_timeout)
             self._start_window_watch()
+            self._start_token_watch()
         except Exception:
             self._shutdown_current()
             raise
@@ -634,6 +689,7 @@ class KernelHost:
         self._pgid = None
         self._close_death_pipe()
         self._close_window_pipe()
+        self._close_token_pipe()
 
     def _close_death_pipe(self):
         if self._death_w is not None:
@@ -657,6 +713,20 @@ class KernelHost:
                 pass
             self._window_r = None
         self._window_thread = None
+
+    def _close_token_pipe(self):
+        # Sole closer of the token-report read end (the reader thread never closes
+        # it). Closing unblocks a thread parked in os.read with OSError, so the
+        # daemon thread just returns -- no deadlock. We deliberately KEEP
+        # self._tensor_url/_token across teardown: re-injecting them on the next
+        # launch is the whole point (issue #86).
+        if self._token_r is not None:
+            try:
+                os.close(self._token_r)
+            except OSError:
+                pass
+            self._token_r = None
+        self._token_thread = None
 
     # -- window-close watcher -------------------------------------------
 
@@ -699,6 +769,60 @@ class KernelHost:
             self.shutdown()
         except Exception:
             logger.exception("teardown after window close failed")
+
+    # -- token-report watcher (issue #86) -------------------------------
+
+    def _start_token_watch(self):
+        """Start the token-report reader thread if the pipe is configured."""
+        fd = self._token_r
+        if fd is None:
+            return
+        self._token_thread = threading.Thread(
+            target=self._watch_token_report,
+            args=(fd,),
+            name="token-report-watch",
+            daemon=True,
+        )
+        self._token_thread.start()
+
+    def _watch_token_report(self, fd):
+        """Cache the (url, token) the kernel reports on each successful connect.
+
+        The kernel writes one ``url\\ttoken\\n`` line per connect (an empty token
+        field means "no token / cleared"). We keep only the latest in
+        ``_tensor_url`` / ``_tensor_token`` so the next :meth:`_launch` re-injects
+        it (issue #86). EOF (the kernel went away via any teardown path) ends the
+        thread. The fd is owned/closed by :meth:`_close_token_pipe`, so we never
+        close it here — avoiding a race with a concurrent teardown.
+        """
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return  # EOF: kernel gone
+            buf += chunk
+            # Process complete lines; keep any trailing partial in the buffer.
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                self._record_token_line(line)
+
+    def _record_token_line(self, line: bytes) -> None:
+        """Update the remembered (url, token) from one reported ``url\\ttoken``
+        line. A malformed/undecodable line is ignored; an empty token field
+        clears the remembered token (e.g. the user switched to a no-auth
+        server)."""
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        url, sep, token = text.partition("\t")
+        if not sep:
+            return  # not a token-report line
+        self._tensor_url = url or None
+        self._tensor_token = token or None
 
     # -- liveness watchdog (issue #13, failure mode 2) ------------------
 

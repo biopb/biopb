@@ -15,6 +15,7 @@ from biopb_mcp._config import DEFAULT_CONFIG
 from biopb_mcp._connection import (
     SERVER_QUERY_THRESHOLD,
     TensorConnection,
+    connect_error_message,
 )
 
 
@@ -146,6 +147,11 @@ class TestConnect:
         assert conn.sources == {}
         assert conn.use_server_query is False
         assert conn.is_connected is False
+        # issue #86 secondary: the failure now records a non-empty reason (no
+        # longer a blank error that server_status/the widget can't explain).
+        assert conn.last_status == "error"
+        assert conn.last_message
+        assert "grpc://host:9" in conn.last_message
 
     def test_refresh_requires_connection(self):
         conn = TensorConnection(config={})
@@ -285,7 +291,11 @@ class TestConnectReadiness:
             conn.connect("grpc://host:9")
         assert conn.is_connected is False
         assert conn.last_status == "error"
-        assert conn.last_message == ""
+        # The stale "starting" message is replaced by the error reason (#86):
+        # an unreachable server gets a friendly, actionable hint.
+        assert "scanning" not in conn.last_message
+        assert "Cannot reach" in conn.last_message
+        assert "grpc://host:9" in conn.last_message
 
     def test_starting_message_includes_zero_counts(self):
         # source_count=0 is meaningful (just started) and must not be dropped.
@@ -833,3 +843,43 @@ class TestAutoConnect:
         )
         # A failed autostart must not propagate out of the best-effort policy.
         conn.auto_connect()
+
+
+# ---------------------------------------------------------------------------
+# connect_error_message (issue #86 secondary)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectErrorMessage:
+    URL = "grpc://host:9"
+
+    def test_auth_required_when_no_token(self):
+        exc = RuntimeError("FlightUnauthenticatedError: token required")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "Authentication required" in msg
+        assert self.URL in msg
+        # Names the fix so the user knows what to do.
+        assert "token" in msg.lower()
+
+    def test_auth_failed_when_token_present(self):
+        exc = RuntimeError("PermissionDenied: invalid token")
+        msg = connect_error_message(exc, self.URL, token="bad")
+        assert "Authentication failed" in msg
+        assert "rejected" in msg
+        assert self.URL in msg
+
+    def test_unreachable_gets_friendly_hint(self):
+        exc = RuntimeError("FlightUnavailableError: failed to connect to all addresses")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "Cannot reach" in msg
+        assert self.URL in msg
+
+    def test_other_error_echoes_underlying(self):
+        exc = ValueError("something odd")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "something odd" in msg
+
+    def test_never_blank(self):
+        # Even an exception with an empty str() yields an actionable message.
+        msg = connect_error_message(RuntimeError(), self.URL, token=None)
+        assert msg.strip()

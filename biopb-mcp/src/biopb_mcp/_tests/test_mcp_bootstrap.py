@@ -1,9 +1,11 @@
 """Unit tests for bootstrap helpers that don't need a kernel/display.
 
 Currently: _register_cache_plugin -- the cluster-wide chunk-cache budget split
-across dask workers, installed via biopb's worker-init plugin.
+across dask workers, installed via biopb's worker-init plugin; and
+_make_token_report_hook -- the connect-time token report to the launcher (#86).
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import biopb.tensor.client as tclient
@@ -112,3 +114,47 @@ class TestHeadlessViewer:
 
     def test_repr_is_self_describing(self):
         assert "headless" in repr(_bootstrap._HeadlessViewer()).lower()
+
+
+class TestTokenReportHook:
+    """The on_connect-side hook that reports (url, token) to the launcher (#86)."""
+
+    def test_none_without_report_fd(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_TOKEN_REPORT_FD", raising=False)
+        assert _bootstrap._make_token_report_hook() is None
+
+    def test_none_when_fd_not_an_int(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TOKEN_REPORT_FD", "not-a-number")
+        assert _bootstrap._make_token_report_hook() is None
+
+    def test_writes_url_tab_token_line(self, monkeypatch):
+        r, w = os.pipe()
+        monkeypatch.setenv("BIOPB_TOKEN_REPORT_FD", str(w))
+        try:
+            hook = _bootstrap._make_token_report_hook()
+            assert hook is not None
+            hook("grpc://srv:8815", "secret-tok")
+            assert os.read(r, 4096) == b"grpc://srv:8815\tsecret-tok\n"
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_none_token_serializes_as_empty_field(self, monkeypatch):
+        r, w = os.pipe()
+        monkeypatch.setenv("BIOPB_TOKEN_REPORT_FD", str(w))
+        try:
+            hook = _bootstrap._make_token_report_hook()
+            hook("grpc://srv:8815", None)
+            # Empty token field => the launcher clears its remembered token.
+            assert os.read(r, 4096) == b"grpc://srv:8815\t\n"
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_io_error_is_swallowed(self, monkeypatch):
+        r, w = os.pipe()
+        monkeypatch.setenv("BIOPB_TOKEN_REPORT_FD", str(w))
+        hook = _bootstrap._make_token_report_hook()
+        os.close(r)
+        os.close(w)  # writing to a closed pipe raises -> must be swallowed
+        hook("grpc://srv:8815", "tok")  # no exception

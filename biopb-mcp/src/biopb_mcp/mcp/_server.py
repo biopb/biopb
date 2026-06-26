@@ -246,6 +246,11 @@ elif getattr(_conn, "last_status", "") == "starting":
     print("  state: starting — " + str(getattr(_conn, "last_message", "")))
 else:
     print("  connected: false")
+    _lm = str(getattr(_conn, "last_message", ""))
+    if _lm:
+        # issue #86: surface the reason (auth required / unreachable) instead of
+        # a bare "connected: false" the agent can't act on.
+        print("  error: " + _lm)
 
 print("")
 print("## Viewer")

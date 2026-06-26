@@ -77,6 +77,50 @@ class TestConfigureDask:
         assert cluster is None
 
 
+class TestTokenReportParsing:
+    """Pure-unit tests for the token-report cache (issue #86), no kernel needed."""
+
+    def test_record_updates_remembered_token(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok-123")
+        assert host._tensor_url == "grpc://host:9"
+        assert host._tensor_token == "tok-123"
+
+    def test_empty_token_field_clears(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok-123")
+        # User switched to a no-auth server: the report carries an empty token.
+        host._record_token_line(b"grpc://other:1\t")
+        assert host._tensor_url == "grpc://other:1"
+        assert host._tensor_token is None
+
+    def test_malformed_line_ignored(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok")
+        host._record_token_line(b"no-tab-here")  # not a token-report line
+        assert host._tensor_token == "tok"
+
+    def test_watch_loop_caches_from_pipe(self):
+        """The reader thread caches lines written to the pipe and exits on EOF."""
+        host = KernelHost(health_probe_code=None)
+        r, w = os.pipe()
+        host._token_r = r
+        host._start_token_watch()
+        try:
+            os.write(w, b"grpc://h:9\ttok-A\n")
+            # Two messages in one write are both processed (line-framed).
+            os.write(w, b"grpc://h:9\ttok-B\ngrpc://h:9\ttok-")
+            deadline = time.time() + 5.0
+            while host._tensor_token != "tok-B" and time.time() < deadline:
+                time.sleep(0.02)
+            assert host._tensor_token == "tok-B"  # partial trailing line buffered
+        finally:
+            os.close(w)  # EOF -> reader thread returns
+        host._token_thread.join(timeout=5.0)
+        assert not host._token_thread.is_alive()
+        os.close(r)
+
+
 @pytest.fixture
 def kernel():
     """A bare kernel with no bootstrap and no health probe."""
@@ -713,5 +757,69 @@ class TestWindowClosePipe:
         try:
             host.start()
             assert host._window_r is None
+        finally:
+            host.shutdown()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="token-report pipe is POSIX-only")
+class TestTokenReportPipe:
+    """End-to-end token persistence across a kernel restart (issue #86)."""
+
+    def test_kernel_reports_token_to_launcher(self):
+        """A token the kernel writes to its report fd is cached in the host."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            host.start()
+            assert host._token_r is not None
+            # Simulate the in-kernel on_connect hook reporting (url, token).
+            host.execute(
+                "import os; os.write(int(os.environ['BIOPB_TOKEN_REPORT_FD']),"
+                " b'grpc://srv:8815\\tsecret-tok\\n')"
+            )
+            deadline = time.time() + 10
+            while host._tensor_token != "secret-tok" and time.time() < deadline:
+                time.sleep(0.05)
+            assert host._tensor_url == "grpc://srv:8815"
+            assert host._tensor_token == "secret-tok"
+        finally:
+            host.shutdown()
+
+    def test_remembered_token_is_reinjected_on_launch(self):
+        """A token remembered in the host reaches the (re)launched kernel's env —
+        the mechanism that lets a GUI-entered token survive restart_kernel."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        # Pre-seed as if a prior kernel had reported it before dying.
+        host._tensor_url = "grpc://srv:8815"
+        host._tensor_token = "remembered-tok"
+        try:
+            host.start()
+            res = host.execute(
+                "import os; print(os.environ.get('BIOPB_TENSOR_TOKEN'),"
+                " os.environ.get('BIOPB_TENSOR_URL'))"
+            )
+            assert "remembered-tok" in res["stdout"]
+            assert "grpc://srv:8815" in res["stdout"]
+        finally:
+            host.shutdown()
+
+    def test_token_survives_across_restart(self):
+        """The full loop: kernel reports a token, restart_kernel rebuilds the
+        kernel, and the new kernel's env carries the remembered token."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            host.start()
+            host.execute(
+                "import os; os.write(int(os.environ['BIOPB_TOKEN_REPORT_FD']),"
+                " b'grpc://srv:8815\\tround-trip-tok\\n')"
+            )
+            deadline = time.time() + 10
+            while host._tensor_token != "round-trip-tok" and time.time() < deadline:
+                time.sleep(0.05)
+            assert host._tensor_token == "round-trip-tok"
+
+            host.restart()  # the #86 repro: kernel process is replaced
+
+            res = host.execute("import os; print(os.environ.get('BIOPB_TENSOR_TOKEN'))")
+            assert "round-trip-tok" in res["stdout"]
         finally:
             host.shutdown()

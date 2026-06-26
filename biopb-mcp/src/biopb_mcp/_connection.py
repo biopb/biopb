@@ -97,6 +97,53 @@ def is_local_url(url: str) -> bool:
     return host is None or host in _LOCAL_HOSTS
 
 
+# Substrings (lowercased) that mark a connect failure as an authentication
+# problem across the Flight/gRPC stacks, vs a plain "server is down".
+_AUTH_ERROR_MARKERS = (
+    "unauthenticat",
+    "unauthoriz",
+    "permission denied",
+    "invalid token",
+    "missing token",
+)
+_UNREACHABLE_MARKERS = (
+    "unavailable",
+    "refused",
+    "failed to connect",
+    "deadline",
+    "timed out",
+    "timeout",
+)
+
+
+def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
+    """A human-readable reason for a failed :meth:`TensorConnection.connect`.
+
+    Read by the widget's status label and the MCP ``server_status`` tool, which
+    used to show a *blank* error here (issue #86 secondary). The common cause of
+    the silent failure was an auth problem — a token needed but missing or wrong
+    (e.g. a GUI-entered token lost across a kernel restart) — so that case names
+    the fix; an unreachable server gets a friendly hint; anything else echoes the
+    underlying error so nothing is hidden.
+    """
+    text = f"{type(exc).__name__}: {exc}".strip()
+    low = text.lower()
+    if any(m in low for m in _AUTH_ERROR_MARKERS):
+        if token:
+            return (
+                f"Authentication failed: the tensor server at {url} rejected the token."
+            )
+        return (
+            f"Authentication required: the tensor server at {url} needs a token. "
+            "Enter it in the Tensor Browser (or set BIOPB_TENSOR_TOKEN)."
+        )
+    if any(m in low for m in _UNREACHABLE_MARKERS):
+        return f"Cannot reach the tensor server at {url} — is it running?"
+    if text:
+        return f"Could not connect to the tensor server at {url}: {text}"
+    return f"Could not connect to the tensor server at {url}."
+
+
 class TensorConnection:
     """Owns the tensor client, source catalog, and connection settings."""
 
@@ -210,12 +257,15 @@ class TensorConnection:
             return sources
         except ServerStarting:
             raise
-        except Exception:
+        except Exception as exc:
             self.client = None
             self.sources = {}
             self.use_server_query = False
             self.last_status = "error"
-            self.last_message = ""
+            # Populate the reason (issue #86 secondary): the disconnect used to
+            # surface as a blank error, hiding the common "token required/wrong"
+            # cause behind a kernel restart.
+            self.last_message = connect_error_message(exc, url, token)
             raise
 
     def refresh(self) -> Dict[str, DataSourceDescriptor]:

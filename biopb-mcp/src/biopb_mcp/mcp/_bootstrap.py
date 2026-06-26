@@ -220,6 +220,37 @@ def _install_window_close_hook(viewer):
         logger.exception("Failed to install napari window-close hook")
 
 
+def _make_token_report_hook():
+    """Return a ``(url, token) -> None`` callback that reports the connection to
+    the launcher, or ``None`` when no report pipe is configured.
+
+    The launcher inherits the *write* end of a pipe via ``BIOPB_TOKEN_REPORT_FD``
+    (set by ``KernelHost._launch``, name = ``_kernel.ENV_TOKEN_REPORT_FD``) and
+    caches the latest token in the MCP-server process so it can re-inject it into
+    the next kernel's env — persisting a token the user entered in the Tensor
+    Browser across ``restart_kernel`` without it ever touching disk (issue #86).
+    Wired into ``TensorConnection.on_connect`` so it fires on every successful
+    connect. One ``url\\ttoken`` line per connect (a single small write, atomic
+    under PIPE_BUF). Fully best-effort: a missing fd or any IO error is swallowed.
+    """
+    fd_str = os.environ.get("BIOPB_TOKEN_REPORT_FD")
+    if not fd_str:
+        return None
+    try:
+        fd = int(fd_str)
+    except ValueError:
+        return None
+
+    def _report(url, token):
+        line = f"{url or ''}\t{token or ''}\n".encode()
+        try:
+            os.write(fd, line)
+        except OSError:
+            pass
+
+    return _report
+
+
 def bootstrap():
     """Entry point called from the kernel's exec_lines."""
     try:
@@ -283,9 +314,19 @@ def _bootstrap_impl():
         if dask_cluster is not None and hasattr(dask_cluster, "worker_spec")
         else None
     )
-    conn.on_connect = lambda url, token: _register_cache_plugin(
-        dask_client, url, token, config, planned_workers
-    )
+    # on_connect fires (in the kernel) after every successful connect with the
+    # final (url, token). It drives two things: bounding the dask chunk cache
+    # (the token is only known post-connect) and reporting the token up to the
+    # launcher so it survives a kernel restart (issue #86). The report hook is
+    # None when no report pipe is configured (Windows, or a bare unit test).
+    _report_token = _make_token_report_hook()
+
+    def _on_connect(url, token):
+        _register_cache_plugin(dask_client, url, token, config, planned_workers)
+        if _report_token is not None:
+            _report_token(url, token)
+
+    conn.on_connect = _on_connect
 
     # 4. Visible napari viewer + Tensor Browser (auto-connects on its own tick).
     #    compute_scheduler pins the viewer's serial slice reads to a
