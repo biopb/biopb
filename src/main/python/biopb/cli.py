@@ -13,13 +13,17 @@ from typing import List, Optional, Tuple
 
 import typer
 
+from ._proc import (
+    is_process_running as _is_process_running,
+    process_create_time as _process_create_time,
+)
+
 console = Console()
 
 app = typer.Typer(
     name="biopb",
     help="BioPB: open protobuf/gRPC protocols for biomedical image processing",
 )
-console = Console()
 
 
 def _add_optional_typer(name: str, import_path: str, help: str) -> None:
@@ -106,16 +110,6 @@ def _ensure_dirs():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _read_pid_file(pid_file: Path) -> Optional[int]:
-    """Read a PID from `pid_file`, return None if missing or invalid."""
-    if not pid_file.exists():
-        return None
-    try:
-        return int(pid_file.read_text().strip())
-    except (ValueError, IOError):
-        return None
-
-
 def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
     """Read (pid, identity_token) from `pid_file`.
 
@@ -158,11 +152,6 @@ def _remove_pid_file(pid_file: Path):
         pid_file.unlink()
 
 
-def _read_pid() -> Optional[int]:
-    """Read the tensor-server daemon PID, or None if missing/invalid."""
-    return _read_pid_file(PID_FILE)
-
-
 def _write_pid(pid: int):
     """Write the tensor-server daemon PID (+ its create-time identity token)."""
     _ensure_dirs()
@@ -172,117 +161,6 @@ def _write_pid(pid: int):
 def _remove_pid():
     """Remove the tensor-server daemon PID file."""
     _remove_pid_file(PID_FILE)
-
-
-def _is_process_running(pid: int) -> bool:
-    """Check if process with PID is running."""
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        # On Windows os.kill(pid, 0) is NOT a liveness probe: signal value 0 is
-        # signal.CTRL_C_EVENT, so os.kill would call GenerateConsoleCtrlEvent and
-        # deliver a real Ctrl+C to the console process group (killing the daemon
-        # we just started, mid-import). Query the process handle instead.
-        import ctypes
-        from ctypes import wintypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)  # Signal 0 just checks if process exists
-        return True
-    except OSError:
-        return False
-
-
-def _process_create_time(pid: int) -> Optional[int]:
-    """A per-process-unique creation-time token for `pid`, or None if it can't be
-    determined.
-
-    Comparing a token recorded at launch with the live value detects PID reuse:
-    a recycled PID gets a different creation time. This is what makes the PID file
-    an *identity* check, not just a liveness check -- crucial on Windows, which
-    hard-kills the daemon at logout (so the PID file is never cleaned) and reuses
-    PIDs aggressively, letting a stale PID name an unrelated process that `stop`
-    would otherwise TerminateProcess.
-
-    Returns None when unavailable -- the process is gone, or the platform has no
-    cheap source (e.g. macOS) -- and callers then degrade to a liveness-only check
-    (the pre-fix behavior), never a false "stopped".
-    """
-    if pid <= 0:
-        return None
-    if sys.platform == "win32":
-        # GetProcessTimes -> creation FILETIME (100ns ticks since 1601), unique
-        # enough per (PID, lifetime). PROCESS_QUERY_LIMITED_INFORMATION suffices.
-        import ctypes
-        from ctypes import wintypes
-
-        class _FILETIME(ctypes.Structure):
-            _fields_ = [
-                ("dwLowDateTime", wintypes.DWORD),
-                ("dwHighDateTime", wintypes.DWORD),
-            ]
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessTimes.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(_FILETIME),
-            ctypes.POINTER(_FILETIME),
-            ctypes.POINTER(_FILETIME),
-            ctypes.POINTER(_FILETIME),
-        ]
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        try:
-            creation, exit_t, kernel_t, user_t = (
-                _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME(),
-            )
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_t),
-                ctypes.byref(kernel_t),
-                ctypes.byref(user_t),
-            ):
-                return None
-            return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-        finally:
-            kernel32.CloseHandle(handle)
-    if sys.platform.startswith("linux"):
-        # /proc/<pid>/stat field 22 = starttime (clock ticks since boot). comm
-        # (field 2) is parenthesized and may itself contain spaces/parens, so
-        # parse the fields after the LAST ')': index 19 of those is starttime.
-        try:
-            data = Path(f"/proc/{pid}/stat").read_bytes()
-            fields = data[data.rfind(b")") + 2:].split()
-            return int(fields[19])
-        except (OSError, ValueError, IndexError):
-            return None
-    return None
 
 
 def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
@@ -637,6 +515,26 @@ def start(
         console.print(f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]")
         _remove_pid()
 
+    # Refuse to start on top of an already-bound gRPC port. The stale-but-dead
+    # PID was handled above; this catches the orphan case the PID file cannot
+    # see -- a data server still serving after its manager exited, its PID file
+    # deleted, or a second login session -- which would otherwise double-bind,
+    # fail silently in the log, and leave a dead process behind the PID file we
+    # are about to write.
+    probe_host, probe_port = _resolve_grpc_hostport(config)
+    if _port_listening(probe_host, probe_port):
+        console.print(
+            f"[red]gRPC port {probe_host}:{probe_port} is already in use.[/red]"
+        )
+        console.print(
+            "It is held by a process biopb is not tracking (no matching PID "
+            "file -- an orphaned daemon, or another login session), so "
+            "[bold]biopb server stop[/bold] cannot reach it. Identify and stop "
+            f"the owner (`netstat -ano | findstr {probe_port}` on Windows, "
+            f"`lsof -i :{probe_port}` on macOS/Linux), then retry."
+        )
+        raise typer.Exit(1)
+
     # Token: skip only when both web and gRPC are bound to localhost
     _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
     if not token:
@@ -703,12 +601,24 @@ def start(
 
     _write_pid(process.pid)
 
-    # Brief wait to check if it started successfully
-    time.sleep(0.5)
-    if not _is_process_running(process.pid):
-        console.print("[red]Failed to start TensorFlight server[/red]")
+    # Wait for the daemon to actually bind its gRPC port -- a readiness check,
+    # not just "is the child alive". A bind collision or early crash surfaces as
+    # the port never coming up (or the process exiting), which we report here
+    # instead of a false "started".
+    if not _await_listening(process.pid, probe_host, probe_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]TensorFlight server started but is not listening on "
+                f"{probe_host}:{probe_port} after 15s.[/red]"
+            )
+            console.print(
+                "It may still be coming up; check [bold]biopb server status -w 30[/bold], "
+                "or [bold]biopb server stop[/bold] if it is wedged."
+            )
+        else:
+            console.print("[red]Failed to start TensorFlight server[/red]")
+            _remove_pid()
         console.print(f"Check logs: {log_file}")
-        _remove_pid()
         raise typer.Exit(1)
 
     console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
@@ -803,13 +713,10 @@ def restart(
     start(config=config, static_dir=static_dir, web_port=web_port, web_host=web_host, log_level=log_level, token=token)
 
 
-def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
-    """Best-effort gRPC endpoint + token for a running server's health query.
-
-    Reads host/port from the TOML config (defaults 127.0.0.1:8815); a server
-    bound to 0.0.0.0/:: is reached over loopback. The token comes from
-    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
-    """
+def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
+    """Loopback-reachable gRPC host/port from the TOML config (default
+    127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
+    the returned host is always something connect()-able locally."""
     host, port = "127.0.0.1", 8815
     if config and config.exists():
         try:
@@ -821,6 +728,17 @@ def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
             pass
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
+    return host, port
+
+
+def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
+    """Best-effort gRPC endpoint + token for a running server's health query.
+
+    Reads host/port from the TOML config (defaults 127.0.0.1:8815); a server
+    bound to 0.0.0.0/:: is reached over loopback. The token comes from
+    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
+    """
+    host, port = _resolve_grpc_hostport(config)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
     return f"grpc://{host}:{port}", token
 
@@ -1114,11 +1032,6 @@ def _require_biopb_mcp() -> None:
         raise typer.Exit(1)
 
 
-def _read_mcp_pid() -> Optional[int]:
-    """Read the MCP daemon PID, or None if missing/invalid."""
-    return _read_pid_file(MCP_PID_FILE)
-
-
 def _write_mcp_pid(pid: int):
     """Write the MCP daemon PID (+ its create-time identity token).
 
@@ -1207,6 +1120,23 @@ def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
         return False
 
 
+def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
+    """Block until (host, port) accepts a connection, returning True. Returns
+    False if the process dies first or `timeout` elapses without the port coming
+    up -- a readiness check (did the daemon actually bind?), strictly stronger
+    than "is the child process still alive". Callers re-check liveness to tell a
+    crash apart from a slow/wedged bind."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _is_process_running(pid):
+            return False
+        if _port_listening(host, port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
 def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
     """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
     wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
@@ -1271,6 +1201,24 @@ def mcp_start(
         _remove_mcp_pid()
 
     resolved_port = port if port is not None else _mcp_default_port()
+
+    # Refuse to start on top of an already-bound port -- the orphan case the PID
+    # file cannot see (daemon still serving with a missing PID file, or another
+    # session). Otherwise the new process double-binds, fails silently in the
+    # log, and leaves a dead process behind the PID file we are about to write.
+    if _port_listening("127.0.0.1", resolved_port):
+        console.print(
+            f"[red]Port 127.0.0.1:{resolved_port} is already in use.[/red]"
+        )
+        console.print(
+            "It is held by a process biopb is not tracking (no matching PID "
+            "file -- an orphaned daemon, or another login session), so "
+            "[bold]biopb mcp stop[/bold] cannot reach it. Identify and stop the "
+            f"owner (`netstat -ano | findstr {resolved_port}` on Windows, "
+            f"`lsof -i :{resolved_port}` on macOS/Linux), then retry."
+        )
+        raise typer.Exit(1)
+
     log_file = _get_mcp_log_file()
     _rotate_log(log_file)
 
@@ -1297,12 +1245,22 @@ def mcp_start(
 
     _write_mcp_pid(process.pid)
 
-    # Brief wait to surface an immediate crash (bad config, port in use).
-    time.sleep(0.5)
-    if not _is_process_running(process.pid):
-        console.print("[red]Failed to start biopb-mcp server[/red]")
+    # Wait for the daemon to actually bind its HTTP port -- a readiness check,
+    # not just "is the child alive". A bind collision or early crash surfaces as
+    # the port never coming up (or the process exiting).
+    if not _await_listening(process.pid, "127.0.0.1", resolved_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]biopb-mcp server started but is not listening on "
+                f"127.0.0.1:{resolved_port} after 15s.[/red]"
+            )
+            console.print(
+                "Check the logs; run [bold]biopb mcp stop[/bold] if it is wedged."
+            )
+        else:
+            console.print("[red]Failed to start biopb-mcp server[/red]")
+            _remove_mcp_pid()
         console.print(f"Check logs: {log_file}")
-        _remove_mcp_pid()
         raise typer.Exit(1)
 
     console.print(f"[green]biopb-mcp server started (PID {process.pid})[/green]")

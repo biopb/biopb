@@ -39,46 +39,20 @@ def _port_listening(port, timeout=0.5):
 def _self_create_time():
     """This process's creation-time token, or None if it can't be determined.
 
-    Mirrors biopb.cli._process_create_time but for os.getpid(): a per-process
-    identity that lets `biopb mcp stop`/`status` tell our daemon apart from an
-    unrelated process that later inherits a reused PID (Windows never cleans the
-    PID file at logout and recycles PIDs aggressively). None -> the CLI falls
-    back to a liveness-only check, the pre-fix behavior.
+    Delegates to biopb._proc.process_create_time (the single source of truth
+    shared with biopb.cli, so the token this daemon writes is computed exactly
+    the way the CLI reads it) for os.getpid(): a per-process identity that lets
+    `biopb mcp stop`/`status` tell our daemon apart from an unrelated process
+    that later inherits a reused PID (Windows never cleans the PID file at logout
+    and recycles PIDs aggressively). None -> the CLI falls back to a liveness-only
+    check, the pre-fix behavior. Best-effort: any failure degrades to None.
     """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
+    try:
+        from biopb._proc import process_create_time
 
-        class _FILETIME(ctypes.Structure):
-            _fields_ = [
-                ("dwLowDateTime", wintypes.DWORD),
-                ("dwHighDateTime", wintypes.DWORD),
-            ]
-
-        kernel32 = ctypes.windll.kernel32
-        creation, exit_t, kernel_t, user_t = (
-            _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME(),
-        )
-        # GetCurrentProcess() is a pseudo-handle (-1); no OpenProcess/CloseHandle.
-        if not kernel32.GetProcessTimes(
-            kernel32.GetCurrentProcess(),
-            ctypes.byref(creation),
-            ctypes.byref(exit_t),
-            ctypes.byref(kernel_t),
-            ctypes.byref(user_t),
-        ):
-            return None
-        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-    if sys.platform.startswith("linux"):
-        try:
-            with open(f"/proc/{os.getpid()}/stat", "rb") as f:
-                data = f.read()
-            # comm (field 2) is parenthesized and may contain spaces/parens; parse
-            # after the last ')'. starttime is field 22 -> index 19 of the rest.
-            return int(data[data.rfind(b")") + 2:].split()[19])
-        except (OSError, ValueError, IndexError):
-            return None
-    return None
+        return process_create_time(os.getpid())
+    except Exception:
+        return None
 
 
 def _pidfile_contents():

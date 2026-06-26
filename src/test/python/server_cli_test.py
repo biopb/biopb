@@ -421,6 +421,10 @@ class TestMcpStart:
             return existing_alive if pid == existing else child_alive
 
         monkeypatch.setattr(cli, "_is_process_running", running)
+        # Port is free pre-launch; readiness mirrors child liveness (a live child
+        # is treated as having bound, a dead one as a failed start).
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli, "_await_listening", lambda pid, *_a, **_k: running(pid))
         proc = MagicMock()
         proc.pid = 4242
         popen = MagicMock(return_value=proc)
@@ -465,6 +469,50 @@ class TestMcpStart:
         res = CliRunner().invoke(cli.app, ["mcp", "start"])
         assert res.exit_code == 1
         assert "Failed to start" in res.output
+
+    def test_port_in_use_fails_loudly(self, monkeypatch, tmp_path):
+        # No PID file, but the port is already bound: an orphan daemon the PID
+        # file cannot see. Refuse to launch rather than double-bind.
+        popen = self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 1
+        assert "already in use" in res.output
+        popen.assert_not_called()
+
+    def test_alive_but_not_listening_fails_loudly(self, monkeypatch, tmp_path):
+        # Child survives but never binds the port (wedged): not a clean start.
+        self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        monkeypatch.setattr(cli, "_await_listening", lambda *_a, **_k: False)
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 1
+        assert "not listening" in res.output
+
+
+class TestAwaitListening:
+    """Readiness probe: did the daemon actually bind, not just stay alive."""
+
+    def test_true_when_port_comes_up(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is True
+
+    def test_false_when_process_dies(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is False
+
+    def test_false_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+        clock = iter([0.0, 0.1, 99.0])
+        monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is False
 
 
 class TestMcpStop:
