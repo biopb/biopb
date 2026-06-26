@@ -36,6 +36,34 @@ def _port_listening(port, timeout=0.5):
         return False
 
 
+def _self_create_time():
+    """This process's creation-time token, or None if it can't be determined.
+
+    Delegates to biopb._proc.process_create_time (the single source of truth
+    shared with biopb.cli, so the token this daemon writes is computed exactly
+    the way the CLI reads it) for os.getpid(): a per-process identity that lets
+    `biopb mcp stop`/`status` tell our daemon apart from an unrelated process
+    that later inherits a reused PID (Windows never cleans the PID file at logout
+    and recycles PIDs aggressively). None -> the CLI falls back to a liveness-only
+    check, the pre-fix behavior. Best-effort: any failure degrades to None.
+    """
+    try:
+        from biopb._proc import process_create_time
+
+        return process_create_time(os.getpid())
+    except Exception:
+        return None
+
+
+def _pidfile_contents():
+    """The text to write into the PID file: `pid` plus, when known, a `pid\\ntoken`
+    create-time identity. Read back by biopb.cli._read_pid_record (two whitespace-
+    separated ints, tolerant of the legacy bare-pid form)."""
+    pid = os.getpid()
+    token = _self_create_time()
+    return f"{pid}\n{token}" if token is not None else str(pid)
+
+
 def _write_pidfile(port):
     """Best-effort: record this daemon's PID so `biopb mcp status` finds it.
 
@@ -43,6 +71,10 @@ def _write_pidfile(port):
     the daemon detached without writing it — so the daemon registers itself
     here, covering every launch path uniformly. Best-effort: a write failure
     only costs `status` visibility, never the server.
+
+    Records a create-time identity token alongside the PID (see
+    :func:`_self_create_time`) so the CLI can distinguish this daemon from an
+    unrelated process that later inherits a reused PID.
 
     Concurrent first-run shims can each spawn a daemon; only the one that binds
     the port survives (the rest die on EADDRINUSE). Re-checking the port
@@ -58,7 +90,7 @@ def _write_pidfile(port):
             # Someone already owns the port; we are about to lose the bind.
             return None
         pidfile.parent.mkdir(parents=True, exist_ok=True)
-        pidfile.write_text(str(os.getpid()))
+        pidfile.write_text(_pidfile_contents())
         return pidfile
     except OSError:
         logger.warning("Could not write PID file %s", pidfile, exc_info=True)
@@ -68,14 +100,16 @@ def _write_pidfile(port):
 def _remove_pidfile(pidfile):
     """Remove our PID file, but only if it still names this process.
 
-    Pid-safe so a losing daemon's exit never deletes the winner's file.
+    Pid-safe so a losing daemon's exit never deletes the winner's file. Compares
+    only the first whitespace-separated field (the PID), ignoring any trailing
+    create-time token, so the match holds regardless of token presence.
     """
     if pidfile is None:
         return
     try:
-        if pidfile.read_text().strip() == str(os.getpid()):
+        if pidfile.read_text().split()[0] == str(os.getpid()):
             pidfile.unlink()
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
 
 

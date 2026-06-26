@@ -84,7 +84,8 @@ class TestStatusHealth:
     and can emit JSON for scripting (used by the installer)."""
 
     def _invoke(self, monkeypatch, *, pid, running, health, extra_args=()):
-        monkeypatch.setattr(cli, "_read_pid", lambda: pid)
+        # token None -> _is_our_daemon falls back to the (mocked) liveness check.
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
         if isinstance(health, list):
             seq = iter(health)
@@ -150,7 +151,7 @@ class TestStatusHealth:
     def test_wait_logs_progress(self, monkeypatch):
         # --wait should log a human-facing progress report while STARTING; JSON
         # stays the last line (parsed by _invoke).
-        monkeypatch.setattr(cli, "_read_pid", lambda: 5)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (5, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
         seq = iter(
             [
@@ -171,7 +172,7 @@ class TestStatusHealth:
 
     def test_no_wait_is_silent(self, monkeypatch):
         # Without --wait, a single probe and no progress chatter.
-        monkeypatch.setattr(cli, "_read_pid", lambda: 5)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (5, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
         monkeypatch.setattr(
             cli, "_query_health", lambda *_a, **_k: {"status": "SERVING", "source_count": 1}
@@ -311,7 +312,9 @@ class TestCacheStats:
     }
 
     def _run(self, monkeypatch, *, running, stats, args=()):
-        monkeypatch.setattr(cli, "_read_pid", lambda: 123 if running else None)
+        monkeypatch.setattr(
+            cli, "_read_pid_record", lambda *_a: (123 if running else None, None)
+        )
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
         monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
         monkeypatch.setattr(cli, "_query_cache_stats", lambda *_a, **_k: stats)
@@ -371,7 +374,7 @@ class TestMcpGate:
         # Spec present -> the gate is a no-op and the command proceeds (here a
         # stopped daemon, so status exits 0 with "Not running").
         monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
-        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: None)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (None, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
         res = CliRunner().invoke(cli.app, ["mcp", "status"])
         assert res.exit_code == 0
@@ -410,12 +413,18 @@ class TestMcpStart:
         monkeypatch.setattr(cli, "MCP_LOG_DIR", tmp_path)
         monkeypatch.setattr(cli, "MCP_PID_FILE", tmp_path / "mcp-server.pid")
         monkeypatch.setattr(cli, "_mcp_default_port", lambda: 8765)
-        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: existing)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (existing, None))
+        # Deterministic PID-file write: no token, so the file is the bare PID.
+        monkeypatch.setattr(cli, "_process_create_time", lambda _p: None)
 
         def running(pid):
             return existing_alive if pid == existing else child_alive
 
         monkeypatch.setattr(cli, "_is_process_running", running)
+        # Port is free pre-launch; readiness mirrors child liveness (a live child
+        # is treated as having bound, a dead one as a failed start).
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli, "_await_listening", lambda pid, *_a, **_k: running(pid))
         proc = MagicMock()
         proc.pid = 4242
         popen = MagicMock(return_value=proc)
@@ -461,11 +470,55 @@ class TestMcpStart:
         assert res.exit_code == 1
         assert "Failed to start" in res.output
 
+    def test_port_in_use_fails_loudly(self, monkeypatch, tmp_path):
+        # No PID file, but the port is already bound: an orphan daemon the PID
+        # file cannot see. Refuse to launch rather than double-bind.
+        popen = self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 1
+        assert "already in use" in res.output
+        popen.assert_not_called()
+
+    def test_alive_but_not_listening_fails_loudly(self, monkeypatch, tmp_path):
+        # Child survives but never binds the port (wedged): not a clean start.
+        self._setup(
+            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=True
+        )
+        monkeypatch.setattr(cli, "_await_listening", lambda *_a, **_k: False)
+        res = CliRunner().invoke(cli.app, ["mcp", "start"])
+        assert res.exit_code == 1
+        assert "not listening" in res.output
+
+
+class TestAwaitListening:
+    """Readiness probe: did the daemon actually bind, not just stay alive."""
+
+    def test_true_when_port_comes_up(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is True
+
+    def test_false_when_process_dies(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is False
+
+    def test_false_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+        clock = iter([0.0, 0.1, 99.0])
+        monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+        assert cli._await_listening(123, "127.0.0.1", 8815, 5.0) is False
+
 
 class TestMcpStop:
     def _run(self, monkeypatch, *, pid, running, graceful=True):
         monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
-        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: pid)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
         monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
         stop = MagicMock(return_value=graceful)
@@ -494,7 +547,7 @@ class TestMcpStop:
 class TestMcpStatus:
     def _json(self, monkeypatch, *, pid, running, listening):
         monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
-        monkeypatch.setattr(cli, "_read_mcp_pid", lambda: pid)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
         monkeypatch.setattr(cli, "_mcp_default_port", lambda: 8765)
         monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: listening)
@@ -568,6 +621,66 @@ class TestMcpLogs:
         res = self._run("--level", "FOO")
         assert res.exit_code == 1
         assert "Invalid --level" in res.output
+
+
+class TestPidIdentity:
+    """The PID file carries a create-time identity token so a stale + reused PID
+    (rife on Windows) is not mistaken for our daemon (issue #138, item 1)."""
+
+    def test_record_roundtrip_with_token(self, tmp_path):
+        f = tmp_path / "x.pid"
+        cli._write_pid_file(f, 1234, 9988776655)
+        assert f.read_text() == "1234\n9988776655"
+        assert cli._read_pid_record(f) == (1234, 9988776655)
+
+    def test_legacy_bare_pid_reads_with_no_token(self, tmp_path):
+        # A pre-upgrade file (bare PID) must still read; token None -> liveness only.
+        f = tmp_path / "x.pid"
+        f.write_text("4321")
+        assert cli._read_pid_record(f) == (4321, None)
+
+    def test_missing_or_garbage_is_none(self, tmp_path):
+        assert cli._read_pid_record(tmp_path / "absent.pid") == (None, None)
+        f = tmp_path / "junk.pid"
+        f.write_text("not-a-pid")
+        assert cli._read_pid_record(f) == (None, None)
+
+    def test_matching_token_is_our_daemon(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_process_create_time", lambda _p: 555)
+        assert cli._is_our_daemon(100, 555) is True
+
+    def test_mismatched_token_is_not_ours(self, monkeypatch):
+        # Alive PID, but a DIFFERENT creation time -> a reused PID, not our daemon.
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_process_create_time", lambda _p: 999)
+        assert cli._is_our_daemon(100, 555) is False
+
+    def test_absent_token_falls_back_to_liveness(self, monkeypatch):
+        # Legacy file / unsupported platform -> trust liveness (pre-fix behavior).
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_process_create_time", lambda _p: 777)
+        assert cli._is_our_daemon(100, None) is True
+
+    def test_dead_pid_is_not_ours(self, monkeypatch):
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: False)
+        assert cli._is_our_daemon(100, 555) is False
+
+    def test_stop_skips_force_kill_on_reused_pid(self, monkeypatch):
+        """`stop` on a stale PID now owned by an unrelated process must clean the
+        PID file WITHOUT TerminateProcess-ing that innocent process."""
+        monkeypatch.setattr("sys.platform", "linux")
+        # The PID is alive, but its identity does not match the recorded token.
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (1234, 555))
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_process_create_time", lambda _p: 999)  # reused
+        remove = MagicMock()
+        monkeypatch.setattr(cli, "_remove_pid", remove)
+        with patch.object(cli.os, "kill") as kill:
+            res = CliRunner().invoke(cli.app, ["server", "stop"])
+        assert res.exit_code == 0
+        kill.assert_not_called()  # the innocent reused PID is never signaled
+        remove.assert_called_once()  # but the stale file is cleaned up
 
 
 class TestWinRequestShutdown:
