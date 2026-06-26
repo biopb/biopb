@@ -191,9 +191,14 @@ for a clean, throwaway environment.
   message-pump or worker-thread approach; (2) raw uv output isn't shown in the
   live memo (it's in `<LogFile>.full.log`); (3) memo auto-scroll-to-bottom not
   wired. A 90-min absolute timeout backstops a hard powershell crash.
-- **CI.** `release.yaml` runs `iscc /DAppVersion=<X.Y.Z>`, signs the output, and
-  attaches `biopb-setup-<R>.exe` to the `release-v*` release next to the engine
-  and `install.ps1`.
+- **CI — implemented (unsigned).** `release.yaml` has a `windows-installer` job
+  (on `windows-latest`) that installs Inno Setup, runs
+  `iscc /DAppVersion=<X.Y.Z>`, and uploads the `.exe` as an artifact; the
+  `release` job downloads it and attaches `biopb-setup-<R>.exe` to the
+  `release-v*` release next to the engine and `install.ps1`. **Signing is not yet
+  wired** — no cert is provisioned, so the build is unsigned and SmartScreen warns
+  "Unknown publisher". Once a cloud-HSM signer is registered with `iscc`, add the
+  sign step (and uncomment `SignTool=biopbsign` in `biopb-setup.iss`).
 
 ## Phasing
 
@@ -201,7 +206,8 @@ for a clean, throwaway environment.
 - **Phase 1 (done in this prototype):** engine ↔ console front-end split; console
   path unchanged for existing users.
 - **Phase 2:** flesh out the Inno wizard + uninstaller against the engine.
-- **Phase 3:** CI build + signing + release-asset attachment.
+- **Phase 3:** CI build + release-asset attachment — **done unsigned**; signing
+  still pending the cert (Phase 0).
 
 ## Code signing
 
