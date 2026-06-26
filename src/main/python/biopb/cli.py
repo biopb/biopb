@@ -36,7 +36,6 @@ def _add_optional_typer(name: str, import_path: str, help: str) -> None:
     surfaces the error only when the subcommand is actually invoked.
     """
     import importlib
-    from typing import List
 
     try:
         module = importlib.import_module(import_path)
@@ -801,8 +800,8 @@ def status(
     ),
 ):
     """Check TensorFlight server daemon status and live health."""
-    pid, token = _read_pid_record(PID_FILE)
-    running = _is_our_daemon(pid, token)
+    pid, id_token = _read_pid_record(PID_FILE)
+    running = _is_our_daemon(pid, id_token)
     stale = bool(pid and not running)
 
     # When running, ask the daemon for its Flight health (status + source_count),
@@ -975,8 +974,8 @@ def cache_stats(
     ),
 ):
     """Show cache hit/miss diagnostics from the running server."""
-    pid, token = _read_pid_record(PID_FILE)
-    if not _is_our_daemon(pid, token):
+    pid, id_token = _read_pid_record(PID_FILE)
+    if not _is_our_daemon(pid, id_token):
         console.print("[yellow]TensorFlight server is not running.[/yellow]")
         raise typer.Exit(1)
 
