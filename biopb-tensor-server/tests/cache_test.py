@@ -937,6 +937,49 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_pending_write_is_discarded_on_recovery(self):
+        """An interrupted write (logged pending, never committed) is dropped on
+        recovery and never served as a torn cache hit -- the WAL's whole purpose,
+        and the crash-safety property that must hold without a clean shutdown
+        (#138 item 2). A committed entry alongside it must still survive.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+
+        backend1 = ArrowFileBackend(config)
+        # A fully committed entry: must survive recovery.
+        backend1.start_compute(b"key_good")
+        backend1.complete_entry(b"key_good", self._make_data([1, 2, 3]), 24)
+        backend1.release(b"key_good")
+        # An in-flight write: pending in the WAL with no committed segment -- the
+        # on-disk shape of a crash mid-complete_entry (after log_pending, before
+        # log_committed).
+        backend1._wal.log_pending(b"key_bad")
+
+        # Crash without clean shutdown, then drop the lock so a fresh instance
+        # can claim it; recovery is then driven by the pending WAL entry.
+        self._simulate_crash(backend1)
+        lock_path = cache_dir / "lock"
+        if lock_path.exists():
+            lock_path.unlink()
+
+        backend2 = ArrowFileBackend(config)
+        # Recovery ran (driven by the pending WAL entry) and purged the in-flight
+        # write: the pending marker is gone, so the key is "lost" per _recover().
+        assert backend2.get_recovery_status() is not None, "recovery must run"
+        assert not backend2._wal.has_pending(), "pending write must be purged"
+
+        good, good_owner = backend2.start_compute(b"key_good")
+        assert good_owner is False, "committed entry must survive as a cache hit"
+        assert good.state == EntryState.READY
+        # The interrupted key was lost: the caller becomes the owner (must
+        # recompute) rather than getting a torn/partial hit.
+        _bad, bad_owner = backend2.start_compute(b"key_bad")
+        assert bad_owner is True, "interrupted write must be recomputed, not served"
+
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
 
 class TestBackendSelection:
     """Tests for CacheManager backend selection."""
