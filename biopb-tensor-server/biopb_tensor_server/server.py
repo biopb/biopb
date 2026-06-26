@@ -26,6 +26,7 @@ import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
     FlightCmd,
+    PyramidLevel,
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,

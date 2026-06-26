@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb.image import (
+    ImageData,
     OpNames,
     OpSchema,
     ProcessImageStub,
@@ -114,7 +115,7 @@ def _parse_input(input_path: Optional[str]) -> tuple[bool, bytes]:
         return (True, input_path)
 
 
-def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageData":
+def _build_image_data(is_file: bool, data_or_path: str) -> "ImageData":
     """Build ImageData from file path or raw bytes.
 
     Args:
@@ -146,13 +147,11 @@ def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageDat
         return _parse_bytes_to_image_data(data_or_path)
 
 
-def _parse_bytes_to_image_data(raw_bytes: bytes) -> "biopb.image.ImageData":
+def _parse_bytes_to_image_data(raw_bytes: bytes) -> "ImageData":
     """Parse raw bytes to ImageData.
 
     Try protobuf SerializedTensor first, fallback to imageio.
     """
-    from biopb.image import ImageData
-
     # Try protobuf SerializedTensor
     try:
         serialized = SerializedTensor.FromString(raw_bytes)

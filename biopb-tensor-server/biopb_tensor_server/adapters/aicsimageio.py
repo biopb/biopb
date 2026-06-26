@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from aicsimageio import AICSImage
 
+    from biopb_tensor_server.base import BackendAdapter
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.remote import RemoteStore

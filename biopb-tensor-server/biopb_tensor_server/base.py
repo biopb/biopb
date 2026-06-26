@@ -57,6 +57,8 @@ from biopb_tensor_server.errors import SourceUnresolvedError
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from biopb.tensor.descriptor_pb2 import PyramidLevel
+
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim

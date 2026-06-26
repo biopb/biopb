@@ -18,6 +18,7 @@ from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.downsample import normalize_reduction_method
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.base import BackendAdapter
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
 
