@@ -1,0 +1,26 @@
+# Repo-root pre-commit, orchestrating lint/format for the whole monorepo
+# (issue #82). Moved up from biopb-mcp/ so the ruff hooks cover all four Python
+# workspace packages. Run locally with `pre-commit run --all-files`.
+#
+# Keep the ruff rev aligned with the CI pin in .github/workflows/lint.yaml.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-docstring-first
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        exclude: ^biopb-mcp/\.napari-hub/.*
+      - id: check-yaml
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  # napari plugin sanity checks apply only to the napari package.
+  - repo: https://github.com/tlambert03/napari-plugin-checks
+    rev: v0.3.0
+    hooks:
+      - id: napari-plugin-checks
+        files: ^biopb-mcp/
