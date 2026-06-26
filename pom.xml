@@ -206,6 +206,9 @@
 					<source>11</source>
 					<failOnWarnings>false</failOnWarnings>
 					<doclint>none</doclint>
+					<!-- biopb.ome is a vestigial, unadopted metadata model (see
+					     CLAUDE.md); keep it out of the published API reference. -->
+					<excludePackageNames>biopb.ome</excludePackageNames>
 				</configuration>
 				<executions>
 					<execution>
