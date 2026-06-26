@@ -349,6 +349,26 @@ class TestCacheStats:
         assert cli._hit_rate(0, 0) == "n/a"
         assert cli._hit_rate(3, 1) == "75.0%"
 
+    def test_explicit_token_is_passed_through(self, monkeypatch):
+        # Regression: --token must reach _query_cache_stats. The PID-record read
+        # binds an identity token; if it reused the name `token` it would clobber
+        # the access-token option (an int identity token would also win `or`).
+        captured = {}
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (123, None))
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+
+        def fake_query(location, token):
+            captured["token"] = token
+            return self._STATS
+
+        monkeypatch.setattr(cli, "_query_cache_stats", fake_query)
+        res = CliRunner().invoke(
+            cli.app, ["server", "cache-stats", "--token", "secret"]
+        )
+        assert res.exit_code == 0, res.output
+        assert captured["token"] == "secret"
+
 
 class TestMcpGate:
     """`mcp` subcommands are gated on the optional biopb-mcp package via
