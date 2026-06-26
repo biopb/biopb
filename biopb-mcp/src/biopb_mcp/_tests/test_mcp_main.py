@@ -206,10 +206,21 @@ class TestPidfile:
         )
         return path
 
-    def test_writes_own_pid_when_port_free(self, pidfile, monkeypatch):
+    def test_writes_pid_and_create_time_token(self, pidfile, monkeypatch):
         monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(launcher, "_self_create_time", lambda: 4242)
         returned = _write_pidfile(8765)
         assert returned == pidfile
+        # pid + create-time token, whitespace-separated (read back by the CLI's
+        # _read_pid_record); the token lets stop/status reject a reused PID.
+        assert pidfile.read_text() == f"{os.getpid()}\n4242"
+
+    def test_writes_bare_pid_when_create_time_unknown(self, pidfile, monkeypatch):
+        # No create-time available (e.g. macOS) -> legacy bare-PID form, which
+        # the CLI still reads (token None -> liveness-only check).
+        monkeypatch.setattr(launcher, "_port_listening", lambda *_a, **_k: False)
+        monkeypatch.setattr(launcher, "_self_create_time", lambda: None)
+        _write_pidfile(8765)
         assert pidfile.read_text() == str(os.getpid())
 
     def test_skips_write_when_port_taken(self, pidfile, monkeypatch):
@@ -230,6 +241,12 @@ class TestPidfile:
 
     def test_remove_is_pid_safe(self, pidfile):
         pidfile.write_text(str(os.getpid()))
+        _remove_pidfile(pidfile)
+        assert not pidfile.exists()
+
+    def test_remove_matches_pid_with_token_present(self, pidfile):
+        # The token-bearing form still self-deletes: match is on the PID field.
+        pidfile.write_text(f"{os.getpid()}\n4242")
         _remove_pidfile(pidfile)
         assert not pidfile.exists()
 
