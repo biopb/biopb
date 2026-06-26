@@ -447,13 +447,21 @@ def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count:
 
 def _detach_kwargs() -> dict:
     """Popen kwargs that detach a spawned daemon from the launching console and
-    process group, so it survives this command returning and ignores console
-    control events (Ctrl+C, terminal close).
+    process group, so it survives this command returning and isn't killed by
+    the terminal's Ctrl+C or close (SIGHUP).
 
-    POSIX: start_new_session (setsid) gives it its own session/process group.
-    Windows: CREATE_NO_WINDOW runs it without a console *window* (so none pops);
-    CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's Ctrl+C does
-    not reach (start_new_session is a silent no-op on Windows).
+    POSIX: start_new_session (setsid) gives the daemon its own session/process
+    group. Windows: CREATE_NO_WINDOW runs it without a console *window* (so none
+    pops); CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's
+    Ctrl+C does not reach (start_new_session is a silent no-op on Windows).
+
+    Note this detaches the daemon *within* the login session; it does NOT make
+    it persistent across logout, and is not meant to. Windows hard-kills session
+    processes on logout, and modern systemd-logind kills the user scope on
+    logout regardless of setsid (unless `loginctl enable-linger` is set). A
+    daemon that must outlive the session — e.g. a shared/remote tensor server —
+    must be made persistent at the container/service/wrapper level (a systemd
+    unit, `enable-linger`, or a long-lived container), not here.
     """
     if sys.platform == "win32":
         return {

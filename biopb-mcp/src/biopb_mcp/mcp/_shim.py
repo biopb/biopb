@@ -116,9 +116,13 @@ def ensure_daemon(config, port, timeout=DAEMON_START_TIMEOUT):
     daemon_log_name = getattr(log, "name", "stderr")
     cmd = _daemon_command(port)
     logger.info("No daemon on 127.0.0.1:%d; spawning: %s", port, cmd)
-    # Detach fully: new session/process group, no inherited stdio. The daemon
-    # must outlive this shim (and its client), which is the point of the
-    # daemon model.
+    # Detach into its own session/process group with no inherited stdio, so the
+    # daemon reliably outlives this shim and its client (orphaned to init, the
+    # port stays bound across shim restarts) even if the client tears down the
+    # shim's *process group* on exit -- the point of the daemon model. setsid
+    # detaches it within the login session only: it is still session-bound and
+    # dies on logout. A daemon meant to survive logout must be made persistent
+    # at the wrapper level (see cli._detach_kwargs).
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
