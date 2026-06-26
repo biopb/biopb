@@ -24,7 +24,59 @@ permissions:
   contents: read
 
 jobs:
+  # Build the Windows GUI installer (Inno Setup) on a Windows runner and hand it
+  # to the release job as an artifact. The installer is an ONLINE bootstrapper
+  # (ships only install/biopb-engine.ps1; wheels/napari are fetched at run time),
+  # so it needs nothing but the checkout — no wheels, no Docker. Compiled UNSIGNED
+  # for now: no code-signing cert is provisioned yet, so the .exe trips a
+  # SmartScreen "Unknown publisher" warning. Wire up signing later by registering
+  # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
+  # (see docs/windows-installer.md "Code signing").
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+
+      # Version stamped into the installer name (OutputBaseFilename) and AppVersion.
+      # Same derivation as the release job's `ver` step, so the two agree: strip
+      # the release-v* tag prefix; a dry run (workflow_dispatch) builds as "dryrun"
+      # purely to verify the .iss still compiles.
+      - name: Compute installer version
+        id: iver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/release-v* ]]; then
+            REL="${GITHUB_REF#refs/tags/release-v}"
+          else
+            REL="dryrun"
+          fi
+          echo "release=$REL" >> "$GITHUB_OUTPUT"
+          echo "installer version: $REL"
+
+      # Inno Setup 6.3+ (for the x64os arch identifier the .iss requires).
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer (unsigned)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /DAppVersion=${{ steps.iver.outputs.release }} install\gui\biopb-setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: install/gui/Output/biopb-setup-*.exe
+          if-no-files-found: error
+
   release:
+    needs: windows-installer
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -210,6 +262,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Pull the Windows installer built by the windows-installer job into the
+      # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
+      # now (no cert yet — see docs/windows-installer.md).
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: release-wheels
+
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
       # uploaded. Installer scripts come from the repo-root install/ (the
@@ -225,6 +286,7 @@ jobs:
             release-wheels/*.whl
             release-wheels/*.tar.gz
             release-wheels/versions.json
+            release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
           body: |
@@ -243,6 +305,8 @@ jobs:
             - `webapp.tar.gz` — the data-browser web UI
             - `versions.json` — release manifest (pins `napari` for the installer)
             - `install.sh` / `install.ps1` — bootstrap installers
+            - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
+              will warn "Unknown publisher" until a signing cert is provisioned)
 
             ### Docker
             - `ghcr.io/${{ github.repository_owner }}/biopb-tensor-server:${{ steps.ver.outputs.tensor_docker }}`
