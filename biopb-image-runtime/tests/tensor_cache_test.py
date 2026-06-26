@@ -136,7 +136,9 @@ def _non_uniform_template() -> da.Array:
     return da.zeros((4, 4), chunks=((2, 2), (1, 3)), dtype=np.float32)
 
 
-def test_embedded_create_array_tracks_upload_status(embedded_cache: EmbeddedTensorCache):
+def test_embedded_create_array_tracks_upload_status(
+    embedded_cache: EmbeddedTensorCache,
+):
     serialized = embedded_cache.create_array("cache:", ["Y", "X"], _uniform_template())
 
     source_id = serialized.tensor_descriptor.array_id

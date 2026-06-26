@@ -450,14 +450,10 @@ class TestSQLValidation:
         secret.write_text("TOP-SECRET")
 
         # Bypasses the denylist validator (FROM only sees `sources`)...
-        db._validate_query(
-            f"SELECT * FROM sources, read_text('{secret}')"
-        )
+        db._validate_query(f"SELECT * FROM sources, read_text('{secret}')")
         # ...but execution is blocked by enable_external_access=False.
         with pytest.raises(ValueError, match="file system operations are disabled"):
-            db.handle_query(
-                f"SELECT content FROM sources, read_text('{secret}')"
-            )
+            db.handle_query(f"SELECT content FROM sources, read_text('{secret}')")
 
     def test_set_external_access_cannot_be_reenabled(self):
         """An attacker can't turn external access back on mid-query."""
@@ -467,9 +463,7 @@ class TestSQLValidation:
             MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
         )
         with pytest.raises(ValueError):
-            db.handle_query(
-                "SET enable_external_access=true; SELECT * FROM sources"
-            )
+            db.handle_query("SET enable_external_access=true; SELECT * FROM sources")
 
 
 class TestFlightInfo:
@@ -658,15 +652,17 @@ class TestListFlightsTruncation:
         server.register_source(
             "test-1",
             MutatingAdapter(
-                "test-1", "/data/test1.zarr", "ome-zarr", [100, 100], "uint16",
+                "test-1",
+                "/data/test1.zarr",
+                "ome-zarr",
+                [100, 100],
+                "uint16",
                 on_descriptor=mutate_sources,
             ),
         )
         server.register_source(
             "test-2",
-            MockAdapter(
-                "test-2", "/data/test2.zarr", "ome-zarr", [100, 100], "uint16"
-            ),
+            MockAdapter("test-2", "/data/test2.zarr", "ome-zarr", [100, 100], "uint16"),
         )
 
         results = list(server.list_flights(None, b""))
@@ -705,13 +701,19 @@ class TestDataResidentColumn:
         db.sync_source_added(
             "local-1",
             MockAdapter(
-                "local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8",
+                "local-1",
+                "/data/x.zarr",
+                "ome-zarr",
+                [10, 10],
+                "uint8",
                 data_resident=True,
             ),
         )
-        row = db._get_connection().execute(
-            "SELECT data_resident FROM sources WHERE source_id='local-1'"
-        ).fetchone()
+        row = (
+            db._get_connection()
+            .execute("SELECT data_resident FROM sources WHERE source_id='local-1'")
+            .fetchone()
+        )
         assert row[0] is True
 
     def test_unresolved_source_is_false_and_filterable(self):
@@ -783,6 +785,5 @@ class TestDataResidentColumn:
 
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(
-                "INSERT INTO sources (source_id, data_resident) "
-                "VALUES ('bad', NULL)"
+                "INSERT INTO sources (source_id, data_resident) VALUES ('bad', NULL)"
             )

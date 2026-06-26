@@ -22,7 +22,7 @@ import datetime
 # it reads the *current* config — the audit notebook is not pinned to the config
 # captured at export. The live napari layers, the distributed dask cluster, and
 # any interactive state are not reproducible (see module docstring).
-BOOTSTRAP_SRC = '''\
+BOOTSTRAP_SRC = """\
 # === biopb-mcp session bootstrap (best-effort audit reconstruction) ===
 # Rebuilds np / da, the data-plane `client`, the compute-plane `ops`, and an
 # (empty) napari `viewer` so the recorded cells below can, in principle, re-run.
@@ -62,7 +62,7 @@ try:
 except Exception as _exc:  # noqa: BLE001 - audit notebook tolerates no display
     viewer = None
     print("napari viewer unavailable (audit notebook):", _exc)
-'''
+"""
 
 
 def _lines(text):
@@ -95,9 +95,7 @@ def _fmt_ts(epoch):
     if not epoch:
         return "?"
     try:
-        return datetime.datetime.fromtimestamp(epoch).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        return datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, OSError, OverflowError):
         return "?"
 
@@ -138,10 +136,7 @@ def _job_cell(snap):
     job_id = snap.get("job_id", "?")
     status = snap.get("status", "?")
     elapsed = snap.get("elapsed", "?")
-    header = (
-        f"# [{job_id} · {status} · {elapsed}s · "
-        f"{_fmt_ts(snap.get('created'))}]\n"
-    )
+    header = f"# [{job_id} · {status} · {elapsed}s · {_fmt_ts(snap.get('created'))}]\n"
     source = header + (snap.get("code") or "")
     return _code_cell(
         source,
@@ -218,7 +213,5 @@ def _now_epoch():
 
 def suggested_filename():
     """``biopb-mcp-session-YYYYMMDD-HHMMSS.ipynb`` for the download."""
-    stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime(
-        "%Y%m%d-%H%M%S"
-    )
+    stamp = datetime.datetime.fromtimestamp(_now_epoch()).strftime("%Y%m%d-%H%M%S")
     return f"biopb-mcp-session-{stamp}.ipynb"

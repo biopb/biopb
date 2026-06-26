@@ -36,6 +36,7 @@ class CredentialProfile:
         token: Session token (for temporary credentials) or service account JSON path (GCS)
         endpoint_url: Custom endpoint (for S3-compatible storage like MinIO)
     """
+
     name: str
     storage_type: str
     key: Optional[str] = None
@@ -100,6 +101,7 @@ class CredentialsConfig:
         default_profile: Name of the default profile to use
         profiles: List of credential profiles
     """
+
     default_profile: Optional[str] = None
     profiles: List[CredentialProfile] = field(default_factory=list)
 
@@ -297,7 +299,9 @@ class RemoteStore:
 
         # 3. Source-level profile (overrides global)
         if self._credentials_config and self._source_profile_name:
-            source_profile = self._credentials_config.get_profile(self._source_profile_name)
+            source_profile = self._credentials_config.get_profile(
+                self._source_profile_name
+            )
             if source_profile:
                 profile_options = source_profile.to_storage_options()
                 storage_options.update(profile_options)
@@ -378,7 +382,9 @@ class RemoteStore:
         Returns:
             List of matching paths
         """
-        return self.fs.find(self.path, pattern=pattern, maxdepth=maxdepth, withdirs=withdirs)
+        return self.fs.find(
+            self.path, pattern=pattern, maxdepth=maxdepth, withdirs=withdirs
+        )
 
     def exists(self, subpath: str = "") -> bool:
         """Check if path exists.
@@ -499,6 +505,7 @@ class RemoteStore:
         except Exception:
             # Fallback to path hash
             import hashlib
+
             return hashlib.sha256(full_path.encode()).hexdigest()[:16]
 
     def _join(self, subpath: str) -> str:
@@ -539,7 +546,9 @@ class RemoteStore:
                 storage_options.update(profile_options)
 
         if self._credentials_config and self._source_profile_name:
-            source_profile = self._credentials_config.get_profile(self._source_profile_name)
+            source_profile = self._credentials_config.get_profile(
+                self._source_profile_name
+            )
             if source_profile:
                 profile_options = source_profile.to_storage_options()
                 storage_options.update(profile_options)

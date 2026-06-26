@@ -51,12 +51,16 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     _single_tensor_source = True
 
     @classmethod
-    def create_from_config(cls, source: SourceConfig, credentials_config: Optional[Any] = None) -> CachedSourceAdapter:
+    def create_from_config(
+        cls, source: SourceConfig, credentials_config: Optional[Any] = None
+    ) -> CachedSourceAdapter:
         """Cache-backed sources are not created from config.
 
         Raises NotImplementedError - use direct instantiation via DoPut.
         """
-        raise NotImplementedError("CachedSourceAdapter is created via DoPut, not config")
+        raise NotImplementedError(
+            "CachedSourceAdapter is created via DoPut, not config"
+        )
 
     def __init__(
         self,
@@ -190,7 +194,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
                 pa.array([logical_shape]),
                 pa.array([dtype_str]),
             ],
-            ["data", "shape", "dtype"]
+            ["data", "shape", "dtype"],
         )
 
         entry, is_owner = cache_manager.start_compute(
@@ -242,7 +246,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         entry = cache_manager.get_or_acquire(
             chunk_id,
             lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-            metadata={'array_id': self.source_id}
+            metadata={"array_id": self.source_id},
         )
         data = entry.data
         cache_manager.release(chunk_id)

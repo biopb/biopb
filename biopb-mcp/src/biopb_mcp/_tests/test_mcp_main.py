@@ -201,9 +201,7 @@ class TestPidfile:
     def pidfile(self, tmp_path, monkeypatch):
         path = tmp_path / "mcp-server.pid"
         # _write_pidfile resolves the path lazily via _config.get_pid_file.
-        monkeypatch.setattr(
-            "biopb_mcp._config.get_pid_file", lambda: path
-        )
+        monkeypatch.setattr("biopb_mcp._config.get_pid_file", lambda: path)
         return path
 
     def test_writes_pid_and_create_time_token(self, pidfile, monkeypatch):

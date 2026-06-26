@@ -53,23 +53,24 @@ def __getattr__(name):
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
 __all__ = [
     # Proto messages
-    'TensorTicket',
-    'ChunkBounds',
-    'TensorDescriptor',
-    'SliceHint',
-    'TensorCriteria',
-    'TensorWriteOptions',
-    'FlightCmd',
-    'TensorReadOption',
-    'MetadataQueryOption',
-    'ResolveProgress',
-    'WarmProgress',
-    'SerializedTensor',
-    'SerializedEndpoint',
+    "TensorTicket",
+    "ChunkBounds",
+    "TensorDescriptor",
+    "SliceHint",
+    "TensorCriteria",
+    "TensorWriteOptions",
+    "FlightCmd",
+    "TensorReadOption",
+    "MetadataQueryOption",
+    "ResolveProgress",
+    "WarmProgress",
+    "SerializedTensor",
+    "SerializedEndpoint",
     # Client
-    'TensorFlightClient',
-    'make_debug_serialized_tensor',
-    'ResolveCancelled',
+    "TensorFlightClient",
+    "make_debug_serialized_tensor",
+    "ResolveCancelled",
 ]

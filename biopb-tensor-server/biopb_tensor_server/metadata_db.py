@@ -60,6 +60,7 @@ class NumpyEncoder(json.JSONEncoder):
                 return obj.decode("utf-8")
             except UnicodeDecodeError:
                 import base64
+
                 return base64.b64encode(obj).decode("ascii")
         # Catch-all: indicate unserializable type
         return f"Unserializable {type(obj).__qualname__}"

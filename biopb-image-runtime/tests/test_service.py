@@ -43,7 +43,9 @@ class TestObjectDetection:
         """RunDetection with small eager image."""
         # Create test image
         image = np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8)
-        image_data = serialize_from_numpy_to_image_data(image, dim_labels=["Y", "X", "C"])
+        image_data = serialize_from_numpy_to_image_data(
+            image, dim_labels=["Y", "X", "C"]
+        )
 
         request = proto.DetectionRequest(
             image_data=image_data,
@@ -128,7 +130,9 @@ class TestProcessImageLazy:
         response = stub.Run(request, timeout=60)
 
         # Response should have lazy_data (SerializedTensor)
-        assert response.image_data.HasField("lazy_data"), "Large image should return lazy data"
+        assert response.image_data.HasField("lazy_data"), (
+            "Large image should return lazy data"
+        )
 
         # Check SerializedTensor structure
         serialized = response.image_data.lazy_data
@@ -150,10 +154,12 @@ class TestProcessImageLazy:
         serialized = response.image_data.lazy_data
         # Mock server fixture uses --tensor-external-location grpc://127.0.0.1:8817
         # If not specified, --local mode would default to grpc://localhost:8817
-        assert serialized.location.startswith("grpc://"), \
+        assert serialized.location.startswith("grpc://"), (
             f"Location should be grpc:// URL, got {serialized.location}"
-        assert "8817" in serialized.location, \
+        )
+        assert "8817" in serialized.location, (
             f"Location should include tensor port 8817, got {serialized.location}"
+        )
 
     def test_local_mode_defaults_to_localhost_location(self):
         """Regression test: --local mode without explicit location uses localhost."""
@@ -164,14 +170,27 @@ class TestProcessImageLazy:
         cache_dir = tempfile.mkdtemp(prefix="biopb-test-default-loc-")
 
         # Start server with --local but WITHOUT --tensor-external-location
-        proc = subprocess.Popen([
-            "python", "-m", "biopb_image_base.mock_servicer",
-            "--port", "50053",
-            "--local",
-            "--cache-dir", cache_dir,
-            "--cache-size", "1GB",
-            "--tensor-port", "8819",
-        ], env={**os.environ, "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-runtime/src", "BIOPB_LOG_LEVEL": "WARNING"})
+        proc = subprocess.Popen(
+            [
+                "python",
+                "-m",
+                "biopb_image_base.mock_servicer",
+                "--port",
+                "50053",
+                "--local",
+                "--cache-dir",
+                cache_dir,
+                "--cache-size",
+                "1GB",
+                "--tensor-port",
+                "8819",
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": "/home/jiyu/work/biopb/biopb-image-runtime/src",
+                "BIOPB_LOG_LEVEL": "WARNING",
+            },
+        )
 
         # Wait for server
         time.sleep(3)
@@ -193,8 +212,9 @@ class TestProcessImageLazy:
             assert response.image_data.HasField("lazy_data")
             serialized = response.image_data.lazy_data
             # Default for --local should be localhost, NOT 0.0.0.0
-            assert serialized.location == "grpc://localhost:8819", \
+            assert serialized.location == "grpc://localhost:8819", (
                 f"--local mode without explicit location should use localhost, got {serialized.location}"
+            )
         finally:
             proc.terminate()
             proc.wait()
@@ -256,8 +276,12 @@ class TestStreaming:
         image2 = np.random.randint(0, 255, (128, 256), dtype=np.uint8)
 
         def request_generator():
-            yield proto.ProcessRequest(image_data=serialize_from_numpy_to_image_data(image1))
-            yield proto.ProcessRequest(image_data=serialize_from_numpy_to_image_data(image2))
+            yield proto.ProcessRequest(
+                image_data=serialize_from_numpy_to_image_data(image1)
+            )
+            yield proto.ProcessRequest(
+                image_data=serialize_from_numpy_to_image_data(image2)
+            )
 
         stub = proto.ProcessImageStub(grpc_channel)
         responses = list(stub.RunStream(request_generator(), timeout=30))

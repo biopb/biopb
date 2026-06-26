@@ -54,7 +54,7 @@ class MockServicer(BiopbServicerBase):
                     try:
                         img = decode_image_data(image_data)
                         # Handle both numpy and dask arrays
-                        if hasattr(img, 'shape'):
+                        if hasattr(img, "shape"):
                             shape = img.shape
                         else:
                             shape = (512, 512)  # fallback
@@ -77,8 +77,8 @@ class MockServicer(BiopbServicerBase):
 
                     roi = proto.ROI(
                         rectangle=proto.Rectangle(
-                            top_left=proto.Point(x=cx - size/2, y=cy - size/2),
-                            bottom_right=proto.Point(x=cx + size/2, y=cy + size/2),
+                            top_left=proto.Point(x=cx - size / 2, y=cy - size / 2),
+                            bottom_right=proto.Point(x=cx + size / 2, y=cy + size / 2),
                         )
                     )
 
@@ -109,7 +109,9 @@ class MockServicer(BiopbServicerBase):
                 else:
                     # Return random labels mask
                     if isinstance(img, np.ndarray):
-                        result = np.random.randint(0, 100, size=img.shape[:2], dtype=np.int32)
+                        result = np.random.randint(
+                            0, 100, size=img.shape[:2], dtype=np.int32
+                        )
                     else:
                         # Dask array - create random labels
                         result = da.random.randint(
@@ -140,7 +142,9 @@ class MockServicer(BiopbServicerBase):
                     accumulated = img
                 else:
                     # Simple concatenation for streaming test
-                    if isinstance(accumulated, np.ndarray) and isinstance(img, np.ndarray):
+                    if isinstance(accumulated, np.ndarray) and isinstance(
+                        img, np.ndarray
+                    ):
                         accumulated = np.concatenate([accumulated, img], axis=0)
 
         if accumulated is None:
@@ -167,7 +171,7 @@ class MockServicer(BiopbServicerBase):
                     description="Random mode - returns random labels mask",
                     labels=["mock", "random"],
                 ),
-            }
+            },
         )
 
 
@@ -199,7 +203,12 @@ def main(
         tensor_external_location: External URL for tensor server (e.g., "grpc://hostname:8817")
     """
     # Validate configuration before starting
-    if cache_dir is not None and not local and ip == "0.0.0.0" and not tensor_external_location:
+    if (
+        cache_dir is not None
+        and not local
+        and ip == "0.0.0.0"
+        and not tensor_external_location
+    ):
         typer.echo(
             "ERROR: --tensor-external-location is required when binding to 0.0.0.0 "
             "with embedded cache enabled (not --local mode).\n"

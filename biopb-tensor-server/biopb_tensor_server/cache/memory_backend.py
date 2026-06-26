@@ -28,6 +28,7 @@ from biopb_tensor_server.cache.base import (
 @dataclass
 class MemoryCacheConfig:
     """Configuration for in-memory cache."""
+
     max_entries: int = 1024
     max_bytes: int = 512 * 1024 * 1024  # 512 MB
     pending_timeout: float = 300.0  # Max wait time for pending entries
@@ -105,9 +106,11 @@ class MemoryCacheBackend(CacheBackend):
         lru_keys = list(self._entries.keys())[:half_size]
 
         # Find smallest evictable entry in LRU half
-        evictable = [(k, self._entries[k].size_bytes)
-                     for k in lru_keys
-                     if self._entries[k].is_evictable()]
+        evictable = [
+            (k, self._entries[k].size_bytes)
+            for k in lru_keys
+            if self._entries[k].is_evictable()
+        ]
 
         if not evictable:
             self._ref_held_skips += 1
@@ -258,6 +261,7 @@ class MemoryCacheBackend(CacheBackend):
             self._oversized_skips += 1
             # Log warning (import at top level to avoid circular import issues)
             import logging
+
             logger = logging.getLogger(__name__)
             logger.warning(
                 f"Skipping cache for oversized chunk: {size_bytes} bytes > {MAX_ARROW_BATCH_BYTES}"

@@ -111,17 +111,11 @@ def _build_op(
         else:
             arr = np.asarray(image)
             arr_labels = (
-                dim_labels
-                if dim_labels is not None
-                else _infer_dim_labels(arr.ndim)
+                dim_labels if dim_labels is not None else _infer_dim_labels(arr.ndim)
             )
-            image_data = serialize_from_numpy_to_image_data(
-                arr, dim_labels=arr_labels
-            )
+            image_data = serialize_from_numpy_to_image_data(arr, dim_labels=arr_labels)
 
-        request = proto.ProcessRequest(
-            image_data=image_data, op_name=op_name or ""
-        )
+        request = proto.ProcessRequest(image_data=image_data, op_name=op_name or "")
         if kwargs:
             request.kwargs.update(kwargs)
 
@@ -154,9 +148,7 @@ def _build_op(
     ]
     if labels:
         doc.append(f"Labels: {', '.join(labels)}")
-    if hint is not None and (
-        hint.expected_singletons or hint.required_multivalue
-    ):
+    if hint is not None and (hint.expected_singletons or hint.required_multivalue):
         doc.append(
             "Input shape hint: "
             f"expected_singletons={list(hint.expected_singletons)}, "
@@ -216,9 +208,7 @@ def build_ops(
 
         stub = proto.ProcessImageStub(channel)
         try:
-            op_names = stub.GetOpNames(
-                empty_pb2.Empty(), timeout=op_names_timeout
-            )
+            op_names = stub.GetOpNames(empty_pb2.Empty(), timeout=op_names_timeout)
             names: List[Optional[str]] = list(op_names.names)
             schemas = dict(op_names.op_schemas)
         except grpc.RpcError as exc:

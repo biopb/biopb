@@ -24,6 +24,7 @@ class MockAdapter:
 
     def get_source_descriptor(self):
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
         return DataSourceDescriptor(
             source_id=self.source_id,
             source_url=self._source_url,
@@ -38,7 +39,10 @@ class MockAdapter:
         )
 
     def get_metadata(self):
-        return {"plate_id": self.source_id.split("-")[0], "acquisition_date": "2024-01-01"}
+        return {
+            "plate_id": self.source_id.split("-")[0],
+            "acquisition_date": "2024-01-01",
+        }
 
 
 def populate_database(db: MetadataDatabase, n_sources: int) -> None:
@@ -47,7 +51,9 @@ def populate_database(db: MetadataDatabase, n_sources: int) -> None:
         plate_num = i // 10
         source_id = f"plate-{plate_num:04d}-well-{i % 10:02d}"
         source_url = f"/data/experiment-{plate_num:04d}/{source_id}.zarr"
-        adapter = MockAdapter(source_id, source_url, "ome-zarr", [512, 512, 64], "uint16")
+        adapter = MockAdapter(
+            source_id, source_url, "ome-zarr", [512, 512, 64], "uint16"
+        )
         db.sync_source_added(source_id, adapter)
 
 
@@ -130,7 +136,13 @@ class TestConcurrentAccess:
             def sync_worker(thread_id):
                 try:
                     source_id = f"dynamic-{thread_id}"
-                    adapter = MockAdapter(source_id, f"/data/{source_id}.zarr", "ome-zarr", [256, 256], "float32")
+                    adapter = MockAdapter(
+                        source_id,
+                        f"/data/{source_id}.zarr",
+                        "ome-zarr",
+                        [256, 256],
+                        "float32",
+                    )
                     fresh_db.sync_source_added(source_id, adapter)
                     fresh_db.sync_source_removed(source_id)
                 except Exception as e:
@@ -140,7 +152,9 @@ class TestConcurrentAccess:
                 try:
                     sql = "SELECT COUNT(*) FROM sources"
                     info = fresh_db.handle_query(sql)
-                    fresh_db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+                    fresh_db.get_pending_result(
+                        info.endpoints[0].ticket.ticket.decode()
+                    )
                 except Exception as e:
                     errors.append(str(e))
 
@@ -292,4 +306,3 @@ class TestQueryComplexity:
 
         n_rows = benchmark(complex_query)
         assert n_rows == 500
-

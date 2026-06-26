@@ -58,8 +58,7 @@ class TestCheckSchemaVersion:
     def test_no_warning_when_no_version_in_metadata(self):
         """Test no warning when metadata doesn't contain version."""
         schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"other_key": "some_value"}
+            [pa.field("data", pa.float32())], metadata={"other_key": "some_value"}
         )
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
@@ -71,7 +70,7 @@ class TestCheckSchemaVersion:
         # Create schema with server version metadata
         schema = pa.schema(
             [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
+            metadata={"tensor_schema_version": "2.0.0"},
         )
 
         # Mock client version to be older
@@ -88,7 +87,7 @@ class TestCheckSchemaVersion:
         """Test no warning when client version equals server version."""
         schema = pa.schema(
             [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "1.0.0"}
+            metadata={"tensor_schema_version": "1.0.0"},
         )
 
         with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
@@ -103,7 +102,7 @@ class TestCheckSchemaVersion:
         """Test no warning when client version is newer than server."""
         schema = pa.schema(
             [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "1.0.0"}
+            metadata={"tensor_schema_version": "1.0.0"},
         )
 
         with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
@@ -118,7 +117,7 @@ class TestCheckSchemaVersion:
         """Test no warning when biopb package not found."""
         schema = pa.schema(
             [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
+            metadata={"tensor_schema_version": "2.0.0"},
         )
 
         with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
@@ -133,7 +132,7 @@ class TestCheckSchemaVersion:
         """Test that older client logs a warning via logger."""
         schema = pa.schema(
             [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
+            metadata={"tensor_schema_version": "2.0.0"},
         )
 
         with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
@@ -183,9 +182,11 @@ class TestImport:
     def test_import_client(self):
         """Test that client module can be imported."""
         import biopb.tensor.client as client
-        assert hasattr(client, 'TensorFlightClient')
+
+        assert hasattr(client, "TensorFlightClient")
 
     def test_import_serialized_pb2(self):
         """Test that serialized_pb2 can be imported."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
+
         assert SerializedTensor is not None

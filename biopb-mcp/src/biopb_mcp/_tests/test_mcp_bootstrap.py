@@ -86,9 +86,7 @@ class TestRegisterCachePlugin:
 
     def test_noop_when_plugin_unavailable(self):
         dc = _fake_dask_client(3)
-        with patch.object(
-            tclient, "make_cache_plugin", return_value=None
-        ) as mk:
+        with patch.object(tclient, "make_cache_plugin", return_value=None) as mk:
             _bootstrap._register_cache_plugin(
                 dc, "grpc://remote:8815", None, {}, planned_workers=3
             )

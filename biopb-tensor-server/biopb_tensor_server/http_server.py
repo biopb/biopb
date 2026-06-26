@@ -248,7 +248,7 @@ def _tensor_matches(td_array_id: str, req_tensor_id: str, source_id: str) -> boo
     prefix = f"{source_id}/"
 
     def field(value: str) -> str:
-        return value[len(prefix):] if value.startswith(prefix) else value
+        return value[len(prefix) :] if value.startswith(prefix) else value
 
     return field(td_array_id) == field(req_tensor_id)
 
@@ -297,6 +297,7 @@ class RenderRequest(BaseModel):
     Returns PNG/JPEG image instead of raw numpy bytes.
     Uses VTK or PIL for rendering on the server side.
     """
+
     source_id: str
     tensor_id: str
     slice_start: Optional[List[int]] = None
@@ -323,7 +324,9 @@ def create_app(
     dev_mode: bool = False,
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
-    static_dir: Optional[str] = None,  # Directory for static webapp files (None = API only)
+    static_dir: Optional[
+        str
+    ] = None,  # Directory for static webapp files (None = API only)
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -382,9 +385,13 @@ def create_app(
         allow_methods=["GET", "POST"],
         allow_headers=["Authorization", "X-Biopb-Token", "Content-Type"],
         expose_headers=[
-            "X-Shape", "X-Dtype", "X-Dim-Labels",
-            "X-Image-Width", "X-Image-Height",
-            "X-Percentile-Lo-Value", "X-Percentile-Hi-Value",
+            "X-Shape",
+            "X-Dtype",
+            "X-Dim-Labels",
+            "X-Image-Width",
+            "X-Image-Height",
+            "X-Percentile-Lo-Value",
+            "X-Percentile-Hi-Value",
         ],
     )
 
@@ -730,7 +737,6 @@ def create_app(
 
         return arr
 
-
     @app.post("/api/slice")
     async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         """Fetch a slice of a tensor and return raw bytes.
@@ -968,11 +974,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc))
         except ImportError as exc:
             raise HTTPException(
-                status_code=503,
-                detail=f"Rendering not available: {exc}"
+                status_code=503, detail=f"Rendering not available: {exc}"
             )
         except Exception as exc:
             import traceback
+
             tb = traceback.format_exc()
             diag.mark_error("RENDER_FAILED", str(exc))
             logger.error(f"render failed: {exc}\n{tb}")
@@ -1029,20 +1035,24 @@ def create_app(
                 # Validate action
                 action = data.get("action")
                 if action != "render":
-                    await websocket.send_json({
-                        "action": "error",
-                        "message": f"Unknown action: {action}",
-                    })
+                    await websocket.send_json(
+                        {
+                            "action": "error",
+                            "message": f"Unknown action: {action}",
+                        }
+                    )
                     continue
 
                 # Parse render params
                 try:
                     params = RenderRequest(**data.get("params", {}))
                 except Exception as e:
-                    await websocket.send_json({
-                        "action": "error",
-                        "message": f"Invalid params: {e}",
-                    })
+                    await websocket.send_json(
+                        {
+                            "action": "error",
+                            "message": f"Invalid params: {e}",
+                        }
+                    )
                     continue
 
                 t0 = time.monotonic()
@@ -1062,13 +1072,16 @@ def create_app(
                     slice_hint: Optional[Tuple[slice, ...]] = None
                     if params.slice_start is not None and params.slice_stop is not None:
                         if len(params.slice_start) != len(params.slice_stop):
-                            await websocket.send_json({
-                                "action": "error",
-                                "message": "slice_start and slice_stop must have the same length",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "action": "error",
+                                    "message": "slice_start and slice_stop must have the same length",
+                                }
+                            )
                             continue
                         slice_hint = tuple(
-                            slice(s, e) for s, e in zip(params.slice_start, params.slice_stop)
+                            slice(s, e)
+                            for s, e in zip(params.slice_start, params.slice_stop)
                         )
 
                     scale_hint = params.scale_hint or None
@@ -1098,14 +1111,28 @@ def create_app(
                         dim_labels = [f"d{i}" for i in range(arr.ndim)]
 
                     # Build axis map to find Y and X indices
-                    y_idx = dim_labels.index("y") if "y" in dim_labels else len(dim_labels) - 2
-                    x_idx = dim_labels.index("x") if "x" in dim_labels else len(dim_labels) - 1
+                    y_idx = (
+                        dim_labels.index("y")
+                        if "y" in dim_labels
+                        else len(dim_labels) - 2
+                    )
+                    x_idx = (
+                        dim_labels.index("x")
+                        if "x" in dim_labels
+                        else len(dim_labels) - 1
+                    )
 
                     # Slice dask array to the originally requested bounds (except y/x) before computing.
-                    if ctx.original_slice_hint is not None and ctx.descriptor.HasField("slice_hint"):
+                    if ctx.original_slice_hint is not None and ctx.descriptor.HasField(
+                        "slice_hint"
+                    ):
                         realized = ctx.descriptor.slice_hint
                         ndim = len(ctx.descriptor.shape)
-                        scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
+                        scale = (
+                            list(ctx.read_opt.scale_hint)
+                            if ctx.read_opt.scale_hint
+                            else None
+                        )
                         crop = []
                         for ax in range(ndim):
                             if ax in (y_idx, x_idx):
@@ -1121,7 +1148,9 @@ def create_app(
                         dask_arr = dask_arr[tuple(crop)]
 
                     t0_compute = time.monotonic()
-                    arr: np.ndarray = await asyncio.get_event_loop().run_in_executor(None, dask_arr.compute)
+                    arr: np.ndarray = await asyncio.get_event_loop().run_in_executor(
+                        None, dask_arr.compute
+                    )
                     compute_ms = (time.monotonic() - t0_compute) * 1000
 
                     # Compute loaded region from realized slice bounds (not requested)
@@ -1133,21 +1162,29 @@ def create_app(
                             "y": int(realized.start[y_idx]),
                             "width": int(realized.stop[x_idx] - realized.start[x_idx]),
                             "height": int(realized.stop[y_idx] - realized.start[y_idx]),
-                            "scale_factors": list(ctx.descriptor.scale_hint) if ctx.descriptor.scale_hint else [1] * len(dim_labels),
+                            "scale_factors": list(ctx.descriptor.scale_hint)
+                            if ctx.descriptor.scale_hint
+                            else [1] * len(dim_labels),
                         }
 
                     # Import renderer
                     from .renderer import render_array_to_image_bytes
 
                     t0_render = time.monotonic()
-                    image_bytes, width, height, lo_val, hi_val = render_array_to_image_bytes(
-                        arr=arr,
-                        dim_labels=dim_labels,
-                        percentile_lo=params.percentile_lo if not params.use_min_max else 0.0,
-                        percentile_hi=params.percentile_hi if not params.use_min_max else 100.0,
-                        color=params.color,
-                        channel_name=params.channel_name,
-                        output_format=params.output_format,
+                    image_bytes, width, height, lo_val, hi_val = (
+                        render_array_to_image_bytes(
+                            arr=arr,
+                            dim_labels=dim_labels,
+                            percentile_lo=params.percentile_lo
+                            if not params.use_min_max
+                            else 0.0,
+                            percentile_hi=params.percentile_hi
+                            if not params.use_min_max
+                            else 100.0,
+                            color=params.color,
+                            channel_name=params.channel_name,
+                            output_format=params.output_format,
+                        )
                     )
                     render_ms = (time.monotonic() - t0_render) * 1000
 
@@ -1176,24 +1213,31 @@ def create_app(
                     await websocket.send_bytes(image_bytes)
 
                 except ValueError as exc:
-                    await websocket.send_json({
-                        "action": "error",
-                        "message": str(exc),
-                    })
+                    await websocket.send_json(
+                        {
+                            "action": "error",
+                            "message": str(exc),
+                        }
+                    )
                 except ImportError as exc:
-                    await websocket.send_json({
-                        "action": "error",
-                        "message": f"Rendering not available: {exc}",
-                    })
+                    await websocket.send_json(
+                        {
+                            "action": "error",
+                            "message": f"Rendering not available: {exc}",
+                        }
+                    )
                 except Exception as exc:
                     import traceback
+
                     tb = traceback.format_exc()
                     diag.mark_error("WS_RENDER_FAILED", str(exc))
                     logger.error(f"ws/render failed: {exc}\n{tb}")
-                    await websocket.send_json({
-                        "action": "error",
-                        "message": f"Render error: {type(exc).__name__}",
-                    })
+                    await websocket.send_json(
+                        {
+                            "action": "error",
+                            "message": f"Render error: {type(exc).__name__}",
+                        }
+                    )
 
         except WebSocketDisconnect:
             logger.info("ws/render: client disconnected")
@@ -1207,6 +1251,7 @@ def create_app(
 
     if static_dir:
         from pathlib import Path as _Path
+
         static_path = _Path(static_dir)
         if static_path.is_dir():
             # SPA fallback middleware - serve index.html for non-API routes
@@ -1216,7 +1261,12 @@ def create_app(
                 # Only intercept 404s for non-API, non-health routes
                 if response.status_code == 404:
                     path = request.url.path
-                    if not path.startswith("/api") and not path.startswith("/live") and not path.startswith("/ready") and not path.startswith("/health"):
+                    if (
+                        not path.startswith("/api")
+                        and not path.startswith("/live")
+                        and not path.startswith("/ready")
+                        and not path.startswith("/health")
+                    ):
                         index_file = static_path / "index.html"
                         if index_file.exists():
                             return Response(
@@ -1226,7 +1276,9 @@ def create_app(
                 return response
 
             # Mount static files at root (must be after all API routes)
-            app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
+            app.mount(
+                "/", StaticFiles(directory=str(static_path), html=True), name="static"
+            )
 
     return app
 
@@ -1302,7 +1354,10 @@ def _install_windows_shutdown_listener(server) -> None:
     def _watch() -> None:
         while True:
             try:
-                if os.path.exists(sentinel) and os.path.getmtime(sentinel) >= installed_at:
+                if (
+                    os.path.exists(sentinel)
+                    and os.path.getmtime(sentinel) >= installed_at
+                ):
                     logger.info("Shutdown sentinel found; requesting graceful exit.")
                     server.should_exit = True
                     server.force_exit = True
@@ -1315,9 +1370,7 @@ def _install_windows_shutdown_listener(server) -> None:
                 pass
             time.sleep(0.2)
 
-    threading.Thread(
-        target=_watch, name="win-shutdown-listener", daemon=True
-    ).start()
+    threading.Thread(target=_watch, name="win-shutdown-listener", daemon=True).start()
     logger.info("Windows shutdown listener installed (sentinel: %s).", sentinel)
 
 

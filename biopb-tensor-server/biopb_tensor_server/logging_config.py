@@ -99,7 +99,9 @@ def setup_logging(
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
 
-        logger.debug(f"Logging configured: level={level_str}, scope=biopb_tensor_server")
+        logger.debug(
+            f"Logging configured: level={level_str}, scope=biopb_tensor_server"
+        )
     else:
         # Configure root logger (affects all packages)
         handlers: list[logging.Handler] = [logging.StreamHandler()]

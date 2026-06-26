@@ -86,13 +86,9 @@ def _configure_dask(config: dict):
             cluster = LocalCluster(
                 n_workers=num_workers,
                 processes=True,
-                threads_per_worker=get_setting(
-                    config, "mcp.dask.threads_per_worker"
-                ),
+                threads_per_worker=get_setting(config, "mcp.dask.threads_per_worker"),
                 memory_limit=get_setting(config, "mcp.dask.memory_limit"),
-                dashboard_address=get_setting(
-                    config, "mcp.dask.dashboard_address"
-                ),
+                dashboard_address=get_setting(config, "mcp.dask.dashboard_address"),
                 local_directory=local_directory,
             )
             client = Client(cluster)
@@ -117,9 +113,7 @@ def _configure_dask(config: dict):
     return None, None
 
 
-def _register_cache_plugin(
-    dask_client, url, token, config: dict, planned_workers=None
-):
+def _register_cache_plugin(dask_client, url, token, config: dict, planned_workers=None):
     """Pin the data-plane chunk-cache budget across dask workers.
 
     For a **remote** server, splits ``mcp.dask.cache_budget`` evenly across the
@@ -159,8 +153,7 @@ def _register_cache_plugin(
 
         n_workers = max(
             1,
-            planned_workers
-            or len(dask_client.scheduler_info().get("workers", {})),
+            planned_workers or len(dask_client.scheduler_info().get("workers", {})),
         )
 
         if _is_localhost_location(url):
@@ -349,9 +342,7 @@ def _bootstrap_impl():
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
-    max_msg_bytes = (
-        get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
-    )
+    max_msg_bytes = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
     channel_options = [
         ("grpc.max_receive_message_length", max_msg_bytes),
         ("grpc.max_send_message_length", max_msg_bytes),
@@ -359,9 +350,7 @@ def _bootstrap_impl():
     try:
         ops = build_ops(
             client_getter=lambda: conn.client,
-            server_urls=get_setting(
-                config, "mcp.services.process_image_servers"
-            ),
+            server_urls=get_setting(config, "mcp.services.process_image_servers"),
             op_names_timeout=get_setting(config, "timeout.get_op_names"),
             run_timeout=get_setting(config, "timeout.process_image"),
             channel_options=channel_options,
@@ -385,9 +374,7 @@ def _bootstrap_impl():
         from ._helpers import patch_viewer_add_tensor
         from ._viewer_proxy import make_viewer_proxy
 
-        patch_viewer_add_tensor(
-            viewer, conn, compute_scheduler=compute_scheduler
-        )
+        patch_viewer_add_tensor(viewer, conn, compute_scheduler=compute_scheduler)
         viewer_handle = make_viewer_proxy(viewer)
 
     # 7. Namespace for execute_code.  client is refreshed per-job by the job
@@ -423,12 +410,8 @@ def _bootstrap_impl():
     #    runs even headless where there is no Qt loop.
     try:
         conn.start_source_watch(
-            min_interval=get_setting(
-                config, "mcp.tensor.health_poll_min_interval"
-            ),
-            max_interval=get_setting(
-                config, "mcp.tensor.health_poll_max_interval"
-            ),
+            min_interval=get_setting(config, "mcp.tensor.health_poll_min_interval"),
+            max_interval=get_setting(config, "mcp.tensor.health_poll_max_interval"),
         )
     except Exception:
         logger.exception("Failed to start source watcher")

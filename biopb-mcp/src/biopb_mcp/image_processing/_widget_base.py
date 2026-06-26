@@ -52,8 +52,7 @@ def _format_error_message(exc: Exception) -> str:
         if len(msg) > 100:
             msg = msg[:100] + "..."
         return (
-            f'<span style="color: #d32f2f; font-weight: bold;">{exc_type}</span>: '
-            f"{msg}"
+            f'<span style="color: #d32f2f; font-weight: bold;">{exc_type}</span>: {msg}'
         )
 
 
@@ -112,9 +111,7 @@ class _WidgetBase(Container):
         """Reset widget state after processing completes."""
         self._stop_all_progress()
         self._progress_bar.visible = False
-        self._progress_bar.label = (
-            "Running..."  # Reset label from "Canceling..."
-        )
+        self._progress_bar.label = "Running..."  # Reset label from "Canceling..."
         self._run_button.visible = True
         self._run_button.enabled = True
         self._cancel_button.visible = False
@@ -199,9 +196,7 @@ class _WidgetBase(Container):
         self._viewer = viewer
         self._cancel_callback = None
         self._abort_event = threading.Event()
-        self._active_future_container: dict = (
-            {}
-        )  # Container for active gRPC future
+        self._active_future_container: dict = {}  # Container for active gRPC future
 
         # Make container expand to fill available width in dock widget
         self.native.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -226,9 +221,7 @@ class _WidgetBase(Container):
             label="Running...", value=0, step=1, visible=False
         )
 
-        self._cancel_button = create_widget(
-            label="Cancel", widget_type="Button"
-        )
+        self._cancel_button = create_widget(label="Cancel", widget_type="Button")
         self._cancel_button.visible = False
 
         self._run_button = create_widget(label="Run", widget_type="Button")
@@ -267,9 +260,7 @@ class _WidgetBase(Container):
         if self._pending_calls > 0 and self._total_calls > 0:
             current = self._progress_bar.value
             target = int(
-                self._calls_completed
-                / self._total_calls
-                * self._progress_bar.max
+                self._calls_completed / self._total_calls * self._progress_bar.max
             )
             # Fake progress: inch toward target + small offset, capped at max-1
             fake_target = min(target + 5, self._progress_bar.max - 1)
@@ -288,9 +279,7 @@ class _WidgetBase(Container):
         For concurrent calls, we track how many calls are pending (submitted but
         not yet completed) and only start the timer once.
         """
-        logger.debug(
-            "Progress: call starting, pending=%d", self._pending_calls
-        )
+        logger.debug("Progress: call starting, pending=%d", self._pending_calls)
         self._pending_calls += 1
         self._total_calls = max(
             self._total_calls, self._pending_calls + self._calls_completed
@@ -316,9 +305,7 @@ class _WidgetBase(Container):
         # Update progress bar directly with guard to ensure value <= max
         if self._total_calls > 0:
             progress = int(
-                self._calls_completed
-                / self._total_calls
-                * self._progress_bar.max
+                self._calls_completed / self._total_calls * self._progress_bar.max
             )
             self._progress_bar.value = min(progress, self._progress_bar.max)
         # Stop timer when no pending calls

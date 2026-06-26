@@ -317,17 +317,12 @@ class TensorConnection:
         if max_interval is None:
             max_interval = CONFIG.get("mcp.tensor.health_poll_max_interval")
         if not min_interval or min_interval <= 0:
-            logger.info(
-                "Source watch disabled (min_interval=%s)", min_interval
-            )
+            logger.info("Source watch disabled (min_interval=%s)", min_interval)
             return
         max_interval = max(max_interval or min_interval, min_interval)
 
         with self._watch_lock:
-            if (
-                self._watch_thread is not None
-                and self._watch_thread.is_alive()
-            ):
+            if self._watch_thread is not None and self._watch_thread.is_alive():
                 return
             self._watch_stop.clear()
             thread = threading.Thread(
@@ -338,17 +333,13 @@ class TensorConnection:
             )
             self._watch_thread = thread
             thread.start()
-        logger.info(
-            "Source watch started (%.1fs..%.1fs)", min_interval, max_interval
-        )
+        logger.info("Source watch started (%.1fs..%.1fs)", min_interval, max_interval)
 
     def stop_source_watch(self) -> None:
         """Signal the background source watcher to stop (best-effort)."""
         self._watch_stop.set()
 
-    def _source_watch_loop(
-        self, min_interval: float, max_interval: float
-    ) -> None:
+    def _source_watch_loop(self, min_interval: float, max_interval: float) -> None:
         """Poll loop for the source watcher; runs on its own daemon thread.
 
         ``last_count`` is the server ``source_count`` we last reconciled the
@@ -384,11 +375,7 @@ class TensorConnection:
                 interval = min(interval * 2, max_interval)
                 continue
 
-            count = (
-                health.get("source_count")
-                if isinstance(health, dict)
-                else None
-            )
+            count = health.get("source_count") if isinstance(health, dict) else None
             if count is None:
                 # Server's health carries no source_count (older server) — there
                 # is nothing to watch; idle at the cap.
@@ -413,17 +400,13 @@ class TensorConnection:
         except Exception:  # noqa: BLE001 - keep the watcher alive on a blip
             logger.exception("Source watch: re-list failed")
             return
-        logger.info(
-            "Source watch: catalog changed, re-listed %d sources", len(sources)
-        )
+        logger.info("Source watch: catalog changed, re-listed %d sources", len(sources))
         callback = self.on_sources_changed
         if callback is not None:
             try:
                 callback(sources)
             except Exception:  # noqa: BLE001 - hook is best-effort
-                logger.exception(
-                    "Source watch: on_sources_changed hook failed"
-                )
+                logger.exception("Source watch: on_sources_changed hook failed")
 
     def query_sources(self, sql: str):
         """Server-side SQL filter passthrough."""
@@ -531,9 +514,7 @@ class TensorConnection:
                     url, token, timeout=self.server_start_timeout()
                 )
             except Exception:  # noqa: BLE001
-                logger.exception(
-                    "auto_connect: %s did not finish starting", url
-                )
+                logger.exception("auto_connect: %s did not finish starting", url)
             return
         except Exception:  # noqa: BLE001
             logger.info("auto_connect: %s unreachable", url)

@@ -163,6 +163,7 @@ class TestImageCliProcess:
 
             # Output should be pickled SerializedTensor
             import pickle
+
             serialized = pickle.loads(result.stdout)
             assert isinstance(serialized, SerializedTensor)
             assert serialized.location.startswith("grpc://")

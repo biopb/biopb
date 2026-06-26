@@ -117,9 +117,7 @@ class TestComputePrecacheScaleHint:
 
     def test_custom_knobs(self):
         # Tighter threshold downsamples further.
-        scale = compute_precache_scale_hint(
-            [20000, 20000], ["y", "x"], threshold=1024
-        )
+        scale = compute_precache_scale_hint([20000, 20000], ["y", "x"], threshold=1024)
         ly = (20000 + scale[0] - 1) // scale[0]
         assert ly <= 1024
 
@@ -255,9 +253,7 @@ class TestWarming:
             adapter = server._get_source_adapter("warm-src")
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
-            scale = compute_precache_scale_hint(
-                list(td.shape), list(td.dim_labels)
-            )
+            scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
             assert scale == [4, 4]
             from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -337,7 +333,9 @@ class TestRuntimePhaseGating:
         try:
             # Stub the heavy commit collaborators so we exercise only the gate.
             monkeypatch.setattr(sm, "_register_source_claim", lambda claim: True)
-            monkeypatch.setattr(sm._state, "add_claim", lambda claim, notify=False: True)
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
             monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
@@ -363,7 +361,9 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(sm, "_register_source_claim", lambda claim: True)
-            monkeypatch.setattr(sm._state, "add_claim", lambda claim, notify=False: True)
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
             monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
@@ -847,9 +847,7 @@ class TestSkipNativePyramid:
         adapter = ZarrAdapter(arr, "plain", ["y", "x"])
         assert adapter.has_native_pyramid() is False
 
-    def test_precache_skips_native_multiscale_source(
-        self, multires_ome_zarr, tmp_path
-    ):
+    def test_precache_skips_native_multiscale_source(self, multires_ome_zarr, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
 
@@ -910,9 +908,7 @@ class TestBuildPyramidPlan:
         shape = [1000, 8000, 8000]
         levels = build_pyramid_plan(shape, ["z", "y", "x"])
         for level in levels:
-            expected = [
-                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)
-            ]
+            expected = [ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)]
             assert list(level.shape) == expected
 
     def test_levels_strictly_coarsen(self):
@@ -933,9 +929,9 @@ class TestBuildPyramidPlan:
     @pytest.mark.parametrize(
         "shape,labels",
         [
-            ([100000], ["x"]),       # 1-D with a label
-            ([100000], None),        # 1-D, no labels (no X/Y to resolve)
-            ([], []),                # 0-D scalar
+            ([100000], ["x"]),  # 1-D with a label
+            ([100000], None),  # 1-D, no labels (no X/Y to resolve)
+            ([], []),  # 0-D scalar
         ],
     )
     def test_sub_2d_is_single_unscaled_level(self, shape, labels):
@@ -977,12 +973,18 @@ class TestNativePyramidLevels:
         # The fixture builds 4 levels at scale 1,2,4,8 (shape 256..32).
         assert levels is not None
         assert [list(lv.scale_hint) for lv in levels] == [
-            [1, 1], [2, 2], [4, 4], [8, 8],
+            [1, 1],
+            [2, 2],
+            [4, 4],
+            [8, 8],
         ]
         assert all(lv.native is True for lv in levels)
         assert all(lv.reduction_method == "precompute" for lv in levels)
         assert [list(lv.shape) for lv in levels] == [
-            [256, 256], [128, 128], [64, 64], [32, 32],
+            [256, 256],
+            [128, 128],
+            [64, 64],
+            [32, 32],
         ]
 
     def test_each_advertised_level_round_trips(self, multires_ome_zarr):
@@ -1074,9 +1076,7 @@ class TestAdvertisedPyramidDescriptor:
         root = zarr.open_group(zarr_path, mode="r")
         server = TensorFlightServer("grpc://localhost:0")
         try:
-            server.register_source(
-                "ome", OmeZarrAdapter(root["0"], "ome")
-            )
+            server.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
             desc = self._descriptor(self._flight_info(server, "ome", "ome"))
             assert len(desc.pyramid) == 4
             assert all(lv.native for lv in desc.pyramid)
@@ -1148,8 +1148,6 @@ class TestPrecacheAdvertisedAlignment:
             worker_coarsest = build_pyramid_plan(
                 list(base_desc.shape), list(base_desc.dim_labels)
             )[-1]
-            assert list(advertised[-1].scale_hint) == list(
-                worker_coarsest.scale_hint
-            )
+            assert list(advertised[-1].scale_hint) == list(worker_coarsest.scale_hint)
         finally:
             server.shutdown()

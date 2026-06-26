@@ -461,9 +461,7 @@ class TestCloudRegistrationEndToEnd:
         mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
 
         # Register an ome-zarr claim flagged unresolved (as the defer branch would).
-        claim = SourceClaim(
-            "ome-zarr", str(store), source_id="cloud1", unresolved=True
-        )
+        claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
         assert mgr._register_source_claim(claim) is True
 
         # Registered as the proxy; catalog row carries NULL shape (empty tensors).
@@ -563,9 +561,7 @@ class TestCloudRescanGating:
         (store / ".zattrs").write_text(json.dumps({"multiscales": [{"datasets": []}]}))
 
         server = _FakeServer()
-        mgr = _make_manager(
-            server, cloud_roots={root.resolve()}, monitored={root}
-        )
+        mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
 
         # The open-for-append probe would recall a placeholder; the cloud gate must
         # bypass it entirely. Make it explode if ever reached during the rescan.
@@ -724,7 +720,9 @@ class TestResolveAction:
         assert kinds[-1] == "result"  # terminal is the descriptor
         assert msgs[-1].result.source_id == "slow"
         # progress heartbeats carry a monotonically non-decreasing elapsed clock
-        elapsed = [m.progress.elapsed_seconds for m, k in zip(msgs, kinds) if k == "progress"]
+        elapsed = [
+            m.progress.elapsed_seconds for m, k in zip(msgs, kinds) if k == "progress"
+        ]
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] >= 0.0
 
@@ -833,7 +831,9 @@ class TestWarmAction:
         assert done.bytes_total == total
         assert done.bytes_done == total  # every byte recalled
         # progress arms report a monotonically non-decreasing files_done
-        prog_files = [m.progress.files_done for m, k in zip(msgs, kinds) if k == "progress"]
+        prog_files = [
+            m.progress.files_done for m, k in zip(msgs, kinds) if k == "progress"
+        ]
         assert prog_files == sorted(prog_files)
         # guard cleaned up
         assert server._warming == set()
@@ -847,7 +847,9 @@ class TestWarmAction:
         self._make_files(root, {"big": 90, "small": 10, "mid": 40})
 
         server = self._server("s2", _DirAdapter(root))
-        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s2"))]
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s2"))
+        ]
         msgs, kinds = self._parse(bodies)
 
         # The current_name as each file finishes, in order (dedupe consecutive
@@ -870,7 +872,9 @@ class TestWarmAction:
         self._make_files(nested, {"chunk": 64})  # interior chunk file
 
         server = self._server("s3", _DirAdapter(root))
-        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s3"))]
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s3"))
+        ]
         msgs, kinds = self._parse(bodies)
         done = msgs[-1].done
         assert done.files_total == 2  # nested file counted
@@ -883,7 +887,9 @@ class TestWarmAction:
         f = tmp_path / "one.tif"
         f.write_bytes(b"x" * 100)
         server = self._server("s4", _DirAdapter(str(f)))  # _source_url is a FILE
-        bodies = [bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s4"))]
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s4"))
+        ]
         msgs, kinds = self._parse(bodies)
         assert kinds == ["done"]
         assert msgs[-1].done.files_total == 0  # nothing to warm
@@ -1038,7 +1044,9 @@ class TestCloudMultiFileBan:
         )
         # ...and each slice is instead claimed single-file, deferred unresolved by
         # DicomAdapter's own residency gate (force_nonresident makes it defer).
-        claim = DicomAdapter.claim(ClaimContext(files[0], cloud_root=True), DiscoveryState())
+        claim = DicomAdapter.claim(
+            ClaimContext(files[0], cloud_root=True), DiscoveryState()
+        )
         assert claim is not None
         assert claim.source_type == "dicom"
         assert claim.unresolved is True
@@ -1159,9 +1167,10 @@ class TestCloudSignatureInvariance:
         after = mgr._build_entry_signature(f.stat(), is_directory=False, cloud=True)
         assert before == after
         # A non-cloud signature WOULD change on the same hydration.
-        assert mgr._build_entry_signature(
-            f.stat(), is_directory=False, cloud=False
-        ) != before
+        assert (
+            mgr._build_entry_signature(f.stat(), is_directory=False, cloud=False)
+            != before
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1270,7 +1279,9 @@ class TestZarrOmeZarrPriority:
         import zarr
 
         store = tmp_path / "arr.zarr"
-        zarr.open_array(str(store), mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
+        zarr.open_array(
+            str(store), mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8"
+        )
 
         claims = self._registry().get_claims_for_path(
             ClaimContext(store), DiscoveryState()

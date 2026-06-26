@@ -135,8 +135,8 @@ def _is_skippable_system_dir(name: str) -> bool:
     low = name.lower()
     if low in _SKIP_DIR_NAMES:
         return True
-    return low == "onedrive" or low.startswith("onedrive -") or low.startswith(
-        "onedrive-"
+    return (
+        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
     )
 
 
@@ -1012,9 +1012,7 @@ def discover_sources_from_entries(
             if is_dir:
                 prune_stack.append(path_str)
 
-    logger.debug(
-        "discover_sources_from_entries: found %d sources", len(state.claims)
-    )
+    logger.debug("discover_sources_from_entries: found %d sources", len(state.claims))
     return state
 
 

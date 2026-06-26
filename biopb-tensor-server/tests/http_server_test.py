@@ -423,6 +423,7 @@ class TestChunkEndpoint:
     def _make_ticket_hex(self, chunk_id: bytes = b"test-chunk") -> str:
         """Create a hex-encoded TensorTicket string."""
         from biopb.tensor.ticket_pb2 import TensorTicket
+
         ticket = TensorTicket(chunk_id=chunk_id)
         return ticket.SerializeToString().hex()
 
@@ -511,6 +512,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow.flight as flight
+
         mock_fc._client.do_get.side_effect = flight.FlightServerError("Chunk not found")
         mock_fc._call_options = MagicMock()
 
@@ -624,6 +626,7 @@ class TestRequestArrayId:
 def _zarr_available() -> bool:
     try:
         import zarr  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -644,7 +647,9 @@ class TestIntegration:
         chunks = (1, 16, 16)
         rng = np.random.default_rng(0)
         data = rng.integers(0, 1000, shape, dtype="uint16")
-        z = zarr.open_array(zarr_path, mode="w", shape=shape, chunks=chunks, dtype="uint16")
+        z = zarr.open_array(
+            zarr_path, mode="w", shape=shape, chunks=chunks, dtype="uint16"
+        )
         z[:] = data
 
         adapter = ZarrAdapter(z, "int-tensor", ["z", "y", "x"])
@@ -752,14 +757,19 @@ class TestQuerySourcesEndpoint:
 
         # Mock query_sources to return an Arrow table
         import pyarrow as pa
-        mock_table = pa.table({
-            "source_id": ["src0", "src1"],
-            "source_type": ["zarr", "zarr"],
-        })
-        mock_table = mock_table.replace_schema_metadata({
-            b"total_sources": "2",
-            b"returned_sources": "2",
-        })
+
+        mock_table = pa.table(
+            {
+                "source_id": ["src0", "src1"],
+                "source_type": ["zarr", "zarr"],
+            }
+        )
+        mock_table = mock_table.replace_schema_metadata(
+            {
+                b"total_sources": "2",
+                b"returned_sources": "2",
+            }
+        )
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(
@@ -777,13 +787,18 @@ class TestQuerySourcesEndpoint:
         tc, mock_fc = auth_client
 
         import pyarrow as pa
-        mock_table = pa.table({
-            "source_id": ["src0", "src1"],
-        })
-        mock_table = mock_table.replace_schema_metadata({
-            b"total_sources": "100",
-            b"returned_sources": "2",
-        })
+
+        mock_table = pa.table(
+            {
+                "source_id": ["src0", "src1"],
+            }
+        )
+        mock_table = mock_table.replace_schema_metadata(
+            {
+                b"total_sources": "100",
+                b"returned_sources": "2",
+            }
+        )
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(

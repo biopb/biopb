@@ -86,7 +86,11 @@ _cachefile_support_lock = threading.Lock()
 
 def _is_cachefile_disabled_by_env() -> bool:
     """Whether the cache-file fast path is explicitly disabled via env var."""
-    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
+    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _cachefile_supported(location: str) -> Optional[bool]:
@@ -148,7 +152,9 @@ def _is_localhost_location(location: str) -> bool:
     # Parse location URI - handle various formats
     # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
     # IPv6 format: grpc://[::1]:port
-    match = re.match(r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location)
+    match = re.match(
+        r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location
+    )
     if not match:
         return False
 
@@ -257,7 +263,8 @@ def _try_cachefile_transfer(
     if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
         logger.debug(
             "chunk_locate reports segment format %s > supported %s; using do_get",
-            info.get("format_version"), _CACHEFILE_SUPPORTED_FORMAT,
+            info.get("format_version"),
+            _CACHEFILE_SUPPORTED_FORMAT,
         )
         _set_cachefile_supported(location, False)
         return None
@@ -289,6 +296,7 @@ def _try_cachefile_transfer(
 # Internal context for tensor flight info
 # ==============================================================================
 
+
 @dataclass
 class _TensorContext:
     """Internal context returned by _get_tensor_context().
@@ -296,11 +304,14 @@ class _TensorContext:
     Contains all parsed flight info needed to build either a dask array
     or a SerializedTensor protobuf.
     """
+
     descriptor: TensorDescriptor
     endpoints: List[Tuple[bytes, ChunkBounds]]  # (chunk_id, bounds) pairs
     read_opt: TensorReadOption
     original_slice_hint: Optional[SliceHint]
-    schema_metadata: Optional[Dict[str, str]] = None  # For SHM transfer feature detection
+    schema_metadata: Optional[Dict[str, str]] = (
+        None  # For SHM transfer feature detection
+    )
 
 
 # ==============================================================================
@@ -319,7 +330,9 @@ class _TensorContext:
 _THREAD_LOCAL = threading.local()
 
 # Global registry for cleanup: thread_id -> {(location, token): FlightClient}
-_CONNECTION_REGISTRY: Dict[int, Dict[Tuple[str, Optional[str]], flight.FlightClient]] = {}
+_CONNECTION_REGISTRY: Dict[
+    int, Dict[Tuple[str, Optional[str]], flight.FlightClient]
+] = {}
 _REGISTRY_LOCK = threading.Lock()
 
 # Shared pools for cache and call options (cross-thread cache hits enabled)
@@ -383,7 +396,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
     current_pid = os.getpid()
 
     # Fast path: thread already has client for this location (no lock)
-    local_pool = getattr(_THREAD_LOCAL, 'clients', None)
+    local_pool = getattr(_THREAD_LOCAL, "clients", None)
     if local_pool is None:
         local_pool = {}
         _THREAD_LOCAL.clients = local_pool
@@ -410,7 +423,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
         generic_options=[
             ("grpc.max_send_message_size", 80 * 1024 * 1024),
             ("grpc.max_receive_message_size", 80 * 1024 * 1024),
-        ]
+        ],
     )
     local_pool[key] = (current_pid, client)
 
@@ -468,7 +481,9 @@ def _get_shared_cache(
         return _CACHE_POOL[key][1]
 
 
-def _get_shared_call_options(location: str, token: Optional[str]) -> flight.FlightCallOptions:
+def _get_shared_call_options(
+    location: str, token: Optional[str]
+) -> flight.FlightCallOptions:
     """Get shared FlightCallOptions.
 
     Args:
@@ -519,9 +534,7 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
     return (client, cache, call_options)
 
 
-def configure_cache(
-    location: str, token: Optional[str], cache_bytes: int
-) -> int:
+def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> int:
     """Pin this process's chunk-cache budget for a connection, authoritatively.
 
     Sets the per-process chunk cache to ``cache_bytes`` and keeps it there: every
@@ -782,7 +795,9 @@ def _build_dask_array_from_chunk_map(
 
     chunks = _regular_grid_chunks(chunk_map, grid_shape, shape)
     if chunks is not None:
-        id_map = {chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()}
+        id_map = {
+            chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()
+        }
         return da.map_blocks(
             _fetch_chunk_block,
             id_map,
@@ -817,7 +832,9 @@ def _build_dask_array_from_chunk_map(
     return da.block(blocks.tolist())
 
 
-def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[bytes], List[ChunkBounds]]:
+def _fetch_endpoints_via_get_flight_info(
+    pb: SerializedTensor,
+) -> Tuple[List[bytes], List[ChunkBounds]]:
     """Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
 
     This is used when the endpoints field in SerializedTensor is empty.
@@ -949,7 +966,9 @@ def _normalize_location(location: str) -> str:
     return location
 
 
-def make_debug_serialized_tensor(arr: da.Array, array_id: str = "debug") -> SerializedTensor:
+def make_debug_serialized_tensor(
+    arr: da.Array, array_id: str = "debug"
+) -> SerializedTensor:
     """Create a SerializedTensor with debug_pickled_array for testing.
 
     Eagerly computes the array and pickles it, bypassing Flight server.
@@ -1035,6 +1054,7 @@ class TensorFlightClient:
         dask.distributed: each worker fetches chunks over its own connection,
         so you can scatter an array across a cluster and compute on it.
     """
+
     # The arrays are pickle-safe because the fetch functions hold no FlightClient
     # in their closure -- connections, caches, and call options are recreated
     # lazily per worker process from module-level pools keyed by (location, token).
@@ -1089,7 +1109,7 @@ class TensorFlightClient:
         """
         prefix = f"{source_id}/"
         if array_id.startswith(prefix):
-            array_id = array_id[len(prefix):]
+            array_id = array_id[len(prefix) :]
         return (source_id, array_id)
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
@@ -1256,9 +1276,7 @@ class TensorFlightClient:
         # Go through object dtype: pandas' str dtype re-coerces a None put back
         # in via .where() to NaN, but an object column preserves None.
         for field in table.schema:
-            if pa.types.is_string(field.type) or pa.types.is_large_string(
-                field.type
-            ):
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
                 col = df[field.name].astype(object)
                 df[field.name] = col.where(col.notna(), None)
         return df
@@ -1420,9 +1438,9 @@ class TensorFlightClient:
                 raise _unresolved_source_error(source_id) from exc
             raise
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
-        self._descriptors[
-            self._descriptor_key(source_id, tensor_desc.array_id)
-        ] = tensor_desc
+        self._descriptors[self._descriptor_key(source_id, tensor_desc.array_id)] = (
+            tensor_desc
+        )
         return tensor_desc
 
     def get_descriptor(self, array_id: str) -> "TensorDescriptor":
@@ -1508,9 +1526,7 @@ class TensorFlightClient:
         desc: Optional[DataSourceDescriptor] = None
         for result in self._client.do_action(action, options=self._call_options):
             if should_cancel is not None and should_cancel():
-                raise ResolveCancelled(
-                    f"resolve('{source_id}') cancelled by caller"
-                )
+                raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
             body = result.body.to_pybytes()
             if not body:
                 continue  # legacy empty-body heartbeat (server predating progress)
@@ -1586,9 +1602,7 @@ class TensorFlightClient:
         try:
             for result in self._client.do_action(action, options=self._call_options):
                 if should_cancel is not None and should_cancel():
-                    raise ResolveCancelled(
-                        f"warm('{source_id}') cancelled by caller"
-                    )
+                    raise ResolveCancelled(f"warm('{source_id}') cancelled by caller")
                 body = result.body.to_pybytes()
                 if not body:
                     continue
@@ -1689,7 +1703,9 @@ class TensorFlightClient:
         Returns:
             _TensorContext with descriptor, endpoints, read_opt, and original_slice_hint
         """
-        logger.debug(f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}")
+        logger.debug(
+            f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}"
+        )
 
         # Ensure sources are loaded; fall back to direct server fetch if list_sources
         # didn't return this source (e.g. truncated result set).
@@ -1789,9 +1805,9 @@ class TensorFlightClient:
         schema_metadata = _extract_schema_metadata(info.schema)
 
         # Cache the response descriptor
-        self._descriptors[
-            self._descriptor_key(source_id, response_desc.array_id)
-        ] = response_desc
+        self._descriptors[self._descriptor_key(source_id, response_desc.array_id)] = (
+            response_desc
+        )
 
         # Parse endpoints into (chunk_id, bounds) pairs
         endpoints = []
@@ -1929,7 +1945,9 @@ class TensorFlightClient:
         # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         # the returned descriptor.shape may be larger than what was requested.
         # We crop the dask array back to the exact requested region here.
-        if ctx.original_slice_hint is not None and ctx.descriptor.HasField("slice_hint"):
+        if ctx.original_slice_hint is not None and ctx.descriptor.HasField(
+            "slice_hint"
+        ):
             realized = ctx.descriptor.slice_hint
             ndim = len(ctx.descriptor.shape)
             scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
@@ -2086,9 +2104,7 @@ class TensorFlightClient:
 
         # Build dask array with lazy chunk fetching
         ndim = len(shape)
-        grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map) for d in range(ndim)
-        )
+        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
 
         # Extract schema_metadata from pb for SHM transfer
         schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
@@ -2169,9 +2185,7 @@ class TensorFlightClient:
         # Blockwise (map_blocks) layer for a regular grid, falling back to
         # da.block-of-from_delayed for ragged/sparse grids.
         ndim = len(shape)
-        grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map) for d in range(ndim)
-        )
+        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
 
         return _build_dask_array_from_chunk_map(
             chunk_map,

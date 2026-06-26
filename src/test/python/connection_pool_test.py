@@ -21,7 +21,7 @@ class TestThreadLocalPool:
         """Test that thread-local storage is initialized correctly."""
         # Each thread starts with empty storage
         local = threading.local()
-        assert hasattr(local, 'clients') or not hasattr(local, 'clients')
+        assert hasattr(local, "clients") or not hasattr(local, "clients")
 
     def test_different_threads_have_different_clients(self):
         """Test that different threads get different FlightClient instances."""
@@ -32,10 +32,10 @@ class TestThreadLocalPool:
             try:
                 # Create a mock client for this thread
                 mock_client = MagicMock(spec=flight.FlightClient)
-                local_pool = getattr(client_module._THREAD_LOCAL, 'clients', {})
+                local_pool = getattr(client_module._THREAD_LOCAL, "clients", {})
                 if local_pool is None:
                     local_pool = {}
-                local_pool[('test_loc', None)] = (os.getpid(), mock_client)
+                local_pool[("test_loc", None)] = (os.getpid(), mock_client)
                 client_module._THREAD_LOCAL.clients = local_pool
                 results[thread_id] = mock_client
             except Exception as e:
@@ -105,7 +105,7 @@ class TestEvictDeadThreads:
             with client_module._REGISTRY_LOCK:
                 if thread_id is not None:
                     client_module._CONNECTION_REGISTRY[thread_id] = {
-                        ('test_loc', None): MagicMock()
+                        ("test_loc", None): MagicMock()
                     }
 
         t = threading.Thread(target=register_thread)
@@ -158,22 +158,32 @@ class TestCachePolicy:
 
     def test_resolve_remote_keeps_requested_size(self):
         with patch.object(client_module, "_is_localhost_location", return_value=False):
-            assert client_module._resolve_cache_bytes("grpc://remote:8815", 1000) == 1000
+            assert (
+                client_module._resolve_cache_bytes("grpc://remote:8815", 1000) == 1000
+            )
 
     def test_resolve_localhost_disables_by_default(self, monkeypatch):
         monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
         with patch.object(client_module, "_is_localhost_location", return_value=True):
-            assert client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 0
+            assert (
+                client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 0
+            )
 
     def test_resolve_localhost_opt_in_via_env(self, monkeypatch):
         monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
         with patch.object(client_module, "_is_localhost_location", return_value=True):
-            assert client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 1000
+            assert (
+                client_module._resolve_cache_bytes("grpc://localhost:8815", 1000)
+                == 1000
+            )
 
     def test_shared_cache_is_none_for_localhost(self, monkeypatch):
         monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
         with patch.object(client_module, "_is_localhost_location", return_value=True):
-            assert client_module._get_shared_cache("grpc://localhost:8815", None, 1000) is None
+            assert (
+                client_module._get_shared_cache("grpc://localhost:8815", None, 1000)
+                is None
+            )
 
     def test_shared_cache_created_for_remote(self):
         loc = "grpc://remote-cache-test:9999"
@@ -237,10 +247,7 @@ class TestConfigureCache:
         with patch.object(client_module, "_is_localhost_location", return_value=False):
             assert client_module.configure_cache(loc, None, 0) == 0
             # a later fetch carrying the default 1GB must NOT recreate a cache
-            assert (
-                client_module._get_shared_cache(loc, None, 1_000_000_000)
-                is None
-            )
+            assert client_module._get_shared_cache(loc, None, 1_000_000_000) is None
 
     def test_get_shared_cache_honors_configured_size(self):
         loc = "grpc://remote:8815"
@@ -270,7 +277,9 @@ class TestCachePlugin:
         loc = "grpc://remote:8815"
         plugin = client_module.make_cache_plugin(loc, None, 777)
         try:
-            with patch.object(client_module, "_is_localhost_location", return_value=False):
+            with patch.object(
+                client_module, "_is_localhost_location", return_value=False
+            ):
                 plugin.setup(worker=None)  # what dask calls on each worker
             assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 777
         finally:
@@ -287,7 +296,7 @@ class TestCleanupConnectionPool:
         # Check that atexit has handlers registered
         # This is a conceptual check - we don't want to actually
         # run the cleanup in tests
-        assert hasattr(client_module, '_cleanup_connection_pool')
+        assert hasattr(client_module, "_cleanup_connection_pool")
 
     def test_cleanup_clears_registries(self):
         """Test that cleanup clears all registries."""
@@ -295,7 +304,7 @@ class TestCleanupConnectionPool:
         with client_module._REGISTRY_LOCK:
             mock_thread_id = 99999
             client_module._CONNECTION_REGISTRY[mock_thread_id] = {
-                ('test_loc', None): MagicMock()
+                ("test_loc", None): MagicMock()
             }
 
         # Run cleanup (but don't close mock clients that might error)
@@ -317,7 +326,7 @@ class TestCallOptionsPool:
         """Test that call options are created without auth token."""
         # Without token, options should be empty
         with client_module._POOL_LOCK:
-            key = ('test_loc', None)
+            key = ("test_loc", None)
             if key in client_module._CALL_OPTS_POOL:
                 opts = client_module._CALL_OPTS_POOL[key]
                 # Should have no auth headers
@@ -326,7 +335,7 @@ class TestCallOptionsPool:
     def test_shared_call_options_with_token(self):
         """Test that call options include auth headers when token provided."""
         # With token, options should have Bearer auth header
-        key = ('test_loc', 'test_token')
+        key = ("test_loc", "test_token")
 
         # Clear any existing entry for clean test
         with client_module._POOL_LOCK:
@@ -342,12 +351,12 @@ class TestPoolLocks:
 
     def test_registry_lock_exists(self):
         """Test that REGISTRY_LOCK exists."""
-        assert hasattr(client_module, '_REGISTRY_LOCK')
+        assert hasattr(client_module, "_REGISTRY_LOCK")
         assert isinstance(client_module._REGISTRY_LOCK, type(threading.Lock()))
 
     def test_pool_lock_exists(self):
         """Test that POOL_LOCK exists."""
-        assert hasattr(client_module, '_POOL_LOCK')
+        assert hasattr(client_module, "_POOL_LOCK")
         assert isinstance(client_module._POOL_LOCK, type(threading.Lock()))
 
     def test_concurrent_registry_access(self):

@@ -31,13 +31,14 @@ def _dicom_value_to_json(value) -> any:
     """Convert DICOM value to JSON-serializable format."""
     try:
         import pydicom
+
         if isinstance(value, pydicom.multival.MultiValue):
             return [_dicom_value_to_json(v) for v in value]
         elif isinstance(value, bytes):
             return value.hex()
         elif isinstance(value, pydicom.uid.UID):
             return str(value)
-        elif hasattr(value, 'value'):
+        elif hasattr(value, "value"):
             # Sequence items or data element wrappers
             return _dicom_value_to_json(value.value)
         else:
@@ -61,7 +62,7 @@ def _derive_orientation_from_iop(iop: List[float]) -> str:
     normal = [
         row_y * col_z - row_z * col_y,
         row_z * col_x - row_x * col_z,
-        row_x * col_y - row_y * col_x
+        row_x * col_y - row_y * col_x,
     ]
 
     # Find dominant component
@@ -78,6 +79,7 @@ def _derive_orientation_from_iop(iop: List[float]) -> str:
 # =============================================================================
 # DicomAdapter - Single file
 # =============================================================================
+
 
 class DicomAdapter(SourceAdapter, TensorAdapter):
     """Adapter for single DICOM files.
@@ -110,7 +112,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 
         # Check extension
         name = ctx.name.lower()
-        if not (name.endswith('.dcm') or name.endswith('.dicom')):
+        if not (name.endswith(".dcm") or name.endswith(".dicom")):
             return None
 
         # Cloud-storage phase 2: reading the DICOM header (even
@@ -131,14 +133,14 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 
             if ctx.is_remote:
                 # Remote: read via file-like object
-                with ctx.store.open(ctx._remote_path, mode='rb') as fobj:
+                with ctx.store.open(ctx._remote_path, mode="rb") as fobj:
                     ds = pydicom.dcmread(fobj, stop_before_pixels=True)
             else:
                 # Local: read metadata only (no pixel data)
                 ds = pydicom.dcmread(ctx.path_str, stop_before_pixels=True)
 
             # Check for image-related tags (indicating pixel data capability)
-            if not (hasattr(ds, 'Rows') and hasattr(ds, 'Columns')):
+            if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
                 return None
 
             state.try_claim_path(ctx.path_str)
@@ -154,9 +156,9 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
     @classmethod
     def create_from_config(
         cls,
-        source: 'SourceConfig',
+        source: "SourceConfig",
         credentials_config: Optional[Any] = None,
-    ) -> 'DicomAdapter':
+    ) -> "DicomAdapter":
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -180,7 +182,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
                     storage_options = profile.to_storage_options()
 
             fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
-            with fs.open(fs_path, mode='rb') as fobj:
+            with fs.open(fs_path, mode="rb") as fobj:
                 ds = pydicom.dcmread(fobj)
         else:
             # Local filesystem
@@ -210,16 +212,16 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
         # Source-level metadata
         if source_url:
             self._source_url = source_url
-        elif hasattr(dicom_dataset, 'filename'):
+        elif hasattr(dicom_dataset, "filename"):
             self._source_url = str(dicom_dataset.filename)
         else:
             self._source_url = ""
         self._source_type = "dicom"
 
         # Get shape info
-        rows = int(self.ds.get('Rows', 0))
-        cols = int(self.ds.get('Columns', 0))
-        num_frames = int(self.ds.get('NumberOfFrames', 1))
+        rows = int(self.ds.get("Rows", 0))
+        cols = int(self.ds.get("Columns", 0))
+        num_frames = int(self.ds.get("NumberOfFrames", 1))
 
         if num_frames > 1:
             self._shape = (num_frames, rows, cols)
@@ -229,26 +231,26 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
             self._is_multiframe = False
 
         # Get dtype from pixel representation
-        bits_stored = int(self.ds.get('BitsStored', 16))
-        pixel_repr = int(self.ds.get('PixelRepresentation', 0))
+        bits_stored = int(self.ds.get("BitsStored", 16))
+        pixel_repr = int(self.ds.get("PixelRepresentation", 0))
 
         if bits_stored <= 8:
-            self._dtype = 'uint8' if pixel_repr == 0 else 'int8'
+            self._dtype = "uint8" if pixel_repr == 0 else "int8"
         elif bits_stored <= 16:
-            self._dtype = 'uint16' if pixel_repr == 0 else 'int16'
+            self._dtype = "uint16" if pixel_repr == 0 else "int16"
         elif bits_stored <= 32:
-            self._dtype = 'uint32' if pixel_repr == 0 else 'int32'
+            self._dtype = "uint32" if pixel_repr == 0 else "int32"
         else:
-            self._dtype = 'float32'
+            self._dtype = "float32"
 
         # Dimension labels
         if dim_labels:
             self.dim_labels = dim_labels
         else:
             if self._is_multiframe:
-                self.dim_labels = ['frame', 'y', 'x']
+                self.dim_labels = ["frame", "y", "x"]
             else:
-                self.dim_labels = ['y', 'x']
+                self.dim_labels = ["y", "x"]
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
@@ -297,12 +299,28 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 
         # Key pixel data tags
         pixel_tags = [
-            'PixelSpacing', 'SliceThickness', 'ImageOrientationPatient',
-            'ImagePositionPatient', 'SliceLocation', 'InstanceNumber',
-            'WindowCenter', 'WindowWidth', 'RescaleSlope', 'RescaleIntercept',
-            'BitsStored', 'BitsAllocated', 'PixelRepresentation', 'PhotometricInterpretation',
-            'Rows', 'Columns', 'NumberOfFrames', 'SamplesPerPixel',
-            'KVP', 'ExposureTime', 'XRayTubeCurrent', 'SliceLocation',
+            "PixelSpacing",
+            "SliceThickness",
+            "ImageOrientationPatient",
+            "ImagePositionPatient",
+            "SliceLocation",
+            "InstanceNumber",
+            "WindowCenter",
+            "WindowWidth",
+            "RescaleSlope",
+            "RescaleIntercept",
+            "BitsStored",
+            "BitsAllocated",
+            "PixelRepresentation",
+            "PhotometricInterpretation",
+            "Rows",
+            "Columns",
+            "NumberOfFrames",
+            "SamplesPerPixel",
+            "KVP",
+            "ExposureTime",
+            "XRayTubeCurrent",
+            "SliceLocation",
         ]
 
         for tag_name in pixel_tags:
@@ -311,33 +329,49 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
                 metadata["tags"][tag_name] = _dicom_value_to_json(value)
 
         # Derived spatial info
-        if hasattr(self.ds, 'PixelSpacing'):
+        if hasattr(self.ds, "PixelSpacing"):
             ps = self.ds.PixelSpacing
             if len(ps) >= 2:
                 metadata["spatial"]["pixel_spacing_mm"] = [float(ps[0]), float(ps[1])]
 
-        if hasattr(self.ds, 'SliceThickness'):
+        if hasattr(self.ds, "SliceThickness"):
             metadata["spatial"]["slice_spacing_mm"] = float(self.ds.SliceThickness)
 
-        if hasattr(self.ds, 'ImageOrientationPatient'):
+        if hasattr(self.ds, "ImageOrientationPatient"):
             iop = self.ds.ImageOrientationPatient
             metadata["spatial"]["orientation"] = _derive_orientation_from_iop(list(iop))
 
-        if hasattr(self.ds, 'ImagePositionPatient'):
+        if hasattr(self.ds, "ImagePositionPatient"):
             ipp = self.ds.ImagePositionPatient
-            metadata["spatial"]["origin_mm"] = [float(ipp[0]), float(ipp[1]), float(ipp[2])]
+            metadata["spatial"]["origin_mm"] = [
+                float(ipp[0]),
+                float(ipp[1]),
+                float(ipp[2]),
+            ]
 
-        if hasattr(self.ds, 'SliceLocation'):
+        if hasattr(self.ds, "SliceLocation"):
             metadata["spatial"]["slice_location_mm"] = float(self.ds.SliceLocation)
 
         # Patient/study info (including all patient fields per user request)
         patient_tags = [
-            'PatientName', 'PatientID', 'PatientBirthDate', 'PatientSex',
-            'PatientAge', 'PatientWeight', 'PatientSize',
-            'StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID',
-            'StudyDate', 'SeriesDate', 'AcquisitionDate',
-            'StudyDescription', 'SeriesDescription',
-            'Modality', 'Manufacturer', 'InstitutionName',
+            "PatientName",
+            "PatientID",
+            "PatientBirthDate",
+            "PatientSex",
+            "PatientAge",
+            "PatientWeight",
+            "PatientSize",
+            "StudyInstanceUID",
+            "SeriesInstanceUID",
+            "SOPInstanceUID",
+            "StudyDate",
+            "SeriesDate",
+            "AcquisitionDate",
+            "StudyDescription",
+            "SeriesDescription",
+            "Modality",
+            "Manufacturer",
+            "InstitutionName",
         ]
 
         for tag_name in patient_tags:
@@ -346,16 +380,16 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
                 metadata["patient"][tag_name] = _dicom_value_to_json(value)
 
         # Windowing parameters (for visualization)
-        if hasattr(self.ds, 'WindowCenter') and hasattr(self.ds, 'WindowWidth'):
+        if hasattr(self.ds, "WindowCenter") and hasattr(self.ds, "WindowWidth"):
             try:
                 wc = self.ds.WindowCenter
                 ww = self.ds.WindowWidth
                 # Handle multi-value window settings
-                if hasattr(wc, '__iter__') and not isinstance(wc, str):
+                if hasattr(wc, "__iter__") and not isinstance(wc, str):
                     metadata["tags"]["WindowCenter"] = [float(v) for v in wc]
                 else:
                     metadata["tags"]["WindowCenter"] = float(wc)
-                if hasattr(ww, '__iter__') and not isinstance(ww, str):
+                if hasattr(ww, "__iter__") and not isinstance(ww, str):
                     metadata["tags"]["WindowWidth"] = [float(v) for v in ww]
                 else:
                     metadata["tags"]["WindowWidth"] = float(ww)
@@ -368,6 +402,7 @@ class DicomAdapter(SourceAdapter, TensorAdapter):
 # =============================================================================
 # DicomSeriesAdapter - Multi-file series
 # =============================================================================
+
 
 class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
@@ -411,7 +446,11 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
             return None
 
         # Find DICOM files
-        dcm_files = list(ctx._path.glob('*.dcm')) + list(ctx._path.glob('*.DICOM')) + list(ctx._path.glob('*.dicom'))
+        dcm_files = (
+            list(ctx._path.glob("*.dcm"))
+            + list(ctx._path.glob("*.DICOM"))
+            + list(ctx._path.glob("*.dicom"))
+        )
 
         # Need at least 2 files for a series
         if len(dcm_files) < 2:
@@ -432,10 +471,10 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
                     ds = pydicom.dcmread(str(f), stop_before_pixels=True)
                 except Exception:
                     continue
-                series_uid = getattr(ds, 'SeriesInstanceUID', None)
+                series_uid = getattr(ds, "SeriesInstanceUID", None)
                 # Rows/Columns indicate pixel-data capability.
                 if series_uid is None or not (
-                    hasattr(ds, 'Rows') and hasattr(ds, 'Columns')
+                    hasattr(ds, "Rows") and hasattr(ds, "Columns")
                 ):
                     continue
                 series_to_files.setdefault(str(series_uid), []).append(f)
@@ -457,14 +496,19 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
             return SourceClaim(
                 source_type="dicom-series",
                 primary_path=ctx.path_str,
-                extra_config={'num_slices': len(series_files), 'series_uid': str(series_uid)},
+                extra_config={
+                    "num_slices": len(series_files),
+                    "series_uid": str(series_uid),
+                },
             )
 
         except Exception:
             return None
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'DicomSeriesAdapter':
+    def create_from_config(
+        cls, source: "SourceConfig", credentials_config: Optional[Any] = None
+    ) -> "DicomSeriesAdapter":
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -499,7 +543,11 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         self._source_type = "dicom-series"
 
         # Find and sort DICOM files
-        dcm_files = list(self.directory.glob('*.dcm')) + list(self.directory.glob('*.DICOM')) + list(self.directory.glob('*.dicom'))
+        dcm_files = (
+            list(self.directory.glob("*.dcm"))
+            + list(self.directory.glob("*.DICOM"))
+            + list(self.directory.glob("*.dicom"))
+        )
 
         # Read first file to get series UID and sort criteria
         first_ds = pydicom.dcmread(str(dcm_files[0]), stop_before_pixels=True)
@@ -510,34 +558,47 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         for f in dcm_files:
             try:
                 ds = pydicom.dcmread(str(f), stop_before_pixels=True)
-                if hasattr(ds, 'SeriesInstanceUID') and ds.SeriesInstanceUID == series_uid:
+                if (
+                    hasattr(ds, "SeriesInstanceUID")
+                    and ds.SeriesInstanceUID == series_uid
+                ):
                     # Get sorting key
-                    instance_num = int(ds.get('InstanceNumber', -1))
-                    slice_loc = float(ds.get('SliceLocation', 0)) if hasattr(ds, 'SliceLocation') else 0
-                    ipp = ds.get('ImagePositionPatient', [0, 0, 0]) if hasattr(ds, 'ImagePositionPatient') else [0, 0, 0]
+                    instance_num = int(ds.get("InstanceNumber", -1))
+                    slice_loc = (
+                        float(ds.get("SliceLocation", 0))
+                        if hasattr(ds, "SliceLocation")
+                        else 0
+                    )
+                    ipp = (
+                        ds.get("ImagePositionPatient", [0, 0, 0])
+                        if hasattr(ds, "ImagePositionPatient")
+                        else [0, 0, 0]
+                    )
                     z_pos = float(ipp[2]) if len(ipp) >= 3 else 0
 
-                    file_info.append({
-                        'path': f,
-                        'instance_number': instance_num,
-                        'slice_location': slice_loc,
-                        'z_position': z_pos,
-                    })
+                    file_info.append(
+                        {
+                            "path": f,
+                            "instance_number": instance_num,
+                            "slice_location": slice_loc,
+                            "z_position": z_pos,
+                        }
+                    )
             except Exception:
                 continue
 
         # Sort files - prefer InstanceNumber, then SliceLocation, then z_position
-        if any(info['instance_number'] >= 0 for info in file_info):
+        if any(info["instance_number"] >= 0 for info in file_info):
             # Sort by InstanceNumber
-            file_info.sort(key=lambda x: x['instance_number'])
-        elif any(info['slice_location'] != 0 for info in file_info):
+            file_info.sort(key=lambda x: x["instance_number"])
+        elif any(info["slice_location"] != 0 for info in file_info):
             # Sort by SliceLocation
-            file_info.sort(key=lambda x: x['slice_location'])
+            file_info.sort(key=lambda x: x["slice_location"])
         else:
             # Sort by z_position from ImagePositionPatient
-            file_info.sort(key=lambda x: x['z_position'])
+            file_info.sort(key=lambda x: x["z_position"])
 
-        self.dicom_files = [info['path'] for info in file_info]
+        self.dicom_files = [info["path"] for info in file_info]
         self._num_slices = len(self.dicom_files)
 
         if self._num_slices == 0:
@@ -547,17 +608,17 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         first_full = pydicom.dcmread(str(self.dicom_files[0]))
         rows = int(first_full.Rows)
         cols = int(first_full.Columns)
-        bits_stored = int(first_full.get('BitsStored', 16))
-        pixel_repr = int(first_full.get('PixelRepresentation', 0))
+        bits_stored = int(first_full.get("BitsStored", 16))
+        pixel_repr = int(first_full.get("PixelRepresentation", 0))
 
         if bits_stored <= 8:
-            self._dtype = 'uint8' if pixel_repr == 0 else 'int8'
+            self._dtype = "uint8" if pixel_repr == 0 else "int8"
         elif bits_stored <= 16:
-            self._dtype = 'uint16' if pixel_repr == 0 else 'int16'
+            self._dtype = "uint16" if pixel_repr == 0 else "int16"
         elif bits_stored <= 32:
-            self._dtype = 'uint32' if pixel_repr == 0 else 'int32'
+            self._dtype = "uint32" if pixel_repr == 0 else "int32"
         else:
-            self._dtype = 'float32'
+            self._dtype = "float32"
 
         self._shape = (self._num_slices, rows, cols)
         self._rows = rows
@@ -567,7 +628,7 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         if dim_labels:
             self.dim_labels = dim_labels
         else:
-            self.dim_labels = ['z', 'y', 'x']
+            self.dim_labels = ["z", "y", "x"]
 
         # Store first dataset for metadata extraction
         self._first_ds = first_full
@@ -644,12 +705,25 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
 
         # Key pixel data tags
         pixel_tags = [
-            'PixelSpacing', 'SliceThickness', 'ImageOrientationPatient',
-            'ImagePositionPatient', 'SliceLocation',
-            'WindowCenter', 'WindowWidth', 'RescaleSlope', 'RescaleIntercept',
-            'BitsStored', 'BitsAllocated', 'PixelRepresentation', 'PhotometricInterpretation',
-            'Rows', 'Columns', 'SamplesPerPixel',
-            'KVP', 'ExposureTime', 'XRayTubeCurrent',
+            "PixelSpacing",
+            "SliceThickness",
+            "ImageOrientationPatient",
+            "ImagePositionPatient",
+            "SliceLocation",
+            "WindowCenter",
+            "WindowWidth",
+            "RescaleSlope",
+            "RescaleIntercept",
+            "BitsStored",
+            "BitsAllocated",
+            "PixelRepresentation",
+            "PhotometricInterpretation",
+            "Rows",
+            "Columns",
+            "SamplesPerPixel",
+            "KVP",
+            "ExposureTime",
+            "XRayTubeCurrent",
         ]
 
         for tag_name in pixel_tags:
@@ -658,30 +732,47 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
                 metadata["tags"][tag_name] = _dicom_value_to_json(value)
 
         # Derived spatial info
-        if hasattr(self._first_ds, 'PixelSpacing'):
+        if hasattr(self._first_ds, "PixelSpacing"):
             ps = self._first_ds.PixelSpacing
             if len(ps) >= 2:
                 metadata["spatial"]["pixel_spacing_mm"] = [float(ps[0]), float(ps[1])]
 
-        if hasattr(self._first_ds, 'SliceThickness'):
-            metadata["spatial"]["slice_spacing_mm"] = float(self._first_ds.SliceThickness)
+        if hasattr(self._first_ds, "SliceThickness"):
+            metadata["spatial"]["slice_spacing_mm"] = float(
+                self._first_ds.SliceThickness
+            )
 
-        if hasattr(self._first_ds, 'ImageOrientationPatient'):
+        if hasattr(self._first_ds, "ImageOrientationPatient"):
             iop = self._first_ds.ImageOrientationPatient
             metadata["spatial"]["orientation"] = _derive_orientation_from_iop(list(iop))
 
-        if hasattr(self._first_ds, 'ImagePositionPatient'):
+        if hasattr(self._first_ds, "ImagePositionPatient"):
             ipp = self._first_ds.ImagePositionPatient
-            metadata["spatial"]["origin_mm"] = [float(ipp[0]), float(ipp[1]), float(ipp[2])]
+            metadata["spatial"]["origin_mm"] = [
+                float(ipp[0]),
+                float(ipp[1]),
+                float(ipp[2]),
+            ]
 
         # Patient/study info
         patient_tags = [
-            'PatientName', 'PatientID', 'PatientBirthDate', 'PatientSex',
-            'PatientAge', 'PatientWeight', 'PatientSize',
-            'StudyInstanceUID', 'SeriesInstanceUID',
-            'StudyDate', 'SeriesDate', 'AcquisitionDate',
-            'StudyDescription', 'SeriesDescription',
-            'Modality', 'Manufacturer', 'InstitutionName',
+            "PatientName",
+            "PatientID",
+            "PatientBirthDate",
+            "PatientSex",
+            "PatientAge",
+            "PatientWeight",
+            "PatientSize",
+            "StudyInstanceUID",
+            "SeriesInstanceUID",
+            "StudyDate",
+            "SeriesDate",
+            "AcquisitionDate",
+            "StudyDescription",
+            "SeriesDescription",
+            "Modality",
+            "Manufacturer",
+            "InstitutionName",
         ]
 
         for tag_name in patient_tags:

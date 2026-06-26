@@ -57,9 +57,7 @@ def install() -> bool:
         # Clean EOF: the launcher process has died — self-terminate.
         _self_terminate()
 
-    threading.Thread(
-        target=_watch, name="parent-death-watch", daemon=True
-    ).start()
+    threading.Thread(target=_watch, name="parent-death-watch", daemon=True).start()
     return True
 
 

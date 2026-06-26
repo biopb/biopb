@@ -15,7 +15,6 @@ on a not-yet-mounted monitored directory. These tests pin the new behavior:
   and skips unresolvable entries only when asked.
 """
 
-
 import biopb_tensor_server.config as config_mod
 import numpy as np
 import pytest
@@ -179,7 +178,9 @@ class TestResolveServeSources:
         static_sources, monitored_sources = _resolve_serve_sources(cfg)
 
         assert monitored_sources == []  # cloud alone does NOT monitor anymore
-        assert [s.local_path for s in static_sources] == [(root / "image.tif").resolve()]
+        assert [s.local_path for s in static_sources] == [
+            (root / "image.tif").resolve()
+        ]
         # cloud gating rides along: the expanded source keeps cloud=True so it is
         # still deferred as an unresolved source downstream.
         assert all(s.cloud for s in static_sources)

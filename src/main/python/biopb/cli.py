@@ -93,6 +93,7 @@ MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
+
 @app.command()
 def version():
     """Show version information."""
@@ -102,6 +103,7 @@ def version():
         biopb_version = "unknown"
 
     console.print(f"biopb: {biopb_version}")
+
 
 def _ensure_dirs():
     """Ensure required directories exist."""
@@ -417,9 +419,7 @@ def _tail_and_follow(
                 st = os.stat(log_file)
             except OSError:
                 st = None
-            if st is not None and (
-                st.st_ino != last_ino or st.st_size < f.tell()
-            ):
+            if st is not None and (st.st_ino != last_ino or st.st_size < f.tell()):
                 f.close()
                 f = open(log_file, errors="replace")
                 last_ino = os.fstat(f.fileno()).st_ino
@@ -433,7 +433,9 @@ def _tail_and_follow(
     raise typer.Exit(0)
 
 
-def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
+def _rotate_log(
+    log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
+):
     """Rotate log file if it exceeds max_bytes, keeping up to backup_count backups."""
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
         return
@@ -514,12 +516,16 @@ def start(
     # masquerade as a live server and silently block a real start).
     existing_pid, existing_token = _read_pid_record(PID_FILE)
     if _is_our_daemon(existing_pid, existing_token):
-        console.print(f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]")
+        console.print(
+            f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]"
+        )
         raise typer.Exit(0)
 
     # Clean up stale PID file
     if existing_pid:
-        console.print(f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]")
+        console.print(
+            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+        )
         _remove_pid()
 
     # Refuse to start on top of an already-bound gRPC port. The stale-but-dead
@@ -551,13 +557,17 @@ def start(
     if config.exists():
         try:
             from biopb_tensor_server.config import load_config as _load_server_config
+
             grpc_host = _load_server_config(config).host
         except Exception:
             pass
 
-    local_only = not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    local_only = (
+        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    )
     if not token and not local_only:
         import secrets as _secrets
+
         token = _secrets.token_urlsafe(32)
         console.print(f"[bold green]Generated access token:[/bold green] {token}")
 
@@ -578,10 +588,14 @@ def start(
         "-m",
         "biopb_tensor_server.cli",
         "launch",
-        "--config", str(config),
-        "--web-port", str(web_port),
-        "--web-host", str(web_host),
-        "--log-level", str(log_level),
+        "--config",
+        str(config),
+        "--web-port",
+        str(web_port),
+        "--web-host",
+        str(web_host),
+        "--log-level",
+        str(log_level),
     ]
     if static_dir and static_dir.exists():
         cmd.extend(["--static-dir", str(static_dir)])
@@ -652,7 +666,9 @@ def stop(
         raise typer.Exit(0)
 
     if not _is_our_daemon(pid, token):
-        console.print(f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]")
+        console.print(
+            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
+        )
         _remove_pid()
         raise typer.Exit(0)
 
@@ -661,9 +677,7 @@ def stop(
     if _graceful_stop(pid, timeout, token):
         console.print("[green]TensorFlight server stopped[/green]")
     else:
-        console.print(
-            f"[yellow]Did not stop within {timeout}s; force killed[/yellow]"
-        )
+        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
     raise typer.Exit(0)
 
 
@@ -717,7 +731,14 @@ def restart(
         time.sleep(1)
 
     # Start with same options
-    start(config=config, static_dir=static_dir, web_port=web_port, web_host=web_host, log_level=log_level, token=token)
+    start(
+        config=config,
+        static_dir=static_dir,
+        web_port=web_port,
+        web_host=web_host,
+        log_level=log_level,
+        token=token,
+    )
 
 
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
@@ -728,6 +749,7 @@ def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
     if config and config.exists():
         try:
             from biopb_tensor_server.config import load_config as _load_server_config
+
             cfg = _load_server_config(config)
             host = cfg.host or host
             port = int(cfg.port or port)
@@ -902,9 +924,7 @@ def logs(
         "--level",
         help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL",
     ),
-    path: bool = typer.Option(
-        False, "--path", help="Print the log file path and exit"
-    ),
+    path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
     """Show the TensorFlight server daemon log."""
     log_file = _get_log_file()
@@ -1214,9 +1234,7 @@ def mcp_start(
     # session). Otherwise the new process double-binds, fails silently in the
     # log, and leaves a dead process behind the PID file we are about to write.
     if _port_listening("127.0.0.1", resolved_port):
-        console.print(
-            f"[red]Port 127.0.0.1:{resolved_port} is already in use.[/red]"
-        )
+        console.print(f"[red]Port 127.0.0.1:{resolved_port} is already in use.[/red]")
         console.print(
             "It is held by a process biopb is not tracking (no matching PID "
             "file -- an orphaned daemon, or another login session), so "

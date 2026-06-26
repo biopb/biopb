@@ -57,6 +57,7 @@ def mock_server() -> Generator[str, None, None]:
         try:
             channel = grpc.insecure_channel(server_addr)
             from grpc_health.v1 import health_pb2, health_pb2_grpc
+
             stub = health_pb2_grpc.HealthStub(channel)
             request = health_pb2.HealthCheckRequest()
             stub.Check(request, timeout=2)

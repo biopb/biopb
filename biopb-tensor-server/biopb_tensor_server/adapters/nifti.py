@@ -49,7 +49,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             return None
 
         name = ctx.name.lower()
-        if not (name.endswith('.nii') or name.endswith('.nii.gz')):
+        if not (name.endswith(".nii") or name.endswith(".nii.gz")):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -63,9 +63,9 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
     @classmethod
     def create_from_config(
         cls,
-        source: 'SourceConfig',
+        source: "SourceConfig",
         credentials_config: Optional[Any] = None,
-    ) -> 'NiftiAdapter':
+    ) -> "NiftiAdapter":
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -83,7 +83,6 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
             from fsspec.core import url_to_fs
 
-
             # Build storage_options from credentials_config if provided
             storage_options = {}
             if credentials_config:
@@ -94,7 +93,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             fs, fs_path = url_to_fs(source.url, storage_options=storage_options)
 
             # Determine suffix for temp file
-            suffix = '.nii.gz' if source.url.lower().endswith('.nii.gz') else '.nii'
+            suffix = ".nii.gz" if source.url.lower().endswith(".nii.gz") else ".nii"
 
             # Download to temp file
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -108,11 +107,22 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
             # Note: temp file is NOT deleted - nibabel caches data internally
             # The OS will clean up temp files eventually
 
-            return cls(nifti_img, source.source_id, source.dim_labels, source_url=str(source.url), temp_file=tmp_path)
+            return cls(
+                nifti_img,
+                source.source_id,
+                source.dim_labels,
+                source_url=str(source.url),
+                temp_file=tmp_path,
+            )
         else:
             # Local filesystem
             nifti_img = nib.load(str(source.url))
-            return cls(nifti_img, source.source_id, source.dim_labels, source_url=str(source.url))
+            return cls(
+                nifti_img,
+                source.source_id,
+                source.dim_labels,
+                source_url=str(source.url),
+            )
 
     def __init__(
         self,
@@ -140,7 +150,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         # Source-level metadata for DataSourceDescriptor
         if source_url:
             self._source_url = source_url
-        elif hasattr(nifti_img, 'file_map'):
+        elif hasattr(nifti_img, "file_map"):
             # Try to get file path from nibabel
             files = list(nifti_img.file_map.keys())
             self._source_url = files[0] if files else ""
@@ -150,7 +160,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
         # Get shape and dtype from header
         # NIfTI dim array: dim[0] = ndim, dim[1-7] = dimensions
-        dim_info = self.header.get('dim', None)
+        dim_info = self.header.get("dim", None)
         if dim_info is not None:
             ndim = int(dim_info[0])
             self._shape = tuple(int(dim_info[i]) for i in range(1, ndim + 1))
@@ -160,7 +170,7 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         # NIfTI uses slope/intercept scaling to represent physical values.
         # Scaled data is always float64, so we report float64 as the dtype
         # and return scaled float64 values via nibabel's lazy slicing.
-        self._dtype = 'float64'
+        self._dtype = "float64"
 
         # Dimension labels
         if dim_labels:
@@ -175,13 +185,13 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         # Check xyzt_units for dimension semantics
         # nibabel encoding: xyzt_units = spatial_unit + temporal_unit
         # where temporal values are: 8=seconds, 16=ms, 24=us, 32=Hz, etc.
-        units = self.header.get('xyzt_units', 0)
+        units = self.header.get("xyzt_units", 0)
         if isinstance(units, np.ndarray):
             units = units.item()
         spatial_unit = units & 0x07  # 1=meter, 2=mm, 3=um
         time_unit = units - spatial_unit  # 8=sec, 16=ms, 24=us
 
-        pixdim = self.header.get('pixdim', [0] * 8)
+        pixdim = self.header.get("pixdim", [0] * 8)
         # If pixdim[4] (time step) is present and > 0, we likely have a time dimension
         if ndim > 4 and pixdim[4] > 0 and time_unit == 0:
             time_unit = 8  # Treat as seconds for labeling purposes
@@ -191,26 +201,26 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
         labels = []
 
         if ndim == 1:
-            labels = ['x']
+            labels = ["x"]
         elif ndim == 2:
-            labels = ['x', 'y']
+            labels = ["x", "y"]
         elif ndim == 3:
             # Could be (x,y,z) or (t,x,y) - check intent and units
             if pixdim[1] == pixdim[2] != pixdim[3] or time_unit == 0:
-                labels = ['x', 'y', 'z']
+                labels = ["x", "y", "z"]
             else:
-                labels = ['t', 'x', 'y']
+                labels = ["t", "x", "y"]
         elif ndim == 4:
             if time_unit >= 8:
-                labels = ['t', 'x', 'y', 'z']
+                labels = ["t", "x", "y", "z"]
             else:
-                labels = ['c', 'x', 'y', 'z']
+                labels = ["c", "x", "y", "z"]
         elif ndim == 5:
             # Could be vector/tensor data
-            labels = ['v', 't', 'x', 'y', 'z']
+            labels = ["v", "t", "x", "y", "z"]
         else:
             # Generic labels for higher dimensions
-            labels = [f'dim{i}' for i in range(ndim)]
+            labels = [f"dim{i}" for i in range(ndim)]
 
         return labels
 
@@ -264,12 +274,27 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
         # Key header fields
         header_fields = [
-            'dim', 'pixdim', 'datatype', 'bitpix',
-            'intent_code', 'intent_name', 'intent_p1', 'intent_p2', 'intent_p3',
-            'sform_code', 'qform_code',
-            'xyzt_units', 'cal_min', 'cal_max',
-            'slice_code', 'slice_start', 'slice_end', 'slice_duration',
-            'toffset', 'descrip', 'aux_file',
+            "dim",
+            "pixdim",
+            "datatype",
+            "bitpix",
+            "intent_code",
+            "intent_name",
+            "intent_p1",
+            "intent_p2",
+            "intent_p3",
+            "sform_code",
+            "qform_code",
+            "xyzt_units",
+            "cal_min",
+            "cal_max",
+            "slice_code",
+            "slice_start",
+            "slice_end",
+            "slice_duration",
+            "toffset",
+            "descrip",
+            "aux_file",
         ]
 
         for field in header_fields:
@@ -290,13 +315,11 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
         # Affine transformation matrix (most important for spatial registration)
         affine = self.nifti_img.affine
-        metadata["spatial"]["affine_matrix"] = [
-            list(row) for row in affine
-        ]
+        metadata["spatial"]["affine_matrix"] = [list(row) for row in affine]
 
         # Voxel dimensions from pixdim
         # pixdim[0] is qfac, pixdim[1-7] are actual dimensions
-        pixdim = self.header.get('pixdim', None)
+        pixdim = self.header.get("pixdim", None)
         if pixdim is not None:
             # Convert to list if it's a numpy array
             if isinstance(pixdim, np.ndarray):
@@ -310,34 +333,44 @@ class NiftiAdapter(SourceAdapter, TensorAdapter):
 
         # Units interpretation (nibabel encoding: spatial + temporal)
         # where temporal values are: 8=seconds, 16=ms, 24=us
-        units = self.header.get('xyzt_units', 0)
+        units = self.header.get("xyzt_units", 0)
         if isinstance(units, np.ndarray):
             units = units.item()
         spatial_unit = units & 0x07
         time_unit = units - spatial_unit
 
-        unit_map = {0: 'unknown', 1: 'meter', 2: 'mm', 3: 'um', 8: 's', 16: 'ms', 24: 'us'}
-        metadata["spatial"]["units"] = unit_map.get(spatial_unit, 'unknown')
+        unit_map = {
+            0: "unknown",
+            1: "meter",
+            2: "mm",
+            3: "um",
+            8: "s",
+            16: "ms",
+            24: "us",
+        }
+        metadata["spatial"]["units"] = unit_map.get(spatial_unit, "unknown")
         if time_unit >= 8:
-            metadata["header"]["time_units"] = unit_map.get(time_unit, 'unknown')
+            metadata["header"]["time_units"] = unit_map.get(time_unit, "unknown")
 
         # Intent interpretation (what the data represents)
-        intent_code = self.header.get('intent_code', 0)
+        intent_code = self.header.get("intent_code", 0)
         if isinstance(intent_code, np.ndarray):
             intent_code = intent_code.item()
         intent_map = {
-            0: 'none',
-            1001: 'estimate',
-            1002: 'label',
-            1003: 'vector',
-            1004: 'time_series',
-            1005: 'mesh',
-            1006: 'matrix',
-            1007: 'point_set',
-            1008: 'triangle',
-            1009: 'quaternion',
-            1010: 'dimless',
+            0: "none",
+            1001: "estimate",
+            1002: "label",
+            1003: "vector",
+            1004: "time_series",
+            1005: "mesh",
+            1006: "matrix",
+            1007: "point_set",
+            1008: "triangle",
+            1009: "quaternion",
+            1010: "dimless",
         }
-        metadata["header"]["intent"] = intent_map.get(intent_code, f'code_{intent_code}')
+        metadata["header"]["intent"] = intent_map.get(
+            intent_code, f"code_{intent_code}"
+        )
 
         return metadata

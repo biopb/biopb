@@ -1,7 +1,7 @@
 """Custom setuptools command to generate protobuf bindings before build.
 
 This module provides a custom build command that automatically generates
-Python protobuf/gRPC bindings from .proto files using buf before the 
+Python protobuf/gRPC bindings from .proto files using buf before the
 standard build process runs.
 
 Usage:
@@ -36,7 +36,7 @@ class build_proto(_build_py):
         # Find project root (parent of src/main/python)
         project_root = Path(__file__).resolve().parent.parent.parent.parent
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Generating protobuf bindings with buf...")
         print(f"Project root: {project_root}")
 
@@ -48,7 +48,7 @@ class build_proto(_build_py):
                 "  https://buf.build/docs/installation\n"
                 "\nOr with Homebrew: brew install buf\n"
                 "Or with curl: curl -sSL https://buf.build/installation | bash",
-                file=sys.stderr
+                file=sys.stderr,
             )
             sys.exit(1)
 
@@ -71,4 +71,4 @@ class build_proto(_build_py):
             sys.exit(1)
 
         print("buf generate completed successfully")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")

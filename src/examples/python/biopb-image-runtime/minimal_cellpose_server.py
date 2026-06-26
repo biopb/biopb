@@ -26,7 +26,7 @@ def process_result(preds):
     pixels = serialize_from_numpy(masks)
 
     response = proto.ProcessResponse(
-        image_data = proto.ImageData(pixels = pixels),
+        image_data=proto.ImageData(pixels=pixels),
     )
 
     return response
@@ -47,14 +47,15 @@ class CellposeServicer(proto.ProcessImageServicer):
             return response
 
         except Exception as e:
-
-            context.abort(grpc.StatusCode.UNKNOWN, f"prediction failed with error: {repr(e)}")
+            context.abort(
+                grpc.StatusCode.UNKNOWN, f"prediction failed with error: {repr(e)}"
+            )
 
 
 def main():
-    print ("server starting ...")
+    print("server starting ...")
 
-    model = models.Cellpose(model_type = "cyto3", gpu=True)
+    model = models.Cellpose(model_type="cyto3", gpu=True)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
 
@@ -64,11 +65,10 @@ def main():
 
     server.start()
 
-    print ("server starting ... ready")
+    print("server starting ... ready")
 
     server.wait_for_termination()
 
 
 if __name__ == "__main__":
     main()
-

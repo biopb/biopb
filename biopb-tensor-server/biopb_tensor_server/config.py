@@ -100,6 +100,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
+
 # Default on-disk cache location for the file backend. Uses the system temp dir
 # (node-local fast scratch on HPC, honoring $TMPDIR/$TEMP/$TMP) rather than home,
 # which is often slow/quota-bound NFS. The directory is scoped per user so that
@@ -508,17 +509,13 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         reduction_method=_pyramid_knob("reduction_method", "area", str),
         threshold=_pyramid_knob("threshold", 4096, int),
         downscale_factor=_pyramid_knob("downscale_factor", 4, int),
-        pixel_budget_cubic_root=_pyramid_knob(
-            "pixel_budget_cubic_root", 512, int
-        ),
+        pixel_budget_cubic_root=_pyramid_knob("pixel_budget_cubic_root", 512, int),
     )
 
     # Parse precache settings (operational knobs only).
     precache_config = PrecacheConfig(
         enabled=bool(precache_data.get("enabled", True)),
-        idle_debounce_seconds=float(
-            precache_data.get("idle_debounce_seconds", 2.0)
-        ),
+        idle_debounce_seconds=float(precache_data.get("idle_debounce_seconds", 2.0)),
         backlog_enabled=bool(precache_data.get("backlog_enabled", True)),
         backlog_high_water=float(precache_data.get("backlog_high_water", 0.8)),
         backlog_idle_recheck_seconds=float(

@@ -170,13 +170,9 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
                     f"specify tensor_id. Available: {ids}"
                 )
 
-        tensor_desc = next(
-            (t for t in src.tensors if t.array_id == tensor_id), None
-        )
+        tensor_desc = next((t for t in src.tensors if t.array_id == tensor_id), None)
         if tensor_desc is None:
-            raise ValueError(
-                f"Tensor '{tensor_id}' not found in source '{source_id}'"
-            )
+            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
 
         if name is None:
             stem = _get_url_stem(src.source_url) or source_id

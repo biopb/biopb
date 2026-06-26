@@ -127,9 +127,7 @@ class TestTakeScreenshot:
         assert result[0].type == "text"
         assert "not initialized" in result[0].text
 
-    def test_headless_returns_message_without_touching_kernel(
-        self, server_with_host
-    ):
+    def test_headless_returns_message_without_touching_kernel(self, server_with_host):
         _server.set_headless(True)
         result = _server.take_screenshot()
         assert result[0].type == "text"
@@ -139,9 +137,7 @@ class TestTakeScreenshot:
 
     def test_returns_png_image_from_delimited_stdout(self, server_with_host):
         data = base64.b64encode(b"fake-png-bytes").decode()
-        server_with_host.execute.return_value = _result(
-            stdout=f"<<PNG_B64>>{data}\n"
-        )
+        server_with_host.execute.return_value = _result(stdout=f"<<PNG_B64>>{data}\n")
 
         result = _server.take_screenshot(canvas_only=True)
 
@@ -160,9 +156,7 @@ class TestTakeScreenshot:
 
     def test_passes_canvas_only_flag(self, server_with_host):
         data = base64.b64encode(b"x").decode()
-        server_with_host.execute.return_value = _result(
-            stdout=f"<<PNG_B64>>{data}"
-        )
+        server_with_host.execute.return_value = _result(stdout=f"<<PNG_B64>>{data}")
         _server.take_screenshot(canvas_only=False)
         snippet = server_with_host.execute.call_args[0][0]
         assert "canvas_only=False" in snippet
@@ -217,9 +211,7 @@ class TestSetHeadless:
         assert "HEADLESS" in _server.mcp._mcp_server.instructions
         _server.set_headless(False)
         assert _server._headless is False
-        assert (
-            _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
-        )
+        assert _server.mcp._mcp_server.instructions == _server._BASE_INSTRUCTIONS
         assert "HEADLESS" not in _server.mcp._mcp_server.instructions
 
     def test_server_status_reports_display_mode(self, server_with_host):
@@ -288,8 +280,7 @@ class TestExecuteCode:
             _job_reply(
                 **_snapshot(
                     status="error",
-                    error_text="Traceback...\nZeroDivisionError: division "
-                    "by zero",
+                    error_text="Traceback...\nZeroDivisionError: division by zero",
                 )
             ),
         ]
@@ -367,9 +358,7 @@ class TestJobTools:
         )
         assert "No such job" in _server.poll_job("job-9")
 
-    def test_poll_job_terminal_appends_window_closed_note(
-        self, server_with_host
-    ):
+    def test_poll_job_terminal_appends_window_closed_note(self, server_with_host):
         server_with_host.execute.return_value = _job_reply(
             window_alive=False, **_snapshot(status="ok", stdout="done\n")
         )
@@ -558,9 +547,7 @@ class TestServerStatus:
         assert "Sessions" not in result
         assert "Bridge" not in result
 
-    def test_reports_observe_disabled_by_default(
-        self, server_with_host, monkeypatch
-    ):
+    def test_reports_observe_disabled_by_default(self, server_with_host, monkeypatch):
         from biopb_mcp.mcp import _observe
 
         monkeypatch.setattr(_observe, "_mounted_http", False)
@@ -568,9 +555,7 @@ class TestServerStatus:
         assert "## Observe" in result
         assert "not running" in result
 
-    def test_reports_observe_url_when_running(
-        self, server_with_host, monkeypatch
-    ):
+    def test_reports_observe_url_when_running(self, server_with_host, monkeypatch):
         from biopb_mcp.mcp import _observe
 
         monkeypatch.setattr(_observe, "_mounted_http", True)
@@ -579,9 +564,7 @@ class TestServerStatus:
         assert "/observe" in result
         assert "http://127.0.0.1:" in result
 
-    def test_reports_observe_even_when_kernel_not_initialized(
-        self, monkeypatch
-    ):
+    def test_reports_observe_even_when_kernel_not_initialized(self, monkeypatch):
         from biopb_mcp.mcp import _observe
 
         # Observe is server-process state -> reported despite no kernel.
@@ -629,9 +612,7 @@ class TestServerStatus:
         assert "napari viewer window" in result  # teardown attribution
         server_with_host.execute.assert_not_called()
 
-    def test_dead_kernel_reports_only_dead_not_starting(
-        self, server_with_host
-    ):
+    def test_dead_kernel_reports_only_dead_not_starting(self, server_with_host):
         # When the watchdog marks the host dead, ready is also false. Report a
         # single DEAD state and return — not DEAD *and* a contradictory
         # "starting"/"failed" line.
@@ -691,9 +672,7 @@ class TestTransportSecurity:
             TransportSecurityMiddleware,
         )
 
-        mw = TransportSecurityMiddleware(
-            _server.mcp.settings.transport_security
-        )
+        mw = TransportSecurityMiddleware(_server.mcp.settings.transport_security)
         assert mw._validate_origin("http://evil.com") is False
         assert mw._validate_origin("http://127.0.0.1:8765") is True
         assert mw._validate_host("evil.com") is False

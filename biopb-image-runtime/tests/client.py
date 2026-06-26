@@ -35,7 +35,9 @@ def test_health(channel: grpc.Channel, metadata: tuple) -> bool:
         return False
 
 
-def construct_request(image: np.ndarray, use_lazy: bool = False) -> proto.DetectionRequest:
+def construct_request(
+    image: np.ndarray, use_lazy: bool = False
+) -> proto.DetectionRequest:
     """Construct a DetectionRequest from numpy array."""
     from biopb.image.utils import serialize_from_numpy_to_image_data
 
@@ -112,11 +114,15 @@ def main(
                         eager_data=proto.Tensor(
                             bindata=proto.BinData(
                                 data=image.tobytes(),
-                                endianness=1 if image.dtype.byteorder == '<' else 0,
+                                endianness=1 if image.dtype.byteorder == "<" else 0,
                             ),
-                            dtype=image.dtype.str.replace('|', '').replace('<', '').replace('>', ''),
+                            dtype=image.dtype.str.replace("|", "")
+                            .replace("<", "")
+                            .replace(">", ""),
                             dims=list(image.shape),
-                            dim_labels=["Y", "X", "C"] if image.ndim == 3 else ["Y", "X"],
+                            dim_labels=["Y", "X", "C"]
+                            if image.ndim == 3
+                            else ["Y", "X"],
                         )
                     ),
                     op_name=mode,
@@ -129,13 +135,16 @@ def main(
 
             # Decode response
             from biopb.image.utils import deserialize_image_data
+
             result = deserialize_image_data(response.image_data)
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if isinstance(result, np.ndarray):
                 print(f"  ProcessImage: {result.shape} in {elapsed_ms:.1f}ms (eager)")
             else:
-                print(f"  ProcessImage: {result.shape} in {elapsed_ms:.1f}ms (lazy dask)")
+                print(
+                    f"  ProcessImage: {result.shape} in {elapsed_ms:.1f}ms (lazy dask)"
+                )
             return True
 
         except grpc.RpcError as e:
@@ -149,7 +158,10 @@ def main(
     cropped = test_image[:373, :372]
     results.append(_test_with_image(cropped, "cropped"))
 
-    padded = np.pad(test_image, [[0, 128], [0, 128], [0, 0]] if test_image.ndim == 3 else [[0, 128], [0, 128]])
+    padded = np.pad(
+        test_image,
+        [[0, 128], [0, 128], [0, 0]] if test_image.ndim == 3 else [[0, 128], [0, 128]],
+    )
     results.append(_test_with_image(padded, "padded"))
 
     if all(results):
@@ -179,6 +191,7 @@ def streaming(
     def _stream_messages(image, n: int = 4):
         """Generate streaming request messages."""
         from biopb.image.utils import serialize_from_numpy_to_image_data
+
         yield proto.ProcessRequest(
             image_data=serialize_from_numpy_to_image_data(image),
         )

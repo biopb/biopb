@@ -42,13 +42,13 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
             SourceClaim if this is a plain zarr array, None otherwise
         """
         # Must be a directory ending in .zarr
-        if not ctx.is_dir() or not ctx.name.endswith('.zarr'):
+        if not ctx.is_dir() or not ctx.name.endswith(".zarr"):
             return None
 
         # Check for zarr structure files
-        has_zarray = ctx.join('.zarray').exists()
-        has_zarr_json = ctx.join('zarr.json').exists()
-        has_zattrs = ctx.join('.zattrs').exists()
+        has_zarray = ctx.join(".zarray").exists()
+        has_zarr_json = ctx.join("zarr.json").exists()
+        has_zattrs = ctx.join(".zattrs").exists()
 
         # Zarr v2/v3: has .zarray / zarr.json (array metadata). The marker's
         # existence is a stat (recall-free), but if it is a non-resident cloud
@@ -57,7 +57,7 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         # background precache warming, which would recall the whole array. So under
         # non-residency claim it provisionally and let resolution hydrate it.
         if has_zarray or has_zarr_json:
-            marker = ctx.join('.zarray') if has_zarray else ctx.join('zarr.json')
+            marker = ctx.join(".zarray") if has_zarray else ctx.join("zarr.json")
             state.try_claim_path(ctx.path_str)
             return SourceClaim(
                 source_type="zarr",
@@ -76,7 +76,7 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
             # type from the hydrated content. (OmeZarrAdapter runs first and, when
             # it also defers, wins claims[0]; this branch only owns the .zattrs
             # store OmeZarr did not provisionally claim.)
-            zattrs_ctx = ctx.join('.zattrs')
+            zattrs_ctx = ctx.join(".zattrs")
             if not zattrs_ctx.is_resident():
                 state.try_claim_path(ctx.path_str)
                 return SourceClaim(
@@ -86,9 +86,9 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
                     unresolved=True,
                 )
             try:
-                zattrs = json.loads(ctx.read_text('.zattrs'))
+                zattrs = json.loads(ctx.read_text(".zattrs"))
                 # If no multiscales, it might be a plain zarr group or array
-                if 'multiscales' not in zattrs:
+                if "multiscales" not in zattrs:
                     state.try_claim_path(ctx.path_str)
                     return SourceClaim(
                         source_type="zarr",
@@ -100,7 +100,6 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
 
         return None
 
-
     def get_metadata(self):
         return {}
 
@@ -110,9 +109,9 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
     @classmethod
     def create_from_config(
         cls,
-        source: 'SourceConfig',
+        source: "SourceConfig",
         credentials_config: Optional[Any] = None,
-    ) -> 'ZarrAdapter':
+    ) -> "ZarrAdapter":
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -135,11 +134,11 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
                 profile_name=source.credentials_profile,
             )
             zarr_store = FSStore(store.path, fs=store.fs)
-            arr = zarr.open_array(zarr_store, mode='r')
+            arr = zarr.open_array(zarr_store, mode="r")
         else:
             # Local filesystem
             path = Path(source.url)
-            arr = zarr.open_array(str(path), mode='r')
+            arr = zarr.open_array(str(path), mode="r")
 
         return cls(arr, source.source_id, source.dim_labels)
 
@@ -161,7 +160,11 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(zarr_array.ndim)]
 
         # Source-level metadata for DataSourceDescriptor
-        self._source_url = str(zarr_array.store.path if hasattr(zarr_array.store, 'path') else str(zarr_array.store))
+        self._source_url = str(
+            zarr_array.store.path
+            if hasattr(zarr_array.store, "path")
+            else str(zarr_array.store)
+        )
         self._source_type = "zarr"
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -198,7 +201,9 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         expected_shape = tuple(s.stop - s.start for s in slices)
         if data.shape != expected_shape:
             padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
-            src_slices = tuple(slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape))
+            src_slices = tuple(
+                slice(0, min(d, es)) for d, es in zip(data.shape, expected_shape)
+            )
             padded[src_slices] = data[src_slices]
             data = padded
 

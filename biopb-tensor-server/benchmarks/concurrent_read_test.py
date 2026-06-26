@@ -187,7 +187,9 @@ def concurrency_benchmark_env(temp_cache_dir):
         _stop_server_process(process, stop_event)
 
 
-def _select_sources(source_pool: List[Dict], client_count: int, scenario: str) -> List[Dict]:
+def _select_sources(
+    source_pool: List[Dict], client_count: int, scenario: str
+) -> List[Dict]:
     if scenario == "same_source":
         return [source_pool[0]] * client_count
 
@@ -256,10 +258,7 @@ def _process_compute_once(arr) -> Dict[str, object]:
 def _create_prewarmed_clients(location: str, client_count: int):
     from biopb.tensor import TensorFlightClient
 
-    clients = [
-        TensorFlightClient(location, cache_bytes=0)
-        for _ in range(client_count)
-    ]
+    clients = [TensorFlightClient(location, cache_bytes=0) for _ in range(client_count)]
 
     for client in clients:
         client.list_sources()
@@ -319,7 +318,9 @@ def _run_concurrent_wave_compute_only(executor, arrays) -> Dict[str, object]:
     }
 
 
-def _run_process_wave_compute_only(executor, wave_barrier, arrays: List) -> Dict[str, object]:
+def _run_process_wave_compute_only(
+    executor, wave_barrier, arrays: List
+) -> Dict[str, object]:
     """Benchmark only .compute() on pre-created dask arrays in process workers."""
     futures = [executor.submit(_process_compute_once, arr) for arr in arrays]
     burst_started = time.perf_counter()
@@ -332,18 +333,27 @@ def _run_process_wave_compute_only(executor, wave_barrier, arrays: List) -> Dict
     }
 
 
-def _assert_and_report(result: Dict[str, object], scenario: str, client_count: int) -> None:
+def _assert_and_report(
+    result: Dict[str, object], scenario: str, client_count: int
+) -> None:
     client_results = result["client_results"]
     assert len(client_results) == client_count
-    assert all(client_result["shape"] == (READ_EDGE, READ_EDGE) for client_result in client_results)
+    assert all(
+        client_result["shape"] == (READ_EDGE, READ_EDGE)
+        for client_result in client_results
+    )
 
     latencies_s = [client_result["latency_s"] for client_result in client_results]
     summary = _latency_summary_ms(latencies_s)
     burst_latency_ms = result["burst_latency_s"] * 1000
     # source_id may be absent when using pre-created arrays
-    source_count = len({client_result.get("source_id", "?") for client_result in client_results})
+    source_count = len(
+        {client_result.get("source_id", "?") for client_result in client_results}
+    )
     total_mb = (client_count * READ_BYTES) / (1024 * 1024)
-    throughput_mb_s = total_mb / result["burst_latency_s"] if result["burst_latency_s"] else 0.0
+    throughput_mb_s = (
+        total_mb / result["burst_latency_s"] if result["burst_latency_s"] else 0.0
+    )
 
     print(
         "\n"
@@ -451,7 +461,9 @@ class TestClientReadLatencyScalability:
         )
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=client_count) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=client_count
+            ) as executor:
                 result = benchmark.pedantic(
                     lambda: _run_concurrent_wave_compute_only(executor, arrays),
                     rounds=4,
@@ -483,7 +495,9 @@ class TestClientReadLatencyScalability:
         )
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=client_count) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=client_count
+            ) as executor:
                 result = benchmark.pedantic(
                     lambda: _run_concurrent_wave_compute_only(executor, arrays),
                     rounds=4,

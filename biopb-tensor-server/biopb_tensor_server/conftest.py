@@ -20,6 +20,7 @@ from biopb_tensor_server.fixtures import (
 # pytest fixtures using the factory functions
 # =============================================================================
 
+
 @pytest.fixture
 def temp_dir():
     """Provide a temporary directory that is cleaned up after the test."""

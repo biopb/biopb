@@ -157,8 +157,7 @@ def _parse_bytes_to_image_data(raw_bytes: bytes) -> "biopb.image.ImageData":
     try:
         serialized = SerializedTensor.FromString(raw_bytes)
         stderr_console.print(
-            f"[green]Parsed as SerializedTensor:[/green] "
-            f"location={serialized.location}"
+            f"[green]Parsed as SerializedTensor:[/green] location={serialized.location}"
         )
         return ImageData(lazy_data=serialized)
     except Exception:
@@ -218,9 +217,7 @@ def _write_output(
         # Lazy tensor - protobuf or pickle
         stderr_console.print("[green]Server returned lazy data[/green]")
         serialized = image_data.lazy_data
-        stderr_console.print(
-            f"[green]Tensor location:[/green] {serialized.location}"
-        )
+        stderr_console.print(f"[green]Tensor location:[/green] {serialized.location}")
 
         if format == "pb":
             pb_bytes = serialized.SerializeToString()
@@ -283,7 +280,9 @@ def ops(
     metadata = [("authorization", f"Bearer {token}")] if token else None
     try:
         stub = ProcessImageStub(channel)
-        response: OpNames = stub.GetOpNames(empty_pb2.Empty(), metadata=metadata, timeout=10)
+        response: OpNames = stub.GetOpNames(
+            empty_pb2.Empty(), metadata=metadata, timeout=10
+        )
 
         if not response.names:
             stderr_console.print(f"[yellow]No operations found on {server}[/yellow]")

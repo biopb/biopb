@@ -24,9 +24,10 @@ MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 class EntryState(Enum):
     """State of a cache entry."""
-    PENDING = "pending"      # Being computed, other threads should wait
-    READY = "ready"          # Computed and available
-    ERROR = "error"          # Computation failed
+
+    PENDING = "pending"  # Being computed, other threads should wait
+    READY = "ready"  # Computed and available
+    ERROR = "error"  # Computation failed
 
 
 @dataclass
@@ -43,6 +44,7 @@ class CacheEntry:
         size_bytes: Data size in bytes
         metadata: Additional metadata
     """
+
     data: Optional[pa.RecordBatch] = None
     state: EntryState = EntryState.PENDING
     event: threading.Event = field(default_factory=threading.Event)
@@ -93,6 +95,7 @@ class CacheEntry:
 @dataclass
 class PoolStats:
     """Per-pool cache statistics."""
+
     pool_key: str  # e.g., "unified-tiny"
     hits: int = 0
     misses: int = 0
@@ -104,6 +107,7 @@ class PoolStats:
 @dataclass
 class CacheStats:
     """Cache statistics."""
+
     total_entries: int = 0
     total_bytes: int = 0
     max_entries: int = 0

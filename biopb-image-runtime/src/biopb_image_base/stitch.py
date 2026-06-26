@@ -50,7 +50,7 @@ def uniform_core(dim: int, target: int) -> int:
         return dim
     best = dim
     best_gap = abs(dim - target)
-    for c in range(1, int(dim ** 0.5) + 1):
+    for c in range(1, int(dim**0.5) + 1):
         if dim % c == 0:
             for cand in (c, dim // c):
                 gap = abs(cand - target)
@@ -61,14 +61,18 @@ def uniform_core(dim: int, target: int) -> int:
 
 def _iter_core_origins(full_shape: tuple, core_shape: tuple):
     """Yield core start coordinates in raster order (outer axis varies slowest)."""
-    axis_starts = [range(0, full_shape[i], core_shape[i]) for i in range(len(full_shape))]
+    axis_starts = [
+        range(0, full_shape[i], core_shape[i]) for i in range(len(full_shape))
+    ]
     yield from product(*axis_starts)
 
 
 def _tile_bounds(core_start, core_shape, full_shape, margin):
     """Core bounds and the padded tile bounds (clipped to the image) for a core."""
     ndim = len(full_shape)
-    core_stop = tuple(min(core_start[i] + core_shape[i], full_shape[i]) for i in range(ndim))
+    core_stop = tuple(
+        min(core_start[i] + core_shape[i], full_shape[i]) for i in range(ndim)
+    )
     tile_start = tuple(max(core_start[i] - margin, 0) for i in range(ndim))
     tile_stop = tuple(min(core_stop[i] + margin, full_shape[i]) for i in range(ndim))
     return core_stop, tile_start, tile_stop

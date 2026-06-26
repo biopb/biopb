@@ -22,9 +22,7 @@ def mock_config_dir(monkeypatch, tmp_path):
     """Redirect the home-relative config dir (~/.config/biopb-mcp) to a tmp path."""
     import pathlib
 
-    monkeypatch.setattr(
-        pathlib.Path, "home", classmethod(lambda cls: tmp_path)
-    )
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path / ".config" / "biopb-mcp"
 
 
@@ -106,14 +104,10 @@ class TestLoadConfig:
         assert "grpc" in config
         assert "mcp" in config
 
-    def test_migrates_installer_flat_process_image_servers(
-        self, mock_config_dir
-    ):
+    def test_migrates_installer_flat_process_image_servers(self, mock_config_dir):
         """The installer's flat mcp.process_image_servers is relocated."""
         # The shape the biopb installer writes (pre-nesting).
-        installer_config = {
-            "mcp": {"process_image_servers": ["grpcs://cellpose:443"]}
-        }
+        installer_config = {"mcp": {"process_image_servers": ["grpcs://cellpose:443"]}}
         config_path = mock_config_dir / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
@@ -127,9 +121,7 @@ class TestLoadConfig:
         # The legacy flat key is removed, not left as a dead duplicate.
         assert "process_image_servers" not in config["mcp"]
 
-    def test_nested_process_image_servers_wins_over_legacy(
-        self, mock_config_dir
-    ):
+    def test_nested_process_image_servers_wins_over_legacy(self, mock_config_dir):
         """An explicit nested value takes precedence over the legacy key."""
         both = {
             "mcp": {
@@ -144,9 +136,7 @@ class TestLoadConfig:
 
         config = load_config()
 
-        assert config["mcp"]["services"]["process_image_servers"] == [
-            "grpcs://new:443"
-        ]
+        assert config["mcp"]["services"]["process_image_servers"] == ["grpcs://new:443"]
         assert "process_image_servers" not in config["mcp"]
 
     def test_mcp_has_server_start_timeout(self):
@@ -361,10 +351,7 @@ class TestDefaultConfig:
         assert tensor["health_poll_min_interval"] == 2.0
         assert tensor["health_poll_max_interval"] == 60.0
         # A sane backoff window: min below max so the interval can grow.
-        assert (
-            tensor["health_poll_min_interval"]
-            < tensor["health_poll_max_interval"]
-        )
+        assert tensor["health_poll_min_interval"] < tensor["health_poll_max_interval"]
 
 
 class TestGetSetting:
@@ -464,18 +451,14 @@ class TestConfigSingleton:
     def test_reload_picks_up_external_edit(self):
         """After reload(), an externally-edited file is observed."""
         # Prime the cache with defaults.
-        assert (
-            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
-        )
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
 
         # Edit the file out-of-band; the cache is stale until reload().
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
             json.dump({"tensor_browser": {"server_url": "grpc://ext:9"}}, f)
-        assert (
-            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
-        )
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
 
         CONFIG.reload()
         assert CONFIG.get("tensor_browser.server_url") == "grpc://ext:9"

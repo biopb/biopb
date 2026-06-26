@@ -25,9 +25,7 @@ class TestConfigureDask:
         """threads/synchronous schedulers yield no client and no cluster."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "threads"}}}
-        )
+        client, cluster = _configure_dask({"mcp": {"dask": {"scheduler": "threads"}}})
         assert client is None
         assert cluster is None
 
@@ -345,9 +343,7 @@ class TestWatchdog:
         try:
             pid1 = host._kernel_pid()
             os.kill(pid1, signal.SIGKILL)
-            assert _wait_until(
-                lambda: host.is_alive() and host._kernel_pid() != pid1
-            )
+            assert _wait_until(lambda: host.is_alive() and host._kernel_pid() != pid1)
             assert host.is_alive()
             assert host._kernel_pid() != pid1
             assert not host._dead
@@ -386,9 +382,7 @@ class TestWatchdog:
             # kernel is alive, not marked dead, and the namespace is cleared.
             assert host.is_alive()
             assert not host._dead
-            assert (
-                "False" in host.execute("print('survivor' in dir())")["stdout"]
-            )
+            assert "False" in host.execute("print('survivor' in dir())")["stdout"]
         finally:
             host.shutdown()
 
@@ -521,9 +515,7 @@ class TestParentDeathPipe:
         r, w = os.pipe()
         monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
         killed = []
-        monkeypatch.setattr(
-            os, "killpg", lambda pg, sig: killed.append((pg, sig))
-        )
+        monkeypatch.setattr(os, "killpg", lambda pg, sig: killed.append((pg, sig)))
 
         assert _deathwatch.install() is True
         os.close(w)  # launcher "dies" -> read end sees EOF
@@ -685,8 +677,7 @@ class TestWindowClosePipe:
             # Simulate the in-kernel close hook: the kernel writes a byte to its
             # inherited write end of the window-close pipe.
             host.execute(
-                "import os; "
-                "os.write(int(os.environ['BIOPB_WINDOW_CLOSE_FD']), b'x')"
+                "import os; os.write(int(os.environ['BIOPB_WINDOW_CLOSE_FD']), b'x')"
             )
             deadline = time.time() + 10
             while host.is_alive() and time.time() < deadline:

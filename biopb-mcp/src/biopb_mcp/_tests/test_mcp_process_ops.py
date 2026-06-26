@@ -28,9 +28,7 @@ from biopb_mcp.mcp._process_ops import (
 
 def _eager_response(arr, dim_labels):
     return proto.ProcessResponse(
-        image_data=serialize_from_numpy_to_image_data(
-            arr, dim_labels=dim_labels
-        )
+        image_data=serialize_from_numpy_to_image_data(arr, dim_labels=dim_labels)
     )
 
 

@@ -46,7 +46,7 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
             return None
 
         name = ctx.name.lower()
-        if not (name.endswith('.h5') or name.endswith('.hdf5')):
+        if not (name.endswith(".h5") or name.endswith(".hdf5")):
             return None
 
         state.try_claim_path(ctx.path_str)
@@ -56,11 +56,13 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
         return SourceClaim(
             source_type="hdf5",
             primary_path=ctx.path_str,
-            extra_config={'needs_dataset': True},
+            extra_config={"needs_dataset": True},
         )
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'Hdf5Adapter':
+    def create_from_config(
+        cls, source: "SourceConfig", credentials_config: Optional[Any] = None
+    ) -> "Hdf5Adapter":
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -79,7 +81,7 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
                 f"HDF5 source '{source.source_id}' requires 'dataset' path in config"
             )
 
-        f = h5py.File(str(source.url), 'r')
+        f = h5py.File(str(source.url), "r")
         dataset = f[source.dataset]
         return cls(dataset, source.source_id, source.dim_labels)
 
@@ -98,10 +100,14 @@ class Hdf5Adapter(SourceAdapter, TensorAdapter):
         """
         self.h5_dataset = h5_dataset
         self.source_id = source_id
-        self.dim_labels = dim_labels or [f"dim{i}" for i in range(len(h5_dataset.shape))]
+        self.dim_labels = dim_labels or [
+            f"dim{i}" for i in range(len(h5_dataset.shape))
+        ]
 
         # Source-level metadata for DataSourceDescriptor
-        self._source_url = h5_dataset.file.filename if hasattr(h5_dataset, 'file') else ""
+        self._source_url = (
+            h5_dataset.file.filename if hasattr(h5_dataset, "file") else ""
+        )
         self._source_type = "hdf5"
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:

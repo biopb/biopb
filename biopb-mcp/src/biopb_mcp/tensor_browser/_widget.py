@@ -171,7 +171,14 @@ class _ResolveWorker(QThread):
 # source's bytes were already recalled by resolve, so warm is a server-side
 # no-op there and we don't bother offering it.
 _MULTIFILE_SOURCE_TYPES = frozenset(
-    {"zarr", "ome-zarr", "ome-zarr-hcs", "ndtiff", "tiff-sequence", "micromanager-legacy"}
+    {
+        "zarr",
+        "ome-zarr",
+        "ome-zarr-hcs",
+        "ndtiff",
+        "tiff-sequence",
+        "micromanager-legacy",
+    }
 )
 
 
@@ -316,8 +323,7 @@ def _build_tree(sources: Dict[str, DataSourceDescriptor]) -> _TreeNode:
                 flatten_paths(child)
                 # Flatten while single folder child
                 while (
-                    len(child.children) == 1
-                    and child.children[0].node_type == "folder"
+                    len(child.children) == 1 and child.children[0].node_type == "folder"
                 ):
                     grandchild = child.children[0]
                     child.name = child.name + "/" + grandchild.name
@@ -423,9 +429,7 @@ class MetadataDialog(QDialog):
 
         # Source URL path (use stem)
         url_parts = _get_path_parts(source.source_url)
-        url_display = (
-            "/" + "/".join(url_parts) if url_parts else source.source_id
-        )
+        url_display = "/" + "/".join(url_parts) if url_parts else source.source_id
         url_label = QLabel(url_display)
         url_label.setStyleSheet("color: #60a5fa; font-weight: bold;")
         header_layout.addWidget(url_label)
@@ -654,13 +658,9 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._tree_widget.customContextMenuRequested.connect(
-            self._show_context_menu
-        )
+        self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
-        self._tree_widget.itemDoubleClicked.connect(
-            self._on_tree_item_double_clicked
-        )
+        self._tree_widget.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         self._tree_widget.setStyleSheet("QTreeWidget { min-height: 300px; }")
         layout.addWidget(self._tree_widget, stretch=1)
 
@@ -736,9 +736,7 @@ class TensorBrowserWidget(QWidget):
             finally:
                 self._connect_done.emit(gen)
 
-        threading.Thread(
-            target=_worker, name="tbw-connect", daemon=True
-        ).start()
+        threading.Thread(target=_worker, name="tbw-connect", daemon=True).start()
 
     def _on_connect_done(self, gen: int):
         """Render the outcome of a background ``auto_connect`` (main thread).
@@ -757,8 +755,7 @@ class TensorBrowserWidget(QWidget):
             # auto_connect recorded the friendly reason (down / still starting).
             self._show_error(
                 self._conn.last_message
-                or f"Cannot reach tensor server at {self._conn.url} — "
-                "is it running?"
+                or f"Cannot reach tensor server at {self._conn.url} — is it running?"
             )
             self._tree_widget.clear()
             self._refresh_button.setEnabled(False)
@@ -943,15 +940,9 @@ class TensorBrowserWidget(QWidget):
             if len(src.tensors) > 1:
                 for tensor in src.tensors:
                     tensor_item = QTreeWidgetItem(item)
-                    tensor_item.setData(
-                        0, Qt.ItemDataRole.UserRole, tensor.array_id
-                    )
-                    tensor_item.setData(
-                        0, Qt.ItemDataRole.UserRole + 1, "tensor"
-                    )
-                    tensor_item.setData(
-                        0, Qt.ItemDataRole.UserRole + 2, src.source_id
-                    )
+                    tensor_item.setData(0, Qt.ItemDataRole.UserRole, tensor.array_id)
+                    tensor_item.setData(0, Qt.ItemDataRole.UserRole + 1, "tensor")
+                    tensor_item.setData(0, Qt.ItemDataRole.UserRole + 2, src.source_id)
                     tensor_name = _tensor_short_name(tensor.array_id)
                     shape_str = _format_shape(tensor.shape)
                     tensor_item.setText(0, f"{tensor_name}  [{shape_str}]")
@@ -1014,9 +1005,7 @@ class TensorBrowserWidget(QWidget):
 
         self._update_metadata_display()
 
-    def _on_tree_item_double_clicked(
-        self, item: QTreeWidgetItem, _column: int
-    ):
+    def _on_tree_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
         """Handle tree item double-click - add tensor to viewer."""
         node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
 
@@ -1075,9 +1064,7 @@ class TensorBrowserWidget(QWidget):
             else:
                 # Multi-tensor or unresolved source
                 tensor_id = None
-                is_multi_tensor_source = (
-                    src is not None and len(src.tensors) > 1
-                )
+                is_multi_tensor_source = src is not None and len(src.tensors) > 1
 
         menu = QMenu(self)
 
@@ -1085,14 +1072,10 @@ class TensorBrowserWidget(QWidget):
         # or "View" (single tensor).
         if is_unresolved_source:
             resolve_action = menu.addAction("Resolve (downloads file)…")
-            resolve_action.triggered.connect(
-                lambda: self._resolve_source(source_id)
-            )
+            resolve_action.triggered.connect(lambda: self._resolve_source(source_id))
         elif is_multi_tensor_source:
             view_action = menu.addAction("View all")
-            view_action.triggered.connect(
-                lambda: self._view_all_tensors(source_id)
-            )
+            view_action.triggered.connect(lambda: self._view_all_tensors(source_id))
         else:
             view_action = menu.addAction("View")
             if tensor_id:
@@ -1109,9 +1092,7 @@ class TensorBrowserWidget(QWidget):
         menu_src = self._sources.get(source_id)
         if menu_src is not None and _is_multifile_source(menu_src):
             warm_action = menu.addAction("Hydrate all files…")
-            warm_action.triggered.connect(
-                lambda: self._warm_source(source_id)
-            )
+            warm_action.triggered.connect(lambda: self._warm_source(source_id))
 
         # Metadata action
         meta_action = menu.addAction("Metadata")
@@ -1159,9 +1140,7 @@ class TensorBrowserWidget(QWidget):
         # manage close ourselves (autoClose/autoReset off) so that hitting Cancel
         # shows a "Cancelling…" state and the dialog stays up until the worker
         # confirms the stop — which also blocks a second resolve in the meantime.
-        progress = QProgressDialog(
-            f"Resolving “{name}”…", "Cancel", 0, 0, self
-        )
+        progress = QProgressDialog(f"Resolving “{name}”…", "Cancel", 0, 0, self)
         progress.setWindowTitle("Resolving")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -1261,9 +1240,7 @@ class TensorBrowserWidget(QWidget):
         parts = _get_path_parts(src.source_url)
         name = parts[-1] if parts else source_id
 
-        progress = QProgressDialog(
-            f"Hydrating “{name}”…", "Cancel", 0, 0, self
-        )
+        progress = QProgressDialog(f"Hydrating “{name}”…", "Cancel", 0, 0, self)
         progress.setWindowTitle("Hydrating")
         progress.setWindowModality(Qt.NonModal)  # user keeps browsing
         progress.setMinimumDuration(0)
@@ -1352,9 +1329,7 @@ class TensorBrowserWidget(QWidget):
                         source_id,
                     )
                 except Exception:
-                    logger.exception(
-                        "Failed to load tensor %s", tensor.array_id
-                    )
+                    logger.exception("Failed to load tensor %s", tensor.array_id)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -1397,9 +1372,7 @@ class TensorBrowserWidget(QWidget):
 
         shape_str = _format_shape(tensor_desc.shape)
         dims_str = (
-            ", ".join(tensor_desc.dim_labels)
-            if tensor_desc.dim_labels
-            else "N/A"
+            ", ".join(tensor_desc.dim_labels) if tensor_desc.dim_labels else "N/A"
         )
         chunks_str = _format_shape(tensor_desc.chunk_shape)
         meta_text = (
@@ -1437,11 +1410,7 @@ class TensorBrowserWidget(QWidget):
         """Apply server-side SQL filter for large catalogs."""
         try:
             # Escape SQL special characters
-            escaped = (
-                query.replace("'", "''")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
+            escaped = query.replace("'", "''").replace("%", "\\%").replace("_", "\\_")
             sql = (
                 f"SELECT source_id FROM sources WHERE "
                 f"LOWER(source_id) LIKE '%{escaped}%' OR "

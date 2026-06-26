@@ -92,9 +92,7 @@ def _scan(root: Path, registry, *, prune: bool) -> DiscoveryState:
         state.add_claim(claims[0])
         return state
 
-    should_descend = (
-        (lambda p: not state.is_path_claimed(str(p))) if prune else None
-    )
+    should_descend = (lambda p: not state.is_path_claimed(str(p))) if prune else None
     for path in walk_with_identity_tracking(
         root, state.visited_identities, should_descend=should_descend
     ):
@@ -196,6 +194,4 @@ class TestDiscoverSourcesScan:
 
         state = benchmark(lambda: discover_sources(root, registry))
 
-        benchmark.extra_info.update(
-            interior_files=n_files, sources=len(state.claims)
-        )
+        benchmark.extra_info.update(interior_files=n_files, sources=len(state.claims))

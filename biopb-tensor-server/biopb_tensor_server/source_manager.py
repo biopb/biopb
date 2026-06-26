@@ -482,9 +482,7 @@ class SourceManager:
             signature,
         ):
             last_changed = previous_entry[2]
-            stable_observations = (
-                self._entry_stable_observations.get(path_str, 0) + 1
-            )
+            stable_observations = self._entry_stable_observations.get(path_str, 0) + 1
             pending_scan = self._entry_pending_scan.get(path_str, False)
         else:
             pending_scan = True

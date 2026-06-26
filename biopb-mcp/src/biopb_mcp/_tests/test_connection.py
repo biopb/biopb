@@ -531,15 +531,11 @@ class TestPersistUrl:
         conn.persist_url()
 
         assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
-        assert CONFIG.get("mcp.services.process_image_servers") == [
-            "grpc://ops:5"
-        ]
+        assert CONFIG.get("mcp.services.process_image_servers") == ["grpc://ops:5"]
         with get_config_path().open() as f:
             saved = json.load(f)
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["mcp"]["services"]["process_image_servers"] == [
-            "grpc://ops:5"
-        ]
+        assert saved["mcp"]["services"]["process_image_servers"] == ["grpc://ops:5"]
 
 
 # ---------------------------------------------------------------------------

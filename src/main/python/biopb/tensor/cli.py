@@ -54,9 +54,13 @@ def _create_flight_client(
     """Create a Flight client, with user-friendly error handling."""
     try:
         normalized = _normalize_location(location)
-        return TensorFlightClient(location=normalized, cache_bytes=cache_bytes, token=token)
+        return TensorFlightClient(
+            location=normalized, cache_bytes=cache_bytes, token=token
+        )
     except Exception as exc:
-        stderr_console.print(f"[red]Cannot connect to server at {location}:[/red] {exc}")
+        stderr_console.print(
+            f"[red]Cannot connect to server at {location}:[/red] {exc}"
+        )
         raise typer.Exit(1)
 
 
@@ -86,7 +90,9 @@ def _parse_slice_hint(slice_hint: Optional[str]) -> Optional[Tuple[slice, ...]]:
         raise typer.BadParameter(f"Invalid slice format: {e}")
 
 
-def _infer_format(output: str, format: Optional[str]) -> Literal["pickle", "zarr", "pb"]:
+def _infer_format(
+    output: str, format: Optional[str]
+) -> Literal["pickle", "zarr", "pb"]:
     """Infer output format from filename or explicit format option.
 
     Args:
@@ -99,7 +105,9 @@ def _infer_format(output: str, format: Optional[str]) -> Literal["pickle", "zarr
     if format:
         fmt = format.lower()
         if fmt not in ("pickle", "zarr", "pb"):
-            raise typer.BadParameter(f"Invalid format: {format}. Must be pickle, zarr, or pb.")
+            raise typer.BadParameter(
+                f"Invalid format: {format}. Must be pickle, zarr, or pb."
+            )
         return fmt
 
     if output == "-":
@@ -362,11 +370,15 @@ def get(
 
             if output == "-":
                 sys.stdout.buffer.write(pb_bytes)
-                stderr_console.print(f"[green]Protobuf written to stdout[/green] ({len(pb_bytes)} bytes)")
+                stderr_console.print(
+                    f"[green]Protobuf written to stdout[/green] ({len(pb_bytes)} bytes)"
+                )
             else:
                 with open(output, "wb") as f:
                     f.write(pb_bytes)
-                stderr_console.print(f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)")
+                stderr_console.print(
+                    f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)"
+                )
 
         elif fmt == "zarr":
             # Zarr format: realized array. Import lazily so that a missing or
@@ -386,7 +398,9 @@ def get(
                 raise typer.BadParameter("zarr format requires file output, not stdout")
 
             zarr.save_array(output, result)
-            stderr_console.print(f"[green]Zarr saved to:[/green] {output} ({result.nbytes} bytes)")
+            stderr_console.print(
+                f"[green]Zarr saved to:[/green] {output} ({result.nbytes} bytes)"
+            )
 
         else:
             # Pickle format: lazy dask array (no compute)
@@ -394,11 +408,15 @@ def get(
 
             if output == "-":
                 pickle.dump(arr, sys.stdout.buffer)
-                stderr_console.print(f"[green]Dask array written to stdout[/green] (shape={list(arr.shape)})")
+                stderr_console.print(
+                    f"[green]Dask array written to stdout[/green] (shape={list(arr.shape)})"
+                )
             else:
                 with open(output, "wb") as f:
                     pickle.dump(arr, f)
-                stderr_console.print(f"[green]Dask array saved to:[/green] {output} (shape={list(arr.shape)})")
+                stderr_console.print(
+                    f"[green]Dask array saved to:[/green] {output} (shape={list(arr.shape)})"
+                )
 
         _log_timing(start_time)
 

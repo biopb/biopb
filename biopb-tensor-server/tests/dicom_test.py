@@ -63,17 +63,17 @@ def create_synthetic_dicom(
 
     # Create file meta info
     file_meta = Dataset()
-    file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage
+    file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.2"  # CT Image Storage
     file_meta.MediaStorageSOPInstanceUID = generate_uid()
-    file_meta.TransferSyntaxUID = '1.2.840.10008.1.2'  # Implicit VR Little Endian
+    file_meta.TransferSyntaxUID = "1.2.840.10008.1.2"  # Implicit VR Little Endian
 
     # Create dataset
-    ds = FileDataset(str(path), {}, file_meta=file_meta, preamble=b'\x00' * 128)
+    ds = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\x00" * 128)
 
     # Set required DICOM tags
-    ds.PatientName = patient_name or 'Test Patient'
-    ds.PatientID = patient_id or 'TEST001'
-    ds.Modality = 'CT'
+    ds.PatientName = patient_name or "Test Patient"
+    ds.PatientID = patient_id or "TEST001"
+    ds.Modality = "CT"
     ds.StudyInstanceUID = generate_uid()
     ds.SeriesInstanceUID = series_uid or generate_uid()
     ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
@@ -95,16 +95,16 @@ def create_synthetic_dicom(
     ds.HighBit = bits_stored - 1
     ds.PixelRepresentation = pixel_representation
     ds.SamplesPerPixel = 1
-    ds.PhotometricInterpretation = 'MONOCHROME2'
+    ds.PhotometricInterpretation = "MONOCHROME2"
 
     # Create pixel data
     if pixel_data is None:
         if bits_stored <= 8:
-            dtype = 'uint8' if pixel_representation == 0 else 'int8'
+            dtype = "uint8" if pixel_representation == 0 else "int8"
         elif bits_stored <= 16:
-            dtype = 'uint16' if pixel_representation == 0 else 'int16'
+            dtype = "uint16" if pixel_representation == 0 else "int16"
         else:
-            dtype = 'uint32' if pixel_representation == 0 else 'int32'
+            dtype = "uint32" if pixel_representation == 0 else "int32"
         pixel_data = np.random.randint(0, 1000, size=total_pixels, dtype=dtype)
         if multi_frame > 0:
             pixel_data = pixel_data.reshape((multi_frame, rows, cols))
@@ -164,7 +164,7 @@ class TestDicomAdapterClaim:
 
     def test_claim_valid_dicom(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
+            dcm_path = Path(tmpdir) / "test.dcm"
             create_synthetic_dicom(dcm_path)
 
             ctx = ClaimContext(dcm_path)
@@ -178,8 +178,8 @@ class TestDicomAdapterClaim:
     def test_claim_non_dicom_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a non-DICOM file
-            txt_path = Path(tmpdir) / 'test.txt'
-            txt_path.write_text('not a dicom file')
+            txt_path = Path(tmpdir) / "test.txt"
+            txt_path.write_text("not a dicom file")
 
             ctx = ClaimContext(txt_path)
             state = DiscoveryState()
@@ -193,18 +193,22 @@ class TestDicomAdapterClaim:
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'no_pixel.dcm'
+            dcm_path = Path(tmpdir) / "no_pixel.dcm"
 
             # Create DICOM without image-related tags (no Rows/Columns)
             file_meta = Dataset()
-            file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.9'  # Basic Text SR
+            file_meta.MediaStorageSOPClassUID = (
+                "1.2.840.10008.5.1.4.1.1.9"  # Basic Text SR
+            )
             file_meta.MediaStorageSOPInstanceUID = generate_uid()
-            file_meta.TransferSyntaxUID = '1.2.840.10008.1.2'
+            file_meta.TransferSyntaxUID = "1.2.840.10008.1.2"
 
-            ds = FileDataset(str(dcm_path), {}, file_meta=file_meta, preamble=b'\x00' * 128)
-            ds.PatientName = 'Test'
-            ds.PatientID = 'TEST'
-            ds.Modality = 'SR'  # Structured Report (no pixel data)
+            ds = FileDataset(
+                str(dcm_path), {}, file_meta=file_meta, preamble=b"\x00" * 128
+            )
+            ds.PatientName = "Test"
+            ds.PatientID = "TEST"
+            ds.Modality = "SR"  # Structured Report (no pixel data)
             # No Rows, Columns, or pixel data tags!
             ds.save_as(str(dcm_path))
 
@@ -233,54 +237,55 @@ class TestDicomAdapter:
         import pydicom
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
+            dcm_path = Path(tmpdir) / "test.dcm"
             rows, cols = 128, 64
             create_synthetic_dicom(dcm_path, rows=rows, cols=cols)
 
             ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
+            adapter = DicomAdapter(ds, "test_source")
 
             assert adapter._shape == (rows, cols)
-            assert adapter._dtype == 'uint16'
-            assert adapter.dim_labels == ['y', 'x']
+            assert adapter._dtype == "uint16"
+            assert adapter.dim_labels == ["y", "x"]
 
     def test_multiframe_dicom(self):
         import pydicom
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'multiframe.dcm'
+            dcm_path = Path(tmpdir) / "multiframe.dcm"
             rows, cols = 32, 32
             num_frames = 10
-            create_synthetic_dicom(dcm_path, rows=rows, cols=cols, multi_frame=num_frames)
+            create_synthetic_dicom(
+                dcm_path, rows=rows, cols=cols, multi_frame=num_frames
+            )
 
             ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_multiframe')
+            adapter = DicomAdapter(ds, "test_multiframe")
 
             assert adapter._shape == (num_frames, rows, cols)
             assert adapter._is_multiframe
-            assert adapter.dim_labels == ['frame', 'y', 'x']
+            assert adapter.dim_labels == ["frame", "y", "x"]
 
     def test_get_tensor_descriptor(self):
         import pydicom
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
+            dcm_path = Path(tmpdir) / "test.dcm"
             create_synthetic_dicom(dcm_path)
 
             ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
+            adapter = DicomAdapter(ds, "test_source")
 
             desc = adapter.get_tensor_descriptor()
-            assert desc.array_id == 'test_source'
+            assert desc.array_id == "test_source"
             assert len(desc.shape) == 2
-            assert desc.dtype == 'uint16'
-
+            assert desc.dtype == "uint16"
 
     def test_get_metadata(self):
         import pydicom
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'test.dcm'
+            dcm_path = Path(tmpdir) / "test.dcm"
             create_synthetic_dicom(
                 dcm_path,
                 pixel_spacing=(0.5, 0.5),
@@ -288,38 +293,38 @@ class TestDicomAdapter:
                 window_width=255.0,
                 rescale_slope=1.0,
                 rescale_intercept=-1024.0,
-                patient_id='PATIENT123',
-                patient_name='John Doe',
+                patient_id="PATIENT123",
+                patient_name="John Doe",
             )
 
             ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
+            adapter = DicomAdapter(ds, "test_source")
 
             metadata = adapter.get_metadata()
 
-            assert metadata['format'] == 'dicom'
-            assert 'tags' in metadata
-            assert 'spatial' in metadata
-            assert 'patient' in metadata
+            assert metadata["format"] == "dicom"
+            assert "tags" in metadata
+            assert "spatial" in metadata
+            assert "patient" in metadata
 
             # Check spatial info
-            assert metadata['spatial']['pixel_spacing_mm'] == [0.5, 0.5]
-            assert metadata['spatial']['orientation'] == 'axial'
+            assert metadata["spatial"]["pixel_spacing_mm"] == [0.5, 0.5]
+            assert metadata["spatial"]["orientation"] == "axial"
 
             # Check patient info
-            assert metadata['patient']['PatientID'] == 'PATIENT123'
+            assert metadata["patient"]["PatientID"] == "PATIENT123"
 
     def test_signed_pixel_data(self):
         import pydicom
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'signed.dcm'
+            dcm_path = Path(tmpdir) / "signed.dcm"
             create_synthetic_dicom(dcm_path, bits_stored=16, pixel_representation=1)
 
             ds = pydicom.dcmread(str(dcm_path))
-            adapter = DicomAdapter(ds, 'test_source')
+            adapter = DicomAdapter(ds, "test_source")
 
-            assert adapter._dtype == 'int16'
+            assert adapter._dtype == "int16"
 
 
 class TestDicomSeriesAdapterClaim:
@@ -333,7 +338,7 @@ class TestDicomSeriesAdapterClaim:
 
             # Create multiple DICOM files with same SeriesInstanceUID
             for i in range(5):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"slice_{i}.dcm"
                 create_synthetic_dicom(
                     dcm_path,
                     series_uid=series_uid,
@@ -354,7 +359,7 @@ class TestDicomSeriesAdapterClaim:
     def test_claim_single_dicom_directory(self):
         """Directory with only one DICOM should not be claimed as series."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            dcm_path = Path(tmpdir) / 'single.dcm'
+            dcm_path = Path(tmpdir) / "single.dcm"
             create_synthetic_dicom(dcm_path)
 
             ctx = ClaimContext(Path(tmpdir))
@@ -373,11 +378,11 @@ class TestDicomSeriesAdapterClaim:
 
             # Create 2 files from series 1
             for i in range(2):
-                dcm_path = Path(tmpdir) / f'series1_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"series1_{i}.dcm"
                 create_synthetic_dicom(dcm_path, series_uid=series_uid1)
 
             # Create 1 file from series 2
-            dcm_path = Path(tmpdir) / 'series2_0.dcm'
+            dcm_path = Path(tmpdir) / "series2_0.dcm"
             create_synthetic_dicom(dcm_path, series_uid=series_uid2)
 
             ctx = ClaimContext(Path(tmpdir))
@@ -387,7 +392,7 @@ class TestDicomSeriesAdapterClaim:
             # Should still claim the first series with 2+ files
             assert claim is not None
             # Should only claim files from one series
-            assert claim.extra_config['num_slices'] == 2
+            assert claim.extra_config["num_slices"] == 2
 
 
 class TestDicomSeriesAdapter:
@@ -402,7 +407,7 @@ class TestDicomSeriesAdapter:
             rows, cols = 64, 32
 
             for i in range(num_slices):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"slice_{i}.dcm"
                 create_synthetic_dicom(
                     dcm_path,
                     rows=rows,
@@ -411,11 +416,11 @@ class TestDicomSeriesAdapter:
                     instance_number=i,
                 )
 
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
+            adapter = DicomSeriesAdapter(tmpdir, "test_series")
 
             assert adapter._shape == (num_slices, rows, cols)
             assert adapter._num_slices == num_slices
-            assert adapter.dim_labels == ['z', 'y', 'x']
+            assert adapter.dim_labels == ["z", "y", "x"]
 
     def test_series_sorting_by_instance_number(self):
         import pydicom
@@ -427,14 +432,14 @@ class TestDicomSeriesAdapter:
             # Create files with non-sequential instance numbers
             instance_numbers = [10, 5, 20, 1, 15]
             for i, inst_num in enumerate(instance_numbers):
-                dcm_path = Path(tmpdir) / f'file_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"file_{i}.dcm"
                 create_synthetic_dicom(
                     dcm_path,
                     series_uid=series_uid,
                     instance_number=inst_num,
                 )
 
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
+            adapter = DicomSeriesAdapter(tmpdir, "test_series")
 
             # Files should be sorted by InstanceNumber
             expected_order = sorted(instance_numbers)
@@ -451,7 +456,7 @@ class TestDicomSeriesAdapter:
             rows, cols = 32, 32
 
             for i in range(num_slices):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"slice_{i}.dcm"
                 create_synthetic_dicom(
                     dcm_path,
                     rows=rows,
@@ -459,13 +464,12 @@ class TestDicomSeriesAdapter:
                     series_uid=series_uid,
                 )
 
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
+            adapter = DicomSeriesAdapter(tmpdir, "test_series")
 
             desc = adapter.get_tensor_descriptor()
-            assert desc.array_id == 'test_series'
+            assert desc.array_id == "test_series"
             assert desc.shape == [num_slices, rows, cols]
             assert desc.chunk_shape == [1, rows, cols]
-
 
     def test_get_metadata(self):
         from pydicom.uid import generate_uid
@@ -475,20 +479,20 @@ class TestDicomSeriesAdapter:
             num_slices = 5
 
             for i in range(num_slices):
-                dcm_path = Path(tmpdir) / f'slice_{i}.dcm'
+                dcm_path = Path(tmpdir) / f"slice_{i}.dcm"
                 create_synthetic_dicom(
                     dcm_path,
                     series_uid=series_uid,
                     pixel_spacing=(0.5, 0.5),
-                    patient_id='PATIENT123',
+                    patient_id="PATIENT123",
                 )
 
-            adapter = DicomSeriesAdapter(tmpdir, 'test_series')
+            adapter = DicomSeriesAdapter(tmpdir, "test_series")
 
             metadata = adapter.get_metadata()
 
-            assert metadata['format'] == 'dicom'
-            assert 'series' in metadata
-            assert metadata['series']['num_slices'] == num_slices
-            assert metadata['spatial']['pixel_spacing_mm'] == [0.5, 0.5]
-            assert metadata['patient']['PatientID'] == 'PATIENT123'
+            assert metadata["format"] == "dicom"
+            assert "series" in metadata
+            assert metadata["series"]["num_slices"] == num_slices
+            assert metadata["spatial"]["pixel_spacing_mm"] == [0.5, 0.5]
+            assert metadata["patient"]["PatientID"] == "PATIENT123"

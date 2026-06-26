@@ -173,7 +173,9 @@ class SourceAdapter(ABC):
 
     @classmethod
     @abstractmethod
-    def create_from_config(cls, source: SourceConfig, credentials_config: Optional[Any] = None) -> SourceAdapter:
+    def create_from_config(
+        cls, source: SourceConfig, credentials_config: Optional[Any] = None
+    ) -> SourceAdapter:
         """Create adapter instance from SourceConfig.
 
         This is used by the server to instantiate adapters based on discovery claims.
@@ -185,7 +187,6 @@ class SourceAdapter(ABC):
         Returns:
             An instance of a SourceAdapter subclass initialized with the provided config
         """
-
 
     @abstractmethod
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
@@ -215,15 +216,13 @@ class SourceAdapter(ABC):
             - dim_labels: Dimension labels (cheap to include)
         """
 
-
     @abstractmethod
     def get_metadata(self) -> dict:
         """Return metadata as dict. In most cases this is OME metadata.
 
-        Used by the metadata engine to create database. 
+        Used by the metadata engine to create database.
         Will be serialized to metadata_json in TensorDescriptor.
         """
-
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -290,8 +289,7 @@ class SourceAdapter(ABC):
             return True
         return not _is_offline_placeholder(path)
 
-
-    def get_tensor_adapter(self, tensor_id: str|None) -> TensorAdapter:
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
 
         Transitions the adapter from source context to tensor context.
@@ -316,9 +314,8 @@ class SourceAdapter(ABC):
         is returned unchanged. Idempotent with the server's own reduction.
         """
         if tensor_id and self.source_id and tensor_id.startswith(f"{self.source_id}/"):
-            return tensor_id[len(self.source_id) + 1:]
+            return tensor_id[len(self.source_id) + 1 :]
         return tensor_id
-
 
     def has_native_pyramid(self) -> bool:
         """Whether this source ships a well-formed multi-resolution pyramid.
@@ -404,7 +401,6 @@ class TensorAdapter(ABC):
         desc = self.get_tensor_descriptor()
         return tuple(int(dim) for dim in desc.chunk_shape)
 
-
     @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the backend.
@@ -420,7 +416,6 @@ class TensorAdapter(ABC):
         desc = self.get_tensor_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
-
 
     def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
         """Validate that bounds are within array shape.
@@ -445,7 +440,6 @@ class TensorAdapter(ABC):
                 raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
             if s >= e:
                 raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
-
 
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
@@ -477,9 +471,9 @@ class TensorAdapter(ABC):
 
         return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)
 
-
     def resolve_chunk_data(
-        self, chunk_id: bytes,
+        self,
+        chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
         """Resolve chunk data, handling scaled chunks and backend caching.
@@ -510,9 +504,7 @@ class TensorAdapter(ABC):
             if is_scaled_chunk_flag:
                 scale_hint, reduction_method = decode_scale_info(chunk_id)
                 # Crop and downsample (no padding needed - bounds aligned via floor_div)
-                result_arr = downsample_block(
-                    result_arr, scale_hint, reduction_method
-                )
+                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
 
             logical_shape = list(result_arr.shape)
             dtype_str = str(result_arr.dtype)
@@ -523,12 +515,14 @@ class TensorAdapter(ABC):
                     pa.array([logical_shape]),
                     pa.array([dtype_str]),
                 ],
-                ["data", "shape", "dtype"]
+                ["data", "shape", "dtype"],
             )
             return result, result_arr.nbytes
 
         if should_cache:
-            entry = cache_manager.get_or_acquire(chunk_id, compute_fn, metadata={'array_id': array_id})
+            entry = cache_manager.get_or_acquire(
+                chunk_id, compute_fn, metadata={"array_id": array_id}
+            )
             data = entry.data
             cache_manager.release(chunk_id)
         else:
@@ -556,7 +550,11 @@ class BackendAdapter(SourceAdapter, TensorAdapter):
     pass
 
 
-def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, chunk_size: Tuple[int, ...]) -> TensorReadPlan:
+def _get_read_plan(
+    base_desc: TensorDescriptor,
+    request_desc: TensorDescriptor,
+    chunk_size: Tuple[int, ...],
+) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
@@ -564,7 +562,9 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
-    slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
+    slice_hint = (
+        request_desc.slice_hint if request_desc.HasField("slice_hint") else None
+    )
 
     # Normalize inputs - use scale_hint/reduction_method directly from TensorDescriptor
     source_start, source_stop = normalized_slice_bounds(base_shape, slice_hint)
@@ -588,8 +588,12 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         logical_chunk_size = safe_chunk_size
         output_dtype = base_desc.dtype
     else:
-        virtual_chunk_size = tuple(lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim))
-        logical_chunk_size = tuple(virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim))
+        virtual_chunk_size = tuple(
+            lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
+        )
+        logical_chunk_size = tuple(
+            virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim)
+        )
         output_dtype = get_output_dtype(base_desc.dtype, reduction_method)
 
     # Snap bounds to virtual_chunk_size grid
@@ -598,14 +602,19 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         for ax in range(ndim)
     )
     realized_stop = tuple(
-        min(ceil_div(source_stop[ax], virtual_chunk_size[ax]) * virtual_chunk_size[ax], base_shape[ax])
+        min(
+            ceil_div(source_stop[ax], virtual_chunk_size[ax]) * virtual_chunk_size[ax],
+            base_shape[ax],
+        )
         for ax in range(ndim)
     )
     realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
 
     # Compute logical shape (for scale_hint case)
     if scale_hint is not None:
-        logical_shape = tuple(ceil_div(realized_shape[ax], scale_hint[ax]) for ax in range(ndim))
+        logical_shape = tuple(
+            ceil_div(realized_shape[ax], scale_hint[ax]) for ax in range(ndim)
+        )
     else:
         logical_shape = realized_shape
 
@@ -641,8 +650,12 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
                 for ax in range(ndim)
             )
         else:
-            logical_start = tuple(virtual_start[ax] - realized_start[ax] for ax in range(ndim))
-            logical_stop = tuple(virtual_stop[ax] - realized_start[ax] for ax in range(ndim))
+            logical_start = tuple(
+                virtual_start[ax] - realized_start[ax] for ax in range(ndim)
+            )
+            logical_stop = tuple(
+                virtual_stop[ax] - realized_start[ax] for ax in range(ndim)
+            )
 
         virtual_bounds = ChunkBounds(start=list(virtual_start), stop=list(virtual_stop))
         logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
@@ -657,7 +670,9 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         else:
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
 
-        logical_endpoints.append(ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds))
+        logical_endpoints.append(
+            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+        )
 
     # Build descriptor
     logical_desc = TensorDescriptor(

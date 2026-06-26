@@ -193,7 +193,13 @@ def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:
 
     Mirrors frontend buildAxisMap() in tensor-flight-client.
     """
-    result: dict[str, Optional[int]] = {"t": None, "z": None, "c": None, "y": None, "x": None}
+    result: dict[str, Optional[int]] = {
+        "t": None,
+        "z": None,
+        "c": None,
+        "y": None,
+        "x": None,
+    }
 
     for i, label in enumerate(dim_labels):
         label_lower = label.lower()
@@ -209,8 +215,16 @@ def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:
             result["x"] = i
 
     # Fallback heuristic for unmapped axes
-    unassigned = [i for i, label in enumerate(dim_labels) if label.lower() not in
-                  AXIS_T_LABELS | AXIS_Z_LABELS | AXIS_C_LABELS | AXIS_Y_LABELS | AXIS_X_LABELS]
+    unassigned = [
+        i
+        for i, label in enumerate(dim_labels)
+        if label.lower()
+        not in AXIS_T_LABELS
+        | AXIS_Z_LABELS
+        | AXIS_C_LABELS
+        | AXIS_Y_LABELS
+        | AXIS_X_LABELS
+    ]
 
     # Positional fallback: last → X, second-last → Y, third-last → Z
     if result["x"] is None and unassigned:
@@ -331,8 +345,7 @@ def extract_yx_slice(
     # For 3D+ arrays, squeeze out non-Y/X dimensions that have size 1
     # Only squeeze dimensions that are actually size 1 to avoid errors
     squeeze_dims = tuple(
-        i for i in range(arr.ndim)
-        if i not in (y_idx, x_idx) and arr.shape[i] == 1
+        i for i in range(arr.ndim) if i not in (y_idx, x_idx) and arr.shape[i] == 1
     )
     if squeeze_dims:
         squeezed = np.squeeze(arr, axis=squeeze_dims)
@@ -380,6 +393,7 @@ def render_array_to_image_bytes(
         (image_bytes, width, height, actual_lo_val, actual_hi_val)
     """
     import time
+
     t0 = time.monotonic()
 
     # Extract 2D Y/X slice
@@ -412,7 +426,9 @@ def render_array_to_image_bytes(
                 "simplejpeg is required for JPEG rendering. "
                 "Install with: pip install simplejpeg"
             )
-        output_bytes = simplejpeg.encode_jpeg(np.ascontiguousarray(rgb), quality=90, colorspace="RGB")
+        output_bytes = simplejpeg.encode_jpeg(
+            np.ascontiguousarray(rgb), quality=90, colorspace="RGB"
+        )
     else:
         try:
             from PIL import Image

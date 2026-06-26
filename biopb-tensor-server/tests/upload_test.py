@@ -83,9 +83,11 @@ class TestCachedSourceAdapter:
     def test_get_metadata_with_ome(self):
         """OME metadata handling."""
         ome_metadata = {
-            "multiscales": [{
-                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
-            }]
+            "multiscales": [
+                {
+                    "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                }
+            ]
         }
 
         adapter = CachedSourceAdapter(
@@ -99,7 +101,6 @@ class TestCachedSourceAdapter:
         metadata = adapter.get_metadata()
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
-
 
     def test_write_chunk(self):
         """write_chunk stores data in cache."""
@@ -258,7 +259,9 @@ class TestCachedSourceAdapter:
             shape = batch.column("shape").to_pylist()[0]
             dtype_str = batch.column("dtype").to_pylist()[0]
 
-            reconstructed = np.array(flat_data, dtype=np.dtype(dtype_str)).reshape(shape)
+            reconstructed = np.array(flat_data, dtype=np.dtype(dtype_str)).reshape(
+                shape
+            )
             assert reconstructed.shape == data.shape
             assert reconstructed.dtype == data.dtype
 
@@ -746,6 +749,6 @@ class TestBuildMinimalOmeMetadata:
         axes = metadata["multiscales"][0]["axes"]
 
         assert axes[0]["type"] == "channel"  # 'c' detected as channel
-        assert axes[1]["type"] == "space"    # 'z' detected as space
-        assert axes[2]["type"] == "space"    # 'y' detected as space
-        assert axes[3]["type"] == "space"    # 'x' detected as space
+        assert axes[1]["type"] == "space"  # 'z' detected as space
+        assert axes[2]["type"] == "space"  # 'y' detected as space
+        assert axes[3]["type"] == "space"  # 'x' detected as space

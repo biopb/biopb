@@ -30,9 +30,7 @@ from biopb_image_base.logging_config import LogLevel, setup_logging
 
 logger = logging.getLogger(__name__)
 
-_NON_UNIFORM_CHUNKS_ERROR = (
-    "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
-)
+_NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
 
 
 def _resolve_tensor_external_location(
@@ -87,7 +85,9 @@ def _iter_chunk_bounds(
     shape: Sequence[int],
     chunk_shape: Sequence[int],
 ) -> Iterator[ChunkBounds]:
-    chunk_starts = [range(0, int(dim), int(chunk)) for dim, chunk in zip(shape, chunk_shape)]
+    chunk_starts = [
+        range(0, int(dim), int(chunk)) for dim, chunk in zip(shape, chunk_shape)
+    ]
     for start_coords in product(*chunk_starts):
         stop_coords = [
             min(start + int(chunk_shape[axis]), int(shape[axis]))
@@ -166,7 +166,9 @@ class EmbeddedTensorCache:
         normalized_name = _normalize_cache_source_name(source_name)
 
         if normalized_name:
-            source_id = f"cache_{hashlib.sha256(normalized_name.encode()).hexdigest()[:12]}"
+            source_id = (
+                f"cache_{hashlib.sha256(normalized_name.encode()).hexdigest()[:12]}"
+            )
         else:
             source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
 
@@ -417,7 +419,7 @@ def create_server(
         - health_servicer: Health servicer for status updates, None if disabled
     """
     # Inject tensor_cache into servicer if provided
-    if tensor_cache is not None and hasattr(servicer, '_tensor_cache'):
+    if tensor_cache is not None and hasattr(servicer, "_tensor_cache"):
         servicer._tensor_cache = tensor_cache
 
     # Determine token setting
@@ -440,7 +442,9 @@ def create_server(
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=workers),
-        compression=grpc.Compression.Gzip if compression else grpc.Compression.NoCompression,
+        compression=grpc.Compression.Gzip
+        if compression
+        else grpc.Compression.NoCompression,
         interceptors=tuple(interceptors),
         options=(
             ("grpc.max_receive_message_length", _MAX_MSG_SIZE),
@@ -527,16 +531,22 @@ def run_server(
 
     # Log system info
     sys_info = get_system_info()
-    logger.info(f"System: {sys_info.get('platform', 'unknown')}, "
-                f"Python {sys_info.get('python_version', 'unknown')}, "
-                f"CPU {sys_info.get('cpu_count', 'unknown')}")
+    logger.info(
+        f"System: {sys_info.get('platform', 'unknown')}, "
+        f"Python {sys_info.get('python_version', 'unknown')}, "
+        f"CPU {sys_info.get('cpu_count', 'unknown')}"
+    )
     if "memory_total_mb" in sys_info:
-        logger.info(f"Memory: {sys_info['memory_total_mb']:.0f}MB total, "
-                    f"{sys_info.get('memory_available_mb', 0):.0f}MB available")
+        logger.info(
+            f"Memory: {sys_info['memory_total_mb']:.0f}MB total, "
+            f"{sys_info.get('memory_available_mb', 0):.0f}MB available"
+        )
     if "gpu" in sys_info:
         gpu = sys_info["gpu"]
-        logger.info(f"GPU: {gpu['device']}, {gpu['total_mb']:.0f}MB total, "
-                    f"{gpu['free_mb']:.0f}MB free")
+        logger.info(
+            f"GPU: {gpu['device']}, {gpu['total_mb']:.0f}MB total, "
+            f"{gpu['free_mb']:.0f}MB free"
+        )
 
     tensor_cache = None
     if cache_dir is not None and not _pyarrow_available():
@@ -562,7 +572,9 @@ def run_server(
         else:
             cache_bytes = int(cache_size)
 
-        logger.info(f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})")
+        logger.info(
+            f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})"
+        )
 
         # Determine external location for SerializedTensor
         external_location = _resolve_tensor_external_location(

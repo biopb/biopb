@@ -323,8 +323,16 @@ def _strace_total_syscalls(root: Path) -> int:
 
     def traced(script: str) -> int:
         proc = subprocess.run(
-            ["strace", "-f", "-c", "-e", f"trace={_STRACE_SYSCALLS}",
-             sys.executable, "-c", script],
+            [
+                "strace",
+                "-f",
+                "-c",
+                "-e",
+                f"trace={_STRACE_SYSCALLS}",
+                sys.executable,
+                "-c",
+                script,
+            ],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -371,7 +379,9 @@ def scan_tree(request, tmp_path_factory):
     return scale, root, _count_interior_files(root)
 
 
-def _report(scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _SyscallCounter):
+def _report(
+    scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _SyscallCounter
+):
     total = state_c.total_syscalls + claim_c.total_syscalls
     per_entry = total / n_files if n_files else 0.0
     print(f"\n=== #56 syscall baseline: {scale} ===")
@@ -380,8 +390,10 @@ def _report(scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _Syscal
     for k in state_c.counts:
         sv, cv = state_c.counts[k], claim_c.counts[k]
         print(f"{k:<28}{sv:>12}{cv:>12}{sv + cv:>10}")
-    print(f"{'TRUE SYSCALLS (os-level)':<28}"
-          f"{state_c.total_syscalls:>12}{claim_c.total_syscalls:>12}{total:>10}")
+    print(
+        f"{'TRUE SYSCALLS (os-level)':<28}"
+        f"{state_c.total_syscalls:>12}{claim_c.total_syscalls:>12}{total:>10}"
+    )
     print(f"--> syscalls per entry: {per_entry:.1f}")
 
 
@@ -473,8 +485,10 @@ class TestSyscallBaseline:
         py_total = py_c.total_syscalls
 
         strace_total = _strace_total_syscalls(root)
-        print(f"\n[strace] {scale}: python-counter={py_total} "
-              f"strace={strace_total} (entries={n_files})")
+        print(
+            f"\n[strace] {scale}: python-counter={py_total} "
+            f"strace={strace_total} (entries={n_files})"
+        )
 
         assert strace_total > 0
         # Same order of magnitude: strace >= python (ground truth sees a superset)

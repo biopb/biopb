@@ -69,7 +69,9 @@ class TestZarrIntegration:
 
         try:
             # Connect client and compute
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # List sources
             sources = client.list_sources()
@@ -107,7 +109,9 @@ class TestZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Test stride downsampling
             darr = client.get_tensor(
@@ -151,7 +155,9 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Test precompute method for scale 2
             darr = client.get_tensor(
@@ -197,7 +203,9 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Request scale 3 - no matching level, should use virtual scaling
             darr = client.get_tensor(
@@ -222,7 +230,6 @@ class TestOmeZarrIntegration:
         finally:
             server.shutdown()
 
-
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_physical_scale_summary_on_descriptor(self, temp_dir):
         """The per-dim physical-scale summary rides the descriptor that
@@ -239,16 +246,22 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="w")
         root.create_dataset("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
         zattrs = {
-            "multiscales": [{
-                "axes": [
-                    {"name": "y", "type": "space", "unit": "micrometer"},
-                    {"name": "x", "type": "space", "unit": "micrometer"},
-                ],
-                "datasets": [
-                    {"path": "0", "coordinateTransformations": [
-                        {"type": "scale", "scale": [0.5, 0.25]}]},
-                ],
-            }]
+            "multiscales": [
+                {
+                    "axes": [
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [
+                        {
+                            "path": "0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [0.5, 0.25]}
+                            ],
+                        },
+                    ],
+                }
+            ]
         }
         with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
             json.dump(zattrs, f)
@@ -336,7 +349,9 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-integration", scene_id)
@@ -379,7 +394,9 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-channels", scene_id)
@@ -458,7 +475,9 @@ class TestMultiSeriesOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # List sources
             sources = client.list_sources()
@@ -647,7 +666,9 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             darr = client.get_tensor("cache-test", "cache-test")
 
@@ -691,7 +712,9 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             darr = client.get_tensor("cache-regions", "cache-regions")
 
@@ -737,7 +760,9 @@ class TestConcurrentAccess:
         results = []
 
         def read_region(client_id):
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
             darr = client.get_tensor("concurrent-test", "concurrent-test")
             data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))
