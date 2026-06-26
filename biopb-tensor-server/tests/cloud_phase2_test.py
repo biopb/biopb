@@ -15,9 +15,7 @@ import os
 import tempfile
 
 import pytest
-
-from biopb_tensor_server import discovery
-from biopb_tensor_server import source_manager as sm_mod
+from biopb_tensor_server import discovery, source_manager as sm_mod
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.config import SourceConfig, parse_config
 from biopb_tensor_server.discovery import (
@@ -298,9 +296,8 @@ class TestUnresolvedProxy:
         # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
         # on its own -- it refuses with SourceUnresolvedError until resolve() has
         # run, so the only thing that downloads is the explicit resolve action.
-        from biopb_tensor_server.errors import SourceUnresolvedError
-
         import zarr
+        from biopb_tensor_server.errors import SourceUnresolvedError
 
         with tempfile.TemporaryDirectory() as d:
             zpath = os.path.join(d, "img.zarr")
@@ -453,7 +450,6 @@ class TestCloudRegistrationEndToEnd:
         self, tmp_path, monkeypatch
     ):
         import zarr
-
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
         store = tmp_path / "img.zarr"
@@ -674,8 +670,8 @@ class TestResolveAction:
         return msgs, [m.WhichOneof("payload") for m in msgs]
 
     def test_resolve_action_streams_full_descriptor(self):
-        import zarr
         import pyarrow.flight as flight
+        import zarr
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
@@ -707,6 +703,7 @@ class TestResolveAction:
         # a minutes-long recall under a proxy's idle read timeout, and the elapsed
         # field lets a client show progress.
         import time as _time
+
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
         from biopb_tensor_server import server as server_mod
@@ -1090,7 +1087,6 @@ class TestDirClaimingMembership:
     def test_tiff_sequence_member_is_dir_only(self, tmp_path):
         import numpy as np
         import tifffile
-
         from biopb_tensor_server.adapters.tiff import TiffSequenceAdapter
 
         # Plain numbered sequence (img_*/OME/MicroManager names are excluded by
@@ -1198,7 +1194,6 @@ class TestResolveErrorSurfacing:
 
     def test_create_from_config_oserror_is_retriable(self, monkeypatch, tmp_path):
         import zarr
-
         from biopb_tensor_server.errors import SourceResolveRetriableError
 
         zpath = str(tmp_path / "img.zarr")

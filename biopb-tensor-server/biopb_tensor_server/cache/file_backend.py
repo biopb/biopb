@@ -14,7 +14,6 @@ import os
 import sys
 import threading
 import time
-from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Literal, Optional, Tuple
@@ -31,12 +30,12 @@ from biopb_tensor_server.cache.base import (
     PoolStats,
 )
 from biopb_tensor_server.cache.recovery import (
+    PoolQueueInfo,
     ProcessLock,
     RecoveryStatus,
     SegmentEntryInfo,
     SegmentInfo,
     SieveKSegmentInfo,
-    PoolQueueInfo,
     WriteAheadLog,
 )
 
@@ -993,7 +992,7 @@ class ArrowFileBackend(CacheBackend):
                 return self._build_chunk_location(entry_info)
 
     def _build_chunk_location(
-        self, entry_info: "SegmentEntryInfo"
+        self, entry_info: SegmentEntryInfo
     ) -> Optional[ChunkLocation]:
         """Build a ``ChunkLocation`` for an already-indexed entry.
 

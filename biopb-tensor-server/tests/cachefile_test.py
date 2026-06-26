@@ -10,7 +10,6 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
   do_get fallback when the fast path is disabled or unavailable.
 """
 
-import json
 import os
 import shutil
 import tempfile
@@ -23,9 +22,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-
-from biopb.tensor.ticket_pb2 import TensorTicket
-
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,

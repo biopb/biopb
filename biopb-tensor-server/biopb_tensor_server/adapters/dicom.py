@@ -5,14 +5,13 @@ Handles single DICOM files and multi-file DICOM series using pydicom.
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import (
     ClaimContext,
     SourceClaim,
@@ -21,7 +20,6 @@ from biopb_tensor_server.discovery import (
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.remote import RemoteStore
 
 
 # =============================================================================
@@ -490,7 +488,6 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels
         """
-        from pathlib import Path
         import pydicom
 
         self.directory = Path(directory)

@@ -8,7 +8,6 @@ opened. The end-to-end resolve-on-serve path is covered by the server suite.
 """
 
 import pytest
-
 from biopb.tensor.client import ResolveCancelled, TensorFlightClient
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,

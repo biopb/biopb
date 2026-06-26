@@ -323,7 +323,6 @@ def downsample_block(
             return result
         except Exception as e:
             logger.warning(f"downsample_block: GPU failed ({e}), falling back to CPU")
-            pass
 
     return _downsample_block_cpu(data, scale_hint, reduction_method)
 

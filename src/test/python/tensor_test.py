@@ -1,13 +1,13 @@
 """Tests for TensorFlightClient using the new multifield API."""
 
+import os
+import tempfile
 import threading
 import time
-import tempfile
-import os
-import pytest
-import numpy as np
 from unittest.mock import Mock
 
+import numpy as np
+import pytest
 from biopb.tensor import (
     TensorFlightClient,
 )
@@ -627,6 +627,7 @@ class TestQuerySourcesFormat:
         # real float column must survive (we only normalize text nulls).
         pd = pytest.importorskip("pandas")
         import math
+
         import pyarrow as pa
 
         t = pa.table({"score": pa.array([1.5, None], type=pa.float64())})

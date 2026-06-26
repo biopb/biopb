@@ -11,9 +11,8 @@ and the cache stays bounded.
 
 from pathlib import Path
 
-import pytest
-
 import biopb_tensor_server.adapters.aicsimageio as aics
+import pytest
 from biopb_tensor_server.adapters.aicsimageio import _get_ome_metadata_from_tiff
 
 

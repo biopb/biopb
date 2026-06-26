@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
-
 from biopb_image_base.server import EmbeddedTensorCache
 
 
@@ -101,8 +100,8 @@ def test_embedded_cache_reports_serving(tmp_path: Path):
     self-mark-ready immediately -- otherwise health would report STARTING
     forever and readiness-gating clients would wait indefinitely.
     """
-    from biopb_tensor_server.cache import CacheManager
     from biopb_image_base.server import _start_embedded_tensor_cache
+    from biopb_tensor_server.cache import CacheManager
 
     CacheManager.reset()
     port = _free_tcp_port()

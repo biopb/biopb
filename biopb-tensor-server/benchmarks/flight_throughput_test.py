@@ -1,16 +1,15 @@
 """Flight throughput benchmark: theoretical ceiling vs real server."""
 
+import json
 import tempfile
-import time
 import threading
+import time
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-from pathlib import Path
-import json
-
 import pytest
-
 
 # Schema matching TensorFlightServer chunk format
 CHUNK_SCHEMA = pa.schema([
@@ -90,10 +89,10 @@ def bench_flight_ceiling(port: int, batch: pa.RecordBatch, concurrency: int, ite
 
 def bench_real_server(port: int, batch: pa.RecordBatch, concurrency: int, iterations: int, use_file_cache: bool = True):
     """Benchmark real TensorFlightServer."""
-    from biopb_tensor_server.server import TensorFlightServer
     from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.server import TensorFlightServer
 
     location = f"grpc://127.0.0.1:{port}"
     edge = int(np.sqrt(batch.nbytes / 2))  # uint16 = 2 bytes

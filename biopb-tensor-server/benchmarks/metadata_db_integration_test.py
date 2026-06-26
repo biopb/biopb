@@ -21,7 +21,6 @@ import threading
 import time
 
 import pytest
-
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server.metadata_db import MetadataDatabase
 from biopb_tensor_server.server import TensorFlightServer

@@ -7,9 +7,8 @@ The end-to-end server-side recall is covered by the server suite
 (``cloud_phase2_test.py::TestWarmAction``).
 """
 
-import pytest
 import pyarrow.flight as flight
-
+import pytest
 from biopb.tensor.client import ResolveCancelled, TensorFlightClient
 from biopb.tensor.descriptor_pb2 import WarmProgress, WarmStreamMessage
 

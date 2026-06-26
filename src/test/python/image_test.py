@@ -1,13 +1,22 @@
-import pytest
-import numpy as np
-import dask.array as da
 import warnings
 from unittest.mock import MagicMock, patch
 
-import biopb.tensor.ticket_pb2
-
-from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype, deserialize_image_data, serialize_from_numpy_to_image_data, _pb_from_np, _np_from_pb, get_image_data_dim_labels, get_image_data_shape, normalize_array_dims
-from biopb.image import BinData, Pixels, ImageData, Tensor
+import dask.array as da
+import numpy as np
+import pytest
+from biopb.image import BinData, ImageData, Pixels
+from biopb.image.utils import (
+    _canonicalize_dtype,
+    _np_from_pb,
+    _pb_from_np,
+    _serialize_from_numpy,
+    deserialize_image_data,
+    deserialize_to_numpy,
+    get_image_data_dim_labels,
+    get_image_data_shape,
+    normalize_array_dims,
+    serialize_from_numpy_to_image_data,
+)
 
 
 def test_import():
@@ -126,7 +135,6 @@ def test_endianness_conflict_warning():
 
     # Manually override to create conflict
     # We'll create a Pixels with dtype '<u1' but endianness BIG
-    from biopb.image import Pixels
     conflicting_pixels = Pixels(
         bindata=BinData(data=img.tobytes(), endianness=BinData.Endianness.BIG),
         dtype='<u1',  # Little-endian prefix but BinData says BIG
@@ -390,8 +398,6 @@ def test_serialize_f_order_input():
 
 def test_deserialize_image_data_eager_data():
     """Test deserialize_image_data with eager_data (Tensor)."""
-    from biopb.image.utils import deserialize_image_data
-    from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
@@ -406,12 +412,10 @@ def test_deserialize_image_data_eager_data():
 
 def test_deserialize_image_data_lazy_data():
     """Test deserialize_image_data with lazy_data (SerializedTensor)."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
-    from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
-    from unittest.mock import patch
+    from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+    from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
     # Create a mock SerializedTensor
     descriptor = TensorDescriptor(
@@ -449,7 +453,6 @@ def test_deserialize_image_data_lazy_data():
 
 def test_deserialize_image_data_legacy_pixels():
     """Test deserialize_image_data with legacy pixels field."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
@@ -470,7 +473,6 @@ def test_deserialize_image_data_legacy_pixels():
 
 def test_deserialize_image_data_no_data_raises():
     """Test that deserialize_image_data raises when no data field is set."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
 
     # Create ImageData with no data fields set
@@ -483,7 +485,6 @@ def test_deserialize_image_data_no_data_raises():
 def test_serialize_from_numpy_to_image_data():
     """Test serialize_from_numpy_to_image_data."""
     from biopb.image.utils import serialize_from_numpy_to_image_data
-    from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
@@ -593,11 +594,9 @@ def test_pb_from_np_and_np_from_pb():
 
 def test_deserialize_image_data_cache_bytes_parameter():
     """Test deserialize_image_data with cache_bytes parameter for lazy_data."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
-    from biopb.tensor.serialized_pb2 import SerializedTensor
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from unittest.mock import patch
+    from biopb.tensor.serialized_pb2 import SerializedTensor
 
     descriptor = TensorDescriptor(
         array_id="test-tensor",

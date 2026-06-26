@@ -5,7 +5,6 @@ import time
 
 import numpy as np
 import pytest
-
 from biopb_tensor_server.chunk import (
     compute_precache_scale_hint,
     is_scaled_chunk,
@@ -214,7 +213,6 @@ class TestFlightIdleProbe:
 class TestWarming:
     def _make_server_with_zarr(self, tmp_path, shape):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -390,7 +388,6 @@ class TestRuntimePhaseGating:
 class TestPreemptionAndLifecycle:
     def test_no_warming_while_in_flight(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
@@ -472,7 +469,6 @@ from types import SimpleNamespace  # noqa: E402
 
 def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
     import zarr
-
     from biopb_tensor_server import ZarrAdapter
 
     arr = zarr.open_array(
@@ -827,7 +823,6 @@ class TestBacklogWarming:
 class TestSkipNativePyramid:
     def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _level_paths, _zattrs = multires_ome_zarr
@@ -840,7 +835,6 @@ class TestSkipNativePyramid:
 
     def test_plain_zarr_has_no_native_pyramid(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -971,7 +965,6 @@ class TestNativePyramidLevels:
 
     def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _level_paths, _zattrs = multires_ome_zarr
@@ -1013,7 +1006,6 @@ class TestNativePyramidLevels:
 
     def test_plain_zarr_has_no_native_levels(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1049,7 +1041,6 @@ class TestAdvertisedPyramidDescriptor:
 
     def _big_zarr_adapter(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1077,7 +1068,6 @@ class TestAdvertisedPyramidDescriptor:
 
     def test_get_flight_info_advertises_native_pyramid(self, multires_ome_zarr):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _lp, _z = multires_ome_zarr
@@ -1098,7 +1088,6 @@ class TestAdvertisedPyramidDescriptor:
         # A 1-D tensor has no Y/X plane; GetFlightInfo must advertise one full-res
         # level rather than raise (regression for the <2-D guard).
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1138,7 +1127,6 @@ class TestPrecacheAdvertisedAlignment:
 
     def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.chunk import build_pyramid_plan
 

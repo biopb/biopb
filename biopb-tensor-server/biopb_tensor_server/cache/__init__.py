@@ -27,9 +27,9 @@ from biopb_tensor_server.cache.base import (
     PoolStats,
 )
 from biopb_tensor_server.cache.file_backend import (
+    CACHE_FILE_FORMAT_VERSION,
     ArrowFileBackend,
     ArrowFileConfig,
-    CACHE_FILE_FORMAT_VERSION,
 )
 from biopb_tensor_server.cache.manager import CacheManager
 from biopb_tensor_server.cache.memory_backend import (

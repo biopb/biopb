@@ -6,9 +6,8 @@ from typing import Optional
 
 import numpy as np
 import pytest
-
 from biopb_tensor_server.adapters.nifti import NiftiAdapter
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
+from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads NIfTI via nibabel (the [nifti]/[medical] extra);
 # skip the whole module when it is not installed rather than erroring.
@@ -174,7 +173,7 @@ class TestNiftiAdapter:
             # Single chunk
             assert list(desc.chunk_shape) == list(shape)
 
-    
+
     def test_get_metadata_affine(self):
         import nibabel as nib
 

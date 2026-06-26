@@ -910,7 +910,7 @@ def create_app(
 
             # Use shape-based fallback if dim_labels not found
             if not dim_labels:
-                dim_labels = [f"d{i}" for i in range(arr.ndim)]
+                dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
 
             logger.debug(
                 f"render: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B, "
@@ -1262,7 +1262,7 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def shutdown_sentinel_path() -> "os.PathLike":
+def shutdown_sentinel_path() -> os.PathLike:
     """Path of the shutdown sentinel file `biopb server stop` writes.
 
     Must stay in sync with the path biopb.cli computes (duplicated there to avoid

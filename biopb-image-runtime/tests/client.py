@@ -12,10 +12,9 @@ import grpc
 import imageio.v2 as imageio
 import numpy as np
 import typer
-from grpc_health.v1 import health_pb2, health_pb2_grpc
-
 from biopb_image_base.common import _AUTH_HEADER_KEY
 from biopb_image_base.logging_config import setup_logging
+from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 app = typer.Typer(pretty_exceptions_enable=False)
 

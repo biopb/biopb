@@ -152,7 +152,7 @@ class SourceAdapter(ABC):
         return f"{self.source_id}/{self._tensor_name}"
 
     @classmethod
-    def claim(cls, ctx: "ClaimContext", state: "DiscoveryState") -> Optional["SourceClaim"]:
+    def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
         """Claim a filesystem path as a data source.
 
         This method is called during discovery to detect if this adapter
@@ -173,7 +173,7 @@ class SourceAdapter(ABC):
 
     @classmethod
     @abstractmethod
-    def create_from_config(cls, source: "SourceConfig", credentials_config: Optional[Any] = None) -> "SourceAdapter":
+    def create_from_config(cls, source: SourceConfig, credentials_config: Optional[Any] = None) -> SourceAdapter:
         """Create adapter instance from SourceConfig.
 
         This is used by the server to instantiate adapters based on discovery claims.
@@ -185,7 +185,6 @@ class SourceAdapter(ABC):
         Returns:
             An instance of a SourceAdapter subclass initialized with the provided config
         """
-        pass
 
 
     @abstractmethod
@@ -215,7 +214,6 @@ class SourceAdapter(ABC):
             Recommended optional fields:
             - dim_labels: Dimension labels (cheap to include)
         """
-        pass    
 
 
     @abstractmethod
@@ -225,7 +223,6 @@ class SourceAdapter(ABC):
         Used by the metadata engine to create database. 
         Will be serialized to metadata_json in TensorDescriptor.
         """
-        pass
 
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
@@ -294,7 +291,7 @@ class SourceAdapter(ABC):
         return not _is_offline_placeholder(path)
 
 
-    def get_tensor_adapter(self, tensor_id: str|None) -> 'TensorAdapter':
+    def get_tensor_adapter(self, tensor_id: str|None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
 
         Transitions the adapter from source context to tensor context.
@@ -335,7 +332,7 @@ class SourceAdapter(ABC):
 
     def get_native_pyramid_levels(
         self, tensor_id: Optional[str] = None
-    ) -> Optional[List["PyramidLevel"]]:
+    ) -> Optional[List[PyramidLevel]]:
         """Native (precomputed on-disk) pyramid levels for *tensor_id*, or None.
 
         Returns ``None`` for formats without a real on-disk pyramid (the default),
@@ -397,7 +394,6 @@ class TensorAdapter(ABC):
             TensorDescriptor with required fields populated (see list_tensor_descriptors
             for field requirements).
         """
-        pass
 
     def get_chunk_size(self) -> Tuple[int, ...]:
         """Return the chunk size for this tensor adapter.
@@ -409,7 +405,7 @@ class TensorAdapter(ABC):
         return tuple(int(dim) for dim in desc.chunk_shape)
 
 
-    @abstractmethod    
+    @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the backend.
         Subclasses should call super().get_data(bounds) to validate bounds,
@@ -537,7 +533,7 @@ class TensorAdapter(ABC):
             cache_manager.release(chunk_id)
         else:
             data, _ = compute_fn()
-        
+
         return data
 
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
@@ -550,7 +546,7 @@ class TensorAdapter(ABC):
                           include slice_hint and scale_hint/reduction_method directly.
         Returns:
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
-        """        
+        """
         base_desc = self.get_tensor_descriptor()
         chunk_size = self.get_chunk_size()
         return _get_read_plan(base_desc, request_desc, chunk_size)

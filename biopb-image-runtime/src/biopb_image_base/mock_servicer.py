@@ -9,22 +9,22 @@ Useful for:
 
 import logging
 import random
-import typer
 from typing import Optional
 
 import biopb.image as proto
-import numpy as np
 import dask.array as da
+import numpy as np
+import typer
 
 from biopb_image_base.common import (
-    abort_invalid_argument,
     BiopbServicerBase,
+    RequestLogger,
+    abort_invalid_argument,
     decode_image_data,
     return_lazy_or_eager,
-    RequestLogger,
 )
-from biopb_image_base.server import run_server
 from biopb_image_base.logging_config import get_log_level_from_env
+from biopb_image_base.server import run_server
 
 logger = logging.getLogger(__name__)
 

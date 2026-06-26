@@ -5,10 +5,10 @@ import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ def get_system_info() -> dict:
 
     # Try to get memory info
     try:
-        with open("/proc/meminfo", "r") as f:
+        with open("/proc/meminfo") as f:
             meminfo = {}
             for line in f:
                 parts = line.split(":")

@@ -117,10 +117,10 @@ class WriteAheadLog:
         """Load existing WAL state from disk."""
         if self._path.exists():
             try:
-                with open(self._path, 'r') as f:
+                with open(self._path) as f:
                     data = json.load(f)
                 self._pending = data.get('pending', {})
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 # Corrupted WAL - start fresh
                 self._pending = {}
 
@@ -181,7 +181,7 @@ class ProcessLock:
         # Check for existing lock
         if self._path.exists():
             try:
-                with open(self._path, 'r') as f:
+                with open(self._path) as f:
                     data = json.load(f)
                 existing_pid = data.get('pid')
 
@@ -191,7 +191,7 @@ class ProcessLock:
 
                 # Stale lock - process is dead, remove it
                 self._path.unlink()
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 # Corrupted lock file - remove it
                 self._path.unlink()
 
@@ -224,12 +224,12 @@ class ProcessLock:
             return False
 
         try:
-            with open(self._path, 'r') as f:
+            with open(self._path) as f:
                 data = json.load(f)
             existing_pid = data.get('pid')
             if existing_pid and not self._is_process_running(existing_pid):
                 return True
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             return True  # Corrupted lock is stale
 
         return False

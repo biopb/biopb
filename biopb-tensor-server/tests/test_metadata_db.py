@@ -9,10 +9,8 @@ Tests cover:
 """
 
 import json
-import pytest
-import pyarrow as pa
-import pyarrow.flight as flight
 
+import pytest
 from biopb_tensor_server.metadata_db import MetadataDatabase
 
 
@@ -149,7 +147,6 @@ class TestSourceSync:
         ).fetchone()
 
         assert result is not None
-        import json
 
         metadata = json.loads(result[0])
         assert metadata["int16"] == 42
@@ -569,7 +566,6 @@ class TestListFlightsTruncation:
     def test_list_flights_schema_metadata(self):
         """Test that list_flights includes truncation metadata in schema."""
         from biopb_tensor_server.server import TensorFlightServer
-        import pyarrow.flight as flight
 
         # Bind to port 0: the OS assigns a free port and this test never connects
         # a client (it calls list_flights in-process), so the value is irrelevant.
@@ -602,7 +598,6 @@ class TestListFlightsTruncation:
     def test_list_flights_truncation(self):
         """Test that list_flights truncates and signals via metadata."""
         from biopb_tensor_server.server import TensorFlightServer
-        import pyarrow.flight as flight
 
         # Bind to port 0: the OS assigns a free port and this test never connects
         # a client (it calls list_flights in-process), so the value is irrelevant.

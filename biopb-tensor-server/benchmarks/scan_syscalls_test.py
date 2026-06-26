@@ -58,7 +58,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     DiscoveryState,
@@ -67,7 +66,6 @@ from biopb_tensor_server.discovery import (
 from biopb_tensor_server.source_manager import SourceManager
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
-
 
 # Same tree "scale" knobs as discovery_scan_test.py so the two benchmarks describe
 # the *same* tree from different angles (probe count there, syscall count here).
@@ -152,7 +150,7 @@ class _SyscallCounter:
     _TRUE_SYSCALL_BUCKETS = _OS_PRIMS + ("scandir", "direntry_stat")
 
     def __init__(self):
-        self.counts = {name: 0 for name in self._TRUE_SYSCALL_BUCKETS}
+        self.counts = dict.fromkeys(self._TRUE_SYSCALL_BUCKETS, 0)
         # Logical high-level calls (each fans out into several os-level syscalls).
         self.counts["logical_resolve"] = 0
         self.counts["logical_get_file_identity"] = 0
@@ -163,6 +161,7 @@ class _SyscallCounter:
     def measure(self):
         import builtins
         import pathlib
+
         import biopb_tensor_server.discovery as discovery
         import biopb_tensor_server.source_manager as source_manager
 

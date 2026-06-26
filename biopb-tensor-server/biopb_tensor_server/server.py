@@ -1114,7 +1114,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnavailableError(
                 f"Source unresolved (open to resolve): {e}"
             ) from e
-        except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
             ) from e
@@ -1192,7 +1192,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch = adapter.resolve_chunk_data(
                     tensor_ticket.chunk_id, cache_manager
                 )
-            except (OSError, IOError, ValueError) as e:
+            except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
                 raise flight.FlightInternalError(
                     f"I/O error reading chunk data: {e}"
@@ -1235,7 +1235,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if location is None:
                 adapter.resolve_chunk_data(chunk_id, cache_manager)
                 location = cache_manager.locate_entry(chunk_id)
-        except (OSError, IOError, ValueError) as e:
+        except (OSError, ValueError) as e:
             raise flight.FlightInternalError(
                 f"I/O error locating chunk data: {e}"
             ) from e
@@ -1453,7 +1453,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if hasattr(adapter, "write_chunk"):
                 adapter.write_chunk(chunk_idx, data)
             else:
-                raise flight.FlightServerError(f"Source does not support writes")
+                raise flight.FlightServerError("Source does not support writes")
 
         elif isinstance(adapter, CachedSourceAdapter):
             # Cache-backed sources accept arbitrary bounds
@@ -1461,7 +1461,7 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter.write_chunk_arrow(bounds, data_column, expected_shape, dtype)
 
         else:
-            raise flight.FlightServerError(f"Source type does not support writes")
+            raise flight.FlightServerError("Source type does not support writes")
 
         self.mark_upload_chunk(upload.source_id, bounds)
 

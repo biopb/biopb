@@ -16,7 +16,6 @@ import inspect
 
 import grpc
 import pytest
-
 from biopb_image_base.common import BiopbServicerBase, abort_invalid_argument
 from biopb_image_base.mock_servicer import MockServicer
 

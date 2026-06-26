@@ -1,10 +1,10 @@
 import sys
 
+import biopb.image as proto
 import grpc
 import imageio.v2 as imageio
-import biopb.image as proto
-
 from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy
+
 
 def grpc_call(server, image, use_https=False):
     request = proto.ProcessRequest(
@@ -12,16 +12,16 @@ def grpc_call(server, image, use_https=False):
     )
 
     if use_https:
-        with grpc.secure_channel(target=server, credentials=grpc.ssl_channel_credentials()) as channel:        
+        with grpc.secure_channel(target=server, credentials=grpc.ssl_channel_credentials()) as channel:
             stub = proto.ProcessImageStub(channel)
             response = stub.Run(request)
     else:
-        with grpc.insecure_channel(target=server) as channel:        
+        with grpc.insecure_channel(target=server) as channel:
             stub = proto.ProcessImageStub(channel)
             response = stub.Run(request)
 
     label = deserialize_to_numpy(response.image_data.pixels)
-    
+
     return label
 
 

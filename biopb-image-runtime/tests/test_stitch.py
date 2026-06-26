@@ -10,9 +10,7 @@ Run with: pytest tests/test_stitch.py
 """
 
 import numpy as np
-
 from biopb_image_base import stitch
-
 
 # --------------------------------------------------------------------------- #
 # Helpers

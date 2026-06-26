@@ -11,11 +11,10 @@ import threading
 import time
 from pathlib import Path
 
+import biopb.tensor.client as cmod
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-
-import biopb.tensor.client as cmod
 from biopb.tensor.client import (
     TensorFlightClient,
     _array_from_unified_batch,

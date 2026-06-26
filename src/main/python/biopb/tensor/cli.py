@@ -7,20 +7,19 @@ Commands:
     stats       Compute statistics (min, max, mean) for a tensor
 """
 
-from typing import Optional, Tuple, Literal
 import json
 import pickle
 import sys
 import time
-
 from pathlib import Path
+from typing import Literal, Optional, Tuple
+
 import dask
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from biopb.tensor.client import TensorFlightClient
-
 
 app = typer.Typer(
     name="tensor",
@@ -265,7 +264,7 @@ def metadata(
             console.print(detail_table)
 
         # Fetch and display source-level metadata (OME/vendor JSON)
-        console.print(f"\n[bold green]Source Metadata:[/bold green]")
+        console.print("\n[bold green]Source Metadata:[/bold green]")
         src_metadata = client.get_source_metadata(source_id)
         if src_metadata:
             # Pass JSON string directly to print_json for proper Rich formatting

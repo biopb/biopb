@@ -475,11 +475,11 @@ def create_companion_ome_dataset(
         tiff_files.append(str(filepath))
 
     # Create companion.ome file with OME-XML referencing TIFFs
-    ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    ome_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
   <Image ID="Image:0" Name="companion_test">
-    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" SizeX="{width}" SizeY="{height}" SizeZ="{n_files}" SizeC="1" SizeT="1" Type="uint16">
-""".format(width=image_shape[1], height=image_shape[0], n_files=n_files)
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" SizeX="{image_shape[1]}" SizeY="{image_shape[0]}" SizeZ="{n_files}" SizeC="1" SizeT="1" Type="uint16">
+"""
 
     for i in range(n_files):
         filename = f"data_{i+1:03d}.tif"

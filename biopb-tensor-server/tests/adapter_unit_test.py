@@ -14,11 +14,9 @@ from biopb.tensor import (
     TensorDescriptor,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
-
 from biopb_tensor_server import (
     OmeZarrAdapter,
     ZarrAdapter,
-    base as tensor_adapter,
     downsample as _ds,
 )
 from biopb_tensor_server.config import parse_config
@@ -55,7 +53,7 @@ class TestZarrAdapter:
             assert desc.dtype == '<u2'
             assert list(desc.dim_labels) == ['y', 'x']
 
-    
+
 
 class TestTensorConfig:
     """Tests for tensor server config parsing."""
@@ -197,7 +195,10 @@ class TestComputeBackendSelection:
         assert backend == 'cpu'
 
     def test_configure_compute_backend_updates_thresholds(self, monkeypatch):
-        from biopb_tensor_server import get_compute_backend_options, configure_compute_backend
+        from biopb_tensor_server import (
+            configure_compute_backend,
+            get_compute_backend_options,
+        )
         monkeypatch.delenv('BIOPB_TENSOR_FORCE_BACKEND', raising=False)
         original = get_compute_backend_options()
 

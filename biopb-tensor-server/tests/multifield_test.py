@@ -7,11 +7,9 @@ import warnings
 import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
-
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.base import (
     BackendAdapter,
-    ChunkEndpoint,
     DataSourceDescriptor,
     TensorDescriptor,
 )
@@ -92,7 +90,7 @@ class MockMultifieldAdapter(BackendAdapter):
             metadata_json="",  # Not populated; returned via GetFlightInfo instead
         )
 
-    
+
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
 

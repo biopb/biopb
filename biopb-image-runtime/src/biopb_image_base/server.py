@@ -14,19 +14,19 @@ from itertools import product
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Union
 
-import numpy as np
-import dask.array as da
 import biopb.image as proto
 import biopb.tensor as tensor_proto
+import dask.array as da
 import grpc
+import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_image_base.common import TokenValidationInterceptor, _MAX_MSG_SIZE
-from biopb_image_base.health import HealthServicer, add_health_servicer
-from biopb_image_base.logging_config import setup_logging, LogLevel
+from biopb_image_base.common import _MAX_MSG_SIZE, TokenValidationInterceptor
 from biopb_image_base.debug import get_system_info
+from biopb_image_base.health import HealthServicer, add_health_servicer
+from biopb_image_base.logging_config import LogLevel, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +271,7 @@ class EmbeddedTensorCache:
         Returns:
             SerializedTensor protobuf with external location
         """
-        from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
+        from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
         from biopb.tensor.ticket_pb2 import TensorTicket
 
         # Get adapter from server
@@ -320,9 +320,9 @@ def _start_embedded_tensor_cache(
     Returns:
         Tuple of (tensor_server, location_url)
     """
-    from biopb_tensor_server.server import TensorFlightServer
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.server import TensorFlightServer
 
     # Clean stale lock file (from previous run/crash)
     lock_path = cache_dir / "lock"

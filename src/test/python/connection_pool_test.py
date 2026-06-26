@@ -4,16 +4,14 @@ Tests the thread-local connection pool, fork-safety, and caching behavior
 without requiring a live Flight server.
 """
 
-import pytest
-import threading
 import os
-import time
+import threading
 from unittest.mock import MagicMock, patch
-
-import pyarrow.flight as flight
 
 # Import the module to test pool behavior
 import biopb.tensor.client as client_module
+import pyarrow.flight as flight
+import pytest
 
 
 class TestThreadLocalPool:
@@ -60,7 +58,7 @@ class TestThreadLocalPool:
         # This is a conceptual test - actual reuse happens in _get_thread_client
         # In the actual implementation, calling _get_thread_client twice
         # with the same location/token returns the same client
-        pass  # This would require a live server or complex mocking
+        # This would require a live server or complex mocking
 
 
 class TestForkSafety:
@@ -142,13 +140,13 @@ class TestSharedCache:
         """Test cache.get returns None for missing keys."""
         # This would test cachey.Cache behavior
         # The actual cache is created in _get_shared_cache
-        pass  # Requires cachey installation
+        # Requires cachey installation
 
     def test_cache_put_and_get(self):
         """Test cache.put and cache.get roundtrip."""
         # In the implementation, cache.put stores with cost
         # and cache.get retrieves
-        pass  # Requires cachey installation
+        # Requires cachey installation
 
 
 class TestCachePolicy:
@@ -285,7 +283,6 @@ class TestCleanupConnectionPool:
     def test_cleanup_registered(self):
         """Test that cleanup is registered with atexit."""
         # _cleanup_connection_pool is registered at module load
-        import atexit
 
         # Check that atexit has handlers registered
         # This is a conceptual check - we don't want to actually
@@ -325,7 +322,6 @@ class TestCallOptionsPool:
                 opts = client_module._CALL_OPTS_POOL[key]
                 # Should have no auth headers
                 # FlightCallOptions.headers would be empty
-                pass
 
     def test_shared_call_options_with_token(self):
         """Test that call options include auth headers when token provided."""
@@ -399,4 +395,3 @@ class TestConnectionRegistryStructure:
         # The structure is: thread_id -> {(location, token): FlightClient}
         # We can verify the structure by looking at the type
         # (without adding actual connections)
-        pass

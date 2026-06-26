@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.base import BackendAdapter
+    pass
 
 
 @dataclass

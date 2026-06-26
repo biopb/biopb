@@ -59,9 +59,9 @@ class PrecacheWorker:
 
     def __init__(
         self,
-        server: "TensorFlightServer",
-        config: "PrecacheConfig",
-        pyramid_config: Optional["PyramidConfig"] = None,
+        server: TensorFlightServer,
+        config: PrecacheConfig,
+        pyramid_config: Optional[PyramidConfig] = None,
     ):
         self._server = server
         self._cfg = config
@@ -73,7 +73,7 @@ class PrecacheWorker:
 
             pyramid_config = PyramidConfig()
         self._pyramid_cfg = pyramid_config
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._queue: queue.Queue[str] = queue.Queue()
         self._seen: Set[str] = set()
         self._seen_lock = threading.Lock()
         # Backlog tier: a newest-mtime-first heap of (-mtime, seq, source_id).

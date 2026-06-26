@@ -87,7 +87,6 @@ from biopb_tensor_server.discovery import (
 from biopb_tensor_server.remote import (
     CredentialProfile,
     CredentialsConfig,
-    is_remote_url as is_remote_url_v2,
 )
 
 # Alias for backward compatibility with internal usage
@@ -689,7 +688,7 @@ def detect_source_type(url: str) -> Optional[str]:
 
                     if "multiscales" in zattrs:
                         return "ome-zarr"
-                except (json.JSONDecodeError, KeyError, IOError):
+                except (OSError, json.JSONDecodeError, KeyError):
                     pass
 
             # Plain Zarr (has .zarray or .zattrs without multiscales)
@@ -836,7 +835,7 @@ def _discover_by_type(
                                     dim_labels=dim_labels,
                                 )
                             )
-                    except (json.JSONDecodeError, KeyError, IOError):
+                    except (OSError, json.JSONDecodeError, KeyError):
                         pass
 
     elif source_type == "hdf5":

@@ -1,12 +1,10 @@
 import os
-import pytest
-
-import grpc
-import numpy as np
 
 import biopb.image as proto
-from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy
-
+import grpc
+import numpy as np
+import pytest
+from biopb.image.utils import deserialize_to_numpy, serialize_from_numpy
 
 # ---------------------------------------------------------------------------
 # shared channel fixture

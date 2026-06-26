@@ -15,8 +15,8 @@ from pathlib import Path
 from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
     DiscoveryState,

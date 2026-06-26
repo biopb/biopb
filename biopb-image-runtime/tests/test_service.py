@@ -2,14 +2,14 @@
 
 import os
 import time
-import numpy as np
+
+import biopb.image as proto
 import grpc
 import grpc_health.v1.health_pb2 as health_pb2
 import grpc_health.v1.health_pb2_grpc as health_pb2_grpc
-import biopb.image as proto
+import numpy as np
+from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
 from google.protobuf.empty_pb2 import Empty
-from biopb.image.utils import serialize_from_numpy_to_image_data, deserialize_image_data
-
 
 # gRPC channel options for large messages (no compression to avoid decompress errors)
 _GRPC_OPTIONS = [
@@ -157,9 +157,9 @@ class TestProcessImageLazy:
 
     def test_local_mode_defaults_to_localhost_location(self):
         """Regression test: --local mode without explicit location uses localhost."""
+        import shutil
         import subprocess
         import tempfile
-        import shutil
 
         cache_dir = tempfile.mkdtemp(prefix="biopb-test-default-loc-")
 

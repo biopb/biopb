@@ -1,7 +1,6 @@
 """Tests for periodic rescan watcher behavior."""
 
 import pytest
-
 from biopb_tensor_server.watcher import (
     PeriodicRescanWatcher,
     WatcherEventType,

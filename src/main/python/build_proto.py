@@ -66,7 +66,7 @@ class build_proto(_build_py):
         )
 
         if result.returncode != 0:
-            print(f"ERROR: buf generate failed:", file=sys.stderr)
+            print("ERROR: buf generate failed:", file=sys.stderr)
             print(result.stderr, file=sys.stderr)
             sys.exit(1)
 

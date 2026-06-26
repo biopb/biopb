@@ -15,13 +15,11 @@ on a not-yet-mounted monitored directory. These tests pin the new behavior:
   and skips unresolvable entries only when asked.
 """
 
-import os
 
+import biopb_tensor_server.config as config_mod
 import numpy as np
 import pytest
 import tifffile
-
-import biopb_tensor_server.config as config_mod
 from biopb_tensor_server.cli import _resolve_serve_sources
 from biopb_tensor_server.config import (
     ServerConfig,

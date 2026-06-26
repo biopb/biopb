@@ -21,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import threading
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -241,7 +240,7 @@ class ClaimContext:
     def __init__(
         self,
         path: Path | str,
-        store: Optional["RemoteStore"] = None,
+        store: Optional[RemoteStore] = None,
         is_dir: Optional[bool] = None,
         signature: Optional[Tuple] = None,
         cloud_root: bool = False,
@@ -324,7 +323,7 @@ class ClaimContext:
         target = self._path / subpath if subpath else self._path
         return target.read_text()
 
-    def join(self, subpath: str) -> "ClaimContext":
+    def join(self, subpath: str) -> ClaimContext:
         """Create context for subpath."""
         if self._store:
             new_path = (
@@ -335,7 +334,7 @@ class ClaimContext:
             return ClaimContext(new_path, self._store)
         return ClaimContext(self._path / subpath)
 
-    def glob(self, pattern: str) -> List["ClaimContext"]:
+    def glob(self, pattern: str) -> List[ClaimContext]:
         """Find files matching pattern."""
         if self._store:
             matches = self._store.find(pattern, maxdepth=1)
@@ -357,7 +356,7 @@ class ClaimContext:
         return self._path.name
 
     @property
-    def parent(self) -> "ClaimContext":
+    def parent(self) -> ClaimContext:
         """Get parent directory context."""
         if self._store:
             parent_path = (
@@ -372,7 +371,7 @@ class ClaimContext:
         return self._store is not None
 
     @property
-    def store(self) -> Optional["RemoteStore"]:
+    def store(self) -> Optional[RemoteStore]:
         """Get underlying RemoteStore if remote."""
         return self._store
 

@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-
 from biopb_tensor_server.adapters.tiff import (
     TiffSequenceAdapter,
     _group_tiff_sequence,

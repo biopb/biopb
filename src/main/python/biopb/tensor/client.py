@@ -10,41 +10,39 @@ Features:
 """
 
 import atexit
-import logging
 import importlib.metadata
 import json
+import logging
 import os
-import sys
+import threading
 import time
 import warnings
-from functools import lru_cache
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-import threading
 
-from dataclasses import dataclass
-
+import dask.array as da
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-import dask.array as da
-from dask.delayed import delayed
 from cachey import Cache
+from dask.delayed import delayed
 
-from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import (
-    TensorDescriptor,
-    SliceHint,
-    FlightCmd,
-    TensorReadOption,
-    MetadataQueryOption,
     DataSourceDescriptor,
+    FlightCmd,
+    MetadataQueryOption,
     ResolveProgress,
     ResolveStreamMessage,
+    SliceHint,
+    TensorDescriptor,
+    TensorReadOption,
     WarmProgress,
     WarmStreamMessage,
 )
-from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
+from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +125,7 @@ def _resolve_cache_bytes(location: str, requested: int) -> int:
     return requested
 
 
-@lru_cache(maxsize=None)
+@cache
 def _is_localhost_location(location: str) -> bool:
     """Check if location points to localhost.
 
@@ -144,8 +142,8 @@ def _is_localhost_location(location: str) -> bool:
     Returns:
         True if location resolves to loopback address
     """
-    import socket
     import re
+    import socket
 
     # Parse location URI - handle various formats
     # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
@@ -2089,7 +2087,7 @@ class TensorFlightClient:
         # Build dask array with lazy chunk fetching
         ndim = len(shape)
         grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
+            max(idx[d] + 1 for idx in chunk_map) for d in range(ndim)
         )
 
         # Extract schema_metadata from pb for SHM transfer
@@ -2172,7 +2170,7 @@ class TensorFlightClient:
         # da.block-of-from_delayed for ragged/sparse grids.
         ndim = len(shape)
         grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
+            max(idx[d] + 1 for idx in chunk_map) for d in range(ndim)
         )
 
         return _build_dask_array_from_chunk_map(

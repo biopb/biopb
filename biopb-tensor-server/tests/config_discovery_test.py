@@ -9,9 +9,7 @@ import os
 import tempfile
 
 import numpy as np
-import pytest
 import tifffile
-
 from biopb_tensor_server.config import (
     SourceConfig,
     discover_sources,
@@ -169,6 +167,7 @@ class TestDeleteSourceRegression:
         and remove_claim, but they expect string keys.
         """
         from pathlib import Path
+
         from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
 
         state = DiscoveryState()
@@ -212,6 +211,7 @@ class TestDeleteSourceRegression:
         _handle_moved(event.path, event.old_path) = _handle_moved(old_path, new_path)
         """
         from pathlib import Path
+
         from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
 
         # Simulate what the watcher creates for a move event

@@ -4,19 +4,15 @@ Uses typer.testing.CliRunner with mocked TensorFlightClient to avoid
 requiring a live server.
 """
 
-from typing import Dict
-from unittest.mock import MagicMock, patch
-import json
 import os
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from typer.testing import CliRunner
-
-from biopb.tensor.cli import app, _parse_slice_hint
+from biopb.tensor.cli import _parse_slice_hint, app
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
-
+from typer.testing import CliRunner
 
 runner = CliRunner()
 

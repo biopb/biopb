@@ -7,11 +7,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from rich.console import Console
-from rich.table import Table
 from typing import List, Optional, Tuple
 
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from ._proc import (
     is_process_running as _is_process_running,
@@ -39,7 +39,7 @@ def _add_optional_typer(name: str, import_path: str, help: str) -> None:
 
     try:
         module = importlib.import_module(import_path)
-        app.add_typer(getattr(module, "app"), name=name, help=help)
+        app.add_typer(module.app, name=name, help=help)
     except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
         error = exc
 
@@ -124,7 +124,7 @@ def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
     try:
         parts = pid_file.read_text().split()
         pid = int(parts[0])
-    except (ValueError, IOError, IndexError):
+    except (OSError, ValueError, IndexError):
         return None, None
     token: Optional[int] = None
     if len(parts) > 1:
@@ -396,7 +396,7 @@ def _tail_and_follow(
     # truncated out from under us (a `restart` rotates it mid-follow). Track the
     # inode + size so a replaced or shrunk file restarts from the top.
     try:
-        f = open(log_file, "r", errors="replace")
+        f = open(log_file, errors="replace")
     except OSError:
         raise typer.Exit(0)
     try:
@@ -421,7 +421,7 @@ def _tail_and_follow(
                 st.st_ino != last_ino or st.st_size < f.tell()
             ):
                 f.close()
-                f = open(log_file, "r", errors="replace")
+                f = open(log_file, errors="replace")
                 last_ino = os.fstat(f.fileno()).st_ino
                 carry = ""
                 continue
@@ -587,7 +587,7 @@ def start(
         cmd.extend(["--static-dir", str(static_dir)])
 
     # Start subprocess
-    console.print(f"[green]Starting TensorFlight server...[/green]")
+    console.print("[green]Starting TensorFlight server...[/green]")
     console.print(f"  Config: {config}")
 
     # Detach the daemon from the launching console/process group so it survives
@@ -631,7 +631,7 @@ def start(
     console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
     url = f"http://{web_host}:{web_port}/" + (f"?token={token}" if token else "")
     console.print(f"  HTTP: {url}")
-    console.print(f"  gRPC: grpc://127.0.0.1:8815")
+    console.print("  gRPC: grpc://127.0.0.1:8815")
     console.print(f"  Logs: {log_file}")
 
 

@@ -5,10 +5,13 @@ import time
 from pathlib import Path
 
 import pytest
-
-from biopb_tensor_server.discovery import DiscoveryState, SourceClaim, generate_source_id
-from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+from biopb_tensor_server.discovery import (
+    DiscoveryState,
+    SourceClaim,
+    generate_source_id,
+)
 from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
 
 
 class _FakeAdapter:

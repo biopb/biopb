@@ -4,8 +4,6 @@ Tests for CachedSourceAdapter, server-side do_put handler,
 and Python client upload methods.
 """
 
-import json
-import os
 import tempfile
 import threading
 from pathlib import Path
@@ -14,13 +12,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.config import CacheConfig
 
 
 class MockMetadataWriter:
@@ -103,7 +100,7 @@ class TestCachedSourceAdapter:
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
 
-    
+
     def test_write_chunk(self):
         """write_chunk stores data in cache."""
         CacheManager.reset()
@@ -215,8 +212,8 @@ class TestCachedSourceAdapter:
 
         Bug: AttributeError: 'pyarrow.lib.FloatArray' object has no attribute 'values'
         """
-        import tempfile
         import shutil
+        import tempfile
 
         CacheManager.reset()
 
@@ -448,8 +445,8 @@ class TestServerDoPutHandler:
 
     def test_create_source_action_round_trip(self):
         """Live client create_source should return the server-assigned source_id."""
-        from biopb_tensor_server.server import TensorFlightServer
         from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)

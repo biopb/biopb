@@ -7,29 +7,27 @@ Commands:
 
 import sys
 import time
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 import grpc
-import typer
 import imageio
+import typer
+from google.protobuf import empty_pb2
 from rich.console import Console
 from rich.table import Table
 
-from google.protobuf import empty_pb2
-
 from biopb.image import (
+    OpNames,
+    OpSchema,
     ProcessImageStub,
     ProcessRequest,
     ProcessResponse,
-    OpNames,
-    OpSchema,
 )
 from biopb.image.utils import (
-    serialize_from_numpy_to_image_data,
     deserialize_image_data,
+    serialize_from_numpy_to_image_data,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
-
 
 app = typer.Typer(
     name="image",
@@ -126,7 +124,6 @@ def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageDat
     Returns:
         ImageData protobuf message
     """
-    from biopb.image import ImageData
 
     if is_file:
         # Try imageio for image files
@@ -245,7 +242,7 @@ def _write_output(
             if output == "-":
                 pickle.dump(serialized, sys.stdout.buffer)
                 stderr_console.print(
-                    f"[green]Pickled SerializedTensor written to stdout[/green]"
+                    "[green]Pickled SerializedTensor written to stdout[/green]"
                 )
             else:
                 with open(output, "wb") as f:

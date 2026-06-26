@@ -62,6 +62,7 @@ def _fresh_client(location):
     # Re-import per run so the per-location capability cache starts empty and the
     # env-var gate is re-read; client cache off to force a transport every fetch.
     import importlib
+
     import biopb.tensor.client as c
     importlib.reload(c)
     return c, c.TensorFlightClient(location, cache_bytes=0)

@@ -9,7 +9,6 @@ lives there.
 """
 
 import pytest
-
 from biopb_tensor_server import TensorFlightServer
 
 

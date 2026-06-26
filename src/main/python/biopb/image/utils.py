@@ -1,11 +1,11 @@
 import warnings
-
-import numpy as np
-import dask.array as da
 from typing import Optional, Sequence, Tuple, Union
 
-from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData, Tensor
-from biopb.tensor.serialized_pb2 import SerializedTensor
+import dask.array as da
+import numpy as np
+
+from . import ROI, BinData, ImageData, Mask, Pixels, Point, Rectangle, Tensor
+
 # NOTE: TensorFlightClient is imported lazily inside the lazy_data branch below.
 # It pulls in pyarrow, whose compiled SSE4.2 baseline SIGILLs on pre-SSE4.2 CPUs
 # (e.g. old AMD Opterons). Keeping it out of the module top lets eager/pixels
@@ -246,7 +246,7 @@ def deserialize_to_numpy(
             DeprecationWarning,
             stacklevel=2
         )
-    
+
     return _deserialize_to_numpy(
         pixels,
         singleton_t=singleton_t,
@@ -346,7 +346,7 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
         points = points.reshape(-1, 1, 2)[:, :, ::-1] # reverse x, y
 
         cv2.fillPoly(mask_, [points], color=1)
-    
+
     elif roi_type == 'mask':
         tl = _get_int_point(roi.mask.rectangle.top_left)
         br = _get_int_point(roi.mask.rectangle.bottom_right)
@@ -379,7 +379,7 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
         ROI protobuf message containing the mask data.
     """
     dim = mask.ndim
-    
+
     if dim == 2:
         yp, xp = np.where(mask)
         ymin, xmin = yp.min(), xp.min()
@@ -496,7 +496,7 @@ def _np_from_pb(tensor: Tensor) -> np.ndarray:
             dt = dt.newbyteorder("<")
 
         return dt
-    
+
     np_array = np.frombuffer(
         tensor.bindata.data,
         dtype=_get_dtype(),

@@ -28,7 +28,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     ClaimContext,
@@ -38,7 +37,6 @@ from biopb_tensor_server.discovery import (
 )
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
-
 
 # Tree "scale": (wells, fields, chunks). Smaller chunks => more chunk files per
 # field array, which is what amplifies the pre-#55 cost. Logical source count is

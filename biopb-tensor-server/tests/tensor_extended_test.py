@@ -9,7 +9,6 @@ import tempfile
 
 import numpy as np
 import pytest
-
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 
 
@@ -33,7 +32,6 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
     @pytest.fixture
     def tiled_ome_tiff(self):
         """Create a tiled OME-TIFF with embedded metadata."""
-        import tempfile
 
         import tifffile
 
@@ -195,7 +193,7 @@ class TestOmeZarrAdapter:
         assert len(multiscales) > 0
         print(f"Multiscales datasets: {multiscales[0].get('datasets', [])}")
 
-    
+
     @pytest.mark.skipif(
         not _zarr_available(),
         reason="zarr not available or incompatible numcodecs"
@@ -260,4 +258,3 @@ class TestHdf5Adapter:
             assert tuple(desc.shape) == shape
             assert tuple(desc.chunk_shape) == chunks
 
-    

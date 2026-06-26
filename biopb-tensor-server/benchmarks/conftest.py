@@ -12,21 +12,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 
-import pytest
 import numpy as np
-
-from biopb_tensor_server.config import CacheConfig
+import pytest
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.server import TensorFlightServer
 
 from benchmarks.utils import (
-    S3_TEST_DATA_URL,
-    NFS_TEST_DATA_DIR,
-    generate_synthetic_hcs_plate,
-    generate_synthetic_zarr,
     generate_multiresolution_zarr,
-    generate_synthetic_tiff,
+    generate_synthetic_hcs_plate,
     generate_synthetic_hdf5,
+    generate_synthetic_tiff,
+    generate_synthetic_zarr,
     reset_cache,
 )
 
@@ -284,7 +281,6 @@ class BaselineClient:
     ) -> Any:
         """Get lazy dask array for tensor."""
         import dask.array as da
-        import zarr
 
         spec = self._sources.get(source_id)
         if not spec:
@@ -619,7 +615,7 @@ def data_source(
         source_type = spec.get("type")
 
         # For public S3 buckets, use anonymous access
-        from biopb_tensor_server.remote import CredentialsConfig, CredentialProfile
+        from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
 
         # Create anon credentials profile (empty key/secret triggers anon=True)
         anon_profile = CredentialProfile(

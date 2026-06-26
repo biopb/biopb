@@ -154,7 +154,6 @@ class CacheBackend(ABC):
         Returns:
             CacheEntry with ref_count >= 1, state READY
         """
-        pass
 
     @abstractmethod
     def complete_entry(
@@ -173,7 +172,6 @@ class CacheBackend(ABC):
             data: Computed RecordBatch
             size_bytes: Size of data in bytes
         """
-        pass
 
     @abstractmethod
     def fail_entry(self, key: bytes, error: Exception) -> None:
@@ -183,7 +181,6 @@ class CacheBackend(ABC):
             key: Cache key bytes
             error: Exception that occurred during computation
         """
-        pass
 
     @abstractmethod
     def release(self, key: bytes) -> int:
@@ -195,7 +192,6 @@ class CacheBackend(ABC):
         Returns:
             New reference count
         """
-        pass
 
     @abstractmethod
     def remove(self, key: bytes) -> bool:
@@ -207,22 +203,18 @@ class CacheBackend(ABC):
         Returns:
             True if removed, False if not found or has references
         """
-        pass
 
     @abstractmethod
     def clear(self) -> None:
         """Clear all evictable entries (ref_count <= 0)."""
-        pass
 
     @abstractmethod
     def stats(self) -> CacheStats:
         """Return current cache statistics."""
-        pass
 
     @abstractmethod
     def close(self) -> None:
         """Close backend and release resources."""
-        pass
 
 
 def get_or_compute_with_context(
@@ -246,4 +238,4 @@ def get_or_compute_with_context(
         (CacheEntry, is_owner) where is_owner indicates if caller should
         call complete_entry/fail_entry
     """
-    pass  # Implementation in concrete backend
+    # Implementation in concrete backend

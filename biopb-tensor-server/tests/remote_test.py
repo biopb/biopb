@@ -2,12 +2,9 @@
 
 import json
 import os
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import fsspec
-
+import pytest
 from biopb_tensor_server.discovery import generate_source_id
 from biopb_tensor_server.remote import (
     CredentialProfile,
@@ -18,7 +15,6 @@ from biopb_tensor_server.remote import (
     _get_env_credentials,
     is_remote_url,
 )
-
 
 # =============================================================================
 # CredentialProfile Tests
@@ -527,9 +523,9 @@ class TestZarrAdapterRemote:
     @pytest.fixture
     def memory_zarr(self):
         """Create in-memory zarr dataset."""
+        import numpy as np
         import zarr
         from zarr.storage import FSStore
-        import numpy as np
 
         fs = fsspec.filesystem('memory')
         store = FSStore('test.zarr', fs=fs)
@@ -539,10 +535,9 @@ class TestZarrAdapterRemote:
 
     def test_zarr_adapter_memory_fs(self, memory_zarr):
         """ZarrAdapter works with memory filesystem."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.remote import RemoteStore
         import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+        from biopb_tensor_server.remote import RemoteStore
         from zarr.storage import FSStore
 
         fs, path = memory_zarr
@@ -560,11 +555,11 @@ class TestZarrAdapterRemote:
 
     def test_zarr_adapter_read_data(self, memory_zarr):
         """Read data from remote zarr via adapter."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        import zarr
-        from zarr.storage import FSStore
         import numpy as np
+        import zarr
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+        from zarr.storage import FSStore
 
         fs, path = memory_zarr
 
@@ -664,8 +659,6 @@ class TestZarrAdapterS3Integration:
 
     def test_zarr_adapter_allen_cell_s3(self):
         """Test ZarrAdapter with Allen Cell S3 (as remote store)."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb_tensor_server.config import SourceConfig
 
         # Allen Cell has TIFF files, not zarr, but we can test RemoteStore creation
         url = "s3://allencell/aics/data_handoff_4dn/crop_seg/"

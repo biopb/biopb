@@ -18,11 +18,10 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
 import biopb.image as proto
+import dask.array as da
 import grpc
 import numpy as np
-import dask.array as da
 from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
-from google.protobuf.json_format import MessageToDict
 
 if TYPE_CHECKING:
     from biopb_image_base.server import EmbeddedTensorCache

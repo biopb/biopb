@@ -5,21 +5,18 @@ Relies on OS page cache for raw data caching.
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
-import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim, is_remote_url
+from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.remote import RemoteStore
 
 
 class ZarrAdapter(SourceAdapter, TensorAdapter):
@@ -102,11 +99,11 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
                 pass
 
         return None
-    
+
 
     def get_metadata(self):
         return {}
-    
+
     def get_tensor_adapter(self, tensor_id):
         return self
 
@@ -127,6 +124,7 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         """
         import zarr
         from zarr.storage import FSStore
+
         from biopb_tensor_server.remote import RemoteStore
 
         if source.is_remote:

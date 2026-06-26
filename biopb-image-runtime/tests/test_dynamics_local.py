@@ -6,7 +6,6 @@ fields. Run with: pytest tests/test_dynamics_local.py
 """
 
 import numpy as np
-
 from biopb_image_base import dynamics_local
 
 

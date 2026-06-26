@@ -11,9 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from biopb_tensor_server.http_server import _request_array_id, create_app
 from fastapi.testclient import TestClient
-
-from biopb_tensor_server.http_server import create_app, _request_array_id
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -637,7 +636,6 @@ class TestIntegration:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
         # Create a small Zarr array
@@ -827,6 +825,7 @@ class TestWindowsShutdownListener:
 
     def test_sentinel_path_matches_stop_side_contract(self):
         from pathlib import Path
+
         from biopb_tensor_server.http_server import shutdown_sentinel_path
 
         # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).

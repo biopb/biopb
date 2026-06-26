@@ -7,11 +7,8 @@ Measures performance for:
 """
 
 import concurrent.futures
-import time
-import threading
 
 import pytest
-
 from biopb_tensor_server.metadata_db import MetadataDatabase
 
 

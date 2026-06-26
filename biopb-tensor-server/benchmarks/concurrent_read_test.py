@@ -12,18 +12,17 @@ import atexit
 import concurrent.futures
 import multiprocessing as mp
 import os
-from pathlib import Path
 import queue
 import random
 import threading
 import time
 import traceback
+from pathlib import Path
 from typing import Dict, Iterable, List
 
 import pytest
 
 from benchmarks.conftest import _generate_and_get_path, _register_source_with_server
-
 
 CLIENT_COUNTS = [1, 4, 16]
 READ_EDGE = int(os.environ.get("BIOPB_BENCH_READ_EDGE", "2048"))

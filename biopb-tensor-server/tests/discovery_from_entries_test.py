@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     ClaimContext,

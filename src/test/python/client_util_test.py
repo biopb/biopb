@@ -3,15 +3,13 @@
 Tests utility functions that don't require a live Flight server.
 """
 
-import pytest
-import warnings
-import logging
 import importlib.metadata
-from unittest.mock import MagicMock, patch
+import warnings
+from unittest.mock import patch
 
 import pyarrow as pa
-
-from biopb.tensor.client import _parse_version, _check_schema_version
+import pytest
+from biopb.tensor.client import _check_schema_version, _parse_version
 
 
 class TestParseVersion:

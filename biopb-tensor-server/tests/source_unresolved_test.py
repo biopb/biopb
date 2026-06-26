@@ -9,7 +9,6 @@ import os
 import tempfile
 
 import pytest
-
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.base import _get_read_plan, require_resolved
 from biopb_tensor_server.errors import SourceUnresolvedError
@@ -61,7 +60,6 @@ class TestResolvedAdapterRegression:
 
     def _make_adapter(self, tmpdir):
         import zarr
-
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
         zarr_path = os.path.join(tmpdir, "test.zarr")
@@ -91,7 +89,6 @@ class TestRemoteSourceResidency:
 
     def test_remote_url_not_resident(self):
         import zarr
-
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
         with tempfile.TemporaryDirectory() as tmpdir:

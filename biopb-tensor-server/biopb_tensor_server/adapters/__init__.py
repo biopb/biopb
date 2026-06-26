@@ -15,8 +15,8 @@ from biopb_tensor_server.discovery import AdapterRegistry
 from .hdf5 import Hdf5Adapter
 from .ome_zarr import OmeZarrAdapter
 from .tiff import (
-    TiffSequenceAdapter,
     MicroManagerLegacyAdapter,
+    TiffSequenceAdapter,
 )
 from .zarr import ZarrAdapter
 
@@ -29,14 +29,14 @@ except ImportError:
 # Optional aicsimageio adapters (format-specific subclasses)
 try:
     from .aicsimageio import (
-        OmeTiffAdapter,
-        ZeissAdapter,
+        AicsImageIoAdapter,
+        BioformatsAdapter,
+        DvAdapter,
         LeicaAdapter,
         NikonAdapter,
-        DvAdapter,
         OlympusAdapter,
-        BioformatsAdapter,
-        AicsImageIoAdapter,
+        OmeTiffAdapter,
+        ZeissAdapter,
     )
 except ImportError:
     OmeTiffAdapter = None  # type: ignore

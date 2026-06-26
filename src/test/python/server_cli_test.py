@@ -8,10 +8,9 @@ tests are deterministic and fast on any platform; time.sleep is neutralized.
 import json
 from unittest.mock import MagicMock, patch
 
+import biopb.cli as cli
 import pytest
 from typer.testing import CliRunner
-
-import biopb.cli as cli
 
 
 @pytest.fixture(autouse=True)

@@ -2,7 +2,6 @@ from concurrent import futures
 
 import biopb.image as proto
 import grpc
-
 from biopb.image.utils import deserialize_to_numpy, serialize_from_numpy
 from cellpose import models
 
@@ -23,7 +22,7 @@ def process_result(preds):
         masks, flows, styles, _ = preds
     except:
         masks, flows, styles = preds
-    
+
     pixels = serialize_from_numpy(masks)
 
     response = proto.ProcessResponse(
@@ -46,7 +45,7 @@ class CellposeServicer(proto.ProcessImageServicer):
             response = process_result(preds)
 
             return response
-        
+
         except Exception as e:
 
             context.abort(grpc.StatusCode.UNKNOWN, f"prediction failed with error: {repr(e)}")

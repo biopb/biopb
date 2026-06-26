@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
@@ -20,7 +20,6 @@ from biopb_tensor_server.downsample import normalize_reduction_method
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.remote import RemoteStore
 
 
 logger = logging.getLogger(__name__)
@@ -156,6 +155,7 @@ class OmeZarrAdapter(ZarrAdapter):
             OmeZarrAdapter instance
         """
         import json
+
         import zarr
         from fsspec.core import url_to_fs
 
@@ -377,7 +377,7 @@ class OmeZarrAdapter(ZarrAdapter):
                         plate_root_path = current_path
                         zattrs_path = candidate_zattrs_path
                         zattrs = candidate_zattrs
-                except (json.JSONDecodeError, IOError):
+                except (OSError, json.JSONDecodeError):
                     pass
 
             # Move up one level; stop at the filesystem root. Comparing against
@@ -459,7 +459,7 @@ class OmeZarrAdapter(ZarrAdapter):
                         images = well_info.get('images', [])
                         if len(images) > field_count:
                             field_count = len(images)
-                except (json.JSONDecodeError, IOError):
+                except (OSError, json.JSONDecodeError):
                     pass
 
         self._hcs_field_count = field_count
@@ -490,7 +490,7 @@ class OmeZarrAdapter(ZarrAdapter):
                                 if 'omero' in field_zattrs:
                                     channels = field_zattrs['omero'].get('channels', [])
                                     self.channel_names = [ch.get('label', f'ch{i}') for i, ch in enumerate(channels)]
-                    except (json.JSONDecodeError, IOError):
+                    except (OSError, json.JSONDecodeError):
                         pass
 
     def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
@@ -568,7 +568,7 @@ class OmeZarrAdapter(ZarrAdapter):
                                         ax.get('name', f'dim{i}') if isinstance(ax, dict) else str(ax)
                                         for i, ax in enumerate(axes)
                                     ]
-                    except (json.JSONDecodeError, IOError):
+                    except (OSError, json.JSONDecodeError):
                         pass
 
                 descriptors.append(TensorDescriptor(
@@ -851,7 +851,7 @@ class OmeZarrAdapter(ZarrAdapter):
                         datasets = multiscales[0].get('datasets', [])
                         if datasets:
                             resolution_path = datasets[0].get('path', '0')
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 pass
 
         # Open the field's resolution array
@@ -878,7 +878,7 @@ class OmeZarrAdapter(ZarrAdapter):
                                 ax.get('name', f'dim{i}') if isinstance(ax, dict) else str(ax)
                                 for i, ax in enumerate(axes)
                             ]
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 pass
 
         # Create adapter for this field

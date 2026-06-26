@@ -22,18 +22,16 @@ from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
-from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (
     CacheConfig,
-    MetadataDbConfig,
     ServerConfig,
     SourceConfig,
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
+from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.metadata_db import MetadataDatabase

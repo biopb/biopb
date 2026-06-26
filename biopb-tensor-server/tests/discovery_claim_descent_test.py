@@ -10,11 +10,9 @@ These tests pin the new claim-feedback behavior: once a directory is claimed,
 its subtree is never walked or probed.
 """
 
-import os
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     discover_sources,

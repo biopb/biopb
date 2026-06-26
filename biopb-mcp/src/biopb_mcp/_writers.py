@@ -40,8 +40,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 # Axis-typing convention -- mirrors biopb_tensor_server.server
 # ._build_minimal_ome_metadata so written axes round-trip through OmeZarrAdapter.
 _SPACE = ("x", "y", "z")

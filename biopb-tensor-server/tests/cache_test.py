@@ -9,14 +9,12 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-
 from biopb_tensor_server.cache import (
     MAX_ARROW_BATCH_BYTES,
     CacheEntry,
     CacheManager,
     EntryState,
     MemoryCacheBackend,
-    PoolStats,
 )
 from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_MEDIUM_THRESHOLD,
@@ -24,8 +22,8 @@ from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
-    _get_size_class,
     K,
+    _get_size_class,
 )
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.recovery import (

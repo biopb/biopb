@@ -17,7 +17,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, IO, Iterator, List, Optional, Set, Tuple
+from typing import IO, Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -331,7 +331,7 @@ class RemoteStore:
         url: str,
         credentials_config: Optional[CredentialsConfig] = None,
         profile_name: Optional[str] = None,
-    ) -> "RemoteStore":
+    ) -> RemoteStore:
         """Create RemoteStore from configuration.
 
         Args:

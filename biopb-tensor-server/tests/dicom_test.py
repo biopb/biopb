@@ -1,19 +1,17 @@
 """Tests for DICOM adapters."""
 
-import struct
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pytest
-
 from biopb_tensor_server.adapters.dicom import (
     DicomAdapter,
     DicomSeriesAdapter,
     _derive_orientation_from_iop,
 )
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
+from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads DICOM via pydicom (the [dicom]/[medical] extra);
 # skip the whole module when it is not installed rather than erroring.
@@ -60,7 +58,6 @@ def create_synthetic_dicom(
         patient_name: Optional PatientName
         multi_frame: Number of frames (0 for single frame)
     """
-    import pydicom
     from pydicom.dataset import Dataset, FileDataset
     from pydicom.uid import generate_uid
 
@@ -192,7 +189,6 @@ class TestDicomAdapterClaim:
 
     def test_claim_dicom_without_pixel_data(self):
         """Test that DICOM files without image tags are not claimed."""
-        import pydicom
         from pydicom.dataset import Dataset, FileDataset
         from pydicom.uid import generate_uid
 
@@ -279,7 +275,7 @@ class TestDicomAdapter:
             assert len(desc.shape) == 2
             assert desc.dtype == 'uint16'
 
-    
+
     def test_get_metadata(self):
         import pydicom
 
@@ -330,7 +326,6 @@ class TestDicomSeriesAdapterClaim:
     """Tests for DicomSeriesAdapter.claim()."""
 
     def test_claim_valid_series(self):
-        import pydicom
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -370,7 +365,6 @@ class TestDicomSeriesAdapterClaim:
 
     def test_claim_mixed_series(self):
         """Directory with DICOMs from different series."""
-        import pydicom
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -400,7 +394,6 @@ class TestDicomSeriesAdapter:
     """Tests for DicomSeriesAdapter functionality."""
 
     def test_init_and_shape(self):
-        import pydicom
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -450,7 +443,6 @@ class TestDicomSeriesAdapter:
                 assert ds.InstanceNumber == expected_order[i]
 
     def test_get_tensor_descriptor(self):
-        import pydicom
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -474,9 +466,8 @@ class TestDicomSeriesAdapter:
             assert desc.shape == [num_slices, rows, cols]
             assert desc.chunk_shape == [1, rows, cols]
 
-    
+
     def test_get_metadata(self):
-        import pydicom
         from pydicom.uid import generate_uid
 
         with tempfile.TemporaryDirectory() as tmpdir:

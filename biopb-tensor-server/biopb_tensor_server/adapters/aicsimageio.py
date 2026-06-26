@@ -32,14 +32,13 @@ import weakref
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 logger = logging.getLogger(__name__)
@@ -943,7 +942,7 @@ class OmeTiffAdapter(_AicsImageIoAdapterBase):
         # Requires bioformats_jar dependency
         if name.endswith(".companion.ome"):
             try:
-                import bioformats_jar
+                import bioformats_jar  # noqa: F401  # availability probe
             except ImportError:
                 return None
 

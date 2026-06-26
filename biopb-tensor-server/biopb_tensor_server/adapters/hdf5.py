@@ -3,15 +3,13 @@
 Relies on OS page cache for raw data caching.
 """
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
