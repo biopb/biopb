@@ -723,11 +723,12 @@ def restart(
     ),
 ):
     """Restart TensorFlight server daemon."""
-    # Stop first
-    pid, token = _read_pid_record(PID_FILE)
-    if _is_our_daemon(pid, token):
+    # Stop first. Use id_token (the PID-record identity token) so we don't clobber
+    # the `token` access-token parameter, which must be passed through to start().
+    pid, id_token = _read_pid_record(PID_FILE)
+    if _is_our_daemon(pid, id_token):
         console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        _graceful_stop(pid, timeout, token)
+        _graceful_stop(pid, timeout, id_token)
         time.sleep(1)
 
     # Start with same options
