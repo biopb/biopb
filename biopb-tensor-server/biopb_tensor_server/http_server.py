@@ -916,7 +916,7 @@ def create_app(
 
             # Use shape-based fallback if dim_labels not found
             if not dim_labels:
-                dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
+                dim_labels = [f"d{i}" for i in range(arr.ndim)]
 
             logger.debug(
                 f"render: computed shape={arr.shape}, dtype={arr.dtype}, size={arr.nbytes}B, "
@@ -1108,7 +1108,7 @@ def create_app(
                     # Get dim_labels from descriptor
                     dim_labels: List[str] = list(ctx.descriptor.dim_labels)
                     if not dim_labels:
-                        dim_labels = [f"d{i}" for i in range(arr.ndim)]
+                        dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
 
                     # Build axis map to find Y and X indices
                     y_idx = (
