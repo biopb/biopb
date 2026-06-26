@@ -6,7 +6,6 @@ fields. Run with: pytest tests/test_dynamics_local.py
 """
 
 import numpy as np
-
 from biopb_image_base import dynamics_local
 
 
@@ -32,16 +31,12 @@ def test_cluster_two_distinct_destinations():
     """Two well-separated destination clusters -> two labels."""
     shape0 = (40, 40)
     # 20 pixels flowing to (10,10), 20 flowing to (30,30).
-    p = np.array(
-        [[10] * 20 + [30] * 20, [10] * 20 + [30] * 20], dtype="float32"
-    )
+    p = np.array([[10] * 20 + [30] * 20, [10] * 20 + [30] * 20], dtype="float32")
     # foreground indices: arbitrary distinct pixels (identity not used by cluster
     # beyond placement), put them at the destinations for simplicity.
     inds = (p[0].astype(int), p[1].astype(int))
 
-    labels, info = dynamics_local.cluster_destinations(
-        p, inds, shape0, min_count=4
-    )
+    labels, info = dynamics_local.cluster_destinations(p, inds, shape0, min_count=4)
 
     assert len(info) == 2
     # Two non-background labels present.

@@ -147,9 +147,7 @@ def _generate_label(
         _render_meshes(response, label, post_process=post_process)
 
     else:
-        raise ValueError(
-            f"supplied label template is not 2d or 3d: {label.shape}"
-        )
+        raise ValueError(f"supplied label template is not 2d or 3d: {label.shape}")
 
     return label
 

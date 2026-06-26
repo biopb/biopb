@@ -443,11 +443,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     mismatches) replace wholesale.
     """
     for key, value in override.items():
-        if (
-            key in base
-            and isinstance(base[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _deep_merge(base[key], value)
         else:
             base[key] = value
@@ -517,9 +513,7 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     # Unique per process *and* thread so two concurrent writers never collide on
     # the temp file (CONFIG._save serializes them under the lock, but this keeps
     # the helper safe if called directly, e.g. via save_config).
-    tmp = path.with_name(
-        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with tmp.open("w") as f:
             json.dump(data, f, indent=2)
@@ -655,9 +649,7 @@ def save_config(config: dict) -> None:
     CONFIG.reload()
 
 
-def get_grid_params(
-    is_3d: bool, config: dict
-) -> Tuple[np.ndarray, np.ndarray]:
+def get_grid_params(is_3d: bool, config: dict) -> Tuple[np.ndarray, np.ndarray]:
     """Get grid size and stride from config.
 
     Args:
@@ -668,10 +660,6 @@ def get_grid_params(
         Tuple of (grid_size, stride) as numpy arrays.
     """
     prefix = "3d" if is_3d else "2d"
-    grid_size = np.array(
-        get_setting(config, f"widget.grid.{prefix}_size"), dtype=int
-    )
-    stride = np.array(
-        get_setting(config, f"widget.grid.{prefix}_stride"), dtype=int
-    )
+    grid_size = np.array(get_setting(config, f"widget.grid.{prefix}_size"), dtype=int)
+    stride = np.array(get_setting(config, f"widget.grid.{prefix}_stride"), dtype=int)
     return grid_size, stride

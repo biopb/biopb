@@ -183,9 +183,7 @@ class ResultBuilder:
             position: Dict mapping numeric dim indices to index values
             chunk: Result chunk array (5D TZCYX from server)
         """
-        logger.debug(
-            f"Adding chunk with shape {chunk.shape} at position {position}"
-        )
+        logger.debug(f"Adding chunk with shape {chunk.shape} at position {position}")
 
         if self.buffer is None:
             output_shape = self._infer_output_shape(chunk)

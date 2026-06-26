@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.base import BackendAdapter
+    pass
 
 
 @dataclass
@@ -37,6 +37,7 @@ class ChunkEndpoint:
         chunk_id: Backend-specific chunk identifier (bytes)
         bounds: Array coordinates (start, stop) for this chunk
     """
+
     chunk_id: bytes
     bounds: ChunkBounds
 
@@ -61,25 +62,25 @@ def encode_chunk_id(
     Returns:
         Encoded chunk_id bytes
     """
-    array_id_bytes = array_id.encode('utf-8')
+    array_id_bytes = array_id.encode("utf-8")
     ndim = len(bounds.start)
 
     parts = [
-        struct.pack('>I', len(array_id_bytes)),
+        struct.pack(">I", len(array_id_bytes)),
         array_id_bytes,
-        struct.pack('>H', ndim),
+        struct.pack(">H", ndim),
     ]
 
     for val in bounds.start:
-        parts.append(struct.pack('>q', int(val)))
+        parts.append(struct.pack(">q", int(val)))
     for val in bounds.stop:
-        parts.append(struct.pack('>q', int(val)))
+        parts.append(struct.pack(">q", int(val)))
 
-    return b''.join(parts)
+    return b"".join(parts)
 
 
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
-    """Decode array_id and bounds from chunk_id. Works for both regular 
+    """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload).
 
     Args:
@@ -88,24 +89,25 @@ def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     Returns:
         Tuple of (array_id, bounds)
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
-    array_id = chunk_id[4:4+array_id_len].decode('utf-8')
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
     offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset+2])[0]
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
     offset += 2
 
     start = []
     for _ in range(ndim):
-        start.append(struct.unpack('>q', chunk_id[offset:offset+8])[0])
+        start.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
         offset += 8
 
     stop = []
     for _ in range(ndim):
-        stop.append(struct.unpack('>q', chunk_id[offset:offset+8])[0])
+        stop.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
         offset += 8
 
     from biopb.tensor.ticket_pb2 import ChunkBounds
+
     bounds = ChunkBounds(start=start, stop=stop)
 
     return array_id, bounds
@@ -246,7 +248,7 @@ def _choose_split_axis(
     Returns:
         Axis index to split along
     """
-    SPATIAL_LABELS = {'y', 'x', 'z', 'c'}
+    SPATIAL_LABELS = {"y", "x", "z", "c"}
 
     # Build label -> axis mapping (case-insensitive)
     label_to_axis: Dict[str, int] = {}
@@ -262,22 +264,24 @@ def _choose_split_axis(
                 non_spatial_candidates.append(ax)
     else:
         # No labels: treat all axes as non-spatial candidates, pick largest
-        non_spatial_candidates = [ax for ax in range(len(shape)) if shape[ax] >= n_splits]
+        non_spatial_candidates = [
+            ax for ax in range(len(shape)) if shape[ax] >= n_splits
+        ]
 
     if non_spatial_candidates:
         return max(non_spatial_candidates, key=lambda ax: shape[ax])
 
     # Priority 2: 'c' (channel)
-    if 'c' in label_to_axis and shape[label_to_axis['c']] >= n_splits:
-        return label_to_axis['c']
+    if "c" in label_to_axis and shape[label_to_axis["c"]] >= n_splits:
+        return label_to_axis["c"]
 
     # Priority 3: 'z' (depth)
-    if 'z' in label_to_axis and shape[label_to_axis['z']] >= n_splits:
-        return label_to_axis['z']
+    if "z" in label_to_axis and shape[label_to_axis["z"]] >= n_splits:
+        return label_to_axis["z"]
 
     # Priority 4: Larger of 'y' or 'x' (preserve spatial plane integrity)
-    y_axis = label_to_axis.get('y')
-    x_axis = label_to_axis.get('x')
+    y_axis = label_to_axis.get("y")
+    x_axis = label_to_axis.get("x")
     if y_axis is not None and x_axis is not None:
         if shape[y_axis] >= n_splits and shape[x_axis] >= n_splits:
             return y_axis if shape[y_axis] >= shape[x_axis] else x_axis
@@ -354,14 +358,16 @@ def encode_chunk_id_with_scale(
     """
     base = encode_chunk_id(array_id, bounds)
 
-    method_bytes = reduction_method.encode('utf-8')
+    method_bytes = reduction_method.encode("utf-8")
     ndim = len(scale_hint)
 
-    scale_payload = b''.join([
-        b''.join(struct.pack('>q', s) for s in scale_hint),
-        struct.pack('>H', len(method_bytes)),
-        method_bytes,
-    ])
+    scale_payload = b"".join(
+        [
+            b"".join(struct.pack(">q", s) for s in scale_hint),
+            struct.pack(">H", len(method_bytes)),
+            method_bytes,
+        ]
+    )
 
     return base + scale_payload
 
@@ -375,9 +381,9 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
     Returns:
         True if chunk_id contains scale info
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset + 2])[0]
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
     bounds_end = offset + 2 + ndim * 8 + ndim * 8
     return len(chunk_id) > bounds_end
 
@@ -391,20 +397,26 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     Returns:
         Tuple of (scale_hint, reduction_method)
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset + 2])[0]
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
     bounds_end = offset + 2 + ndim * 8 + ndim * 8
 
     # Decode scale_hint
     scale_hint = []
     for ax in range(ndim):
-        scale_hint.append(struct.unpack('>q', chunk_id[bounds_end + ax*8:bounds_end + ax*8 + 8])[0])
+        scale_hint.append(
+            struct.unpack(
+                ">q", chunk_id[bounds_end + ax * 8 : bounds_end + ax * 8 + 8]
+            )[0]
+        )
 
     # Decode method
     method_offset = bounds_end + ndim * 8
-    method_len = struct.unpack('>H', chunk_id[method_offset:method_offset + 2])[0]
-    method = chunk_id[method_offset + 2:method_offset + 2 + method_len].decode('utf-8')
+    method_len = struct.unpack(">H", chunk_id[method_offset : method_offset + 2])[0]
+    method = chunk_id[method_offset + 2 : method_offset + 2 + method_len].decode(
+        "utf-8"
+    )
 
     return tuple(scale_hint), method
 
@@ -481,7 +493,7 @@ def compute_pyramid_scale_hints(
     if ndim < 2:
         return [[1] * ndim]
 
-    budget = pixel_budget_cubic_root ** 3
+    budget = pixel_budget_cubic_root**3
     floor = min(pixel_budget_cubic_root, threshold)
 
     y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
@@ -652,7 +664,7 @@ def _choose_split_axis_excluding(
 
     Returns None if no eligible axis can accommodate n_splits.
     """
-    SPATIAL_LABELS = {'y', 'x', 'z', 'c'}
+    SPATIAL_LABELS = {"y", "x", "z", "c"}
 
     # Build label -> axis mapping
     label_to_axis: Dict[str, int] = {}
@@ -661,8 +673,9 @@ def _choose_split_axis_excluding(
             label_to_axis[label.lower()] = ax
 
     # Eligible axes: not excluded and large enough for splits
-    eligible = [ax for ax in range(len(shape))
-                if ax not in exclude_axes and shape[ax] >= 2]
+    eligible = [
+        ax for ax in range(len(shape)) if ax not in exclude_axes and shape[ax] >= 2
+    ]
 
     if not eligible:
         return None
@@ -681,20 +694,20 @@ def _choose_split_axis_excluding(
         return max(non_spatial, key=lambda ax: shape[ax])
 
     # Priority 2: 'c' (channel)
-    if 'c' in label_to_axis:
-        c_ax = label_to_axis['c']
+    if "c" in label_to_axis:
+        c_ax = label_to_axis["c"]
         if c_ax in eligible:
             return c_ax
 
     # Priority 3: 'z' (depth)
-    if 'z' in label_to_axis:
-        z_ax = label_to_axis['z']
+    if "z" in label_to_axis:
+        z_ax = label_to_axis["z"]
         if z_ax in eligible:
             return z_ax
 
     # Priority 4: Larger of 'y' or 'x'
-    y_ax = label_to_axis.get('y')
-    x_ax = label_to_axis.get('x')
+    y_ax = label_to_axis.get("y")
+    x_ax = label_to_axis.get("x")
     y_eligible = y_ax in eligible if y_ax else False
     x_eligible = x_ax in eligible if x_ax else False
 

@@ -8,10 +8,9 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-
 
 # =============================================================================
 # Test data configuration (environment variables)
@@ -19,7 +18,7 @@ import numpy as np
 
 S3_TEST_DATA_URL = os.environ.get(
     "S3_TEST_DATA_URL",
-    "s3://idr-public/ngff/6001240.zarr"  # IDR public OME-Zarr sample
+    "s3://idr-public/ngff/6001240.zarr",  # IDR public OME-Zarr sample
 )
 
 NFS_TEST_DATA_DIR = os.environ.get("NFS_TEST_DATA_DIR", "/data/microscopy")
@@ -64,7 +63,9 @@ def get_cache_stats() -> Dict:
         "hits": stats.hits,
         "misses": stats.misses,
         "evictions": stats.evictions,
-        "hit_rate": stats.hits / (stats.hits + stats.misses) if (stats.hits + stats.misses) > 0 else 0.0,
+        "hit_rate": stats.hits / (stats.hits + stats.misses)
+        if (stats.hits + stats.misses) > 0
+        else 0.0,
     }
 
 
@@ -244,7 +245,7 @@ def generate_multiresolution_zarr(
     datasets = []
 
     for level in range(n_levels):
-        scale_factor = 2 ** level
+        scale_factor = 2**level
         level_shape = (
             max(1, base_shape[0] // scale_factor),
             max(1, base_shape[1] // scale_factor),
@@ -260,21 +261,28 @@ def generate_multiresolution_zarr(
         # Fill with distinguishable data per level
         arr[:] = level * 100
 
-        datasets.append({
-            "path": str(level),
-            "coordinateTransformations": [
-                {"type": "scale", "scale": [scale_factor, scale_factor]}
-            ]
-        })
+        datasets.append(
+            {
+                "path": str(level),
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [scale_factor, scale_factor]}
+                ],
+            }
+        )
 
     # Write OME-Zarr metadata
     ome_meta = {
-        "multiscales": [{
-            "name": "synthetic-pyramid",
-            "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
-            "datasets": datasets,
-            "version": "0.4",
-        }]
+        "multiscales": [
+            {
+                "name": "synthetic-pyramid",
+                "axes": [
+                    {"name": "y", "type": "space"},
+                    {"name": "x", "type": "space"},
+                ],
+                "datasets": datasets,
+                "version": "0.4",
+            }
+        ]
     }
 
     zattrs_path = zarr_path / ".zattrs"
@@ -357,7 +365,7 @@ def measure_read_time(arr, slice_tuple: Tuple[slice, ...]) -> float:
     start = time.perf_counter()
     sliced = arr[slice_tuple]
     # Handle both dask arrays (need .compute()) and numpy/zarr (direct)
-    if hasattr(sliced, 'compute'):
+    if hasattr(sliced, "compute"):
         sliced.compute()
     elapsed = time.perf_counter() - start
     return elapsed

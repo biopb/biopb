@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     ClaimContext,
@@ -84,7 +83,9 @@ class TestEquivalenceWithWalk:
         nested, _, _ = create_multiresolution_ome_zarr(str(tmp_path / "a" / "b"))
 
         walked = discover_sources(tmp_path, get_default_registry())
-        snap = discover_sources_from_entries(_snapshot(tmp_path), get_default_registry())
+        snap = discover_sources_from_entries(
+            _snapshot(tmp_path), get_default_registry()
+        )
 
         assert {c.primary_path for c in snap.claims.values()} == {
             c.primary_path for c in walked.claims.values()
@@ -130,7 +131,11 @@ class TestPruning:
         )
 
         assert state.claims == {}
-        under_skip = [p for p in seen if skip.resolve() in Path(p).parents or Path(p) == skip.resolve()]
+        under_skip = [
+            p
+            for p in seen
+            if skip.resolve() in Path(p).parents or Path(p) == skip.resolve()
+        ]
         assert under_skip == [], f"probed under skipped dir: {under_skip[:5]} ..."
 
     def test_path_filter_false_dir_prunes_subtree(self, tmp_path):

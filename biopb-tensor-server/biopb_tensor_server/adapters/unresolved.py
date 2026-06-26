@@ -235,7 +235,9 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 f"(re-claim recall/IO failed): {e}"
             ) from e
         except Exception as e:  # a non-IO claim error: no claim, keep the guess
-            logger.debug("re-claim during resolution failed for %s: %s", self.source_id, e)
+            logger.debug(
+                "re-claim during resolution failed for %s: %s", self.source_id, e
+            )
             claims = []
         if claims:
             claim = claims[0]

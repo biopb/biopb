@@ -121,7 +121,10 @@ def process_create_time(pid: int) -> Optional[int]:
             ]
             kernel32.GetProcessTimes.restype = wintypes.BOOL
             creation, exit_t, kernel_t, user_t = (
-                _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME(),
+                _FILETIME(),
+                _FILETIME(),
+                _FILETIME(),
+                _FILETIME(),
             )
             if not kernel32.GetProcessTimes(
                 handle,
@@ -138,7 +141,7 @@ def process_create_time(pid: int) -> Optional[int]:
         # parse the fields after the LAST ')': index 19 of those is starttime.
         try:
             data = Path(f"/proc/{pid}/stat").read_bytes()
-            fields = data[data.rfind(b")") + 2:].split()
+            fields = data[data.rfind(b")") + 2 :].split()
             return int(fields[19])
         except (OSError, ValueError, IndexError):
             return None

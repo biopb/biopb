@@ -84,3 +84,75 @@ biopb = { workspace = true }
 biopb-image-base = { workspace = true }
 biopb-tensor-server = { workspace = true }
 biopb-mcp = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Single source of truth for Python lint + format across the whole monorepo.
+# ruff resolves config hierarchically, so this root [tool.ruff] applies to all
+# four workspace packages (root client, image-runtime, tensor-server, mcp) —
+# the per-package ruff/black blocks were removed in favor of this (issue #82).
+#
+# Rule set = the union of what the packages used before: mcp's rich select
+# (E/F/W/UP/I/B/SIM/...) plus tensor-server's F401+I, carrying mcp's ignore
+# list globally to keep the initial migration to format churn + autofixes
+# rather than a 2000-finding rewrite. Tighten (drop ignores) in follow-ups.
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+fix = true  # `ruff check` autofixes by default (pre-commit relies on it); CI passes --no-fix.
+
+exclude = [
+    ".bzr", ".direnv", ".eggs", ".git", ".mypy_cache", ".pants.d",
+    ".ruff_cache", ".svn", ".tox", ".venv", "__pypackages__",
+    "_build", "buck-out", "build", "dist", "node_modules", "venv",
+    "*vendored*", "*_vendor*",
+    "_version.py",  # setuptools_scm-generated, per package
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", # pycodestyle + pyflakes
+    "UP",  # pyupgrade
+    "I",   # isort
+    "BLE", # flake8-blind-exception
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "C4",  # flake8-comprehensions
+    "ISC", # flake8-implicit-str-concat
+    "G",   # flake8-logging-format
+    "PIE", # flake8-pie
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",            # line too long — ruff format handles wrapping.
+    "UP006", "UP007",  # runtime type annotations: magicgui (mcp) requires them.
+    "UP045",           # Optional[X] -> X | None: same runtime-annotation family as UP006/UP007.
+    "UP035",           # deprecated-import: keep typing.List/Dict, consistent with UP006/UP007.
+    "SIM117",          # nested with-statements — some don't read well post-format; revisit.
+    "SIM105",          # suppressible-exception — keep explicit try/except/pass in cleanup paths.
+    "BLE001",          # blind-except — intentional best-effort cleanup paths must never propagate.
+    "G004",            # logging-f-string — stylistic; codebase mixes f-string and lazy %-style.
+    "B904",            # raise-without-from-inside-except — a few deliberate re-raises.
+
+    # --- Staged: rules that newly fire on the previously unlinted packages /
+    # test suites. Deferred to keep the #82 migration mechanical (format +
+    # autofix), NOT a verdict that they're noise. F401 and F821 (the rule that
+    # caught the http_server NameError) stay ENFORCED. Tracked follow-ups to fix
+    # the findings and re-enable the rest:
+    #   #162 — correctness/likely-bugs: F841, F811, B023
+    #   #163 — flake8-bugbear:          B905, B007, B008, B017, B018, B028, B011
+    #   #164 — style/simplify:          SIM*, C4*, A002, G201, PIE810, E712, E722
+    "F841", "F811",
+    "B905", "B007", "B008", "B023", "B028", "B018", "B017", "B011",
+    "A002", "G201", "PIE810",
+    "SIM102", "SIM108", "SIM113", "SIM115", "SIM118", "SIM210",
+    "C401", "C408", "C416",
+    "E712", "E722",
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+force-single-line = false
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export aggregator hubs: imports exist to re-export, not for local use.
+"__init__.py" = ["F401"]

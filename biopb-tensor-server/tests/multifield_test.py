@@ -7,11 +7,9 @@ import warnings
 import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
-
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.base import (
     BackendAdapter,
-    ChunkEndpoint,
     DataSourceDescriptor,
     TensorDescriptor,
 )
@@ -68,12 +66,14 @@ class MockMultifieldAdapter(BackendAdapter):
         """Return descriptors for all tensors - multifield override."""
         descriptors = []
         for tensor_id, shape, dtype in self.tensor_specs:
-            descriptors.append(TensorDescriptor(
-                array_id=tensor_id,
-                shape=list(shape),
-                chunk_shape=list(shape),  # Single chunk per tensor
-                dtype=dtype,
-            ))
+            descriptors.append(
+                TensorDescriptor(
+                    array_id=tensor_id,
+                    shape=list(shape),
+                    chunk_shape=list(shape),  # Single chunk per tensor
+                    dtype=dtype,
+                )
+            )
         return descriptors
 
     def get_tensor_adapter(self, tensor_id: str) -> BackendAdapter:
@@ -92,13 +92,14 @@ class MockMultifieldAdapter(BackendAdapter):
             metadata_json="",  # Not populated; returned via GetFlightInfo instead
         )
 
-    
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
 
     def get_data(self, bounds):
         """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
-        raise NotImplementedError("MockMultifieldAdapter.get_data() should not be called directly")
+        raise NotImplementedError(
+            "MockMultifieldAdapter.get_data() should not be called directly"
+        )
 
 
 class MockSingleTensorAdapter(BackendAdapter):
@@ -117,8 +118,8 @@ class MockSingleTensorAdapter(BackendAdapter):
     def __init__(self, array_id: str, shape: tuple, dtype: str, value: int = 0):
         # Parse array_id to get source_id and tensor_name
         # array_id format: source_id/tensor_name for multi-tensor
-        if '/' in array_id:
-            self.source_id, self._tensor_name = array_id.split('/', 1)
+        if "/" in array_id:
+            self.source_id, self._tensor_name = array_id.split("/", 1)
         else:
             self.source_id = array_id
             self._tensor_name = None
@@ -143,7 +144,9 @@ class MockSingleTensorAdapter(BackendAdapter):
     def get_data(self, bounds) -> np.ndarray:
         """Return mock data within bounds."""
         super().get_data(bounds)
-        shape = tuple(int(stop - start) for start, stop in zip(bounds.start, bounds.stop))
+        shape = tuple(
+            int(stop - start) for start, stop in zip(bounds.start, bounds.stop)
+        )
         return np.full(shape, self.value, dtype=self.dtype)
 
     def get_metadata(self) -> dict:
@@ -611,7 +614,9 @@ class TestFieldWithinSource:
     field the adapters key on (identity policy, server-free)."""
 
     def test_strips_source_qualified_prefix(self):
-        assert TensorFlightServer._field_within_source("src", "src/Image:0") == "Image:0"
+        assert (
+            TensorFlightServer._field_within_source("src", "src/Image:0") == "Image:0"
+        )
 
     def test_hierarchical_field_keeps_inner_slashes(self):
         # HCS: array_id = source/well/field; split only on the first '/'.

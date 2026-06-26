@@ -8,7 +8,6 @@ opened. The end-to-end resolve-on-serve path is covered by the server suite.
 """
 
 import pytest
-
 from biopb.tensor.client import ResolveCancelled, TensorFlightClient
 from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
@@ -219,12 +218,8 @@ class TestPhysicalScaleUnresolvedGuard:
             physical_scale=[0.5, 0.25],
             physical_unit=["um", "um"],
         )
-        client._sources = {
-            "r": DataSourceDescriptor(source_id="r", tensors=[td])
-        }
-        monkeypatch.setattr(
-            client, "_fetch_tensor_descriptor", lambda *a, **k: td
-        )
+        client._sources = {"r": DataSourceDescriptor(source_id="r", tensors=[td])}
+        monkeypatch.setattr(client, "_fetch_tensor_descriptor", lambda *a, **k: td)
         scale, unit = client.get_physical_scale("r")
         assert scale == [0.5, 0.25]
         assert unit == ["um", "um"]

@@ -7,29 +7,28 @@ Commands:
 
 import sys
 import time
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 import grpc
-import typer
 import imageio
+import typer
+from google.protobuf import empty_pb2
 from rich.console import Console
 from rich.table import Table
 
-from google.protobuf import empty_pb2
-
 from biopb.image import (
+    ImageData,
+    OpNames,
+    OpSchema,
     ProcessImageStub,
     ProcessRequest,
     ProcessResponse,
-    OpNames,
-    OpSchema,
 )
 from biopb.image.utils import (
-    serialize_from_numpy_to_image_data,
     deserialize_image_data,
+    serialize_from_numpy_to_image_data,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
-
 
 app = typer.Typer(
     name="image",
@@ -116,7 +115,7 @@ def _parse_input(input_path: Optional[str]) -> tuple[bool, bytes]:
         return (True, input_path)
 
 
-def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageData":
+def _build_image_data(is_file: bool, data_or_path: str) -> "ImageData":
     """Build ImageData from file path or raw bytes.
 
     Args:
@@ -126,7 +125,6 @@ def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageDat
     Returns:
         ImageData protobuf message
     """
-    from biopb.image import ImageData
 
     if is_file:
         # Try imageio for image files
@@ -149,19 +147,16 @@ def _build_image_data(is_file: bool, data_or_path: str) -> "biopb.image.ImageDat
         return _parse_bytes_to_image_data(data_or_path)
 
 
-def _parse_bytes_to_image_data(raw_bytes: bytes) -> "biopb.image.ImageData":
+def _parse_bytes_to_image_data(raw_bytes: bytes) -> "ImageData":
     """Parse raw bytes to ImageData.
 
     Try protobuf SerializedTensor first, fallback to imageio.
     """
-    from biopb.image import ImageData
-
     # Try protobuf SerializedTensor
     try:
         serialized = SerializedTensor.FromString(raw_bytes)
         stderr_console.print(
-            f"[green]Parsed as SerializedTensor:[/green] "
-            f"location={serialized.location}"
+            f"[green]Parsed as SerializedTensor:[/green] location={serialized.location}"
         )
         return ImageData(lazy_data=serialized)
     except Exception:
@@ -221,9 +216,7 @@ def _write_output(
         # Lazy tensor - protobuf or pickle
         stderr_console.print("[green]Server returned lazy data[/green]")
         serialized = image_data.lazy_data
-        stderr_console.print(
-            f"[green]Tensor location:[/green] {serialized.location}"
-        )
+        stderr_console.print(f"[green]Tensor location:[/green] {serialized.location}")
 
         if format == "pb":
             pb_bytes = serialized.SerializeToString()
@@ -245,7 +238,7 @@ def _write_output(
             if output == "-":
                 pickle.dump(serialized, sys.stdout.buffer)
                 stderr_console.print(
-                    f"[green]Pickled SerializedTensor written to stdout[/green]"
+                    "[green]Pickled SerializedTensor written to stdout[/green]"
                 )
             else:
                 with open(output, "wb") as f:
@@ -286,7 +279,9 @@ def ops(
     metadata = [("authorization", f"Bearer {token}")] if token else None
     try:
         stub = ProcessImageStub(channel)
-        response: OpNames = stub.GetOpNames(empty_pb2.Empty(), metadata=metadata, timeout=10)
+        response: OpNames = stub.GetOpNames(
+            empty_pb2.Empty(), metadata=metadata, timeout=10
+        )
 
         if not response.names:
             stderr_console.print(f"[yellow]No operations found on {server}[/yellow]")

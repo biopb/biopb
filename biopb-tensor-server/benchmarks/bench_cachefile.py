@@ -30,13 +30,17 @@ CHUNK_Z = 23  # ~63 MB per chunk for 1024x1344 uint16, matching the issue
 def _load_to_zarr(tmp: str):
     import tifffile
     import zarr
+
     arr = np.asarray(tifffile.imread(DATA))
     arr = np.squeeze(arr)
     assert arr.ndim == 3, f"expected 3D (Z,Y,X), got {arr.shape}"
     zpath = str(Path(tmp) / "gt.zarr")
     z = zarr.open_array(
-        zpath, mode="w", shape=arr.shape,
-        chunks=(CHUNK_Z, arr.shape[1], arr.shape[2]), dtype=arr.dtype,
+        zpath,
+        mode="w",
+        shape=arr.shape,
+        chunks=(CHUNK_Z, arr.shape[1], arr.shape[2]),
+        dtype=arr.dtype,
     )
     z[:] = arr
     return zpath, arr.shape, arr.dtype
@@ -52,7 +56,9 @@ def _start_server(zpath):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=str(cache_dir)))
     server = TensorFlightServer("grpc://localhost:0")
-    server.register_source("gt", ZarrAdapter(zarr.open_array(zpath, mode="r"), "gt", ["z", "y", "x"]))
+    server.register_source(
+        "gt", ZarrAdapter(zarr.open_array(zpath, mode="r"), "gt", ["z", "y", "x"])
+    )
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(1.0)
     return server
@@ -62,7 +68,9 @@ def _fresh_client(location):
     # Re-import per run so the per-location capability cache starts empty and the
     # env-var gate is re-read; client cache off to force a transport every fetch.
     import importlib
+
     import biopb.tensor.client as c
+
     importlib.reload(c)
     return c, c.TensorFlightClient(location, cache_bytes=0)
 
@@ -96,7 +104,7 @@ def _bench(location, disable_cachefile, shape, trials=4):
     for _ in range(3):
         t0 = time.perf_counter()
         for z in range(Z):
-            darr[z:z + 1].compute(scheduler="threads")
+            darr[z : z + 1].compute(scheduler="threads")
         scans.append(time.perf_counter() - t0)
 
     used = (not disable_cachefile) and (cmod._cachefile_support.get(location) is True)
@@ -132,7 +140,9 @@ def main():
     sm, ss, _ = sock["per_chunk_ms"]
     cm, cs, _ = cf["per_chunk_ms"]
     print(f"\nper-chunk speedup (socket/cachefile): {sm / cm:.2f}x")
-    print(f"scan speedup:                         {sock['scan_s'][0] / cf['scan_s'][0]:.2f}x")
+    print(
+        f"scan speedup:                         {sock['scan_s'][0] / cf['scan_s'][0]:.2f}x"
+    )
 
 
 if __name__ == "__main__":

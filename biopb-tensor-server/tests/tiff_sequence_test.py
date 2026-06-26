@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-
 from biopb_tensor_server.adapters.tiff import (
     TiffSequenceAdapter,
     _group_tiff_sequence,
@@ -106,9 +105,7 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is not None
 
-            ordered = _group_tiff_sequence(
-                list(Path(tmpdir).glob("*.tif"))
-            )
+            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tif")))
             assert [f.name for f in ordered] == [
                 "s1-0001_bf2.tif",
                 "s1-0002_bf2.tif",
@@ -233,7 +230,9 @@ class TestTiffSequenceInit:
             for i in range(1, 4):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
 
-            adapter = TiffSequenceAdapter(str(tmpdir), "sid", dim_labels=["z", "y", "x"])
+            adapter = TiffSequenceAdapter(
+                str(tmpdir), "sid", dim_labels=["z", "y", "x"]
+            )
             assert adapter.dim_labels == ["z", "y", "x"]
             assert adapter.full_shape == [3, 8, 8]
 

@@ -47,7 +47,9 @@ def create_multifile_micromanager_dataset(
     metadata = {"Summary": {"Channels": n_channels, "Positions": n_positions}}
 
     # Generate expected files and create them
-    skip_file_idx = n_channels - 1 if not complete else -1  # Skip last channel if incomplete
+    skip_file_idx = (
+        n_channels - 1 if not complete else -1
+    )  # Skip last channel if incomplete
 
     for pos_idx in range(n_positions):
         for chan_idx in range(n_channels):
@@ -208,7 +210,7 @@ def create_multifile_ome_dataset(
   <Image ID="Image:0" Name="test">
 """
     for i in range(n_files):
-        filename = f"img_{i+1:03d}.tif"
+        filename = f"img_{i + 1:03d}.tif"
         # Conformant urn:uuid (RFC 4122 8-4-4-4-12 hex). ome_types >= 0.6 strictly
         # validates this against the OME XSD UniversallyUniqueIdentifier pattern,
         # so a placeholder like "urn:uuid:test-0" raises a ValidationError when the
@@ -275,7 +277,7 @@ def create_multiresolution_ome_zarr(
 
     for level in range(n_levels):
         # Compute level shape by dividing by scale factor
-        scale_factor = 2 ** level
+        scale_factor = 2**level
         level_shape = (
             base_shape[0] // scale_factor,
             base_shape[1] // scale_factor,
@@ -297,10 +299,14 @@ def create_multiresolution_ome_zarr(
         level_paths.append(str(zarr_path / str(level)))
 
         # Add dataset metadata
-        datasets.append({
-            "path": str(level),
-            "coordinateTransformations": [{"type": "scale", "scale": [scale_factor, scale_factor]}]
-        })
+        datasets.append(
+            {
+                "path": str(level),
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [scale_factor, scale_factor]}
+                ],
+            }
+        )
 
     # Create .zattrs with multiscales
     if with_axes_names:
@@ -309,12 +315,14 @@ def create_multiresolution_ome_zarr(
         axes = [{"name": "y"}, {"name": "x"}]
 
     zattrs = {
-        "multiscales": [{
-            "name": "test",
-            "axes": axes,
-            "datasets": datasets,
-            "version": "0.4",
-        }]
+        "multiscales": [
+            {
+                "name": "test",
+                "axes": axes,
+                "datasets": datasets,
+                "version": "0.4",
+            }
+        ]
     }
 
     zattrs_path = zarr_path / ".zattrs"
@@ -405,7 +413,7 @@ def create_multi_series_ome_tiff(
 
     # Create data for each series with distinguishable values
     series_names = []
-    series_info = {'n_series': n_series, 'shapes': []}
+    series_info = {"n_series": n_series, "shapes": []}
 
     # Write multi-series TIFF using tifffile's metadata support
     data_stack = []
@@ -420,7 +428,7 @@ def create_multi_series_ome_tiff(
             series_data[plane_idx] = series_idx * 100 + plane_idx + 1
 
         data_stack.append(series_data)
-        series_info['shapes'].append(series_shape)
+        series_info["shapes"].append(series_shape)
 
     # Write as OME-TIFF with multiple images (series)
     # tifffile handles this via metadata
@@ -432,8 +440,8 @@ def create_multi_series_ome_tiff(
                 photometric="minisblack",
                 tile=tile_size,
                 metadata={
-                    'axes': 'CYX',
-                    'Name': f"Field_{series_idx}",
+                    "axes": "CYX",
+                    "Name": f"Field_{series_idx}",
                 },
             )
 
@@ -468,26 +476,26 @@ def create_companion_ome_dataset(
     # Create TIFF files with unique values
     tiff_files = []
     for i in range(n_files):
-        filename = f"data_{i+1:03d}.tif"
+        filename = f"data_{i + 1:03d}.tif"
         filepath = dir_path / filename
         data = np.full(image_shape, i + 1, dtype=dtype)
         tifffile.imwrite(str(filepath), data)
         tiff_files.append(str(filepath))
 
     # Create companion.ome file with OME-XML referencing TIFFs
-    ome_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    ome_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
   <Image ID="Image:0" Name="companion_test">
-    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" SizeX="{width}" SizeY="{height}" SizeZ="{n_files}" SizeC="1" SizeT="1" Type="uint16">
-""".format(width=image_shape[1], height=image_shape[0], n_files=n_files)
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" SizeX="{image_shape[1]}" SizeY="{image_shape[0]}" SizeZ="{n_files}" SizeC="1" SizeT="1" Type="uint16">
+"""
 
     for i in range(n_files):
-        filename = f"data_{i+1:03d}.tif"
+        filename = f"data_{i + 1:03d}.tif"
         # Conformant urn:uuid (RFC 4122 8-4-4-4-12 hex). ome_types >= 0.6 strictly
         # validates this against the OME XSD UniversallyUniqueIdentifier pattern,
         # so a placeholder like "urn:uuid:data-1" raises a ValidationError when the
         # companion OME-XML is round-tripped through aicsimageio/bioformats.
-        uuid = f"urn:uuid:00000000-0000-4000-8000-{i+1:012d}"
+        uuid = f"urn:uuid:00000000-0000-4000-8000-{i + 1:012d}"
         ome_xml += f"""      <TiffData FirstZ="{i}" FirstC="0" FirstT="0" IFD="0">
         <UUID FileName="{filename}">{uuid}</UUID>
       </TiffData>
@@ -502,9 +510,9 @@ def create_companion_ome_dataset(
     companion_path.write_text(ome_xml)
 
     metadata_info = {
-        'n_files': n_files,
-        'image_shape': image_shape,
-        'companion_path': str(companion_path),
+        "n_files": n_files,
+        "image_shape": image_shape,
+        "companion_path": str(companion_path),
     }
 
     return str(companion_path), tiff_files, metadata_info
@@ -575,7 +583,9 @@ def create_zarr_array(
     n_chunks_per_dim = [s // c for s, c in zip(shape, chunks)]
     for chunk_indices in np.ndindex(*n_chunks_per_dim):
         # Compute chunk value based on indices
-        chunk_value = sum(idx * (max(n_chunks_per_dim) ** i) for i, idx in enumerate(chunk_indices))
+        chunk_value = sum(
+            idx * (max(n_chunks_per_dim) ** i) for i, idx in enumerate(chunk_indices)
+        )
         slices = tuple(
             slice(idx * c, min((idx + 1) * c, s))
             for idx, c, s in zip(chunk_indices, chunks, shape)

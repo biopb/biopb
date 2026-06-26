@@ -176,15 +176,9 @@ def _setup_observe(config):
         from . import _observe
 
         _observe.configure(
-            max_output_chars=get_setting(
-                config, "mcp.observe.max_output_chars"
-            ),
-            poll_interval_ms=get_setting(
-                config, "mcp.observe.poll_interval_ms"
-            ),
-            allowed_origins=get_setting(
-                config, "mcp.transport.allowed_origins"
-            ),
+            max_output_chars=get_setting(config, "mcp.observe.max_output_chars"),
+            poll_interval_ms=get_setting(config, "mcp.observe.poll_interval_ms"),
+            allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
             allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
         )
         _observe.register_http_routes()
@@ -336,9 +330,7 @@ def _serve_http(config, port):
         busy_lock_timeout=get_setting(config, "mcp.kernel.busy_lock_timeout"),
         env=kernel_env,
         watchdog_interval=get_setting(config, "mcp.kernel.watchdog_interval"),
-        watchdog_max_respawns=get_setting(
-            config, "mcp.kernel.watchdog_max_respawns"
-        ),
+        watchdog_max_respawns=get_setting(config, "mcp.kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(
             config, "mcp.kernel.watchdog_respawn_window"
         ),

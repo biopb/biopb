@@ -11,9 +11,8 @@ import json
 import threading
 import time
 
-from pyarrow import flight
-
 from biopb_tensor_server.server import TensorFlightServer
+from pyarrow import flight
 
 
 def _health(server) -> dict:

@@ -37,8 +37,7 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines="
-    "import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
 )
 
 # Best-effort snippet run before a restart so dask releases child processes /
@@ -340,15 +339,12 @@ class KernelHost:
             self._health_probe_code, timeout=self._startup_timeout
         )
         haystack = res.get("stdout", "") + res.get("result_text", "")
-        ok = (
-            res.get("status") == "ok" and self._health_probe_expect in haystack
-        )
+        ok = res.get("status") == "ok" and self._health_probe_expect in haystack
         if not ok:
             raise RuntimeError(
                 "Kernel bootstrap health probe failed "
                 f"(status={res.get('status')!r}, stdout={res.get('stdout')!r}, "
-                f"error={res.get('error_text')!r})"
-                + self._bootstrap_error_detail()
+                f"error={res.get('error_text')!r})" + self._bootstrap_error_detail()
             )
         # Probe passed: the kernel is fully booted and tools may dispatch to it.
         self._ready.set()
@@ -452,9 +448,7 @@ class KernelHost:
             "status": "not_started",
         }
 
-    def _execute_internal(
-        self, code: str, timeout: Optional[float] = None
-    ) -> dict:
+    def _execute_internal(self, code: str, timeout: Optional[float] = None) -> dict:
         """Lock-guarded execution, bypassing the readiness wait.
 
         Used by the startup health probe and bootstrap-error fetch, which run
@@ -568,9 +562,7 @@ class KernelHost:
                 try:
                     self._execute_locked(_DASK_RELEASE_SNIPPET, timeout=5.0)
                 except Exception:
-                    logger.debug(
-                        "dask release failed on restart", exc_info=True
-                    )
+                    logger.debug("dask release failed on restart", exc_info=True)
 
                 self._shutdown_current()
                 try:
@@ -604,9 +596,7 @@ class KernelHost:
                 try:
                     self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
                 except Exception:
-                    logger.debug(
-                        "graceful close on shutdown failed", exc_info=True
-                    )
+                    logger.debug("graceful close on shutdown failed", exc_info=True)
             self._shutdown_current()
 
     def _shutdown_current(self):
@@ -716,10 +706,7 @@ class KernelHost:
         """Start the liveness watchdog thread if enabled and not running."""
         if self._watchdog_interval <= 0:
             return
-        if (
-            self._watchdog_thread is not None
-            and self._watchdog_thread.is_alive()
-        ):
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             return
         self._stopping = False
         self._watchdog_stop.clear()
@@ -756,16 +743,12 @@ class KernelHost:
 
     def _handle_unexpected_death(self):
         """Reap the orphaned process group and respawn, bounded. Held lock."""
-        logger.warning(
-            "Kernel died unexpectedly; reaping orphans and respawning."
-        )
+        logger.warning("Kernel died unexpectedly; reaping orphans and respawning.")
         self._shutdown_current()  # killpg the captured pgid -> reap dask group
 
         now = time.monotonic()
         window = self._watchdog_respawn_window
-        self._respawn_times = [
-            t for t in self._respawn_times if now - t < window
-        ]
+        self._respawn_times = [t for t in self._respawn_times if now - t < window]
         if len(self._respawn_times) >= self._watchdog_max_respawns:
             logger.error(
                 "Kernel respawn limit reached (%d within %.0fs); marking the "
@@ -801,8 +784,7 @@ class KernelHost:
             "dead": self._dead,
             "recent_respawns": len(self._respawn_times),
             "watchdog_running": (
-                self._watchdog_thread is not None
-                and self._watchdog_thread.is_alive()
+                self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             ),
         }
 

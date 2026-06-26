@@ -214,9 +214,7 @@ def build_proxy(remote):
     async def _list_resource_templates(_):
         return types.ServerResult(await remote.list_resource_templates())
 
-    app.request_handlers[types.ListResourceTemplatesRequest] = (
-        _list_resource_templates
-    )
+    app.request_handlers[types.ListResourceTemplatesRequest] = _list_resource_templates
 
     async def _read_resource(req):
         return types.ServerResult(await remote.read_resource(req.params.uri))
@@ -237,9 +235,7 @@ def build_proxy(remote):
 
     async def _complete(req):
         return types.ServerResult(
-            await remote.complete(
-                req.params.ref, req.params.argument.model_dump()
-            )
+            await remote.complete(req.params.ref, req.params.argument.model_dump())
         )
 
     app.request_handlers[types.CompleteRequest] = _complete

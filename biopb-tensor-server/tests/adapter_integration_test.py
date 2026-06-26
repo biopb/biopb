@@ -8,7 +8,6 @@ import importlib.util
 import tempfile
 import threading
 import time
-
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,6 @@ import pytest
 from biopb.tensor import (
     TensorFlightClient,
 )
-
 from biopb_tensor_server import TensorFlightServer
 
 
@@ -39,7 +37,7 @@ def _h5py_available() -> bool:
 def _bioformats_available() -> bool:
     """Check if bioformats_jar is available for companion.ome support."""
     try:
-        import bioformats_jar
+        import bioformats_jar  # noqa: F401  # availability probe
 
         return True
     except ImportError:
@@ -53,7 +51,6 @@ class TestZarrIntegration:
     def test_server_client_roundtrip(self, simple_zarr_array):
         """Test basic server -> client -> dask compute workflow."""
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -72,7 +69,9 @@ class TestZarrIntegration:
 
         try:
             # Connect client and compute
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # List sources
             sources = client.list_sources()
@@ -95,7 +94,6 @@ class TestZarrIntegration:
     def test_scaled_read_integration(self, simple_zarr_array):
         """Test scaled reads through server/client."""
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -111,7 +109,9 @@ class TestZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Test stride downsampling
             darr = client.get_tensor(
@@ -138,7 +138,6 @@ class TestOmeZarrIntegration:
     def test_precompute_level_access(self, multires_ome_zarr):
         """Test accessing precomputed pyramid levels."""
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
@@ -156,7 +155,9 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Test precompute method for scale 2
             darr = client.get_tensor(
@@ -185,7 +186,6 @@ class TestOmeZarrIntegration:
     def test_virtual_scaling_with_ome_zarr(self, multires_ome_zarr):
         """Test virtual scaling when no matching precomputed level."""
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, level_paths, zattrs = multires_ome_zarr
@@ -203,7 +203,9 @@ class TestOmeZarrIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # Request scale 3 - no matching level, should use virtual scaling
             darr = client.get_tensor(
@@ -228,7 +230,6 @@ class TestOmeZarrIntegration:
         finally:
             server.shutdown()
 
-
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_physical_scale_summary_on_descriptor(self, temp_dir):
         """The per-dim physical-scale summary rides the descriptor that
@@ -238,7 +239,6 @@ class TestOmeZarrIntegration:
         import os
 
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         # OME-Zarr with real physical units (the fixture uses relative scales).
@@ -246,16 +246,22 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="w")
         root.create_dataset("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
         zattrs = {
-            "multiscales": [{
-                "axes": [
-                    {"name": "y", "type": "space", "unit": "micrometer"},
-                    {"name": "x", "type": "space", "unit": "micrometer"},
-                ],
-                "datasets": [
-                    {"path": "0", "coordinateTransformations": [
-                        {"type": "scale", "scale": [0.5, 0.25]}]},
-                ],
-            }]
+            "multiscales": [
+                {
+                    "axes": [
+                        {"name": "y", "type": "space", "unit": "micrometer"},
+                        {"name": "x", "type": "space", "unit": "micrometer"},
+                    ],
+                    "datasets": [
+                        {
+                            "path": "0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [0.5, 0.25]}
+                            ],
+                        },
+                    ],
+                }
+            ]
         }
         with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
             json.dump(zattrs, f)
@@ -296,7 +302,6 @@ class TestOmeZarrIntegration:
     def test_plain_zarr_has_no_physical_scale(self, simple_zarr_array):
         """A plain Zarr source advertises no physical scale -> client None."""
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -344,7 +349,9 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-integration", scene_id)
@@ -387,7 +394,9 @@ class TestOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-channels", scene_id)
@@ -466,7 +475,9 @@ class TestMultiSeriesOmeTiffIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             # List sources
             sources = client.list_sources()
@@ -494,8 +505,8 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_lazy_tile_loading(self, multi_series_ome_tiff):
         """Test that aicsimageio provides tile-level lazy loading."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
         from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
@@ -528,8 +539,9 @@ class TestCompanionOmeIntegration:
         # .companion.ome is handled by OmeTiffAdapter (the generic
         # AicsImageIoAdapter excludes it); the claim parses the OME-XML and groups
         # the referenced TIFFs into one multi-file source.
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
         from pathlib import Path
+
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         companion_path, tiff_files, metadata_info = companion_ome_dataset
 
@@ -555,8 +567,8 @@ class TestCompanionOmeIntegration:
     )
     def test_companion_data_access(self, companion_ome_dataset):
         """Test reading data from companion OME dataset."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
         from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
         companion_path, tiff_files, metadata_info = companion_ome_dataset
 
@@ -593,7 +605,6 @@ class TestHdf5Integration:
     def test_hdf5_read(self, hdf5_dataset):
         """Test reading from HDF5 through server."""
         import h5py
-
         from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 
         h5_path, shape, chunks = hdf5_dataset
@@ -640,7 +651,6 @@ class TestCacheIntegration:
     def test_cache_hit_multiple_reads(self, simple_zarr_array):
         """Test that repeated reads hit cache."""
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -656,7 +666,9 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             darr = client.get_tensor("cache-test", "cache-test")
 
@@ -685,7 +697,6 @@ class TestCacheIntegration:
     def test_different_regions_different_cache_entries(self, simple_zarr_array):
         """Test that different regions create different cache entries."""
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -701,7 +712,9 @@ class TestCacheIntegration:
         time.sleep(1)
 
         try:
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
 
             darr = client.get_tensor("cache-regions", "cache-regions")
 
@@ -730,7 +743,6 @@ class TestConcurrentAccess:
         import concurrent.futures
 
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         zarr_path, shape, chunks = simple_zarr_array
@@ -748,7 +760,9 @@ class TestConcurrentAccess:
         results = []
 
         def read_region(client_id):
-            client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=10_000_000)
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
             darr = client.get_tensor("concurrent-test", "concurrent-test")
             data = darr[: chunks[0], : chunks[1]].compute()
             results.append((client_id, data.mean()))

@@ -22,18 +22,16 @@ from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
-from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (
     CacheConfig,
-    MetadataDbConfig,
     ServerConfig,
     SourceConfig,
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
+from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.metadata_db import MetadataDatabase
@@ -64,6 +62,7 @@ def _install_sigterm_handler() -> None:
 
     Must be called from the main thread; no-op if that's not possible.
     """
+
     def _handler(signum, frame):
         raise KeyboardInterrupt
 
@@ -180,15 +179,16 @@ def _resolve_serve_sources(
     # Still needed when a non-monitored entry's expansion lands under a
     # monitored root. Remote sources are always static (no filesystem monitoring).
     monitored_dirs = {
-        ms.local_path
-        for ms in monitored_sources
-        if not ms.is_remote and ms.local_path
+        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
     }
     static_sources = [
-        s for s in sources
-        if s.is_remote or (s.local_path and not any(
-            s.local_path.is_relative_to(md) for md in monitored_dirs
-        ))
+        s
+        for s in sources
+        if s.is_remote
+        or (
+            s.local_path
+            and not any(s.local_path.is_relative_to(md) for md in monitored_dirs)
+        )
     ]
     return static_sources, monitored_sources
 
@@ -293,11 +293,13 @@ def _setup_flight_server(
                 f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
                 f"({e}); falling back to in-memory cache.[/yellow]"
             )
-            manager = CacheManager.initialize(CacheConfig(
-                backend="memory",
-                memory_max_entries=cache_config.memory_max_entries,
-                memory_max_bytes=cache_config.memory_max_bytes,
-            ))
+            manager = CacheManager.initialize(
+                CacheConfig(
+                    backend="memory",
+                    memory_max_entries=cache_config.memory_max_entries,
+                    memory_max_bytes=cache_config.memory_max_bytes,
+                )
+            )
         if isinstance(manager.backend, ArrowFileBackend):
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] "
@@ -331,9 +333,7 @@ def _setup_flight_server(
 
     # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
-    static_sources, monitored_sources = _resolve_serve_sources(
-        server_config, registry
-    )
+    static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
 
     if not static_sources and not monitored_sources:
         console.print("[yellow]Warning: No data sources configured[/yellow]")
@@ -822,7 +822,9 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file)
+    setup_logging(
+        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+    )
 
     # --- Determine dev mode ---
     env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")

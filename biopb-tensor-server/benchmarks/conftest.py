@@ -12,21 +12,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 
-import pytest
 import numpy as np
-
-from biopb_tensor_server.config import CacheConfig
+import pytest
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.server import TensorFlightServer
 
 from benchmarks.utils import (
-    S3_TEST_DATA_URL,
-    NFS_TEST_DATA_DIR,
-    generate_synthetic_hcs_plate,
-    generate_synthetic_zarr,
     generate_multiresolution_zarr,
-    generate_synthetic_tiff,
+    generate_synthetic_hcs_plate,
     generate_synthetic_hdf5,
+    generate_synthetic_tiff,
+    generate_synthetic_zarr,
     reset_cache,
 )
 
@@ -37,9 +34,7 @@ from benchmarks.utils import (
 
 def pytest_configure(config):
     """Register custom markers."""
-    config.addinivalue_line(
-        "markers", "s3: tests requiring S3 network access"
-    )
+    config.addinivalue_line("markers", "s3: tests requiring S3 network access")
     config.addinivalue_line(
         "markers", "nfs: tests requiring NFS/local filesystem access"
     )
@@ -49,7 +44,9 @@ def pytest_configure(config):
     config.option.benchmark_sort = "name"
     config.option.benchmark_time_unit = "ms"
     if not getattr(config.option, "benchmark_json", None):
-        benchmark_output = Path(__file__).resolve().parent.parent / ".benchmarks" / "output.json"
+        benchmark_output = (
+            Path(__file__).resolve().parent.parent / ".benchmarks" / "output.json"
+        )
         benchmark_output.parent.mkdir(parents=True, exist_ok=True)
         config.option.benchmark_json = benchmark_output.open("wb")
 
@@ -246,20 +243,23 @@ class BaselineClient:
         elif source_type in ("ome_zarr", "ome_zarr_hcs"):
             if url:  # S3
                 import s3fs
+
                 fs = s3fs.S3FileSystem(anon=True)
                 return zarr.open_group(s3fs.S3Map(fs, url), mode="r")
             return zarr.open_group(path, mode="r")
 
         elif source_type == "hdf5":
             import h5py
+
             return h5py.File(path, "r")
 
         # Catch-all: use aicsimageio for any unhandled format
         # Supports: OME-TIFF, TIFF, CZI, ND2, LIF, DV, and many more
         # aicsimageio can read from local path or S3 URL directly
         import aicsimageio
+
         target = url or path
-        fs_kwargs = {'anon': True} if target.startswith('s3://') else {}
+        fs_kwargs = {"anon": True} if target.startswith("s3://") else {}
         return aicsimageio.AICSImage(target, fs_kwargs=fs_kwargs)
 
     def list_sources(self) -> Dict[str, Dict]:
@@ -284,7 +284,6 @@ class BaselineClient:
     ) -> Any:
         """Get lazy dask array for tensor."""
         import dask.array as da
-        import zarr
 
         spec = self._sources.get(source_id)
         if not spec:
@@ -322,6 +321,7 @@ class BaselineClient:
             # AICSImage handles OME-TIFF, TIFF, CZI, ND2, LIF, DV, etc.
             # xarray_dask_data returns dask-backed DataArray with proper dims
             import aicsimageio
+
             if isinstance(reader, aicsimageio.AICSImage):
                 # Handle scene selection - tensor_id may be scene name like "Image:0"
                 if tensor_id in reader.scenes:
@@ -385,6 +385,7 @@ def temp_cache_dir() -> Generator[str, None, None]:
         yield str(subdir)
         # Cleanup
         import shutil
+
         shutil.rmtree(subdir, ignore_errors=True)
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -444,6 +445,7 @@ def bench_server(
     CacheManager.initialize(config)
 
     import random
+
     port = random.randint(8900, 8999)
     server = TensorFlightServer(f"grpc://localhost:{port}")
     server._bench_port = port
@@ -485,7 +487,9 @@ def _generate_and_get_path(spec: Dict, cache_dir: str) -> str:
         shape = tuple(params.get("shape", [256, 256]))
         chunks = tuple(params.get("chunks", [128, 128]))
         dtype = np.dtype(params.get("dtype", "uint16"))
-        zarr_path, _, _ = generate_synthetic_hcs_plate(cache_dir, wells, fields, shape, chunks, dtype)
+        zarr_path, _, _ = generate_synthetic_hcs_plate(
+            cache_dir, wells, fields, shape, chunks, dtype
+        )
         return zarr_path
 
     elif generator == "generate_multiresolution_zarr":
@@ -493,7 +497,9 @@ def _generate_and_get_path(spec: Dict, cache_dir: str) -> str:
         chunks = tuple(params.get("chunks", [256, 256]))
         n_levels = params.get("n_levels", 4)
         dtype = params.get("dtype", "uint16")
-        zarr_path, _, _ = generate_multiresolution_zarr(cache_dir, base_shape, chunks, n_levels, dtype)
+        zarr_path, _, _ = generate_multiresolution_zarr(
+            cache_dir, base_shape, chunks, n_levels, dtype
+        )
         return zarr_path
 
     elif generator == "generate_synthetic_tiff":
@@ -511,7 +517,9 @@ def _generate_and_get_path(spec: Dict, cache_dir: str) -> str:
     raise ValueError(f"Unknown generator: {generator}")
 
 
-def _register_source_with_server(spec: Dict, path: str, server: TensorFlightServer) -> str:
+def _register_source_with_server(
+    spec: Dict, path: str, server: TensorFlightServer
+) -> str:
     """Register source with Flight server using registry mechanism.
 
     Uses the server's adapter registry and SourceConfig pattern,
@@ -619,7 +627,7 @@ def data_source(
         source_type = spec.get("type")
 
         # For public S3 buckets, use anonymous access
-        from biopb_tensor_server.remote import CredentialsConfig, CredentialProfile
+        from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
 
         # Create anon credentials profile (empty key/secret triggers anon=True)
         anon_profile = CredentialProfile(
@@ -648,6 +656,7 @@ def data_source(
 
         # Create SourceConfig for S3 with anon credentials profile
         from biopb_tensor_server.config import SourceConfig
+
         source_config = SourceConfig(
             url=url,
             type=adapter_cls.SOURCE_TYPE,
@@ -665,7 +674,9 @@ def data_source(
 
     elif is_nfs_source(source_id):
         if not has_nfs_marker:
-            pytest.skip(f"NFS source {source_id} - run with -m nfs or select explicitly")
+            pytest.skip(
+                f"NFS source {source_id} - run with -m nfs or select explicitly"
+            )
 
         path_env = spec.get("path_env")
         nfs_path = os.environ.get(path_env)

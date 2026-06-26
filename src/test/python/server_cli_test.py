@@ -8,10 +8,9 @@ tests are deterministic and fast on any platform; time.sleep is neutralized.
 import json
 from unittest.mock import MagicMock, patch
 
+import biopb.cli as cli
 import pytest
 from typer.testing import CliRunner
-
-import biopb.cli as cli
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +69,9 @@ class TestGracefulStop:
     def test_force_kill_surfaces_diag_when_delivery_failed(self, monkeypatch, capsys):
         monkeypatch.setattr("sys.platform", "win32")
         monkeypatch.setattr(cli, "_request_graceful_stop", lambda _pid: False)
-        monkeypatch.setattr(cli, "_LAST_WIN_SHUTDOWN_DIAG", "could not write shutdown sentinel: boom")
+        monkeypatch.setattr(
+            cli, "_LAST_WIN_SHUTDOWN_DIAG", "could not write shutdown sentinel: boom"
+        )
         monkeypatch.setattr(cli, "_is_process_running", lambda _pid: True)
         monkeypatch.setattr(cli, "_remove_pid", MagicMock())
         monkeypatch.setattr(cli, "_win_remove_sentinel", MagicMock())
@@ -92,7 +93,9 @@ class TestStatusHealth:
             monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
         else:
             monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: health)
-        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
+        )
         res = CliRunner().invoke(cli.app, ["server", "status", "--json", *extra_args])
         assert res.exit_code == 0, res.output
         return json.loads(res.stdout.strip().splitlines()[-1])
@@ -102,8 +105,12 @@ class TestStatusHealth:
             monkeypatch,
             pid=123,
             running=True,
-            health={"status": "SERVING", "source_count": 7, "writable": False,
-                    "uptime_seconds": 42},
+            health={
+                "status": "SERVING",
+                "source_count": 7,
+                "writable": False,
+                "uptime_seconds": 42,
+            },
         )
         assert d["running"] is True and d["pid"] == 123
         assert d["status"] == "running"
@@ -160,10 +167,10 @@ class TestStatusHealth:
             ]
         )
         monkeypatch.setattr(cli, "_query_health", lambda *_a, **_k: next(seq))
-        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
-        res = CliRunner().invoke(
-            cli.app, ["server", "status", "--json", "--wait", "5"]
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
         )
+        res = CliRunner().invoke(cli.app, ["server", "status", "--json", "--wait", "5"])
         assert res.exit_code == 0, res.output
         assert "starting" in res.output and "2 source" in res.output
         # JSON (final verdict) is still the last line.
@@ -175,9 +182,13 @@ class TestStatusHealth:
         monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (5, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
         monkeypatch.setattr(
-            cli, "_query_health", lambda *_a, **_k: {"status": "SERVING", "source_count": 1}
+            cli,
+            "_query_health",
+            lambda *_a, **_k: {"status": "SERVING", "source_count": 1},
         )
-        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
+        )
         res = CliRunner().invoke(cli.app, ["server", "status", "--json"])
         assert res.exit_code == 0
         assert "starting" not in res.output and "waiting" not in res.output
@@ -194,7 +205,7 @@ class TestLogLineHelpers:
     def test_line_level_none_for_off_format(self):
         assert cli._line_level("--- Started at 2026-06-12 10:00:00 ---") is None
         assert cli._line_level("") is None
-        assert cli._line_level("    File \"foo.py\", line 3, in bar") is None
+        assert cli._line_level('    File "foo.py", line 3, in bar') is None
         # A bracketed-but-unknown token is not a level.
         assert cli._line_level("[2026-06-12 10:00:00] NOTALEVEL x: y") is None
 
@@ -276,9 +287,7 @@ class TestLogs:
         assert "INFO a: i" not in res.output and "DEBUG a: d" not in res.output
 
     def test_level_filter_keeps_continuation(self, log_file):
-        log_file.write_text(
-            "[t] INFO a: i\n[t] WARNING a: boom\ncontinuation trace\n"
-        )
+        log_file.write_text("[t] INFO a: i\n[t] WARNING a: boom\ncontinuation trace\n")
         res = self._run("--level", "warning")  # case-insensitive
         assert res.exit_code == 0
         assert "WARNING a: boom" in res.output
@@ -316,7 +325,9 @@ class TestCacheStats:
             cli, "_read_pid_record", lambda *_a: (123 if running else None, None)
         )
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
-        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
+        )
         monkeypatch.setattr(cli, "_query_cache_stats", lambda *_a, **_k: stats)
         return CliRunner().invoke(cli.app, ["server", "cache-stats", *args])
 
@@ -356,7 +367,9 @@ class TestCacheStats:
         captured = {}
         monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (123, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
-        monkeypatch.setattr(cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None))
+        monkeypatch.setattr(
+            cli, "_resolve_grpc_endpoint", lambda _c: ("grpc://x", None)
+        )
 
         def fake_query(location, token):
             captured["token"] = token
@@ -412,7 +425,7 @@ class TestMcpLineLevel:
 
     def test_off_format_is_unclassified(self):
         assert cli._mcp_line_level("Traceback (most recent call last):") is None
-        assert cli._mcp_line_level("    File \"x.py\", line 3, in f") is None
+        assert cli._mcp_line_level('    File "x.py", line 3, in f') is None
         assert cli._mcp_line_level("") is None
         # dask's " - LEVEL - " shape is not classified (best-effort).
         assert cli._mcp_line_level("distributed.worker - INFO - busy") is None
@@ -444,7 +457,9 @@ class TestMcpStart:
         # Port is free pre-launch; readiness mirrors child liveness (a live child
         # is treated as having bound, a dead one as a failed start).
         monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
-        monkeypatch.setattr(cli, "_await_listening", lambda pid, *_a, **_k: running(pid))
+        monkeypatch.setattr(
+            cli, "_await_listening", lambda pid, *_a, **_k: running(pid)
+        )
         proc = MagicMock()
         proc.pid = 4242
         popen = MagicMock(return_value=proc)
@@ -461,7 +476,14 @@ class TestMcpStart:
         assert "http://127.0.0.1:8765/mcp" in res.output
         # Launches the http transport in a child process.
         cmd = popen.call_args.args[0]
-        assert cmd[1:] == ["-m", "biopb_mcp.mcp", "--transport", "http", "--port", "8765"]
+        assert cmd[1:] == [
+            "-m",
+            "biopb_mcp.mcp",
+            "--transport",
+            "http",
+            "--port",
+            "8765",
+        ]
         assert (tmp_path / "mcp-server.pid").read_text() == "4242"
 
     def test_custom_port(self, monkeypatch, tmp_path):
@@ -484,7 +506,11 @@ class TestMcpStart:
 
     def test_failed_start_exits_1(self, monkeypatch, tmp_path):
         self._setup(
-            monkeypatch, tmp_path, existing=None, existing_alive=False, child_alive=False
+            monkeypatch,
+            tmp_path,
+            existing=None,
+            existing_alive=False,
+            child_alive=False,
         )
         res = CliRunner().invoke(cli.app, ["mcp", "start"])
         assert res.exit_code == 1

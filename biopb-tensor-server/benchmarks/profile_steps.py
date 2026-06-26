@@ -11,11 +11,10 @@ import threading
 import time
 from pathlib import Path
 
+import biopb.tensor.client as cmod
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-
-import biopb.tensor.client as cmod
 from biopb.tensor.client import (
     TensorFlightClient,
     _array_from_unified_batch,
@@ -34,14 +33,28 @@ def _setup():
 
     tmp = tempfile.mkdtemp()
     shape = (CHUNK_Z * 4, 1024, 1344)
-    arr = (np.arange(int(np.prod(shape)), dtype=np.uint16) % 997).reshape(shape).astype(np.uint16)
+    arr = (
+        (np.arange(int(np.prod(shape)), dtype=np.uint16) % 997)
+        .reshape(shape)
+        .astype(np.uint16)
+    )
     zpath = str(Path(tmp) / "d.zarr")
-    z = zarr.open_array(zpath, mode="w", shape=shape, chunks=(CHUNK_Z, shape[1], shape[2]), dtype=arr.dtype)
+    z = zarr.open_array(
+        zpath,
+        mode="w",
+        shape=shape,
+        chunks=(CHUNK_Z, shape[1], shape[2]),
+        dtype=arr.dtype,
+    )
     z[:] = arr
     CacheManager.reset()
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache")))
+    CacheManager.initialize(
+        CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+    )
     server = TensorFlightServer("grpc://localhost:0")
-    server.register_source("d", ZarrAdapter(zarr.open_array(zpath, mode="r"), "d", ["z", "y", "x"]))
+    server.register_source(
+        "d", ZarrAdapter(zarr.open_array(zpath, mode="r"), "d", ["z", "y", "x"])
+    )
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(1.0)
     return server, shape
@@ -67,7 +80,8 @@ def _capture_chunk_ids(location, shape):
     seen, ids = set(), []
     for cid in captured:
         if cid not in seen:
-            seen.add(cid); ids.append(cid)
+            seen.add(cid)
+            ids.append(cid)
     return ids
 
 
@@ -93,13 +107,16 @@ def main():
 
         # ---- cache-file sub-steps ----
         def locate():
-            a = flight.Action("chunk_locate", TensorTicket(chunk_id=cid).SerializeToString())
+            a = flight.Action(
+                "chunk_locate", TensorTicket(chunk_id=cid).SerializeToString()
+            )
             return json.loads(next(client.do_action(a, options=opts)).body.to_pybytes())
 
         info = locate()
 
         def map_open():
-            mm = pa.memory_map(info["segment_path"], "r"); mm.close()
+            mm = pa.memory_map(info["segment_path"], "r")
+            mm.close()
 
         def full_read():
             mm = pa.memory_map(info["segment_path"], "r")
@@ -135,7 +152,10 @@ def main():
 
         # ---- socket sub-steps ----
         def do_get_readall():
-            r = client.do_get(flight.Ticket(TensorTicket(chunk_id=cid).SerializeToString()), options=opts)
+            r = client.do_get(
+                flight.Ticket(TensorTicket(chunk_id=cid).SerializeToString()),
+                options=opts,
+            )
             return r.read_all()
 
         tbl = do_get_readall()
@@ -152,8 +172,10 @@ def main():
         print(f"  + to_numpy materialize  : {full_m:7.2f} +/- {full_s:5.2f} ms (total)")
         print(f"  => materialize alone ~  : {full_m - dg_m:7.2f} ms\n")
 
-        print(f"end-to-end: cachefile {l_m + fr_m:.1f} ms  vs  socket {full_m:.1f} ms"
-              f"  -> {full_m / (l_m + fr_m):.2f}x")
+        print(
+            f"end-to-end: cachefile {l_m + fr_m:.1f} ms  vs  socket {full_m:.1f} ms"
+            f"  -> {full_m / (l_m + fr_m):.2f}x"
+        )
     finally:
         server.shutdown()
 

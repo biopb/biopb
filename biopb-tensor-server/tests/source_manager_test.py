@@ -5,10 +5,13 @@ import time
 from pathlib import Path
 
 import pytest
-
-from biopb_tensor_server.discovery import DiscoveryState, SourceClaim, generate_source_id
-from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+from biopb_tensor_server.discovery import (
+    DiscoveryState,
+    SourceClaim,
+    generate_source_id,
+)
 from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
 
 
 class _FakeAdapter:
@@ -223,7 +226,9 @@ class TestSourceManagerRegressions:
         assert server._metadata_db.added == []
         assert server._metadata_db.removed == []
 
-    def test_skipped_stable_subtree_preserves_existing_claims(self, tmp_path, monkeypatch):
+    def test_skipped_stable_subtree_preserves_existing_claims(
+        self, tmp_path, monkeypatch
+    ):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         stable_dir = monitored_dir / "stable"
@@ -298,7 +303,9 @@ class TestSourceManagerRegressions:
         assert server.unregistered == [source_id]
         assert server._metadata_db.removed == [source_id]
 
-    def test_full_rescan_backstop_recovers_stale_skipped_subtree(self, tmp_path, monkeypatch):
+    def test_full_rescan_backstop_recovers_stale_skipped_subtree(
+        self, tmp_path, monkeypatch
+    ):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -391,9 +398,7 @@ class TestSourceManagerRegressions:
             manager._handle_rescan()
 
         assert manager._entry_state == previous_entry_state
-        assert (
-            manager._entry_stable_observations == previous_stable_observations
-        )
+        assert manager._entry_stable_observations == previous_stable_observations
         assert manager._entry_pending_scan == previous_pending_scan
         assert manager._skipped_stable_dirs == previous_skipped_dirs
 
@@ -475,7 +480,9 @@ class TestSourceManagerRegressions:
 
         assert manager._should_scan_path(data_path) is False
 
-    def test_should_scan_path_can_require_multiple_stable_rescans(self, tmp_path, monkeypatch):
+    def test_should_scan_path_can_require_multiple_stable_rescans(
+        self, tmp_path, monkeypatch
+    ):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -509,7 +516,9 @@ class TestSourceManagerRegressions:
         manager._refresh_entry_state()
         assert manager._should_scan_path(data_path) is True
 
-    def test_aggressive_dir_pruning_can_skip_monitored_root(self, tmp_path, monkeypatch):
+    def test_aggressive_dir_pruning_can_skip_monitored_root(
+        self, tmp_path, monkeypatch
+    ):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -547,7 +556,9 @@ class TestSourceManagerRegressions:
         assert server.registered == []
         assert server.unregistered == []
 
-    def test_non_aggressive_root_rescan_after_stability_delay(self, tmp_path, monkeypatch):
+    def test_non_aggressive_root_rescan_after_stability_delay(
+        self, tmp_path, monkeypatch
+    ):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
 
@@ -1206,7 +1217,9 @@ class TestSignatureScanLoopAndSkip:
 
         assert str((root / "Microscopy" / "good.dat").resolve()) in next_state
         assert str((root / "AppData").resolve()) not in next_state
-        assert str((root / "AppData" / "Local" / "junk.dat").resolve()) not in next_state
+        assert (
+            str((root / "AppData" / "Local" / "junk.dat").resolve()) not in next_state
+        )
         assert str((root / "OneDrive - Lab").resolve()) not in next_state
         if offline_supported:
             assert str(stub.resolve()) not in next_state

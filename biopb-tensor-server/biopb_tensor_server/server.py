@@ -26,6 +26,7 @@ import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
     FlightCmd,
+    PyramidLevel,
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
@@ -183,7 +184,7 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:
-            separator = '&' if '?' in location else '?'
+            separator = "&" if "?" in location else "?"
             location = f"{location}{separator}grpc.max_send_message_size={grpc_max_message_size}&grpc.max_receive_message_size={grpc_max_message_size}"
 
         middleware = kwargs.pop("middleware", {})
@@ -436,9 +437,7 @@ class TensorFlightServer(flight.FlightServerBase):
         mw = context.get_middleware("auth")
         provided = getattr(mw, "token", None) if mw is not None else None
         if provided != expected:
-            raise flight.FlightUnauthenticatedError(
-                "Invalid or missing source token"
-            )
+            raise flight.FlightUnauthenticatedError("Invalid or missing source token")
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
@@ -480,7 +479,7 @@ class TensorFlightServer(flight.FlightServerBase):
             return None
         prefix = f"{source_id}/"
         if tensor_id.startswith(prefix):
-            return tensor_id[len(prefix):]
+            return tensor_id[len(prefix) :]
         if tensor_id == source_id:
             return None
         return tensor_id
@@ -540,11 +539,21 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
-            flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
+            flight.ActionType(
+                "create_source",
+                "Create a writable source from a TensorDescriptor request",
+            ),
             flight.ActionType("upload_status", "Upload status for a writable source"),
-            flight.ActionType("chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"),
-            flight.ActionType("cache_stats", "Cache statistics - returns backend CacheStats JSON"),
-            flight.ActionType("warm", "Hydrate-ahead: recall a resolved cloud source's member files server-side"),
+            flight.ActionType(
+                "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
+            ),
+            flight.ActionType(
+                "cache_stats", "Cache statistics - returns backend CacheStats JSON"
+            ),
+            flight.ActionType(
+                "warm",
+                "Hydrate-ahead: recall a resolved cloud source's member files server-side",
+            ),
         ]
 
     def do_action(
@@ -658,9 +667,7 @@ class TensorFlightServer(flight.FlightServerBase):
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
-        worker = threading.Thread(
-            target=_run, name=f"resolve-{source_id}", daemon=True
-        )
+        worker = threading.Thread(target=_run, name=f"resolve-{source_id}", daemon=True)
         worker.start()
         while worker.is_alive():
             worker.join(timeout=_RESOLVE_HEARTBEAT_SECONDS)
@@ -777,7 +784,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 for dirpath, _dirs, names in os.walk(root):
                     if context.is_cancelled():
                         yield WarmStreamMessage(
-                            done=WarmProgress(elapsed_seconds=time.monotonic() - started)
+                            done=WarmProgress(
+                                elapsed_seconds=time.monotonic() - started
+                            )
                         ).SerializeToString()
                         return
                     for name in names:
@@ -823,8 +832,11 @@ class TensorFlightServer(flight.FlightServerBase):
                                 if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
                                     last_yield = now
                                     yield _progress(
-                                        files_total, files_done,
-                                        bytes_total, bytes_done, name,
+                                        files_total,
+                                        files_done,
+                                        bytes_total,
+                                        bytes_done,
+                                        name,
                                     )
                     except OSError as exc:
                         logger.warning("warm: skipping %s: %s", fpath, exc)
@@ -833,7 +845,11 @@ class TensorFlightServer(flight.FlightServerBase):
                     if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
                         last_yield = now
                         yield _progress(
-                            files_total, files_done, bytes_total, bytes_done, name,
+                            files_total,
+                            files_done,
+                            bytes_total,
+                            bytes_done,
+                            name,
                         )
 
                 # 4. Terminal done (partial counts if cancelled mid-loop).
@@ -964,9 +980,7 @@ class TensorFlightServer(flight.FlightServerBase):
             # Metadata SQL query branch
             if cmd.HasField("metadata_query"):
                 sql = cmd.metadata_query.sql
-                logger.debug(
-                    f"get_flight_info: metadata_query sql={sql[:100]}..."
-                )
+                logger.debug(f"get_flight_info: metadata_query sql={sql[:100]}...")
                 if self._metadata_db is None:
                     raise flight.FlightServerError(
                         "Metadata database not enabled. Set metadata_db config to enable SQL queries."
@@ -975,7 +989,9 @@ class TensorFlightServer(flight.FlightServerBase):
                     return self._metadata_db.handle_query(sql)
                 except ValueError as e:
                     # Query validation or execution failure
-                    raise flight.FlightInternalError(f"Metadata query failed: {e}") from e
+                    raise flight.FlightInternalError(
+                        f"Metadata query failed: {e}"
+                    ) from e
             else:
                 raise flight.FlightServerError(
                     "Metadata query source_id but no MetadataQueryOption"
@@ -1019,16 +1035,10 @@ class TensorFlightServer(flight.FlightServerBase):
         )
 
         # Get tensor adapter for the specified source and tensor
-        tensor_adapter = self._get_adapter_for_tensor(
-            source_id, field
-        )
+        tensor_adapter = self._get_adapter_for_tensor(source_id, field)
         if tensor_adapter is None:
-            logger.warning(
-                f"Tensor not found: {source_id}/{tensor_id}"
-            )
-            raise flight.FlightServerError(
-                f"Tensor not found: {source_id}/{tensor_id}"
-            )
+            logger.warning(f"Tensor not found: {source_id}/{tensor_id}")
+            raise flight.FlightServerError(f"Tensor not found: {source_id}/{tensor_id}")
 
         # Build request descriptor for the specific tensor
         try:
@@ -1114,7 +1124,7 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnavailableError(
                 f"Source unresolved (open to resolve): {e}"
             ) from e
-        except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
             ) from e
@@ -1192,7 +1202,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch = adapter.resolve_chunk_data(
                     tensor_ticket.chunk_id, cache_manager
                 )
-            except (OSError, IOError, ValueError) as e:
+            except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
                 raise flight.FlightInternalError(
                     f"I/O error reading chunk data: {e}"
@@ -1202,7 +1212,9 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.debug(f"do_get: returning {batch_size} bytes")
 
             # zero-copy wrapper - do _not_ convert to pa.Table!
-            reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
+            reader = pa.RecordBatchReader.from_batches(
+                record_batch.schema, [record_batch]
+            )
             return flight.RecordBatchStream(reader)
 
     def _handle_chunk_locate(self, chunk_id: bytes) -> str:
@@ -1235,7 +1247,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if location is None:
                 adapter.resolve_chunk_data(chunk_id, cache_manager)
                 location = cache_manager.locate_entry(chunk_id)
-        except (OSError, IOError, ValueError) as e:
+        except (OSError, ValueError) as e:
             raise flight.FlightInternalError(
                 f"I/O error locating chunk data: {e}"
             ) from e
@@ -1243,14 +1255,16 @@ class TensorFlightServer(flight.FlightServerBase):
         if location is None:
             return json.dumps({"available": False})
 
-        return json.dumps({
-            "available": True,
-            "format_version": CACHE_FILE_FORMAT_VERSION,
-            "segment_path": location.segment_path,
-            "byte_offset": location.byte_offset,
-            "byte_length": location.byte_length,
-            "generation_id": location.generation_id,
-        })
+        return json.dumps(
+            {
+                "available": True,
+                "format_version": CACHE_FILE_FORMAT_VERSION,
+                "segment_path": location.segment_path,
+                "byte_offset": location.byte_offset,
+                "byte_length": location.byte_length,
+                "generation_id": location.generation_id,
+            }
+        )
 
     def do_put(
         self,
@@ -1453,7 +1467,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if hasattr(adapter, "write_chunk"):
                 adapter.write_chunk(chunk_idx, data)
             else:
-                raise flight.FlightServerError(f"Source does not support writes")
+                raise flight.FlightServerError("Source does not support writes")
 
         elif isinstance(adapter, CachedSourceAdapter):
             # Cache-backed sources accept arbitrary bounds
@@ -1461,7 +1475,7 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter.write_chunk_arrow(bounds, data_column, expected_shape, dtype)
 
         else:
-            raise flight.FlightServerError(f"Source type does not support writes")
+            raise flight.FlightServerError("Source type does not support writes")
 
         self.mark_upload_chunk(upload.source_id, bounds)
 

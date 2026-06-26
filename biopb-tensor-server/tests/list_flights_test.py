@@ -6,7 +6,6 @@ skipped while the remaining healthy sources are still returned.
 """
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
-
 from biopb_tensor_server.server import TensorFlightServer
 
 

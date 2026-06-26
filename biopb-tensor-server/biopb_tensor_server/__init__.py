@@ -16,21 +16,21 @@ Note: This package is not distributed via PyPI. Install locally with:
 from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.tiff import (
-    TiffSequenceAdapter,
     MicroManagerLegacyAdapter,
+    TiffSequenceAdapter,
 )
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
 # Optional aicsimageio adapters
 try:
     from biopb_tensor_server.adapters.aicsimageio import (
-        OmeTiffAdapter,
-        ZeissAdapter,
+        AicsImageIoAdapter,
+        DvAdapter,
         LeicaAdapter,
         NikonAdapter,
-        DvAdapter,
         OlympusAdapter,
-        AicsImageIoAdapter,
+        OmeTiffAdapter,
+        ZeissAdapter,
     )
 except ImportError:
     OmeTiffAdapter = None  # type: ignore
@@ -41,19 +41,12 @@ except ImportError:
     OlympusAdapter = None  # type: ignore
     AicsImageIoAdapter = None  # type: ignore
 
-from biopb_tensor_server.downsample import (
-    ComputeBackendOptions,
-    configure_compute_backend,
-    get_compute_backend_options,
-)
 from biopb_tensor_server.base import (
     BackendAdapter,
     SourceAdapter,
     TensorAdapter,
     TensorReadPlan,
 )
-from biopb_tensor_server.chunk import ChunkEndpoint
-
 from biopb_tensor_server.cache import (
     CacheBackend,
     CacheEntry,
@@ -62,8 +55,14 @@ from biopb_tensor_server.cache import (
     EntryState,
     MemoryCacheBackend,
 )
+from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.config import (
     CacheConfig,
+)
+from biopb_tensor_server.downsample import (
+    ComputeBackendOptions,
+    configure_compute_backend,
+    get_compute_backend_options,
 )
 from biopb_tensor_server.server import (
     TensorFlightServer,

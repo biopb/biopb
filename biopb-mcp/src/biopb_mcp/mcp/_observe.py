@@ -161,9 +161,7 @@ def _kernel_error(res):
     """
     status = res.get("status")
     if status == "busy":
-        return JSONResponse(
-            {"busy": True, "jobs": [], "headless": _server._headless}
-        )
+        return JSONResponse({"busy": True, "jobs": [], "headless": _server._headless})
     return JSONResponse(
         {
             "error": status or "kernel error",
@@ -191,9 +189,7 @@ def _truncate_tail(text):
 
 
 async def _observe_page(request):
-    return HTMLResponse(
-        _OBSERVE_HTML.replace("__POLL_MS__", str(_poll_interval_ms))
-    )
+    return HTMLResponse(_OBSERVE_HTML.replace("__POLL_MS__", str(_poll_interval_ms)))
 
 
 async def _api_jobs(request):

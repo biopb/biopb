@@ -9,9 +9,7 @@ import os
 import tempfile
 
 import numpy as np
-import pytest
 import tifffile
-
 from biopb_tensor_server.config import (
     SourceConfig,
     discover_sources,
@@ -126,7 +124,9 @@ class TestDeleteSourceRegression:
             primary_path="/tmp/test.tif",
             source_id="test_123",
         )
-        state.consumed_paths.discard("/tmp/test.tif")  # Remove from consumed to allow add
+        state.consumed_paths.discard(
+            "/tmp/test.tif"
+        )  # Remove from consumed to allow add
         state.add_claim(claim)
 
         # Verify string lookup works
@@ -134,6 +134,7 @@ class TestDeleteSourceRegression:
 
         # Verify Path object lookup does NOT work (demonstrates the bug pattern)
         from pathlib import Path
+
         assert state.get_source_for_path(Path("/tmp/test.tif")) is None
 
     def test_remove_claim_requires_string_key(self):
@@ -169,6 +170,7 @@ class TestDeleteSourceRegression:
         and remove_claim, but they expect string keys.
         """
         from pathlib import Path
+
         from biopb_tensor_server.discovery import DiscoveryState, SourceClaim
 
         state = DiscoveryState()
@@ -212,6 +214,7 @@ class TestDeleteSourceRegression:
         _handle_moved(event.path, event.old_path) = _handle_moved(old_path, new_path)
         """
         from pathlib import Path
+
         from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
 
         # Simulate what the watcher creates for a move event
@@ -224,13 +227,13 @@ class TestDeleteSourceRegression:
         event = WatcherEvent(
             event_type=WatcherEventType.MOVED,
             path=original_path,  # This is actually the OLD path
-            old_path=new_path,   # This is actually the NEW path
+            old_path=new_path,  # This is actually the NEW path
             is_directory=False,
         )
 
         # Verify the confusing naming
         assert event.path == original_path  # OLD path (original location)
-        assert event.old_path == new_path   # NEW path (destination)
+        assert event.old_path == new_path  # NEW path (destination)
 
         # Correct call order: _handle_moved(old_path, new_path)
         # Should be: _handle_moved(event.path, event.old_path)

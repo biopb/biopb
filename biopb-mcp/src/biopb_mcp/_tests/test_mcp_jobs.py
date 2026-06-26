@@ -82,9 +82,9 @@ class TestJobRunnerUnit:
         assert "ValueError" in snap["error_text"]
 
     def test_one_job_at_a_time(self, runner):
-        jid = _jobs.submit(
-            "import time\nwhile not cancelled():\n    time.sleep(0.02)"
-        )["job_id"]
+        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
+            "job_id"
+        ]
         try:
             busy = _jobs.submit("1 + 1")
             assert busy.get("error") == "busy"
@@ -137,9 +137,9 @@ class TestJobRunnerUnit:
                 calls["force"] = force
 
         runner["_dask_client"] = _StubClient()
-        jid = _jobs.submit(
-            "import time\nwhile not cancelled():\n    time.sleep(0.02)"
-        )["job_id"]
+        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
+            "job_id"
+        ]
         time.sleep(0.05)
         _jobs.cancel(jid)
         passed = calls["futures"]
@@ -161,9 +161,9 @@ class TestJobRunnerUnit:
     # -- user-action attribution --------------------------------------------
 
     def test_cancel_attributes_reason(self, runner):
-        jid = _jobs.submit(
-            "import time\nwhile not cancelled():\n    time.sleep(0.02)"
-        )["job_id"]
+        jid = _jobs.submit("import time\nwhile not cancelled():\n    time.sleep(0.02)")[
+            "job_id"
+        ]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
         out = _jobs.cancel(jid, reason="stopped by Alice")
@@ -178,9 +178,7 @@ class TestJobRunnerUnit:
     def test_interrupt_current_stops_uncooperative_job(self, runner):
         # A loop that NEVER checks cancelled() -> only a KeyboardInterrupt raised
         # into the worker thread can stop it (short of restart).
-        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")[
-            "job_id"
-        ]
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
         out = _jobs.interrupt_current(reason="forced by Bob")
@@ -211,9 +209,7 @@ class TestJobRunnerUnit:
         assert snap["code"] == src
 
     def test_jobs_summary_has_code_preview(self, runner):
-        jid = _jobs.submit("\n\n  print('first real line')  \nmore = 2")[
-            "job_id"
-        ]
+        jid = _jobs.submit("\n\n  print('first real line')  \nmore = 2")["job_id"]
         self._wait(jid)
         summ = {j["job_id"]: j for j in _jobs.jobs_summary()}[jid]
         assert summ["code_preview"] == "print('first real line')"
@@ -266,9 +262,7 @@ class TestJobConcurrency:
     def test_main_thread_free_while_job_runs(self, kernel):
         # A GIL-releasing background job (time.sleep) must not block the kernel
         # main thread — the whole point of B2.
-        sub = self._submit(
-            kernel, "import time; time.sleep(2.0); print('job-done')"
-        )
+        sub = self._submit(kernel, "import time; time.sleep(2.0); print('job-done')")
         assert sub["status"] == "running"
         job_id = sub["job_id"]
 
@@ -351,9 +345,7 @@ class TestNapariJobs:
 
     def test_screenshot_and_status_during_job(self, napari_kernel):
         _server.set_promote_after(0.5)
-        handle = _server.execute_code(
-            "import time; time.sleep(4.0); print('done')"
-        )
+        handle = _server.execute_code("import time; time.sleep(4.0); print('done')")
         assert "still running" in handle  # promoted to a job
 
         # The agent is NOT blind: screenshot + status work mid-job.
@@ -365,9 +357,7 @@ class TestNapariJobs:
 
     def test_restart_clears_jobs(self, napari_kernel):
         sub = napari_kernel.execute(
-            _server._job_snippet(
-                "submit(" + repr("import time; time.sleep(30)") + ")"
-            )
+            _server._job_snippet("submit(" + repr("import time; time.sleep(30)") + ")")
         )
         job_id = _job_result(sub["stdout"])["job_id"]
         napari_kernel.restart()  # respawns + re-bootstraps (resets jobs)

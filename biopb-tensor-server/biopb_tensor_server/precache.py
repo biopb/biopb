@@ -59,9 +59,9 @@ class PrecacheWorker:
 
     def __init__(
         self,
-        server: "TensorFlightServer",
-        config: "PrecacheConfig",
-        pyramid_config: Optional["PyramidConfig"] = None,
+        server: TensorFlightServer,
+        config: PrecacheConfig,
+        pyramid_config: Optional[PyramidConfig] = None,
     ):
         self._server = server
         self._cfg = config
@@ -73,7 +73,7 @@ class PrecacheWorker:
 
             pyramid_config = PyramidConfig()
         self._pyramid_cfg = pyramid_config
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._queue: queue.Queue[str] = queue.Queue()
         self._seen: Set[str] = set()
         self._seen_lock = threading.Lock()
         # Backlog tier: a newest-mtime-first heap of (-mtime, seq, source_id).
@@ -133,9 +133,7 @@ class PrecacheWorker:
                 if source_id in self._backlog_ids or source_id in seen_snapshot:
                     continue
                 self._backlog_seq += 1
-                heapq.heappush(
-                    self._backlog, (-mtime, self._backlog_seq, source_id)
-                )
+                heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
                 self._backlog_ids.add(source_id)
                 added += 1
         logger.info(
@@ -300,9 +298,7 @@ class PrecacheWorker:
         for td in descriptors:
             if self._stop.is_set():
                 return False
-            if self._process_tensor(
-                source_adapter, td, cache_manager, backlog=backlog
-            ):
+            if self._process_tensor(source_adapter, td, cache_manager, backlog=backlog):
                 return True  # preempted mid-source
         return False
 
@@ -323,9 +319,7 @@ class PrecacheWorker:
         try:
             base_desc = tensor_adapter.get_tensor_descriptor()
         except Exception:
-            logger.exception(
-                "precache: get_tensor_descriptor failed for %s", tensor_id
-            )
+            logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
             return False
 
         # Warm the coarsest level of the same plan the server advertises (a

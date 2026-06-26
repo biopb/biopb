@@ -108,9 +108,7 @@ class ObjectDetectionWidget(_WidgetBase):
 
         return image_data
 
-    def _get_grid_positions(
-        self, image, settings: dict
-    ) -> List[Tuple[slice, ...]]:
+    def _get_grid_positions(self, image, settings: dict) -> List[Tuple[slice, ...]]:
         """Compute grid positions for tiled processing.
 
         Args:
@@ -153,12 +151,8 @@ class ObjectDetectionWidget(_WidgetBase):
         settings = self._snapshot()
         CONFIG.set("widget.server_url", settings["Server"], persist=False)
         CONFIG.set("widget.is_3d", settings["3D"], persist=False)
-        CONFIG.set(
-            "widget.detection.min_score", settings["Min Score"], persist=False
-        )
-        CONFIG.set(
-            "widget.detection.size_hint", settings["Size Hint"], persist=False
-        )
+        CONFIG.set("widget.detection.min_score", settings["Min Score"], persist=False)
+        CONFIG.set("widget.detection.size_hint", settings["Size Hint"], persist=False)
         CONFIG.set("widget.detection.nms", settings["NMS"], persist=False)
         CONFIG.set(
             "widget.detection.z_aspect_ratio",

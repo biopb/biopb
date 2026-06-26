@@ -163,9 +163,7 @@ class TestProgressTimer:
     @pytest.mark.skip(
         reason="qtbot.waitSignal doesn't process QTimer events; works in real GUI"
     )
-    def test_progress_updates_during_thread_worker(
-        self, qtbot, make_napari_viewer
-    ):
+    def test_progress_updates_during_thread_worker(self, qtbot, make_napari_viewer):
         """Timer ticks while a thread worker is blocked."""
         from napari.qt.threading import thread_worker
         from qtpy.QtWidgets import QApplication
@@ -220,18 +218,15 @@ class TestProgressTimer:
         while time.time() - start_time < 2.0:
             app.processEvents()
             time.sleep(0.02)
-            if (
-                call_started[0]
-                and len([v for v in progress_values if v > 0]) >= 3
-            ):
+            if call_started[0] and len([v for v in progress_values if v > 0]) >= 3:
                 break
 
         widget._progress_timer.stop()
 
         print(f"Progress values: {progress_values}")
-        assert (
-            len([v for v in progress_values if v > 0]) >= 3
-        ), f"Expected >= 3 progress updates, got {len([v for v in progress_values if v > 0])}"
+        assert len([v for v in progress_values if v > 0]) >= 3, (
+            f"Expected >= 3 progress updates, got {len([v for v in progress_values if v > 0])}"
+        )
 
 
 # Skip on macOS CI due to OpenGL/vispy headless issues

@@ -21,7 +21,6 @@ import threading
 import time
 
 import pytest
-
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server.metadata_db import MetadataDatabase
 from biopb_tensor_server.server import TensorFlightServer
@@ -39,6 +38,7 @@ class MockAdapter:
 
     def get_source_descriptor(self):
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
         return DataSourceDescriptor(
             source_id=self.source_id,
             source_url=self._source_url,
@@ -53,13 +53,14 @@ class MockAdapter:
         )
 
     def get_metadata(self):
-        return {"plate_id": self.source_id.split("-")[0], "acquisition_date": "2024-01-01"}
+        return {
+            "plate_id": self.source_id.split("-")[0],
+            "acquisition_date": "2024-01-01",
+        }
 
 
 def populate_server_sources(
-    server: TensorFlightServer,
-    metadata_db: MetadataDatabase,
-    n_sources: int
+    server: TensorFlightServer, metadata_db: MetadataDatabase, n_sources: int
 ) -> None:
     """Populate server and metadata_db with N synthetic sources.
 
@@ -70,7 +71,9 @@ def populate_server_sources(
         plate_num = i // 10
         source_id = f"plate-{plate_num:04d}-well-{i % 10:02d}"
         source_url = f"/data/experiment-{plate_num:04d}/{source_id}.zarr"
-        adapter = MockAdapter(source_id, source_url, "ome-zarr", [512, 512, 64], "uint16")
+        adapter = MockAdapter(
+            source_id, source_url, "ome-zarr", [512, 512, 64], "uint16"
+        )
         server.register_source(source_id, adapter)
         metadata_db.sync_source_added(source_id, adapter)
 
@@ -215,7 +218,11 @@ class TestConcurrentAccess:
                 try:
                     source_id = f"dynamic-{thread_id}"
                     adapter = MockAdapter(
-                        source_id, f"/data/{source_id}.zarr", "ome-zarr", [256, 256], "float32"
+                        source_id,
+                        f"/data/{source_id}.zarr",
+                        "ome-zarr",
+                        [256, 256],
+                        "float32",
                     )
                     server.register_source(source_id, adapter)
                     db.sync_source_added(source_id, adapter)
@@ -285,7 +292,9 @@ class TestLargeScale:
         server = server_with_metadata_db["server"]
         db = server_with_metadata_db["db"]
 
-        benchmark.pedantic(lambda: populate_server_sources(server, db, 100000), rounds=1)
+        benchmark.pedantic(
+            lambda: populate_server_sources(server, db, 100000), rounds=1
+        )
 
         conn = db._get_connection()
         result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()

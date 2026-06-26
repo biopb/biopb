@@ -10,13 +10,12 @@ Run with: pytest tests/test_stitch.py
 """
 
 import numpy as np
-
 from biopb_image_base import stitch
-
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
 
 def _square(gt, label, cy, cx, half):
     """Stamp a (2*half+1)^2 square cell labelled ``label`` centered at (cy,cx)."""
@@ -39,6 +38,7 @@ def _make_compute_chunk(gt, centers, jitter=0):
 
     With jitter>0, a few destinations are perturbed by +-1 px to emulate noise.
     """
+
     def compute_chunk(tile_start, tile_stop):
         sl = tuple(slice(tile_start[i], tile_stop[i]) for i in range(2))
         sub = gt[sl]
@@ -54,16 +54,17 @@ def _make_compute_chunk(gt, centers, jitter=0):
         if jitter:
             # Perturb a small fraction of points by +-1 px.
             rng = np.arange(labs.size)
-            mask = (rng % 7 == 0)
-            p[0, mask] += ((rng[mask] % 3) - 1)
-            p[1, mask] += (((rng[mask] // 3) % 3) - 1)
+            mask = rng % 7 == 0
+            p[0, mask] += (rng[mask] % 3) - 1
+            p[1, mask] += ((rng[mask] // 3) % 3) - 1
         return inds, p
 
     return compute_chunk
 
 
-def _run(gt, *, core_shape=(40, 40), margin=12, jitter=0, cluster_kwargs=None,
-         observer=None):
+def _run(
+    gt, *, core_shape=(40, 40), margin=12, jitter=0, cluster_kwargs=None, observer=None
+):
     centers = _centers_from_gt(gt)
     compute_chunk = _make_compute_chunk(gt, centers, jitter=jitter)
     out = np.zeros(gt.shape, dtype="int32")
@@ -108,6 +109,7 @@ def _same_partition(a, b):
 # Scenarios
 # --------------------------------------------------------------------------- #
 
+
 def test_cell_inside_single_core():
     gt = np.zeros((80, 80), dtype="int32")
     _square(gt, 1, 20, 20, 4)  # well inside core (0,0)
@@ -146,8 +148,8 @@ def test_cell_at_four_core_corner():
 
 def test_noisy_destinations_one_id_per_cell():
     gt = np.zeros((80, 80), dtype="int32")
-    _square(gt, 1, 20, 43, 5)   # straddling, noisy
-    _square(gt, 2, 60, 20, 5)   # interior, noisy
+    _square(gt, 1, 20, 43, 5)  # straddling, noisy
+    _square(gt, 2, 60, 20, 5)  # interior, noisy
     out, n_ids = _run(gt, jitter=1, cluster_kwargs={"min_count": 4, "match_tol": 5.0})
     assert n_ids == 2, "noise must not split or spuriously create instances"
     # Under noise we don't require a pixel-exact partition, but each cell must be

@@ -167,15 +167,11 @@ class _FakeRemote:
         self.calls.append("list_tools")
         return types.ListToolsResult(tools=[])
 
-    async def call_tool(
-        self, name, arguments, progress_callback=None, *, meta=None
-    ):
+    async def call_tool(self, name, arguments, progress_callback=None, *, meta=None):
         self.calls.append(("call_tool", name, arguments, meta))
         if name == "explodes":
             raise RuntimeError("kaboom")
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text="ok")]
-        )
+        return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
 
     async def read_resource(self, uri):
         self.calls.append(("read_resource", str(uri)))
@@ -294,9 +290,7 @@ class TestEndToEnd:
             send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             tools = json.loads(shim.stdout.readline())["result"]["tools"]
-            assert {"start_kernel", "execute_code"} <= {
-                t["name"] for t in tools
-            }
+            assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
 
             # Client hangs up; the shim must exit promptly and cleanly...
             shim.stdin.close()

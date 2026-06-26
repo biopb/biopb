@@ -10,7 +10,6 @@ Replaces the retired /dev/shm shm_transfer path. Covers:
   do_get fallback when the fast path is disabled or unavailable.
 """
 
-import json
 import os
 import shutil
 import tempfile
@@ -23,9 +22,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-
-from biopb.tensor.ticket_pb2 import TensorTicket
-
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
@@ -40,6 +36,7 @@ from biopb_tensor_server.server import TensorFlightServer
 def _zarr_available() -> bool:
     try:
         import zarr  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -49,10 +46,13 @@ def _zarr_available() -> bool:
 # Helpers
 # ==============================================================================
 
+
 def _make_typed_batch(arr: np.ndarray) -> pa.RecordBatch:
     """Build a batch in the [data: list<dtype>, shape, dtype] schema the cache
     expects from a compute_fn (mirrors BackendAdapter.resolve_chunk_data)."""
-    data = pa.array([arr.ravel().tolist()], type=pa.list_(pa.from_numpy_dtype(arr.dtype)))
+    data = pa.array(
+        [arr.ravel().tolist()], type=pa.list_(pa.from_numpy_dtype(arr.dtype))
+    )
     shape = pa.array([list(arr.shape)], type=pa.list_(pa.int64()))
     dtype = pa.array([str(arr.dtype)], type=pa.string())
     return pa.RecordBatch.from_arrays([data, shape, dtype], ["data", "shape", "dtype"])
@@ -75,11 +75,13 @@ def _read_via_location(loc: ChunkLocation) -> np.ndarray:
 @pytest.fixture
 def file_backend():
     d = tempfile.mkdtemp()
-    be = ArrowFileBackend(ArrowFileConfig(
-        cache_dir=Path(d),
-        max_segment_bytes=8 * 1024 * 1024,
-        max_total_bytes=256 * 1024 * 1024,
-    ))
+    be = ArrowFileBackend(
+        ArrowFileConfig(
+            cache_dir=Path(d),
+            max_segment_bytes=8 * 1024 * 1024,
+            max_total_bytes=256 * 1024 * 1024,
+        )
+    )
     try:
         yield be
     finally:
@@ -91,6 +93,7 @@ def file_backend():
 # Backend: locate_entry
 # ==============================================================================
 
+
 class TestLocateEntry:
     def test_locate_roundtrip_multiple_chunks(self, file_backend):
         """Each chunk in a shared segment locates to its exact message bytes."""
@@ -99,7 +102,9 @@ class TestLocateEntry:
             a = ((np.arange(1500, dtype=np.uint16) + i * 13) % 509).astype(np.uint16)
             arrs[i] = a
             key = f"chunk-{i}".encode()
-            file_backend.get_or_acquire(key, (lambda a=a: (_make_typed_batch(a), a.nbytes)))
+            file_backend.get_or_acquire(
+                key, (lambda a=a: (_make_typed_batch(a), a.nbytes))
+            )
             file_backend.release(key)
 
         for i in range(4):
@@ -157,8 +162,9 @@ class TestLocateEntry:
         appending a truncated copy of a real message to the segment file.
         """
         d = tempfile.mkdtemp()
-        cfg = dict(max_segment_bytes=64 * 1024 * 1024,
-                   max_total_bytes=256 * 1024 * 1024)
+        cfg = dict(
+            max_segment_bytes=64 * 1024 * 1024, max_total_bytes=256 * 1024 * 1024
+        )
         be = ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **cfg))
         try:
             arrs = {}
@@ -175,7 +181,7 @@ class TestLocateEntry:
             loc0 = be.locate_entry(b"good-0")
             seg_path = Path(loc0.segment_path)
             raw = seg_path.read_bytes()
-            full = raw[loc0.byte_offset:loc0.byte_offset + loc0.byte_length]
+            full = raw[loc0.byte_offset : loc0.byte_offset + loc0.byte_length]
             with open(seg_path, "ab") as f:
                 f.write(full[: len(full) // 2])
 
@@ -209,6 +215,7 @@ class TestLocateViaManager:
 # Server: chunk_locate action
 # ==============================================================================
 
+
 class TestChunkLocateAction:
     def test_chunk_locate_listed(self):
         server = TensorFlightServer("grpc://localhost:0")
@@ -227,41 +234,52 @@ class TestChunkLocateAction:
 # Client helpers
 # ==============================================================================
 
+
 class TestLocalhostDetection:
     """Localhost detection (still used to gate the cache-file fast path)."""
 
     def test_localhost_explicit(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc://localhost:8815") is True
 
     def test_127_0_0_1(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc://127.0.0.1:8815") is True
 
     def test_ipv6_loopback(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc://[::1]:8815") is True
 
     def test_grpc_tls_scheme(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc+tls://localhost:8815") is True
 
     def test_not_localhost_remote_ip(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc://192.168.1.100:8815") is False
 
     def test_not_localhost_remote_hostname(self):
         from biopb.tensor.client import _is_localhost_location
+
         assert _is_localhost_location("grpc://example.com:8815") is False
 
 
 class TestExtractSchemaMetadata:
     def test_extracts_metadata_dict(self):
         from biopb.tensor.client import _extract_schema_metadata
-        schema = pa.schema([], metadata={
-            b"tensor_schema_version": b"0.4.0",
-            b"other_key": b"other_value",
-        })
+
+        schema = pa.schema(
+            [],
+            metadata={
+                b"tensor_schema_version": b"0.4.0",
+                b"other_key": b"other_value",
+            },
+        )
         metadata = _extract_schema_metadata(schema)
         assert metadata is not None
         assert metadata["tensor_schema_version"] == "0.4.0"
@@ -269,36 +287,43 @@ class TestExtractSchemaMetadata:
 
     def test_returns_none_for_no_metadata(self):
         from biopb.tensor.client import _extract_schema_metadata
+
         assert _extract_schema_metadata(pa.schema([])) is None
 
 
 class TestShouldTryCachefile:
     def setup_method(self):
         import biopb.tensor.client as c
+
         c._cachefile_support.clear()
 
     def test_enabled_on_posix_localhost(self):
         from biopb.tensor.client import _should_try_cachefile
+
         if os.name != "posix":
             pytest.skip("POSIX-only path")
         assert _should_try_cachefile("grpc://localhost:8815") is True
 
     def test_disabled_by_env(self):
         from biopb.tensor.client import _should_try_cachefile
+
         with patch.dict(os.environ, {"BIOPB_CACHEFILE_TRANSFER_DISABLED": "1"}):
             assert _should_try_cachefile("grpc://localhost:8815") is False
 
     def test_disabled_for_remote(self):
         from biopb.tensor.client import _should_try_cachefile
+
         assert _should_try_cachefile("grpc://192.168.1.100:8815") is False
 
     def test_disabled_on_non_posix(self):
         import biopb.tensor.client as c
+
         with patch.object(os, "name", "nt"):
             assert c._should_try_cachefile("grpc://localhost:8815") is False
 
     def test_skips_after_unsupported_memoized(self):
         import biopb.tensor.client as c
+
         c._set_cachefile_supported("grpc://localhost:8815", False)
         assert c._should_try_cachefile("grpc://localhost:8815") is False
 
@@ -307,6 +332,7 @@ class TestArrayFromUnifiedBatch:
     def test_decode_matches_source(self):
         from biopb.tensor.client import _array_from_unified_batch
         from biopb_tensor_server.cache.file_backend import _cast_to_unified_schema
+
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
         unified = _cast_to_unified_schema(_make_typed_batch(a))
         got = _array_from_unified_batch(unified)
@@ -318,6 +344,7 @@ class TestArrayFromUnifiedBatch:
 # Integration: file-backed server <-> client
 # ==============================================================================
 
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestCachefileIntegration:
     def _serve_zarr(self, tmp, backend_cfg):
@@ -327,11 +354,17 @@ class TestCachefileIntegration:
         CacheManager.reset()
         CacheManager.initialize(backend_cfg)
         zpath = str(Path(tmp) / "data.zarr")
-        src = (np.arange(96 * 96, dtype=np.uint16).reshape(96, 96) % 997).astype(np.uint16)
-        z = zarr.open_array(zpath, mode="w", shape=src.shape, chunks=(48, 48), dtype=src.dtype)
+        src = (np.arange(96 * 96, dtype=np.uint16).reshape(96, 96) % 997).astype(
+            np.uint16
+        )
+        z = zarr.open_array(
+            zpath, mode="w", shape=src.shape, chunks=(48, 48), dtype=src.dtype
+        )
         z[:] = src
         server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("z", ZarrAdapter(zarr.open_array(zpath, mode="r"), "z", ["y", "x"]))
+        server.register_source(
+            "z", ZarrAdapter(zarr.open_array(zpath, mode="r"), "z", ["y", "x"])
+        )
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(0.8)
         return server, src

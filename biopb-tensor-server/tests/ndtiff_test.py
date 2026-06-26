@@ -7,19 +7,16 @@ Tests cover:
 - Server/client roundtrip
 """
 
-import os
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
-
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
@@ -27,7 +24,7 @@ from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 def _ndtiff_available() -> bool:
     """Check if ndtiff is available."""
     try:
-        import ndtiff
+        import ndtiff  # noqa: F401  # availability probe
 
         return True
     except ImportError:

@@ -175,9 +175,7 @@ _SCREENSHOT_SNIPPET = (
     "    _arr = viewer.screenshot(canvas_only={canvas_only})\n"
     "    _bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
     "    _ok, _buf = _cv2.imencode('.png', _bgra)\n"
-    "    print('"
-    + _PNG_DELIM
-    + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
+    "    print('" + _PNG_DELIM + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
 )
 
 # Self-contained inspection snippet.  Built by string concatenation (no
@@ -459,10 +457,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = host.execute(snippet)
-    if (
-        _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM)
-        is not None
-    ):
+    if _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM) is not None:
         return [
             TextContent(
                 type="text",
@@ -475,9 +470,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
         ]
     data = _extract_delimited(res.get("stdout", ""), _PNG_DELIM)
     if data is None:
-        detail = (
-            res.get("error_text") or res.get("stdout") or res.get("status")
-        )
+        detail = res.get("error_text") or res.get("stdout") or res.get("status")
         return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
     return [ImageContent(type="image", mimeType="image/png", data=data)]
 
@@ -541,9 +534,7 @@ def execute_code(python_code: str) -> str:
     snap = submitted
     while time.monotonic() < deadline:
         time.sleep(0.4)
-        snap, res, window_alive = _run_job_call(
-            host, "poll(" + repr(job_id) + ")"
-        )
+        snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
             return _format_execute_result(res)
         if snap.get("status") != "running":
@@ -556,9 +547,7 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
-        "Partial output:\n"
-        + (partial or "(none yet)")
-        + _window_note(window_alive)
+        "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
     )
 
 
@@ -579,9 +568,7 @@ def poll_job(job_id: str) -> str:
         return _format_execute_result(res)
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'."
-    note = (
-        _window_note(window_alive) if snap.get("status") != "running" else ""
-    )
+    note = _window_note(window_alive) if snap.get("status") != "running" else ""
     return _format_job_status(snap) + note
 
 
@@ -598,9 +585,7 @@ def cancel_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    data, res, _window_alive = _run_job_call(
-        host, "cancel(" + repr(job_id) + ")"
-    )
+    data, res, _window_alive = _run_job_call(host, "cancel(" + repr(job_id) + ")")
     if data is None:
         return _format_execute_result(res)
     status = data.get("status")
@@ -729,10 +714,10 @@ def server_status() -> str:
         "## System",
         f"  cpu_usage: {cpu_percent}%",
         f"  cpu_count: {os.cpu_count()}",
-        f"  memory_total: {mem.total / (1024 ** 3):.1f} GB",
-        f"  memory_available: {mem.available / (1024 ** 3):.1f} GB",
+        f"  memory_total: {mem.total / (1024**3):.1f} GB",
+        f"  memory_available: {mem.available / (1024**3):.1f} GB",
         f"  memory_used_percent: {mem.percent}%",
-        f"  process_rss: {proc_mem.rss / (1024 ** 2):.0f} MB",
+        f"  process_rss: {proc_mem.rss / (1024**2):.0f} MB",
         "",
     ]
 
@@ -756,9 +741,7 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
-    lines.append(
-        f"  display: {'headless (no viewer)' if _headless else 'visible'}"
-    )
+    lines.append(f"  display: {'headless (no viewer)' if _headless else 'visible'}")
     health = host.health()
     lines.append(f"  alive: {health['alive']}")
     lines.append(f"  ready: {health['ready']}")
@@ -774,9 +757,7 @@ def server_status() -> str:
     # startup budget. A user-attributed teardown reason (window close) is shown.
     teardown = health.get("teardown_reason")
     if health["dead"]:
-        lines.append(
-            "  state: DEAD — respawn budget exhausted; call start_kernel"
-        )
+        lines.append("  state: DEAD — respawn budget exhausted; call start_kernel")
         if health.get("start_error"):
             lines.append(f"    last error: {health['start_error']}")
         return "\n".join(lines)
@@ -796,9 +777,7 @@ def server_status() -> str:
                 "  state: starting — kernel/viewer still booting; retry shortly"
             )
         else:
-            line = (
-                "  state: not started — call start_kernel to launch the kernel"
-            )
+            line = "  state: not started — call start_kernel to launch the kernel"
             if teardown:
                 line += f" (torn down: {teardown})"
             lines.append(line)
@@ -813,8 +792,7 @@ def server_status() -> str:
     else:
         lines.append("")
         lines.append(
-            "  kernel query error: "
-            + (res.get("error_text") or str(res.get("status")))
+            "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
     return "\n".join(lines)

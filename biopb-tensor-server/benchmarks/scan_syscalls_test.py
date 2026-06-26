@@ -58,7 +58,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     DiscoveryState,
@@ -67,7 +66,6 @@ from biopb_tensor_server.discovery import (
 from biopb_tensor_server.source_manager import SourceManager
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
-
 
 # Same tree "scale" knobs as discovery_scan_test.py so the two benchmarks describe
 # the *same* tree from different angles (probe count there, syscall count here).
@@ -152,7 +150,7 @@ class _SyscallCounter:
     _TRUE_SYSCALL_BUCKETS = _OS_PRIMS + ("scandir", "direntry_stat")
 
     def __init__(self):
-        self.counts = {name: 0 for name in self._TRUE_SYSCALL_BUCKETS}
+        self.counts = dict.fromkeys(self._TRUE_SYSCALL_BUCKETS, 0)
         # Logical high-level calls (each fans out into several os-level syscalls).
         self.counts["logical_resolve"] = 0
         self.counts["logical_get_file_identity"] = 0
@@ -163,6 +161,7 @@ class _SyscallCounter:
     def measure(self):
         import builtins
         import pathlib
+
         import biopb_tensor_server.discovery as discovery
         import biopb_tensor_server.source_manager as source_manager
 
@@ -324,8 +323,16 @@ def _strace_total_syscalls(root: Path) -> int:
 
     def traced(script: str) -> int:
         proc = subprocess.run(
-            ["strace", "-f", "-c", "-e", f"trace={_STRACE_SYSCALLS}",
-             sys.executable, "-c", script],
+            [
+                "strace",
+                "-f",
+                "-c",
+                "-e",
+                f"trace={_STRACE_SYSCALLS}",
+                sys.executable,
+                "-c",
+                script,
+            ],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -372,7 +379,9 @@ def scan_tree(request, tmp_path_factory):
     return scale, root, _count_interior_files(root)
 
 
-def _report(scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _SyscallCounter):
+def _report(
+    scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _SyscallCounter
+):
     total = state_c.total_syscalls + claim_c.total_syscalls
     per_entry = total / n_files if n_files else 0.0
     print(f"\n=== #56 syscall baseline: {scale} ===")
@@ -381,8 +390,10 @@ def _report(scale: str, n_files: int, state_c: _SyscallCounter, claim_c: _Syscal
     for k in state_c.counts:
         sv, cv = state_c.counts[k], claim_c.counts[k]
         print(f"{k:<28}{sv:>12}{cv:>12}{sv + cv:>10}")
-    print(f"{'TRUE SYSCALLS (os-level)':<28}"
-          f"{state_c.total_syscalls:>12}{claim_c.total_syscalls:>12}{total:>10}")
+    print(
+        f"{'TRUE SYSCALLS (os-level)':<28}"
+        f"{state_c.total_syscalls:>12}{claim_c.total_syscalls:>12}{total:>10}"
+    )
     print(f"--> syscalls per entry: {per_entry:.1f}")
 
 
@@ -474,8 +485,10 @@ class TestSyscallBaseline:
         py_total = py_c.total_syscalls
 
         strace_total = _strace_total_syscalls(root)
-        print(f"\n[strace] {scale}: python-counter={py_total} "
-              f"strace={strace_total} (entries={n_files})")
+        print(
+            f"\n[strace] {scale}: python-counter={py_total} "
+            f"strace={strace_total} (entries={n_files})"
+        )
 
         assert strace_total > 0
         # Same order of magnitude: strace >= python (ground truth sees a superset)

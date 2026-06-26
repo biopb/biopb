@@ -31,9 +31,7 @@ class TestParseServerUrl:
 
     def test_valid_domain_with_port(self):
         """Valid domain:port format parses correctly."""
-        host, port, scheme, label_filter = _parse_server_url(
-            "lacss.biopb.org:8080"
-        )
+        host, port, scheme, label_filter = _parse_server_url("lacss.biopb.org:8080")
         assert host == "lacss.biopb.org"
         assert port == 8080
         assert scheme is None  # Auto-detect
@@ -57,9 +55,7 @@ class TestParseServerUrl:
 
     def test_http_scheme_prefix(self):
         """http:// prefix returns HTTP scheme."""
-        host, port, scheme, label_filter = _parse_server_url(
-            "http://localhost:50051"
-        )
+        host, port, scheme, label_filter = _parse_server_url("http://localhost:50051")
         assert host == "localhost"
         assert port == 50051
         assert scheme == "http"
@@ -77,9 +73,7 @@ class TestParseServerUrl:
 
     def test_https_scheme_no_port(self):
         """https:// with hostname only defaults to port 443."""
-        host, port, scheme, label_filter = _parse_server_url(
-            "https://lacss.biopb.org"
-        )
+        host, port, scheme, label_filter = _parse_server_url("https://lacss.biopb.org")
         assert host == "lacss.biopb.org"
         assert port == 443
         assert scheme == "https"
@@ -87,9 +81,7 @@ class TestParseServerUrl:
 
     def test_http_scheme_no_port(self):
         """http:// with hostname only defaults to port 443."""
-        host, port, scheme, label_filter = _parse_server_url(
-            "http://localhost"
-        )
+        host, port, scheme, label_filter = _parse_server_url("http://localhost")
         assert host == "localhost"
         assert port == 443
         assert scheme == "http"
@@ -97,9 +89,7 @@ class TestParseServerUrl:
 
     def test_url_with_label_filter(self):
         """URL with path component extracts label filter."""
-        host, port, scheme, label_filter = _parse_server_url(
-            "localhost:50051/filter"
-        )
+        host, port, scheme, label_filter = _parse_server_url("localhost:50051/filter")
         assert host == "localhost"
         assert port == 50051
         assert scheme is None
@@ -161,13 +151,9 @@ class TestGetLabelFilter:
         """URL with path returns label filter."""
         assert _get_label_filter("localhost:50051/filter") == "filter"
         assert (
-            _get_label_filter("http://localhost:50051/segmentation")
-            == "segmentation"
+            _get_label_filter("http://localhost:50051/segmentation") == "segmentation"
         )
-        assert (
-            _get_label_filter("https://lacss.biopb.org/threshold")
-            == "threshold"
-        )
+        assert _get_label_filter("https://lacss.biopb.org/threshold") == "threshold"
 
     def test_invalid_url_raises(self):
         """Invalid URL raises ValueError."""
@@ -381,15 +367,11 @@ class TestGrpcObjectDetection:
 
     @patch("biopb_mcp.image_processing._grpc._get_grpc_channel")
     @patch("biopb_mcp.image_processing._grpc.proto.ObjectDetectionStub")
-    def test_generator_yields_progress(
-        self, mock_stub_class, mock_channel_func
-    ):
+    def test_generator_yields_progress(self, mock_stub_class, mock_channel_func):
         """Generator yields None for progress updates."""
         # Setup mocks
         mock_channel = MagicMock()
-        mock_channel_func.return_value.__enter__ = MagicMock(
-            return_value=mock_channel
-        )
+        mock_channel_func.return_value.__enter__ = MagicMock(return_value=mock_channel)
         mock_channel_func.return_value.__exit__ = MagicMock(return_value=False)
 
         mock_stub = MagicMock()

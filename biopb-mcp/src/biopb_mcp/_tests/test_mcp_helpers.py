@@ -54,9 +54,7 @@ class TestPatchViewerAddTensor:
         with pytest.raises(RuntimeError, match="No tensor server connected"):
             viewer.add_tensor("some_source")
 
-    def test_raises_when_source_not_found_without_get_source(
-        self, viewer, connection
-    ):
+    def test_raises_when_source_not_found_without_get_source(self, viewer, connection):
         client = MagicMock()
         del client.get_source  # simulate biopb without the direct-fetch method
         connection.client = client
@@ -138,9 +136,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(
-                viewer, connection, compute_scheduler="threads"
-            )
+            patch_viewer_add_tensor(viewer, connection, compute_scheduler="threads")
             viewer.add_tensor("src1")
 
         (passed,), kwargs = viewer.add_image.call_args
@@ -193,9 +189,7 @@ class TestPatchViewerAddTensor:
             patch_viewer_add_tensor(viewer, connection)
             viewer.add_tensor("src1")
 
-        viewer.add_image.assert_called_once_with(
-            levels, name="big", multiscale=True
-        )
+        viewer.add_image.assert_called_once_with(levels, name="big", multiscale=True)
 
     def test_raises_for_invalid_tensor_id(self, viewer, connection):
         tensor = _make_tensor("t1", [256, 256])

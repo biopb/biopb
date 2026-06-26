@@ -18,19 +18,19 @@ Note: Server components have been moved to the biopb-tensor-server package.
 """
 
 # Import proto-generated classes with explicit paths
-from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
 from biopb.tensor.descriptor_pb2 import (
-    TensorDescriptor,
-    SliceHint,
-    TensorCriteria,
-    TensorWriteOptions,
     FlightCmd,
-    TensorReadOption,
     MetadataQueryOption,
     ResolveProgress,
+    SliceHint,
+    TensorCriteria,
+    TensorDescriptor,
+    TensorReadOption,
+    TensorWriteOptions,
     WarmProgress,
 )
-from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
+from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 # Import client lazily. biopb.tensor.client imports pyarrow at module load, and
 # pyarrow's compiled SSE4.2 baseline raises SIGILL on pre-SSE4.2 CPUs (e.g. old
@@ -53,23 +53,24 @@ def __getattr__(name):
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
 __all__ = [
     # Proto messages
-    'TensorTicket',
-    'ChunkBounds',
-    'TensorDescriptor',
-    'SliceHint',
-    'TensorCriteria',
-    'TensorWriteOptions',
-    'FlightCmd',
-    'TensorReadOption',
-    'MetadataQueryOption',
-    'ResolveProgress',
-    'WarmProgress',
-    'SerializedTensor',
-    'SerializedEndpoint',
+    "TensorTicket",
+    "ChunkBounds",
+    "TensorDescriptor",
+    "SliceHint",
+    "TensorCriteria",
+    "TensorWriteOptions",
+    "FlightCmd",
+    "TensorReadOption",
+    "MetadataQueryOption",
+    "ResolveProgress",
+    "WarmProgress",
+    "SerializedTensor",
+    "SerializedEndpoint",
     # Client
-    'TensorFlightClient',
-    'make_debug_serialized_tensor',
-    'ResolveCancelled',
+    "TensorFlightClient",
+    "make_debug_serialized_tensor",
+    "ResolveCancelled",
 ]

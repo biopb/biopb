@@ -19,8 +19,7 @@ Chunk data: stored in CacheManager keyed by full chunk_id
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -29,12 +28,11 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint, encode_chunk_id
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.chunk import encode_chunk_id
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +51,16 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     _single_tensor_source = True
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'CachedSourceAdapter':
+    def create_from_config(
+        cls, source: SourceConfig, credentials_config: Optional[Any] = None
+    ) -> CachedSourceAdapter:
         """Cache-backed sources are not created from config.
 
         Raises NotImplementedError - use direct instantiation via DoPut.
         """
-        raise NotImplementedError("CachedSourceAdapter is created via DoPut, not config")
+        raise NotImplementedError(
+            "CachedSourceAdapter is created via DoPut, not config"
+        )
 
     def __init__(
         self,
@@ -192,7 +194,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
                 pa.array([logical_shape]),
                 pa.array([dtype_str]),
             ],
-            ["data", "shape", "dtype"]
+            ["data", "shape", "dtype"],
         )
 
         entry, is_owner = cache_manager.start_compute(
@@ -244,7 +246,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         entry = cache_manager.get_or_acquire(
             chunk_id,
             lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-            metadata={'array_id': self.source_id}
+            metadata={"array_id": self.source_id},
         )
         data = entry.data
         cache_manager.release(chunk_id)

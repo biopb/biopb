@@ -210,9 +210,7 @@ def build_pyramid_levels(
     ndim = len(shape)
 
     # Per-tensor labels win; fall back to the source descriptor's labels.
-    dim_labels = tensor_desc.dim_labels or getattr(
-        source_desc, "dim_labels", None
-    )
+    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
     y_idx, x_idx = get_xy_dim_indices(shape, dim_labels)
     z_idx = get_z_dim_index(shape, dim_labels)
     # A degenerate label set could map z onto an x/y axis; drop it if so.
@@ -229,9 +227,7 @@ def build_pyramid_levels(
     # is the fallback for servers that advertise no pyramid -- it recomputes the
     # scale plan and (deliberately) omits reduction_method, which is fine only
     # when there is nothing pre-warmed to miss.
-    advertised = _advertised_pyramid_levels(
-        client, source_id, tensor_id, tensor_desc
-    )
+    advertised = _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc)
     if advertised:
         levels = [
             client.get_tensor(
@@ -254,9 +250,7 @@ def build_pyramid_levels(
             if z_idx is not None:
                 scale_hint[z_idx] = sz
 
-            arr = client.get_tensor(
-                source_id, tensor_id, scale_hint=scale_hint
-            )
+            arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
             levels.append(arr)
 
             # Real downsampled extents from the returned array, not
@@ -264,20 +258,14 @@ def build_pyramid_levels(
             lx = arr.shape[x_idx]
             ly = arr.shape[y_idx]
             lz = arr.shape[z_idx] if z_idx is not None else 1
-            if (
-                lx * ly * lz <= pixel_budget
-                and lx <= threshold
-                and ly <= threshold
-            ):
+            if lx * ly * lz <= pixel_budget and lx <= threshold and ly <= threshold:
                 break
 
             # Downsample each axis individually, leaving any at the floor.
             nsx = sx * downscale_factor if lx > axis_floor else sx
             nsy = sy * downscale_factor if ly > axis_floor else sy
             nsz = (
-                sz * downscale_factor
-                if (z_idx is not None and lz > axis_floor)
-                else sz
+                sz * downscale_factor if (z_idx is not None and lz > axis_floor) else sz
             )
             if (nsx, nsy, nsz) == (sx, sy, sz):
                 break  # nothing left to shrink; avoid an infinite loop
@@ -353,9 +341,7 @@ def build_layer_scale(
             dim_labels = tensor_desc.dim_labels
         if not dim_labels:
             dim_labels = getattr(source_desc, "dim_labels", None)
-        src_shape = (
-            list(tensor_desc.shape) if tensor_desc is not None else scale_vec
-        )
+        src_shape = list(tensor_desc.shape) if tensor_desc is not None else scale_vec
         y_idx, x_idx = get_xy_dim_indices(src_shape, dim_labels)
         z_idx = get_z_dim_index(src_shape, dim_labels)
         if z_idx is not None and z_idx in (x_idx, y_idx):
@@ -363,17 +349,11 @@ def build_layer_scale(
 
         def _at(idx):
             return (
-                scale_vec[idx]
-                if (idx is not None and idx < len(scale_vec))
-                else None
+                scale_vec[idx] if (idx is not None and idx < len(scale_vec)) else None
             )
 
         def _unit_at(idx):
-            return (
-                unit_vec[idx]
-                if (idx is not None and idx < len(unit_vec))
-                else None
-            )
+            return unit_vec[idx] if (idx is not None and idx < len(unit_vec)) else None
 
         psx = _positive_float(_at(x_idx))
         psy = _positive_float(_at(y_idx))

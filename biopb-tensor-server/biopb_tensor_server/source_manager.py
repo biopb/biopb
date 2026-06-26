@@ -15,8 +15,8 @@ from pathlib import Path
 from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
     DiscoveryState,
@@ -482,9 +482,7 @@ class SourceManager:
             signature,
         ):
             last_changed = previous_entry[2]
-            stable_observations = (
-                self._entry_stable_observations.get(path_str, 0) + 1
-            )
+            stable_observations = self._entry_stable_observations.get(path_str, 0) + 1
             pending_scan = self._entry_pending_scan.get(path_str, False)
         else:
             pending_scan = True

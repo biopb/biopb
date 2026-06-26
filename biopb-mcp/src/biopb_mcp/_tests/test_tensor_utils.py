@@ -145,16 +145,12 @@ class TestBuildPyramidLevels:
         # Canonical output always carries an explicit (here singleton) Z.
         assert levels[0].shape == (1, 256, 256)
         # Unified loop always passes a scale_hint, even for a single level.
-        client.get_tensor.assert_called_once_with(
-            "src", "t1", scale_hint=[1, 1]
-        )
+        client.get_tensor.assert_called_once_with("src", "t1", scale_hint=[1, 1])
 
     def test_threshold_boundary_no_pyramid(self):
         desc = _make_tensor_desc([THRESHOLD, THRESHOLD])
         client = MagicMock()
-        client.get_tensor.return_value = _arr_with_shape(
-            [THRESHOLD, THRESHOLD]
-        )
+        client.get_tensor.return_value = _arr_with_shape([THRESHOLD, THRESHOLD])
 
         levels = build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
         assert len(levels) == 1
@@ -189,10 +185,7 @@ class TestBuildPyramidLevels:
         assert second_hint[1] == FACTOR  # y
         assert second_hint[2] == FACTOR  # x
         # z stays full-res at every level.
-        assert all(
-            c[1]["scale_hint"][0] == 1
-            for c in client.get_tensor.call_args_list
-        )
+        assert all(c[1]["scale_hint"][0] == 1 for c in client.get_tensor.call_args_list)
 
     def test_pyramid_coarsest_level_fits_within_threshold(self):
         # Levels are emitted until the coarsest fits within `threshold`.
@@ -206,9 +199,7 @@ class TestBuildPyramidLevels:
         build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
 
         # x is the last dim for a 2D source; scale is symmetric in x/y.
-        scales = [
-            c[1]["scale_hint"][1] for c in client.get_tensor.call_args_list
-        ]
+        scales = [c[1]["scale_hint"][1] for c in client.get_tensor.call_args_list]
         coarsest = size // scales[-1]
         assert coarsest <= THRESHOLD
         assert coarsest > THRESHOLD // FACTOR
@@ -220,13 +211,9 @@ class TestBuildPyramidLevels:
     def test_deep_stack_bounds_coarsest_volume_including_z(self):
         # A deep stack must downsample z too, so the coarsest level's whole
         # volume (Lz*Ly*Lx) fits the voxel budget (issue #29).
-        desc = _make_tensor_desc(
-            [3000, 8192, 8192], dim_labels=["z", "y", "x"]
-        )
+        desc = _make_tensor_desc([3000, 8192, 8192], dim_labels=["z", "y", "x"])
         client = MagicMock()
-        client.get_tensor.side_effect = _scaling_side_effect(
-            [3000, 8192, 8192]
-        )
+        client.get_tensor.side_effect = _scaling_side_effect([3000, 8192, 8192])
 
         build_pyramid_levels(client, "src", "t1", desc, config=_CFG)
 
@@ -271,9 +258,7 @@ class TestAdvertisedPyramid:
             ],
         )
 
-        levels = build_pyramid_levels(
-            client, "src", "src/A2", desc, config=_CFG
-        )
+        levels = build_pyramid_levels(client, "src", "src/A2", desc, config=_CFG)
 
         assert len(levels) == 2
         # Both requests carry the advertised scale_hint AND reduction_method.
@@ -303,9 +288,7 @@ class TestAdvertisedPyramid:
         )
         lean = SimpleNamespace(shape=self._FULL, dim_labels=self._LABELS)
 
-        levels = build_pyramid_levels(
-            client, "src", "src/A2", lean, config=_CFG
-        )
+        levels = build_pyramid_levels(client, "src", "src/A2", lean, config=_CFG)
 
         client.get_source.assert_called_once_with("src", "src/A2")
         assert len(levels) == 2
@@ -347,15 +330,9 @@ class TestAdvertisedPyramidLevelsHelper:
         # requested id -> still use it (single-tensor source).
         client = MagicMock()
         client.get_source.return_value = SimpleNamespace(
-            tensors=[
-                SimpleNamespace(
-                    array_id="other", pyramid=[_adv_level([1], "x")]
-                )
-            ]
+            tensors=[SimpleNamespace(array_id="other", pyramid=[_adv_level([1], "x")])]
         )
-        out = _advertised_pyramid_levels(
-            client, "src", "src/A2", SimpleNamespace()
-        )
+        out = _advertised_pyramid_levels(client, "src", "src/A2", SimpleNamespace())
         assert len(out) == 1
 
 
@@ -502,9 +479,7 @@ class TestAddTensorLayer:
         client.get_tensor.side_effect = _dask_scaling_side_effect([8192, 8192])
         desc = _make_tensor_desc([8192, 8192], ["y", "x"])
 
-        add_tensor_layer(
-            viewer, client, "src", "t1", desc, name="lyr", config=_CFG
-        )
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         levels_arg = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args
@@ -525,9 +500,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((256, 256))
         desc = _make_tensor_desc([256, 256], ["y", "x"])
 
-        add_tensor_layer(
-            viewer, client, "src", "t1", desc, name="lyr", config=_CFG
-        )
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         _, kwargs = viewer.add_image.call_args
         assert kwargs == {"name": "lyr"}
@@ -540,9 +513,7 @@ class TestAddTensorLayer:
         client.get_tensor.return_value = da.zeros((64, 32, 3))
         desc = _make_tensor_desc([64, 32, 3], ["y", "x", "c"])
 
-        add_tensor_layer(
-            viewer, client, "src", "t1", desc, name="lyr", config=_CFG
-        )
+        add_tensor_layer(viewer, client, "src", "t1", desc, name="lyr", config=_CFG)
 
         arr = viewer.add_image.call_args[0][0]
         _, kwargs = viewer.add_image.call_args

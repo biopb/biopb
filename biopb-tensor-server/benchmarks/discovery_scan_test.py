@@ -28,7 +28,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     ClaimContext,
@@ -38,7 +37,6 @@ from biopb_tensor_server.discovery import (
 )
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
-
 
 # Tree "scale": (wells, fields, chunks). Smaller chunks => more chunk files per
 # field array, which is what amplifies the pre-#55 cost. Logical source count is
@@ -94,9 +92,7 @@ def _scan(root: Path, registry, *, prune: bool) -> DiscoveryState:
         state.add_claim(claims[0])
         return state
 
-    should_descend = (
-        (lambda p: not state.is_path_claimed(str(p))) if prune else None
-    )
+    should_descend = (lambda p: not state.is_path_claimed(str(p))) if prune else None
     for path in walk_with_identity_tracking(
         root, state.visited_identities, should_descend=should_descend
     ):
@@ -198,6 +194,4 @@ class TestDiscoverSourcesScan:
 
         state = benchmark(lambda: discover_sources(root, registry))
 
-        benchmark.extra_info.update(
-            interior_files=n_files, sources=len(state.claims)
-        )
+        benchmark.extra_info.update(interior_files=n_files, sources=len(state.claims))

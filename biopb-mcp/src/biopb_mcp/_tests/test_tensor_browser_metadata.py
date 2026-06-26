@@ -107,9 +107,13 @@ class TestGetPathParts:
     def test_windows_path_splits_on_backslash(self):
         # The regression: urlparse reads "C:" as a scheme and leaves the path
         # backslash-separated; splitting on "/" alone yielded one giant leaf.
-        assert _get_path_parts(
-            r"C:\Users\me\Pictures\Screenshots 1\shot.png"
-        ) == ["Users", "me", "Pictures", "Screenshots 1", "shot.png"]
+        assert _get_path_parts(r"C:\Users\me\Pictures\Screenshots 1\shot.png") == [
+            "Users",
+            "me",
+            "Pictures",
+            "Screenshots 1",
+            "shot.png",
+        ]
 
     def test_windows_drive_root_file(self):
         assert _get_path_parts(r"C:\img.tif") == ["img.tif"]

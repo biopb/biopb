@@ -10,7 +10,6 @@ from pathlib import Path
 
 import imageio
 import numpy as np
-
 from biopb.tensor.serialized_pb2 import SerializedTensor
 
 
@@ -164,6 +163,7 @@ class TestImageCliProcess:
 
             # Output should be pickled SerializedTensor
             import pickle
+
             serialized = pickle.loads(result.stdout)
             assert isinstance(serialized, SerializedTensor)
             assert serialized.location.startswith("grpc://")
@@ -260,4 +260,3 @@ class TestImageCliProcess:
         """Process input piped from stdin."""
         # This test would pipe data from tensor get to image process
         # Skipped if tensor server not available
-        pass

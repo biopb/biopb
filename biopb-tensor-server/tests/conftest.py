@@ -6,14 +6,13 @@ Imports fixture factory functions from fixtures module and wraps them as pytest 
 import tempfile
 
 import pytest
-
 from biopb_tensor_server.fixtures import (
-    create_companion_ome_dataset,
     create_5d_6d_micromanager_dataset,
+    create_companion_ome_dataset,
     create_hdf5_dataset,
+    create_multi_series_ome_tiff,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
-    create_multi_series_ome_tiff,
     create_multiresolution_ome_zarr,
     create_tiled_ome_tiff,
     create_zarr_array,
@@ -22,6 +21,7 @@ from biopb_tensor_server.fixtures import (
 # =============================================================================
 # pytest fixtures using the factory functions
 # =============================================================================
+
 
 @pytest.fixture
 def temp_dir():

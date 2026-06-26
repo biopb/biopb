@@ -379,14 +379,10 @@ class ImageProcessingWidget(_WidgetBase):
 
             # Handle annotations: merge and display table
             if self._current_annotations:
-                merged_annotation = _merge_annotations(
-                    self._current_annotations
-                )
+                merged_annotation = _merge_annotations(self._current_annotations)
                 if not merged_annotation.empty:
                     # Use output layer if exists, else input layer
-                    target_layer = (
-                        self.out_layer if self.out_layer else image_layer
-                    )
+                    target_layer = self.out_layer if self.out_layer else image_layer
                     target_layer.metadata["annotation"] = merged_annotation
                     _show_annotation_table(
                         target_layer, self._viewer, merged_annotation
@@ -436,9 +432,7 @@ def _prepare_for_viewer(data: np.ndarray) -> tuple[np.ndarray, bool]:
         # Move C from index 2 to last: TZCYX -> TZYXC
         data = np.moveaxis(data, 2, -1)
         # Selectively squeeze singleton dims (except last which is C)
-        squeeze_axes = tuple(
-            i for i, s in enumerate(data.shape[:-1]) if s == 1
-        )
+        squeeze_axes = tuple(i for i, s in enumerate(data.shape[:-1]) if s == 1)
         if squeeze_axes:
             data = np.squeeze(data, axis=squeeze_axes)
     else:

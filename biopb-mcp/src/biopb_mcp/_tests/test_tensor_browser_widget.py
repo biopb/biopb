@@ -105,8 +105,7 @@ class TestConnect:
         # auto_connect tried, failed, recorded the friendly reason. There is no
         # dialog anymore — the failure just renders inline.
         conn.last_message = (
-            "Cannot reach tensor server at grpc://localhost:8815 — "
-            "is it running?"
+            "Cannot reach tensor server at grpc://localhost:8815 — is it running?"
         )
 
         w._auto_connect()
@@ -177,9 +176,7 @@ class TestConnect:
         stale_worker()
         w._build_and_display_tree.assert_not_called()
 
-    def test_worker_signals_completion_even_if_auto_connect_raises(
-        self, widget
-    ):
+    def test_worker_signals_completion_even_if_auto_connect_raises(self, widget):
         w, conn, workers = widget
         # auto_connect is documented best-effort, but the worker must still
         # signal completion (and not die) if it ever leaks an exception.
@@ -360,9 +357,7 @@ class TestResolveAction:
         conn.is_connected = True
         conn.sources = {"cloud_x": _descriptor("cloud_x", tensors=[])}
 
-        answer = (
-            widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
-        )
+        answer = widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
         monkeypatch.setattr(
             widget_mod.QMessageBox, "warning", staticmethod(lambda *a, **k: answer)
         )
@@ -526,7 +521,9 @@ class TestResolveAction:
         w._add_to_viewer.assert_not_called()  # unresolved never hits the add path
 
 
-def _warm_progress(files_done=1, files_total=3, bytes_done=10, bytes_total=30, name="c"):
+def _warm_progress(
+    files_done=1, files_total=3, bytes_done=10, bytes_total=30, name="c"
+):
     from biopb.tensor.descriptor_pb2 import WarmProgress
 
     return WarmProgress(
@@ -615,18 +612,14 @@ class TestHydrateAction:
         w._show_error.assert_not_called()
 
     def test_failure_surfaces_error(self, widget, monkeypatch):
-        w, progs, _ = self._arm(
-            widget, monkeypatch, events=[("failed", "disk full")]
-        )
+        w, progs, _ = self._arm(widget, monkeypatch, events=[("failed", "disk full")])
         w._warm_source("m")
         assert progs[0].closed
         w._show_error.assert_called_once()
         assert "disk full" in w._show_error.call_args[0][0]
 
     def test_cancelled_closes_quietly(self, widget, monkeypatch):
-        w, progs, _ = self._arm(
-            widget, monkeypatch, events=[("cancelled", None)]
-        )
+        w, progs, _ = self._arm(widget, monkeypatch, events=[("cancelled", None)])
         w._warm_source("m")
         assert progs[0].closed
         w._show_error.assert_not_called()

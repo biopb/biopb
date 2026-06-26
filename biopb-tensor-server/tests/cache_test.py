@@ -9,14 +9,12 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-
 from biopb_tensor_server.cache import (
     MAX_ARROW_BATCH_BYTES,
     CacheEntry,
     CacheManager,
     EntryState,
     MemoryCacheBackend,
-    PoolStats,
 )
 from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_MEDIUM_THRESHOLD,
@@ -24,8 +22,8 @@ from biopb_tensor_server.cache.file_backend import (
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
-    _get_size_class,
     K,
+    _get_size_class,
 )
 from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
 from biopb_tensor_server.cache.recovery import (
@@ -67,8 +65,8 @@ class TestCacheEntry:
     def test_set_ready(self):
         """Mark entry ready."""
         data = pa.RecordBatch.from_arrays(
-            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
         entry = CacheEntry(state=EntryState.PENDING)
         entry.set_ready(data, size_bytes=24)
@@ -92,8 +90,8 @@ class TestCacheEntry:
         def complete():
             time.sleep(0.1)
             data = pa.RecordBatch.from_arrays(
-                [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(['int64'])],
-                ["data", "shape", "dtype"]
+                [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(["int64"])],
+                ["data", "shape", "dtype"],
             )
             entry.set_ready(data, 24)
 
@@ -127,8 +125,8 @@ class TestMemoryCacheBackend:
     def _make_data(self, values) -> pa.RecordBatch:
         """Helper to create RecordBatch with new schema format."""
         return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
     def test_start_compute_creates_pending(self):
@@ -335,8 +333,8 @@ class TestCacheManager:
         assert is_owner is True
 
         data = pa.RecordBatch.from_arrays(
-            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
         manager.complete_entry(b"key1", data, 24)
 
@@ -380,8 +378,8 @@ class TestConcurrentCompute:
                     compute_counts[0] += 1
                 time.sleep(0.1)  # Simulate computation
                 data = pa.RecordBatch.from_arrays(
-                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array(['int64'])],
-                    ["data", "shape", "dtype"]
+                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array(["int64"])],
+                    ["data", "shape", "dtype"],
                 )
                 backend.complete_entry(b"key1", data, 8)
             else:
@@ -409,8 +407,8 @@ class TestConcurrentCompute:
             entry, is_owner = backend.start_compute(key)
             assert is_owner is True
             data = pa.RecordBatch.from_arrays(
-                [pa.array([[value]]), pa.array([[1]]), pa.array(['int64'])],
-                ["data", "shape", "dtype"]
+                [pa.array([[value]]), pa.array([[1]]), pa.array(["int64"])],
+                ["data", "shape", "dtype"],
             )
             backend.complete_entry(key, data, 8)
             results[key] = value
@@ -453,8 +451,8 @@ class TestArrowFileBackend:
     def _make_data(self, values) -> pa.RecordBatch:
         """Helper to create RecordBatch with new schema format."""
         return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
     def _make_temp_cache_dir(self):
@@ -766,8 +764,8 @@ class TestArrowFileBackend:
                     compute_counts[0] += 1
                 time.sleep(0.1)
                 data = pa.RecordBatch.from_arrays(
-                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array(['int64'])],
-                    ["data", "shape", "dtype"]
+                    [pa.array([[worker_id]]), pa.array([[1]]), pa.array(["int64"])],
+                    ["data", "shape", "dtype"],
                 )
                 backend.complete_entry(b"key1", data, 8)
             else:
@@ -810,8 +808,8 @@ class TestArrowFileBackendRecovery:
 
     def _make_data(self, values) -> pa.RecordBatch:
         return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
     def _make_temp_cache_dir(self):
@@ -840,8 +838,9 @@ class TestArrowFileBackendRecovery:
 
         # Create a stale lock with fake PID
         import json
+
         fake_data = {"pid": 99999, "acquired_at": time.time()}
-        with open(lock_path, 'w') as f:
+        with open(lock_path, "w") as f:
             json.dump(fake_data, f)
 
         # ProcessLock should detect it as stale
@@ -906,6 +905,7 @@ class TestArrowFileBackendRecovery:
     def test_stale_lock_triggers_recovery_without_wal_entries(self):
         """Stale lock alone (no WAL entries) triggers recovery on restart."""
         import json
+
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
 
@@ -920,11 +920,12 @@ class TestArrowFileBackendRecovery:
         self._simulate_crash(backend1)
         lock_path = cache_dir / "lock"
         fake_data = {"pid": 99999, "acquired_at": time.time()}
-        with open(lock_path, 'w') as f:
+        with open(lock_path, "w") as f:
             json.dump(fake_data, f)
 
         # Verify WAL has no pending entries (so recovery must be triggered by stale lock)
         from biopb_tensor_server.cache.recovery import WriteAheadLog
+
         wal = WriteAheadLog(cache_dir / "wal.json")
         assert not wal.has_pending(), "Test requires no pending WAL entries"
 
@@ -1025,8 +1026,8 @@ class TestOversizedChunkHandling:
 
     def _make_data(self, values) -> pa.RecordBatch:
         return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
     def test_memory_backend_skips_oversized(self):
@@ -1123,12 +1124,20 @@ class TestSchemaPooling:
 
         # Create batches with different schemas (different dtypes)
         int_data = pa.RecordBatch.from_arrays(
-            [pa.array([[1, 2, 3]], type=pa.list_(pa.int32())), pa.array([[3]]), pa.array(['int32'])],
-            ["data", "shape", "dtype"]
+            [
+                pa.array([[1, 2, 3]], type=pa.list_(pa.int32())),
+                pa.array([[3]]),
+                pa.array(["int32"]),
+            ],
+            ["data", "shape", "dtype"],
         )
         float_data = pa.RecordBatch.from_arrays(
-            [pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float32())), pa.array([[3]]), pa.array(['float32'])],
-            ["data", "shape", "dtype"]
+            [
+                pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float32())),
+                pa.array([[3]]),
+                pa.array(["float32"]),
+            ],
+            ["data", "shape", "dtype"],
         )
 
         # Write alternating entries with different schemas
@@ -1178,8 +1187,8 @@ class TestSchemaPooling:
         # Use the MAX_ARROW_BATCH_BYTES threshold (>64MB triggers oversized skip)
         large_size = MAX_ARROW_BATCH_BYTES + 1000
         data = pa.RecordBatch.from_arrays(
-            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([[1, 2, 3]]), pa.array([[3]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
         entry, _ = backend.start_compute(b"large_key")
@@ -1216,16 +1225,24 @@ class TestSchemaPooling:
 
         # Tiny entry (< 2MB)
         tiny_data = pa.RecordBatch.from_arrays(
-            [pa.array([[1] * 100], type=list_type), pa.array([[100]]), pa.array(['int32'])],
-            ["data", "shape", "dtype"]
+            [
+                pa.array([[1] * 100], type=list_type),
+                pa.array([[100]]),
+                pa.array(["int32"]),
+            ],
+            ["data", "shape", "dtype"],
         )
         tiny_size = 400  # Tiny
 
         # Small entry (between 2MB and 32MB in size classification)
         # Simulate with small actual data but report larger size
         small_data = pa.RecordBatch.from_arrays(
-            [pa.array([[2] * 100], type=list_type), pa.array([[100]]), pa.array(['int32'])],
-            ["data", "shape", "dtype"]
+            [
+                pa.array([[2] * 100], type=list_type),
+                pa.array([[100]]),
+                pa.array(["int32"]),
+            ],
+            ["data", "shape", "dtype"],
         )
         small_size = SIZE_CLASS_TINY_THRESHOLD + 1000  # Small class
 
@@ -1254,8 +1271,8 @@ class TestSieveKEviction:
     def _make_data(self, values) -> pa.RecordBatch:
         """Helper to create RecordBatch with new schema format."""
         return pa.RecordBatch.from_arrays(
-            [pa.array([values]), pa.array([[len(values)]]), pa.array(['int64'])],
-            ["data", "shape", "dtype"]
+            [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
+            ["data", "shape", "dtype"],
         )
 
     def _make_temp_cache_dir(self):
@@ -1323,7 +1340,9 @@ class TestSieveKEviction:
 
         if pool_queue:
             # Get segment info
-            segment_id = pool_queue.queue[-1] if pool_queue.queue else None  # Tail (oldest)
+            segment_id = (
+                pool_queue.queue[-1] if pool_queue.queue else None
+            )  # Tail (oldest)
             if segment_id:
                 seg_info = pool_queue.segments.get(segment_id)
                 assert seg_info is not None
@@ -1599,7 +1618,7 @@ class TestWriteLockDoesNotWedgeReads:
         cache_dir = Path(tempfile.mkdtemp(prefix="biopb-cache-wedge-test-"))
         config = ArrowFileConfig(
             cache_dir=cache_dir,
-            max_segment_bytes=10 * 1024 * 1024,   # big: keep one segment open
+            max_segment_bytes=10 * 1024 * 1024,  # big: keep one segment open
             max_total_bytes=100 * 1024 * 1024,
         )
         return _InstrumentedBackend(config), cache_dir
@@ -1620,7 +1639,9 @@ class TestWriteLockDoesNotWedgeReads:
                 daemon=True,
             )
             blocked.start()
-            assert backend.write_in_progress.wait(timeout=5), "stalled write never started"
+            assert backend.write_in_progress.wait(timeout=5), (
+                "stalled write never started"
+            )
 
             # While that write is stalled (holding _write_lock, not _lock), a
             # read of the already-cached key must still complete promptly.
@@ -1636,7 +1657,7 @@ class TestWriteLockDoesNotWedgeReads:
             assert done[0].data.column(0).to_pylist() == [[1, 2, 3]]
             backend.release(b"ready")
         finally:
-            backend.release_write.set()   # let the stalled write finish
+            backend.release_write.set()  # let the stalled write finish
             blocked.join(timeout=5)
             backend.close()
             shutil.rmtree(cache_dir)

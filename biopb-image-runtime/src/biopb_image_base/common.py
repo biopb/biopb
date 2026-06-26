@@ -18,11 +18,10 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
 import biopb.image as proto
+import dask.array as da
 import grpc
 import numpy as np
-import dask.array as da
 from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
-from google.protobuf.json_format import MessageToDict
 
 if TYPE_CHECKING:
     from biopb_image_base.server import EmbeddedTensorCache
@@ -109,7 +108,9 @@ def decode_image_data(image_data: proto.ImageData) -> Union[np.ndarray, da.Array
     return result
 
 
-def encode_image(image: np.ndarray, dim_labels: Optional[list] = None) -> proto.ImageData:
+def encode_image(
+    image: np.ndarray, dim_labels: Optional[list] = None
+) -> proto.ImageData:
     """Encode numpy array to protobuf ImageData (eager).
 
     Args:
@@ -146,7 +147,7 @@ def return_lazy_or_eager(
         ValueError: If tensor_cache not provided for lazy result
     """
     is_lazy = isinstance(result, da.Array)
-    nbytes = result.nbytes if hasattr(result, 'nbytes') else 0
+    nbytes = result.nbytes if hasattr(result, "nbytes") else 0
 
     if is_lazy or nbytes > max_eager_size:
         if tensor_cache is None:
@@ -200,11 +201,14 @@ def parse_kwargs(request, defaults: dict) -> dict:
                 kwargs[key] = value.bool_value
             elif value.HasField("list_value"):
                 # Convert ListValue to Python list, converting integer floats to int
-                kwargs[key] = [_convert_list_item(item) for item in value.list_value.values]
+                kwargs[key] = [
+                    _convert_list_item(item) for item in value.list_value.values
+                ]
             elif value.HasField("struct_value"):
                 # Convert nested Struct to Python dict
                 kwargs[key] = {
-                    k: _convert_list_item(v) for k, v in value.struct_value.fields.items()
+                    k: _convert_list_item(v)
+                    for k, v in value.struct_value.fields.items()
                 }
     return kwargs
 
@@ -284,9 +288,13 @@ def validate_kwargs(kwargs: dict, schema: dict) -> list[str]:
                             # Valid - float representing an integer (e.g., from protobuf)
                             pass
                         elif not isinstance(item, int):
-                            errors.append(f"{key}[{i}]: expected int, got {type(item).__name__}")
+                            errors.append(
+                                f"{key}[{i}]: expected int, got {type(item).__name__}"
+                            )
                     elif item_type == "number" and not isinstance(item, (int, float)):
-                        errors.append(f"{key}[{i}]: expected number, got {type(item).__name__}")
+                        errors.append(
+                            f"{key}[{i}]: expected number, got {type(item).__name__}"
+                        )
 
             min_len = rules.get("min_length")
             max_len = rules.get("max_length")
@@ -600,9 +608,13 @@ class BiopbServicerBase(
                 if next_request.image_data.HasField("pixels"):
                     request.image_data.pixels.CopyFrom(next_request.image_data.pixels)
                 if next_request.image_data.HasField("eager_data"):
-                    request.image_data.eager_data.CopyFrom(next_request.image_data.eager_data)
+                    request.image_data.eager_data.CopyFrom(
+                        next_request.image_data.eager_data
+                    )
                 if next_request.image_data.HasField("lazy_data"):
-                    request.image_data.lazy_data.CopyFrom(next_request.image_data.lazy_data)
+                    request.image_data.lazy_data.CopyFrom(
+                        next_request.image_data.lazy_data
+                    )
                 if next_request.image_data.HasField("image_annotation"):
                     request.image_data.image_annotation.CopyFrom(
                         next_request.image_data.image_annotation
@@ -612,8 +624,8 @@ class BiopbServicerBase(
                 request.detection_settings.CopyFrom(next_request.detection_settings)
 
             if request.image_data is not None and (
-                request.image_data.HasField("pixels") or
-                request.image_data.HasField("eager_data") or
-                request.image_data.HasField("lazy_data")
+                request.image_data.HasField("pixels")
+                or request.image_data.HasField("eager_data")
+                or request.image_data.HasField("lazy_data")
             ):
                 yield self.RunDetection(request, context)

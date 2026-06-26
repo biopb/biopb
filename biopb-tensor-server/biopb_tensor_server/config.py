@@ -87,7 +87,6 @@ from biopb_tensor_server.discovery import (
 from biopb_tensor_server.remote import (
     CredentialProfile,
     CredentialsConfig,
-    is_remote_url as is_remote_url_v2,
 )
 
 # Alias for backward compatibility with internal usage
@@ -100,6 +99,7 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
+
 
 # Default on-disk cache location for the file backend. Uses the system temp dir
 # (node-local fast scratch on HPC, honoring $TMPDIR/$TEMP/$TMP) rather than home,
@@ -509,17 +509,13 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         reduction_method=_pyramid_knob("reduction_method", "area", str),
         threshold=_pyramid_knob("threshold", 4096, int),
         downscale_factor=_pyramid_knob("downscale_factor", 4, int),
-        pixel_budget_cubic_root=_pyramid_knob(
-            "pixel_budget_cubic_root", 512, int
-        ),
+        pixel_budget_cubic_root=_pyramid_knob("pixel_budget_cubic_root", 512, int),
     )
 
     # Parse precache settings (operational knobs only).
     precache_config = PrecacheConfig(
         enabled=bool(precache_data.get("enabled", True)),
-        idle_debounce_seconds=float(
-            precache_data.get("idle_debounce_seconds", 2.0)
-        ),
+        idle_debounce_seconds=float(precache_data.get("idle_debounce_seconds", 2.0)),
         backlog_enabled=bool(precache_data.get("backlog_enabled", True)),
         backlog_high_water=float(precache_data.get("backlog_high_water", 0.8)),
         backlog_idle_recheck_seconds=float(
@@ -689,7 +685,7 @@ def detect_source_type(url: str) -> Optional[str]:
 
                     if "multiscales" in zattrs:
                         return "ome-zarr"
-                except (json.JSONDecodeError, KeyError, IOError):
+                except (OSError, json.JSONDecodeError, KeyError):
                     pass
 
             # Plain Zarr (has .zarray or .zattrs without multiscales)
@@ -836,7 +832,7 @@ def _discover_by_type(
                                     dim_labels=dim_labels,
                                 )
                             )
-                    except (json.JSONDecodeError, KeyError, IOError):
+                    except (OSError, json.JSONDecodeError, KeyError):
                         pass
 
     elif source_type == "hdf5":

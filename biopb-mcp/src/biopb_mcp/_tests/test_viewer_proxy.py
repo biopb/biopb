@@ -224,9 +224,7 @@ def test_no_handle_leaks_through_proxy(proxy):
     proxy.add_image(np.zeros((4, 4), np.uint8))
     proxy.add_labels(np.zeros((4, 4), np.int32))
     proxy.add_points(np.array([[1.0, 1.0]]))
-    proxy.add_shapes(
-        [np.array([[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0]])]
-    )
+    proxy.add_shapes([np.array([[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0]])])
     proxy.add_vectors(np.zeros((2, 2, 2)))
 
     HANDLE = (EventedModel, Layer, EventedList, Selection)
@@ -254,6 +252,4 @@ def test_no_handle_leaks_through_proxy(proxy):
                 visit(value[i], f"{path}[{i}]")
 
     visit(proxy, "viewer")
-    assert not leaks, "napari handles leaked unwrapped:\n  " + "\n  ".join(
-        leaks
-    )
+    assert not leaks, "napari handles leaked unwrapped:\n  " + "\n  ".join(leaks)

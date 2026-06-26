@@ -69,9 +69,7 @@ def test_write_image_honors_explicit_dim_labels(tmp_path):
     arr = np.zeros((2, 5, 6), dtype="uint8")  # c, y, x
     out = tmp_path / "labeled_axes.ome.zarr"
 
-    write_image_ome_zarr(
-        str(out), arr, {"metadata": {"dim_labels": ["c", "y", "x"]}}
-    )
+    write_image_ome_zarr(str(out), arr, {"metadata": {"dim_labels": ["c", "y", "x"]}})
 
     ms, _ = _read_multiscale(out)
     assert [a["name"] for a in ms["axes"]] == ["c", "y", "x"]

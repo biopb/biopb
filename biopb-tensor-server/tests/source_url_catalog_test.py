@@ -86,7 +86,9 @@ class _StubAdapter(SourceAdapter):
 
 class TestDescriptorNormalization:
     def test_windows_path_becomes_file_uri(self):
-        desc = _StubAdapter(r"C:\Users\me\OneDrive\Pictures\shot.png").get_source_descriptor()
+        desc = _StubAdapter(
+            r"C:\Users\me\OneDrive\Pictures\shot.png"
+        ).get_source_descriptor()
         assert desc.source_url == "file:///C:/Users/me/OneDrive/Pictures/shot.png"
         # source_id is independent of the URL string (no re-index needed).
         assert desc.source_id == "stub_id"
