@@ -161,57 +161,6 @@ addopts = "--ignore-glob='*_vendor*'"
 [tool.pytest_env]
 QT_QPA_PLATFORM = "offscreen"
 
-[tool.black]
-line-length = 79
-target-version = ['py310', 'py311', 'py312']
-
-[tool.ruff]
-line-length = 79
-lint.select = [
-    "E", "F", "W", #flake8
-    "UP", # pyupgrade
-    "I", # isort
-    "BLE", # flake8-blind-exception
-    "B", # flake8-bugbear
-    "A", # flake8-builtins
-    "C4", # flake8-comprehensions
-    "ISC", # flake8-implicit-str-concat
-    "G", # flake8-logging-format
-    "PIE", # flake8-pie
-    "SIM", # flake8-simplify
-]
-lint.ignore = [
-    "E501", # line too long. let black handle this
-    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
-    "SIM117", # flake8-simplify - some merged with statements don't look great with black; revisit later
-    "BLE001", # blind-except - intentional best-effort cleanup paths (e.g. _kernel.py, _config.py, connect/autostart) that must never propagate.
-    "UP035", # deprecated-import - keep typing.List/Dict for magicgui runtime annotations, consistent with the UP006/UP007 ignores.
-    "G004", # logging-f-string - stylistic; the codebase mixes f-string and lazy %-style logs.
-    "SIM105", # suppressible-exception - keep explicit try/except/pass over contextlib.suppress in death-pipe / cleanup paths.
-    "B904", # raise-without-from-inside-except - one deliberate re-raise in image_processing/_grpc.py.
-]
-
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".mypy_cache",
-    ".pants.d",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
-    "*vendored*",
-    "*_vendor*",
-]
-
-target-version = "py310"
-fix = true
+# Lint/format config lives at the monorepo root [tool.ruff] (issue #82). The
+# magicgui-driven ignores (UP006/UP007/UP035 runtime annotations) were promoted
+# there and now apply repo-wide.
