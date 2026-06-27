@@ -278,7 +278,9 @@ class TestReaderDeferBranches:
         d.mkdir()
         for i in range(3):
             (d / f"frame{i}.tif").write_bytes(b"II*\x00not-a-real-tiff")
-        claim = TiffSequenceAdapter.claim(_RaisingReadCtx(d, cloud_root=True), DiscoveryState())
+        claim = TiffSequenceAdapter.claim(
+            _RaisingReadCtx(d, cloud_root=True), DiscoveryState()
+        )
         assert claim is not None
         assert claim.unresolved is True
         assert claim.source_type == "tiff-sequence"
