@@ -1053,9 +1053,20 @@ class SourceManager:
             return True
         if not self._is_under_cloud_root(claim.primary_path):
             return False
-        # A directory source (zarr store, ...) is born resolved from its resident
-        # sidecars; only a non-resident *content file* forces deferral. Guard on
-        # is_file so a directory's st_blocks==0 (macOS APFS) is never a false hit.
+        return self._claim_has_dehydrated_member(claim)
+
+    def _claim_has_dehydrated_member(self, claim: SourceClaim) -> bool:
+        """True when any local member *file* of *claim* is a non-resident placeholder.
+
+        Metadata-only (``os.stat`` via ``_is_offline_placeholder``); never opens
+        content, so it cannot itself trigger a cloud recall. Remote members are
+        ignored.
+
+        A directory source (zarr store, ...) is born resolved from its resident
+        sidecars; only a non-resident *content file* forces deferral. Guard on
+        ``is_file`` so a directory's ``st_blocks == 0`` (macOS APFS) is never a
+        false hit.
+        """
         for member in claim.member_paths:
             if is_remote_url(member):
                 continue
@@ -1066,6 +1077,31 @@ class SourceManager:
             except OSError:
                 continue
         return False
+
+    def should_warm(self, source_id: str) -> bool:
+        """Whether the precache worker may warm *source_id* right now.
+
+        Residency is decided once, at registration time (``_claim_is_unresolved``):
+        a source whose files were resident then registers as a normal adapter and
+        keeps that registration even if the cloud provider (OneDrive Files
+        On-Demand, ...) later re-dehydrates the bytes. Precache has no per-chunk
+        residency gate, so a later backlog pass would read those bytes and trigger
+        a background recall the ``cloud = true`` policy exists to prevent (#174).
+
+        This re-checks residency at warm time, mirroring the registration-path
+        rule so the two stay in sync. Only sources under a ``cloud`` root are
+        gated -- a normal local source always warms -- and the check is
+        metadata-only, so it never recalls content itself. Returns False (skip)
+        when any member file is now a placeholder, or when the source is no longer
+        registered.
+        """
+        with self._lock:
+            claim = self._state.claims.get(source_id)
+        if claim is None:
+            return False
+        if not self._is_under_cloud_root(claim.primary_path):
+            return True
+        return not self._claim_has_dehydrated_member(claim)
 
     def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
         """Backfill the metadata DB when an unresolved cloud source resolves.

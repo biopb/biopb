@@ -36,7 +36,7 @@ import heapq
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -83,6 +83,13 @@ class PrecacheWorker:
         self._backlog_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Residency gate: re-checks at warm time whether a cloud-root source's
+        # files are still resident, so we never recall content OneDrive (or
+        # another Files-On-Demand provider) has re-dehydrated since registration
+        # (#174). Wired from SourceManager.should_warm in cli.py; left None when
+        # there is no manager (e.g. static-only deployments), in which case the
+        # gate is a no-op and warming proceeds as before.
+        self.should_warm: Optional[Callable[[str], bool]] = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -271,6 +278,16 @@ class PrecacheWorker:
         # condition, enforced regardless of config.
         if not self._file_backend_active():
             logger.debug("precache: file backend not active, skipping %s", source_id)
+            return False
+        # Residency gate (#174): under a cloud root, skip a source whose member
+        # files have been re-dehydrated since registration. Reading them would
+        # recall content the cloud=true policy is meant to keep offline. Coarse
+        # (whole-source) by design, matching the registration-time check; a
+        # partially-evicted cloud source is skipped rather than partly recalled.
+        if self.should_warm is not None and not self.should_warm(source_id):
+            logger.debug(
+                "precache: source %s not resident (cloud), skipping warm", source_id
+            )
             return False
         cache_manager = CacheManager.get_instance()
 

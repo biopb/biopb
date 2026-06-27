@@ -439,6 +439,11 @@ def _setup_flight_server(
             server, server_config.precache, server_config.pyramid
         )
         source_manager._on_source_committed = precache_worker.enqueue
+        # Residency gate (#174): let the worker re-check, at warm time, that a
+        # cloud-root source's files are still resident before reading them, so a
+        # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
+        # registration.
+        precache_worker.should_warm = source_manager.should_warm
 
     if watcher and source_manager:
         try:

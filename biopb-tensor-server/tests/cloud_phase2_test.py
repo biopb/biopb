@@ -474,6 +474,49 @@ class TestUnresolvedDecision:
         assert mgr._claim_is_unresolved(claim) is False
 
 
+class TestShouldWarm:
+    """Residency gate the precache worker consults before warming (#174).
+
+    Mirrors ``_claim_is_unresolved`` so a source that re-dehydrates after
+    registration is skipped instead of recalled on a later backlog pass.
+    """
+
+    def _register(self, mgr, claim):
+        mgr._state.claims[claim.source_id] = claim
+
+    def test_unknown_source_not_warmed(self, tmp_path):
+        mgr = _make_manager(_FakeServer())
+        assert mgr.should_warm("nope") is False
+
+    def test_local_source_outside_cloud_root_always_warms(self, tmp_path):
+        mgr = _make_manager(_FakeServer())
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        claim = SourceClaim("nifti", str(f), source_id="s1")
+        self._register(mgr, claim)
+        assert mgr.should_warm("s1") is True
+
+    def test_resident_cloud_source_warms(self, tmp_path):
+        mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        claim = SourceClaim("nifti", str(f), source_id="s1")
+        self._register(mgr, claim)
+        assert mgr.should_warm("s1") is True
+
+    def test_rehydrated_cloud_source_skipped(
+        self, tmp_path, force_nonresident
+    ):
+        # Registered as a normal adapter while resident, then OneDrive evicted the
+        # bytes: should_warm now returns False so the warm read never recalls them.
+        mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        claim = SourceClaim("nifti", str(f), source_id="s1")
+        self._register(mgr, claim)
+        assert mgr.should_warm("s1") is False
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end through the source manager
 # --------------------------------------------------------------------------- #

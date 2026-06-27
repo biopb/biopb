@@ -276,6 +276,33 @@ class TestWarming:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
+    def test_should_warm_gate_skips_non_resident_source(self, tmp_path):
+        # #174: a should_warm callback returning False (source re-dehydrated under
+        # a cloud root) must short-circuit before any chunk is read, so OneDrive
+        # is never asked to recall the bytes.
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            server = self._make_server_with_zarr(tmp_path, (8192, 8192))
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            worker.should_warm = lambda source_id: False
+
+            worker._process_source("warm-src")
+
+            # Gate fires after the file-backend check but before any compute.
+            stats = CacheManager.get_instance().stats()
+            assert stats.misses == 0
+            assert stats.total_entries == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
     def test_memory_backend_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
