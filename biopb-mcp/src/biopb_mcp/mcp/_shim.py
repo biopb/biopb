@@ -123,10 +123,19 @@ def ensure_daemon(config, port, timeout=DAEMON_START_TIMEOUT):
     # detaches it within the login session only: it is still session-bound and
     # dies on logout. A daemon meant to survive logout must be made persistent
     # at the wrapper level (see cli._detach_kwargs).
+    #
+    # Windows: CREATE_NO_WINDOW, NOT DETACHED_PROCESS. Both keep the shim from
+    # pinning a console, but DETACHED_PROCESS leaves the daemon with *no* console
+    # at all -- so when it later spawns the console-subsystem Jupyter kernel
+    # (python.exe, no creation flags of its own) Windows is forced to allocate a
+    # fresh *visible* console for it, and an empty shell window pops on the user's
+    # desktop. CREATE_NO_WINDOW instead gives the daemon a hidden console the
+    # kernel inherits silently. This mirrors cli._detach_kwargs, the convention
+    # for every other daemon spawn in the project ("so none pops").
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
     else:
         popen_kwargs["start_new_session"] = True
