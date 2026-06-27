@@ -740,7 +740,17 @@ function Invoke-BiopbInstall {
     # ===== 2. Python =====
     Report-Step 2 "Ensuring Python..."
 
+    # biopb-mcp (always installed) requires Python >= 3.10.
     $minMinor = 10
+
+    # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
+    # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
+    # interpreter uv builds lxml from source -- which fails on a fresh Windows
+    # box without libxml2/libxslt headers and an MSVC compiler. Cap at 3.12, the
+    # newest Python with a prebuilt lxml 4.x wheel; if the system Python is newer
+    # we fall back to a uv-managed 3.12 below. Mirrors install.sh (MAX_MINOR).
+    $maxMinor = 12
+
     $pythonOk = $false
     $pythonSpec = ""
     $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -749,21 +759,23 @@ function Invoke-BiopbInstall {
         if ($LASTEXITCODE -eq 0 -and $verStr) {
             $parts = $verStr.Trim() -split '\s+'
             $maj = [int]$parts[0]; $min = [int]$parts[1]
-            if ($maj -gt 3 -or ($maj -eq 3 -and $min -ge $minMinor)) {
+            if ($maj -eq 3 -and $min -ge $minMinor -and $min -le $maxMinor) {
                 Report-Ok "Using system Python: $(& $pyExe --version)"
                 $pythonOk = $true
                 $pythonSpec = $pyExe
+            } elseif ($maj -gt 3 -or ($maj -eq 3 -and $min -gt $maxMinor)) {
+                Report-Warn "System Python too new ($(& $pyExe --version)); using a managed 3.$maxMinor (aicsimageio's lxml<5 has no wheel for 3.13+)"
             } else {
                 Report-Warn "System Python too old ($(& $pyExe --version)), need >= 3.$minMinor"
             }
         }
     }
     if (-not $pythonOk) {
-        Report-Info "Installing Python 3.11 via uv..."
-        uv python install 3.11
+        Report-Info "Installing Python 3.$maxMinor via uv..."
+        uv python install "3.$maxMinor"
         Assert-LastExit "Python install"
-        Report-Ok "Python 3.11 ready"
-        $pythonSpec = "3.11"
+        Report-Ok "Python 3.$maxMinor ready"
+        $pythonSpec = "3.$maxMinor"
     }
 
     # ===== 3. Install biopb packages =====
