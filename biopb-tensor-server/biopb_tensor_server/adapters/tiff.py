@@ -182,9 +182,29 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         # duplicate that prune and pin a brittle membership.
         state.try_claim_path(ctx.path_str)
 
+        # Cloud-storage phase 2 (biopb/biopb#173): ``__init__`` opens EVERY file
+        # in the sequence to validate dimension consistency (see below). Under a
+        # cloud root those members may be dehydrated placeholders, so building the
+        # adapter eagerly would recall the whole sequence -- one synced-folder
+        # round-trip per file (~hundreds of ms each on OneDrive Files-On-Demand),
+        # serialized -- during the synchronous startup scan. That wedges health at
+        # STARTING for minutes (a 749-file sequence measured at ~4 min) before
+        # ``mark_ready()`` is ever reached, and the per-file content skip the cloud
+        # policy applies elsewhere never fires because the sequence claim records
+        # only the directory (``is_file()`` is False, so ``_claim_is_unresolved``
+        # has no member to test). Claim the directory provisionally and defer
+        # construction to first access, where the sequence is hydrated and opening
+        # every file is expected -- the same strategy MicroManagerLegacyAdapter
+        # already uses for its placeholder metadata.txt. Gated on ``cloud_root``
+        # (not residency) so the deferral still holds at resolve, when the files
+        # are resident -- consistent with OmeTiffAdapter and the cloud opt-in's
+        # "don't open it eagerly" contract. An unresolved source also advertises no
+        # tensors, so the precache worker skips it instead of warming (recalling)
+        # every chunk in the background.
         return SourceClaim(
             source_type="tiff-sequence",
             primary_path=ctx.path_str,
+            unresolved=ctx.cloud_root,
         )
 
     @classmethod

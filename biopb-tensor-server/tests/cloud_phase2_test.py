@@ -264,6 +264,39 @@ class TestReaderDeferBranches:
         generic = AicsImageIoAdapter.claim(ClaimContext(f), DiscoveryState())
         assert generic is not None
 
+    def test_tiff_sequence_defers_under_cloud(self, tmp_path):
+        # TiffSequenceAdapter.__init__ opens EVERY file in the sequence to validate
+        # dimensions; under a cloud root those opens recall the whole sequence at
+        # startup and wedge health at STARTING (biopb/biopb#173). The claim records
+        # only the directory, so the per-file residency gate in _claim_is_unresolved
+        # cannot catch it -- the adapter must defer itself. Gated on cloud_root (not
+        # residency) so the deferral also holds at resolve. claim() is metadata-free
+        # (it only globs/templates names), so _RaisingReadCtx proves no byte read.
+        from biopb_tensor_server.adapters.tiff import TiffSequenceAdapter
+
+        d = tmp_path / "seq"
+        d.mkdir()
+        for i in range(3):
+            (d / f"frame{i}.tif").write_bytes(b"II*\x00not-a-real-tiff")
+        claim = TiffSequenceAdapter.claim(_RaisingReadCtx(d, cloud_root=True), DiscoveryState())
+        assert claim is not None
+        assert claim.unresolved is True
+        assert claim.source_type == "tiff-sequence"
+
+    def test_tiff_sequence_resolves_eagerly_outside_cloud(self, tmp_path):
+        # Outside a cloud root the sequence claims as before (resolved), so the
+        # ordinary local fast path is unchanged.
+        from biopb_tensor_server.adapters.tiff import TiffSequenceAdapter
+
+        d = tmp_path / "seq"
+        d.mkdir()
+        for i in range(3):
+            (d / f"frame{i}.tif").write_bytes(b"II*\x00not-a-real-tiff")
+        claim = TiffSequenceAdapter.claim(ClaimContext(d), DiscoveryState())
+        assert claim is not None
+        assert claim.unresolved is False
+        assert claim.source_type == "tiff-sequence"
+
 
 # --------------------------------------------------------------------------- #
 # UnresolvedSourceAdapter proxy
