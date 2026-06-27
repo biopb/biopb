@@ -112,7 +112,7 @@ release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring h
 | Welcome / license | — | — |
 | Options (custom page) | `-Webapp`, `-Bioformats`, `-NoRemotePlugins` | `Select-Components` + remote-plugins consent |
 | Keep-config dialog | `-KeepConfig` (or proceed to data dir) | `Select-DataDir -KeepOption` |
-| Data directory | `-DataDir` | `Select-DataDir` |
+| Data directory | `-DataDir` (`-Cloud` when the cloud box is ticked) | `Select-DataDir` |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
 
@@ -127,6 +127,23 @@ pre-read the existing data dir (a config may hold multiple `[[sources]]` and the
 engine rewrites a fixed template anyway, so "keep" means *don't touch the file*).
 The data-dir default is `%USERPROFILE%\Microscopy`, not Documents, matching the
 console's OneDrive-avoiding choice.
+
+**Cloud / synced folders.** When a cloud root is present (`%OneDrive%`,
+`%OneDriveConsumer/Commercial%`, or `%USERPROFILE%\iCloudDrive`), the data-dir
+page adds a *"My images are in a cloud folder"* checkbox: ticking it points the
+picker at a `Microscopy` folder under the cloud root and passes `-Cloud`, which
+makes the engine write `cloud = true` on the source. The console front-end gets
+the same cloud folders for free — `Get-DataDirCandidates` (in the engine) now
+offers them alongside the local/drive candidates. Either way the engine
+*auto-detects* cloud-ness from the chosen path (`Test-IsCloudPath`: any dir at or
+under a known cloud root), so browsing/typing a OneDrive path yields `cloud = true`
+even without the checkbox; `-Cloud` is just an explicit override for roots the
+probes miss (e.g. a Dropbox path the GUI didn't enumerate). A `cloud = true`
+source admits OneDrive/Dropbox/iCloud "Files-On-Demand" placeholders as
+*unresolved* sources (resolved lazily on first read) instead of letting the
+directory scan hang on hydrate-on-read placeholders — the reason the installer
+historically steered *away* from OneDrive. See the tensor server's cloud-storage
+phase 2 (`SourceConfig.cloud`).
 
 Inno gives the **uninstaller + Add/Remove Programs entry for free** — something
 the CLI install can't offer today.

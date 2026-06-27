@@ -61,6 +61,14 @@ param(
     # Explicitly keep an existing biopb.toml untouched (do not rewrite it).
     [switch]$KeepConfig,
 
+    # Mark the written source as cloud/synced storage (OneDrive, Dropbox, iCloud):
+    # the server admits dehydrated "Files On-Demand" placeholders as *unresolved*
+    # sources (resolved lazily on first read) instead of skipping them. Absent =
+    # auto-detected from the data dir (any path under a known cloud root; see
+    # Test-IsCloudPath), so this switch is only a manual override for cloud roots
+    # the env-var/registry probes miss.
+    [switch]$Cloud,
+
     # Walk all steps and emit the full progress stream WITHOUT doing any real
     # work (no downloads, no install, no config/server changes). For testing the
     # console output and the GUI wizard safely. Honors -Webapp for the result.
@@ -242,13 +250,72 @@ function Add-ToUserPath {
     if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
 }
 
+# Known cloud / synced-folder roots on this machine (OneDrive, iCloud, Dropbox).
+# Returns existing absolute dir paths (no trailing slash), de-duplicated. These
+# are folders whose contents are "Files On-Demand" placeholders that hydrate on
+# read; biopb handles them with a source-level `cloud = true` flag (admit
+# placeholders as *unresolved* sources, resolve lazily) rather than skipping them
+# -- see the tensor server's cloud-storage phase 2. Used both to offer cloud
+# folders in the pickers and to auto-mark a chosen cloud dir (Test-IsCloudPath).
+function Get-CloudRoots {
+    # OneDrive exports these when signed in (personal and/or business); iCloud's
+    # Windows app mounts under the profile; Dropbox records its folder(s) in a
+    # JSON sidecar. Probe all, then keep the ones that actually exist.
+    $raw = @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)
+    if ($env:USERPROFILE) { $raw += (Join-Path $env:USERPROFILE 'iCloudDrive') }
+    foreach ($base in @($env:LOCALAPPDATA, $env:APPDATA)) {
+        if (-not $base) { continue }
+        $info = Join-Path $base 'Dropbox\info.json'
+        if (Test-Path -LiteralPath $info) {
+            try {
+                $j = Get-Content -Raw -LiteralPath $info | ConvertFrom-Json
+                foreach ($acct in @('personal', 'business')) {
+                    if ($j.$acct -and $j.$acct.path) { $raw += [string]$j.$acct.path }
+                }
+            } catch { }   # malformed sidecar: just skip Dropbox detection
+        }
+    }
+    $roots = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($p in $raw) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            $full = ([System.IO.Path]::GetFullPath($p)).TrimEnd('\', '/')
+            if ($seen.Add($full.ToLowerInvariant())) { $roots.Add($full) | Out-Null }
+        }
+    }
+    return $roots.ToArray()
+}
+
+# True when $Path is at or under any known cloud/synced root. Drives the config
+# writer's auto-detection so that no matter HOW the data dir was chosen (console
+# menu, GUI browse, manual entry, BIOPB_DATA_DIR), a cloud folder is written with
+# `cloud = true` -- placeholders are then admitted as unresolved sources instead
+# of hanging recursive discovery before the server can bind.
+function Test-IsCloudPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try { $full = ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\', '/') } catch { return $false }
+    $fullLc = $full.ToLowerInvariant()
+    foreach ($root in Get-CloudRoots) {
+        $rootLc = $root.ToLowerInvariant()
+        # Equal root, or a child under either separator (Windows uses '\'; tolerate
+        # '/' so an env var that carries forward slashes still matches).
+        if ($fullLc -eq $rootLc -or $fullLc.StartsWith($rootLc + '\') -or $fullLc.StartsWith($rootLc + '/')) {
+            return $true
+        }
+    }
+    return $false
+}
+
 # Compute candidate microscopy data directories WITHOUT prompting. Front-ends use
 # this to populate their data-directory pickers (console menu, GUI dir page), so
-# the candidate logic lives in one place. Returns a string[] of existing dirs.
-# Offers dedicated data subfolders only -- never the profile root, Documents, or
-# OneDrive -- plus non-system fixed-drive roots; OneDrive "Files On-Demand"
-# placeholders hydrate-on-read and hang recursive discovery before the server can
-# bind.
+# the candidate logic lives in one place. Returns a string[] of existing dirs:
+# dedicated data subfolders (never the profile root or Documents), non-system
+# fixed-drive roots, then cloud/synced folders. Cloud roots were once excluded
+# here because Files-On-Demand placeholders hung discovery; they are now offered
+# because the engine marks any dir under a cloud root `cloud = true`
+# (Test-IsCloudPath), which admits placeholders as unresolved sources instead. A
+# Microscopy subfolder under a cloud root is preferred over the whole synced root.
 function Get-DataDirCandidates {
     param([string]$BiopbHome)
     $candidates = New-Object System.Collections.Generic.List[string]
@@ -266,6 +333,13 @@ function Get-DataDirCandidates {
         if ($drv.Name -ne 'C' -and $drv.Root -and (Test-Path -LiteralPath $drv.Root)) {
             if ($seen.Add($drv.Root.ToLowerInvariant())) { $candidates.Add($drv.Root) | Out-Null }
         }
+    }
+    foreach ($root in Get-CloudRoots) {
+        $sub = Join-Path $root 'Microscopy'
+        if ((Test-Path -LiteralPath $sub) -and $seen.Add($sub.ToLowerInvariant())) {
+            $candidates.Add($sub) | Out-Null
+        }
+        if ($seen.Add($root.ToLowerInvariant())) { $candidates.Add($root) | Out-Null }
     }
     return $candidates.ToArray()
 }
@@ -963,6 +1037,27 @@ function Invoke-BiopbInstall {
 
         # Escape for a TOML basic string: backslashes first, then quotes.
         $tomlDataDir = $effectiveDataDir -replace '\\', '\\' -replace '"', '\"'
+
+        # Cloud/synced root? Auto-detect from the path so any front-end (GUI,
+        # console menu, manual entry, BIOPB_DATA_DIR) gets it right; -Cloud forces
+        # it on for roots the probes miss. A cloud source admits dehydrated
+        # Files-On-Demand placeholders as unresolved sources instead of hanging
+        # discovery -- see the tensor server's cloud-storage phase 2.
+        $isCloud = [bool]$Cloud -or (Test-IsCloudPath -Path $effectiveDataDir)
+        $sourceBlock = @"
+[[sources]]
+url = "$tomlDataDir"
+monitor = true
+"@
+        if ($isCloud) {
+            $sourceBlock += "`n" + @"
+# Cloud/synced folder (OneDrive/Dropbox/iCloud): index Files-On-Demand
+# placeholders as unresolved sources without downloading them; each resolves
+# lazily on first read.
+cloud = true
+"@
+        }
+
         $tomlContent = @"
 [server]
 host = "127.0.0.1"
@@ -981,12 +1076,15 @@ file_max_total_gb = 128
 [metadata_db]
 enabled = true
 
-[[sources]]
-url = "$tomlDataDir"
-monitor = true
+$sourceBlock
 "@
         Set-FileUtf8NoBom -Path $configFile -Content $tomlContent
-        Report-Ok "Created: $configFile (data dir: $effectiveDataDir)"
+        if ($isCloud) {
+            Report-Ok "Created: $configFile (cloud data dir: $effectiveDataDir)"
+            Report-Info "Cloud-synced folder: images are indexed without downloading (cloud = true)."
+        } else {
+            Report-Ok "Created: $configFile (data dir: $effectiveDataDir)"
+        }
     }
 
     # ===== 6. Start the data server =====

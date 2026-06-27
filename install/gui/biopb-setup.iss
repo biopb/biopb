@@ -83,6 +83,17 @@ var
   ProgressPage: TOutputMarqueeProgressWizardPage;
   LogMemo:      TNewMemo;
 
+  { Cloud / synced-folder support. When a cloud root (OneDrive, iCloud) is found
+    we add a checkbox to the data-dir page; ticking it points the picker at a
+    Microscopy folder under the cloud root and passes -Cloud so the engine writes
+    `cloud = true`. The engine ALSO auto-detects cloud-ness from the path, so the
+    flag is belt-and-suspenders -- browsing to a OneDrive folder works regardless. }
+  CbCloud:      TNewCheckBox;
+  CbCloudDesc:  TNewStaticText;
+  CloudRoot:    String;
+  LocalDataDir: String;
+  CloudDataDir: String;
+
   { Existing-config detection (mirrors the console "keep current config" path) }
   ConfigPath:   String;
   ConfigExists: Boolean;
@@ -145,6 +156,39 @@ begin
   Result := cb;
 end;
 
+{ First existing cloud / synced-folder root, or '' if none. Mirrors the engine's
+  Get-CloudRoots probe order (OneDrive personal/business, then iCloud); the engine
+  additionally reads Dropbox's sidecar, but OneDrive covers the lab norm and the
+  engine still auto-detects a hand-picked Dropbox path by prefix. }
+function GetCloudRoot: String;
+var
+  p: String;
+begin
+  Result := '';
+  p := GetEnv('OneDrive');
+  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
+  p := GetEnv('OneDriveConsumer');
+  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
+  p := GetEnv('OneDriveCommercial');
+  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
+  p := AddBackslash(GetEnv('USERPROFILE')) + 'iCloudDrive';
+  if DirExists(p) then begin Result := p; Exit; end;
+end;
+
+{ Toggle the suggested folder between the local default and a Microscopy folder
+  under the cloud root. Only swaps when the box still holds the OTHER known
+  default, so a hand-typed/browsed path is never clobbered. }
+procedure CloudCheckboxClick(Sender: TObject);
+begin
+  if CbCloud.Checked then begin
+    if CompareText(DataDirPage.Values[0], LocalDataDir) = 0 then
+      DataDirPage.Values[0] := CloudDataDir;
+  end else begin
+    if CompareText(DataDirPage.Values[0], CloudDataDir) = 0 then
+      DataDirPage.Values[0] := LocalDataDir;
+  end;
+end;
+
 procedure InitializeWizard;
 var
   T: Integer;
@@ -185,7 +229,37 @@ begin
   { Default under the profile root, NOT the Documents folder: Documents is
     frequently OneDrive-redirected, and OneDrive "Files On-Demand" placeholders
     hang the server's directory scan. Matches the console installer's fallback. }
-  DataDirPage.Values[0] := AddBackslash(GetEnv('USERPROFILE')) + 'Microscopy';
+  LocalDataDir := AddBackslash(GetEnv('USERPROFILE')) + 'Microscopy';
+  DataDirPage.Values[0] := LocalDataDir;
+
+  { If a cloud root exists, offer it: a checkbox under the dir input that points
+    the picker at a Microscopy folder there and flags the source `cloud = true`.
+    Cloud sources are now safe to index -- the server admits Files-On-Demand
+    placeholders as unresolved sources (resolved lazily on read) instead of
+    hanging the scan, which is exactly why we once steered AWAY from OneDrive. }
+  CloudRoot := GetCloudRoot;
+  if CloudRoot <> '' then begin
+    CloudDataDir := AddBackslash(CloudRoot) + 'Microscopy';
+    CbCloud := TNewCheckBox.Create(DataDirPage);
+    CbCloud.Parent  := DataDirPage.Surface;
+    CbCloud.Left    := 0;
+    CbCloud.Top     := DataDirPage.Edits[0].Top + DataDirPage.Edits[0].Height + ScaleY(16);
+    CbCloud.Width   := DataDirPage.SurfaceWidth;
+    CbCloud.Height  := ScaleY(17);
+    CbCloud.Caption := 'My images are in a cloud folder (OneDrive / iCloud / Dropbox)';
+    CbCloud.OnClick := @CloudCheckboxClick;
+
+    CbCloudDesc := TNewStaticText.Create(DataDirPage);
+    CbCloudDesc.Parent   := DataDirPage.Surface;
+    CbCloudDesc.Left     := ScaleX(18);
+    CbCloudDesc.Top      := CbCloud.Top + CbCloud.Height + ScaleY(2);
+    CbCloudDesc.Width    := DataDirPage.SurfaceWidth - ScaleX(18);
+    CbCloudDesc.AutoSize := False;
+    CbCloudDesc.WordWrap := True;
+    CbCloudDesc.Height   := ScaleY(34);
+    CbCloudDesc.Caption  := 'biopb indexes these without downloading every file -- images are ' +
+                            'pulled on demand the first time you open them.';
+  end;
 
   { Progress page. We deliberately DROP the step-counting determinate gauge -- its
     n/total updates proved finicky and could skip a step -- in favor of an
@@ -221,8 +295,13 @@ begin
     (re)write it pointing at the chosen folder. }
   if KeepConfig then
     Args := Args + ' -KeepConfig'
-  else
+  else begin
     Args := Args + ' -DataDir "' + DataDirPage.Values[0] + '"';
+    { Cloud opt-in (only meaningful when (re)writing the config). The engine also
+      auto-detects cloud-ness from the path, so this is an explicit override. }
+    if (CbCloud <> nil) and CbCloud.Checked then
+      Args := Args + ' -Cloud';
+  end;
   if CbViewer.Checked     then Args := Args + ' -Webapp';
   if CbBioformats.Checked then Args := Args + ' -Bioformats';
   { Default ON; unchecking it disables the off-site cellpose server (IP logging). }
