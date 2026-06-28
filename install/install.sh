@@ -1192,5 +1192,203 @@ EOF
     printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
 }
 
-# Only run if script was fully downloaded (function defined completely)
-install_biopb
+# ===== Uninstall path =========================================================
+# Mirrors the Windows engine's -Uninstall / -Purge teardown (biopb-engine.ps1,
+# Invoke-BiopbUninstall): stop the daemons, unregister biopb from every agent
+# this installer wires up, remove the one shared uv tool environment, and — only
+# with --purge — delete config and cached/state data. The user's image data is
+# NEVER touched. Best-effort throughout (no `set -e`): a missing component or a
+# stop that does nothing must not abort the rest of the teardown.
+
+# Remove the biopb stdio entry from a JSON MCP config: delete the "biopb" key
+# under top-level <parent> in <file>. No-op when the file, the parent section,
+# or the entry is absent (the file is left byte-for-byte untouched). Preserves
+# all other content and writes atomically — the exact inverse of _mcp_merge.
+# Prints "removed" iff it deleted an entry, so callers can report per client.
+_mcp_unmerge() {
+    local file="$1" parent="$2"
+    [ -f "$file" ] || return 0
+    _py - "$file" "$parent" 2>/dev/null <<'PY'
+import json, os, sys
+path, parent = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (FileNotFoundError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+section = data.get(parent)
+if not isinstance(section, dict) or "biopb" not in section:
+    sys.exit(0)
+del section["biopb"]
+tmp = path + ".biopb.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, path)
+print("removed")
+PY
+}
+
+# Unregister biopb from every MCP client the installer can wire it into: Claude
+# Code via its CLI, and the JSON-config clients (Claude Desktop, Cursor,
+# opencode) via _mcp_unmerge. Requires PLATFORM to be set (Claude Desktop's
+# config path is OS-specific).
+_unregister_agents() {
+    local removed_any=0
+
+    # Claude Code — managed through the `claude` CLI. The installer adds it at
+    # user scope; try that first, then the default scope, to cover older wirings.
+    if command -v claude &>/dev/null; then
+        if claude mcp remove biopb -s user &>/dev/null \
+            || claude mcp remove biopb &>/dev/null; then
+            _ok "Claude Code: unregistered biopb"
+            removed_any=1
+        fi
+    fi
+
+    # JSON-config clients. Each row is "label|file|parent-key".
+    local cd_cfg=""
+    case "$PLATFORM" in
+        macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
+        Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
+    esac
+    local row label file parent
+    for row in \
+        "Claude Desktop|$cd_cfg|mcpServers" \
+        "Cursor|$HOME/.cursor/mcp.json|mcpServers" \
+        "opencode|$HOME/.config/opencode/opencode.json|mcp"; do
+        IFS='|' read -r label file parent <<< "$row"
+        [ -n "$file" ] || continue
+        if [ "$(_mcp_unmerge "$file" "$parent")" = "removed" ]; then
+            _ok "$label: unregistered biopb ($file)"
+            removed_any=1
+        fi
+    done
+
+    # Hermes' YAML is edited by hand on install, so we can't safely edit it back.
+    if [ -f "$HOME/.hermes/config.yaml" ] \
+        && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
+        _info "Hermes: remove the 'biopb:' entry from $HOME/.hermes/config.yaml by hand"
+    fi
+
+    [ "$removed_any" = "0" ] && _info "No MCP client registrations found to remove"
+    return 0
+}
+
+# Print usage for the flag-driven entry point to stderr (help is diagnostic, and
+# stdout may be the curl|bash pipe).
+_usage() {
+    cat >&2 <<EOF
+biopb stack installer
+
+Usage:
+  curl -fsSL https://biopb.org/install.sh | bash                          # install / upgrade
+  curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall [--purge]
+
+Options:
+  --uninstall   Remove the biopb stack: stop the data/MCP servers, unregister
+                biopb from detected AI agents, and remove the package
+                environment. Keeps config and cached data unless --purge.
+  --purge       With --uninstall, also delete config and cached/state data
+                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb).
+                Implies --uninstall. Never touches your image data.
+  -h, --help    Show this help.
+EOF
+}
+
+uninstall_biopb() {
+    local purge="${1:-0}"
+
+    # Minimal platform detection — _unregister_agents needs it for the
+    # OS-specific Claude Desktop config path. (The install path detects this in
+    # its own step-0 system check, which we deliberately skip here.)
+    case "$(uname -s)" in
+        Linux)  if grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then PLATFORM="WSL"; else PLATFORM="Linux"; fi ;;
+        Darwin) PLATFORM="macOS" ;;
+        *)      PLATFORM="Linux" ;;
+    esac
+
+    printf "\n%s%sUninstalling the biopb stack%s\n" "${BOLD}" "${CYAN}" "${RESET}"
+
+    # 1. Stop the daemons first. On some platforms a live process keeps its files
+    #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
+    #    engine hits exactly this — os error 5), so stopping precedes removal.
+    _step "[1/3] Stopping biopb services..."
+    if command -v biopb &>/dev/null; then
+        biopb server stop &>/dev/null || true
+        biopb mcp stop &>/dev/null || true
+        _ok "Data server and MCP server stopped (if they were running)"
+    else
+        _info "biopb command not on PATH; nothing to stop"
+    fi
+
+    # 2. Unregister from agents BEFORE removing the package, while `claude` and
+    #    the config paths are still meaningful.
+    _step "[2/3] Unregistering from AI agents..."
+    _unregister_agents
+
+    # 3. Remove the one shared uv tool environment (holds all three packages and
+    #    their console scripts: biopb, biopb-tensor-server, biopb-mcp).
+    _step "[3/3] Removing biopb packages..."
+    if command -v uv &>/dev/null; then
+        if uv tool uninstall biopb &>/dev/null; then
+            _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
+        else
+            _info "biopb tool environment not present (already removed?)"
+        fi
+    else
+        _warn "uv not found; cannot remove the biopb tool environment"
+        _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
+    fi
+
+    # Optional purge of config + cached/state data. Never the user's images:
+    # only biopb's own dotfile dirs are removed, never any configured data dir.
+    if [ "$purge" = "1" ]; then
+        _step "Purging config and cached data..."
+        local d
+        for d in \
+            "$HOME/.config/biopb" \
+            "$HOME/.config/biopb-mcp" \
+            "$HOME/.local/share/biopb"; do
+            if [ -e "$d" ]; then
+                rm -rf "$d"
+                _ok "Removed $d"
+            fi
+        done
+        _info "Your image data was not touched."
+    else
+        _info "Config and cached data were kept. Remove them with --purge, or:"
+        _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+    fi
+
+    printf "\n%s%s=== biopb uninstalled ===%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
+    _info "uv and any AI agent (e.g. opencode) were left installed."
+    echo ""
+}
+
+# --- entry point -------------------------------------------------------------
+# Parse a tiny flag set so `... | bash -s -- --uninstall [--purge]` works while a
+# bare `... | bash` still installs (no args => install, the unchanged default).
+main() {
+    local action="install" purge=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --uninstall|--remove) action="uninstall" ;;
+            --purge)              action="uninstall"; purge=1 ;;
+            -h|--help)            _usage; return 0 ;;
+            *) _err "Unknown option: $1"; _usage; return 2 ;;
+        esac
+        shift
+    done
+
+    if [ "$action" = "uninstall" ]; then
+        uninstall_biopb "$purge"
+    else
+        install_biopb
+    fi
+}
+
+# Only run if the script was fully downloaded (every function defined completely).
+main "$@"

@@ -77,6 +77,26 @@ are produced.
 
 Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
 
+## Uninstall
+
+`install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
+Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
+from any detected agent (Claude Code/Desktop, Cursor, opencode), and removes the
+shared `uv` tool environment. Add `--purge` to also delete config and cached
+data — your **image data is never touched**.
+
+```sh
+# Remove the stack, keep config + cached data
+curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall
+
+# Remove everything biopb owns, including config and cache
+curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
+```
+
+`--purge` deletes `~/.config/biopb`, `~/.config/biopb-mcp`, and
+`~/.local/share/biopb`. `uv` and any AI agent (e.g. opencode) are left installed.
+On Windows, uninstall through Add/Remove Programs instead.
+
 ## Notes
 
 - Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
