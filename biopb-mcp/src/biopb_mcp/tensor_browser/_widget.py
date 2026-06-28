@@ -898,6 +898,10 @@ class TensorBrowserWidget(QWidget):
 
         # Restore expanded state
         self._restore_expanded_state()
+        # Restore the highlighted item: the tree is cleared and rebuilt on every
+        # filter/refresh, which drops Qt's current-item even though we still track
+        # the logical selection (issue #191).
+        self._restore_selection()
 
     def _add_tree_node(self, parent, node: _TreeNode):
         """Add a tree node to the widget."""
@@ -959,6 +963,50 @@ class TensorBrowserWidget(QWidget):
 
         for i in range(self._tree_widget.topLevelItemCount()):
             restore_recursive(self._tree_widget.topLevelItem(i))
+
+    def _restore_selection(self):
+        """Re-highlight the tracked source/tensor in a freshly rebuilt tree.
+
+        Walk the new items, find the one matching ``_selected_source_id`` (and the
+        tensor field when one is selected), make it the current item, and scroll it
+        into view so a refresh -- notably after resolving a cloud source -- doesn't
+        lose the user's place (issue #191). Prefer the tensor child when a field is
+        selected, else fall back to the source node.
+        """
+        if self._selected_source_id is None:
+            return
+
+        target_source: QTreeWidgetItem | None = None
+        target_tensor: QTreeWidgetItem | None = None
+
+        def find_recursive(item: QTreeWidgetItem):
+            nonlocal target_source, target_tensor
+            node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            if node_type == "tensor":
+                if (
+                    self._selected_tensor_id is not None
+                    and item.data(0, Qt.ItemDataRole.UserRole + 2)
+                    == self._selected_source_id
+                    and item.data(0, Qt.ItemDataRole.UserRole)
+                    == self._selected_tensor_id
+                ):
+                    target_tensor = item
+            elif node_type == "source":
+                if (
+                    item.data(0, Qt.ItemDataRole.UserRole)
+                    == self._selected_source_id
+                ):
+                    target_source = item
+            for i in range(item.childCount()):
+                find_recursive(item.child(i))
+
+        for i in range(self._tree_widget.topLevelItemCount()):
+            find_recursive(self._tree_widget.topLevelItem(i))
+
+        target = target_tensor or target_source
+        if target is not None:
+            self._tree_widget.setCurrentItem(target)
+            self._tree_widget.scrollToItem(target)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, _column: int):
         """Handle tree item click."""
@@ -1163,6 +1211,14 @@ class TensorBrowserWidget(QWidget):
 
         def _on_resolved(descriptor):
             progress.close()
+            # Pin the just-resolved source as the logical selection so the rebuild
+            # below re-highlights it and scrolls it into view -- otherwise the user
+            # loses track of it in the refreshed list (issue #191). Set here (not
+            # only on click) because double-click/context-menu resolve can fire
+            # without a prior single-click selection. Drop any tensor sub-selection
+            # so we land on the source node itself.
+            self._selected_source_id = source_id
+            self._selected_tensor_id = None
             # The connection snapshot was refreshed by resolve_source(); re-render
             # through _apply_filter so any active search text is preserved and the
             # resolved source now shows its shape badge / field children.

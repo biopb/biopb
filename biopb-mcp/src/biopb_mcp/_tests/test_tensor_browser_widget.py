@@ -277,6 +277,85 @@ class TestResidencyIndicator:
         assert item.toolTip(0) == ""
 
 
+class TestRestoreSelection:
+    """`_restore_selection` re-highlights the tracked row in a rebuilt tree (#191)."""
+
+    def _source_node(self, source_id, tensors):
+        from biopb.tensor.descriptor_pb2 import (
+            DataSourceDescriptor,
+            TensorDescriptor,
+        )
+
+        from biopb_mcp.tensor_browser._widget import _TreeNode
+
+        src = DataSourceDescriptor(
+            source_id=source_id,
+            source_url=f"/data/{source_id}.zarr",
+            tensors=[
+                TensorDescriptor(array_id=tid, shape=[8, 8], dtype="uint8")
+                for tid in tensors
+            ],
+        )
+        return _TreeNode(
+            node_id=source_id,
+            name=f"{source_id}.zarr",
+            node_type="source",
+            depth=0,
+            source=src,
+        )
+
+    def _build(self, w, *source_nodes):
+        w._tree_widget.clear()
+        for node in source_nodes:
+            w._add_tree_node(w._tree_widget, node)
+
+    def test_reselects_source_node_after_rebuild(self, widget):
+        w, _, _ = widget
+        self._build(
+            w,
+            self._source_node("a", ["a"]),
+            self._source_node("b", ["b"]),
+        )
+        # No current item right after a rebuild.
+        assert w._tree_widget.currentItem() is None
+
+        w._selected_source_id = "b"
+        w._selected_tensor_id = None
+        w._restore_selection()
+
+        current = w._tree_widget.currentItem()
+        assert current is not None
+        assert current.data(0, _user_role()) == "b"
+
+    def test_reselects_tensor_child_when_field_selected(self, widget):
+        from qtpy.QtCore import Qt
+
+        w, _, _ = widget
+        self._build(w, self._source_node("multi", ["multi/f0", "multi/f1"]))
+
+        w._selected_source_id = "multi"
+        w._selected_tensor_id = "multi/f1"
+        w._restore_selection()
+
+        current = w._tree_widget.currentItem()
+        assert current is not None
+        assert current.data(0, Qt.ItemDataRole.UserRole + 1) == "tensor"
+        assert current.data(0, _user_role()) == "multi/f1"
+
+    def test_no_selection_leaves_current_unset(self, widget):
+        w, _, _ = widget
+        self._build(w, self._source_node("a", ["a"]))
+        w._selected_source_id = None
+        w._restore_selection()
+        assert w._tree_widget.currentItem() is None
+
+
+def _user_role():
+    from qtpy.QtCore import Qt
+
+    return Qt.ItemDataRole.UserRole
+
+
 def _descriptor(source_id, *, tensors, source_type=""):
     from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
@@ -410,6 +489,10 @@ class TestResolveAction:
         assert started["n"] == 1  # resolve ran off-thread
         w._apply_filter.assert_called_once()  # tree repopulated from fresh catalog
         w._show_error.assert_not_called()
+        # The resolved source is pinned as the selection so the rebuild re-selects
+        # it and the user doesn't lose track of it (issue #191).
+        assert w._selected_source_id == "cloud_x"
+        assert w._selected_tensor_id is None
 
     def test_failure_surfaces_error(self, widget, monkeypatch):
         w, _ = self._arm(
