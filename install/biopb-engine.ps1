@@ -262,6 +262,18 @@ function Get-CloudRoots {
     # Windows app mounts under the profile; Dropbox records its folder(s) in a
     # JSON sidecar. Probe all, then keep the ones that actually exist.
     $raw = @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)
+    # Env vars only cover ONE business account (the most recently active one);
+    # the registry lists every signed-in account (personal + each business) via
+    # its UserFolder value, so a user with two business OneDrives sees both.
+    try {
+        $acctKey = 'HKCU:\Software\Microsoft\OneDrive\Accounts'
+        if (Test-Path -LiteralPath $acctKey) {
+            foreach ($sub in Get-ChildItem -LiteralPath $acctKey -ErrorAction SilentlyContinue) {
+                $uf = @((Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).UserFolder)[0]
+                if ($uf) { $raw += [string]$uf }
+            }
+        }
+    } catch { }   # missing/inaccessible key: env vars still cover the common case
     if ($env:USERPROFILE) { $raw += (Join-Path $env:USERPROFILE 'iCloudDrive') }
     foreach ($base in @($env:LOCALAPPDATA, $env:APPDATA)) {
         if (-not $base) { continue }
@@ -568,14 +580,17 @@ function Remove-McpClients {
 # Fetch the latest GitHub release metadata for a given tag prefix. The monorepo
 # hosts several release lines, so /releases/latest is NOT component-specific: list
 # releases (date-desc) and take the newest whose tag is a CLEAN $TagPrefix+X.Y.Z.
-# With -AllowRc the regex also admits a PEP 440 prerelease suffix.
+# With -AllowRc the regex also admits a PEP 440 prerelease suffix. PEP 440 lets the
+# prerelease marker be glued to the version (1.0rc1) OR dot-separated (1.0.rc1);
+# the tag convention here uses the dot form (e.g. release-v0.10.0.rc5), so the
+# regex tolerates an optional '.' before a/b/rc (matches both spellings).
 function Get-LatestRelease {
     param([string]$Repo, [string]$TagPrefix = "", [bool]$AllowRc = $false)
     $headers = @{ "User-Agent" = "biopb-installer" }
     $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
         -Headers $headers
     $rx = if ($AllowRc) {
-        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+((a|b|rc)\d+)?$"
+        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+(\.?(a|b|rc)\d+)?$"
     } else {
         "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
     }
@@ -915,7 +930,16 @@ function Invoke-BiopbInstall {
     $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
     if ($sumsAsset) {
         $sums = @{}
-        foreach ($line in ((Invoke-WebRequest -Uri $sumsAsset.browser_download_url -UseBasicParsing).Content -split "`n")) {
+        # Download to a temp file and read it back rather than reading .Content
+        # directly: GitHub serves SHA256SUMS as application/octet-stream, and
+        # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
+        # non-text content types -- splitting a byte[] on "`n" yields individual
+        # bytes, so the regex matches nothing and every wheel fails with
+        # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
+        # encoding trap and matches the wheel-download pattern above.
+        $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
+        Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
+        foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
             # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
             $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
             if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }

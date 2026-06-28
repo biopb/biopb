@@ -83,16 +83,18 @@ var
   ProgressPage: TOutputMarqueeProgressWizardPage;
   LogMemo:      TNewMemo;
 
-  { Cloud / synced-folder support. When a cloud root (OneDrive, iCloud) is found
-    we add a checkbox to the data-dir page; ticking it points the picker at a
-    Microscopy folder under the cloud root and passes -Cloud so the engine writes
-    `cloud = true`. The engine ALSO auto-detects cloud-ness from the path, so the
-    flag is belt-and-suspenders -- browsing to a OneDrive folder works regardless. }
+  { Cloud / synced-folder support. When one or more cloud roots (OneDrive,
+    iCloud) are found we add a checkbox to the data-dir page; ticking it points
+    the picker at a Microscopy folder under a cloud root and passes -Cloud so the
+    engine writes `cloud = true`. The engine ALSO auto-detects cloud-ness from the
+    path, so the flag is belt-and-suspenders -- browsing to a OneDrive folder
+    works regardless. With more than one signed-in OneDrive a dropdown
+    (CbCloudCombo) lets the user pick which one (#188). }
   CbCloud:      TNewCheckBox;
   CbCloudDesc:  TNewStaticText;
-  CloudRoot:    String;
+  CbCloudCombo: TNewComboBox;
+  CloudRoots:   TArrayOfString;
   LocalDataDir: String;
-  CloudDataDir: String;
 
   { Existing-config detection (mirrors the console "keep current config" path) }
   ConfigPath:   String;
@@ -156,35 +158,95 @@ begin
   Result := cb;
 end;
 
-{ First existing cloud / synced-folder root, or '' if none. Mirrors the engine's
-  Get-CloudRoots probe order (OneDrive personal/business, then iCloud); the engine
-  additionally reads Dropbox's sidecar, but OneDrive covers the lab norm and the
-  engine still auto-detects a hand-picked Dropbox path by prefix. }
-function GetCloudRoot: String;
+{ Append P to Roots if it exists on disk and is not already present
+  (case-insensitive). Trailing backslash is stripped so comparisons are stable. }
+procedure AddCloudRoot(const P: String);
 var
-  p: String;
+  q: String;
+  i, n: Integer;
 begin
-  Result := '';
-  p := GetEnv('OneDrive');
-  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
-  p := GetEnv('OneDriveConsumer');
-  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
-  p := GetEnv('OneDriveCommercial');
-  if (p <> '') and DirExists(p) then begin Result := p; Exit; end;
-  p := AddBackslash(GetEnv('USERPROFILE')) + 'iCloudDrive';
-  if DirExists(p) then begin Result := p; Exit; end;
+  if P = '' then Exit;
+  q := RemoveBackslashUnlessRoot(P);
+  if not DirExists(q) then Exit;
+  for i := 0 to GetArrayLength(CloudRoots) - 1 do
+    if CompareText(CloudRoots[i], q) = 0 then Exit;   { dedupe }
+  n := GetArrayLength(CloudRoots);
+  SetArrayLength(CloudRoots, n + 1);
+  CloudRoots[n] := q;
+end;
+
+{ Fill CloudRoots with every existing cloud / synced-folder root. Mirrors the
+  engine's Get-CloudRoots probe order: OneDrive env vars, then the OneDrive
+  registry accounts, then iCloud. The env vars only ever name ONE business
+  account (the most recently active one), so the registry pass --
+  HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder, which lists every
+  signed-in account (personal + each business) -- is the multi-OneDrive fix
+  (#188). The engine additionally reads Dropbox's JSON sidecar, but OneDrive
+  covers the lab norm and the engine still auto-detects a hand-picked Dropbox
+  path by prefix. }
+procedure DiscoverCloudRoots;
+var
+  accounts: TArrayOfString;
+  i: Integer;
+  uf, prof: String;
+begin
+  SetArrayLength(CloudRoots, 0);
+  AddCloudRoot(GetEnv('OneDrive'));
+  AddCloudRoot(GetEnv('OneDriveConsumer'));
+  AddCloudRoot(GetEnv('OneDriveCommercial'));
+  if RegGetSubkeyNames(HKEY_CURRENT_USER, 'Software\Microsoft\OneDrive\Accounts', accounts) then
+    for i := 0 to GetArrayLength(accounts) - 1 do
+      if RegQueryStringValue(HKEY_CURRENT_USER,
+           'Software\Microsoft\OneDrive\Accounts\' + accounts[i], 'UserFolder', uf) then
+        AddCloudRoot(uf);
+  prof := GetEnv('USERPROFILE');
+  if prof <> '' then AddCloudRoot(AddBackslash(prof) + 'iCloudDrive');
+end;
+
+{ The Microscopy folder under the Idx-th detected cloud root. }
+function CloudDirFor(Idx: Integer): String;
+begin
+  Result := AddBackslash(CloudRoots[Idx]) + 'Microscopy';
+end;
+
+{ Index of the cloud root whose Microscopy folder equals P, or -1. Used to tell a
+  still-default cloud suggestion apart from a hand-typed/browsed path. }
+function IndexOfCloudDir(const P: String): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to GetArrayLength(CloudRoots) - 1 do
+    if CompareText(P, CloudDirFor(i)) = 0 then begin Result := i; Exit; end;
+end;
+
+{ Currently selected cloud root (the dropdown choice, or the only root). }
+function CurrentCloudIdx: Integer;
+begin
+  if CbCloudCombo <> nil then Result := CbCloudCombo.ItemIndex else Result := 0;
+  if Result < 0 then Result := 0;
+end;
+
+{ Re-point the suggestion at the newly selected cloud root -- but only when the
+  field still holds one of our cloud defaults, so a hand-typed path is kept. }
+procedure CloudComboChange(Sender: TObject);
+begin
+  if CbCloud.Checked and (IndexOfCloudDir(DataDirPage.Values[0]) >= 0) then
+    DataDirPage.Values[0] := CloudDirFor(CurrentCloudIdx);
 end;
 
 { Toggle the suggested folder between the local default and a Microscopy folder
-  under the cloud root. Only swaps when the box still holds the OTHER known
-  default, so a hand-typed/browsed path is never clobbered. }
+  under the chosen cloud root. Only swaps when the box still holds a KNOWN
+  default (local on the way in, any cloud default on the way out), so a
+  hand-typed/browsed path is never clobbered. }
 procedure CloudCheckboxClick(Sender: TObject);
 begin
+  if CbCloudCombo <> nil then CbCloudCombo.Enabled := CbCloud.Checked;
   if CbCloud.Checked then begin
     if CompareText(DataDirPage.Values[0], LocalDataDir) = 0 then
-      DataDirPage.Values[0] := CloudDataDir;
+      DataDirPage.Values[0] := CloudDirFor(CurrentCloudIdx);
   end else begin
-    if CompareText(DataDirPage.Values[0], CloudDataDir) = 0 then
+    if IndexOfCloudDir(DataDirPage.Values[0]) >= 0 then
       DataDirPage.Values[0] := LocalDataDir;
   end;
 end;
@@ -192,6 +254,7 @@ end;
 procedure InitializeWizard;
 var
   T: Integer;
+  i: Integer;
 begin
   { Options page: each checkbox carries its own description on the line(s)
     directly beneath it (TNewCheckBox + TNewStaticText pairs), instead of one
@@ -237,9 +300,8 @@ begin
     Cloud sources are now safe to index -- the server admits Files-On-Demand
     placeholders as unresolved sources (resolved lazily on read) instead of
     hanging the scan, which is exactly why we once steered AWAY from OneDrive. }
-  CloudRoot := GetCloudRoot;
-  if CloudRoot <> '' then begin
-    CloudDataDir := AddBackslash(CloudRoot) + 'Microscopy';
+  DiscoverCloudRoots;
+  if GetArrayLength(CloudRoots) > 0 then begin
     CbCloud := TNewCheckBox.Create(DataDirPage);
     CbCloud.Parent  := DataDirPage.Surface;
     CbCloud.Left    := 0;
@@ -259,6 +321,23 @@ begin
     CbCloudDesc.Height   := ScaleY(34);
     CbCloudDesc.Caption  := 'biopb indexes these without downloading every file -- images are ' +
                             'pulled on demand the first time you open them.';
+
+    { Multiple signed-in OneDrives: a dropdown picks which one (env vars name
+      only one business account -- #188). A single root needs no dropdown, so the
+      common case keeps the bare-checkbox UX. Disabled until cloud is ticked. }
+    if GetArrayLength(CloudRoots) > 1 then begin
+      CbCloudCombo := TNewComboBox.Create(DataDirPage);
+      CbCloudCombo.Parent  := DataDirPage.Surface;
+      CbCloudCombo.Style    := csDropDownList;
+      CbCloudCombo.Left     := ScaleX(18);
+      CbCloudCombo.Top      := CbCloudDesc.Top + CbCloudDesc.Height + ScaleY(6);
+      CbCloudCombo.Width    := DataDirPage.SurfaceWidth - ScaleX(18);
+      for i := 0 to GetArrayLength(CloudRoots) - 1 do
+        CbCloudCombo.Items.Add(CloudRoots[i]);
+      CbCloudCombo.ItemIndex := 0;
+      CbCloudCombo.Enabled   := False;
+      CbCloudCombo.OnChange  := @CloudComboChange;
+    end;
   end;
 
   { Progress page. We deliberately DROP the step-counting determinate gauge -- its
