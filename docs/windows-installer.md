@@ -128,11 +128,17 @@ engine rewrites a fixed template anyway, so "keep" means *don't touch the file*)
 The data-dir default is `%USERPROFILE%\Microscopy`, not Documents, matching the
 console's OneDrive-avoiding choice.
 
-**Cloud / synced folders.** When a cloud root is present (`%OneDrive%`,
-`%OneDriveConsumer/Commercial%`, or `%USERPROFILE%\iCloudDrive`), the data-dir
-page adds a *"My images are in a cloud folder"* checkbox: ticking it points the
-picker at a `Microscopy` folder under the cloud root and passes `-Cloud`, which
-makes the engine write `cloud = true` on the source. The console front-end gets
+**Cloud / synced folders.** When a cloud root is present the data-dir page adds a
+*"My images are in a cloud folder"* checkbox: ticking it points the picker at a
+`Microscopy` folder under the cloud root and passes `-Cloud`, which makes the
+engine write `cloud = true` on the source. The GUI discovers roots the same way
+the engine's `Get-CloudRoots` does — OneDrive env vars (`%OneDrive%`,
+`%OneDriveConsumer/Commercial%`), **plus the OneDrive account registry**
+(`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`), then
+`%USERPROFILE%\iCloudDrive`. The env vars only name one business account, so the
+registry pass is what surfaces *every* signed-in OneDrive; when more than one is
+found the checkbox is paired with a dropdown to pick which root (#188). The
+console front-end gets
 the same cloud folders for free — `Get-DataDirCandidates` (in the engine) now
 offers them alongside the local/drive candidates. Either way the engine
 *auto-detects* cloud-ness from the chosen path (`Test-IsCloudPath`: any dir at or
