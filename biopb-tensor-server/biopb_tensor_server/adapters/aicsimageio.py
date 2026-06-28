@@ -26,6 +26,7 @@ Relies on OS page cache for raw data caching.
 
 import logging
 import os
+import re
 import threading
 import time
 import weakref
@@ -189,6 +190,62 @@ def _get_ome_metadata_from_tiff(
         while len(_OME_META_CACHE) > _OME_META_CACHE_MAX:
             _OME_META_CACHE.popitem(last=False)
     return result
+
+
+# =============================================================================
+# tifffile-direct descriptor fast path (biopb/biopb#168)
+# =============================================================================
+#
+# Registering a large OME-TIFF used to materialize the AICSImage OME model
+# (``ome_metadata`` -> ome-types/pydantic objects, one per plane) just to learn
+# shape/dims/dtype/scenes for the catalog row -- ~97 s for a single 40k-plane
+# MMStack, serial across sources, dominating server startup. tifffile already
+# walks the IFDs and parses the OME-XML cheaply (~6 s), exposing the same
+# shape/axes/dtype per series WITHOUT building the pydantic object graph. These
+# helpers build the descriptor straight from tifffile; the AICSImage parse is
+# deferred to the first actual *read* of a scene (set_scene), off the startup
+# path. Anything outside the validated regime returns None and falls back to the
+# authoritative aicsimageio descriptor, so a wrong descriptor is never emitted.
+
+# AICSImage always presents OME-TIFF data as 5-D TCZYX (singleton-padding absent
+# axes), so the tifffile-derived descriptor must match that exactly to stay
+# byte-identical to the aicsimageio path it replaces.
+_CANONICAL_DIMS = "TCZYX"
+
+
+def _tczyx_shape(series_shape, series_axes) -> Optional[List[int]]:
+    """Map a tifffile series (shape + axes string) onto canonical 5-D TCZYX.
+
+    Returns a list of 5 ints, or None if any axis is outside TCZYX (e.g. RGB
+    samples ``S``, or an unknown ``Q``/``I``) or the axes/shape lengths disagree
+    -- cases where AICSImage's own canonicalization (RGB-sample folding, dim
+    expansion) could diverge from a naive mapping, so the caller must fall back.
+    """
+    axes = str(series_axes or "")
+    if not axes or len(axes) != len(series_shape):
+        return None
+    if any(ax not in _CANONICAL_DIMS for ax in axes):
+        return None
+    by_axis = {ax: int(n) for ax, n in zip(axes, series_shape)}
+    return [by_axis.get(ax, 1) for ax in _CANONICAL_DIMS]
+
+
+def _ome_scene_ids(ome_xml: Optional[str], n_series: int) -> List[str]:
+    """Scene identifiers matching ``AICSImage.scenes`` for an OME-TIFF.
+
+    aicsimageio derives scenes as ``tuple(image.id for image in ome.images)``
+    (the OME ``Image`` ``ID`` attribute, in document order), and tifffile's
+    series are in that same order. We read the IDs directly from the embedded
+    OME-XML with a cheap attribute scan -- NOT an ome-types object build, which
+    is the very cost this fix removes. On any mismatch (namespace quirk, missing
+    attribute, count disagreement) fall back to the positional ``Image:{i}``
+    convention, which is what conformant OME files use anyway.
+    """
+    if ome_xml:
+        ids = re.findall(r'<(?:\w+:)?Image\b[^>]*?\bID="([^"]*)"', ome_xml)
+        if len(ids) == n_series:
+            return ids
+    return [f"Image:{i}" for i in range(n_series)]
 
 
 # Generic raster/video formats that aicsimageio/bioformats technically read but
@@ -691,6 +748,74 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
 
+    def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:
+        """Build per-scene descriptors straight from tifffile (biopb/biopb#168).
+
+        Returns a list of ``TensorDescriptor`` on success, or ``None`` to signal
+        the caller to fall back to the authoritative aicsimageio descriptor path.
+        Applies only to a local, OME-XML-bearing TIFF with canonical
+        (TCZYX-subset) axes and no custom ``dim_labels`` override -- the regime
+        validated against AICSImage. Scene IDs match ``AICSImage.scenes`` so the
+        catalog array_ids are unchanged, and the AICSImage OME parse is avoided
+        entirely here (deferred to the first read's ``set_scene``).
+        """
+        # An explicit dim_labels override goes through the slower, authoritative
+        # aicsimageio path (it owns the non-canonical relabeling).
+        if self.dim_labels:
+            return None
+
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None  # remote/fsspec source: no local tifffile handle
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+
+        import tifffile
+
+        try:
+            with tifffile.TiffFile(path) as tiff:
+                # Scope to OME-TIFF: the embedded OME-XML object-parse is the cost
+                # being removed. A plain TIFF is already cheap in aicsimageio and
+                # its dim canonicalization is less predictable, so leave it to
+                # aicsimageio.
+                ome_xml = tiff.ome_metadata
+                if not ome_xml:
+                    return None
+                series = tiff.series
+                n = len(series)
+                if n == 0:
+                    return None
+                scene_ids = _ome_scene_ids(ome_xml, n)
+
+                descriptors = []
+                for i, s in enumerate(series):
+                    shape = _tczyx_shape(s.shape, s.axes)
+                    if shape is None:
+                        # An axis AICSImage would canonicalize differently
+                        # (RGB samples, unknown dim): defer the whole source.
+                        return None
+                    descriptors.append(
+                        TensorDescriptor(
+                            # Identity policy: array_id = source_id/field; the
+                            # field is the aicsimageio scene id (OME Image ID).
+                            array_id=f"{self.source_id}/{scene_ids[i]}",
+                            dim_labels=list(_CANONICAL_DIMS),
+                            shape=shape,
+                            chunk_shape=[],  # call get_flight_info for chunk info
+                            dtype=s.dtype.str,
+                        )
+                    )
+                return descriptors
+        except Exception:
+            logger.debug(
+                "tifffile descriptor fast path unavailable for %s; "
+                "using aicsimageio descriptor path",
+                self._source_url,
+                exc_info=True,
+            )
+            return None
+
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors (scenes) available in this source.
 
@@ -704,6 +829,15 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # Source-level: use cached descriptors if available
         if self._cached_descriptors is not None:
             return self._cached_descriptors
+
+        # Fast path (biopb/biopb#168): derive shape/dims/dtype/scenes from
+        # tifffile, skipping the AICSImage OME-XML object parse that dominates
+        # startup. Returns None when not applicable (non-OME, remote, custom
+        # dims, exotic axes), in which case we fall through to aicsimageio.
+        fast = self._tifffile_descriptors()
+        if fast is not None:
+            self._cached_descriptors = fast
+            return fast
 
         descriptors = []
         scene_ids = list(self._aics_image.scenes)
@@ -769,6 +903,28 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         self._cached_descriptors = descriptors
         return descriptors
 
+    def _scene_index_for_field(self, field: Optional[str]) -> int:
+        """Resolve a within-source scene field to its integer scene index.
+
+        Prefers the cached descriptor order (biopb/biopb#168) so a read does NOT
+        re-enumerate ``AICSImage.scenes`` -- which would trigger the OME-XML
+        object parse the fast path avoided at registration. The cached
+        descriptors are in series/scene order, so the position IS the scene
+        index, and aicsimageio's ``set_scene`` takes that int directly. Falls
+        back to enumerating scenes when no descriptors are cached (e.g. a read
+        without a prior list_tensor_descriptors).
+        """
+        if self._cached_descriptors is not None:
+            for i, d in enumerate(self._cached_descriptors):
+                if self._within_source_field(d.array_id) == field:
+                    return i
+            raise ValueError(f"Unknown scene: {field}")
+        scene_ids = list(self._aics_image.scenes)
+        try:
+            return scene_ids.index(field)
+        except ValueError:
+            raise ValueError(f"Unknown scene: {field}")
+
     def get_tensor_adapter(self, tensor_id: str) -> "BackendAdapter":
         """Get BackendAdapter for a specific scene within this source.
 
@@ -783,11 +939,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         tensor_id = self._within_source_field(tensor_id)
 
         # Source-level: lazy initialize tensor level adapters
-        scene_ids = list(self._aics_image.scenes)
-        try:
-            scene_idx = scene_ids.index(tensor_id)
-        except ValueError:
-            raise ValueError(f"Unknown scene: {tensor_id}")
+        scene_idx = self._scene_index_for_field(tensor_id)
 
         if hasattr(self, "_tensor_adapters"):
             # Check if adapter already exists for this scene
