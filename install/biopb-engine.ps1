@@ -262,6 +262,18 @@ function Get-CloudRoots {
     # Windows app mounts under the profile; Dropbox records its folder(s) in a
     # JSON sidecar. Probe all, then keep the ones that actually exist.
     $raw = @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)
+    # Env vars only cover ONE business account (the most recently active one);
+    # the registry lists every signed-in account (personal + each business) via
+    # its UserFolder value, so a user with two business OneDrives sees both.
+    try {
+        $acctKey = 'HKCU:\Software\Microsoft\OneDrive\Accounts'
+        if (Test-Path -LiteralPath $acctKey) {
+            foreach ($sub in Get-ChildItem -LiteralPath $acctKey -ErrorAction SilentlyContinue) {
+                $uf = (Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).UserFolder
+                if ($uf) { $raw += [string]$uf }
+            }
+        }
+    } catch { }   # missing/inaccessible key: env vars still cover the common case
     if ($env:USERPROFILE) { $raw += (Join-Path $env:USERPROFILE 'iCloudDrive') }
     foreach ($base in @($env:LOCALAPPDATA, $env:APPDATA)) {
         if (-not $base) { continue }
