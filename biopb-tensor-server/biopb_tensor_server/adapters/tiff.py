@@ -126,6 +126,25 @@ def _group_tiff_sequence(
     return [f for f, _ in members]
 
 
+def _pad_plane(plane: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Zero-pad (bottom/right) or crop a 2-D plane to ``(target_h, target_w)``.
+
+    TIFF-sequence frames can drift by a few pixels in Y/X. Rather than reject the
+    whole source over it -- fatal at cloud resolve, where there is no fallback
+    and the user could simply never open the source (biopb/biopb#198) -- the
+    descriptor advertises the per-axis maximum and every smaller plane is padded
+    up to the requested chunk extent, so frames stack uniformly. No-op (returns
+    the input untouched) when the plane already matches.
+    """
+    h, w = plane.shape[-2], plane.shape[-1]
+    if h == target_h and w == target_w:
+        return plane
+    ch, cw = min(h, target_h), min(w, target_w)
+    out = np.zeros((target_h, target_w), dtype=plane.dtype)
+    out[:ch, :cw] = plane[:ch, :cw]
+    return out
+
+
 # =============================================================================
 # TiffSequenceAdapter - Plain TIFF sequences (no metadata)
 # =============================================================================
@@ -288,10 +307,13 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             raise ValueError(f"No TIFF sequence found in {directory}")
         self._tiff_files = sorted_files
 
-        # Open first file to get shape and tile info
+        # Open the first file only for the structural facts the descriptor takes
+        # from a representative frame: tiling and page count. Spatial shape and
+        # dtype are deliberately NOT read here -- they are reconciled across the
+        # whole sequence below, so a non-representative first file can neither
+        # mis-size the tensor nor pin a too-narrow dtype.
         with tifffile.TiffFile(str(self._tiff_files[0])) as tf:
             first_page = tf.pages[0]
-            self._dtype = str(first_page.dtype)
 
             # Tile info
             if first_page.is_tiled:
@@ -301,49 +323,55 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                 self._spatial_chunk = [self.tile_length, self.tile_width]
             else:
                 self.is_tiled = False
-                self._spatial_chunk = [first_page.shape[0], first_page.shape[1]]
+                self._spatial_chunk = None  # finalized to the max plane below
 
             # Pages per file
             n_pages_per_file = len(tf.pages)
 
-        spatial_shape = (first_page.shape[0], first_page.shape[1])
-
-        # Build file index map: (file_path, n_pages). We open every file here
-        # anyway, so verify the sequence is uniform at near-zero extra cost —
-        # this is the real consistency check that replaces the old (size-based)
-        # proxy in claim(). The descriptor's dtype / pages-per-file and
-        # get_data()'s stacking all assume the first file is representative, so
-        # spatial shape, dtype, and page count must match across the sequence.
+        # Walk every file to reconcile the sequence. We open them all here anyway,
+        # so this is the real consistency pass (it replaces the old size-based
+        # proxy in claim()). For a cloud / synced-folder source this runs at
+        # *resolve* time, where a raise is terminal -- there is no fallback and
+        # the user could simply never open the source (biopb/biopb#197/#198). So
+        # we normalize whatever can be normalized and reserve raising for the one
+        # mismatch that genuinely changes the tensor's structure:
+        #
+        #  - dtype: promote to a type that holds every file's values *losslessly*
+        #    (a uint8 preview frame among uint16 acquisition frames -> uint16,
+        #    never the reverse); get_data() upcasts each chunk to it.
+        #  - spatial shape: take the per-axis maximum; get_data() zero-pads a
+        #    smaller plane up to it. A few-pixel size drift between frames is
+        #    common and harmless; rejecting the whole source over it is not.
+        #  - page count: the one un-normalizable mismatch -- it changes ndim
+        #    (whether a file contributes a page axis at all), so it still raises.
         self._file_ifd_map = []
+        file_dtypes = []
+        max_h, max_w = first_page.shape[0], first_page.shape[1]
         for file_path in self._tiff_files:
             with tifffile.TiffFile(str(file_path)) as tf:
                 page = tf.pages[0]
                 n_pages = len(tf.pages)
-                if (page.shape[0], page.shape[1]) != spatial_shape:
-                    raise ValueError(
-                        f"Inconsistent TIFF dimensions in {directory}: "
-                        f"{file_path.name} is {page.shape[:2]}, expected "
-                        f"{spatial_shape}"
-                    )
-                if str(page.dtype) != self._dtype:
-                    raise ValueError(
-                        f"Inconsistent TIFF dtype in {directory}: "
-                        f"{file_path.name} is {page.dtype}, expected {self._dtype}"
-                    )
                 if n_pages != n_pages_per_file:
                     raise ValueError(
                         f"Inconsistent TIFF page count in {directory}: "
                         f"{file_path.name} has {n_pages} pages, expected "
                         f"{n_pages_per_file}"
                     )
+                max_h = max(max_h, page.shape[0])
+                max_w = max(max_w, page.shape[1])
+                file_dtypes.append(page.dtype)
                 self._file_ifd_map.append((file_path, n_pages))
+
+        # Promote to the lossless common dtype, and size the tensor to the
+        # largest plane (smaller frames are padded in get_data()).
+        self._dtype = str(np.result_type(*file_dtypes))
+        spatial_shape = [max_h, max_w]
+        if not self.is_tiled:
+            self._spatial_chunk = [max_h, max_w]
 
         # Determine shape and dim labels
         # Shape: (num_files, pages_per_file, Y, X) or (num_files, Y, X)
         n_files = len(self._tiff_files)
-
-        # Get spatial shape from first page (not series, which may include page dimension)
-        spatial_shape = [first_page.shape[0], first_page.shape[1]]
 
         if n_pages_per_file > 1:
             # Multi-page files: (num_files, pages, Y, X)
@@ -415,6 +443,15 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                 y_slice = slices[-2] if len(slices) >= 2 else slice(None)
                 x_slice = slices[-1] if len(slices) >= 1 else slice(None)
 
+            # The chunk's target Y/X extent. Frames smaller than the descriptor's
+            # (padded) spatial shape read back short, so every plane is padded up
+            # to this so they stack uniformly (biopb/biopb#198). Fall back to the
+            # descriptor spatial dims for an unbounded slice.
+            desc_h, desc_w = self.full_shape[-2], self.full_shape[-1]
+            y0, x0 = (y_slice.start or 0), (x_slice.start or 0)
+            target_h = (y_slice.stop if y_slice.stop is not None else desc_h) - y0
+            target_w = (x_slice.stop if x_slice.stop is not None else desc_w) - x0
+
             # Determine which files and pages to read
             file_indices = range(
                 file_slice.start or 0,
@@ -447,6 +484,9 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                             else:
                                 # 3D+ array (pages, Y, X)
                                 page_data = zarr_arr[page_idx, y_slice, x_slice]
+                            # Pad a short frame up to the chunk extent so frames
+                            # of differing Y/X stack uniformly (biopb/biopb#198).
+                            page_data = _pad_plane(page_data, target_h, target_w)
                             result_pages.append(page_data)
 
             # Stack into result array
@@ -468,7 +508,11 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             else:
                 result = result_4d
 
-            return result
+            # Upcast to the descriptor dtype -- the lossless promotion across the
+            # sequence (e.g. uint8 -> uint16). A mixed-dtype sequence advertises
+            # one dtype, so every chunk must match it regardless of the source
+            # file's on-disk dtype (biopb/biopb#197). No-op when already equal.
+            return result.astype(self._dtype, copy=False)
 
     def get_metadata(self) -> dict:
         """Return empty dict (no metadata for plain TIFF sequences)."""

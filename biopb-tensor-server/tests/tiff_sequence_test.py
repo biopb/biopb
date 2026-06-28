@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.tiff import (
     TiffSequenceAdapter,
     _group_tiff_sequence,
@@ -81,19 +82,34 @@ class TestTiffSequenceClaim:
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert len(adapter._tiff_files) == 5
 
-    def test_inconsistent_dimensions_claimed_but_init_raises(self):
-        """Template matches -> claim() ok; mismatched Y/X -> __init__ raises."""
+    def test_inconsistent_dimensions_padded_not_rejected(self):
+        """Mismatched Y/X no longer rejects the source: the tensor is sized to
+        the per-axis maximum and smaller frames are zero-padded (biopb/biopb#198).
+
+        Rejecting is fatal at cloud resolve (no fallback), so a few-pixel size
+        drift between frames must not make the whole source unloadable.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 5):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", shape=(8, 8), seed=i)
-            # One file with a different spatial shape.
+            # One larger frame -> the tensor grows to the max (16, 16).
             _write_tiff(Path(tmpdir) / "s1-0005_bf.tif", shape=(16, 16), seed=99)
 
             claim, _ = _claim(tmpdir)
             assert claim is not None  # claim() is metadata-free
 
-            with pytest.raises(ValueError, match="Inconsistent TIFF dimensions"):
-                TiffSequenceAdapter(str(tmpdir), "sid")
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")  # must NOT raise
+            assert adapter.full_shape == [5, 16, 16]
+
+            # A small (8, 8) frame reads back padded to the (16, 16) chunk extent,
+            # zeros outside its real data.
+            chunk = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 16, 16]))
+            assert chunk.shape == (1, 16, 16)
+            assert int(chunk[0, 8:, :].max()) == 0 and int(chunk[0, :, 8:].max()) == 0
+
+            # The large frame reads back in full.
+            big = adapter.get_data(ChunkBounds(start=[4, 0, 0], stop=[5, 16, 16]))
+            assert big.shape == (1, 16, 16)
 
     def test_trailing_constant_number_orders_by_middle_field(self):
         """`s1-NNNN_bf2.tif`: trailing constant `2` ignored; order by NNNN."""
@@ -260,18 +276,60 @@ class TestTiffSequenceInit:
             with pytest.raises(ValueError, match="No TIFF sequence found"):
                 TiffSequenceAdapter(str(tmpdir), "sid")
 
-    def test_inconsistent_dtype_raises(self):
-        """A file with a different dtype -> __init__ raises ValueError."""
+    def test_heterogeneous_dtype_promotes_to_widest(self):
+        """Mixed per-file dtypes no longer raise: the descriptor advertises the
+        lossless promotion across the sequence and reads are cast to it
+        (biopb/biopb#197/#198)."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            # First three files uint16; the last one uint8 (with a non-zero
+            # value, so the upcast is observable and lossless).
             for i in range(1, 4):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
-            # uint8 instead of the uint16 the others use
             tifffile.imwrite(
                 str(Path(tmpdir) / "s1-0004_bf.tif"),
+                np.full((8, 8), 7, dtype=np.uint8),
+            )
+
+            # Construction succeeds (no raise) and the descriptor advertises the
+            # promoted dtype (uint16, wide enough for every frame).
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter._dtype == "uint16"
+            assert adapter.get_tensor_descriptor().dtype == "uint16"
+
+            # The uint8 file (index 3) reads back upcast to the descriptor dtype,
+            # values preserved.
+            chunk = adapter.get_data(ChunkBounds(start=[3, 0, 0], stop=[4, 8, 8]))
+            assert str(chunk.dtype) == "uint16"
+            assert int(chunk.max()) == 7
+
+    def test_dtype_promotes_up_never_down(self):
+        """The descriptor is the *widest* dtype, not the first file's: a uint8
+        first frame among uint16 frames promotes to uint16 (so the uint16 frames
+        are read losslessly), never the reverse (which would clip them)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # First file uint8 (e.g. a preview frame), the rest uint16 with values
+            # that exceed the uint8 range -- a down-cast would lose them.
+            tifffile.imwrite(
+                str(Path(tmpdir) / "s1-0001_bf.tif"),
                 np.zeros((8, 8), dtype=np.uint8),
             )
-            with pytest.raises(ValueError, match="Inconsistent TIFF dtype"):
-                TiffSequenceAdapter(str(tmpdir), "sid")
+            for i in range(2, 5):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"),
+                    np.full((8, 8), 4000, dtype=np.uint16),
+                )
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter._dtype == "uint16"
+            assert adapter.get_tensor_descriptor().dtype == "uint16"
+
+            # The uint8 first frame upcasts cleanly...
+            first = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+            assert str(first.dtype) == "uint16"
+            # ...and the wide uint16 frames keep their full value (no clipping).
+            wide = adapter.get_data(ChunkBounds(start=[1, 0, 0], stop=[2, 8, 8]))
+            assert str(wide.dtype) == "uint16"
+            assert int(wide.max()) == 4000
 
     def test_inconsistent_page_count_raises(self):
         """A file with a different page count -> __init__ raises ValueError."""
