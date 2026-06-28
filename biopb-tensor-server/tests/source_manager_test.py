@@ -1236,3 +1236,133 @@ class TestSignatureScanLoopAndSkip:
         next_state = _scan(_make_signature_manager({root, sub}))
 
         assert str((sub / "sample.dat").resolve()) in next_state
+
+
+class _FakeStat:
+    """Minimal stand-in for ``os.stat_result`` with a controllable ``st_ino``.
+
+    Lets us simulate the Windows ``DirEntry.stat()`` behaviour (st_ino/st_dev
+    reported as zero) on any platform, so the cloud inode-backfill skip is
+    testable on the POSIX CI box where a real stat would never return inode 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        st_ino,
+        st_dev=0,
+        mode=0o100644,
+        size=10,
+        mtime_ns=111,
+        ctime_ns=222,
+        st_blocks=8,
+    ):
+        self.st_ino = st_ino
+        self.st_dev = st_dev
+        self.st_mode = mode
+        self.st_size = size
+        self.st_mtime_ns = mtime_ns
+        self.st_ctime_ns = ctime_ns
+        self.st_mtime = mtime_ns / 1_000_000_000
+        self.st_ctime = ctime_ns / 1_000_000_000
+        self.st_blocks = st_blocks
+
+
+class _FakeDirEntry:
+    """``os.DirEntry`` stand-in exposing only what ``_scan_tree_state`` reads."""
+
+    def __init__(self, path, stat_result):
+        self.path = str(path)
+        self._stat = stat_result
+
+    def is_symlink(self):
+        return False
+
+    def stat(self):
+        return self._stat
+
+
+class TestCloudInodeBackfillSkip:
+    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``_scan_tree_state``
+    backfills it with a real ``os.stat``. Under a cloud root that backfill is an
+    extra whole network round-trip per entry, so it is skipped (biopb/biopb#190,
+    Finding 1). This is correct ONLY because the cloud signature is identity-only
+    and degrades safely to ``(0, 0)``; these tests pin that contract.
+    """
+
+    def _scan_one(self, manager, tmp_path, *, cloud, monkeypatch):
+        f = tmp_path / "sample.dat"
+        f.write_text("x")
+        entry = _FakeDirEntry(f, _FakeStat(st_ino=0))
+
+        backfill_calls = []
+
+        def _counting_stat(p, *a, **k):
+            backfill_calls.append(str(p))
+            return _FakeStat(st_ino=4242, st_dev=7)
+
+        monkeypatch.setattr(os, "stat", _counting_stat)
+
+        next_state, next_cloud = {}, {}
+        manager._scan_tree_state(
+            path=f,
+            now=time.time(),
+            next_state=next_state,
+            next_stable_observations={},
+            next_pending_scan={},
+            next_cloud=next_cloud,
+            skipped_dirs=set(),
+            force_full=True,
+            allow_prune=True,
+            visited_identities=set(),
+            is_root=False,
+            dir_entry=entry,
+            cloud=cloud,
+        )
+        return str(f), next_state, next_cloud, backfill_calls
+
+    def test_cloud_skips_backfill_and_degrades_signature(self, tmp_path, monkeypatch):
+        manager = _make_signature_manager({tmp_path})
+        path_str, next_state, next_cloud, backfill_calls = self._scan_one(
+            manager, tmp_path, cloud=True, monkeypatch=monkeypatch
+        )
+
+        # The whole point: no second os.stat -> no extra cloud round-trip.
+        assert backfill_calls == []
+        # The entry is still recorded, with the signature degraded to the
+        # identity-only (0, 0) (residency-invariant, never flaps on hydrate).
+        assert path_str in next_state
+        _is_dir, signature, _changed = next_state[path_str]
+        assert signature == (0, 0)
+        assert next_cloud[path_str] is True
+
+    def test_non_cloud_still_backfills_inode(self, tmp_path, monkeypatch):
+        manager = _make_signature_manager({tmp_path})
+        path_str, next_state, next_cloud, backfill_calls = self._scan_one(
+            manager, tmp_path, cloud=False, monkeypatch=monkeypatch
+        )
+
+        # Non-cloud Windows must still pay the backfill: the real inode is
+        # load-bearing for the full mtime/size signature and NTFS identity (#56).
+        assert backfill_calls == [path_str]
+        assert path_str in next_state
+        _is_dir, signature, _changed = next_state[path_str]
+        assert signature[:2] == (7, 4242)  # backfilled (st_dev, st_ino)
+        assert next_cloud[path_str] is False
+
+    def test_get_file_identity_path_hash_fallback_distinguishes_zero_inode(
+        self, tmp_path
+    ):
+        # Condition 3 of the skip: with a zeroed inode, get_file_identity falls
+        # back to hashing the resolved path, so distinct cloud entries still get
+        # distinct identities and visited_identities dedup does not collapse the
+        # walk into a single (0, 0) bucket.
+        from biopb_tensor_server.discovery import get_file_identity
+
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        id_a = get_file_identity(a, _FakeStat(st_ino=0, mode=0o040755))
+        id_b = get_file_identity(b, _FakeStat(st_ino=0, mode=0o040755))
+
+        assert id_a != id_b

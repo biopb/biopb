@@ -446,7 +446,40 @@ class SourceManager:
                 # backfill the identity fields; POSIX DirEntry.stat() already does a
                 # real stat, so this only fires on Windows and the syscall-cut win is
                 # untouched.
-                if stat_result.st_ino == 0:
+                #
+                # ...EXCEPT under a cloud root, where that backfill os.stat() is a
+                # whole-extra network round-trip per entry (the cached DirEntry.stat()
+                # is free, served from the directory enumeration; the inode is the one
+                # field that costs a round-trip on a synced placeholder). On a OneDrive
+                # tree this backfill measured ~59s of startup (biopb/biopb#190,
+                # Finding 1). We skip it under cloud, which is correct ONLY because
+                # every consumer of the zeroed inode has a cloud-safe degradation --
+                # do not break these invariants:
+                #
+                #   1. Signature. `_build_entry_signature(cloud=True)` is *already*
+                #      identity-only `(st_dev, st_ino)` and excludes size/mtime/ctime
+                #      on purpose (hydration bumps those -> destructive flap). With a
+                #      zeroed inode it degrades to a constant `(0, 0)` per entry. That
+                #      is residency-invariant (never flaps on hydrate/evict -- strictly
+                #      safer than today) and it is compared *per path_str*, so distinct
+                #      cloud paths never collide into one another.
+                #   2. Stability gate. A constant `(0, 0)` signature means
+                #      `stable_observations` never advances -- but cloud entries
+                #      *bypass* the stability window entirely (`_should_scan_resolved`
+                #      returns True immediately for a cloud path), so that counter is
+                #      never read under cloud. If that bypass is ever removed, this
+                #      skip becomes incorrect.
+                #   3. Identity / loop-breaking. `get_file_identity` falls back to a
+                #      hash of the *resolved path* when `st_ino == 0` (its FAT32 path),
+                #      so `visited_identities` dedup still distinguishes cloud entries
+                #      without a real inode. (Junctions/hardlinks under a cloud root
+                #      would no longer dedup by physical identity -- accepted: rare, and
+                #      cloud change-detection is already coarse, via the periodic
+                #      force_full re-walk, not per-entry signatures.)
+                #
+                # NOTE: this is a Windows-only effect; on POSIX DirEntry.stat() returns
+                # a real inode, so neither the backfill nor this skip ever fires there.
+                if stat_result.st_ino == 0 and not cloud:
                     stat_result = os.stat(dir_entry.path)
             else:
                 # Root: _refresh_entry_state hands it in pre-resolved, so it is
@@ -646,6 +679,12 @@ class SourceManager:
         would flap it). Archived cloud data is stable and cloud mtime is
         untrustworthy anyway, so identity is the right key there. Non-cloud
         entries keep the full mtime/size-sensitive signature.
+
+        Load-bearing for the cloud inode-backfill skip in ``_scan_tree_state``
+        (biopb/biopb#190): because this branch is identity-only, a zeroed cloud
+        inode degrades it to a constant ``(0, 0)`` that is still residency-
+        invariant and per-path. If you add size/mtime back to the cloud
+        signature, you must restore that backfill (and reintroduce the flap).
         """
         if cloud:
             return (stat_result.st_dev, stat_result.st_ino)
@@ -715,6 +754,12 @@ class SourceManager:
         #     filesystems (doc S1.2), so a placeholder could never stabilize.
         # Archived dehydrated data is inherently stable (never mid-write), so admit
         # it immediately. The pending-scan clear side effect is preserved.
+        #
+        # This bypass is also load-bearing for the cloud inode-backfill skip in
+        # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
+        # degrades to a constant (0, 0), so `stable_observations` never advances
+        # -- safe only because this early-return means that counter is never read
+        # for a cloud path. Removing the bypass would make that skip incorrect.
         if self._is_under_cloud_root(resolved_str):
             self._entry_pending_scan[resolved_str] = False
             return True
