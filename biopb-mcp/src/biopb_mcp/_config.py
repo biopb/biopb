@@ -310,6 +310,28 @@ DEFAULT_CONFIG = {
             # slow: each poll is a kernel round-trip competing with agent calls.
             "poll_interval_ms": 3000,
         },
+        "update": {
+            # Kernel-start auto-updater (issue #87). When a napari window exists,
+            # the kernel checks once — in the background, fail-open — whether a
+            # newer biopb release-v* *deployment* is available than the one the
+            # installer recorded (~/.config/biopb/release.version), and offers to
+            # re-run the installer. The check never blocks or crashes the viewer.
+            "enabled": True,
+            # owner/name of the deployment repo whose release-v* line is the
+            # product. Overridable for forks / testing; the release line prefix
+            # ("release-v") is fixed (see docs/release-model.md).
+            "repo": "biopb/biopb",
+            # "stable"     -> newest clean release-vX.Y.Z (prereleases skipped,
+            #                 matching the installer's default).
+            # "prerelease" -> also consider release candidates (…a/b/rc).
+            "channel": "stable",
+            # A version the user chose to skip ("Skip vX.Y.Z"): suppresses the
+            # prompt for exactly that version. Empty -> nothing skipped.
+            "skipped_version": "",
+            # Per-request network timeout (seconds) for the GitHub API fetch.
+            # Short on purpose — the check must never delay viewer start.
+            "timeout": 5.0,
+        },
         # Give-up budget (seconds) for start_local_server's just-launched boot
         # wait, where connection-refused is tolerated while the server binds and
         # scans its data folder. The normal auto-connect path has no timeout: it
