@@ -188,6 +188,16 @@ def _is_multifile_source(src: DataSourceDescriptor) -> bool:
     return not _is_unresolved(src) and src.source_type in _MULTIFILE_SOURCE_TYPES
 
 
+# Grace period before a hydrate-ahead warm surfaces its (non-modal) progress
+# dialog. A warm that finishes within this window -- e.g. a TIFF sequence whose
+# files resolve already recalled -- shows no dialog at all; only a genuinely slow
+# cloud recall crosses the threshold and floats one (biopb/biopb#202).
+_HYDRATE_DIALOG_DELAY_MS = 600
+# A minimum-duration far enough out to disable QProgressDialog's built-in
+# auto-show timer; the deferred _maybe_show drives appearance instead.
+_NEVER_AUTO_SHOW_MS = 10_000_000
+
+
 class _WarmWorker(QThread):
     """Runs the blocking ``TensorConnection.warm_source`` off the GUI thread.
 
@@ -1221,10 +1231,15 @@ class TensorBrowserWidget(QWidget):
             # resolved source now shows its shape badge / field children.
             self._apply_filter()
             # A multi-file source's member data files are still dehydrated -- they
-            # recall lazily (and slowly) onto the read path. Offer to hydrate them
-            # ahead of time now; the user can also (re)trigger via the context menu.
+            # recall lazily (and slowly) onto the read path. The user just asked
+            # for this source explicitly, so start hydrating ahead in the
+            # background now without a second confirmation (biopb/biopb#202).
+            # _warm_source surfaces a non-modal, cancelable dialog only if there is
+            # real work -- a source whose files resolve already recalled (e.g. a
+            # TIFF sequence) finishes within the grace window and shows nothing.
+            # The user can also (re)trigger via the context menu.
             if descriptor is not None and _is_multifile_source(descriptor):
-                self._offer_hydrate(source_id, name)
+                self._warm_source(source_id)
 
         def _on_failed(message):
             progress.close()
@@ -1254,35 +1269,22 @@ class TensorBrowserWidget(QWidget):
         # delivered inside this exec_, so a fast finish can't deadlock.
         progress.exec_()
 
-    def _offer_hydrate(self, source_id: str, name: str):
-        """After resolving a multi-file source, offer to hydrate its files now.
-
-        A quick yes/no; the long-running warm itself runs non-modally
-        (:meth:`_warm_source`) so the user keeps browsing. Declining is fine --
-        the data still recalls lazily on read, and the context menu re-offers.
-        """
-        choice = QMessageBox.question(
-            self,
-            "Hydrate data files?",
-            f"“{name}” is resolved. Its image data is stored across many files "
-            f"that are still in the cloud and will download one-by-one (slowly) "
-            f"the first time you view them.\n\nDownload them all now in the "
-            f"background? You can keep working, and cancel anytime.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if choice == QMessageBox.Yes:
-            self._warm_source(source_id)
-
     def _warm_source(self, source_id: str):
         """Hydrate-ahead a resolved multi-file source's member files.
 
-        Runs the blocking warm in a worker behind a *non-modal* progress dialog
-        (``show()``, not ``exec_()``), so the user keeps browsing/viewing while
-        the server recalls files. The dialog shows live files/bytes progress and
-        a working Cancel button (cooperative: the client closes the stream and the
-        server stops). Idempotent, so re-triggering after a cancel just finishes
-        the remainder; several sources can warm at once.
+        Runs the blocking warm in a worker behind a *non-modal* progress dialog,
+        so the user keeps browsing/viewing while the server recalls files. The
+        dialog shows live files/bytes progress and a working Cancel button
+        (cooperative: the client closes the stream and the server stops).
+        Idempotent, so re-triggering after a cancel just finishes the remainder;
+        several sources can warm at once.
+
+        The dialog is *deferred*: it appears only if the warm is still running
+        after :data:`_HYDRATE_DIALOG_DELAY_MS` (biopb/biopb#202). A source
+        whose member files were already recalled by resolve (e.g. a TIFF sequence,
+        whose construction opens every file) warms to a near-instant server no-op
+        and never flashes a dialog, while a slow cloud chunk recall (zarr /
+        ome-zarr) crosses the threshold and shows the cancelable dialog.
         """
         src = self._sources.get(source_id)
         if not src or not self._conn.is_connected:
@@ -1296,10 +1298,12 @@ class TensorBrowserWidget(QWidget):
         progress = QProgressDialog(f"Hydrating “{name}”…", "Cancel", 0, 0, self)
         progress.setWindowTitle("Hydrating")
         progress.setWindowModality(Qt.NonModal)  # user keeps browsing
-        progress.setMinimumDuration(0)
+        # Neutralize Qt's own auto-show timer (a huge minimum duration) -- we
+        # surface the dialog ourselves via the deferred _maybe_show below so a
+        # no-op warm never flashes a dialog and a finished warm can't be re-shown.
+        progress.setMinimumDuration(_NEVER_AUTO_SHOW_MS)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
-        progress.setValue(0)
 
         worker = _WarmWorker(self._conn, source_id)
         self._warm_workers.add(worker)
@@ -1338,8 +1342,18 @@ class TensorBrowserWidget(QWidget):
         worker.finished.connect(lambda: self._warm_workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
-        # Non-modal: returns immediately, dialog floats while the user works.
-        progress.show()
+
+        # Defer the dialog: only surface it if the warm is still in flight after a
+        # short grace period. The worker is dropped from `_warm_workers` on
+        # `finished`, so membership is the "still running" check -- an instant
+        # no-op warm (already-resident files) is already gone by the time this
+        # fires and shows nothing; a slow recall is still present and floats the
+        # non-modal dialog while the user keeps working (biopb/biopb#202).
+        def _maybe_show():
+            if worker in self._warm_workers:
+                progress.show()
+
+        QTimer.singleShot(_HYDRATE_DIALOG_DELAY_MS, _maybe_show)
 
     def _view_tensor(self, source_id: str, tensor_id: str):
         """Add single tensor to viewer."""

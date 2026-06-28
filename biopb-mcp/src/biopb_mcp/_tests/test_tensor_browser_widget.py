@@ -389,6 +389,7 @@ class _FakeProgress:
 
     def __init__(self, *a, **k):
         self.closed = False
+        self.shown = False
         self.label = ""
         self.canceled = _Sig()  # user Cancel button -> request_cancel
 
@@ -409,7 +410,7 @@ class _FakeProgress:
         pass
 
     def show(self):  # non-modal path (warm/hydrate)
-        pass
+        self.shown = True
 
 
 class TestUnresolvedHelper:
@@ -478,7 +479,7 @@ class TestResolveAction:
         w._apply_filter.assert_not_called()
 
     def test_accepted_resolves_then_repopulates(self, widget, monkeypatch):
-        # A plain (non-multifile) resolved descriptor: repopulate, no hydrate offer.
+        # A plain (non-multifile) resolved descriptor: repopulate, no warm started.
         w, started = self._arm(
             widget,
             monkeypatch,
@@ -563,9 +564,10 @@ class TestResolveAction:
             worker.finished.emit()
         assert w._resolve_workers == set()
 
-    def test_multifile_resolve_offers_hydrate(self, widget, monkeypatch):
-        # Resolving a multi-file (dir-backed) source pops the hydrate-ahead offer;
-        # a plain single-file one (test above) does not.
+    def test_multifile_resolve_starts_warm(self, widget, monkeypatch):
+        # Resolving a multi-file (dir-backed) source starts hydrate-ahead directly
+        # -- no confirmation dialog (biopb/biopb#202); a plain single-file one
+        # (test above) does not.
         w, started = self._arm(
             widget,
             monkeypatch,
@@ -575,9 +577,9 @@ class TestResolveAction:
                 _descriptor("cloud_x", tensors=["cloud_x"], source_type="zarr"),
             ),
         )
-        w._offer_hydrate = MagicMock()
+        w._warm_source = MagicMock()
         w._resolve_source("cloud_x")
-        w._offer_hydrate.assert_called_once()
+        w._warm_source.assert_called_once_with("cloud_x")
 
     def test_double_click_routes_unresolved_to_resolve(self, widget, monkeypatch):
         from biopb_mcp.tensor_browser._widget import _TreeNode
@@ -717,28 +719,40 @@ class TestHydrateAction:
         assert workers[0].cancel_requested
         assert progs[0].label == "Cancelling…"
 
-    def test_offer_accepted_starts_warm(self, widget, monkeypatch):
+    def test_instant_warm_never_shows_dialog(self, widget, monkeypatch):
+        # An already-resident warm finishes (worker dropped from _warm_workers)
+        # before the deferred _maybe_show fires, so no dialog is ever shown
+        # (biopb/biopb#202). Capture the singleShot callback and fire it after.
         from biopb_mcp.tensor_browser import _widget as widget_mod
 
-        w, _conn, _ = widget
+        captured = []
         monkeypatch.setattr(
-            widget_mod.QMessageBox,
-            "question",
-            staticmethod(lambda *a, **k: widget_mod.QMessageBox.Yes),
+            widget_mod.QTimer,
+            "singleShot",
+            staticmethod(lambda _ms, cb: captured.append(cb)),
         )
-        w._warm_source = MagicMock()
-        w._offer_hydrate("m", "m.zarr")
-        w._warm_source.assert_called_once_with("m")
+        w, progs, _ = self._arm(
+            widget, monkeypatch, events=[("warmed", object()), ("finished", None)]
+        )
+        w._warm_source("m")
+        assert progs[0].closed  # warm completed
+        assert captured  # a deferred-show was scheduled
+        captured[0]()  # the grace period elapses -- worker already gone
+        assert not progs[0].shown  # nothing flashed
 
-    def test_offer_declined_does_nothing(self, widget, monkeypatch):
+    def test_slow_warm_shows_dialog_after_grace(self, widget, monkeypatch):
+        # A warm still in flight when the grace period elapses surfaces the
+        # non-modal dialog (biopb/biopb#202).
         from biopb_mcp.tensor_browser import _widget as widget_mod
 
-        w, _conn, _ = widget
+        captured = []
         monkeypatch.setattr(
-            widget_mod.QMessageBox,
-            "question",
-            staticmethod(lambda *a, **k: widget_mod.QMessageBox.No),
+            widget_mod.QTimer,
+            "singleShot",
+            staticmethod(lambda _ms, cb: captured.append(cb)),
         )
-        w._warm_source = MagicMock()
-        w._offer_hydrate("m", "m.zarr")
-        w._warm_source.assert_not_called()
+        w, progs, _ = self._arm(widget, monkeypatch, events=[])  # no completion
+        w._warm_source("m")
+        assert not progs[0].shown  # not shown synchronously
+        captured[0]()  # grace period elapses while still in flight
+        assert progs[0].shown
