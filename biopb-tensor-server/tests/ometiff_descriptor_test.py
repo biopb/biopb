@@ -253,10 +253,9 @@ class TestStripPerPlane:
         import time
 
         planes = "".join(
-            f'<Plane TheZ="0" TheC="0" TheT="{i}" DeltaT="{i}.0"/>'
-            for i in range(8000)
+            f'<Plane TheZ="0" TheC="0" TheT="{i}" DeltaT="{i}.0"/>' for i in range(8000)
         )
-        xml = f"<Pixels>{planes}<Channel ID=\"c0\"/></Pixels>"
+        xml = f'<Pixels>{planes}<Channel ID="c0"/></Pixels>'
         t = time.monotonic()
         reduced = _STRIP_PER_PLANE.sub("", xml)
         elapsed = time.monotonic() - t
