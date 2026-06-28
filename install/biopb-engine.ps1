@@ -930,7 +930,16 @@ function Invoke-BiopbInstall {
     $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
     if ($sumsAsset) {
         $sums = @{}
-        foreach ($line in ((Invoke-WebRequest -Uri $sumsAsset.browser_download_url -UseBasicParsing).Content -split "`n")) {
+        # Download to a temp file and read it back rather than reading .Content
+        # directly: GitHub serves SHA256SUMS as application/octet-stream, and
+        # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
+        # non-text content types -- splitting a byte[] on "`n" yields individual
+        # bytes, so the regex matches nothing and every wheel fails with
+        # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
+        # encoding trap and matches the wheel-download pattern above.
+        $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
+        Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
+        foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
             # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
             $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
             if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
