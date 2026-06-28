@@ -99,9 +99,7 @@ class TestFastPathParity:
     def _fast(self, adapter):
         descs = adapter._tifffile_descriptors()
         assert descs is not None, "fast path should apply to this OME-TIFF"
-        return [
-            (d.array_id.split("/", 1)[1], list(d.shape), d.dtype) for d in descs
-        ]
+        return [(d.array_id.split("/", 1)[1], list(d.shape), d.dtype) for d in descs]
 
     def test_single_series_parity(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
@@ -175,7 +173,7 @@ _OME_WITH_PLANES = (
     '<TiffData FirstZ="0" FirstC="0" FirstT="0" IFD="0" PlaneCount="1"/>'
     '<Plane TheZ="1" TheC="0" TheT="0" DeltaT="0.1"/>'
     '<TiffData FirstZ="1" FirstC="0" FirstT="0" IFD="1">'
-    "<UUID FileName=\"f.tif\">urn:uuid:00000000-0000-0000-0000-000000000001</UUID>"
+    '<UUID FileName="f.tif">urn:uuid:00000000-0000-0000-0000-000000000001</UUID>'
     "</TiffData>"
     "</Pixels></Image></OME>"
 )
