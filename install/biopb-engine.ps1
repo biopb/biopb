@@ -908,6 +908,30 @@ function Invoke-BiopbInstall {
     Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
     Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
     Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
+
+    # Verify the wheels against the release's SHA256SUMS before installing them
+    # (issue #87 trust item). Hard-fail on a mismatch or a wheel missing from a
+    # SHA256SUMS that exists; fail open (warn) when the release predates it.
+    $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
+    if ($sumsAsset) {
+        $sums = @{}
+        foreach ($line in ((Invoke-WebRequest -Uri $sumsAsset.browser_download_url -UseBasicParsing).Content -split "`n")) {
+            # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
+            $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
+            if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
+        }
+        foreach ($w in @($mcpWhl, $sdkWhl, $tensorWhl)) {
+            $base = Split-Path -Leaf $w
+            $expected = $sums[$base]
+            if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $w).Hash.ToLower()
+            if ($actual -ne $expected) { throw "Checksum mismatch for $base - refusing to install (expected $expected, got $actual)" }
+        }
+        Report-Ok "Wheel checksums verified"
+    } else {
+        Report-Warn "Release $($release.tag_name) has no SHA256SUMS; skipping wheel integrity check"
+    }
+
     # Direct file:// references pin each package to this exact wheel.
     $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
     $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
@@ -959,6 +983,25 @@ function Invoke-BiopbInstall {
     $versionOutput = (biopb-tensor-server version 2>$null)
     if (-not $versionOutput) { $versionOutput = "installed" }
     Report-Ok "$versionOutput"
+
+    # Record the installed deployment version as the kernel-start auto-updater's
+    # baseline (issue #87): the check compares the latest release-v* deployment's
+    # versions.json `release` against this marker. Read `release` from the same
+    # manifest; fall back to the tag (release-vX.Y.Z -> X.Y.Z). Best-effort — a
+    # write failure only re-prompts a future update, never the install.
+    $releaseVersion = ""
+    $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
+    if ($verAsset) {
+        try { $releaseVersion = ((Invoke-WebRequest -Uri $verAsset.browser_download_url -UseBasicParsing).Content | ConvertFrom-Json).release } catch { $releaseVersion = "" }
+    }
+    if (-not $releaseVersion) { $releaseVersion = ($release.tag_name -replace "^$([regex]::Escape($ReleaseTagPrefix))", "") }
+    try {
+        if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
+        Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "release.version") -Content $releaseVersion
+        Report-Info "recorded installed release $releaseVersion"
+    } catch {
+        Report-Warn "Could not record installed release version (update checks may re-prompt)"
+    }
 
     # ===== 4. Webapp =====
     Report-Step 4 "Installing data browser..."
