@@ -359,7 +359,6 @@ def encode_chunk_id_with_scale(
     base = encode_chunk_id(array_id, bounds)
 
     method_bytes = reduction_method.encode("utf-8")
-    ndim = len(scale_hint)
 
     scale_payload = b"".join(
         [

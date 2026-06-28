@@ -242,7 +242,6 @@ class TestMemoryCacheBackend:
         backend.complete_entry(b"key4", self._make_data([4]), 8)
         backend.release(b"key4")
 
-        stats = backend.stats()
         # key1 should still exist (has ref_count > 0)
         assert backend.start_compute(b"key1")[0].state == EntryState.READY
         backend.close()
@@ -895,9 +894,9 @@ class TestArrowFileBackendRecovery:
         assert is_owner2 is False  # Should find cached entry
         assert entry2.state == EntryState.READY
 
-        # Recovery status should be available
-        recovery = backend2.get_recovery_status()
+        # Recovery status should be available (smoke check: does not raise).
         # May or may not have recovery depending on whether there were pending writes
+        backend2.get_recovery_status()
 
         backend2.close()
         shutil.rmtree(cache_dir)
@@ -1346,7 +1345,6 @@ class TestSieveKEviction:
             if segment_id:
                 seg_info = pool_queue.segments.get(segment_id)
                 assert seg_info is not None
-                initial_freq = seg_info.frequency
 
                 # Access 5 times - frequency should saturate at K=2
                 for _ in range(5):
@@ -1381,9 +1379,6 @@ class TestSieveKEviction:
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and len(pool_queue.queue) > 2:
-            # Record hand position before eviction
-            initial_hand = pool_queue.hand
-
             # Trigger eviction
             key_new = b"key_new"
             entry, _ = backend.start_compute(key_new)

@@ -389,7 +389,6 @@ class OmeZarrAdapter(ZarrAdapter):
         # For HCS plates, array is at plate.zarr/A01/0/0, but plate .zattrs is at plate.zarr/
         # We need to find .zattrs with 'plate' key, not just any .zattrs
         plate_root_path = None
-        zattrs_path = None
         zattrs = None
 
         # Navigate up to find .zattrs with plate metadata (HCS) or multiscales (single image)
@@ -404,7 +403,6 @@ class OmeZarrAdapter(ZarrAdapter):
                     # Check for HCS plate metadata first (highest priority)
                     if "plate" in candidate_zattrs:
                         plate_root_path = current_path
-                        zattrs_path = candidate_zattrs_path
                         zattrs = candidate_zattrs
                         break  # Found plate root, stop searching
 
@@ -413,7 +411,6 @@ class OmeZarrAdapter(ZarrAdapter):
                     if "multiscales" in candidate_zattrs and zattrs is None:
                         # Save this as fallback (single image case)
                         plate_root_path = current_path
-                        zattrs_path = candidate_zattrs_path
                         zattrs = candidate_zattrs
                 except (OSError, json.JSONDecodeError):
                     pass

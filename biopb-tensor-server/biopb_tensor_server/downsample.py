@@ -425,7 +425,7 @@ def _resample_linear(data: np.ndarray, target_shape: Tuple[int, ...]) -> np.ndar
         dst_coords = np.clip(dst_coords, 0.0, float(max(src_len - 1, 0)))
 
         resampled = np.apply_along_axis(
-            lambda values: np.interp(dst_coords, src_coords, values),
+            lambda values, dst=dst_coords, src=src_coords: np.interp(dst, src, values),
             axis,
             resampled,
         )

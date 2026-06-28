@@ -433,7 +433,6 @@ class ArrowFileBackend(CacheBackend):
                 self._segment_mmaps[segment_id] = mmap
 
                 # Read all batches to extract keys and build index
-                offset = 0
                 entry_count = 0
                 segment_size = seg_file.stat().st_size
                 segment_created = seg_file.stat().st_mtime

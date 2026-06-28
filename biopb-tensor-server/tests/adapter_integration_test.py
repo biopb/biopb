@@ -719,11 +719,11 @@ class TestCacheIntegration:
             darr = client.get_tensor("cache-regions", "cache-regions")
 
             # Read first chunk
-            data1 = darr[: chunks[0], : chunks[1]].compute()
+            darr[: chunks[0], : chunks[1]].compute()
             nbytes1 = client.cache_info()["size_bytes"]
 
             # Read second chunk (different region)
-            data2 = darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
+            darr[chunks[0] : chunks[0] * 2, chunks[1] : chunks[1] * 2].compute()
             nbytes2 = client.cache_info()["size_bytes"]
 
             # Cache should have grown

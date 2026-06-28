@@ -328,9 +328,9 @@ class TestCallOptionsPool:
         with client_module._POOL_LOCK:
             key = ("test_loc", None)
             if key in client_module._CALL_OPTS_POOL:
-                opts = client_module._CALL_OPTS_POOL[key]
-                # Should have no auth headers
-                # FlightCallOptions.headers would be empty
+                # A pooled entry exists; without a token it carries no auth
+                # headers (FlightCallOptions.headers would be empty).
+                pass
 
     def test_shared_call_options_with_token(self):
         """Test that call options include auth headers when token provided."""

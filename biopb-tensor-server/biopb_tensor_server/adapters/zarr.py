@@ -180,7 +180,6 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        desc = self.get_tensor_descriptor()
         slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
         return self.zarr_array[slices]
 

@@ -613,8 +613,8 @@ def create_app(
             # Decode hex string to bytes
             ticket_bytes = bytes.fromhex(ticket_hex)
 
-            # Parse TensorTicket to validate
-            tensor_ticket = TensorTicket.FromString(ticket_bytes)
+            # Parse TensorTicket to validate (raises on malformed ticket)
+            TensorTicket.FromString(ticket_bytes)
 
             # Get Flight client
             client = _get_client()
