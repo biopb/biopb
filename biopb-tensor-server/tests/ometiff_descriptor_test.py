@@ -24,6 +24,7 @@ from biopb_tensor_server.adapters.aicsimageio import (
 )
 from biopb_tensor_server.fixtures import (
     create_multi_series_ome_tiff,
+    create_multifile_embedded_ome_tiff,
     create_tiled_ome_tiff,
 )
 
@@ -110,6 +111,22 @@ class TestFastPathParity:
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
         adapter = AicsImageIoAdapter.create_from_url(path, "multi")
         assert self._fast(adapter) == self._aics_truth(path)
+
+    def test_multifile_embedded_ome_parity(self, tmp_path):
+        # Multi-file OME-TIFF: the master's local IFD count (1) is LESS than the
+        # OME-declared SizeC (3) -- the shape must come from the OME Size* across
+        # sibling files, not the local file. tifffile assembles the siblings into
+        # one OME series, so the fast path's shape must still match aicsimageio.
+        path, names, full_shape = create_multifile_embedded_ome_tiff(
+            str(tmp_path), n_files=3
+        )
+        adapter = AicsImageIoAdapter.create_from_url(path, "mfembed")
+
+        fast = self._fast(adapter)
+        assert fast == self._aics_truth(path)
+        # Guard the specific invariant the reviewer flagged: full SizeC, not 1.
+        assert fast[0][1] == list(full_shape)  # (1, 3, 1, h, w)
+        assert len(names) == 3
 
     def test_list_descriptors_does_not_parse_aicsimageio(self, tmp_path):
         # The registration path must build the catalog row without ever touching
