@@ -208,6 +208,81 @@ class TestStripPerPlane:
         xml = '<OME><Image ID="Image:0"/></OME>'
         assert _STRIP_PER_PLANE.sub("", xml) == xml
 
+    def test_strips_tiffdata_wrapping_self_closing_uuid(self):
+        # Some MMStacks emit `<UUID FileName="..."/>` (no urn body). The strip must
+        # consume the whole <TiffData>...</TiffData>, not stop at the child's `/>`
+        # and orphan the close tag -- which produced malformed XML (biopb/biopb#193).
+        xml = (
+            '<Pixels><TiffData FirstZ="0" IFD="0">'
+            '<UUID FileName="f.ome.tif"/>'
+            '</TiffData><Channel ID="c0"/></Pixels>'
+        )
+        reduced = _STRIP_PER_PLANE.sub("", xml)
+        assert reduced == '<Pixels><Channel ID="c0"/></Pixels>'
+        # No orphaned open/close fragments left behind.
+        assert "TiffData" not in reduced
+
+    def test_strips_plane_wrapping_child_element(self):
+        xml = (
+            '<Pixels><Plane TheZ="0" TheC="0" TheT="0">'
+            '<AnnotationRef ID="Annotation:0"/>'
+            '</Plane><Channel ID="c0"/></Pixels>'
+        )
+        assert _STRIP_PER_PLANE.sub("", xml) == '<Pixels><Channel ID="c0"/></Pixels>'
+
+    def test_strips_namespaced_per_plane_elements(self):
+        xml = (
+            '<ns:Pixels><ns:TiffData IFD="0">'
+            '<ns:UUID FileName="f"/></ns:TiffData>'
+            '<ns:Channel ID="c0"/></ns:Pixels>'
+        )
+        reduced = _STRIP_PER_PLANE.sub("", xml)
+        assert reduced == '<ns:Pixels><ns:Channel ID="c0"/></ns:Pixels>'
+
+    def test_does_not_strip_unrelated_lookalike_element(self):
+        # \b after the captured name must not let a longer element name match.
+        xml = '<Pixels><TiffDataset Foo="1"/><Channel ID="c0"/></Pixels>'
+        assert _STRIP_PER_PLANE.sub("", xml) == xml
+
+    def test_many_self_closing_planes_strip_in_linear_time(self):
+        # Regression guard (biopb/biopb#193): a real MMStack carries one
+        # self-closing <Plane/> per frame (10k+). An open/close form that scanned
+        # `.*?</Plane>` to EOF for each self-closing plane was O(n^2) (~87 s on a
+        # 10k-plane file). The conditional self-closing branch keeps it linear, so
+        # this large input must strip near-instantly, not in seconds.
+        import time
+
+        planes = "".join(
+            f'<Plane TheZ="0" TheC="0" TheT="{i}" DeltaT="{i}.0"/>'
+            for i in range(8000)
+        )
+        xml = f"<Pixels>{planes}<Channel ID=\"c0\"/></Pixels>"
+        t = time.monotonic()
+        reduced = _STRIP_PER_PLANE.sub("", xml)
+        elapsed = time.monotonic() - t
+        assert reduced == '<Pixels><Channel ID="c0"/></Pixels>'
+        assert elapsed < 2.0, f"strip took {elapsed:.1f}s (catastrophic backtracking?)"
+
+    def test_fast_metadata_parses_self_closing_uuid_tiffdata(self):
+        # End-to-end: the reduced XML must be well-formed so ome-types parses it
+        # instead of falling back to the ~105 s authoritative parse (#193).
+        ome = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Image ID="Image:0" Name="m"><Pixels ID="Pixels:0" '
+            'DimensionOrder="XYZCT" Type="uint16" SizeX="16" SizeY="16" '
+            'SizeZ="1" SizeC="1" SizeT="1">'
+            '<Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/>'
+            '<TiffData FirstZ="0" FirstC="0" FirstT="0" IFD="0" PlaneCount="1">'
+            '<UUID FileName="f.ome.tif"/>'
+            "</TiffData>"
+            "</Pixels></Image></OME>"
+        )
+        md = _fast_ome_metadata(ome)
+        assert md is not None
+        px = md["images"][0]["pixels"]
+        assert px["tiff_data_blocks"] == []
+        assert [c["name"] for c in px["channels"]] == ["DAPI"]
+
 
 class TestFastMetadata:
     def test_drops_planes_keeps_structure(self):

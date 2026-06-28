@@ -253,11 +253,22 @@ def _ome_scene_ids(ome_xml: Optional[str], n_series: int) -> List[str]:
 # OME-XML and the sole reason ome-types parsing blows up (40k planes -> ~90 s).
 # They carry no catalog-relevant *source* metadata (pixel sizes, channels, dims,
 # acquisition annotations all live on Image/Pixels/Channel/StructuredAnnotations),
-# so the fast metadata path strips them and parses the tiny remainder. Matches a
-# self-closing element or an open/close pair (TiffData may wrap a <UUID>); DOTALL
-# so the close form spans lines. Non-greedy so each element is removed individually.
+# so the fast metadata path strips them and parses the tiny remainder.
+#
+# `(/)?>` captures an optional self-closing slash and the conditional `(?(2)...)`
+# then branches on it: a self-closing element (`<Plane .../>`, `<TiffData .../>`)
+# matches with NOTHING after the tag, while an open tag consumes up to its OWN
+# `</name>` (the \1 backreference). Two correctness/perf properties this buys:
+#   * a nested self-closing child (`<TiffData><UUID FileName="f"/></TiffData>`,
+#     which some MMStacks emit) cannot end the match at its own `/>` and orphan
+#     the parent's `</TiffData>` -- the close form is anchored to the parent name
+#     (biopb/biopb#193).
+#   * self-closing elements never enter the `.*?</name>` branch, so a file with
+#     40k self-closing `<Plane/>` does NOT trigger an O(n^2) scan-to-EOF per plane
+#     (an earlier `[^>]*(?:/>|>.*?</\1>)` form took ~87 s on a 10k-plane file;
+#     this form is ~0.08 s). `[^>]*?` keeps the attribute scan inside the open tag.
 _STRIP_PER_PLANE = re.compile(
-    r"<(?:\w+:)?(?:Plane|TiffData)\b.*?(?:/>|</(?:\w+:)?(?:Plane|TiffData)>)",
+    r"<(?:\w+:)?(Plane|TiffData)\b[^>]*?(/)?>(?(2)|.*?</(?:\w+:)?\1>)",
     re.DOTALL,
 )
 
