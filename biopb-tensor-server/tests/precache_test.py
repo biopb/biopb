@@ -292,9 +292,20 @@ class TestWarming:
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             worker.should_warm = lambda source_id: False
 
+            # Pin the ordering contract of #174: the gate must fire *before* any
+            # adapter access, so a denied warm never touches the source at all.
+            # A spy on _get_source_adapter (and the cache stats) catches a future
+            # re-ordering of the gate below adapter/list/compute.
+            adapter_calls = []
+            real_get = server._get_source_adapter
+            server._get_source_adapter = lambda sid: (
+                adapter_calls.append(sid) or real_get(sid)
+            )
+
             worker._process_source("warm-src")
 
-            # Gate fires after the file-backend check but before any compute.
+            assert adapter_calls == []  # gate fired before any adapter access
+            # ... and consequently nothing was computed/cached.
             stats = CacheManager.get_instance().stats()
             assert stats.misses == 0
             assert stats.total_entries == 0

@@ -1092,8 +1092,16 @@ class SourceManager:
         rule so the two stay in sync. Only sources under a ``cloud`` root are
         gated -- a normal local source always warms -- and the check is
         metadata-only, so it never recalls content itself. Returns False (skip)
-        when any member file is now a placeholder, or when the source is no longer
-        registered.
+        when any member *file* is now a placeholder, or when the source is no
+        longer registered.
+
+        Boundary: like ``_claim_has_dehydrated_member``, the residency check is
+        ``is_file``-guarded, so it does not catch re-dehydration of a
+        dir-claiming source's *interior* files (ome-zarr, micromanager, ndtiff,
+        tiff-sequence, whose ``member_paths`` is just the directory). Those are
+        kept safe today by ``UnresolvedSourceAdapter.list_tensor_descriptors``
+        returning empty until resolved; closing the post-resolution re-warm path
+        is the cloud-storage spec's phase-4 deferral.
         """
         with self._lock:
             claim = self._state.claims.get(source_id)
