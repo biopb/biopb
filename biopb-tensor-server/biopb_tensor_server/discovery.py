@@ -598,17 +598,17 @@ class AdapterRegistry:
     def get_claims_for_path(
         self, ctx: ClaimContext, state: DiscoveryState
     ) -> List[SourceClaim]:
-        """Ask all adapters to claim this path.
+        """Ask adapters to claim this path, stopping at the first winner.
 
-        Each adapter's claim(ctx, state) method is called in registration order.
-        First adapter to return a non-None claim wins.
+        Adapters' claim(ctx, state) methods are called in registration order;
+        the first to return a non-None claim wins and the rest are not probed.
 
         Args:
             ctx: ClaimContext for unified filesystem access
             state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            List of SourceClaim objects (may be empty if no adapter claims)
+            List with the single winning SourceClaim, or empty if none claims.
         """
         claims = []
         for adapter_cls in self._adapters:
@@ -624,6 +624,12 @@ class AdapterRegistry:
                         f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}"
                     )
                     self._type_to_adapter[claim.source_type] = adapter_cls
+                    # First claim wins: callers take claims[0] and the registry
+                    # order is load-bearing priority, so stop probing the
+                    # remaining adapters. On cloud roots their claim() probes are
+                    # network round-trips, so this avoids up to 17x the wasted
+                    # stat/glob per non-matching entry (biopb/biopb#190).
+                    break
             except Exception as e:
                 logger.debug(
                     f"Adapter {adapter_cls.__name__} claim() raised exception: {e}"
