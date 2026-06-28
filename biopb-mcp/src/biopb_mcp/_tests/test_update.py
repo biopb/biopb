@@ -8,8 +8,8 @@ build) — so no network is touched and the fail-open contract is exercised.
 
 import pytest
 
-from biopb_mcp._config import get_default_config
-from biopb_mcp.mcp import _update
+from biopb_mcp._config import CONFIG, get_default_config
+from biopb_mcp.mcp import _update, _update_apply
 
 
 def _release(tag, *, prerelease=False, draft=False, url="https://example/r"):
@@ -216,3 +216,59 @@ class TestCheckForUpdate:
         )
         info = _update.check_for_update(config, installed="0.6.6")
         assert info is not None and info.latest == "0.7.0rc1"
+
+
+class TestHandleChoice:
+    """The nagger choice dispatch (runs on the Qt main thread in production)."""
+
+    @pytest.fixture
+    def info(self):
+        return _update.UpdateInfo(
+            current="0.6.6",
+            latest="0.7.0",
+            tag="release-v0.7.0",
+            html_url="https://example/r",
+        )
+
+    def test_skip_persists_skipped_version(self, info):
+        # conftest isolates CONFIG to a tmp dir, so this write-through is hermetic.
+        _update_apply.handle_choice("skip", info, get_default_config())
+        assert CONFIG.get("mcp.update.skipped_version") == "0.7.0"
+        # skip is per-version; the check stays enabled.
+        assert CONFIG.get("mcp.update.enabled") is True
+
+    def test_disable_turns_check_off(self, info):
+        _update_apply.handle_choice("disable", info, get_default_config())
+        assert CONFIG.get("mcp.update.enabled") is False
+        # disable is not a per-version skip.
+        assert CONFIG.get("mcp.update.skipped_version") == ""
+
+    def test_later_does_nothing(self, info):
+        _update_apply.handle_choice("later", info, get_default_config())
+        assert CONFIG.get("mcp.update.skipped_version") == ""
+        assert CONFIG.get("mcp.update.enabled") is True
+
+    def test_unknown_action_is_noop(self, info):
+        _update_apply.handle_choice("bogus", info, get_default_config())
+        assert CONFIG.get("mcp.update.skipped_version") == ""
+        assert CONFIG.get("mcp.update.enabled") is True
+
+    def test_handler_error_is_swallowed(self, info, monkeypatch):
+        def _boom(*a, **k):
+            raise RuntimeError("config blew up")
+
+        monkeypatch.setattr(_update_apply, "_persist_skip", _boom)
+        # Must not raise — it runs inside a Qt slot.
+        _update_apply.handle_choice("skip", info, get_default_config())
+
+
+class TestUpgradeCommand:
+    def test_posix_uses_curl_pipe_bash(self, monkeypatch):
+        monkeypatch.setattr(_update_apply.os, "name", "posix")
+        cmd = _update_apply.upgrade_command()
+        assert cmd.startswith("curl ") and "install.sh" in cmd
+
+    def test_windows_uses_irm_iex(self, monkeypatch):
+        monkeypatch.setattr(_update_apply.os, "name", "nt")
+        cmd = _update_apply.upgrade_command()
+        assert "irm " in cmd and "install.ps1" in cmd

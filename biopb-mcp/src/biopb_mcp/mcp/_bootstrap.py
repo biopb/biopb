@@ -251,6 +251,52 @@ def _make_token_report_hook():
     return _report
 
 
+def _start_update_check(viewer, config):
+    """Kick off the kernel-start update reminder (issue #87), GUI branch only.
+
+    Runs the network version check on a daemon thread so it can never delay
+    window paint, then marshals a window-only reminder popup to the Qt main
+    thread via ``run_on_main`` (which the popup returns from immediately — it
+    ``.show()``s rather than ``.exec()``s). Fully best-effort and fail-open: the
+    check itself swallows every error, and this wrapper swallows the rest, so it
+    never disturbs a working session. The caller invokes this only when a real
+    napari window exists (never headless — "only when a napari window exists").
+
+    This is a *notify-only* reminder: it tells the user to run the install/
+    upgrade script. biopb does not self-update (a graceful cross-platform apply
+    needs a staging step we don't handle yet — see issue #87).
+    """
+    import threading
+
+    def _worker():
+        try:
+            from ._jobs import run_on_main
+            from ._update import check_for_update
+            from ._update_apply import handle_choice
+            from ._update_popup import show_update_popup
+
+            info = check_for_update(config)
+            if info is None:
+                return
+
+            logger.info(
+                "biopb update available: %s -> %s", info.current, info.latest
+            )
+
+            def _on_choice(action):
+                handle_choice(action, info, config)
+
+            # Returns as soon as the box is shown (non-blocking); button clicks
+            # are handled later on the main thread via the popup's signals.
+            run_on_main(show_update_popup, info, _on_choice, viewer)
+        except Exception:
+            logger.debug("update check failed (fail-open)", exc_info=True)
+
+    threading.Thread(
+        target=_worker, name="biopb-update-check", daemon=True
+    ).start()
+
+
 def bootstrap():
     """Entry point called from the kernel's exec_lines."""
     try:
@@ -379,6 +425,12 @@ def _bootstrap_impl():
         # Tear the kernel down to idle when the user closes the window: signal
         # the launcher's reader thread over the inherited window-close pipe.
         _install_window_close_hook(viewer)
+
+        # Kernel-start update reminder (issue #87): once a window exists, check
+        # in the background whether a newer release-v* deployment is available
+        # and, if so, remind the user to run the upgrade script. GUI branch only;
+        # never blocks window paint.
+        _start_update_check(viewer, config)
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
