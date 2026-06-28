@@ -248,6 +248,46 @@ def _ome_scene_ids(ome_xml: Optional[str], n_series: int) -> List[str]:
     return [f"Image:{i}" for i in range(n_series)]
 
 
+# Per-plane OME elements: one <Plane> (timing/stage position) and one <TiffData>
+# (IFD->plane map) per plane. These are the O(plane-count) bulk of a big MMStack's
+# OME-XML and the sole reason ome-types parsing blows up (40k planes -> ~90 s).
+# They carry no catalog-relevant *source* metadata (pixel sizes, channels, dims,
+# acquisition annotations all live on Image/Pixels/Channel/StructuredAnnotations),
+# so the fast metadata path strips them and parses the tiny remainder. Matches a
+# self-closing element or an open/close pair (TiffData may wrap a <UUID>); DOTALL
+# so the close form spans lines. Non-greedy so each element is removed individually.
+_STRIP_PER_PLANE = re.compile(
+    r"<(?:\w+:)?(?:Plane|TiffData)\b.*?(?:/>|</(?:\w+:)?(?:Plane|TiffData)>)",
+    re.DOTALL,
+)
+
+
+def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
+    """Build the OME metadata dict cheaply by stripping per-plane elements first.
+
+    Parses the *reduced* OME-XML (per-plane ``<Plane>``/``<TiffData>`` removed)
+    with the real ome-types parser, so the result is structurally identical to
+    ``ome_metadata.model_dump(mode="json")`` EXCEPT that ``planes`` and
+    ``tiff_data_blocks`` come back empty -- the deliberate accuracy trade for
+    making registration O(structure) instead of O(plane-count) (biopb/biopb#168).
+    Returns ``None`` on any failure so the caller falls back to the authoritative
+    aicsimageio metadata.
+    """
+    try:
+        from ome_types import from_xml
+
+        reduced = _STRIP_PER_PLANE.sub("", ome_xml)
+        ome = from_xml(reduced)
+        if hasattr(ome, "model_dump"):
+            return ome.model_dump(mode="json")
+        if hasattr(ome, "dict"):
+            return ome.dict(by_alias=False, exclude_none=False)
+        return None
+    except Exception:
+        logger.debug("fast OME metadata parse failed", exc_info=True)
+        return None
+
+
 # Generic raster/video formats that aicsimageio/bioformats technically read but
 # are almost never microscopy *tensor* sources in practice (screenshots, icons,
 # UI assets, thumbnails, movies). Claiming these during recursive directory
@@ -577,6 +617,13 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         self._persistent_attempted = False
         self._persistent_last_access = 0.0
 
+        # Cache of the embedded OME-XML string (biopb/biopb#168), shared by the
+        # tifffile descriptor and metadata fast paths so registration opens the
+        # file once. ``_raw_ome_xml_probed`` distinguishes "not looked yet" from
+        # a probed-but-absent (None) result.
+        self._raw_ome_xml = None
+        self._raw_ome_xml_probed = False
+
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from aicsimageio dask array.
 
@@ -748,6 +795,34 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
 
+    def _local_ome_xml(self) -> Optional[str]:
+        """Return the embedded OME-XML string for a local source, or None.
+
+        Cached on the instance (and populated as a side effect of the descriptor
+        fast path) so registration opens the file at most once across the
+        descriptor and metadata fast paths. Returns None for remote, non-TIFF, or
+        non-OME sources.
+        """
+        if self._raw_ome_xml_probed:
+            return self._raw_ome_xml
+        self._raw_ome_xml_probed = True
+        self._raw_ome_xml = None
+
+        url = self._source_url or ""
+        if "://" in url and not url.startswith("file://"):
+            return None
+        path = url[len("file://") :] if url.startswith("file://") else url
+        if not path:
+            return None
+        try:
+            import tifffile
+
+            with tifffile.TiffFile(path) as tiff:
+                self._raw_ome_xml = tiff.ome_metadata or None
+        except Exception:
+            self._raw_ome_xml = None
+        return self._raw_ome_xml
+
     def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:
         """Build per-scene descriptors straight from tifffile (biopb/biopb#168).
 
@@ -780,6 +855,9 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 # its dim canonicalization is less predictable, so leave it to
                 # aicsimageio.
                 ome_xml = tiff.ome_metadata
+                # Cache for the metadata fast path so it does not reopen the file.
+                self._raw_ome_xml = ome_xml or None
+                self._raw_ome_xml_probed = True
                 if not ome_xml:
                     return None
                 series = tiff.series
@@ -963,14 +1041,26 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         return adapter
 
     def get_metadata(self) -> dict:
-        """Return OME metadata from the aicsimageio file.
+        """Return OME metadata as a dict (model_dump of the OME-XML).
 
-        Uses aicsimageio's ome_metadata property which provides OME-XML
-        converted metadata.
+        Fast path (biopb/biopb#168): for a local OME-TIFF, parse the OME-XML with
+        the per-plane ``<Plane>``/``<TiffData>`` elements stripped, which yields
+        the same ome-types structure MINUS the per-plane arrays at a fraction of
+        the cost (the per-plane bulk is what makes a big MMStack's parse ~90 s).
+        This runs at registration (the metadata-DB sync calls get_metadata), so
+        keeping it cheap is what actually moves the OME parse off startup. Any
+        non-OME-TIFF source, or any failure, falls back to the authoritative
+        aicsimageio ``ome_metadata`` below.
 
         Returns:
             OME metadata as dict, or empty dict if unavailable.
         """
+        ome_xml = self._local_ome_xml()
+        if ome_xml:
+            fast = _fast_ome_metadata(ome_xml)
+            if fast is not None:
+                return fast
+
         try:
             ome_meta = self._aics_image.ome_metadata
             if ome_meta is None:

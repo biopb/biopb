@@ -16,7 +16,9 @@ These tests lock the two things that make that safe:
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.aicsimageio import (
+    _STRIP_PER_PLANE,
     AicsImageIoAdapter,
+    _fast_ome_metadata,
     _ome_scene_ids,
     _tczyx_shape,
 )
@@ -160,6 +162,104 @@ class TestSceneResolutionAndReads:
             bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 1, 1])
             val = np.asarray(scene.get_data(bounds)).ravel()[0]
             assert val == k * 100 + 1, f"series {k} returned {val}"
+
+
+_OME_WITH_PLANES = (
+    '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+    '<Image ID="Image:0" Name="m"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" '
+    'Type="uint16" SizeX="16" SizeY="16" SizeZ="3" SizeC="2" SizeT="1" '
+    'PhysicalSizeX="0.1" PhysicalSizeXUnit="µm">'
+    '<Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/>'
+    '<Channel ID="Channel:0:1" Name="GFP" SamplesPerPixel="1"/>'
+    '<Plane TheZ="0" TheC="0" TheT="0" DeltaT="0.0"/>'
+    '<TiffData FirstZ="0" FirstC="0" FirstT="0" IFD="0" PlaneCount="1"/>'
+    '<Plane TheZ="1" TheC="0" TheT="0" DeltaT="0.1"/>'
+    '<TiffData FirstZ="1" FirstC="0" FirstT="0" IFD="1">'
+    "<UUID FileName=\"f.tif\">urn:uuid:00000000-0000-0000-0000-000000000001</UUID>"
+    "</TiffData>"
+    "</Pixels></Image></OME>"
+)
+
+
+class TestStripPerPlane:
+    def test_strips_self_closing_and_uuid_tiffdata(self):
+        reduced = _STRIP_PER_PLANE.sub("", _OME_WITH_PLANES)
+        assert "<Plane" not in reduced
+        assert "<TiffData" not in reduced
+        # Structural elements survive untouched.
+        assert "<Channel" in reduced and "PhysicalSizeX" in reduced
+
+    def test_keeps_xml_when_no_per_plane_elements(self):
+        xml = '<OME><Image ID="Image:0"/></OME>'
+        assert _STRIP_PER_PLANE.sub("", xml) == xml
+
+
+class TestFastMetadata:
+    def test_drops_planes_keeps_structure(self):
+        md = _fast_ome_metadata(_OME_WITH_PLANES)
+        assert md is not None
+        px = md["images"][0]["pixels"]
+        # Per-plane arrays dropped (the accuracy trade); structure preserved.
+        assert px["planes"] == []
+        assert px["tiff_data_blocks"] == []
+        assert px["size_z"] == 3
+        assert px["physical_size_x"] == 0.1
+        assert [c["name"] for c in px["channels"]] == ["DAPI", "GFP"]
+
+    def test_parity_with_full_parse_except_planes(self):
+        # The fast dict must equal the full ome-types model_dump with only the
+        # per-plane arrays zeroed out.
+        from ome_types import from_xml
+
+        full = from_xml(_OME_WITH_PLANES).model_dump(mode="json")
+        fast = _fast_ome_metadata(_OME_WITH_PLANES)
+
+        def _zero_planes(md):
+            for im in md.get("images", []):
+                im["pixels"]["planes"] = []
+                im["pixels"]["tiff_data_blocks"] = []
+            return md
+
+        assert _zero_planes(full) == fast
+
+    def test_malformed_returns_none(self):
+        assert _fast_ome_metadata("<OME><not valid") is None
+
+    def test_get_metadata_does_not_parse_aicsimageio(self, tmp_path):
+        # get_metadata runs at registration (metadata-DB sync); it must build the
+        # dict from the stripped OME-XML without touching AICSImage.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        adapter = AicsImageIoAdapter.create_from_url(path, "md")
+
+        hits = []
+
+        class Recorder:
+            @property
+            def ome_metadata(self):
+                hits.append("ome_metadata")
+                return None
+
+            def __getattr__(self, n):
+                hits.append(n)
+                return None
+
+        adapter._aics_image = Recorder()
+        md = adapter.get_metadata()
+
+        assert hits == [], f"AICSImage accessed in get_metadata: {hits}"
+        assert "images" in md and md["images"][0]["pixels"]["planes"] == []
+
+    def test_raw_ome_xml_cached_across_descriptor_and_metadata(self, tmp_path):
+        # The descriptor fast path populates the OME-XML cache so get_metadata
+        # does not reopen the file.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+        adapter = AicsImageIoAdapter.create_from_url(path, "cache")
+        assert adapter._raw_ome_xml_probed is False
+
+        adapter.list_tensor_descriptors()  # descriptor fast path
+        assert adapter._raw_ome_xml_probed is True
+        assert adapter._raw_ome_xml  # the embedded OME-XML string
+        assert adapter._local_ome_xml() == adapter._raw_ome_xml
 
 
 class TestFallback:
