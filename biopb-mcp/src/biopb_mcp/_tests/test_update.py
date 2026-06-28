@@ -132,9 +132,7 @@ class TestCheckForUpdate:
         """Make _http_json return a fixed releases payload (no network)."""
 
         def _install(payload):
-            monkeypatch.setattr(
-                _update, "_http_json", lambda url, timeout: payload
-            )
+            monkeypatch.setattr(_update, "_http_json", lambda url, timeout: payload)
 
         return _install
 

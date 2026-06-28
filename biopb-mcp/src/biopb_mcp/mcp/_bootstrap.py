@@ -279,9 +279,7 @@ def _start_update_check(viewer, config):
             if info is None:
                 return
 
-            logger.info(
-                "biopb update available: %s -> %s", info.current, info.latest
-            )
+            logger.info("biopb update available: %s -> %s", info.current, info.latest)
 
             def _on_choice(action):
                 handle_choice(action, info, config)
@@ -292,9 +290,7 @@ def _start_update_check(viewer, config):
         except Exception:
             logger.debug("update check failed (fail-open)", exc_info=True)
 
-    threading.Thread(
-        target=_worker, name="biopb-update-check", daemon=True
-    ).start()
+    threading.Thread(target=_worker, name="biopb-update-check", daemon=True).start()
 
 
 def bootstrap():

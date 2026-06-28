@@ -92,7 +92,7 @@ def is_dev_version(version: str) -> bool:
 
 def tag_to_version(tag: str, prefix: str = RELEASE_TAG_PREFIX) -> str:
     """``release-v0.6.6`` -> ``0.6.6``; leave a non-matching tag untouched."""
-    return tag[len(prefix):] if tag.startswith(prefix) else tag
+    return tag[len(prefix) :] if tag.startswith(prefix) else tag
 
 
 def select_latest(releases, *, prefix=RELEASE_TAG_PREFIX, allow_prerelease=False):
@@ -151,7 +151,9 @@ def _running_library_version() -> str:
         return ""
 
 
-def check_for_update(config: dict, *, installed: str | None = None) -> UpdateInfo | None:
+def check_for_update(
+    config: dict, *, installed: str | None = None
+) -> UpdateInfo | None:
     """Return an :class:`UpdateInfo` if a newer deployment is available, else
     ``None``. Never raises — every failure mode yields ``None`` (debug-logged).
 
