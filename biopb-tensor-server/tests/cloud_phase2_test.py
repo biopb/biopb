@@ -504,9 +504,7 @@ class TestShouldWarm:
         self._register(mgr, claim)
         assert mgr.should_warm("s1") is True
 
-    def test_rehydrated_cloud_source_skipped(
-        self, tmp_path, force_nonresident
-    ):
+    def test_rehydrated_cloud_source_skipped(self, tmp_path, force_nonresident):
         # Registered as a normal adapter while resident, then OneDrive evicted the
         # bytes: should_warm now returns False so the warm read never recalls them.
         mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
