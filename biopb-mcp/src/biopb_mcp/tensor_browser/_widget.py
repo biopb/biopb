@@ -992,10 +992,7 @@ class TensorBrowserWidget(QWidget):
                 ):
                     target_tensor = item
             elif node_type == "source":
-                if (
-                    item.data(0, Qt.ItemDataRole.UserRole)
-                    == self._selected_source_id
-                ):
+                if item.data(0, Qt.ItemDataRole.UserRole) == self._selected_source_id:
                     target_source = item
             for i in range(item.childCount()):
                 find_recursive(item.child(i))
