@@ -797,7 +797,6 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
 
         with self._io_lock:
             ndim = len(self.full_shape)
-            original_ndim = len(slices)
 
             # Extract spatial slices (last 2 axes)
             y_slice = slices[-2] if len(slices) >= 2 else slice(None)

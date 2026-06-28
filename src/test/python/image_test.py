@@ -132,7 +132,6 @@ def test_endianness_conflict_warning():
     # Create a Pixels message with conflicting endianness
     # dtype has '<' (little-endian) but BinData says BIG
     img = np.array([[1, 2], [3, 4]], dtype=np.uint8)
-    pixels = _serialize_from_numpy(img)
 
     # Manually override to create conflict
     # We'll create a Pixels with dtype '<u1' but endianness BIG

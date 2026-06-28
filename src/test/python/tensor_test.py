@@ -646,7 +646,7 @@ class TestQuerySourcesFormat:
         # to a float NaN under Arrow->pandas, and NaN is *truthy* -- so the
         # obvious `if row.metadata_json:` guard passes and json.loads() then
         # blows up on a float. We normalize string-column nulls to None.
-        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pandas")
         import pyarrow as pa
 
         t = pa.table(
@@ -667,7 +667,7 @@ class TestQuerySourcesFormat:
     def test_pandas_numeric_nan_is_untouched(self):
         # The fix targets string columns by Arrow schema, so a genuine NaN in a
         # real float column must survive (we only normalize text nulls).
-        pd = pytest.importorskip("pandas")
+        pytest.importorskip("pandas")
         import math
 
         import pyarrow as pa

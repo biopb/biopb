@@ -220,11 +220,6 @@ class SourceConfig:
             return None
         return Path(self.url).resolve()
 
-    @property
-    def is_remote(self) -> bool:
-        """Check if this source is a remote URL."""
-        return _is_remote_url(self.url)
-
 
 @dataclass
 class CacheConfig:

@@ -158,7 +158,7 @@ def main():
             )
             return r.read_all()
 
-        tbl = do_get_readall()
+        do_get_readall()  # warm-up before timing
 
         def materialize():
             t = do_get_readall()

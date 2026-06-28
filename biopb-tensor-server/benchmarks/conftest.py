@@ -472,7 +472,6 @@ def _generate_and_get_path(spec: Dict, cache_dir: str) -> str:
     """Generate synthetic data and return path."""
     generator = spec.get("generator")
     params = spec.get("params", {})
-    source_id = spec["id"]
 
     if generator == "generate_synthetic_zarr":
         shape = tuple(params.get("shape", [512, 512]))

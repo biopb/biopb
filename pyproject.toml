@@ -138,11 +138,9 @@ ignore = [
     # autofix), NOT a verdict that they're noise. F401 and F821 (the rule that
     # caught the http_server NameError) stay ENFORCED. Tracked follow-ups to fix
     # the findings and re-enable the rest:
-    #   #162 — correctness/likely-bugs: F841, F811, B023
     #   #163 — flake8-bugbear:          B905, B007, B008, B017, B018, B028, B011
     #   #164 — style/simplify:          SIM*, C4*, A002, G201, PIE810, E712, E722
-    "F841", "F811",
-    "B905", "B007", "B008", "B023", "B028", "B018", "B017", "B011",
+    "B905", "B007", "B008", "B028", "B018", "B017", "B011",
     "A002", "G201", "PIE810",
     "SIM102", "SIM108", "SIM113", "SIM115", "SIM118", "SIM210",
     "C401", "C408", "C416",
