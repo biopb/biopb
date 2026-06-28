@@ -261,12 +261,15 @@ class TestHandleChoice:
 
 
 class TestUpgradeCommand:
+    # Patch the _is_windows seam rather than the global os.name: setting
+    # os.name="nt" on a POSIX runner makes pathlib pick WindowsPath, which raises
+    # on Python < 3.12 and crashes pytest's own location reporting mid-test.
     def test_posix_uses_curl_pipe_bash(self, monkeypatch):
-        monkeypatch.setattr(_update_apply.os, "name", "posix")
+        monkeypatch.setattr(_update_apply, "_is_windows", lambda: False)
         cmd = _update_apply.upgrade_command()
         assert cmd.startswith("curl ") and "install.sh" in cmd
 
     def test_windows_uses_irm_iex(self, monkeypatch):
-        monkeypatch.setattr(_update_apply.os, "name", "nt")
+        monkeypatch.setattr(_update_apply, "_is_windows", lambda: True)
         cmd = _update_apply.upgrade_command()
         assert "irm " in cmd and "install.ps1" in cmd

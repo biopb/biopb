@@ -24,9 +24,21 @@ _INSTALL_SH = "curl -fsSL https://biopb.org/install.sh | bash"
 _INSTALL_PS1 = "irm https://biopb.org/install.ps1 | iex"
 
 
+def _is_windows() -> bool:
+    """Whether the running platform is Windows.
+
+    A seam so tests can select the platform without mutating the global
+    ``os.name`` — patching that corrupts ``pathlib`` on Python < 3.12 (it picks
+    ``WindowsPath``/``PosixPath`` off ``os.name``, and instantiating the
+    non-native one raises ``NotImplementedError``), which crashes pytest's own
+    location reporting mid-test.
+    """
+    return os.name == "nt"
+
+
 def upgrade_command() -> str:
     """The platform-appropriate install/upgrade command to show the user."""
-    return _INSTALL_PS1 if os.name == "nt" else _INSTALL_SH
+    return _INSTALL_PS1 if _is_windows() else _INSTALL_SH
 
 
 def handle_choice(action: str, info, config: dict) -> None:
