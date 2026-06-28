@@ -276,6 +276,44 @@ class TestWarming:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
+    def test_should_warm_gate_skips_non_resident_source(self, tmp_path):
+        # #174: a should_warm callback returning False (source re-dehydrated under
+        # a cloud root) must short-circuit before any chunk is read, so OneDrive
+        # is never asked to recall the bytes.
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            server = self._make_server_with_zarr(tmp_path, (8192, 8192))
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            worker.should_warm = lambda source_id: False
+
+            # Pin the ordering contract of #174: the gate must fire *before* any
+            # adapter access, so a denied warm never touches the source at all.
+            # A spy on _get_source_adapter (and the cache stats) catches a future
+            # re-ordering of the gate below adapter/list/compute.
+            adapter_calls = []
+            real_get = server._get_source_adapter
+            server._get_source_adapter = lambda sid: (
+                adapter_calls.append(sid) or real_get(sid)
+            )
+
+            worker._process_source("warm-src")
+
+            assert adapter_calls == []  # gate fired before any adapter access
+            # ... and consequently nothing was computed/cached.
+            stats = CacheManager.get_instance().stats()
+            assert stats.misses == 0
+            assert stats.total_entries == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
     def test_memory_backend_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
