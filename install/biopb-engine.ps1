@@ -269,7 +269,7 @@ function Get-CloudRoots {
         $acctKey = 'HKCU:\Software\Microsoft\OneDrive\Accounts'
         if (Test-Path -LiteralPath $acctKey) {
             foreach ($sub in Get-ChildItem -LiteralPath $acctKey -ErrorAction SilentlyContinue) {
-                $uf = (Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).UserFolder
+                $uf = @((Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).UserFolder)[0]
                 if ($uf) { $raw += [string]$uf }
             }
         }
