@@ -448,6 +448,74 @@ def create_multi_series_ome_tiff(
     return str(tiff_path), series_names, series_info
 
 
+def create_multifile_embedded_ome_tiff(
+    tmpdir: str,
+    n_files: int = 3,
+    plane_shape: Tuple[int, int] = (16, 16),
+    dtype: np.dtype = np.uint16,
+) -> Tuple[str, List[str], Tuple[int, int, int, int, int]]:
+    """Create a *multi-file* OME-TIFF with embedded OME-XML.
+
+    Unlike ``create_multifile_ome_dataset`` (companion ``_metadata.txt`` form),
+    this writes the real embedded-OME-XML multi-file layout that
+    ``OmeTiffAdapter`` claims: a primary ``.ome.tif`` whose OME-XML declares the
+    full shape via ``Size*`` and maps each plane to a sibling file via
+    ``<TiffData><UUID FileName="sibling.ome.tif">...</UUID></TiffData>``. The
+    siblings carry a ``BinaryOnly`` stub pointing back at the master.
+
+    Each of ``n_files`` files holds a single channel plane, so the *master* file
+    locally has one IFD while the OME-declared ``SizeC`` is ``n_files`` -- which
+    is exactly the case where a descriptor must come from the OME ``Size*``
+    (spanning siblings), not the local IFD count.
+
+    ``metadata=None`` on write is load-bearing: it stops tifffile stamping its own
+    "shaped" series metadata, which would otherwise mask OME series assembly.
+
+    Returns:
+        Tuple of (master_path, file_names, full_shape_tczyx).
+    """
+    import uuid as _uuid
+
+    import tifffile
+
+    h, w = plane_shape
+    uuids = [f"urn:uuid:{_uuid.UUID(int=i + 1)}" for i in range(n_files)]
+    names = [f"mfembed_{i}.ome.tif" for i in range(n_files)]
+
+    tiff_data = "".join(
+        f'<TiffData FirstC="{c}" FirstZ="0" FirstT="0" IFD="0" PlaneCount="1">'
+        f'<UUID FileName="{names[c]}">{uuids[c]}</UUID></TiffData>'
+        for c in range(n_files)
+    )
+    channels = "".join(
+        f'<Channel ID="Channel:0:{c}" SamplesPerPixel="1"/>' for c in range(n_files)
+    )
+    master_xml = (
+        '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
+        f'UUID="{uuids[0]}"><Image ID="Image:0" Name="mfembed">'
+        '<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16" '
+        f'SizeX="{w}" SizeY="{h}" SizeZ="1" SizeC="{n_files}" SizeT="1">'
+        f"{channels}{tiff_data}</Pixels></Image></OME>"
+    )
+
+    for c, name in enumerate(names):
+        if c == 0:
+            xml = master_xml
+        else:
+            xml = (
+                '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
+                f'UUID="{uuids[c]}"><BinaryOnly UUID="{uuids[0]}" '
+                f'MetadataFile="{names[0]}"/></OME>'
+            )
+        # Each file: one channel plane filled with c + 1 (distinguishable).
+        data = np.full((h, w), c + 1, dtype=dtype)
+        with tifffile.TiffWriter(str(Path(tmpdir) / name)) as writer:
+            writer.write(data, description=xml, metadata=None)
+
+    full_shape = (1, n_files, 1, h, w)  # canonical TCZYX
+    return str(Path(tmpdir) / names[0]), names, full_shape
+
+
 def create_companion_ome_dataset(
     tmpdir: str,
     n_files: int = 3,

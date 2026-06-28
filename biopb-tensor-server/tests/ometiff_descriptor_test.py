@@ -1,0 +1,302 @@
+"""Tests for the tifffile-direct OME-TIFF descriptor fast path (biopb/biopb#168).
+
+Registering a large OME-TIFF used to materialize the AICSImage OME model just to
+learn shape/dims/dtype/scenes for the catalog row -- the ~97 s/dataset that
+dominated server startup. The fast path derives the same descriptor straight
+from tifffile (~6 s) and defers the AICSImage parse to the first read.
+
+These tests lock the two things that make that safe:
+1. Parity -- the tifffile descriptor is byte-identical to the aicsimageio one
+   (shape/dims/dtype AND the scene ids that form the catalog array_ids).
+2. The AICSImage OME parse is genuinely gone from the registration path, while
+   reads still resolve the right scene (via the cached descriptor order ->
+   set_scene(int)).
+"""
+
+import numpy as np
+import pytest
+from biopb_tensor_server.adapters.aicsimageio import (
+    _STRIP_PER_PLANE,
+    AicsImageIoAdapter,
+    _fast_ome_metadata,
+    _ome_scene_ids,
+    _tczyx_shape,
+)
+from biopb_tensor_server.fixtures import (
+    create_multi_series_ome_tiff,
+    create_multifile_embedded_ome_tiff,
+    create_tiled_ome_tiff,
+)
+
+
+class TestTczyxShape:
+    @pytest.mark.parametrize(
+        "shape,axes,expected",
+        [
+            ((2, 3, 16, 16), "CZYX", [1, 2, 3, 16, 16]),
+            ((5, 16, 16), "ZYX", [1, 1, 5, 16, 16]),
+            ((16, 16), "YX", [1, 1, 1, 16, 16]),
+            ((4, 2, 3, 16, 16), "TCZYX", [4, 2, 3, 16, 16]),
+            ((3, 16, 16), "CYX", [1, 3, 1, 16, 16]),
+        ],
+    )
+    def test_canonical_axes_map_to_tczyx(self, shape, axes, expected):
+        assert _tczyx_shape(shape, axes) == expected
+
+    @pytest.mark.parametrize(
+        "shape,axes",
+        [
+            ((16, 16, 3), "YXS"),  # RGB samples -> aicsimageio folds specially
+            ((4, 16, 16), "QYX"),  # unknown axis
+            ((2, 16, 16), "CZYX"),  # axes/shape length mismatch
+            ((16, 16), ""),  # no axes
+        ],
+    )
+    def test_non_canonical_axes_signal_fallback(self, shape, axes):
+        assert _tczyx_shape(shape, axes) is None
+
+
+class TestOmeSceneIds:
+    def test_extracts_image_ids_in_order(self):
+        xml = '<OME><Image ID="Image:0"/><Image ID="Image:1"/></OME>'
+        assert _ome_scene_ids(xml, 2) == ["Image:0", "Image:1"]
+
+    def test_handles_name_before_id_and_namespace(self):
+        xml = '<ome:Image Name="f" ID="Image:7"></ome:Image>'
+        assert _ome_scene_ids(xml, 1) == ["Image:7"]
+
+    def test_count_mismatch_falls_back_to_positional(self):
+        # Only one ID parsed but tifffile reports two series -> positional.
+        xml = '<OME><Image ID="Image:0"/></OME>'
+        assert _ome_scene_ids(xml, 2) == ["Image:0", "Image:1"]
+
+    def test_no_xml_falls_back_to_positional(self):
+        assert _ome_scene_ids(None, 3) == ["Image:0", "Image:1", "Image:2"]
+
+
+class _Tripwire:
+    """Stand-in for AICSImage that fails on ANY attribute access.
+
+    Installed in place of ``adapter._aics_image`` to prove the registration
+    (descriptor) path never touches aicsimageio -- the whole point of the fix.
+    """
+
+    def __getattr__(self, name):
+        raise AssertionError(f"AICSImage accessed during registration: .{name}")
+
+
+class TestFastPathParity:
+    def _aics_truth(self, path):
+        """The descriptor aicsimageio would produce: (scene_id, shape, dtype)."""
+        from aicsimageio import AICSImage
+
+        img = AICSImage(path)
+        out = []
+        for i, scene in enumerate(img.scenes):
+            img.set_scene(i)
+            out.append((scene, list(img.shape), img.dask_data.dtype.str))
+        return out
+
+    def _fast(self, adapter):
+        descs = adapter._tifffile_descriptors()
+        assert descs is not None, "fast path should apply to this OME-TIFF"
+        return [(d.array_id.split("/", 1)[1], list(d.shape), d.dtype) for d in descs]
+
+    def test_single_series_parity(self, tmp_path):
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        adapter = AicsImageIoAdapter.create_from_url(path, "single")
+        assert self._fast(adapter) == self._aics_truth(path)
+
+    def test_multi_series_parity(self, tmp_path):
+        path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
+        adapter = AicsImageIoAdapter.create_from_url(path, "multi")
+        assert self._fast(adapter) == self._aics_truth(path)
+
+    def test_multifile_embedded_ome_parity(self, tmp_path):
+        # Multi-file OME-TIFF: the master's local IFD count (1) is LESS than the
+        # OME-declared SizeC (3) -- the shape must come from the OME Size* across
+        # sibling files, not the local file. tifffile assembles the siblings into
+        # one OME series, so the fast path's shape must still match aicsimageio.
+        path, names, full_shape = create_multifile_embedded_ome_tiff(
+            str(tmp_path), n_files=3
+        )
+        adapter = AicsImageIoAdapter.create_from_url(path, "mfembed")
+
+        fast = self._fast(adapter)
+        assert fast == self._aics_truth(path)
+        # Guard the specific invariant the reviewer flagged: full SizeC, not 1.
+        assert fast[0][1] == list(full_shape)  # (1, 3, 1, h, w)
+        assert len(names) == 3
+
+    def test_list_descriptors_does_not_parse_aicsimageio(self, tmp_path):
+        # The registration path must build the catalog row without ever touching
+        # AICSImage (the ome-types parse is the startup cost being removed).
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+        adapter = AicsImageIoAdapter.create_from_url(path, "noparse")
+        adapter._aics_image = _Tripwire()
+
+        descriptors = adapter.list_tensor_descriptors()
+
+        assert len(descriptors) == 1
+        assert descriptors[0].array_id == "noparse/Image:0"
+        assert list(descriptors[0].shape) == [1, 2, 1, 32, 32]
+        assert list(descriptors[0].dim_labels) == list("TCZYX")
+        # Cached, and still served from cache without parsing.
+        assert adapter._cached_descriptors is descriptors
+        assert adapter.list_tensor_descriptors() is descriptors
+
+
+class TestSceneResolutionAndReads:
+    def test_scene_index_resolves_from_cache(self, tmp_path):
+        path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
+        adapter = AicsImageIoAdapter.create_from_url(path, "idx")
+        descriptors = adapter.list_tensor_descriptors()
+        fields = [d.array_id.split("/", 1)[1] for d in descriptors]
+
+        for i, field in enumerate(fields):
+            assert adapter._scene_index_for_field(field) == i
+        with pytest.raises(ValueError):
+            adapter._scene_index_for_field("Image:999")
+
+    def test_reads_select_correct_series_after_fast_path(self, tmp_path):
+        # The cached descriptor order must map to the right AICSImage scene at
+        # read time (cache index -> set_scene(int)). The fixture writes each
+        # series filled with series_idx*100 + plane + 1, so series k plane 0 == k*100+1.
+        path, _, _ = create_multi_series_ome_tiff(
+            str(tmp_path), n_series=3, series_shape=(2, 32, 32)
+        )
+        adapter = AicsImageIoAdapter.create_from_url(path, "reads")
+        descriptors = adapter.list_tensor_descriptors()
+
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        for k, desc in enumerate(descriptors):
+            field = desc.array_id.split("/", 1)[1]
+            scene = adapter.get_tensor_adapter(field)
+            # shape is TCZYX = (1, 2, 1, 32, 32); read the (0,0,0,0,0) corner.
+            bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 1, 1, 1])
+            val = np.asarray(scene.get_data(bounds)).ravel()[0]
+            assert val == k * 100 + 1, f"series {k} returned {val}"
+
+
+_OME_WITH_PLANES = (
+    '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+    '<Image ID="Image:0" Name="m"><Pixels ID="Pixels:0" DimensionOrder="XYZCT" '
+    'Type="uint16" SizeX="16" SizeY="16" SizeZ="3" SizeC="2" SizeT="1" '
+    'PhysicalSizeX="0.1" PhysicalSizeXUnit="µm">'
+    '<Channel ID="Channel:0:0" Name="DAPI" SamplesPerPixel="1"/>'
+    '<Channel ID="Channel:0:1" Name="GFP" SamplesPerPixel="1"/>'
+    '<Plane TheZ="0" TheC="0" TheT="0" DeltaT="0.0"/>'
+    '<TiffData FirstZ="0" FirstC="0" FirstT="0" IFD="0" PlaneCount="1"/>'
+    '<Plane TheZ="1" TheC="0" TheT="0" DeltaT="0.1"/>'
+    '<TiffData FirstZ="1" FirstC="0" FirstT="0" IFD="1">'
+    '<UUID FileName="f.tif">urn:uuid:00000000-0000-0000-0000-000000000001</UUID>'
+    "</TiffData>"
+    "</Pixels></Image></OME>"
+)
+
+
+class TestStripPerPlane:
+    def test_strips_self_closing_and_uuid_tiffdata(self):
+        reduced = _STRIP_PER_PLANE.sub("", _OME_WITH_PLANES)
+        assert "<Plane" not in reduced
+        assert "<TiffData" not in reduced
+        # Structural elements survive untouched.
+        assert "<Channel" in reduced and "PhysicalSizeX" in reduced
+
+    def test_keeps_xml_when_no_per_plane_elements(self):
+        xml = '<OME><Image ID="Image:0"/></OME>'
+        assert _STRIP_PER_PLANE.sub("", xml) == xml
+
+
+class TestFastMetadata:
+    def test_drops_planes_keeps_structure(self):
+        md = _fast_ome_metadata(_OME_WITH_PLANES)
+        assert md is not None
+        px = md["images"][0]["pixels"]
+        # Per-plane arrays dropped (the accuracy trade); structure preserved.
+        assert px["planes"] == []
+        assert px["tiff_data_blocks"] == []
+        assert px["size_z"] == 3
+        assert px["physical_size_x"] == 0.1
+        assert [c["name"] for c in px["channels"]] == ["DAPI", "GFP"]
+
+    def test_parity_with_full_parse_except_planes(self):
+        # The fast dict must equal the full ome-types model_dump with only the
+        # per-plane arrays zeroed out.
+        from ome_types import from_xml
+
+        full = from_xml(_OME_WITH_PLANES).model_dump(mode="json")
+        fast = _fast_ome_metadata(_OME_WITH_PLANES)
+
+        def _zero_planes(md):
+            for im in md.get("images", []):
+                im["pixels"]["planes"] = []
+                im["pixels"]["tiff_data_blocks"] = []
+            return md
+
+        assert _zero_planes(full) == fast
+
+    def test_malformed_returns_none(self):
+        assert _fast_ome_metadata("<OME><not valid") is None
+
+    def test_get_metadata_does_not_parse_aicsimageio(self, tmp_path):
+        # get_metadata runs at registration (metadata-DB sync); it must build the
+        # dict from the stripped OME-XML without touching AICSImage.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        adapter = AicsImageIoAdapter.create_from_url(path, "md")
+
+        hits = []
+
+        class Recorder:
+            @property
+            def ome_metadata(self):
+                hits.append("ome_metadata")
+                return None
+
+            def __getattr__(self, n):
+                hits.append(n)
+                return None
+
+        adapter._aics_image = Recorder()
+        md = adapter.get_metadata()
+
+        assert hits == [], f"AICSImage accessed in get_metadata: {hits}"
+        assert "images" in md and md["images"][0]["pixels"]["planes"] == []
+
+    def test_raw_ome_xml_cached_across_descriptor_and_metadata(self, tmp_path):
+        # The descriptor fast path populates the OME-XML cache so get_metadata
+        # does not reopen the file.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+        adapter = AicsImageIoAdapter.create_from_url(path, "cache")
+        assert adapter._raw_ome_xml_probed is False
+
+        adapter.list_tensor_descriptors()  # descriptor fast path
+        assert adapter._raw_ome_xml_probed is True
+        assert adapter._raw_ome_xml  # the embedded OME-XML string
+        assert adapter._local_ome_xml() == adapter._raw_ome_xml
+
+
+class TestFallback:
+    def test_remote_url_falls_back(self, tmp_path):
+        # Build on a local file (no S3 round-trip at construction), then point the
+        # source_url at a remote URL to exercise the no-local-handle gate.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+        adapter = AicsImageIoAdapter.create_from_url(path, "remote")
+        adapter._source_url = "s3://bucket/x.ome.tif"
+        assert adapter._tifffile_descriptors() is None
+
+    def test_custom_dim_labels_fall_back(self, tmp_path):
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+        adapter = AicsImageIoAdapter.create_from_url(
+            path, "customdims", dim_labels=["C", "Y", "X"]
+        )
+        assert adapter._tifffile_descriptors() is None
+
+    def test_plain_non_ome_tiff_falls_back(self, tmp_path):
+        import tifffile
+
+        plain = tmp_path / "plain.tif"
+        tifffile.imwrite(str(plain), np.zeros((16, 16), np.uint8))  # no OME-XML
+        adapter = AicsImageIoAdapter.create_from_url(str(plain), "plain")
+        assert adapter._tifffile_descriptors() is None
