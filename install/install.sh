@@ -607,6 +607,61 @@ _release_asset_url() {
         | grep -E "/$1\$" | head -1 || true
 }
 
+# Print the SHA-256 hex digest of file $1, or nothing if no tool is available
+# (Linux ships GNU `sha256sum`; macOS ships `shasum`). The empty result lets the
+# caller skip the integrity check rather than abort on a toolless host.
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# Verify each wheel path in "$@" against the release's SHA256SUMS asset before it
+# is file://-installed. Hard-fails (exits) on a checksum mismatch or a wheel with
+# no entry in a SHA256SUMS that exists. Fails OPEN (warns, returns 0) when the
+# release predates checksums or no sha256 tool is present, so installs of older
+# releases — and toolless hosts — still work. Requires _fetch_latest_release.
+_verify_wheels() {
+    local sums_url sums
+    sums_url=$(_release_asset_url 'SHA256SUMS')
+    if [ -z "$sums_url" ]; then
+        _warn "Release $RELEASE_TAG has no SHA256SUMS; skipping wheel integrity check"
+        return 0
+    fi
+    sums=$(curl -fsSL "$sums_url" 2>/dev/null) || {
+        _warn "Could not fetch SHA256SUMS; skipping wheel integrity check"
+        return 0
+    }
+
+    local f base expected actual
+    for f in "$@"; do
+        base=$(basename "$f")
+        # SHA256SUMS lines are "<hex>  <filename>"; a leading '*' on the name
+        # marks binary mode (Git Bash / Cygwin emit it, GNU/Linux does not), so
+        # strip it before matching the basename.
+        expected=$(printf '%s' "$sums" \
+            | awk -v b="$base" '{f=$2; sub(/^\*/, "", f)} f == b {print $1; exit}')
+        if [ -z "$expected" ]; then
+            _err "No checksum for $base in the release SHA256SUMS"
+            exit 1
+        fi
+        actual=$(_sha256 "$f")
+        if [ -z "$actual" ]; then
+            _warn "No sha256 tool found; skipping integrity check for $base"
+            continue
+        fi
+        if [ "$actual" != "$expected" ]; then
+            _err "Checksum mismatch for $base — refusing to install"
+            _info "  expected $expected"
+            _info "  actual   $actual"
+            exit 1
+        fi
+    done
+    _ok "Wheel checksums verified"
+}
+
 # Print the tail of the server log, indented, for diagnosing a bad startup.
 _tail_log() {
     local log="$1"
@@ -916,15 +971,25 @@ install_biopb() {
     # Pin napari from the release's versions.json attribute so the installed
     # napari is identical to the one this release was built/tested against
     # (closes the last dev/deploy version-skew — and the napari[all] Qt
-    # binding, which is napari-version-dependent). Tolerant: an older release
-    # without the manifest falls back to the unversioned spec.
-    local versions_url napari_pin
+    # binding, which is napari-version-dependent). The same manifest carries the
+    # deployment `release` version, which we record post-install as the
+    # auto-updater's baseline (issue #87). Tolerant: an older release without the
+    # manifest falls back to the unversioned napari spec and a tag-derived
+    # version. RELEASE_VERSION is read here but written only after a clean install.
+    local versions_url versions_json napari_pin
     versions_url=$(_release_asset_url 'versions\.json')
     if [ -n "$versions_url" ]; then
-        napari_pin=$(curl -fsSL "$versions_url" 2>/dev/null \
+        versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
+        napari_pin=$(printf '%s' "$versions_json" \
             | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
+        RELEASE_VERSION=$(printf '%s' "$versions_json" \
+            | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     fi
+    # Fall back to the tag (release-vX.Y.Z -> X.Y.Z) when the manifest is absent
+    # or lacks `release`, so the recorded baseline is always a clean PEP 440
+    # version the update check can compare with packaging.version.
+    RELEASE_VERSION="${RELEASE_VERSION:-${RELEASE_TAG#"${RELEASE_TAG_PREFIX:-release-v}"}}"
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
@@ -935,6 +1000,10 @@ install_biopb() {
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
+    # Verify the downloaded wheels against the release's SHA256SUMS before they
+    # are file://-installed (aborts on a mismatch; fails open on an older release
+    # without the manifest). See the auto-updater trust item in issue #87.
+    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
     # `biopb[tensor]`) to the downloaded set rather than to PyPI.
@@ -986,6 +1055,20 @@ install_biopb() {
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
+
+    # Record the installed deployment version as the kernel-start auto-updater's
+    # baseline (issue #87): the check compares the latest release-v* deployment's
+    # versions.json `release` against this marker. Written only now, after a clean
+    # install, so a half-finished run never advertises a version it isn't on.
+    # Best-effort — a write failure only re-prompts a future update, never the
+    # install. (biopb_mcp.__version__ is a decoupled library version and is
+    # deliberately NOT used for this comparison.)
+    if mkdir -p "$CONFIG_DIR" 2>/dev/null \
+        && printf '%s' "$RELEASE_VERSION" > "$CONFIG_DIR/release.version" 2>/dev/null; then
+        _info "  recorded installed release $RELEASE_VERSION"
+    else
+        _warn "Could not record installed release version (update checks may re-prompt)"
+    fi
 
     # ===== 4. Webapp =====
     _step "[4/7] Installing data browser..."

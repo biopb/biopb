@@ -271,6 +271,17 @@ jobs:
           name: windows-installer
           path: release-wheels
 
+      # One digest file over every attached binary asset. The installers verify
+      # the wheel triple against it before file://-installing (issue #87 trust
+      # item); a future release-signing step would sign this file. Bare basenames
+      # (cd into the dir) so the lines match the names the installer sees on disk.
+      - name: Checksums (SHA256SUMS)
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          cd release-wheels
+          sha256sum *.whl *.tar.gz versions.json biopb-setup-*.exe > SHA256SUMS
+          cat SHA256SUMS
+
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
       # uploaded. Installer scripts come from the repo-root install/ (the
@@ -286,6 +297,7 @@ jobs:
             release-wheels/*.whl
             release-wheels/*.tar.gz
             release-wheels/versions.json
+            release-wheels/SHA256SUMS
             release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
@@ -303,7 +315,10 @@ jobs:
             - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
               version-paired wheel triple (installer `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
-            - `versions.json` — release manifest (pins `napari` for the installer)
+            - `versions.json` — release manifest (pins `napari`; carries the
+              `release` version the installer records as the update baseline)
+            - `SHA256SUMS` — digests of the assets above; the installer verifies
+              the wheel triple against it before installing
             - `install.sh` / `install.ps1` — bootstrap installers
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)
