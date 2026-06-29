@@ -38,6 +38,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Hard backstop against unbounded recursion in the rescan walk. visited_identities
+# breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
+# identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
+# degrades to a path hash that never repeats inside a junction loop -> RecursionError,
+# which the os.scandir `except OSError` does not catch (biopb/biopb#207 review). This
+# cap turns any such loop into a bounded, logged skip. Real microscopy trees are far
+# shallower (rarely past ~10 levels), so this only ever fires on a pathological loop.
+_MAX_WALK_DEPTH = 64
+
 
 @dataclass
 class _FailureTracker:
@@ -418,6 +427,7 @@ class SourceManager:
         is_root: bool = False,
         dir_entry: Optional[os.DirEntry] = None,
         cloud: bool = False,
+        depth: int = 0,
     ) -> None:
         """Capture the current filesystem signature state for one subtree.
 
@@ -446,7 +456,46 @@ class SourceManager:
                 # backfill the identity fields; POSIX DirEntry.stat() already does a
                 # real stat, so this only fires on Windows and the syscall-cut win is
                 # untouched.
-                if stat_result.st_ino == 0:
+                #
+                # ...EXCEPT under a cloud root, where that backfill os.stat() is a
+                # whole-extra network round-trip per entry (the cached DirEntry.stat()
+                # is free, served from the directory enumeration; the inode is the one
+                # field that costs a round-trip on a synced placeholder). On a OneDrive
+                # tree this backfill measured ~59s of startup (biopb/biopb#190,
+                # Finding 1). We skip it under cloud, which is correct ONLY because
+                # every consumer of the zeroed inode has a cloud-safe degradation --
+                # do not break these invariants:
+                #
+                #   1. Signature. `_build_entry_signature(cloud=True)` is *already*
+                #      identity-only `(st_dev, st_ino)` and excludes size/mtime/ctime
+                #      on purpose (hydration bumps those -> destructive flap). With a
+                #      zeroed inode it degrades to a constant `(0, 0)` per entry. That
+                #      is residency-invariant (never flaps on hydrate/evict -- strictly
+                #      safer than today) and it is compared *per path_str*, so distinct
+                #      cloud paths never collide into one another.
+                #   2. Stability gate. A constant `(0, 0)` signature means
+                #      `stable_observations` never advances -- but cloud entries
+                #      *bypass* the stability window entirely (`_should_scan_resolved`
+                #      returns True immediately for a cloud path), so that counter is
+                #      never read under cloud. If that bypass is ever removed, this
+                #      skip becomes incorrect.
+                #   3. Identity / loop-breaking. `get_file_identity` falls back to a
+                #      hash of the *resolved path* when `st_ino == 0` (its FAT32 path),
+                #      so `visited_identities` dedup still distinguishes cloud entries
+                #      without a real inode. BUT for *non-symlink* reparse points
+                #      (Windows junction, bind mount) `(st_dev, st_ino)` is the only
+                #      thing that breaks a directory *cycle* (symlinks are skipped
+                #      separately), and a non-symlink entry is never resolve()d, so a
+                #      junction loop `J -> .` yields an ever-growing path that hashes
+                #      to a new identity each descent -- the cycle is never caught.
+                #      That is no longer just a lost-dedup (rare aliasing); it would
+                #      recurse to RecursionError. The `_MAX_WALK_DEPTH` backstop in
+                #      `_scan_tree_state` bounds such a loop to a logged skip instead
+                #      of crashing the refresh thread (biopb/biopb#207 review).
+                #
+                # NOTE: this is a Windows-only effect; on POSIX DirEntry.stat() returns
+                # a real inode, so neither the backfill nor this skip ever fires there.
+                if stat_result.st_ino == 0 and not cloud:
                     stat_result = os.stat(dir_entry.path)
             else:
                 # Root: _refresh_entry_state hands it in pre-resolved, so it is
@@ -551,6 +600,21 @@ class SourceManager:
             )
             return
 
+        # Depth backstop: if identity dedup ever fails to catch a directory loop
+        # (e.g. a cloud junction whose zeroed inode makes get_file_identity fall back
+        # to an ever-growing path hash, biopb/biopb#207 review), the walk would recurse
+        # to RecursionError -- which the os.scandir `except OSError` below does NOT
+        # catch, so it propagates and kills the refresh thread. Record this entry but
+        # do not descend past the cap, turning any such loop into a bounded skip.
+        if depth >= _MAX_WALK_DEPTH:
+            logger.warning(
+                "Rescan walk hit max depth %d at %s; not descending further "
+                "(possible directory loop)",
+                _MAX_WALK_DEPTH,
+                resolved_path,
+            )
+            return
+
         try:
             # os.scandir yields DirEntry objects carrying d_type and a cached stat,
             # so each child is processed with one stat and no resolve — the per-entry
@@ -571,6 +635,7 @@ class SourceManager:
                         visited_identities,
                         dir_entry=entry,
                         cloud=cloud,
+                        depth=depth + 1,
                     )
         except OSError:
             return
@@ -646,6 +711,12 @@ class SourceManager:
         would flap it). Archived cloud data is stable and cloud mtime is
         untrustworthy anyway, so identity is the right key there. Non-cloud
         entries keep the full mtime/size-sensitive signature.
+
+        Load-bearing for the cloud inode-backfill skip in ``_scan_tree_state``
+        (biopb/biopb#190): because this branch is identity-only, a zeroed cloud
+        inode degrades it to a constant ``(0, 0)`` that is still residency-
+        invariant and per-path. If you add size/mtime back to the cloud
+        signature, you must restore that backfill (and reintroduce the flap).
         """
         if cloud:
             return (stat_result.st_dev, stat_result.st_ino)
@@ -715,6 +786,12 @@ class SourceManager:
         #     filesystems (doc S1.2), so a placeholder could never stabilize.
         # Archived dehydrated data is inherently stable (never mid-write), so admit
         # it immediately. The pending-scan clear side effect is preserved.
+        #
+        # This bypass is also load-bearing for the cloud inode-backfill skip in
+        # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
+        # degrades to a constant (0, 0), so `stable_observations` never advances
+        # -- safe only because this early-return means that counter is never read
+        # for a cloud path. Removing the bypass would make that skip incorrect.
         if self._is_under_cloud_root(resolved_str):
             self._entry_pending_scan[resolved_str] = False
             return True
