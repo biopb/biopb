@@ -374,3 +374,44 @@ class TestFallback:
         tifffile.imwrite(str(plain), np.zeros((16, 16), np.uint8))  # no OME-XML
         adapter = AicsImageIoAdapter.create_from_url(str(plain), "plain")
         assert adapter._tifffile_descriptors() is None
+
+
+class TestOmeParseDedup:
+    """The OME parse is shared across aicsimageio's redundant probes (#192)."""
+
+    def test_get_ome_is_memoized(self):
+        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
+
+        get_ome = OmeTiffReader.__dict__["_get_ome"]
+        assert getattr(get_ome.__func__, "_biopb_dedup", False), (
+            "OmeTiffReader._get_ome should be wrapped by _install_ome_parse_dedup"
+        )
+
+    def test_construction_parses_ome_xml_once_not_three_times(self, tmp_path):
+        # Stock aicsimageio parses the OME-XML 3x per OME-TIFF construction
+        # (determine_reader probe + reader _is_supported probe + stored _ome).
+        # The dedup memo collapses them to a single from_xml.
+        import aicsimageio.readers.ome_tiff_reader as omr
+        from aicsimageio import AICSImage
+        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
+
+        # Drop any shared-cache entry so this fixture's XML is a real miss.
+        OmeTiffReader.__dict__["_get_ome"].__func__.cache_clear()
+
+        calls = {"n": 0}
+        real_from_xml = omr.from_xml
+
+        def counting_from_xml(*args, **kwargs):
+            calls["n"] += 1
+            return real_from_xml(*args, **kwargs)
+
+        omr.from_xml = counting_from_xml
+        try:
+            path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+            img = AICSImage(path)
+            assert type(img.reader).__name__ == "OmeTiffReader"
+            assert len(img.scenes) == 1  # force the model to be fully built
+        finally:
+            omr.from_xml = real_from_xml
+
+        assert calls["n"] == 1, f"expected a single OME parse, got {calls['n']}"
