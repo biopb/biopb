@@ -18,6 +18,7 @@ Key components:
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import logging
 import os
@@ -244,6 +245,7 @@ class ClaimContext:
         is_dir: Optional[bool] = None,
         signature: Optional[Tuple] = None,
         cloud_root: bool = False,
+        child_listing: Optional[List[str]] = None,
     ):
         self._path = Path(path) if store is None else None
         self._store = store
@@ -272,6 +274,19 @@ class ClaimContext:
         # file is already resident. Remote contexts are never "cloud roots" in
         # this sense (they have their own fetch model), so force False there.
         self._cloud_root = cloud_root if store is None else False
+        # The directory's child paths as the state walk recorded them
+        # (snapshot-driven discovery only). When present, ``glob()`` serves
+        # single-level name-pattern matches from this list instead of re-reading
+        # the directory off disk. A directory-claiming adapter globs its candidate
+        # directory up to 6× per rescan cycle (TIFF sequence: ``*.tif``, ``*.tiff``
+        # + 4 metadata patterns), and on cloud storage each glob is a directory
+        # enumeration round-trip (~0.5-1 s/dir on OneDrive Files-On-Demand) — yet
+        # the state walk already enumerated every directory's children once, so the
+        # claim phase can reuse that listing instead of re-hitting the filesystem
+        # (biopb/biopb#65). ``None`` on live-walk and ``join()`` sub-contexts, which
+        # fall back to a real ``glob`` (same discipline as the ``is_dir`` /
+        # ``signature`` caches). Local contexts only.
+        self._child_listing = child_listing if store is None else None
 
     @property
     def cloud_root(self) -> bool:
@@ -335,10 +350,26 @@ class ClaimContext:
         return ClaimContext(self._path / subpath)
 
     def glob(self, pattern: str) -> List[ClaimContext]:
-        """Find files matching pattern."""
+        """Find files matching ``pattern`` in this directory (maxdepth 1).
+
+        When a cached child listing is available (snapshot-driven discovery) and
+        the pattern is a single directory level — which every directory-claiming
+        adapter's claim glob is (``*.tif``, ``metadata.txt``, ``*.companion.ome``,
+        …) — the matches are served by ``fnmatch``ing the cached basenames, with no
+        filesystem read (biopb/biopb#65). ``fnmatch`` mirrors ``Path.glob``'s
+        per-platform case sensitivity (case-sensitive on POSIX, case-insensitive on
+        Windows) via ``os.path.normcase``. Multi-level patterns (containing ``/``
+        or ``**``) and contexts without a cached listing fall back to a real glob.
+        """
         if self._store:
             matches = self._store.find(pattern, maxdepth=1)
             return [ClaimContext(m, self._store) for m in matches]
+        if self._child_listing is not None and "/" not in pattern:
+            return [
+                ClaimContext(Path(child))
+                for child in self._child_listing
+                if fnmatch.fnmatch(os.path.basename(child), pattern)
+            ]
         return [ClaimContext(p) for p in self._path.glob(pattern)]
 
     @property
@@ -970,6 +1001,17 @@ def discover_sources_from_entries(
     if state is None:
         state = DiscoveryState()
 
+    # Group the snapshot into each directory's recorded children once (O(n) by
+    # parent path) so a directory's ClaimContext can serve its claim globs from
+    # memory instead of re-reading the directory — the largest remaining per-cycle
+    # cost in the claim phase, and on cloud storage a per-glob round-trip
+    # (biopb/biopb#65). The state walk emits entries parent-first, so a directory
+    # is processed before its children stream in; build the full map up front.
+    entries = list(entries)
+    children_by_dir: Dict[str, List[str]] = {}
+    for path_str, _is_dir, _signature in entries:
+        children_by_dir.setdefault(os.path.dirname(path_str), []).append(path_str)
+
     skipped = skipped_dirs or set()
     prune_stack: List[str] = []
 
@@ -1008,6 +1050,9 @@ def discover_sources_from_entries(
             cloud_root=cloud_by_path.get(path_str, False)
             if cloud_by_path is not None
             else False,
+            # Only directories glob (every claim glob is maxdepth-1 over a dir's
+            # children); files carry no listing.
+            child_listing=children_by_dir.get(path_str) if is_dir else None,
         )
         claims = registry.get_claims_for_path(ctx, state)
         if claims:

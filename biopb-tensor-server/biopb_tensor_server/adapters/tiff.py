@@ -163,7 +163,10 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             "*.companion.ome",
         ]
         for pattern in metadata_patterns:
-            if list(ctx._path.glob(pattern)):
+            # Route through ctx.glob (not ctx._path.glob) so the snapshot's cached
+            # child listing serves the match without re-reading the directory
+            # (biopb/biopb#65).
+            if ctx.glob(pattern):
                 return None
 
         # Group into a single ordered sequence by the one varying numeric field.
