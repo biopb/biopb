@@ -799,13 +799,14 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setText("")
 
     def _report_failure(self, title: str, message: str):
-        """Modally report a failed *user-initiated* action (resolve/hydrate).
+        """Modally report a failed *user-initiated* action (resolve/hydrate/load).
 
-        These actions are explicit, consenting gestures the user watched through
-        a modal progress dialog, so their failure deserves an acknowledged modal
-        box rather than the easily-missed, transient inline error pane (which is
-        wiped by the next refresh/selection). Background errors (connect,
-        refresh, list) stay on the inline pane -- issue #206.
+        These actions are explicit, consenting gestures the user actively
+        triggered and watched (a modal progress dialog, or a busy cursor during
+        load), so their failure deserves an acknowledged modal box rather than
+        the easily-missed, transient inline error pane (which is wiped by the
+        next refresh/selection). Background errors (connect, refresh, list) stay
+        on the inline pane -- issue #206.
         """
         QMessageBox.critical(self, title, message or "Unknown error")
 
@@ -1558,7 +1559,7 @@ class TensorBrowserWidget(QWidget):
             )
 
         except Exception:
-            self._show_error("Failed to load tensor")
+            self._report_failure("Load failed", "Failed to load tensor")
             logger.exception(
                 "Failed to get tensor %s from %s",
                 self._selected_tensor_id,

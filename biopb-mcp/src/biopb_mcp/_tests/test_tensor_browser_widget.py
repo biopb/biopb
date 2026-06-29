@@ -749,3 +749,34 @@ class TestHydrateAction:
         w._warm_source = MagicMock()
         w._offer_hydrate("m", "m.zarr")
         w._warm_source.assert_not_called()
+
+
+class TestAddToViewer:
+    """`_add_to_viewer` loads the selected tensor behind a busy cursor."""
+
+    def _arm(self, widget):
+        # `_client`/`_sources` are read-only views onto the connection.
+        w, conn, _ = widget
+        conn.client = MagicMock()
+        conn.sources = {"m": _descriptor("m", tensors=["m"], source_type="zarr")}
+        w._selected_source_id = "m"
+        w._selected_tensor_id = "m"
+        w._show_error = MagicMock()
+        w._report_failure = MagicMock()
+        return w
+
+    def test_load_failure_reports_modally(self, widget, monkeypatch):
+        # A failed view/load is user-initiated too, so it reports modally rather
+        # than on the easily-missed inline pane (#206 consistency).
+        from biopb_mcp.tensor_browser import _widget as widget_mod
+
+        w = self._arm(widget)
+        monkeypatch.setattr(
+            widget_mod,
+            "add_tensor_layer",
+            MagicMock(side_effect=RuntimeError("boom")),
+        )
+        w._add_to_viewer()
+        w._report_failure.assert_called_once()
+        assert "Failed to load tensor" in w._report_failure.call_args[0][1]
+        w._show_error.assert_not_called()
