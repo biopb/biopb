@@ -69,6 +69,19 @@ export interface DiagnosticsSnapshot {
   metrics_ready: boolean;
 }
 
+/** The tensor server's `health` action payload, forwarded verbatim by /readyz. */
+export interface BackendHealth {
+  status?: string;
+  source_count?: number;
+  metadata_db_enabled?: boolean;
+  writable?: boolean;
+  uptime_seconds?: number;
+  /** Progressive discovery: whether a full catalog scan is running right now. */
+  full_scan_in_progress?: boolean;
+  /** Epoch seconds of the last successful full scan, or null until the first. */
+  last_full_scan_finished_at?: number | null;
+}
+
 export interface ReadyzSnapshot {
   status: string;
   timestamp: string;
@@ -76,6 +89,10 @@ export interface ReadyzSnapshot {
   dev_mode: boolean;
   service: string;
   version: string;
+  /** source_count from the backend health (0/absent on older servers). */
+  source_count?: number;
+  /** Full backend health dict, including the freshness fields above. */
+  backend_health?: BackendHealth | null;
 }
 
 export interface QuerySourcesResult {

@@ -302,6 +302,7 @@ function TreeRow({
 export function SourceTree() {
   const sources = useAppStore((s) => s.sources);
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
+  const scanning = useAppStore((s) => s.scanning);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
   const selectSource = useAppStore((s) => s.selectSource);
@@ -424,7 +425,11 @@ export function SourceTree() {
             {serverQueryLoading ? "Searching..." : "Loading sources..."}
           </div>
         ) : filteredSources.length === 0 ? (
-          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>No sources</div>
+          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
+            {scanning && sources.length === 0
+              ? "Indexing data folder… (sources will appear as they are found)"
+              : "No sources"}
+          </div>
         ) : displayTree ? (
           displayTree.children.map((child) => (
             <TreeRow

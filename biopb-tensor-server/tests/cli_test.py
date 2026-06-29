@@ -89,3 +89,56 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     cli.serve(config=Path("unused.toml"))
 
     assert not lock_path.exists()
+
+
+def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
+    """A static-only config reaches SERVING and reports a freshness timestamp.
+
+    Progressive discovery: _setup_flight_server no longer blocks on a scan. With
+    no monitored dirs there is nothing to background, so the launcher drives the
+    first-scan-complete path directly -- the server is SERVING, not scanning, and
+    last_full_scan_finished_at is stamped so a client sees an established catalog.
+    """
+    import json
+
+    from biopb_tensor_server.fixtures import create_zarr_array
+    from pyarrow import flight
+
+    zarr_path, _, _ = create_zarr_array(str(tmp_path))
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "memory"},
+                "sources": [
+                    {
+                        "type": "zarr",
+                        "url": zarr_path,
+                        "source_id": "z",
+                        "dim_labels": ["y", "x"],
+                    }
+                ],
+            }
+        )
+    )
+
+    config = cli.load_config(config_path)
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        assert server.is_ready is True
+
+        (raw,) = list(server.do_action(None, flight.Action("health", b"")))
+        health = json.loads(bytes(raw))
+        assert health["status"] == "SERVING"
+        assert health["full_scan_in_progress"] is False
+        assert health["last_full_scan_finished_at"] is not None
+        assert health["source_count"] == 1
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        server.shutdown()

@@ -12,6 +12,7 @@ import os
 import secrets
 import signal
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -430,9 +431,11 @@ def _setup_flight_server(
         metadata_db.initial_sync(server._sources)
 
     # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start() so runtime additions
-    # are captured; the initial scan was committed before start() and is
-    # excluded. The worker itself no-ops on a memory backend.
+    # Wire the commit hook BEFORE source_manager.start(). Under progressive
+    # discovery the startup set is committed by the *background* scan (after
+    # start); the manager gates it out of the prompt enqueue via
+    # _initial_scan_done and seeds it into the backlog through the first-scan
+    # callback below. The worker no-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
         precache_worker = PrecacheWorker(
@@ -445,10 +448,28 @@ def _setup_flight_server(
         # registration.
         precache_worker.should_warm = source_manager.should_warm
 
+    # Seed the precache backlog with the startup catalog the moment the first
+    # full scan establishes it (newest first; warmed when the server is idle).
+    # Wired before start() so the background scan's completion finds it.
+    def _seed_backlog_on_first_scan() -> None:
+        if precache_worker is not None and server_config.precache.backlog_enabled:
+            precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
+
+    source_manager._on_initial_scan_complete = _seed_backlog_on_first_scan
+
+    # Report "a full scan is running" from the first SERVING moment. The
+    # background scan sets this itself on entry, but pre-setting here closes the
+    # brief window between mark_ready() and the event loop picking up the first
+    # rescan, so a client never sees "SERVING, not scanning, never scanned".
+    if monitored_dirs:
+        server.set_full_scan_in_progress(True)
+
+    background_scan_running = False
     if watcher and source_manager:
         try:
             watcher.start(monitored_dirs)
             source_manager.start()
+            background_scan_running = True
             console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
         except Exception as e:
             console.print(f"[red]Failed to start monitoring: {e}[/red]")
@@ -458,16 +479,27 @@ def _setup_flight_server(
     if precache_worker is not None:
         precache_worker.start()
 
-    # Initial scan/registration is complete: flip the health action from
-    # STARTING to SERVING so clients waiting through startup can proceed.
+    # Progressive discovery: reach SERVING immediately. The monitored bootstrap
+    # scan runs in the background; the catalog populates live and the health
+    # action carries its freshness (full_scan_in_progress /
+    # last_full_scan_finished_at). A client needing a complete catalog waits on
+    # those fields, not on SERVING.
     server.mark_ready()
 
-    # Seed the secondary backlog with the local sources discovered at startup,
-    # so they warm (newest first) when the server is otherwise idle. Done after
-    # start()/mark_ready() so the live tier is already wired and the backlog is
-    # exactly the startup set.
-    if precache_worker is not None and server_config.precache.backlog_enabled:
-        precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
+    if not background_scan_running:
+        # No event loop will drive the bootstrap scan. Two cases:
+        #  - monitored dirs but the watcher failed to start: scan synchronously
+        #    now so those sources are still registered (the pre-progressive
+        #    behavior for watcher-less setups); _handle_rescan also stamps
+        #    freshness, flips _initial_scan_done, and seeds the backlog.
+        #  - static-only config (no monitored dirs, nothing to scan): drive the
+        #    completion path directly so it still reports a timestamp and seeds.
+        if monitored_dirs:
+            source_manager._handle_rescan()
+        else:
+            source_manager._initial_scan_done = True
+            server.set_last_full_scan(time.time())
+            _seed_backlog_on_first_scan()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 

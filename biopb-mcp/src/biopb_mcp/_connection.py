@@ -162,6 +162,13 @@ class TensorConnection:
         self.last_status: str = "disconnected"
         self.last_message: str = ""
 
+        # Most recent health dict observed (from the connect probe and the
+        # source-watch poll), cached so a UI can distinguish "catalog still
+        # indexing" from "genuinely empty" without an extra round-trip on its
+        # paint thread. None until the first health probe; may lack the
+        # progressive-discovery freshness fields on an older server.
+        self.last_health: dict | None = None
+
         cfg = config if config is not None else CONFIG.as_dict()
         self.url, self.token = self.resolve_from_config(cfg)
 
@@ -229,6 +236,7 @@ class TensorConnection:
             # which stays the authoritative connectivity test.
             try:
                 health = client.health_check()
+                self.last_health = health if isinstance(health, dict) else None
                 status = (
                     health.get("status", "SERVING")
                     if isinstance(health, dict)
@@ -429,6 +437,7 @@ class TensorConnection:
                 interval = min(interval * 2, max_interval)
                 continue
 
+            self.last_health = health if isinstance(health, dict) else None
             count = health.get("source_count") if isinstance(health, dict) else None
             if count is None:
                 # Server's health carries no source_count (older server) — there
@@ -481,6 +490,27 @@ class TensorConnection:
     def health(self):
         """Return the server health check result, or ``None`` if not connected."""
         return self.client.health_check() if self.client else None
+
+    def scan_in_progress(self) -> bool:
+        """Whether the last-observed health said a full catalog scan is running.
+
+        Reads the cached :attr:`last_health` (no round-trip), so a UI can tell
+        "still indexing" from "genuinely empty" on its paint thread. ``False``
+        when unknown or on an older server lacking the freshness field — i.e.
+        callers treat absence as "not scanning", preserving old behavior.
+        """
+        h = self.last_health
+        return bool(h.get("full_scan_in_progress")) if isinstance(h, dict) else False
+
+    def scan_source_count(self) -> int:
+        """The ``source_count`` from the last-observed health (0 if unknown)."""
+        h = self.last_health
+        if isinstance(h, dict):
+            try:
+                return int(h.get("source_count") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
 
     def can_autostart_server(self) -> bool:
         """Whether a local biopb server could be auto-started for this URL.

@@ -17,7 +17,9 @@ def test_periodic_watcher_emits_rescan_after_interval(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
 
-    watcher = PeriodicRescanWatcher(rescan_interval=1.0)
+    # initial_immediate=False: testing the steady-state cadence (first tick after
+    # one interval), not the progressive-discovery immediate-first-tick.
+    watcher = PeriodicRescanWatcher(rescan_interval=1.0, initial_immediate=False)
     watcher.start({tmp_path})
 
     current_time["value"] = 100.5
@@ -28,6 +30,29 @@ def test_periodic_watcher_emits_rescan_after_interval(monkeypatch, tmp_path):
 
     assert len(events) == 1
     assert events[0].event_type == WatcherEventType.RESCAN
+
+
+def test_periodic_watcher_emits_immediately_by_default(monkeypatch, tmp_path):
+    # Progressive discovery: the first rescan fires at once on start() (no need
+    # to wait a full interval), so the background bootstrap scan begins promptly.
+    current_time = {"value": 100.0}
+
+    monkeypatch.setattr(
+        "biopb_tensor_server.watcher.time.monotonic",
+        lambda: current_time["value"],
+    )
+    monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
+
+    watcher = PeriodicRescanWatcher(rescan_interval=30.0)  # default immediate
+    watcher.start({tmp_path})
+
+    # No clock advance: the first tick is due immediately.
+    events = watcher.get_events(timeout=0)
+    assert len(events) == 1
+    assert events[0].event_type == WatcherEventType.RESCAN
+
+    # ...and it reschedules for one interval out (no immediate re-fire).
+    assert watcher.get_events(timeout=0) == []
 
 
 def test_periodic_watcher_stops_cleanly(tmp_path):
@@ -61,7 +86,7 @@ def test_periodic_watcher_reschedules_after_emit(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("biopb_tensor_server.watcher.time.sleep", lambda _: None)
 
-    watcher = PeriodicRescanWatcher(rescan_interval=2.0)
+    watcher = PeriodicRescanWatcher(rescan_interval=2.0, initial_immediate=False)
     watcher.start({tmp_path})
 
     current_time["value"] = 52.1

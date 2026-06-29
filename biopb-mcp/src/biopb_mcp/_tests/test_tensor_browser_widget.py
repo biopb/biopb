@@ -43,6 +43,10 @@ def widget(make_napari_viewer, monkeypatch):
     conn.is_connected = False
     conn.sources = {}
     conn.last_message = ""
+    # Default: server is not mid-scan, so an empty catalog renders as a genuine
+    # "no sources" error (progressive-discovery indexing case is opt-in per test).
+    conn.scan_in_progress.return_value = False
+    conn.scan_source_count.return_value = 0
 
     # Capture connect workers instead of spawning real threads so the tests run
     # them explicitly (and can assert the in-flight state before completion).
@@ -136,6 +140,25 @@ class TestConnect:
 
         assert "No sources found" in w._error_label.text()
         assert not w._refresh_button.isEnabled()
+        w._build_and_display_tree.assert_not_called()
+
+    def test_empty_catalog_while_indexing_shows_status(self, widget):
+        # Progressive discovery: SERVING but the scan is still running. An empty
+        # catalog is "not done indexing yet", not an error -- show grey status,
+        # keep Refresh enabled (more sources are coming), no error label.
+        w, conn, workers = widget
+        _connected_with(conn, {})
+        conn.scan_in_progress.return_value = True
+        conn.scan_source_count.return_value = 7
+
+        w._auto_connect()
+        workers.pop(0)()
+
+        assert w._error_label.isHidden()
+        assert not w._status_label.isHidden()
+        assert "Indexing" in w._status_label.text()
+        assert "7 sources so far" in w._status_label.text()
+        assert w._refresh_button.isEnabled()
         w._build_and_display_tree.assert_not_called()
 
     def test_large_catalog_enables_sql_filter(self, widget):

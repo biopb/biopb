@@ -2420,11 +2420,19 @@ class TensorFlightClient:
 
         Returns:
             Dictionary with health status information:
-            - status: "SERVING" or other status string
+            - status: "SERVING" or other status string. Note: with progressive
+              discovery, SERVING means "up and serving the possibly-still-
+              populating catalog," not "catalog complete" -- use the freshness
+              fields below to tell whether indexing is still in progress.
             - source_count: Number of registered sources
             - metadata_db_enabled: Whether metadata database is enabled
             - writable: Whether server accepts uploads
             - uptime_seconds: Server uptime in seconds
+            - full_scan_in_progress: Whether a full catalog rescan is running now
+              (absent on older servers)
+            - last_full_scan_finished_at: Epoch seconds when a full scan last
+              succeeded, or None until the first one does (absent on older
+              servers)
 
         Raises:
             FlightError: If server is unreachable or action fails
