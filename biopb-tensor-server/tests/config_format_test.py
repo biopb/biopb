@@ -6,6 +6,7 @@ dict, so a JSON and an equivalent TOML file must yield an identical model.
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -108,7 +109,9 @@ def test_extensionless_file_sniffed_as_toml(tmp_path, caplog):
 def test_invalid_json_raises_value_error_naming_file(tmp_path):
     p = tmp_path / "biopb.json"
     p.write_text("{not valid json")
-    with pytest.raises(ValueError, match=str(p)):
+    # `match` is a regex; re.escape so a Windows path (backslashes -> escapes
+    # like \U) is matched literally.
+    with pytest.raises(ValueError, match=re.escape(str(p))):
         load_config(p)
 
 
