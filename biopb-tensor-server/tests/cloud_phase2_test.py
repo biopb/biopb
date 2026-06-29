@@ -424,6 +424,12 @@ class _FakeServer:
     def unregister_source(self, source_id):
         self.registered.pop(source_id, None)
 
+    def set_full_scan_in_progress(self, in_progress):
+        pass
+
+    def set_last_full_scan(self, timestamp):
+        pass
+
 
 def _make_manager(server, cloud_roots=None, monitored=None):
     from biopb_tensor_server.adapters import get_default_registry

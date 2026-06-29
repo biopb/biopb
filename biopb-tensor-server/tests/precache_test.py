@@ -354,17 +354,19 @@ class TestRuntimePhaseGating:
         )
         return server, sm
 
-    def test_runtime_phase_default_false_then_start_flips(self):
+    def test_initial_scan_done_default_false_and_start_does_not_flip(self):
         server, sm = self._bare_source_manager()
         try:
-            assert sm._runtime_phase is False
-            # Static-only (watcher=None) start() is a no-op and does NOT flip.
+            assert sm._initial_scan_done is False
+            # start() no longer flips the precache gate -- only the first full
+            # scan completing does. A static-only (watcher=None) start() is a
+            # no-op and leaves it False.
             sm.start()
-            assert sm._runtime_phase is False
+            assert sm._initial_scan_done is False
         finally:
             server.shutdown()
 
-    def test_commit_hook_fires_only_in_runtime_phase(self, monkeypatch):
+    def test_commit_hook_fires_only_after_initial_scan(self, monkeypatch):
         from types import SimpleNamespace
 
         server, sm = self._bare_source_manager()
@@ -381,13 +383,14 @@ class TestRuntimePhaseGating:
             sm._on_source_committed = fired.append
             claim = SimpleNamespace(source_id="s1", primary_path="/x")
 
-            # Startup phase: hook must NOT fire.
-            sm._runtime_phase = False
+            # During the initial scan: startup sources go to the backlog, not the
+            # prompt enqueue -- the hook must NOT fire.
+            sm._initial_scan_done = False
             assert sm._commit_add_claim(claim) is True
             assert fired == []
 
-            # Runtime phase: hook fires with the source_id.
-            sm._runtime_phase = True
+            # After the initial scan: live additions fire the hook.
+            sm._initial_scan_done = True
             assert sm._commit_add_claim(claim) is True
             assert fired == ["s1"]
         finally:
@@ -409,7 +412,7 @@ class TestRuntimePhaseGating:
                 raise RuntimeError("hook failure")
 
             sm._on_source_committed = boom
-            sm._runtime_phase = True
+            sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="s2", primary_path="/y")
             # Commit still succeeds despite the hook raising.
             assert sm._commit_add_claim(claim) is True

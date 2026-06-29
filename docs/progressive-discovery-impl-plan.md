@@ -1,6 +1,6 @@
 # Progressive Discovery — Implementation Plan
 
-**Status:** Implementation plan — Phases 0–2 complete (audit, freshness fields, client indexing/empty UI); Phases 3–5 not started
+**Status:** Implementation plan — Phases 0–3 complete (audit, freshness fields, client UI, background scan / Option 0); Phases 4–5 not started
 **Component:** `biopb-tensor-server` (+ a small client-gating change in `biopb-mcp`)
 **Design:** [progressive-discovery.md](progressive-discovery.md) — read first; this doc
 turns that design's *Changes by file* and *Suggested sequence* into PR-sized,
@@ -211,7 +211,44 @@ defensive copy/branch changes, no new fill mechanism.
 
 ---
 
-## Phase 3 — Background the scan (Option 0 baseline)
+## Phase 3 — Background the scan (Option 0 baseline) ✅ (complete)
+
+**Landed:**
+- **`source_manager.py`** — replaced `_runtime_phase` with `_initial_scan_done`
+  (the correct startup/runtime boundary now that the first scan runs *after*
+  `start()`); the precache enqueue gate keys on it. Added `_on_initial_scan_complete`.
+  `_handle_rescan` now (on a force-full pass) pushes `set_full_scan_in_progress(True)`
+  on entry and `False` in a guaranteed outer `finally`, advances
+  `set_last_full_scan(...)` on success, and on the *first* success flips
+  `_initial_scan_done` and fires the completion callback (best-effort, via
+  `_fire_initial_scan_complete`). `create_source_manager` no longer runs the
+  synchronous bootstrap scan.
+- **`watcher.py`** — `PeriodicRescanWatcher(initial_immediate=True)` fires the
+  first rescan at once on `start()` (cadence tests opt out with `False`).
+- **`cli.py`** — wires the first-scan-complete callback (seeds the precache
+  backlog) and pre-sets `full_scan_in_progress=True` before `start()`; calls
+  `mark_ready()` **early**; and adds a `background_scan_running` fallback: if no
+  event loop will run the scan (watcher failed to start, *or* a static-only
+  config), it scans synchronously (monitored) or drives the completion path
+  directly (static-only) — preserving registration for watcher-less setups.
+- **Tests** — watcher immediate-tick (1); precache gate retargeted to
+  `_initial_scan_done` (3 updated); `_handle_rescan` freshness push + one-shot
+  callback + failure-reset/retry + incremental-no-toggle (3 new); static-only
+  `_setup_flight_server` integration (SERVING + freshness stamped, 1 new);
+  `_FakeServer`s gained the setters. Full tensor-server suite green (793 passed,
+  1 skipped).
+
+**Note (correctness catch):** removing the synchronous scan made monitored-source
+registration depend on the event loop. The `background_scan_running` fallback in
+`cli.py` restores the pre-existing guarantee that a watcher-less monitored config
+still registers its sources (synchronously).
+
+Catalog still appears in one batch at end-of-walk — within-walk streaming is
+Phase 4 (Option B).
+
+---
+
+### Original plan (for reference)
 
 **Goal:** reach `SERVING` immediately; run the monitored bootstrap scan in the
 SourceManager event loop; push freshness status. Catalog still appears in one

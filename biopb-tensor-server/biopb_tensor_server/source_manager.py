@@ -99,11 +99,21 @@ class SourceManager:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         # Background precache hook: called with a source_id when a source is
-        # committed *after* start() (the runtime phase). Left None for the
-        # initial startup scan -- which is committed before start() -- so the
-        # precache worker only warms sources that arrive live. See start().
+        # committed *after* the initial scan completes. Gated on
+        # ``_initial_scan_done`` so the (possibly large) startup set is routed to
+        # the slow precache *backlog* instead of the prompt enqueue -- only
+        # sources discovered live (later rescans) warm promptly. See
+        # ``_commit_add_claim``.
         self._on_source_committed: Optional[Callable[[str], None]] = None
-        self._runtime_phase = False
+        # Flipped True at the end of the first successful full rescan. Under
+        # progressive discovery that scan runs in the event loop *after* start(),
+        # so this -- not "are we past start()" -- is the correct startup/runtime
+        # boundary for the precache gate.
+        self._initial_scan_done = False
+        # Best-effort callback fired once, when the first full scan completes
+        # (from the event-loop thread). The launcher uses it to seed the precache
+        # backlog with the startup set at the moment the catalog is established.
+        self._on_initial_scan_complete: Optional[Callable[[], None]] = None
         # Rescan/reconcile helpers may re-enter other state-mutating helpers.
         # Use an RLock so nested calls on the same thread do not deadlock.
         self._lock = threading.RLock()
@@ -142,10 +152,10 @@ class SourceManager:
             logger.warning("SourceManager already running")
             return
 
-        # Everything committed from here on is a live (runtime) addition; the
-        # initial startup scan ran before this point and is excluded from the
-        # precache hook.
-        self._runtime_phase = True
+        # The background bootstrap scan runs in this event loop (the watcher
+        # fires its first rescan immediately). Until that first scan completes,
+        # ``_initial_scan_done`` stays False so its sources route to the precache
+        # backlog rather than the prompt enqueue.
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -234,59 +244,91 @@ class SourceManager:
             return
 
         force_full_rescan = self._should_force_full_rescan()
-        (
-            next_state,
-            next_stable_observations,
-            next_pending_scan,
-            skipped_dirs,
-            next_cloud,
-        ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
-        previous_state = self._entry_state
-        previous_stable_observations = self._entry_stable_observations
-        previous_pending_scan = self._entry_pending_scan
-        previous_skipped_dirs = self._skipped_stable_dirs
-
-        self._entry_state = next_state
-        self._entry_stable_observations = next_stable_observations
-        self._entry_pending_scan = next_pending_scan
-        self._skipped_stable_dirs = skipped_dirs
-
-        rescan_succeeded = False
+        # Progressive-discovery freshness signals: while a *full* reconcile runs,
+        # the health action reports full_scan_in_progress=True; on success it
+        # advances last_full_scan_finished_at. Incremental rescans leave both
+        # untouched (they deliberately skip stable/cloud subtrees, so they are
+        # not a whole-tree reconcile). Guaranteed reset in the outer finally.
+        if force_full_rescan:
+            self._server.set_full_scan_in_progress(True)
         try:
-            # Single traversal: the state walk above already visited every entry and
-            # recorded its (resolved path, is_directory) into next_state in DFS
-            # parent-first order. Drive the claim phase straight off that snapshot
-            # instead of re-walking the filesystem a second time — the duplicate walk
-            # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
-            # skipped_dirs prunes the stable subtrees the state walk carried forward
-            # (their claims are preserved below), exactly as the old per-dir
-            # `if ... in skipped_dirs: continue` did for whole roots.
-            discovered_state = discover_sources_from_entries(
-                (
-                    (path_str, entry[0], entry[1])
-                    for path_str, entry in next_state.items()
-                ),
-                self._registry,
-                dim_labels=self._dim_labels,
-                path_filter=self._should_scan_resolved,
-                skipped_dirs=skipped_dirs,
-                cloud_by_path=next_cloud,
-            )
+            (
+                next_state,
+                next_stable_observations,
+                next_pending_scan,
+                skipped_dirs,
+                next_cloud,
+            ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
+            previous_state = self._entry_state
+            previous_stable_observations = self._entry_stable_observations
+            previous_pending_scan = self._entry_pending_scan
+            previous_skipped_dirs = self._skipped_stable_dirs
 
-            self._preserve_skipped_claims(discovered_state, skipped_dirs)
+            self._entry_state = next_state
+            self._entry_stable_observations = next_stable_observations
+            self._entry_pending_scan = next_pending_scan
+            self._skipped_stable_dirs = skipped_dirs
 
-            unstable_paths = self._get_unstable_paths()
-            self._reconcile_discovered_state(discovered_state, unstable_paths)
-            rescan_succeeded = True
+            rescan_succeeded = False
+            try:
+                # Single traversal: the state walk above already visited every entry and
+                # recorded its (resolved path, is_directory) into next_state in DFS
+                # parent-first order. Drive the claim phase straight off that snapshot
+                # instead of re-walking the filesystem a second time — the duplicate walk
+                # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
+                # skipped_dirs prunes the stable subtrees the state walk carried forward
+                # (their claims are preserved below), exactly as the old per-dir
+                # `if ... in skipped_dirs: continue` did for whole roots.
+                discovered_state = discover_sources_from_entries(
+                    (
+                        (path_str, entry[0], entry[1])
+                        for path_str, entry in next_state.items()
+                    ),
+                    self._registry,
+                    dim_labels=self._dim_labels,
+                    path_filter=self._should_scan_resolved,
+                    skipped_dirs=skipped_dirs,
+                    cloud_by_path=next_cloud,
+                )
+
+                self._preserve_skipped_claims(discovered_state, skipped_dirs)
+
+                unstable_paths = self._get_unstable_paths()
+                self._reconcile_discovered_state(discovered_state, unstable_paths)
+                rescan_succeeded = True
+            finally:
+                if not rescan_succeeded:
+                    self._entry_state = previous_state
+                    self._entry_stable_observations = previous_stable_observations
+                    self._entry_pending_scan = previous_pending_scan
+                    self._skipped_stable_dirs = previous_skipped_dirs
+
+            if force_full_rescan and rescan_succeeded:
+                self._last_full_rescan_at = time.time()
+                self._server.set_last_full_scan(self._last_full_rescan_at)
+                # First full scan done: flip the precache gate (live additions
+                # now prompt-enqueue) and let the launcher seed the backlog with
+                # the established catalog. Fired once, best-effort.
+                if not self._initial_scan_done:
+                    self._initial_scan_done = True
+                    self._fire_initial_scan_complete()
         finally:
-            if not rescan_succeeded:
-                self._entry_state = previous_state
-                self._entry_stable_observations = previous_stable_observations
-                self._entry_pending_scan = previous_pending_scan
-                self._skipped_stable_dirs = previous_skipped_dirs
+            if force_full_rescan:
+                self._server.set_full_scan_in_progress(False)
 
-        if force_full_rescan and rescan_succeeded:
-            self._last_full_rescan_at = time.time()
+    def _fire_initial_scan_complete(self) -> None:
+        """Invoke the first-scan-complete callback, swallowing any error.
+
+        Best-effort, mirroring the precache commit hook: a callback failure must
+        never abort or destabilize the rescan that triggered it.
+        """
+        callback = self._on_initial_scan_complete
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("on_initial_scan_complete callback failed")
 
     def _cleanup_deleted_monitored_dirs(self) -> None:
         """Remove claims for monitored roots that no longer exist."""
@@ -1010,9 +1052,11 @@ class SourceManager:
             )
             self._clear_failed_source_attempt(claim.source_id)
 
-        # Notify the precache worker of live additions only (runtime phase).
+        # Notify the precache worker of live additions only -- those discovered
+        # after the initial scan completes. The startup set (committed while
+        # _initial_scan_done is False) is seeded into the slow backlog instead.
         # Best-effort: a hook failure must never abort a source commit.
-        if self._runtime_phase and self._on_source_committed is not None:
+        if self._initial_scan_done and self._on_source_committed is not None:
             try:
                 self._on_source_committed(claim.source_id)
             except Exception:
@@ -1450,8 +1494,11 @@ def create_source_manager(
         )
         manager._commit_add_claim(claim)
 
-    # Bootstrap monitored discovery through the same rescan pipeline used at runtime.
-    if monitored_dirs:
-        manager._handle_rescan()
-
+    # Monitored discovery is NOT run synchronously here: under progressive
+    # discovery the launcher starts the manager's event loop and the watcher
+    # fires the first rescan immediately, so the (possibly slow) bootstrap scan
+    # happens in the background while the server already reports SERVING. A
+    # static-only config (no monitored_dirs) has nothing to scan -- the launcher
+    # drives the first-scan-complete path directly so it still reports a
+    # freshness timestamp and seeds the backlog.
     return manager

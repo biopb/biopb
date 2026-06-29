@@ -62,12 +62,23 @@ class _FakeServer:
         self.registered = []
         self.unregistered = []
         self._metadata_db = _FakeMetadataDb()
+        # Progressive-discovery freshness signals, recorded for assertions.
+        self.full_scan_in_progress = False
+        self.scan_in_progress_history = []
+        self.last_full_scan_at = None
 
     def register_source(self, source_id, adapter):
         self.registered.append(source_id)
 
     def unregister_source(self, source_id):
         self.unregistered.append(source_id)
+
+    def set_full_scan_in_progress(self, in_progress):
+        self.full_scan_in_progress = bool(in_progress)
+        self.scan_in_progress_history.append(bool(in_progress))
+
+    def set_last_full_scan(self, timestamp):
+        self.last_full_scan_at = float(timestamp)
 
 
 class _FailingRegisterServer(_FakeServer):
@@ -1420,3 +1431,83 @@ class TestCloudInodeBackfillSkip:
         id_b = get_file_identity(b, _FakeStat(st_ino=0, mode=0o040755))
 
         assert id_a != id_b
+
+
+class TestProgressiveDiscoveryFreshness:
+    """Health freshness signals pushed by _handle_rescan (progressive #212)."""
+
+    def _manager_with_source(self, tmp_path):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        (monitored_dir / "sample.dat").write_text("hello")
+
+        server = _FakeServer()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+        return server, manager
+
+    def test_first_full_rescan_pushes_freshness_and_fires_callback(self, tmp_path):
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager._on_initial_scan_complete = lambda: fired.append(True)
+
+        manager._handle_rescan()
+
+        # in_progress was raised for the scan and lowered when it finished.
+        assert server.scan_in_progress_history == [True, False]
+        assert server.full_scan_in_progress is False
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done is True
+        assert fired == [True]
+
+    def test_incremental_rescan_leaves_freshness_untouched(self, tmp_path):
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager._on_initial_scan_complete = lambda: fired.append(True)
+
+        manager._handle_rescan()  # first: force-full
+        first_ts = server.last_full_scan_at
+
+        # Immediately after, the default 3600s interval makes the next rescan
+        # incremental -> it must not toggle in_progress, advance the timestamp,
+        # or re-fire the one-shot completion callback.
+        manager._handle_rescan()
+
+        assert server.scan_in_progress_history == [True, False]
+        assert server.last_full_scan_at == first_ts
+        assert fired == [True]
+
+    def test_failed_first_scan_resets_progress_and_retries(self, tmp_path, monkeypatch):
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager._on_initial_scan_complete = lambda: fired.append(True)
+
+        # Fail the reconcile of the first (force-full) scan.
+        def boom(*a, **k):
+            raise RuntimeError("reconcile failed")
+
+        monkeypatch.setattr(manager, "_reconcile_discovered_state", boom)
+        with pytest.raises(RuntimeError, match="reconcile failed"):
+            manager._handle_rescan()
+
+        # in_progress reset, no timestamp, gate still closed, callback not fired.
+        assert server.scan_in_progress_history == [True, False]
+        assert server.full_scan_in_progress is False
+        assert server.last_full_scan_at is None
+        assert manager._initial_scan_done is False
+        assert fired == []
+
+        # Next tick retries (still force-full since the timestamp never advanced)
+        # and succeeds.
+        monkeypatch.undo()
+        manager._handle_rescan()
+        assert manager._initial_scan_done is True
+        assert server.last_full_scan_at is not None
+        assert fired == [True]

@@ -71,8 +71,13 @@ class DirectoryWatcher(ABC):
 class PeriodicRescanWatcher(DirectoryWatcher):
     """Timer-driven watcher that requests periodic rescans."""
 
-    def __init__(self, rescan_interval: float = 30.0):
+    def __init__(self, rescan_interval: float = 30.0, initial_immediate: bool = True):
         self._rescan_interval = max(0.1, rescan_interval)
+        # Fire the first rescan immediately on start() rather than after a full
+        # interval, so progressive discovery's background bootstrap scan begins at
+        # once (the server is already SERVING by then). Set False to restore the
+        # "first tick after one interval" cadence (used by cadence tests).
+        self._initial_immediate = initial_immediate
         self._directories: Set[Path] = set()
         self._running = False
         self._next_rescan_at: Optional[float] = None
@@ -80,7 +85,10 @@ class PeriodicRescanWatcher(DirectoryWatcher):
     def start(self, directories: Set[Path]) -> None:
         self._directories = {directory.resolve() for directory in directories}
         self._running = True
-        self._next_rescan_at = time.monotonic() + self._rescan_interval
+        now = time.monotonic()
+        self._next_rescan_at = (
+            now if self._initial_immediate else now + self._rescan_interval
+        )
         logger.info(
             "Starting periodic rescan watcher for %s every %.1fs",
             self._directories,
