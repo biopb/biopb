@@ -65,6 +65,7 @@ credentials_profile = "aws-prod"
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 import os
 import sys
@@ -72,6 +73,18 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+
+# Config file location & format preference live in the core `biopb` package so
+# the umbrella CLI and biopb-mcp share one definition (all three depend on
+# `biopb`). Re-exported for back-compat (`biopb_tensor_server.config.find_config`
+# and the name constants). See biopb._config_location for the JSON-canonical
+# rationale (biopb/biopb#34).
+from biopb._config_location import (
+    CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
+    DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
+    LEGACY_CONFIG_NAME as LEGACY_CONFIG_NAME,
+    find_config as find_config,
+)
 
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
@@ -392,17 +405,23 @@ class ServerConfig:
 
 
 def load_config(path: Path) -> ServerConfig:
-    """Load configuration from a TOML file.
+    """Load configuration from a JSON or TOML file.
+
+    JSON is the canonical format; TOML is still read for back-compat during the
+    migration window (biopb/biopb#34) and emits a deprecation warning. Format is
+    chosen by file extension, with a content sniff for unknown / extension-less
+    paths. Either way the file is parsed to a plain dict and handed to the
+    format-agnostic :func:`parse_config`.
 
     Args:
-        path: Path to TOML config file
+        path: Path to JSON (``.json``) or TOML (``.toml``) config file
 
     Returns:
         ServerConfig object
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If config is invalid
+        ValueError: If the file cannot be parsed as its declared/sniffed format
     """
     if isinstance(path, str):
         path = Path(path)
@@ -410,17 +429,76 @@ def load_config(path: Path) -> ServerConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-
+    data = _read_config_file(path)
     return parse_config(data)
+
+
+def _read_config_file(path: Path) -> Dict[str, Any]:
+    """Read a config file into a plain dict, dispatching on format.
+
+    Dispatch is by extension (``.json`` / ``.toml``); an unknown or
+    extension-less path is sniffed (JSON first, since it is canonical, then
+    TOML). Reading TOML logs a one-line deprecation warning naming the canonical
+    alternative.
+    """
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        return _load_json(path)
+    if suffix == ".toml":
+        _warn_toml_deprecated(path)
+        return _load_toml(path)
+
+    # Unknown / extension-less: sniff. Prefer JSON (canonical); on a JSON parse
+    # failure fall back to TOML rather than guessing from bytes.
+    raw = path.read_bytes()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    _warn_toml_deprecated(path)
+    try:
+        return tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(
+            f"Config file {path} is neither valid JSON nor valid TOML: {e}"
+        ) from e
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as f:
+            return json.load(f)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON in config file {path}: {e}") from e
+
+
+def _load_toml(path: Path) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"Invalid TOML in config file {path}: {e}") from e
+
+
+def _warn_toml_deprecated(path: Path) -> None:
+    logger.warning(
+        "Config file %s uses the legacy TOML format, which is deprecated; "
+        "JSON (%s) is now canonical. TOML will keep working during the "
+        "migration window. See biopb/biopb#34.",
+        path,
+        CANONICAL_CONFIG_NAME,
+    )
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Parse configuration from a dictionary.
 
+    Format-agnostic: ``data`` is a plain dict already read from JSON or TOML by
+    :func:`load_config`.
+
     Args:
-        data: Config dictionary (from TOML)
+        data: Config dictionary (from JSON or TOML)
 
     Returns:
         ServerConfig object

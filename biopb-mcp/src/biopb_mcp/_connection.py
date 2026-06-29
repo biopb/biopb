@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 from urllib.parse import urlparse
 
+from biopb._config_location import find_config
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
@@ -39,9 +40,12 @@ logger = logging.getLogger(__name__)
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
 
-# Default location of the biopb server's TOML config (matches the
-# `biopb server start` CLI default).
-DEFAULT_SERVER_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
+
+# Default location of the biopb server's config (matches the `biopb server
+# start` CLI default). Prefers JSON over legacy TOML and warns when both exist;
+# resolution is shared with the tensor server and the umbrella CLI via the core
+# `biopb` package (biopb/biopb#34).
+DEFAULT_SERVER_CONFIG = find_config()
 
 # Hosts considered "local" — auto-starting a server only makes sense for these.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
