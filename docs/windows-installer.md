@@ -3,8 +3,11 @@
 How the biopb Windows installer is structured so a GUI wizard and the existing
 console one-liner share **one install brain**.
 
-> Status: **prototype** on branch `feat/windows-gui-installer`. The engine split
-> and console front-end are working; the Inno Setup wizard is a reviewed skeleton.
+> Status: **implemented and shipping.** The engine (`install/biopb-engine.ps1`),
+> console front-end (`install/install.ps1`), and Inno Setup GUI wizard
+> (`install/gui/biopb-setup.iss`) are all on `dev` and drive one shared engine; the
+> Windows job in `release.yaml` builds the installer. Code signing is the one
+> deferred piece (no cert yet). (Was a prototype on `feat/windows-gui-installer`.)
 
 ## The core constraint
 

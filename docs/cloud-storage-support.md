@@ -1,7 +1,12 @@
 # Cloud storage support in the tensor server (proposal)
 
-> **Status: proposal.** A design sketch, not a build plan — captures the
-> approach and the decisions it rests on so they can be reviewed before any code.
+> **Status: Phase 2 implemented and shipping.** Cloud/synced-folder data is
+> registered as *unresolved* sources (`adapters/unresolved.py`) and lazily hydrated
+> via a streaming `do_action("resolve")` (`server.py`), gated by `SourceConfig.cloud`,
+> with the `TensorFlightClient.resolve()` SDK method and napari integration
+> (`tests/cloud_phase2_test.py`, `client_resolve_test.py`). Later phases —
+> metadata-DB durability across restart, the read-tolerance mode below — remain
+> design. The rest of this doc is the original design sketch.
 
 Scope: `biopb-tensor-server` (server + Python SDK), with knock-on effects for the
 Java SDK and a (minimal) carve-out for the TS/web client.
