@@ -53,6 +53,54 @@ if TYPE_CHECKING:
     from biopb_tensor_server.remote import RemoteStore
 
 
+def _install_ome_parse_dedup() -> None:
+    """Collapse aicsimageio's 3x redundant OME-XML parse at OME-TIFF construction.
+
+    Building an ``AICSImage`` for an OME-TIFF parses the embedded OME model THREE
+    times -- ``determine_reader``'s support probe, ``OmeTiffReader``'s own
+    ``_is_supported_image`` probe, and the stored ``self._ome`` -- each an
+    ``ome_types.from_xml`` over the full model. For a 40k-plane MMStack that parse
+    is ~27 s, so the redundancy is ~3x the dominant registration cost and the bulk
+    of the startup tail (biopb/biopb#192). cProfile attributes ~100% of the ~80 s
+    construction to these parses; the tifffile IFD walk is ~2.5 s by comparison.
+
+    All three call sites pass the identical ``tiff.pages[0].description`` string,
+    so a tiny LRU on ``OmeTiffReader._get_ome`` makes them share a single parse
+    (measured 80 s -> 27 s, ~3x, scenes byte-identical). It is deliberately NOT a
+    forced ``AICSImage(reader=OmeTiffReader)``: ``determine_reader``'s probe is what
+    falls back to ``TiffReader`` when the OME does not validate (e.g. a MicroManager
+    file with a degenerate self-closing ``<BinData/>``, biopb/biopb#199), and a
+    parse that *raises* is not cached, so that fallback path is unchanged.
+
+    Idempotent and best-effort: a guard prevents double-wrapping and any aicsimageio
+    layout change just leaves the stock (slower) parse in place.
+    """
+    try:
+        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
+    except Exception:  # pragma: no cover - aicsimageio is a hard dep in practice
+        return
+    current = OmeTiffReader.__dict__.get("_get_ome")
+    if current is None or getattr(current.__func__, "_biopb_dedup", False):
+        return
+
+    import functools
+
+    original = current.__func__  # unwrap the staticmethod
+
+    # maxsize=2 holds at most the in-flight file's model (registration is serial;
+    # a concurrent rescan adds at most one more) so memory stays bounded -- the
+    # parsed OME is already retained for the source's lifetime via the reader.
+    @functools.lru_cache(maxsize=2)
+    def _get_ome_cached(ome_xml: str, clean_metadata: bool = True):
+        return original(ome_xml, clean_metadata)
+
+    _get_ome_cached._biopb_dedup = True
+    OmeTiffReader._get_ome = staticmethod(_get_ome_cached)
+
+
+_install_ome_parse_dedup()
+
+
 # =============================================================================
 # OME-XML metadata helpers (for OME-TIFF handling)
 # =============================================================================
