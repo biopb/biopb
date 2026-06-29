@@ -507,7 +507,7 @@ def serve(
         "--config",
         "-c",
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -614,7 +614,7 @@ def validate(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
 ):
     """Validate a config file.
@@ -663,7 +663,7 @@ def list_tensors(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
 ):
     """List data sources and tensors defined in a config file.
@@ -744,7 +744,7 @@ def launch(
         "--config",
         "-c",
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     log_level: Optional[str] = typer.Option(
         None,

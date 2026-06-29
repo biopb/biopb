@@ -74,8 +74,27 @@ app.add_typer(server_app, name="server")
 # Daemon management constants
 PID_FILE = Path.home() / ".local" / "share" / "biopb" / "tensor-server.pid"
 LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
-DEFAULT_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
 DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
+
+
+def _default_config() -> Path:
+    """Default config path, preferring JSON over legacy TOML (biopb/biopb#34).
+
+    Mirrors ``biopb_tensor_server.config.find_config``; kept inline so resolving
+    a typer Option default does not import the (heavy) server config module on
+    every ``biopb`` invocation.
+    """
+    config_dir = Path.home() / ".config" / "biopb"
+    json_path = config_dir / "biopb.json"
+    if json_path.exists():
+        return json_path
+    toml_path = config_dir / "biopb.toml"
+    if toml_path.exists():
+        return toml_path
+    return json_path
+
+
+DEFAULT_CONFIG = _default_config()
 
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it
@@ -480,7 +499,7 @@ def start(
         DEFAULT_CONFIG,
         "--config",
         "-c",
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -687,7 +706,7 @@ def restart(
         DEFAULT_CONFIG,
         "--config",
         "-c",
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -743,7 +762,7 @@ def restart(
 
 
 def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
-    """Loopback-reachable gRPC host/port from the TOML config (default
+    """Loopback-reachable gRPC host/port from the config (default
     127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
     the returned host is always something connect()-able locally."""
     host, port = "127.0.0.1", 8815
@@ -764,7 +783,7 @@ def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
 def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
     """Best-effort gRPC endpoint + token for a running server's health query.
 
-    Reads host/port from the TOML config (defaults 127.0.0.1:8815); a server
+    Reads host/port from the config (defaults 127.0.0.1:8815); a server
     bound to 0.0.0.0/:: is reached over loopback. The token comes from
     BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
     """
@@ -818,7 +837,7 @@ def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
 @server_app.command("status")
 def status(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
     ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -993,7 +1012,7 @@ def _render_cache_stats(stats: dict) -> None:
 @server_app.command("cache-stats")
 def cache_stats(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
     ),
     token: Optional[str] = typer.Option(
         None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"

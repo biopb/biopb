@@ -39,9 +39,22 @@ logger = logging.getLogger(__name__)
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
 
-# Default location of the biopb server's TOML config (matches the
-# `biopb server start` CLI default).
-DEFAULT_SERVER_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
+
+# Default location of the biopb server's config (matches the `biopb server
+# start` CLI default). JSON is canonical; legacy TOML is still honored during
+# the migration window, preferring JSON when both exist (biopb/biopb#34). Kept
+# inline -- biopb-mcp has no runtime dependency on biopb_tensor_server, so it
+# cannot import that package's find_config(); this 4-line twin mirrors it.
+def _default_server_config() -> Path:
+    config_dir = Path.home() / ".config" / "biopb"
+    json_path = config_dir / "biopb.json"
+    if json_path.exists():
+        return json_path
+    toml_path = config_dir / "biopb.toml"
+    return toml_path if toml_path.exists() else json_path
+
+
+DEFAULT_SERVER_CONFIG = _default_server_config()
 
 # Hosts considered "local" — auto-starting a server only makes sense for these.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}

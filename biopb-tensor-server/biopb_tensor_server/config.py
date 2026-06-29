@@ -65,6 +65,7 @@ credentials_profile = "aws-prod"
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 import os
 import sys
@@ -99,6 +100,43 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
+
+
+# --- Config file location & format (biopb/biopb#34) ---------------------------
+#
+# JSON is the *canonical* on-disk format going forward: the config is
+# machine-generated (the installer / a future generator write it), and once
+# nobody hand-edits it, TOML's hand-editing ergonomics (comments, [[sources]])
+# stop paying for its one wart -- no stdlib *writer*. JSON has a stdlib writer on
+# both ends (Python `json.dumps`, PowerShell `ConvertTo-Json`), unifies the
+# format with biopb-mcp's `config.json`, and pairs with JSON Schema for
+# validation. TOML stays *readable* through a deprecation window so no existing
+# `biopb.toml` breaks on upgrade; only the read step is format-aware
+# (`parse_config` operates on a plain dict, so the data model is untouched).
+DEFAULT_CONFIG_DIR = Path.home() / ".config" / "biopb"
+CANONICAL_CONFIG_NAME = "biopb.json"
+LEGACY_CONFIG_NAME = "biopb.toml"
+
+
+def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
+    """Resolve the config file in *config_dir*, preferring JSON over TOML.
+
+    Returns the first of ``biopb.json`` / ``biopb.toml`` that exists. When
+    neither exists, returns the canonical JSON path so callers seed / print the
+    forward-looking name. Callers that need a guaranteed-existing file should
+    still check ``.exists()`` on the result.
+
+    This is the single source of truth for the default-config preference; the
+    umbrella ``biopb`` CLI and ``biopb-mcp`` mirror it (the latter cannot import
+    this package at runtime, so it keeps a 4-line twin).
+    """
+    json_path = config_dir / CANONICAL_CONFIG_NAME
+    if json_path.exists():
+        return json_path
+    toml_path = config_dir / LEGACY_CONFIG_NAME
+    if toml_path.exists():
+        return toml_path
+    return json_path
 
 
 # Default on-disk cache location for the file backend. Uses the system temp dir
@@ -392,17 +430,23 @@ class ServerConfig:
 
 
 def load_config(path: Path) -> ServerConfig:
-    """Load configuration from a TOML file.
+    """Load configuration from a JSON or TOML file.
+
+    JSON is the canonical format; TOML is still read for back-compat during the
+    migration window (biopb/biopb#34) and emits a deprecation warning. Format is
+    chosen by file extension, with a content sniff for unknown / extension-less
+    paths. Either way the file is parsed to a plain dict and handed to the
+    format-agnostic :func:`parse_config`.
 
     Args:
-        path: Path to TOML config file
+        path: Path to JSON (``.json``) or TOML (``.toml``) config file
 
     Returns:
         ServerConfig object
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If config is invalid
+        ValueError: If the file cannot be parsed as its declared/sniffed format
     """
     if isinstance(path, str):
         path = Path(path)
@@ -410,10 +454,66 @@ def load_config(path: Path) -> ServerConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
-
+    data = _read_config_file(path)
     return parse_config(data)
+
+
+def _read_config_file(path: Path) -> Dict[str, Any]:
+    """Read a config file into a plain dict, dispatching on format.
+
+    Dispatch is by extension (``.json`` / ``.toml``); an unknown or
+    extension-less path is sniffed (JSON first, since it is canonical, then
+    TOML). Reading TOML logs a one-line deprecation warning naming the canonical
+    alternative.
+    """
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        return _load_json(path)
+    if suffix == ".toml":
+        _warn_toml_deprecated(path)
+        return _load_toml(path)
+
+    # Unknown / extension-less: sniff. Prefer JSON (canonical); on a JSON parse
+    # failure fall back to TOML rather than guessing from bytes.
+    raw = path.read_bytes()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    _warn_toml_deprecated(path)
+    try:
+        return tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(
+            f"Config file {path} is neither valid JSON nor valid TOML: {e}"
+        ) from e
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as f:
+            return json.load(f)
+    except ValueError as e:
+        raise ValueError(f"Invalid JSON in config file {path}: {e}") from e
+
+
+def _load_toml(path: Path) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"Invalid TOML in config file {path}: {e}") from e
+
+
+def _warn_toml_deprecated(path: Path) -> None:
+    logger.warning(
+        "Config file %s uses the legacy TOML format, which is deprecated; "
+        "JSON (%s) is now canonical. TOML will keep working during the "
+        "migration window. See biopb/biopb#34.",
+        path,
+        CANONICAL_CONFIG_NAME,
+    )
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
