@@ -337,15 +337,28 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         # shape / dtype / page-count -- a *physical* constraint, not a naming one.
         # Bucket the directory by that stackability signature and take the largest
         # uniform group as the tensor. Files that do not fit (thumbnails, a max-
-        # projection, an odd overview, an unreadable file) are NOT stacked but
-        # their names are still surfaced via get_metadata(), so the directory is
-        # represented losslessly. We deliberately do not group by filename pattern
-        # or infer what the file axis means (channel / time / site / z): that
-        # ambiguous, metadata-free inference is delegated to the agent, which gets
-        # the per-file names alongside the array. This replaces the old "single
-        # varying field or raise" grouping -- a mismatched file now lands in a
-        # different bucket and becomes a sibling instead of aborting the source.
+        # projection, an odd overview) are NOT stacked but their names are still
+        # surfaced via get_metadata(), so the directory is represented losslessly.
+        # We deliberately do not group by filename pattern or infer what the file
+        # axis means (channel / time / site / z): that ambiguous, metadata-free
+        # inference is delegated to the agent, which gets the per-file names
+        # alongside the array. This replaces the old "single varying field or
+        # raise" grouping -- a mismatched file now lands in a different bucket and
+        # becomes a sibling instead of aborting the source.
+        #
+        # Exception policy: split "could not read the bytes" from "the bytes are
+        # not a valid image". OSError (a missing file, or a cloud recall that
+        # fails on a network blip) is a transport failure -> re-raise, so it
+        # surfaces as a retryable error instead of silently shrinking the stack.
+        # Any other exception means the file opened at the I/O level but is not a
+        # stackable image (TiffFileError, or a corrupt header that makes
+        # ``pages[0]`` raise IndexError / a parse error) -> demote to a sibling.
+        # Tile info is captured here from the first-seen member of each bucket --
+        # which, since all_tiffs is natural-sorted, is exactly that bucket's
+        # members[0] -- so there is no second open of the representative (no extra
+        # recall, no time-of-check/use window).
         buckets: Dict[Tuple[Any, ...], List[Path]] = {}
+        tile_info: Dict[Tuple[Any, ...], Tuple[bool, int, int]] = {}
         unreadable: List[Path] = []
         for p in all_tiffs:
             try:
@@ -356,8 +369,16 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                         str(page.dtype),
                         len(tf.pages),
                     )
+                    if sig not in buckets:  # first member of this bucket == members[0]
+                        tile_info[sig] = (
+                            bool(page.is_tiled),
+                            page.tilewidth,
+                            page.tilelength,
+                        )
+            except OSError:
+                raise  # transport / recall failure -- retryable, do not swallow
             except Exception:
-                unreadable.append(p)
+                unreadable.append(p)  # not a valid image -- demote to sibling
                 continue
             buckets.setdefault(sig, []).append(p)
 
@@ -377,17 +398,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         stacked = set(members)
         self._unstacked_files = [p for p in all_tiffs if p not in stacked] + unreadable
 
-        # Tile info from a representative member (all members share best_sig).
-        with tifffile.TiffFile(str(members[0])) as tf:
-            first_page = tf.pages[0]
-            if first_page.is_tiled:
-                self.is_tiled = True
-                self.tile_width = first_page.tilewidth
-                self.tile_length = first_page.tilelength
-                self._spatial_chunk = [self.tile_length, self.tile_width]
-            else:
-                self.is_tiled = False
-                self._spatial_chunk = [spatial_h, spatial_w]
+        # Tile info captured for members[0] in the bucketing pass above.
+        self.is_tiled, tile_w, tile_l = tile_info[best_sig]
+        if self.is_tiled:
+            self.tile_width = tile_w
+            self.tile_length = tile_l
+            self._spatial_chunk = [tile_l, tile_w]
+        else:
+            self._spatial_chunk = [spatial_h, spatial_w]
 
         # Members share best_sig by construction, so the per-file map needs no
         # re-validation: bucketing already subsumes the old dimension/dtype/page

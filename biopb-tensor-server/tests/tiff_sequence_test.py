@@ -278,6 +278,29 @@ class TestTiffSequenceStackAll:
             assert adapter.full_shape[0] == 3
             assert "truncated.tif" in adapter.get_metadata()["unstacked_files"]
 
+    def test_transport_error_propagates_not_demoted(self, monkeypatch):
+        """An OSError while reading a member (e.g. a failed cloud recall) is
+        re-raised, not swallowed into a silently-undersized stack. Contrast a
+        corrupt file, which demotes (see test_unreadable_tiff_listed_as_unstacked).
+        """
+        import tifffile as tff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                _write_tiff(Path(tmpdir) / f"img_{i}.tif", seed=i)
+
+            real_open = tff.TiffFile
+            failing = str(Path(tmpdir) / "img_1.tif")
+
+            def fake_open(path, *a, **k):
+                if str(path) == failing:
+                    raise OSError("simulated recall failure")
+                return real_open(path, *a, **k)
+
+            monkeypatch.setattr(tff, "TiffFile", fake_open)
+            with pytest.raises(OSError, match="simulated recall failure"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
+
     def test_natural_sort_order(self):
         """The file axis defaults to numeric-aware order: img_2 before img_10."""
         with tempfile.TemporaryDirectory() as tmpdir:
