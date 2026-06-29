@@ -1,6 +1,6 @@
 # Progressive Discovery — Implementation Plan
 
-**Status:** Implementation plan — Phases 0–4 complete (audit, freshness fields, client UI, background scan, Option B streaming); Phase 5 (docs) remaining
+**Status:** Implementation plan — **all phases complete** (audit, freshness fields, client UI, background scan, Option B streaming, docs)
 **Component:** `biopb-tensor-server` (+ a small client-gating change in `biopb-mcp`)
 **Design:** [progressive-discovery.md](progressive-discovery.md) — read first; this doc
 turns that design's *Changes by file* and *Suggested sequence* into PR-sized,
@@ -391,14 +391,17 @@ by special-casing only the add-only first scan and keeping reconcile idempotent.
 
 ---
 
-## Phase 5 — Docs
+## Phase 5 — Docs ✅ (complete)
 
-- `biopb-tensor-server/CLAUDE.md`: update Discovery/Startup and health-action
-  sections (progressive startup, redefined `mark_ready()`/`SERVING`, the two new
-  health fields).
-- Root `CLAUDE.md` §2.2/§3 mention the startup scan in passing — light touch.
-- Flip `docs/progressive-discovery.md` Status from "Design / not yet implemented"
-  to "Implemented" (or "Phases 1–3 implemented; Option B = Phase 4").
+**Landed:**
+- `biopb-tensor-server/ARCHITECTURE.md` (the `CLAUDE.md` symlink target): the
+  Registration section now defines `mark_ready()`/`SERVING` as "serving the
+  possibly-still-populating catalog" and documents the two `health` freshness
+  fields; the Directory Monitoring section describes progressive/streamed startup.
+- Root `development.md` (the root `CLAUDE.md` symlink target): the `health`
+  `do_action` bullet notes progressive startup + the freshness fields.
+- `docs/progressive-discovery.md` Status flipped to "Implemented (Option B)" with
+  a pointer to this plan.
 
 ---
 

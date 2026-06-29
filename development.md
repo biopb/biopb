@@ -309,6 +309,11 @@ editing the code.
 - **The standard Flight verbs are extended with custom `do_action` types** on
   the tensor server: `health`, `create_source`, `upload_status`, `chunk_locate`
   — alongside the normal `do_get`/`do_put`/`get_flight_info`/`list_flights`.
+  Startup is **progressive** (`biopb/biopb#212`): the server reaches `SERVING`
+  immediately and runs/streams its data-folder scan in the background, so
+  `SERVING` no longer implies a complete catalog — `health` carries
+  `full_scan_in_progress` / `last_full_scan_finished_at` as the freshness signal
+  (see `biopb-tensor-server/ARCHITECTURE.md` and `docs/progressive-discovery.md`).
 
 - **A tensor is identified by its `array_id` alone** — the policy every server,
   SDK (Python/Java/TS), and the CLI must follow. The authoritative spec lives in

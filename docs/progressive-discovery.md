@@ -1,7 +1,11 @@
 # Progressive Discovery & Catalog Freshness Signals
 
-**Status:** Design / not yet implemented
-**Component:** `biopb-tensor-server`
+**Status:** Implemented (Option B). The server backgrounds and streams its
+bootstrap scan, reports `SERVING` immediately, and carries
+`full_scan_in_progress` / `last_full_scan_finished_at` on the `health` action.
+See the phased breakdown and what landed in
+[progressive-discovery-impl-plan.md](progressive-discovery-impl-plan.md).
+**Component:** `biopb-tensor-server` (+ a client indexing/empty-state hint in `biopb-mcp` and the webapp)
 **Related:** startup discovery scan, `mark_ready()`, the Flight `health` action, the
 background precache worker.
 

@@ -40,14 +40,31 @@ The FastAPI server handles both API requests and serves the static React webapp.
 ```python
 server = TensorFlightServer("grpc://0.0.0.0:8815")
 server.register_source("my-zarr", ZarrAdapter(arr, "t0", ["z", "y", "x"]))
-server.mark_ready()  # registration done -> health reports SERVING (else STARTING forever)
+server.mark_ready()  # health reports SERVING (else STARTING forever)
 server.serve()  # blocking
 ```
 
-The `biopb-tensor-server` CLI launcher is the authoritative entry point: it
-scans the configured data folders and calls `mark_ready()` after registration
-completes. Code that drives `TensorFlightServer` directly (as above) is
-responsible for calling `mark_ready()` itself once its sources are registered.
+The `biopb-tensor-server` CLI launcher is the authoritative entry point. Code
+that drives `TensorFlightServer` directly (as above) is responsible for calling
+`mark_ready()` itself once it is ready to serve.
+
+**Progressive discovery (biopb/biopb#212).** `mark_ready()` / `SERVING` means
+"up and serving the **possibly-still-populating** catalog," *not* "the data
+folder scan finished." The CLI launcher reaches `SERVING` immediately and runs
+the monitored bootstrap scan in the background (the watcher fires its first
+rescan at once); the catalog grows *within* that scan as each source is claimed
+(see Directory Monitoring below). Catalog *freshness* is therefore a separate
+signal carried by two `health` fields, not by `SERVING`:
+
+- `full_scan_in_progress` (bool) — a full catalog rescan is running right now.
+- `last_full_scan_finished_at` (epoch seconds, or `null` until the first full
+  scan succeeds) — when the catalog was last fully reconciled. A periodic full
+  rescan advances it, so boot and steady state share one mechanism.
+
+A client that needs a complete catalog waits on these fields, not on `SERVING`;
+a client that just needs "is the port up" still uses `SERVING`. (A static-only
+config has nothing to scan, so the launcher stamps `last_full_scan_finished_at`
+directly and `full_scan_in_progress` stays `false`.)
 
 Sources are keyed by `source_id`. Each source maps to one `BackendAdapter`
 which may expose multiple tensors (e.g., multi-field).
@@ -285,9 +302,9 @@ Lightweight claim object using `__slots__` for memory efficiency when scanning l
 
 ```python
 class SourceClaim:
-    __slots__ = ('source_type', 'primary_path', 
+    __slots__ = ('source_type', 'primary_path',
                  'source_id', 'dim_labels', 'extra_config', 'is_remote')
-    
+
     source_type: str      # "zarr", "ome-tiff", "hdf5", etc.
     primary_path: str     # Main entry point (str for URL support)
     source_id: str        # Auto-generated from URL hash
@@ -337,7 +354,7 @@ class DiscoveryState:
     path_to_source: Dict[Path, str]          # primary_path → source_id
     consumed_paths: Set[Path]                # all claimed paths
     visited_identities: Set[str]             # inode-based dedup
-    
+
     on_source_added: Callable[[SourceClaim], None]   # Callback
     on_source_removed: Callable[[str], None]         # Callback
 ```
@@ -347,6 +364,21 @@ class DiscoveryState:
 **Modules:** `biopb_tensor_server.watcher`, `biopb_tensor_server.source_manager`
 
 Periodic monitoring for configured directories. On each rescan interval, the catalog reconciles against a fresh stable snapshot of the monitored trees.
+
+**Startup is progressive (biopb/biopb#212).** The bootstrap scan is **not** run
+synchronously before the server serves: the launcher reaches `SERVING`
+immediately, `PeriodicRescanWatcher` fires its first rescan at once
+(`initial_immediate=True`), and the scan runs on the SourceManager's event-loop
+thread. The **first** full scan also *streams* its additions — each source is
+registered the moment the walk claims it (`SourceManager._stream_first_scan_add`
+wired as the discovery state's `on_source_added`) rather than batching at
+end-of-walk — so the catalog (and `health.source_count`) grows during the scan.
+This is safe only for the first scan (empty + force-full ⇒ no removals to diff);
+steady-state rescans keep the snapshot-diff reconcile. `_handle_rescan` pushes
+`full_scan_in_progress` around a force-full pass and advances
+`last_full_scan_finished_at` on success; the first success also flips the
+internal `_initial_scan_done` gate (startup sources warm via the precache
+*backlog*; live additions thereafter prompt-enqueue).
 
 #### Architecture
 
@@ -422,7 +454,7 @@ Coordinates watcher, discovery, and server catalog updates:
 class SourceManager:
     def start() → None    # Start event processing thread
     def stop() → None     # Stop thread and clean up
-    
+
     # Callbacks (set on DiscoveryState)
     def _on_source_added(claim)   # Create adapter, register with server
     def _on_source_removed(source_id)  # Unregister from server
