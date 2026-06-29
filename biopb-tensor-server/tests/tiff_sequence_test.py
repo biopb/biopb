@@ -1,12 +1,15 @@
-"""Tests for TiffSequenceAdapter file-grouping / claiming logic.
+"""Tests for TiffSequenceAdapter claiming + stack-all behavior (#215).
 
-Covers the single-varying-numeric-field grouping introduced to replace the old
-"last number + equal file size" heuristic:
-- numeric index anywhere in the name, with constant numeric tokens ignored
-- compressed sequences with differing file sizes are still claimed
-- dimension consistency is verified lazily in __init__, not in claim()
-- multi-varying-field directories are rejected
-- off-pattern sibling files are ignored, not fatal
+Stack-all policy: every uniformly-shaped TIFF in a directory is stacked along an
+opaque file axis (label ``i``); the axis's semantic structure (channel / time /
+site / z) is NOT inferred. Per-file names are exposed via get_metadata() for a
+downstream agent to interpret. Covered here:
+- claim is metadata-free and no longer needs a single varying numeric field;
+  multi-field names (index x channel, MetaMorph ``_w/_s/_t``) are claimed too
+- the dominant *shape* bucket is stacked; odd-shaped/dtype/page siblings are not
+  stacked but ARE surfaced in metadata (nothing silently dropped)
+- uppercase ``.TIF`` extensions are matched (MetaMorph and friends)
+- the retained _group_tiff_sequence helper (single-field ordering reference)
 """
 
 import tempfile
@@ -15,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.tiff import (
     TiffSequenceAdapter,
     _group_tiff_sequence,
@@ -46,8 +50,8 @@ def _claim(tmpdir):
 
 
 class TestTiffSequenceClaim:
-    def test_claim_middle_varying_field_with_constant_token(self):
-        """`s1-NNNN_bf.tif`: constant `s1` ignored, NNNN is the index."""
+    def test_claim_single_field_sequence(self):
+        """`s1-NNNN_bf.tif`: a plain sequence is claimed (dir is the boundary)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             files = [Path(tmpdir) / f"s1-{i:04d}_bf.tif" for i in range(1, 6)]
             for j, f in enumerate(files):
@@ -58,9 +62,6 @@ class TestTiffSequenceClaim:
             assert claim is not None
             assert claim.source_type == "tiff-sequence"
             assert claim.primary_path == str(tmpdir)
-            # Dir-claiming policy: the directory is the dataset boundary and the
-            # only recorded member; the interior TIFFs are covered by the dir's
-            # subtree prune, not enumerated individually.
             assert str(tmpdir) in state.consumed_paths
             assert claim.member_paths == {str(tmpdir)}
 
@@ -77,85 +78,63 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is not None
 
-            # Same-shaped pixels -> instantiation succeeds.
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert len(adapter._tiff_files) == 5
 
-    def test_inconsistent_dimensions_claimed_but_init_raises(self):
-        """Template matches -> claim() ok; mismatched Y/X -> __init__ raises."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", shape=(8, 8), seed=i)
-            # One file with a different spatial shape.
-            _write_tiff(Path(tmpdir) / "s1-0005_bf.tif", shape=(16, 16), seed=99)
-
-            claim, _ = _claim(tmpdir)
-            assert claim is not None  # claim() is metadata-free
-
-            with pytest.raises(ValueError, match="Inconsistent TIFF dimensions"):
-                TiffSequenceAdapter(str(tmpdir), "sid")
-
-    def test_trailing_constant_number_orders_by_middle_field(self):
-        """`s1-NNNN_bf2.tif`: trailing constant `2` ignored; order by NNNN."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files = [Path(tmpdir) / f"s1-{i:04d}_bf2.tif" for i in range(1, 5)]
-            for j, f in enumerate(files):
-                _write_tiff(f, seed=j)
-
-            claim, _ = _claim(tmpdir)
-            assert claim is not None
-
-            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tif")))
-            assert [f.name for f in ordered] == [
-                "s1-0001_bf2.tif",
-                "s1-0002_bf2.tif",
-                "s1-0003_bf2.tif",
-                "s1-0004_bf2.tif",
-            ]
-
-    def test_no_claim_multiple_varying_fields(self):
-        """Two numeric fields varying together -> not a 1-D sequence -> reject."""
+    def test_claim_multi_field_filenames(self):
+        """Stack-all (#215): two numeric fields varying together no longer block
+        the claim -- the directory is claimed and the files stacked, with the
+        agent left to interpret the axis from the names."""
         with tempfile.TemporaryDirectory() as tmpdir:
             names = ["r1-c1_x.tif", "r2-c2_x.tif", "r3-c3_x.tif"]
             for j, n in enumerate(names):
                 _write_tiff(Path(tmpdir) / n, seed=j)
 
             claim, _ = _claim(tmpdir)
-            assert claim is None
-            assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
-
-    def test_sibling_non_numbered_ignored(self):
-        """A digit-less sibling does not reject the directory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            seq = [Path(tmpdir) / f"ND{i:03d}_aligned.tiff" for i in range(4)]
-            for j, f in enumerate(seq):
-                _write_tiff(f, seed=j)
-            readme = Path(tmpdir) / "readme.tif"
-            _write_tiff(readme, seed=42)
-
-            claim, state = _claim(tmpdir)
             assert claim is not None
-            # Dir-claiming: the directory is the recorded member; the digit-less
-            # readme.tif neither rejects the claim nor is itself catalogued (the
-            # dir-claim prunes the whole subtree).
-            assert claim.member_paths == {str(tmpdir)}
-            assert str(readme) not in state.consumed_paths
+            assert claim.source_type == "tiff-sequence"
 
-    def test_regression_end_number_pattern(self):
-        """Original supported pattern still works and orders numerically."""
+    def test_claim_metamorph_channel_site_time(self):
+        """The driving #215 example: `..._w<c>NAME_s<s>_t<t>.TIF` (MetaMorph).
+
+        Multi-axis names + uppercase extension are claimed and stacked; the
+        per-file names reach the agent via get_metadata for reshape/relabel.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in (2, 0, 1):  # write out of order
-                _write_tiff(Path(tmpdir) / f"ND{i:03d}_aligned.tiff", seed=i)
+            for ch in ("w1DIC", "w2GFP"):
+                for s in (1, 2):
+                    for t in (1, 2, 10):
+                        _write_tiff(
+                            Path(tmpdir) / f"07122017_Sample2_{ch}_s{s}_t{t}.TIF",
+                            seed=t,
+                        )
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
+            assert claim.source_type == "tiff-sequence"
 
-            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tiff")))
-            assert [f.name for f in ordered] == [
-                "ND000_aligned.tiff",
-                "ND001_aligned.tiff",
-                "ND002_aligned.tiff",
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape == [12, 8, 8]
+            assert adapter.dim_labels == ["i", "y", "x"]
+            files = adapter.get_metadata()["files"]
+            assert len(files) == 12
+            # Natural order: t1, t2, t10 within a (channel, site) group.
+            assert files[:3] == [
+                "07122017_Sample2_w1DIC_s1_t1.TIF",
+                "07122017_Sample2_w1DIC_s1_t2.TIF",
+                "07122017_Sample2_w1DIC_s1_t10.TIF",
             ]
+
+    def test_uppercase_tif_extension_claimed(self):
+        """Case-insensitive extension match: a folder of `.TIF` is claimed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                _write_tiff(Path(tmpdir) / f"frame_{i}.TIF", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape[0] == 3
 
     def test_no_claim_fewer_than_three(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -165,13 +144,53 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is None
 
+    def test_no_claim_incoherent_grab_bag(self):
+        """Coherence gate: unrelated filenames (no shared template or stem) are
+        not welded into one tensor -- left to per-file fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for n in ("logo.tif", "figure3.tif", "scalebar.tif"):
+                _write_tiff(Path(tmpdir) / n, seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+
+    def test_no_claim_bare_channel_tokens(self):
+        """Accepted limitation: a no-number, no-stem channel set (bare
+        red/green/blue.tif) is indistinguishable from a grab-bag by filename
+        alone, so it is not claimed (graceful miss, never a wrong tensor)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for c in ("red", "green", "blue"):
+                _write_tiff(Path(tmpdir) / f"{c}.tif", seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+
+    def test_claim_short_stem_numbered_sequence(self):
+        """A numbered sequence with a tiny stem (a1/a2/a3) coheres via its shared
+        digit-template even though the common prefix is only one char."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                _write_tiff(Path(tmpdir) / f"a{i}.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+
+    def test_claim_indexed_channel_tokens(self):
+        """An indexed channel set (sp_0001_{red,green,blue}) coheres via its
+        shared stem even though no single digit-template is a majority."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for c in ("red", "green", "blue"):
+                _write_tiff(Path(tmpdir) / f"sp_0001_{c}.tif", seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+
     def test_claim_when_micromanager_metadata_present(self):
         """A metadata.txt no longer blocks the claim.
 
         MicroManagerLegacyAdapter has higher priority and prunes any valid MM
         dataset before this adapter runs, so a metadata.txt that reaches here is
-        one MM could not parse (e.g. truncated from an aborted acquisition). The
-        sequence claim is the wanted fallback instead of N per-frame sources.
+        one MM could not parse (e.g. truncated from an aborted acquisition).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 5):
@@ -183,11 +202,7 @@ class TestTiffSequenceClaim:
             assert claim.source_type == "tiff-sequence"
 
     def test_claim_micromanager_img_frames_without_metadata(self):
-        """img_* single-frame sequences (no metadata) are claimed as one source.
-
-        Regression: these previously fell through every directory adapter and the
-        walk registered each frame as its own per-file aics source.
-        """
+        """img_* single-frame sequences (no metadata) are claimed as one source."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(4):
                 _write_tiff(Path(tmpdir) / f"img_{i:09d}__000.tif", seed=i)
@@ -217,8 +232,8 @@ class TestTiffSequenceClaim:
 
     def test_claim_ome_tiff_directory_under_cloud(self):
         """Under a cloud root OmeTiffAdapter is disabled, so the OME guards lift
-        and a folder of .ome.tif is grouped into one sequence (claimed unresolved)
-        instead of degrading to one per-file source per frame."""
+        and a folder of .ome.tif is claimed (unresolved) instead of degrading to
+        one per-file source per frame."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 5):
                 _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
@@ -241,57 +256,177 @@ class TestTiffSequenceClaim:
             assert claim is not None
             assert claim.source_type == "tiff-sequence"
 
-    def test_init_matches_claim_order(self):
-        """__init__ file order equals the claimed member order."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files = [Path(tmpdir) / f"s1-{i:04d}_bf.tif" for i in range(1, 6)]
-            for j, f in enumerate(files):
-                _write_tiff(f, seed=j)
 
-            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tif")))
+class TestTiffSequenceStackAll:
+    def test_stacks_all_uniform_files_with_provenance(self):
+        """All uniform files stack; metadata.files is index-aligned to axis 0."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            names = [f"sp29_{i:04d}_{c}.tif" for i in range(1, 4) for c in "rgb"]
+            for j, n in enumerate(names):
+                _write_tiff(Path(tmpdir) / n, seed=j)
+
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter._tiff_files == ordered
+            assert adapter.full_shape == [9, 8, 8]
+            assert adapter.dim_labels == ["i", "y", "x"]
+            md = adapter.get_metadata()
+            assert len(md["files"]) == 9
+            assert "unstacked_files" not in md
+            # index-aligned: metadata order == stacked file order
+            assert md["files"] == [p.name for p in adapter._tiff_files]
 
-
-class TestTiffSequenceInit:
-    def test_empty_directory_raises(self):
-        """A directory with no valid sequence -> __init__ raises ValueError."""
+    def test_only_page_count_splits_the_stack(self):
+        """Page count is the one un-normalizable mismatch -> a different-page file
+        is a sibling. Differing shape and dtype are normalized into the stack
+        (#198), not demoted."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="No TIFF sequence found"):
-                TiffSequenceAdapter(str(tmpdir), "sid")
-
-    def test_inconsistent_dtype_raises(self):
-        """A file with a different dtype -> __init__ raises ValueError."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 4):
-                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
-            # uint8 instead of the uint16 the others use
-            tifffile.imwrite(
-                str(Path(tmpdir) / "s1-0004_bf.tif"),
-                np.zeros((8, 8), dtype=np.uint8),
+            for i in range(4):  # (8,8) uint16 single-page
+                _write_tiff(Path(tmpdir) / f"frame_{i}.tif", seed=i)
+            _write_tiff(Path(tmpdir) / "frame_big.tif", shape=(16, 16), seed=9)
+            tifffile.imwrite(  # different dtype -> promoted, not demoted
+                str(Path(tmpdir) / "frame_u8.tif"), np.zeros((8, 8), np.uint8)
             )
-            with pytest.raises(ValueError, match="Inconsistent TIFF dtype"):
-                TiffSequenceAdapter(str(tmpdir), "sid")
+            tifffile.imwrite(  # different page count -> the only sibling
+                str(Path(tmpdir) / "frame_zstack.tif"),
+                np.zeros((4, 8, 8), np.uint16),
+                photometric="minisblack",
+            )
 
-    def test_inconsistent_page_count_raises(self):
-        """A file with a different page count -> __init__ raises ValueError."""
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            # 6 single-page files stacked, padded to the max plane, promoted dtype
+            assert adapter.full_shape == [6, 16, 16]
+            assert adapter._dtype == "uint16"
+            assert adapter.get_metadata()["unstacked_files"] == ["frame_zstack.tif"]
+
+    def test_dtype_promotes_up_never_down(self):
+        """The descriptor takes the widest dtype; a uint16 value survives a
+        uint8 sibling instead of clipping (#198)."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 4):
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_0.tif"), np.full((8, 8), 5, np.uint8)
+            )
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_1.tif"), np.full((8, 8), 300, np.uint16)
+            )
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_2.tif"), np.full((8, 8), 7, np.uint8)
+            )
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter._dtype == "uint16"
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert out.dtype == np.uint16
+            assert int(out[0, 0, 0]) == 5  # uint8 frame upcast
+            assert int(out[1, 0, 0]) == 300  # uint16 value not clipped to 255
+
+    def test_smaller_frame_zero_padded(self):
+        """A frame smaller than the max plane reads back zero-padded (#198)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_0.tif"), np.full((4, 4), 7, np.uint16)
+            )
+            for i in (1, 2):
                 tifffile.imwrite(
-                    str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"),
-                    np.zeros((4, 8, 8), dtype=np.uint16),
-                    photometric="minisblack",
+                    str(Path(tmpdir) / f"img_{i}.tif"), np.full((8, 8), 3, np.uint16)
                 )
-            # single-page file among multi-page ones
-            tifffile.imwrite(
-                str(Path(tmpdir) / "s1-0004_bf.tif"),
-                np.zeros((8, 8), dtype=np.uint16),
-            )
-            with pytest.raises(ValueError, match="Inconsistent TIFF page count"):
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape == [3, 8, 8]
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert int(out[0, 0, 0]) == 7 and int(out[0, 3, 3]) == 7  # data
+            assert int(out[0, 4, 4]) == 0 and int(out[0, 7, 7]) == 0  # padding
+            assert (out[1] == 3).all()  # full-size frame intact
+
+    def test_init_rejects_incoherent_names(self):
+        """The coherence gate runs at resolve too: an explicit source pointed at
+        a grab-bag raises rather than welding it into a tensor."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for n in ("logo.tif", "figure3.tif", "scalebar.tif"):
+                _write_tiff(Path(tmpdir) / n, seed=1)
+
+            with pytest.raises(ValueError, match="do not look like one sequence"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
+
+    def test_same_shape_sibling_is_stacked_and_listed(self):
+        """A same-shape digit-less sibling (e.g. readme.tif) is physically
+        stackable, so it IS stacked -- and visible in metadata for the agent to
+        disregard. (Contrast the old behavior, which silently ignored it.)"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(4):
+                _write_tiff(Path(tmpdir) / f"ND{i:03d}_aligned.tiff", seed=i)
+            _write_tiff(Path(tmpdir) / "readme.tif", seed=42)
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape[0] == 5
+            assert "readme.tif" in adapter.get_metadata()["files"]
+
+    def test_unreadable_tiff_listed_as_unstacked(self):
+        """A corrupt/unreadable TIFF is not stacked but is surfaced, not fatal."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                _write_tiff(Path(tmpdir) / f"frame_{i}.tif", seed=i)
+            (Path(tmpdir) / "truncated.tif").write_bytes(b"II*\x00garbage")
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape[0] == 3
+            assert "truncated.tif" in adapter.get_metadata()["unstacked_files"]
+
+    def test_transport_error_propagates_not_demoted(self, monkeypatch):
+        """An OSError while reading a member (e.g. a failed cloud recall) is
+        re-raised, not swallowed into a silently-undersized stack. Contrast a
+        corrupt file, which demotes (see test_unreadable_tiff_listed_as_unstacked).
+        """
+        import tifffile as tff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                _write_tiff(Path(tmpdir) / f"img_{i}.tif", seed=i)
+
+            real_open = tff.TiffFile
+            failing = str(Path(tmpdir) / "img_1.tif")
+
+            def fake_open(path, *a, **k):
+                if str(path) == failing:
+                    raise OSError("simulated recall failure")
+                return real_open(path, *a, **k)
+
+            monkeypatch.setattr(tff, "TiffFile", fake_open)
+            with pytest.raises(OSError, match="simulated recall failure"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
+
+    def test_natural_sort_order(self):
+        """The file axis defaults to numeric-aware order: img_2 before img_10."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in (1, 2, 10):
+                _write_tiff(Path(tmpdir) / f"img_{i}.tif", seed=i)
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.get_metadata()["files"] == [
+                "img_1.tif",
+                "img_2.tif",
+                "img_10.tif",
+            ]
+
+    def test_get_data_returns_ordered_stack(self):
+        """get_data reads the stacked axis in file order (real, ordered data)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(3):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"img_{i}.tif"),
+                    np.full((8, 8), i, dtype=np.uint16),
+                )
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert out.shape == (3, 8, 8)
+            assert [int(out[k, 0, 0]) for k in range(3)] == [0, 1, 2]
+
+    def test_empty_directory_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="No TIFF files found"):
                 TiffSequenceAdapter(str(tmpdir), "sid")
 
     def test_explicit_dim_labels_single_page(self):
-        """Caller-supplied dim_labels are used for single-page files."""
+        """Caller-supplied dim_labels override the default 'i' file axis."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 4):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
@@ -303,27 +438,27 @@ class TestTiffSequenceInit:
             assert adapter.full_shape == [3, 8, 8]
 
     def test_multi_page_files(self):
-        """Multi-page files -> (num_files, pages, Y, X) with t,z,y,x labels."""
+        """Multi-page files -> (num_files, pages, Y, X) with i,z,y,x labels."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 4):
-                data = np.zeros((4, 8, 8), dtype=np.uint16)  # 4 pages
                 tifffile.imwrite(
                     str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"),
-                    data,
+                    np.zeros((4, 8, 8), dtype=np.uint16),
                     photometric="minisblack",
                 )
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.full_shape == [3, 4, 8, 8]
-            assert adapter.dim_labels == ["t", "z", "y", "x"]
+            assert adapter.dim_labels == ["i", "z", "y", "x"]
 
     def test_tiled_tiff(self):
         """Tiled TIFFs drive the tile-info branch and chunk shape."""
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 4):
-                data = np.zeros((32, 32), dtype=np.uint16)
                 tifffile.imwrite(
-                    str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"), data, tile=(16, 16)
+                    str(Path(tmpdir) / f"s1-{i:04d}_bf.tif"),
+                    np.zeros((32, 32), dtype=np.uint16),
+                    tile=(16, 16),
                 )
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
@@ -333,8 +468,10 @@ class TestTiffSequenceInit:
 
 
 class TestGroupHelper:
+    """_group_tiff_sequence is retained (single-field ordering reference); it is
+    no longer the claim gate under stack-all (#215)."""
+
     def test_dominant_mask_wins(self):
-        """Mixed mask families: only the dominant group is returned, sorted."""
         with tempfile.TemporaryDirectory() as tmpdir:
             big = [Path(tmpdir) / f"s1-{i:04d}_bf.tif" for i in range(1, 6)]
             small = [Path(tmpdir) / f"other_{i}.tif" for i in range(3)]
@@ -344,8 +481,26 @@ class TestGroupHelper:
             ordered = _group_tiff_sequence(big + small)
             assert ordered == big
 
+    def test_orders_by_single_varying_field(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in (2, 0, 1):  # write out of order
+                _write_tiff(Path(tmpdir) / f"ND{i:03d}_aligned.tiff", seed=i)
+
+            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tiff")))
+            assert [f.name for f in ordered] == [
+                "ND000_aligned.tiff",
+                "ND001_aligned.tiff",
+                "ND002_aligned.tiff",
+            ]
+
+    def test_multi_varying_field_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            names = ["r1-c1_x.tif", "r2-c2_x.tif", "r3-c3_x.tif"]
+            for j, n in enumerate(names):
+                _write_tiff(Path(tmpdir) / n, seed=j)
+            assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
+
     def test_groups_micromanager_img_frames(self):
-        """img_* frames are grouped (MM exclusion removed -- they are the fallback)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             names = ["img_000.tif", "img_001.tif", "img_002.tif"]
             files = [Path(tmpdir) / n for n in names]
@@ -354,7 +509,6 @@ class TestGroupHelper:
             assert _group_tiff_sequence(files) == files
 
     def test_excludes_ome_off_cloud(self):
-        """.ome.tif names are excluded off cloud (owned by OmeTiffAdapter)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             files = [Path(tmpdir) / f"img_{i:03d}.ome.tif" for i in range(3)]
             for j, f in enumerate(files):
@@ -362,7 +516,6 @@ class TestGroupHelper:
             assert _group_tiff_sequence(files) is None
 
     def test_groups_ome_on_cloud(self):
-        """Under cloud, .ome.tif are grouped (OmeTiffAdapter is disabled there)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             files = [Path(tmpdir) / f"img_{i:03d}.ome.tif" for i in range(3)]
             for j, f in enumerate(files):
