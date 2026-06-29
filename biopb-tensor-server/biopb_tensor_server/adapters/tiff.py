@@ -60,6 +60,13 @@ def _filter_tiff_candidates(files: List[Path], exclude_ome: bool = True) -> List
     return [f for f in files if not any(f.match(p) for p in _TIFF_EXCLUDE_PATTERNS)]
 
 
+# Minimum number of TIFFs for a directory to be claimed as a stacked sequence.
+# Below this a directory is left to per-file fallback. The stack-all policy
+# (#215) no longer requires a single varying numeric field -- any several plain
+# TIFFs are claimed and stacked, with per-file provenance exposed for the agent.
+_MIN_TIFF_FILES = 3
+
+
 def _mask_and_digits(name: str) -> Tuple[str, List[int]]:
     """Split a filename into its structural mask and its numeric fields.
 
@@ -74,10 +81,32 @@ def _mask_and_digits(name: str) -> Tuple[str, List[int]]:
     return mask, digits
 
 
+def _natural_key(name: str) -> List[Tuple[int, Any]]:
+    """Sort key ordering embedded numbers numerically (``img_2`` < ``img_10``).
+
+    Splits ``name`` into alternating digit / non-digit chunks. Each chunk is
+    wrapped as ``(0, int)`` or ``(1, str)`` so numbers sort before text at any
+    position and int/str never compare directly (no ``TypeError`` on names of
+    differing structure). Gives the stacked file axis a sensible *default* order;
+    the authoritative interpretation of that axis is the agent's, via
+    :meth:`TiffSequenceAdapter.get_metadata`.
+    """
+    return [
+        (0, int(t)) if t.isdigit() else (1, t.lower())
+        for t in re.findall(r"\d+|\D+", name)
+    ]
+
+
 def _group_tiff_sequence(
     files: List[Path], exclude_ome: bool = True
 ) -> Optional[List[Path]]:
     """Group plain-TIFF files into one ordered sequence by a single varying field.
+
+    .. note::
+       Retained for unit coverage and as a single-field ordering reference. Under
+       the stack-all policy (#215) it is no longer the claim gate: ``claim`` now
+       claims any directory with enough TIFFs and ``__init__`` stacks the
+       dominant *shape* bucket, delegating axis semantics to the agent.
 
     Files are bucketed by their digit-run mask; the dominant (largest) bucket is
     inspected for exactly one numeric field that varies across its members (all
@@ -145,40 +174,57 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     - Handle 5D/6D coordinate mapping
     - Discover related files via companion files
 
-    Simple axis inference:
-    - (num_files, Y, X) for single-page files -> 't' or 'z'
-    - (num_files, pages, Y, X) for multi-page files -> 't', 'z' or 'c'
+    Stack-all policy (#215): every uniformly-shaped TIFF in the directory is
+    stacked along an opaque file axis (label ``i``); the axis's semantic
+    structure (channel / time / site / z -- e.g. MetaMorph ``_w/_s/_t`` or
+    ``_red/_green/_blue``) is deliberately NOT inferred here. Instead the per-file
+    names are exposed via ``get_metadata`` so a downstream agent can parse them
+    and reshape / relabel. This is metadata-free, never silently drops files
+    (odd-shaped siblings are listed too), and avoids guessing axes wrong.
+
+    Shape:
+    - (num_files, Y, X) for single-page files -> ['i', 'y', 'x']
+    - (num_files, pages, Y, X) for multi-page files -> ['i', 'z', 'y', 'x']
     """
 
     _single_tensor_source = True
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim directories containing plain TIFF file sequences.
+        """Claim directories holding several plain TIFFs (stack-all, #215).
 
-        A sequence is detected (see ``_group_tiff_sequence``) when, among 3+
-        TIFF files sharing a filename template (excluding OME/MicroManager
-        patterns), exactly one numeric field varies across the names; that field
-        orders the sequence and constant numeric tokens are ignored.
+        Claim when at least ``_MIN_TIFF_FILES`` TIFFs are present (excluding OME
+        names owned by OmeTiffAdapter). The previous single-varying-numeric-field
+        requirement is gone: directories whose filenames encode several axes
+        (channel x site x time, ``_red/_green/_blue``, MetaMorph ``_w/_s/_t``) are
+        now claimed too. ``__init__`` stacks the dominant *shape* group and
+        exposes per-file names for the agent to interpret -- no filename-pattern
+        inference, and no silent channel drop.
 
         Claiming is intentionally metadata-free — no per-file reads, so discovery
-        scans stay cheap. Dimension consistency across the files is validated
-        lazily in ``__init__`` (where every file is opened anyway), not here.
+        scans stay cheap. Stackability (shape/dtype/pages) is resolved lazily in
+        ``__init__`` (where every file is opened anyway), not here.
 
         Args:
             ctx: ClaimContext for unified filesystem access
             state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            SourceClaim with directory if sequence detected
+            SourceClaim with directory if enough TIFFs are present
         """
         # Only support local directories for now (remote glob/stat is expensive)
         if ctx.is_remote or not ctx.is_dir():
             return None
 
-        # Gather all TIFF files
-        all_tiffs = list(ctx.glob("*.tif")) + list(ctx.glob("*.tiff"))
-        tiff_files = [t._path for t in all_tiffs]  # Extract underlying Path objects
+        # Gather all TIFF files. Match common extension cases (MetaMorph and
+        # other instrument exports use uppercase ``.TIF``), deduping by path so
+        # case-insensitive filesystems don't double-count. Route through ctx.glob
+        # so the snapshot's cached child listing serves the match (biopb#65).
+        seen: Dict[str, Path] = {}
+        for pat in ("*.tif", "*.tiff", "*.TIF", "*.TIFF"):
+            for t in ctx.glob(pat):
+                seen[str(t._path)] = t._path
+        tiff_files = list(seen.values())
 
         # OME guards arbitrate ownership against the file-level OmeTiffAdapter, and
         # apply only OFF cloud. Under a cloud root OmeTiffAdapter is disabled (it
@@ -203,20 +249,18 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         if exclude_ome and ctx.glob("*.companion.ome"):
             return None
 
-        # Group into a single ordered sequence by the one varying numeric field.
-        # Filename-template based: no per-file metadata reads, so discovery scans
-        # stay cheap. Dimension consistency is verified lazily in __init__, where
-        # every file is opened anyway.
-        sorted_files = _group_tiff_sequence(tiff_files, exclude_ome=exclude_ome)
-        if sorted_files is None:
+        # Stack-all claim gate (#215): enough plain TIFFs present. No filename-
+        # template grouping -- multi-field names are claimed too and sorted out at
+        # read time. Metadata-free: a cheap count, no per-file reads.
+        candidates = _filter_tiff_candidates(tiff_files, exclude_ome=exclude_ome)
+        if len(candidates) < _MIN_TIFF_FILES:
             return None
 
         # Dir-claiming policy (biopb/biopb): the directory IS the dataset
-        # boundary. ``_group_tiff_sequence`` above is still needed to *decide*
-        # whether to claim, but its file list need not be recorded as members:
-        # claiming the dir already prunes its whole subtree, so the interior
-        # TIFFs are never independently walked. Recording the glob would only
-        # duplicate that prune and pin a brittle membership.
+        # boundary. Claiming the dir prunes its whole subtree, so the interior
+        # TIFFs are never independently walked and need not be recorded as
+        # members -- that would only duplicate the prune and pin a brittle
+        # membership.
         state.try_claim_path(ctx.path_str)
 
         # Cloud-storage phase 2 (biopb/biopb#173): ``__init__`` opens EVERY file
@@ -272,28 +316,70 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         self._source_type = "tiff-sequence"
         self._io_lock = threading.Lock()
 
-        # Discover and order the sequence. Unlike claim(), read does NOT exclude
-        # OME-TIFF names (``exclude_ome=False``): the OME exclusion is purely a
-        # claim-time ownership decision (does this directory belong to this adapter
-        # or to the file-level OmeTiffAdapter?). By the time we read, the directory
-        # has already been claimed as a tiff-sequence and its subtree pruned, so
-        # OmeTiffAdapter can never claim those files -- excluding them here would
-        # only drop legitimate frames from a sequence already committed to. Every
-        # TIFF in the claimed directory is therefore a member.
-        all_tiffs = list(self.directory.glob("*.tif")) + list(
-            self.directory.glob("*.tiff")
+        # Gather every TIFF in the claimed directory. Unlike claim(), read does
+        # NOT exclude OME names: the OME exclusion is a claim-time ownership
+        # decision; by now the directory is claimed and its subtree pruned, so
+        # every TIFF here is a member. Natural-sort for a stable, numeric-aware
+        # default order (``img_2`` before ``img_10``); what that order *means* is
+        # the agent's to decide (see get_metadata), not ours.
+        all_tiffs = sorted(
+            (
+                p
+                for p in self.directory.iterdir()
+                if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
+            ),
+            key=lambda p: _natural_key(p.name),
         )
-        sorted_files = _group_tiff_sequence(all_tiffs, exclude_ome=False)
-        if sorted_files is None:
-            raise ValueError(f"No TIFF sequence found in {directory}")
-        self._tiff_files = sorted_files
+        if not all_tiffs:
+            raise ValueError(f"No TIFF files found in {directory}")
 
-        # Open first file to get shape and tile info
-        with tifffile.TiffFile(str(self._tiff_files[0])) as tf:
+        # Stack-all policy (#215). A dense tensor requires its members to share
+        # shape / dtype / page-count -- a *physical* constraint, not a naming one.
+        # Bucket the directory by that stackability signature and take the largest
+        # uniform group as the tensor. Files that do not fit (thumbnails, a max-
+        # projection, an odd overview, an unreadable file) are NOT stacked but
+        # their names are still surfaced via get_metadata(), so the directory is
+        # represented losslessly. We deliberately do not group by filename pattern
+        # or infer what the file axis means (channel / time / site / z): that
+        # ambiguous, metadata-free inference is delegated to the agent, which gets
+        # the per-file names alongside the array. This replaces the old "single
+        # varying field or raise" grouping -- a mismatched file now lands in a
+        # different bucket and becomes a sibling instead of aborting the source.
+        buckets: Dict[Tuple[Any, ...], List[Path]] = {}
+        unreadable: List[Path] = []
+        for p in all_tiffs:
+            try:
+                with tifffile.TiffFile(str(p)) as tf:
+                    page = tf.pages[0]
+                    sig = (
+                        (page.shape[0], page.shape[1]),
+                        str(page.dtype),
+                        len(tf.pages),
+                    )
+            except Exception:
+                unreadable.append(p)
+                continue
+            buckets.setdefault(sig, []).append(p)
+
+        if not buckets:
+            raise ValueError(f"No readable TIFF files in {directory}")
+
+        # Dominant bucket: most files; tie-broken toward the larger frame (so a
+        # thumbnail bucket never wins a tie against the real images), then the
+        # signature itself for determinism.
+        best_sig, members = max(
+            buckets.items(),
+            key=lambda kv: (len(kv[1]), kv[0][0][0] * kv[0][0][1], kv[0]),
+        )
+        (spatial_h, spatial_w), self._dtype, n_pages_per_file = best_sig
+
+        self._tiff_files = members  # members preserve all_tiffs' natural order
+        stacked = set(members)
+        self._unstacked_files = [p for p in all_tiffs if p not in stacked] + unreadable
+
+        # Tile info from a representative member (all members share best_sig).
+        with tifffile.TiffFile(str(members[0])) as tf:
             first_page = tf.pages[0]
-            self._dtype = str(first_page.dtype)
-
-            # Tile info
             if first_page.is_tiled:
                 self.is_tiled = True
                 self.tile_width = first_page.tilewidth
@@ -301,66 +387,26 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                 self._spatial_chunk = [self.tile_length, self.tile_width]
             else:
                 self.is_tiled = False
-                self._spatial_chunk = [first_page.shape[0], first_page.shape[1]]
+                self._spatial_chunk = [spatial_h, spatial_w]
 
-            # Pages per file
-            n_pages_per_file = len(tf.pages)
+        # Members share best_sig by construction, so the per-file map needs no
+        # re-validation: bucketing already subsumes the old dimension/dtype/page
+        # consistency checks.
+        self._file_ifd_map = [(p, n_pages_per_file) for p in members]
 
-        spatial_shape = (first_page.shape[0], first_page.shape[1])
-
-        # Build file index map: (file_path, n_pages). We open every file here
-        # anyway, so verify the sequence is uniform at near-zero extra cost —
-        # this is the real consistency check that replaces the old (size-based)
-        # proxy in claim(). The descriptor's dtype / pages-per-file and
-        # get_data()'s stacking all assume the first file is representative, so
-        # spatial shape, dtype, and page count must match across the sequence.
-        self._file_ifd_map = []
-        for file_path in self._tiff_files:
-            with tifffile.TiffFile(str(file_path)) as tf:
-                page = tf.pages[0]
-                n_pages = len(tf.pages)
-                if (page.shape[0], page.shape[1]) != spatial_shape:
-                    raise ValueError(
-                        f"Inconsistent TIFF dimensions in {directory}: "
-                        f"{file_path.name} is {page.shape[:2]}, expected "
-                        f"{spatial_shape}"
-                    )
-                if str(page.dtype) != self._dtype:
-                    raise ValueError(
-                        f"Inconsistent TIFF dtype in {directory}: "
-                        f"{file_path.name} is {page.dtype}, expected {self._dtype}"
-                    )
-                if n_pages != n_pages_per_file:
-                    raise ValueError(
-                        f"Inconsistent TIFF page count in {directory}: "
-                        f"{file_path.name} has {n_pages} pages, expected "
-                        f"{n_pages_per_file}"
-                    )
-                self._file_ifd_map.append((file_path, n_pages))
-
-        # Determine shape and dim labels
-        # Shape: (num_files, pages_per_file, Y, X) or (num_files, Y, X)
-        n_files = len(self._tiff_files)
-
-        # Get spatial shape from first page (not series, which may include page dimension)
-        spatial_shape = [first_page.shape[0], first_page.shape[1]]
-
+        n_files = len(members)
+        spatial_shape = [spatial_h, spatial_w]
         if n_pages_per_file > 1:
-            # Multi-page files: (num_files, pages, Y, X)
+            # Multi-page files: (num_files, pages, Y, X). File axis is opaque;
+            # page axis keeps the conventional 'z' default.
             self.full_shape = [n_files, n_pages_per_file] + spatial_shape
             self.chunk_shape = [1, 1] + self._spatial_chunk
-            if dim_labels:
-                self.dim_labels = dim_labels
-            else:
-                self.dim_labels = ["t", "z", "y", "x"]
+            self.dim_labels = dim_labels if dim_labels else ["i", "z", "y", "x"]
         else:
-            # Single-page files: (num_files, Y, X)
+            # Single-page files: (num_files, Y, X). 'i' = opaque file/stack axis.
             self.full_shape = [n_files] + spatial_shape
             self.chunk_shape = [1] + self._spatial_chunk
-            if dim_labels:
-                self.dim_labels = dim_labels
-            else:
-                self.dim_labels = ["t", "y", "x"]
+            self.dim_labels = dim_labels if dim_labels else ["i", "y", "x"]
 
         # Total IFDs for coordinate mapping
         self._total_ifds = sum(n for _, n in self._file_ifd_map)
@@ -471,8 +517,21 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             return result
 
     def get_metadata(self) -> dict:
-        """Return empty dict (no metadata for plain TIFF sequences)."""
-        return {}
+        """Expose per-file provenance so the agent can interpret the file axis.
+
+        The file axis (label ``i``) is an opaque stack of every uniformly-shaped
+        TIFF in the directory; its semantic structure (channel / time / site / z
+        -- e.g. MetaMorph ``_w/_s/_t`` or ``_red/_green/_blue``) is intentionally
+        NOT inferred here. ``files`` lists the stacked members index-aligned to
+        axis 0, so a downstream agent can parse the names and reshape / relabel as
+        needed. ``unstacked_files`` lists TIFFs in the directory that did not fit
+        the dominant shape (thumbnails, projections, unreadable files) -- present
+        for completeness so nothing is silently dropped.
+        """
+        md: Dict[str, Any] = {"files": [p.name for p in self._tiff_files]}
+        if self._unstacked_files:
+            md["unstacked_files"] = [p.name for p in self._unstacked_files]
+        return md
 
 
 # =============================================================================
