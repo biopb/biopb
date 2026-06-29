@@ -1,6 +1,6 @@
 # Config Format Migration — TOML → JSON (coexistence phase)
 
-**Status:** Read-side coexistence implemented; installer/generator + validation deferred
+**Status:** Phases 1–2 done — read-side JSON/TOML coexistence (`biopb._config_location` + TOML deprecation warning) and warn-level value validation (`_CONSTRAINTS`, `config.py`). Phase 3 deferred — installer still writes TOML (`install/biopb-engine.ps1`); JSON Schema emitter not built.
 **Component:** `biopb-tensor-server` (config), `biopb` umbrella CLI, `biopb-mcp`
 **Tracking:** biopb/biopb#34 (the agreed plan lives in that issue's first comment)
 

@@ -1,6 +1,9 @@
 # Plan: Writable, readable, ephemeral zarr arrays on the tensor server
 
-Status: proposal
+Status: proposal — not implemented. The upload facility it builds on exists
+(`create_source` / `do_put` / `upload_status`, with `cache:` and `ome_zarr:`
+source types in `server.py`); the `scratch:` ephemeral-zarr type, `delete_source`,
+and the idle/TTL lifecycle proposed here are not yet built.
 Scope: `biopb-tensor-server` (server + Python SDK client)
 Related: `biopb/biopb#8` (read-grid decoupling), the upload facility
 (`create_source` / `do_put` / `upload_status`).
