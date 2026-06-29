@@ -226,6 +226,17 @@ class TensorFlightServer(flight.FlightServerBase):
         # disk/recall pressure. Guarded by the activity lock (cheap, uncontended).
         self._warming: set = set()
 
+        # Catalog-freshness signals for the ``health`` action (progressive
+        # discovery, biopb/biopb#212). ``SERVING`` only means "up and serving the
+        # possibly-still-populating catalog"; these two fields carry *how fresh*
+        # the catalog is. Written by the SourceManager's single event-loop thread
+        # via the setters below, read from gRPC handler threads -- guarded by a
+        # dedicated lock so a health read never contends with catalog/activity
+        # locks. ``None`` until the first full scan succeeds.
+        self._scan_status_lock = threading.Lock()
+        self._full_scan_in_progress = False
+        self._last_full_scan_at: Optional[float] = None
+
     @contextlib.contextmanager
     def _serving_request(self):
         """Mark a heavy read in flight for its duration (precache idle signal)."""
@@ -261,6 +272,24 @@ class TensorFlightServer(flight.FlightServerBase):
     def is_ready(self) -> bool:
         """Whether initial source registration has completed."""
         return self._ready.is_set()
+
+    def set_full_scan_in_progress(self, in_progress: bool) -> None:
+        """Record whether a full catalog rescan is running right now.
+
+        Called by the SourceManager around a force-full rescan; surfaced on the
+        ``health`` action so a client can tell "a scan is running" from "idle".
+        """
+        with self._scan_status_lock:
+            self._full_scan_in_progress = bool(in_progress)
+
+    def set_last_full_scan(self, timestamp: float) -> None:
+        """Record the epoch-seconds time a full catalog rescan last succeeded.
+
+        Surfaced on ``health`` as ``last_full_scan_finished_at`` -- the catalog
+        freshness signal that unifies boot with steady-state periodic rescans.
+        """
+        with self._scan_status_lock:
+            self._last_full_scan_at = float(timestamp)
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -572,12 +601,21 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         if action.type == "health":
             uptime_seconds = int(time.time() - self._start_time)
+            with self._scan_status_lock:
+                full_scan_in_progress = self._full_scan_in_progress
+                last_full_scan_at = self._last_full_scan_at
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
                 "source_count": len(self._get_sources_snapshot()),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
+                # Catalog-freshness signals (progressive discovery). ``SERVING``
+                # no longer implies a complete catalog; these say whether a full
+                # scan is running and when one last finished (epoch seconds, or
+                # null until the first full scan succeeds). See biopb/biopb#212.
+                "full_scan_in_progress": full_scan_in_progress,
+                "last_full_scan_finished_at": last_full_scan_at,
             }
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":

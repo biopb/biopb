@@ -46,8 +46,34 @@ def test_health_payload_shape_unchanged():
         "metadata_db_enabled",
         "writable",
         "uptime_seconds",
+        "full_scan_in_progress",
+        "last_full_scan_finished_at",
     ):
         assert key in payload
+
+
+def test_health_freshness_fields_default_inert():
+    """A fresh server reports no scan running and no full scan yet."""
+    server = TensorFlightServer("grpc://localhost:0")
+
+    payload = _health(server)
+    assert payload["full_scan_in_progress"] is False
+    assert payload["last_full_scan_finished_at"] is None
+
+
+def test_health_reflects_scan_status_setters():
+    """The SourceManager-facing setters surface on the next health payload."""
+    server = TensorFlightServer("grpc://localhost:0")
+
+    server.set_full_scan_in_progress(True)
+    assert _health(server)["full_scan_in_progress"] is True
+
+    server.set_last_full_scan(1234.5)
+    server.set_full_scan_in_progress(False)
+
+    payload = _health(server)
+    assert payload["full_scan_in_progress"] is False
+    assert payload["last_full_scan_finished_at"] == 1234.5
 
 
 def test_health_starting_over_the_wire_before_ready():
