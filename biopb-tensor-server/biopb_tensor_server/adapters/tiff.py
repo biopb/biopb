@@ -5,6 +5,7 @@ OME-TIFF files are handled by the aicsimageio adapter.
 """
 
 import json
+import logging
 import re
 import threading
 from pathlib import Path
@@ -24,6 +25,9 @@ from biopb_tensor_server.discovery import (
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
+
+
+logger = logging.getLogger(__name__)
 
 
 # OME-TIFF naming patterns owned by the file-level OmeTiffAdapter. Excluded only
@@ -84,6 +88,12 @@ def _group_tiff_sequence(
     other numeric tokens, e.g. the ``s1`` in ``s1-0001_bf.tif``, must be
     constant). The bucket is sorted by that varying field.
 
+    The dominant bucket must be a strict majority of the candidate files. When it
+    is not -- the hallmark of a second varying field encoded outside the digits,
+    such as a ``red`` / ``green`` / ``blue`` channel token that splits the files
+    into comparably-sized masks -- the directory is rejected rather than claimed
+    on one bucket (which would silently drop the others). See biopb/biopb#196.
+
     ``exclude_ome`` is forwarded to :func:`_filter_tiff_candidates`. claim() sets
     it to ``not ctx.cloud_root`` (OME ownership arbitration vs OmeTiffAdapter);
     read passes ``False`` (the directory is already claimed, so all TIFFs are
@@ -107,6 +117,38 @@ def _group_tiff_sequence(
     best_mask = max(groups, key=lambda m: (len(groups[m]), m))
     members = groups[best_mask]
     if len(members) < 3:
+        return None
+
+    # Split-field guard (biopb/biopb#196). A directory whose filenames encode a
+    # second varying field *outside* the digit runs -- e.g. a channel token like
+    # ``..._red.tif`` / ``..._green.tif`` / ``..._blue.tif`` -- buckets into
+    # several comparably-sized masks that differ only by that token. Picking the
+    # dominant bucket here would stack a single channel and silently drop the
+    # rest: the directory claim prunes the whole subtree, so the other channels
+    # are never surfaced, yielding a plausible-but-wrong single-channel tensor.
+    # Refuse to claim when the dominant bucket is not a strict majority of the
+    # candidates -- i.e. the leftover files are too many to be incidental
+    # off-pattern siblings (readme.tif, a thumbnail). A clear dominant sequence
+    # with a few such siblings still claims (it stays a majority). Building a
+    # real multi-channel tensor is the proper fix (deferred); this is the safety
+    # floor that guarantees no silently-wrong single-channel tensor.
+    if 2 * len(members) <= len(candidates):
+        runners_up = sorted(
+            (m for m in groups if m != best_mask),
+            key=lambda m: (len(groups[m]), m),
+            reverse=True,
+        )
+        logger.warning(
+            "Ambiguous TIFF sequence in %s: dominant filename pattern %r covers "
+            "only %d of %d files; competing patterns %s indicate a second varying "
+            "field (e.g. a channel). Refusing to claim rather than silently "
+            "dropping files -- see biopb/biopb#196.",
+            candidates[0].parent,
+            best_mask,
+            len(members),
+            len(candidates),
+            [f"{m} (x{len(groups[m])})" for m in runners_up[:3]],
+        )
         return None
 
     n_fields = len(members[0][1])  # all members share the mask -> same count

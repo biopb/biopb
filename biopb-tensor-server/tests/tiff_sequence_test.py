@@ -6,6 +6,8 @@ Covers the single-varying-numeric-field grouping introduced to replace the old
 - compressed sequences with differing file sizes are still claimed
 - dimension consistency is verified lazily in __init__, not in claim()
 - multi-varying-field directories are rejected
+- split-field directories (index x channel, text or numeric) are rejected
+  rather than silently stacking one channel (biopb/biopb#196)
 - off-pattern sibling files are ignored, not fatal
 """
 
@@ -123,6 +125,54 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is None
             assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
+
+    def test_no_claim_text_channel_token_split(self):
+        """`..._red/green/blue.tif`: channel token splits files into equal-sized
+        masks; no bucket is a majority -> reject instead of stacking one channel
+        and silently dropping the others (biopb/biopb#196)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                for color in ("red", "green", "blue"):
+                    _write_tiff(Path(tmpdir) / f"sp29_{i:04d}_{color}.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+            assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
+
+    def test_no_claim_two_channel_token_split(self):
+        """Even a 50/50 two-channel split is not a strict majority -> reject."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 5):
+                for color in ("red", "green"):
+                    _write_tiff(Path(tmpdir) / f"sp29_{i:04d}_{color}.tif", seed=i)
+
+            assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
+
+    def test_no_claim_numeric_channel_token(self):
+        """`..._cN.tif`: a numeric channel makes two digit fields vary in one
+        mask -> not a 1-D sequence -> reject (biopb/biopb#196)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                for c in range(3):
+                    _write_tiff(Path(tmpdir) / f"sp29_{i:04d}_c{c}.tif", seed=i)
+
+            assert _group_tiff_sequence(list(Path(tmpdir).glob("*.tif"))) is None
+
+    def test_claim_dominant_majority_with_channel_minority(self):
+        """The nuance: a clear dominant sequence still claims even though a
+        smaller off-pattern bucket exists, as long as it stays a majority."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 8 frames of the real sequence ...
+            for i in range(8):
+                _write_tiff(Path(tmpdir) / f"scan_{i:04d}.tif", seed=i)
+            # ... plus 3 incidental siblings sharing one off-pattern mask.
+            for i in range(3):
+                _write_tiff(Path(tmpdir) / f"preview_{i}.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+            ordered = _group_tiff_sequence(list(Path(tmpdir).glob("*.tif")))
+            assert [f.name for f in ordered] == [f"scan_{i:04d}.tif" for i in range(8)]
 
     def test_sibling_non_numbered_ignored(self):
         """A digit-less sibling does not reject the directory."""
