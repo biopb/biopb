@@ -752,15 +752,16 @@ class TestHydrateAction:
         assert self._row_fraction(w) is None
         w._show_error.assert_not_called()
 
-    def test_failure_reports_modally_and_clears(self, widget, monkeypatch):
-        # A failed hydrate reports via the modal box (#206) and clears the bar.
+    def test_failure_surfaces_inline_and_clears(self, widget, monkeypatch):
+        # Hydrate is a background op (inline bar, no modal), so its failure lands
+        # on the inline error pane -- not the modal _report_failure (#202/#206).
         w, _ = self._arm(widget, monkeypatch, events=[("failed", "disk full")])
         w._warm_source("m")
         assert "m" not in w._warms
         assert self._row_fraction(w) is None
-        w._report_failure.assert_called_once()
-        assert "disk full" in w._report_failure.call_args[0][1]
-        w._show_error.assert_not_called()
+        w._show_error.assert_called_once()
+        assert "disk full" in w._show_error.call_args[0][0]
+        w._report_failure.assert_not_called()
 
     def test_second_start_while_in_flight_is_noop(self, widget, monkeypatch):
         w, workers = self._arm(widget, monkeypatch, events=[])  # stays in flight

@@ -1434,8 +1434,12 @@ class TensorBrowserWidget(QWidget):
             self._set_warm_indicator(source_id, None)  # remove the bar
 
         def _on_failed(message):
+            # Hydrate is a background, unintrusive operation (inline row bar, no
+            # modal progress), so its failure stays on the inline error pane to
+            # match -- unlike the explicit, modal resolve/load paths which report
+            # via _report_failure (biopb/biopb#206).
             _finish()
-            self._report_failure("Hydrate failed", message)
+            self._show_error(f"Hydrate failed: {message}")
 
         worker.progress.connect(_on_progress)
         worker.warmed.connect(lambda _done: _finish())
