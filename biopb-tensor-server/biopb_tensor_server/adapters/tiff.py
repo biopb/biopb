@@ -206,6 +206,37 @@ def _group_tiff_sequence(
     return [f for f, _ in members]
 
 
+def _resolve_aszarr_axes(axes: str, ndim: int) -> Tuple[int, int, Optional[int]]:
+    """Locate the (Y, X, page) axes within a ``series[0].aszarr()`` array.
+
+    tifffile orders a series' axes as ``[sequence…] Y X [samples]``: an IFD/page
+    *sequence* axis (present only when a file holds several pages) leads, the
+    spatial pair ``Y X`` sits in the middle, and a *samples* axis (``S``/``Q`` --
+    RGB, or a singleton extrasample) trails ``X``. So the spatial pair is NOT
+    reliably the last two dims: a trailing samples axis (``YXS``/``YXQ``, e.g.
+    what ``imwrite`` produces from a ``(Y, X, 1)`` array) pushes ``shape[-2:]``
+    onto ``(X, samples)``. Reading off that mistaken pair, and then treating the
+    3-D shape as ``(page, Y, X)``, collapses each plane to a single column
+    (biopb/biopb#220). Keying off the axes string instead is read-free and
+    matches the descriptor, which already takes ``Y``/``X`` from ``page.shape[:2]``.
+
+    Returns ``(y_ax, x_ax, page_ax)``; ``page_ax`` is the leading sequence axis,
+    or ``None`` for a single-page file. The caller fixes every other (samples)
+    axis at index 0.
+    """
+    a = axes.upper()
+    if "Y" in a and "X" in a:
+        y_ax, x_ax = a.index("Y"), a.index("X")
+    else:  # opaque axes -> fall back to the legacy "spatial pair is last two"
+        y_ax, x_ax = ndim - 2, ndim - 1
+    # The page/sequence axis (if any) precedes the spatial pair; samples trail it.
+    page_ax = next(
+        (i for i in range(ndim) if i not in (y_ax, x_ax) and i < min(y_ax, x_ax)),
+        None,
+    )
+    return y_ax, x_ax, page_ax
+
+
 # =============================================================================
 # TiffSequenceAdapter - Plain TIFF sequences (no metadata)
 # =============================================================================
@@ -512,7 +543,9 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     def _read_padded_plane(
         self,
         zarr_arr: Any,
-        zarr_ndim: int,
+        y_ax: int,
+        x_ax: int,
+        page_ax: Optional[int],
         page_idx: int,
         y_slice: slice,
         x_slice: slice,
@@ -525,6 +558,11 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         typed as the descriptor dtype, so a frame smaller than the per-axis max
         (``fh`` x ``fw`` is *this* file's plane size) reads back zero-padded and a
         narrower-dtype frame is cast up. Returns a ``(out_h, out_w)`` array.
+
+        ``y_ax`` / ``x_ax`` / ``page_ax`` are positions within ``zarr_arr`` as
+        resolved by :func:`_resolve_aszarr_axes` -- not assumed to be the last
+        two / leading axis -- so a trailing samples axis (``YXS``/``YXQ``) is
+        indexed at 0 instead of being mistaken for ``X`` (biopb/biopb#220).
         """
         ys = y_slice.start or 0
         ye = y_slice.stop if y_slice.stop is not None else fh
@@ -533,10 +571,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         plane = np.zeros((ye - ys, xe - xs), dtype=self._dtype)
         ry, rx = min(ye, fh), min(xe, fw)
         if ry > ys and rx > xs:
-            if zarr_ndim == 2:
-                data = zarr_arr[ys:ry, xs:rx]
-            else:
-                data = zarr_arr[page_idx, ys:ry, xs:rx]
+            index: List[Any] = [0] * zarr_arr.ndim
+            index[y_ax] = slice(ys, ry)
+            index[x_ax] = slice(xs, rx)
+            if page_ax is not None:
+                index[page_ax] = page_idx
+            data = zarr_arr[tuple(index)]
+            if y_ax > x_ax:  # tifffile emits Y before X; transpose if ever not
+                data = data.T
             plane[: ry - ys, : rx - xs] = data
         return plane
 
@@ -604,15 +646,20 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             for file_idx in file_indices:
                 file_path, n_pages_in_file = self._file_ifd_map[file_idx]
                 with tifffile.TiffFile(str(file_path)) as tf:
-                    zarr_arr = zarr.open_array(tf.series[0].aszarr(), mode="r")
-                    zarr_ndim = len(zarr_arr.shape)
-                    fh, fw = zarr_arr.shape[-2], zarr_arr.shape[-1]
+                    series = tf.series[0]
+                    zarr_arr = zarr.open_array(series.aszarr(), mode="r")
+                    y_ax, x_ax, page_ax = _resolve_aszarr_axes(
+                        series.axes, zarr_arr.ndim
+                    )
+                    fh, fw = zarr_arr.shape[y_ax], zarr_arr.shape[x_ax]
                     for page_idx in page_indices:
                         if page_idx < n_pages_in_file:
                             result_pages.append(
                                 self._read_padded_plane(
                                     zarr_arr,
-                                    zarr_ndim,
+                                    y_ax,
+                                    x_ax,
+                                    page_ax,
                                     page_idx,
                                     y_slice,
                                     x_slice,
