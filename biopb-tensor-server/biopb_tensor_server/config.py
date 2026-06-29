@@ -74,6 +74,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+# Config file location & format preference live in the core `biopb` package so
+# the umbrella CLI and biopb-mcp share one definition (all three depend on
+# `biopb`). Re-exported for back-compat (`biopb_tensor_server.config.find_config`
+# and the name constants). See biopb._config_location for the JSON-canonical
+# rationale (biopb/biopb#34).
+from biopb._config_location import (
+    CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
+    DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
+    LEGACY_CONFIG_NAME as LEGACY_CONFIG_NAME,
+    find_config as find_config,
+)
+
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
@@ -100,56 +112,6 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
-
-
-# --- Config file location & format (biopb/biopb#34) ---------------------------
-#
-# JSON is the *canonical* on-disk format going forward: the config is
-# machine-generated (the installer / a future generator write it), and once
-# nobody hand-edits it, TOML's hand-editing ergonomics (comments, [[sources]])
-# stop paying for its one wart -- no stdlib *writer*. JSON has a stdlib writer on
-# both ends (Python `json.dumps`, PowerShell `ConvertTo-Json`), unifies the
-# format with biopb-mcp's `config.json`, and pairs with JSON Schema for
-# validation. TOML stays *readable* through a deprecation window so no existing
-# `biopb.toml` breaks on upgrade; only the read step is format-aware
-# (`parse_config` operates on a plain dict, so the data model is untouched).
-DEFAULT_CONFIG_DIR = Path.home() / ".config" / "biopb"
-CANONICAL_CONFIG_NAME = "biopb.json"
-LEGACY_CONFIG_NAME = "biopb.toml"
-
-
-def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
-    """Resolve the config file in *config_dir*, preferring JSON over TOML.
-
-    Returns the first of ``biopb.json`` / ``biopb.toml`` that exists. When
-    neither exists, returns the canonical JSON path so callers seed / print the
-    forward-looking name. Callers that need a guaranteed-existing file should
-    still check ``.exists()`` on the result.
-
-    When *both* files exist the legacy TOML is silently shadowed, so this logs a
-    warning naming the file that is being ignored.
-
-    This is the single source of truth for the default-config preference; the
-    umbrella ``biopb`` CLI and ``biopb-mcp`` mirror it (the latter cannot import
-    this package at runtime, so it keeps a 4-line twin).
-    """
-    json_path = config_dir / CANONICAL_CONFIG_NAME
-    toml_path = config_dir / LEGACY_CONFIG_NAME
-    if json_path.exists():
-        if toml_path.exists():
-            logger.warning(
-                "Both %s and %s exist in %s; using %s and ignoring the legacy "
-                "%s. Remove the TOML file to silence this. See biopb/biopb#34.",
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-                config_dir,
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-            )
-        return json_path
-    if toml_path.exists():
-        return toml_path
-    return json_path
 
 
 # Default on-disk cache location for the file backend. Uses the system temp dir

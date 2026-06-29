@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from ._config_location import find_config
 from ._proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
@@ -76,33 +77,11 @@ PID_FILE = Path.home() / ".local" / "share" / "biopb" / "tensor-server.pid"
 LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
 DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
 
-
-def _default_config() -> Path:
-    """Default config path, preferring JSON over legacy TOML (biopb/biopb#34).
-
-    Mirrors ``biopb_tensor_server.config.find_config``; kept inline so resolving
-    a typer Option default does not import the (heavy) server config module on
-    every ``biopb`` invocation.
-    """
-    config_dir = Path.home() / ".config" / "biopb"
-    json_path = config_dir / "biopb.json"
-    toml_path = config_dir / "biopb.toml"
-    if json_path.exists():
-        if toml_path.exists():
-            # Legacy TOML is shadowed -- warn to stderr so stdout stays clean
-            # for scripted use. Only fires in the rare both-exist transition.
-            Console(stderr=True).print(
-                f"[yellow]Both biopb.json and biopb.toml exist in {config_dir}; "
-                "using biopb.json and ignoring the legacy biopb.toml. Remove the "
-                "TOML file to silence this (biopb/biopb#34).[/yellow]"
-            )
-        return json_path
-    if toml_path.exists():
-        return toml_path
-    return json_path
-
-
-DEFAULT_CONFIG = _default_config()
+# Default config path, preferring JSON over legacy TOML and warning when both
+# exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
+# core module, so resolving this typer Option default does not import the heavy
+# server config module (biopb/biopb#34).
+DEFAULT_CONFIG = find_config()
 
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it

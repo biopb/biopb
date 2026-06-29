@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 from urllib.parse import urlparse
 
+from biopb._config_location import find_config
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
@@ -41,27 +42,10 @@ SERVER_QUERY_THRESHOLD = 1000
 
 
 # Default location of the biopb server's config (matches the `biopb server
-# start` CLI default). JSON is canonical; legacy TOML is still honored during
-# the migration window, preferring JSON when both exist (biopb/biopb#34). Kept
-# inline -- biopb-mcp has no runtime dependency on biopb_tensor_server, so it
-# cannot import that package's find_config(); this 4-line twin mirrors it.
-def _default_server_config() -> Path:
-    config_dir = Path.home() / ".config" / "biopb"
-    json_path = config_dir / "biopb.json"
-    toml_path = config_dir / "biopb.toml"
-    if json_path.exists():
-        if toml_path.exists():
-            logger.warning(
-                "Both biopb.json and biopb.toml exist in %s; using biopb.json "
-                "and ignoring the legacy biopb.toml. Remove the TOML file to "
-                "silence this. See biopb/biopb#34.",
-                config_dir,
-            )
-        return json_path
-    return toml_path if toml_path.exists() else json_path
-
-
-DEFAULT_SERVER_CONFIG = _default_server_config()
+# start` CLI default). Prefers JSON over legacy TOML and warns when both exist;
+# resolution is shared with the tensor server and the umbrella CLI via the core
+# `biopb` package (biopb/biopb#34).
+DEFAULT_SERVER_CONFIG = find_config()
 
 # Hosts considered "local" — auto-starting a server only makes sense for these.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}

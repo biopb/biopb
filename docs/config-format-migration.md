@@ -45,17 +45,20 @@ load_config(path)
    logs a one-line deprecation warning naming `biopb.json` as canonical. Invalid
    files raise a `ValueError` naming the path.
 
-2. **JSON-preferred default-path resolution.** `find_config(dir)` returns the
-   first of `biopb.json` → `biopb.toml` that exists, else the canonical
-   `biopb.json` path. When **both** exist the legacy TOML is silently shadowed,
-   so resolution logs a warning naming the ignored file (stderr for the umbrella
-   CLI, so stdout stays scriptable). The three entry points that hardcoded
-   `biopb.toml` now prefer JSON:
-   - `biopb_tensor_server.config.find_config` (source of truth)
-   - `biopb.cli._default_config` (umbrella `biopb server …`)
-   - `biopb_mcp._connection._default_server_config` (auto-start spawner) — a
-     4-line twin, because `biopb-mcp` has **no runtime dependency** on
-     `biopb_tensor_server` and cannot import the canonical helper.
+2. **JSON-preferred default-path resolution — one shared implementation.**
+   `find_config(dir)` returns the first of `biopb.json` → `biopb.toml` that
+   exists, else the canonical `biopb.json` path. When **both** exist the legacy
+   TOML is silently shadowed, so it logs a warning naming the ignored file.
+   It lives once in **`biopb._config_location`** (a stdlib-only module in the
+   core `biopb` package — no heavy adapter/discovery imports, so it is cheap to
+   import on every CLI invocation) and the three consumers all call it:
+   - `biopb_tensor_server.config` re-exports it (`find_config` + name constants)
+   - `biopb.cli` sets `DEFAULT_CONFIG = find_config()`
+   - `biopb_mcp._connection` sets `DEFAULT_SERVER_CONFIG = find_config()`
+
+   This works because all three already depend on the core `biopb` package
+   (`biopb-tensor-server` lists `biopb`; `biopb-mcp` lists `biopb[tensor]`; the
+   umbrella CLI *is* core), so there is no longer a per-consumer twin to drift.
 
 3. **CLI help text** updated from "TOML config file" to "config file (JSON or
    TOML)" across `serve`/`launch`/`validate`/`list` and `biopb server …`.
