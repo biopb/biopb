@@ -798,6 +798,17 @@ class TensorBrowserWidget(QWidget):
         self._error_label.setVisible(False)
         self._error_label.setText("")
 
+    def _report_failure(self, title: str, message: str):
+        """Modally report a failed *user-initiated* action (resolve/hydrate).
+
+        These actions are explicit, consenting gestures the user watched through
+        a modal progress dialog, so their failure deserves an acknowledged modal
+        box rather than the easily-missed, transient inline error pane (which is
+        wiped by the next refresh/selection). Background errors (connect,
+        refresh, list) stay on the inline pane -- issue #206.
+        """
+        QMessageBox.critical(self, title, message or "Unknown error")
+
     def _show_status(self, msg: str):
         """Display a transient status/progress message (grey, non-error)."""
         self._status_label.setText(msg)
@@ -1228,7 +1239,7 @@ class TensorBrowserWidget(QWidget):
 
         def _on_failed(message):
             progress.close()
-            self._show_error(f"Resolve failed: {message}")
+            self._report_failure("Resolve failed", message)
 
         def _on_cancelled():
             # User-initiated stop; the server recall continues + caches, so a
@@ -1321,7 +1332,7 @@ class TensorBrowserWidget(QWidget):
 
         def _on_failed(message):
             progress.close()
-            self._show_error(f"Hydrate failed: {message}")
+            self._report_failure("Hydrate failed", message)
 
         def _on_cancelled():
             progress.close()

@@ -467,6 +467,7 @@ class TestResolveAction:
         monkeypatch.setattr(widget_mod, "_ResolveWorker", _FakeWorker)
         w._apply_filter = MagicMock()
         w._show_error = MagicMock()
+        w._report_failure = MagicMock()
         return w, started
 
     def test_declined_warning_does_nothing(self, widget, monkeypatch):
@@ -495,12 +496,15 @@ class TestResolveAction:
         assert w._selected_tensor_id is None
 
     def test_failure_surfaces_error(self, widget, monkeypatch):
+        # A failed user-initiated resolve reports via a modal box, not the
+        # easily-missed inline pane (issue #206).
         w, _ = self._arm(
             widget, monkeypatch, accept=True, outcome=("failed", "offline")
         )
         w._resolve_source("cloud_x")
-        w._show_error.assert_called_once()
-        assert "offline" in w._show_error.call_args[0][0]
+        w._report_failure.assert_called_once()
+        assert "offline" in w._report_failure.call_args[0][1]
+        w._show_error.assert_not_called()
 
     def test_cancelled_closes_quietly(self, widget, monkeypatch):
         # A user-cancelled resolve is not an error: no banner, no repopulate (the
@@ -681,6 +685,7 @@ class TestHydrateAction:
 
         monkeypatch.setattr(widget_mod, "_WarmWorker", _FakeWarmWorker)
         w._show_error = MagicMock()
+        w._report_failure = MagicMock()
         return w, made_progress, made_workers
 
     def test_progress_updates_label_then_warmed_closes(self, widget, monkeypatch):
@@ -695,11 +700,13 @@ class TestHydrateAction:
         w._show_error.assert_not_called()
 
     def test_failure_surfaces_error(self, widget, monkeypatch):
+        # A failed hydrate is user-initiated too, so it reports modally (#206).
         w, progs, _ = self._arm(widget, monkeypatch, events=[("failed", "disk full")])
         w._warm_source("m")
         assert progs[0].closed
-        w._show_error.assert_called_once()
-        assert "disk full" in w._show_error.call_args[0][0]
+        w._report_failure.assert_called_once()
+        assert "disk full" in w._report_failure.call_args[0][1]
+        w._show_error.assert_not_called()
 
     def test_cancelled_closes_quietly(self, widget, monkeypatch):
         w, progs, _ = self._arm(widget, monkeypatch, events=[("cancelled", None)])
