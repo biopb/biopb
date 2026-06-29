@@ -267,12 +267,14 @@ class _WarmWorker(QThread):
 
 @dataclass
 class _WarmState:
-    """In-flight hydrate-ahead warm for one source.
+    """In-flight hydrate-ahead warm for one source (UI state).
 
-    Holds the :class:`_WarmWorker` (which is also the GC owner of the QThread,
-    like ``_resolve_workers``) and the last progress ``fraction`` (``None`` =
-    indeterminate). The fraction is kept here, not only on the tree item, so the
-    inline bar can be re-applied after the tree is cleared and rebuilt.
+    Holds the :class:`_WarmWorker` reference used to cancel from the context menu
+    and the last progress ``fraction`` (``None`` = indeterminate); the fraction is
+    kept here, not only on the tree item, so the inline bar can be re-applied after
+    the tree is cleared and rebuilt. GC ownership of the QThread lives separately
+    in ``_warm_retain`` (held until ``finished``), because this state is dropped
+    earlier -- on ``warmed``/``cancelled``/``failed`` -- to flip the menu back.
     """
 
     worker: _WarmWorker
@@ -611,12 +613,19 @@ class TensorBrowserWidget(QWidget):
         # clobber each other's only ref and get the QThread GC'd / destroyed while
         # still running -- important once a non-modal progress/cancel lets two run.
         self._resolve_workers: set = set()
-        # In-flight hydrate-ahead warms, keyed by source_id -> _WarmState. The map
-        # owns each QThread (GC) like _resolve_workers, gives O(1) "is this source
-        # warming?" for the context menu / dedup, and carries the row progress
-        # fraction so a tree rebuild can re-apply the inline bar. Warm runs in the
-        # background (the user keeps browsing), so several overlap.
+        # In-flight hydrate-ahead warms, keyed by source_id -> _WarmState. This map
+        # is *UI state* -- it answers "is this source warming?" for the context
+        # menu / dedup and carries the row progress fraction so a rebuild can
+        # re-apply the inline bar. It is popped on warmed/cancelled/failed (which
+        # all fire *before* `finished`) so the menu flips back to "Hydrate"
+        # promptly; it is therefore NOT the GC owner of the QThread.
         self._warms: Dict[str, _WarmState] = {}
+        # GC ownership of warm QThreads, separate from `_warms` and held all the
+        # way to `finished` (like `_resolve_workers`). `_warms` drops the worker
+        # too early to anchor it through the warmed->finished window, so a strong
+        # Python ref must live here or a backend that doesn't keep the wrapper
+        # alive could GC/destroy the QThread while it is still running.
+        self._warm_retain: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -1298,10 +1307,10 @@ class TensorBrowserWidget(QWidget):
             # recall lazily (and slowly) onto the read path. The user just asked
             # for this source explicitly, so start hydrating ahead in the
             # background now without a second confirmation (biopb/biopb#202).
-            # _warm_source surfaces a non-modal, cancelable dialog only if there is
-            # real work -- a source whose files resolve already recalled (e.g. a
-            # TIFF sequence) finishes within the grace window and shows nothing.
-            # The user can also (re)trigger via the context menu.
+            # _warm_source shows progress as an inline bar on the source's row
+            # (no dialog); a source whose files resolve already recalled (e.g. a
+            # TIFF sequence) warms to a near-instant no-op and the bar barely
+            # appears. Cancel / re-trigger is available via the context menu.
             if descriptor is not None and _is_multifile_source(descriptor):
                 self._warm_source(source_id)
 
@@ -1416,7 +1425,8 @@ class TensorBrowserWidget(QWidget):
         self._clear_error()
 
         worker = _WarmWorker(self._conn, source_id)
-        self._warms[source_id] = _WarmState(worker=worker)
+        self._warms[source_id] = _WarmState(worker=worker)  # UI state
+        self._warm_retain.add(worker)  # GC owner, held until `finished`
         # Indeterminate until the first server count arrives.
         self._set_warm_indicator(source_id, _WARM_INDETERMINATE)
 
@@ -1445,8 +1455,10 @@ class TensorBrowserWidget(QWidget):
         worker.warmed.connect(lambda _done: _finish())
         worker.cancelled.connect(_finish)
         worker.failed.connect(_on_failed)
-        # `worker` stays referenced via this closure until Qt processes
-        # deleteLater, even after _finish() drops it from self._warms.
+        # Release the GC ref and schedule C++ deletion only once the thread has
+        # actually finished -- _finish() above drops the earlier `_warms` entry,
+        # so `_warm_retain` is what keeps the QThread alive in between.
+        worker.finished.connect(lambda: self._warm_retain.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
 

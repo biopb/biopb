@@ -776,6 +776,18 @@ class TestHydrateAction:
         w._cancel_warm("m")
         assert workers[0].cancel_requested
 
+    def test_worker_gc_retained_until_finished(self, widget, monkeypatch):
+        # _warms drops the worker on `warmed` (so the menu flips back to
+        # "Hydrate"), but the QThread must stay GC-anchored in _warm_retain until
+        # `finished` fires, else a backend that doesn't keep the wrapper alive
+        # could destroy a still-running thread (#202 review).
+        w, workers = self._arm(widget, monkeypatch, events=[("warmed", object())])
+        w._warm_source("m")
+        assert "m" not in w._warms  # UI state already dropped
+        assert workers[0] in w._warm_retain  # ...but GC ref still held
+        workers[0].finished.emit()  # released only on finished
+        assert workers[0] not in w._warm_retain
+
     def test_indicator_survives_tree_rebuild(self, widget, monkeypatch):
         # Every refresh/filter clear()s and rebuilds the tree, dropping the
         # per-item role; _reapply_warm_indicators paints the bar back (#202).
