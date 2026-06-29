@@ -165,15 +165,81 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is None
 
-    def test_no_claim_when_metadata_present(self):
-        """metadata.txt guard is unchanged."""
+    def test_claim_when_micromanager_metadata_present(self):
+        """A metadata.txt no longer blocks the claim.
+
+        MicroManagerLegacyAdapter has higher priority and prunes any valid MM
+        dataset before this adapter runs, so a metadata.txt that reaches here is
+        one MM could not parse (e.g. truncated from an aborted acquisition). The
+        sequence claim is the wanted fallback instead of N per-frame sources.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             for i in range(1, 5):
                 _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
-            (Path(tmpdir) / "metadata.txt").write_text("{}")
+            (Path(tmpdir) / "metadata.txt").write_text("{ truncated")
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+            assert claim.source_type == "tiff-sequence"
+
+    def test_claim_micromanager_img_frames_without_metadata(self):
+        """img_* single-frame sequences (no metadata) are claimed as one source.
+
+        Regression: these previously fell through every directory adapter and the
+        walk registered each frame as its own per-file aics source.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(4):
+                _write_tiff(Path(tmpdir) / f"img_{i:09d}__000.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+            assert claim.source_type == "tiff-sequence"
+
+    def test_no_claim_when_ome_companion_present(self):
+        """*.companion.ome still defers to the file-level OmeTiffAdapter."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 5):
+                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
+            (Path(tmpdir) / "set.companion.ome").write_text("<OME/>")
 
             claim, _ = _claim(tmpdir)
             assert claim is None
+
+    def test_no_claim_for_ome_tiff_directory(self):
+        """A folder of .ome.tif files is left to the file-level OmeTiffAdapter."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 5):
+                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+
+    def test_claim_ome_tiff_directory_under_cloud(self):
+        """Under a cloud root OmeTiffAdapter is disabled, so the OME guards lift
+        and a folder of .ome.tif is grouped into one sequence (claimed unresolved)
+        instead of degrading to one per-file source per frame."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 5):
+                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+
+            ctx = ClaimContext(Path(tmpdir), cloud_root=True)
+            claim = TiffSequenceAdapter.claim(ctx, DiscoveryState())
+            assert claim is not None
+            assert claim.source_type == "tiff-sequence"
+            assert claim.unresolved is True
+
+    def test_claim_ome_companion_under_cloud(self):
+        """The *.companion.ome guard also lifts under a cloud root."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 5):
+                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+            (Path(tmpdir) / "set.companion.ome").write_text("<OME/>")
+
+            ctx = ClaimContext(Path(tmpdir), cloud_root=True)
+            claim = TiffSequenceAdapter.claim(ctx, DiscoveryState())
+            assert claim is not None
+            assert claim.source_type == "tiff-sequence"
 
     def test_init_matches_claim_order(self):
         """__init__ file order equals the claimed member order."""
@@ -278,10 +344,27 @@ class TestGroupHelper:
             ordered = _group_tiff_sequence(big + small)
             assert ordered == big
 
-    def test_excludes_ome_and_micromanager(self):
+    def test_groups_micromanager_img_frames(self):
+        """img_* frames are grouped (MM exclusion removed -- they are the fallback)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             names = ["img_000.tif", "img_001.tif", "img_002.tif"]
             files = [Path(tmpdir) / n for n in names]
             for j, f in enumerate(files):
                 _write_tiff(f, seed=j)
+            assert _group_tiff_sequence(files) == files
+
+    def test_excludes_ome_off_cloud(self):
+        """.ome.tif names are excluded off cloud (owned by OmeTiffAdapter)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [Path(tmpdir) / f"img_{i:03d}.ome.tif" for i in range(3)]
+            for j, f in enumerate(files):
+                _write_tiff(f, seed=j)
             assert _group_tiff_sequence(files) is None
+
+    def test_groups_ome_on_cloud(self):
+        """Under cloud, .ome.tif are grouped (OmeTiffAdapter is disabled there)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [Path(tmpdir) / f"img_{i:03d}.ome.tif" for i in range(3)]
+            for j, f in enumerate(files):
+                _write_tiff(f, seed=j)
+            assert _group_tiff_sequence(files, exclude_ome=False) == files

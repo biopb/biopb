@@ -26,19 +26,37 @@ if TYPE_CHECKING:
     from biopb_tensor_server.discovery import DiscoveryState
 
 
-# Known OME / MicroManager naming patterns handled by other adapters.
+# OME-TIFF naming patterns owned by the file-level OmeTiffAdapter. Excluded only
+# OFF cloud (see ``exclude_ome`` below): OmeTiffAdapter claims individual .ome.tif
+# FILES, not the directory, so if this directory-claiming adapter grouped a folder
+# of .ome.tif into a plain sequence it would prune the subtree before any OME-XML /
+# multi-scene parsing ran. Under a cloud root OmeTiffAdapter is disabled
+# (``if ctx.cloud_root: return None``) and every .ome.tif degrades to a per-file
+# aics source anyway, so deferring to it there is pointless -- grouping the
+# directory into one sequence is the better fallback.
+#
+# MicroManager img_* patterns are deliberately NOT excluded. This adapter is
+# registered *below* MicroManagerLegacyAdapter (see adapters/__init__.py), and
+# registration order is load-bearing priority, so a valid MicroManager dataset is
+# already claimed -- and its subtree pruned -- before this adapter is ever probed.
+# The only img_* directories that reach here are ones MM declined (no metadata.txt
+# or a corrupt/truncated one from an aborted acquisition). Grouping their frames
+# into one sequence is exactly the wanted fallback, instead of letting the walk
+# descend and register every frame as its own per-file aics source.
 _TIFF_EXCLUDE_PATTERNS = {
     "*.ome.tif",
     "*.ome.tiff",
-    "img_*.tif",
-    "img_*.tiff",
-    "img_channel*.tif",
-    "img_channel*.tiff",
 }
 
 
-def _filter_tiff_candidates(files: List[Path]) -> List[Path]:
-    """Drop files matching known OME / MicroManager naming patterns."""
+def _filter_tiff_candidates(files: List[Path], exclude_ome: bool = True) -> List[Path]:
+    """Drop files matching OME-TIFF naming patterns owned by OmeTiffAdapter.
+
+    ``exclude_ome`` is ``False`` under a cloud root, where OmeTiffAdapter is
+    disabled and grouping .ome.tif into one sequence beats per-file fallback.
+    """
+    if not exclude_ome:
+        return list(files)
     return [f for f in files if not any(f.match(p) for p in _TIFF_EXCLUDE_PATTERNS)]
 
 
@@ -56,7 +74,9 @@ def _mask_and_digits(name: str) -> Tuple[str, List[int]]:
     return mask, digits
 
 
-def _group_tiff_sequence(files: List[Path]) -> Optional[List[Path]]:
+def _group_tiff_sequence(
+    files: List[Path], exclude_ome: bool = True
+) -> Optional[List[Path]]:
     """Group plain-TIFF files into one ordered sequence by a single varying field.
 
     Files are bucketed by their digit-run mask; the dominant (largest) bucket is
@@ -64,10 +84,15 @@ def _group_tiff_sequence(files: List[Path]) -> Optional[List[Path]]:
     other numeric tokens, e.g. the ``s1`` in ``s1-0001_bf.tif``, must be
     constant). The bucket is sorted by that varying field.
 
+    ``exclude_ome`` is forwarded to :func:`_filter_tiff_candidates`. claim() sets
+    it to ``not ctx.cloud_root`` (OME ownership arbitration vs OmeTiffAdapter);
+    read passes ``False`` (the directory is already claimed, so all TIFFs are
+    members). See the call sites for the rationale.
+
     Returns the sorted file list, or ``None`` if no valid single-varying-field
     sequence of at least three files exists. Never returns an empty list.
     """
-    candidates = _filter_tiff_candidates(files)
+    candidates = _filter_tiff_candidates(files, exclude_ome=exclude_ome)
     if len(candidates) < 3:
         return None
 
@@ -155,25 +180,34 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         all_tiffs = list(ctx.glob("*.tif")) + list(ctx.glob("*.tiff"))
         tiff_files = [t._path for t in all_tiffs]  # Extract underlying Path objects
 
-        # Check for metadata files - if present, don't claim (let other adapters handle)
-        metadata_patterns = [
-            "metadata.txt",
-            "_metadata.txt",
-            "DisplaySettings.json",
-            "*.companion.ome",
-        ]
-        for pattern in metadata_patterns:
-            # Route through ctx.glob (not ctx._path.glob) so the snapshot's cached
-            # child listing serves the match without re-reading the directory
-            # (biopb/biopb#65).
-            if ctx.glob(pattern):
-                return None
+        # OME guards arbitrate ownership against the file-level OmeTiffAdapter, and
+        # apply only OFF cloud. Under a cloud root OmeTiffAdapter is disabled (it
+        # returns None for every .ome.tif / .companion.ome), so the files it would
+        # normally own degrade to per-file aics sources; deferring to it there is
+        # pointless and grouping the directory is the better fallback. This is a
+        # claim-time-only decision: once the directory is claimed, __init__ reads
+        # ALL TIFFs (exclude_ome=False) since OmeTiffAdapter is already locked out.
+        exclude_ome = not ctx.cloud_root
+
+        # OME companion guard: a *.companion.ome marks this directory as a
+        # multi-file OME-TIFF set owned by the file-level OmeTiffAdapter, so don't
+        # claim it out from under that adapter. MicroManager metadata.txt /
+        # DisplaySettings.json are deliberately NOT guarded here -- MicroManager-
+        # LegacyAdapter has higher priority and prunes any valid MM dataset before
+        # this adapter runs, so a metadata file that survives to here belongs to a
+        # dataset MM could not parse (e.g. a truncated metadata.txt from an aborted
+        # acquisition); falling back to a plain sequence claim is preferable to
+        # registering every frame as its own per-file source. Route through
+        # ctx.glob (not ctx._path.glob) so the snapshot's cached child listing
+        # serves the match without re-reading the directory (biopb/biopb#65).
+        if exclude_ome and ctx.glob("*.companion.ome"):
+            return None
 
         # Group into a single ordered sequence by the one varying numeric field.
         # Filename-template based: no per-file metadata reads, so discovery scans
         # stay cheap. Dimension consistency is verified lazily in __init__, where
         # every file is opened anyway.
-        sorted_files = _group_tiff_sequence(tiff_files)
+        sorted_files = _group_tiff_sequence(tiff_files, exclude_ome=exclude_ome)
         if sorted_files is None:
             return None
 
@@ -238,12 +272,18 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         self._source_type = "tiff-sequence"
         self._io_lock = threading.Lock()
 
-        # Discover and order the sequence with the same helper claim() uses, so
-        # the runtime file list always matches the claimed member set / order.
+        # Discover and order the sequence. Unlike claim(), read does NOT exclude
+        # OME-TIFF names (``exclude_ome=False``): the OME exclusion is purely a
+        # claim-time ownership decision (does this directory belong to this adapter
+        # or to the file-level OmeTiffAdapter?). By the time we read, the directory
+        # has already been claimed as a tiff-sequence and its subtree pruned, so
+        # OmeTiffAdapter can never claim those files -- excluding them here would
+        # only drop legitimate frames from a sequence already committed to. Every
+        # TIFF in the claimed directory is therefore a member.
         all_tiffs = list(self.directory.glob("*.tif")) + list(
             self.directory.glob("*.tiff")
         )
-        sorted_files = _group_tiff_sequence(all_tiffs)
+        sorted_files = _group_tiff_sequence(all_tiffs, exclude_ome=False)
         if sorted_files is None:
             raise ValueError(f"No TIFF sequence found in {directory}")
         self._tiff_files = sorted_files
