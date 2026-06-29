@@ -274,26 +274,77 @@ class TestTiffSequenceStackAll:
             # index-aligned: metadata order == stacked file order
             assert md["files"] == [p.name for p in adapter._tiff_files]
 
-    def test_odd_shaped_dtype_page_siblings_unstacked_not_dropped(self):
-        """The dominant shape bucket stacks; files differing in shape, dtype, or
-        page-count are NOT stacked but ARE surfaced -- no raise, nothing lost."""
+    def test_only_page_count_splits_the_stack(self):
+        """Page count is the one un-normalizable mismatch -> a different-page file
+        is a sibling. Differing shape and dtype are normalized into the stack
+        (#198), not demoted."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(4):  # dominant: (8,8) uint16 single-page
+            for i in range(4):  # (8,8) uint16 single-page
                 _write_tiff(Path(tmpdir) / f"frame_{i}.tif", seed=i)
-            _write_tiff(Path(tmpdir) / "overview.tif", shape=(16, 16), seed=9)
-            tifffile.imwrite(  # different dtype
-                str(Path(tmpdir) / "mask.tif"), np.zeros((8, 8), np.uint8)
+            _write_tiff(Path(tmpdir) / "frame_big.tif", shape=(16, 16), seed=9)
+            tifffile.imwrite(  # different dtype -> promoted, not demoted
+                str(Path(tmpdir) / "frame_u8.tif"), np.zeros((8, 8), np.uint8)
             )
-            tifffile.imwrite(  # different page count
-                str(Path(tmpdir) / "zstack.tif"),
+            tifffile.imwrite(  # different page count -> the only sibling
+                str(Path(tmpdir) / "frame_zstack.tif"),
                 np.zeros((4, 8, 8), np.uint16),
                 photometric="minisblack",
             )
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter.full_shape == [4, 8, 8]
-            unstacked = adapter.get_metadata()["unstacked_files"]
-            assert set(unstacked) == {"overview.tif", "mask.tif", "zstack.tif"}
+            # 6 single-page files stacked, padded to the max plane, promoted dtype
+            assert adapter.full_shape == [6, 16, 16]
+            assert adapter._dtype == "uint16"
+            assert adapter.get_metadata()["unstacked_files"] == ["frame_zstack.tif"]
+
+    def test_dtype_promotes_up_never_down(self):
+        """The descriptor takes the widest dtype; a uint16 value survives a
+        uint8 sibling instead of clipping (#198)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_0.tif"), np.full((8, 8), 5, np.uint8)
+            )
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_1.tif"), np.full((8, 8), 300, np.uint16)
+            )
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_2.tif"), np.full((8, 8), 7, np.uint8)
+            )
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter._dtype == "uint16"
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert out.dtype == np.uint16
+            assert int(out[0, 0, 0]) == 5  # uint8 frame upcast
+            assert int(out[1, 0, 0]) == 300  # uint16 value not clipped to 255
+
+    def test_smaller_frame_zero_padded(self):
+        """A frame smaller than the max plane reads back zero-padded (#198)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tifffile.imwrite(
+                str(Path(tmpdir) / "img_0.tif"), np.full((4, 4), 7, np.uint16)
+            )
+            for i in (1, 2):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"img_{i}.tif"), np.full((8, 8), 3, np.uint16)
+                )
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            assert adapter.full_shape == [3, 8, 8]
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert int(out[0, 0, 0]) == 7 and int(out[0, 3, 3]) == 7  # data
+            assert int(out[0, 4, 4]) == 0 and int(out[0, 7, 7]) == 0  # padding
+            assert (out[1] == 3).all()  # full-size frame intact
+
+    def test_init_rejects_incoherent_names(self):
+        """The coherence gate runs at resolve too: an explicit source pointed at
+        a grab-bag raises rather than welding it into a tensor."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for n in ("logo.tif", "figure3.tif", "scalebar.tif"):
+                _write_tiff(Path(tmpdir) / n, seed=1)
+
+            with pytest.raises(ValueError, match="do not look like one sequence"):
+                TiffSequenceAdapter(str(tmpdir), "sid")
 
     def test_same_shape_sibling_is_stacked_and_listed(self):
         """A same-shape digit-less sibling (e.g. readme.tif) is physically

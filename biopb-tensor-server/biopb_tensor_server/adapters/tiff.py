@@ -156,8 +156,8 @@ def _group_tiff_sequence(
     .. note::
        Retained for unit coverage and as a single-field ordering reference. Under
        the stack-all policy (#215) it is no longer the claim gate: ``claim`` now
-       claims any directory with enough TIFFs and ``__init__`` stacks the
-       dominant *shape* bucket, delegating axis semantics to the agent.
+       claims any directory with enough coherent TIFFs and ``__init__`` stacks
+       them (normalizing dtype/shape), delegating axis semantics to the agent.
 
     Files are bucketed by their digit-run mask; the dominant (largest) bucket is
     inspected for exactly one numeric field that varies across its members (all
@@ -225,13 +225,15 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     - Handle 5D/6D coordinate mapping
     - Discover related files via companion files
 
-    Stack-all policy (#215): every uniformly-shaped TIFF in the directory is
-    stacked along an opaque file axis (label ``i``); the axis's semantic
+    Stack-all policy (#215): every TIFF in the directory that can share a tensor
+    is stacked along an opaque file axis (label ``i``); the axis's semantic
     structure (channel / time / site / z -- e.g. MetaMorph ``_w/_s/_t`` or
     ``_red/_green/_blue``) is deliberately NOT inferred here. Instead the per-file
     names are exposed via ``get_metadata`` so a downstream agent can parse them
-    and reshape / relabel. This is metadata-free, never silently drops files
-    (odd-shaped siblings are listed too), and avoids guessing axes wrong.
+    and reshape / relabel. Differing dtype and spatial size are normalized into
+    the stack (#198: widest dtype, zero-pad to the max plane); only a differing
+    page count (or an unreadable file) is left out, and listed as a sibling. This
+    is metadata-free, never silently drops files, and avoids guessing axes wrong.
 
     Shape:
     - (num_files, Y, X) for single-page files -> ['i', 'y', 'x']
@@ -390,83 +392,92 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         if not all_tiffs:
             raise ValueError(f"No TIFF files found in {directory}")
 
-        # Stack-all policy (#215). A dense tensor requires its members to share
-        # shape / dtype / page-count -- a *physical* constraint, not a naming one.
-        # Bucket the directory by that stackability signature and take the largest
-        # uniform group as the tensor. Files that do not fit (thumbnails, a max-
-        # projection, an odd overview) are NOT stacked but their names are still
-        # surfaced via get_metadata(), so the directory is represented losslessly.
-        # We deliberately do not group by filename pattern or infer what the file
-        # axis means (channel / time / site / z): that ambiguous, metadata-free
-        # inference is delegated to the agent, which gets the per-file names
-        # alongside the array. This replaces the old "single varying field or
-        # raise" grouping -- a mismatched file now lands in a different bucket and
-        # becomes a sibling instead of aborting the source.
+        # Stack-all policy (#215) + per-file normalization (#198). A dense tensor
+        # has exactly one hard constraint: every member must contribute the same
+        # number of pages, since the page count sets the tensor's ndim (whether a
+        # file adds a page axis at all) and so cannot be reconciled. Differing
+        # dtype and spatial size, by contrast, ARE normalized at read time -- the
+        # descriptor takes the widest dtype (np.result_type: promote *up* so no
+        # member's values clip) and the per-axis max plane (smaller frames
+        # zero-pad in get_data). So we bucket only by page count; files with a
+        # different page count are not stacked but are surfaced via
+        # get_metadata(), as are unreadable ones. We do not parse what the file
+        # axis means (channel / time / site / z): that is delegated to the agent,
+        # which gets the per-file names alongside the array.
         #
-        # Exception policy: split "could not read the bytes" from "the bytes are
-        # not a valid image". OSError (a missing file, or a cloud recall that
-        # fails on a network blip) is a transport failure -> re-raise, so it
-        # surfaces as a retryable error instead of silently shrinking the stack.
-        # Any other exception means the file opened at the I/O level but is not a
-        # stackable image (TiffFileError, or a corrupt header that makes
-        # ``pages[0]`` raise IndexError / a parse error) -> demote to a sibling.
-        # Tile info is captured here from the first-seen member of each bucket --
-        # which, since all_tiffs is natural-sorted, is exactly that bucket's
-        # members[0] -- so there is no second open of the representative (no extra
-        # recall, no time-of-check/use window).
-        buckets: Dict[Tuple[Any, ...], List[Path]] = {}
-        tile_info: Dict[Tuple[Any, ...], Tuple[bool, int, int]] = {}
+        # Exception policy: OSError (a missing file, or a cloud recall that fails
+        # on a network blip) is a transport failure -> re-raise, so it surfaces as
+        # a retryable error instead of silently shrinking the stack. Any other
+        # error means the file opened at the I/O level but is not a stackable
+        # image (TiffFileError, or a corrupt header that makes ``pages[0]`` raise)
+        # -> demote to a sibling. Each file is probed exactly once.
+        probes: Dict[Path, Tuple[Any, ...]] = {}  # h, w, dtype, npages, tiled, tw, tl
+        buckets: Dict[int, List[Path]] = {}
         unreadable: List[Path] = []
         for p in all_tiffs:
             try:
                 with tifffile.TiffFile(str(p)) as tf:
                     page = tf.pages[0]
-                    sig = (
-                        (page.shape[0], page.shape[1]),
+                    probe = (
+                        page.shape[0],
+                        page.shape[1],
                         str(page.dtype),
                         len(tf.pages),
+                        bool(page.is_tiled),
+                        page.tilewidth,
+                        page.tilelength,
                     )
-                    if sig not in buckets:  # first member of this bucket == members[0]
-                        tile_info[sig] = (
-                            bool(page.is_tiled),
-                            page.tilewidth,
-                            page.tilelength,
-                        )
             except OSError:
                 raise  # transport / recall failure -- retryable, do not swallow
             except Exception:
                 unreadable.append(p)  # not a valid image -- demote to sibling
                 continue
-            buckets.setdefault(sig, []).append(p)
+            probes[p] = probe
+            buckets.setdefault(probe[3], []).append(p)
 
         if not buckets:
             raise ValueError(f"No readable TIFF files in {directory}")
 
-        # Dominant bucket: most files; tie-broken toward the larger frame (so a
-        # thumbnail bucket never wins a tie against the real images), then the
-        # signature itself for determinism.
-        best_sig, members = max(
-            buckets.items(),
-            key=lambda kv: (len(kv[1]), kv[0][0][0] * kv[0][0][1], kv[0]),
+        # Dominant bucket: most files; tie-broken toward the higher page count for
+        # determinism. Members keep all_tiffs' natural order.
+        n_pages_per_file, members = max(
+            buckets.items(), key=lambda kv: (len(kv[1]), kv[0])
         )
-        (spatial_h, spatial_w), self._dtype, n_pages_per_file = best_sig
 
-        self._tiff_files = members  # members preserve all_tiffs' natural order
+        # Coherence gate at resolve too (mirrors claim()): the stacked members
+        # must look like a related set, not an incidental grab-bag. Filename-only;
+        # this is the one mismatch normalization can't fix, so unlike dtype/shape
+        # it raises rather than stacking nonsense.
+        if not _looks_like_tiff_sequence([p.name for p in members]):
+            raise ValueError(
+                f"TIFF files in {directory} do not look like one sequence "
+                f"(no shared filename template or stem across the stacked files)"
+            )
+
+        self._tiff_files = members
         stacked = set(members)
         self._unstacked_files = [p for p in all_tiffs if p not in stacked] + unreadable
 
-        # Tile info captured for members[0] in the bucketing pass above.
-        self.is_tiled, tile_w, tile_l = tile_info[best_sig]
+        # Normalized descriptor geometry across the members (#198):
+        #  - dtype: the widest dtype, promoting up so no member's values clip;
+        #  - spatial: the per-axis max plane (smaller frames zero-pad in get_data).
+        members_info = [probes[p] for p in members]
+        spatial_h = max(i[0] for i in members_info)
+        spatial_w = max(i[1] for i in members_info)
+        self._dtype = str(np.result_type(*(np.dtype(i[2]) for i in members_info)))
+
+        # Tile / chunk geometry from members[0] (best effort; tiling may vary
+        # across members, but the chunk grid is only a hint -- get_data reads each
+        # file's own zarr and pads to the requested extent regardless).
+        _, _, _, _, m0_tiled, m0_tw, m0_tl = probes[members[0]]
+        self.is_tiled = m0_tiled
         if self.is_tiled:
-            self.tile_width = tile_w
-            self.tile_length = tile_l
-            self._spatial_chunk = [tile_l, tile_w]
+            self.tile_width = m0_tw
+            self.tile_length = m0_tl
+            self._spatial_chunk = [m0_tl, m0_tw]
         else:
             self._spatial_chunk = [spatial_h, spatial_w]
 
-        # Members share best_sig by construction, so the per-file map needs no
-        # re-validation: bucketing already subsumes the old dimension/dtype/page
-        # consistency checks.
         self._file_ifd_map = [(p, n_pages_per_file) for p in members]
 
         n_files = len(members)
@@ -497,6 +508,37 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
+
+    def _read_padded_plane(
+        self,
+        zarr_arr: Any,
+        zarr_ndim: int,
+        page_idx: int,
+        y_slice: slice,
+        x_slice: slice,
+        fh: int,
+        fw: int,
+    ) -> np.ndarray:
+        """Read one plane into a zero-padded, dtype-promoted buffer (#198).
+
+        The buffer is sized to the requested ``y_slice`` / ``x_slice`` extent and
+        typed as the descriptor dtype, so a frame smaller than the per-axis max
+        (``fh`` x ``fw`` is *this* file's plane size) reads back zero-padded and a
+        narrower-dtype frame is cast up. Returns a ``(out_h, out_w)`` array.
+        """
+        ys = y_slice.start or 0
+        ye = y_slice.stop if y_slice.stop is not None else fh
+        xs = x_slice.start or 0
+        xe = x_slice.stop if x_slice.stop is not None else fw
+        plane = np.zeros((ye - ys, xe - xs), dtype=self._dtype)
+        ry, rx = min(ye, fh), min(xe, fw)
+        if ry > ys and rx > xs:
+            if zarr_ndim == 2:
+                data = zarr_arr[ys:ry, xs:rx]
+            else:
+                data = zarr_arr[page_idx, ys:ry, xs:rx]
+            plane[: ry - ys, : rx - xs] = data
+        return plane
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.
@@ -553,22 +595,31 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             )
             n_pages = (page_slice.stop or pages_per_file) - (page_slice.start or 0)
 
-            # Read data via aszarr() for tile-level access
+            # Read data via aszarr() for tile-level access. Each plane is read
+            # into a zero-filled buffer of the requested extent and cast to the
+            # descriptor dtype (#198): a frame smaller than the per-axis max reads
+            # back zero-padded (bottom/right), and a narrower-dtype frame is
+            # promoted up -- so heterogeneous members stack uniformly.
             result_pages = []
             for file_idx in file_indices:
                 file_path, n_pages_in_file = self._file_ifd_map[file_idx]
                 with tifffile.TiffFile(str(file_path)) as tf:
                     zarr_arr = zarr.open_array(tf.series[0].aszarr(), mode="r")
                     zarr_ndim = len(zarr_arr.shape)
+                    fh, fw = zarr_arr.shape[-2], zarr_arr.shape[-1]
                     for page_idx in page_indices:
                         if page_idx < n_pages_in_file:
-                            if zarr_ndim == 2:
-                                # 2D array (Y, X) - single page
-                                page_data = zarr_arr[y_slice, x_slice]
-                            else:
-                                # 3D+ array (pages, Y, X)
-                                page_data = zarr_arr[page_idx, y_slice, x_slice]
-                            result_pages.append(page_data)
+                            result_pages.append(
+                                self._read_padded_plane(
+                                    zarr_arr,
+                                    zarr_ndim,
+                                    page_idx,
+                                    y_slice,
+                                    x_slice,
+                                    fh,
+                                    fw,
+                                )
+                            )
 
             # Stack into result array
             if result_pages:
@@ -599,9 +650,11 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         -- e.g. MetaMorph ``_w/_s/_t`` or ``_red/_green/_blue``) is intentionally
         NOT inferred here. ``files`` lists the stacked members index-aligned to
         axis 0, so a downstream agent can parse the names and reshape / relabel as
-        needed. ``unstacked_files`` lists TIFFs in the directory that did not fit
-        the dominant shape (thumbnails, projections, unreadable files) -- present
-        for completeness so nothing is silently dropped.
+        needed. ``unstacked_files`` lists TIFFs in the directory that could not
+        join the stack -- a different page count (the one mismatch normalization
+        can't fix) or an unreadable file -- present for completeness so nothing is
+        silently dropped. (Differing dtype and spatial size do NOT land here: they
+        are normalized into the stack per #198.)
         """
         md: Dict[str, Any] = {"files": [p.name for p in self._tiff_files]}
         if self._unstacked_files:
