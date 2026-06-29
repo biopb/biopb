@@ -1237,6 +1237,60 @@ class TestSignatureScanLoopAndSkip:
 
         assert str((sub / "sample.dat").resolve()) in next_state
 
+    def _defeat_identity_dedup(self, monkeypatch):
+        # Make get_file_identity return a fresh value on every call, so the
+        # visited_identities loop guard NEVER fires -- exactly the cloud/zeroed-inode
+        # junction failure mode (its path-hash identity grows with the loop, so no two
+        # descents share an identity). Without the depth cap this recurses forever.
+        import itertools
+
+        from biopb_tensor_server import source_manager as sm_module
+
+        counter = itertools.count()
+        monkeypatch.setattr(
+            sm_module, "get_file_identity", lambda *a, **k: f"id-{next(counter)}"
+        )
+        return sm_module
+
+    def test_depth_cap_breaks_loop_when_identity_dedup_fails(
+        self, tmp_path, monkeypatch
+    ):
+        # With identity dedup defeated, a tree deeper than the cap must still
+        # terminate (no RecursionError that the os.scandir except OSError can't catch
+        # and that would kill the refresh thread) and must stop descending at the cap.
+        sm_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 4)
+
+        root = tmp_path / "monitored"
+        deep = root
+        for i in range(8):  # deeper than the cap of 4
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        (deep / "sample.dat").write_text("hi")
+
+        next_state = _scan(_make_signature_manager({root}))  # must not raise
+
+        # Descent stopped at the cap: the below-cap data file is never reached.
+        assert str((deep / "sample.dat").resolve()) not in next_state
+        # ...but entries within the cap were still recorded.
+        assert str((root / "d0").resolve()) in next_state
+
+    def test_depth_cap_logs_warning(self, tmp_path, monkeypatch, caplog):
+        sm_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 3)
+
+        root = tmp_path / "monitored"
+        deep = root
+        for i in range(6):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        (deep / "sample.dat").write_text("hi")
+
+        with caplog.at_level("WARNING"):
+            _scan(_make_signature_manager({root}))
+
+        assert any("max depth" in rec.message for rec in caplog.records)
+
 
 class _FakeStat:
     """Minimal stand-in for ``os.stat_result`` with a controllable ``st_ino``.

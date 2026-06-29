@@ -38,6 +38,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Hard backstop against unbounded recursion in the rescan walk. visited_identities
+# breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
+# identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
+# degrades to a path hash that never repeats inside a junction loop -> RecursionError,
+# which the os.scandir `except OSError` does not catch (biopb/biopb#207 review). This
+# cap turns any such loop into a bounded, logged skip. Real microscopy trees are far
+# shallower (rarely past ~10 levels), so this only ever fires on a pathological loop.
+_MAX_WALK_DEPTH = 64
+
 
 @dataclass
 class _FailureTracker:
@@ -418,6 +427,7 @@ class SourceManager:
         is_root: bool = False,
         dir_entry: Optional[os.DirEntry] = None,
         cloud: bool = False,
+        depth: int = 0,
     ) -> None:
         """Capture the current filesystem signature state for one subtree.
 
@@ -472,10 +482,16 @@ class SourceManager:
                 #   3. Identity / loop-breaking. `get_file_identity` falls back to a
                 #      hash of the *resolved path* when `st_ino == 0` (its FAT32 path),
                 #      so `visited_identities` dedup still distinguishes cloud entries
-                #      without a real inode. (Junctions/hardlinks under a cloud root
-                #      would no longer dedup by physical identity -- accepted: rare, and
-                #      cloud change-detection is already coarse, via the periodic
-                #      force_full re-walk, not per-entry signatures.)
+                #      without a real inode. BUT for *non-symlink* reparse points
+                #      (Windows junction, bind mount) `(st_dev, st_ino)` is the only
+                #      thing that breaks a directory *cycle* (symlinks are skipped
+                #      separately), and a non-symlink entry is never resolve()d, so a
+                #      junction loop `J -> .` yields an ever-growing path that hashes
+                #      to a new identity each descent -- the cycle is never caught.
+                #      That is no longer just a lost-dedup (rare aliasing); it would
+                #      recurse to RecursionError. The `_MAX_WALK_DEPTH` backstop in
+                #      `_scan_tree_state` bounds such a loop to a logged skip instead
+                #      of crashing the refresh thread (biopb/biopb#207 review).
                 #
                 # NOTE: this is a Windows-only effect; on POSIX DirEntry.stat() returns
                 # a real inode, so neither the backfill nor this skip ever fires there.
@@ -584,6 +600,21 @@ class SourceManager:
             )
             return
 
+        # Depth backstop: if identity dedup ever fails to catch a directory loop
+        # (e.g. a cloud junction whose zeroed inode makes get_file_identity fall back
+        # to an ever-growing path hash, biopb/biopb#207 review), the walk would recurse
+        # to RecursionError -- which the os.scandir `except OSError` below does NOT
+        # catch, so it propagates and kills the refresh thread. Record this entry but
+        # do not descend past the cap, turning any such loop into a bounded skip.
+        if depth >= _MAX_WALK_DEPTH:
+            logger.warning(
+                "Rescan walk hit max depth %d at %s; not descending further "
+                "(possible directory loop)",
+                _MAX_WALK_DEPTH,
+                resolved_path,
+            )
+            return
+
         try:
             # os.scandir yields DirEntry objects carrying d_type and a cached stat,
             # so each child is processed with one stat and no resolve — the per-entry
@@ -604,6 +635,7 @@ class SourceManager:
                         visited_identities,
                         dir_entry=entry,
                         cloud=cloud,
+                        depth=depth + 1,
                     )
         except OSError:
             return
