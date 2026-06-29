@@ -97,6 +97,57 @@ def _natural_key(name: str) -> List[Tuple[int, Any]]:
     ]
 
 
+# A claimed directory should look like a *coherent* set of related files, not an
+# incidental grab-bag of unrelated TIFFs that merely share a directory (and, after
+# shape-bucketing, a pixel size). Stack-all (#215) stopped parsing what the
+# filename fields *mean* -- that is the agent's job -- but "is this a dataset at
+# all?" is still the adapter's call, so we keep a cheap, filename-only coherence
+# gate at claim time. Two signals, either sufficient:
+#   (a) a majority share one digit-template (mask) -- catches numbered sequences
+#       including short stems like ``a1/a2/a3`` whose common prefix is tiny;
+#   (b) a majority share a non-trivial common stem (prefix) -- catches sets that
+#       vary by a token rather than a number, e.g. ``sp_0001_{red,green,blue}``
+#       or MetaMorph ``..._w1DIC_.. / .._w2GFP_..``.
+# A bare, no-number, no-stem set (``red/green/blue.tif``) is indistinguishable
+# from a grab-bag by filename alone, so it is left to per-file fallback -- a
+# graceful miss, never a wrong tensor.
+_MIN_STEM = 3  # chars; a shorter shared prefix is too weak to imply coherence
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        n += 1
+    return n
+
+
+def _looks_like_tiff_sequence(names: List[str]) -> bool:
+    """Filename-only coherence gate (see the comment above). Pure, no I/O."""
+    n = len(names)
+    if n < _MIN_TIFF_FILES:
+        return False
+    majority = n // 2 + 1
+
+    # (a) a digit-template (mask) shared by a majority of the names.
+    mask_counts: Dict[str, int] = {}
+    for nm in names:
+        mask, _ = _mask_and_digits(nm)
+        mask_counts[mask] = mask_counts.get(mask, 0) + 1
+    if max(mask_counts.values()) >= majority:
+        return True
+
+    # (b) a non-trivial common stem shared by a majority. A majority-shared prefix
+    # is contiguous once the names are sorted, so the LCP of the first and last
+    # entry of each majority-sized window covers every candidate prefix.
+    ordered = sorted(nm.lower() for nm in names)
+    for i in range(n - majority + 1):
+        if _common_prefix_len(ordered[i], ordered[i + majority - 1]) >= _MIN_STEM:
+            return True
+    return False
+
+
 def _group_tiff_sequence(
     files: List[Path], exclude_ome: bool = True
 ) -> Optional[List[Path]]:
@@ -194,12 +245,15 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         """Claim directories holding several plain TIFFs (stack-all, #215).
 
         Claim when at least ``_MIN_TIFF_FILES`` TIFFs are present (excluding OME
-        names owned by OmeTiffAdapter). The previous single-varying-numeric-field
-        requirement is gone: directories whose filenames encode several axes
+        names owned by OmeTiffAdapter) AND their names cohere as a related set
+        (see ``_looks_like_tiff_sequence``). The previous single-varying-numeric-
+        field requirement is gone: directories whose filenames encode several axes
         (channel x site x time, ``_red/_green/_blue``, MetaMorph ``_w/_s/_t``) are
         now claimed too. ``__init__`` stacks the dominant *shape* group and
         exposes per-file names for the agent to interpret -- no filename-pattern
-        inference, and no silent channel drop.
+        inference, and no silent channel drop. The coherence gate only avoids
+        welding an incidental grab-bag of unrelated TIFFs into one tensor; it does
+        NOT parse what the fields mean.
 
         Claiming is intentionally metadata-free — no per-file reads, so discovery
         scans stay cheap. Stackability (shape/dtype/pages) is resolved lazily in
@@ -249,11 +303,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         if exclude_ome and ctx.glob("*.companion.ome"):
             return None
 
-        # Stack-all claim gate (#215): enough plain TIFFs present. No filename-
-        # template grouping -- multi-field names are claimed too and sorted out at
-        # read time. Metadata-free: a cheap count, no per-file reads.
+        # Stack-all claim gate (#215): enough plain TIFFs present AND their names
+        # cohere as a related set (not a grab-bag). No filename-template *parsing*
+        # -- multi-field names are claimed too and sorted out by the agent at read
+        # time -- only a coherence check. Metadata-free: filenames only, no reads.
         candidates = _filter_tiff_candidates(tiff_files, exclude_ome=exclude_ome)
         if len(candidates) < _MIN_TIFF_FILES:
+            return None
+        if not _looks_like_tiff_sequence([p.name for p in candidates]):
             return None
 
         # Dir-claiming policy (biopb/biopb): the directory IS the dataset

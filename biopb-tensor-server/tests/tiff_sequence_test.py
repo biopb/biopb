@@ -144,6 +144,47 @@ class TestTiffSequenceClaim:
             claim, _ = _claim(tmpdir)
             assert claim is None
 
+    def test_no_claim_incoherent_grab_bag(self):
+        """Coherence gate: unrelated filenames (no shared template or stem) are
+        not welded into one tensor -- left to per-file fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for n in ("logo.tif", "figure3.tif", "scalebar.tif"):
+                _write_tiff(Path(tmpdir) / n, seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+
+    def test_no_claim_bare_channel_tokens(self):
+        """Accepted limitation: a no-number, no-stem channel set (bare
+        red/green/blue.tif) is indistinguishable from a grab-bag by filename
+        alone, so it is not claimed (graceful miss, never a wrong tensor)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for c in ("red", "green", "blue"):
+                _write_tiff(Path(tmpdir) / f"{c}.tif", seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is None
+
+    def test_claim_short_stem_numbered_sequence(self):
+        """A numbered sequence with a tiny stem (a1/a2/a3) coheres via its shared
+        digit-template even though the common prefix is only one char."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 4):
+                _write_tiff(Path(tmpdir) / f"a{i}.tif", seed=i)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+
+    def test_claim_indexed_channel_tokens(self):
+        """An indexed channel set (sp_0001_{red,green,blue}) coheres via its
+        shared stem even though no single digit-template is a majority."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for c in ("red", "green", "blue"):
+                _write_tiff(Path(tmpdir) / f"sp_0001_{c}.tif", seed=1)
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None
+
     def test_claim_when_micromanager_metadata_present(self):
         """A metadata.txt no longer blocks the claim.
 
