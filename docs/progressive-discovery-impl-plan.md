@@ -1,6 +1,6 @@
 # Progressive Discovery — Implementation Plan
 
-**Status:** Implementation plan — Phases 0–3 complete (audit, freshness fields, client UI, background scan / Option 0); Phases 4–5 not started
+**Status:** Implementation plan — Phases 0–4 complete (audit, freshness fields, client UI, background scan, Option B streaming); Phase 5 (docs) remaining
 **Component:** `biopb-tensor-server` (+ a small client-gating change in `biopb-mcp`)
 **Design:** [progressive-discovery.md](progressive-discovery.md) — read first; this doc
 turns that design's *Changes by file* and *Suggested sequence* into PR-sized,
@@ -319,7 +319,42 @@ the launch-path sidecar (**`cli.py:971`**) no longer waits on the scan.
 
 ---
 
-## Phase 4 — Stream first-scan additions (Option B)
+## Phase 4 — Stream first-scan additions (Option B) ✅ (complete)
+
+**Landed (`source_manager.py`):** `_handle_rescan` now, on the *first* full scan
+(`force_full and not _initial_scan_done`), wires the discovery state's
+`on_source_added` to a new `_stream_first_scan_add`, so each source is committed
+(via `_commit_add_claim` → register + metadata sync + signature + precache gate)
+the moment the walk claims it — the catalog grows within the walk instead of in
+one end-of-walk batch. The implementation is small because the claim phase
+already applies the stability gate (`path_filter`), so deferred/unstable entries
+are never claimed and therefore never streamed; and the existing end-of-walk
+`_reconcile_discovered_state` runs unchanged, now idempotent (discovered ==
+current ⇒ no adds/removes). Steady-state rescans are untouched (no callback
+wired). Streamed adds route to the precache *backlog*, not the prompt enqueue,
+because `_initial_scan_done` is still False during the first scan.
+
+**Sharp edge handled:** `_commit_add_claim` *unregisters* on a duplicate add, so
+a retried first scan (after a partial failure) would delete already-streamed
+sources. `_stream_first_scan_add` guards with a presence check, so re-streaming
+is a no-op and the duplicate-rollback is never hit.
+
+**Tests (`source_manager_test.py::TestProgressiveStreaming`, 4 new):** sources
+are registered *before* reconcile runs (the streaming assertion) with no
+double-register; a steady-state full rescan does *not* stream (adds go through
+batch reconcile); a retried first scan neither re-registers nor unregisters the
+streamed set; an unstable first-scan entry is deferred (not streamed) and picked
+up by a later rescan. Full tensor-server suite green (797 passed, 1 skipped).
+
+> Concurrency note: the design's "read handlers never raise during an in-progress
+> first scan" is covered structurally — catalog mutation/reads already serialize
+> on `_sources_lock` (Phase 3 / the design's "already progressive-safe" finding),
+> and `register_source` goes through that lock. Not re-tested with a threaded
+> server here.
+
+---
+
+### Original plan (for reference)
 
 **Goal:** true within-walk progressive population at startup — sources become
 visible as they are claimed, not only at end-of-walk.

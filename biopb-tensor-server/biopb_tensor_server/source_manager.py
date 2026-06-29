@@ -271,6 +271,21 @@ class SourceManager:
 
             rescan_succeeded = False
             try:
+                # Progressive population (Option B): on the *first* full scan,
+                # register each source the moment the walk claims it instead of
+                # batching every add into the end-of-walk reconcile, so the
+                # catalog grows within the walk. This is safe only for the first
+                # scan -- it starts empty and force-full, so there are no removals
+                # to diff and every claim is a pure add. The claim phase already
+                # applies the stability gate (path_filter), so deferred/unstable
+                # entries are never claimed and therefore never streamed; they
+                # are picked up by the next steady-state rescan. The end-of-walk
+                # reconcile below still runs and is idempotent for streamed adds.
+                stream_first_scan = force_full_rescan and not self._initial_scan_done
+                discovered_state = DiscoveryState()
+                if stream_first_scan:
+                    discovered_state.on_source_added = self._stream_first_scan_add
+
                 # Single traversal: the state walk above already visited every entry and
                 # recorded its (resolved path, is_directory) into next_state in DFS
                 # parent-first order. Drive the claim phase straight off that snapshot
@@ -285,6 +300,7 @@ class SourceManager:
                         for path_str, entry in next_state.items()
                     ),
                     self._registry,
+                    state=discovered_state,
                     dim_labels=self._dim_labels,
                     path_filter=self._should_scan_resolved,
                     skipped_dirs=skipped_dirs,
@@ -1034,6 +1050,25 @@ class SourceManager:
                 if claim_path == skipped_dir or claim_path.is_relative_to(skipped_dir):
                     return True
         return False
+
+    def _stream_first_scan_add(self, claim: SourceClaim) -> None:
+        """Commit a first-scan claim live, as the walk discovers it (Option B).
+
+        Wired as the discovery state's ``on_source_added`` only during the first
+        full scan. Routes through ``_commit_add_claim`` so a streamed add gets
+        the same server registration, metadata-DB sync, signature bookkeeping,
+        and precache gating as a reconcile-driven add.
+
+        Idempotent against a *retried* first scan: a source already committed by
+        a prior partial scan (that later failed before flipping
+        ``_initial_scan_done``) is skipped, so the duplicate-rollback path in
+        ``_commit_add_claim`` -- which would *unregister* it -- is never hit, and
+        the end-of-walk reconcile stays a clean no-op.
+        """
+        with self._lock:
+            if claim.source_id in self._state.claims:
+                return
+        self._commit_add_claim(claim)
 
     def _commit_add_claim(self, claim: SourceClaim) -> bool:
         """Register a discovered source, then commit it into confirmed state."""

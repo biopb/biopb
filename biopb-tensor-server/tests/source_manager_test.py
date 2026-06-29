@@ -1511,3 +1511,127 @@ class TestProgressiveDiscoveryFreshness:
         assert manager._initial_scan_done is True
         assert server.last_full_scan_at is not None
         assert fired == [True]
+
+
+class TestProgressiveStreaming:
+    """Option B: the first scan streams adds within the walk (progressive #212)."""
+
+    def _manager(self, tmp_path, n_sources, **kw):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        for i in range(n_sources):
+            (monitored_dir / f"s{i}.dat").write_text(f"data{i}")
+
+        server = _FakeServer()
+        manager = SourceManager(
+            server=server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+            **kw,
+        )
+        return server, manager
+
+    def test_first_scan_streams_adds_before_reconcile(self, tmp_path, monkeypatch):
+        server, manager = self._manager(tmp_path, n_sources=3)
+
+        # Capture how many sources were already registered when reconcile starts.
+        # Under Option B every first-scan add is streamed *during* the walk, so
+        # the catalog is already full before the end-of-walk reconcile runs.
+        seen_at_reconcile = []
+        orig_reconcile = manager._reconcile_discovered_state
+
+        def spy(discovered_state, unstable_paths):
+            seen_at_reconcile.append(len(server.registered))
+            return orig_reconcile(discovered_state, unstable_paths)
+
+        monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
+
+        manager._handle_rescan()
+
+        assert seen_at_reconcile == [3]  # all 3 registered before reconcile
+        assert len(server.registered) == 3
+        # Reconcile did not re-add them (idempotent): exactly one register each.
+        assert len(server.registered) == len(set(server.registered))
+
+    def test_steady_state_rescan_does_not_stream(self, tmp_path, monkeypatch):
+        # After the first scan, a force-full steady-state rescan must NOT stream
+        # (its on_source_added stays unset) -- adds go through batch reconcile.
+        server, manager = self._manager(tmp_path, n_sources=2)
+        manager._handle_rescan()  # first scan: _initial_scan_done -> True
+
+        # Force the next rescan to be a full one and add a new source.
+        manager._last_full_rescan_at = float("-inf")
+        (tmp_path / "monitored" / "s2.dat").write_text("data2")
+
+        seen_at_reconcile = []
+        orig_reconcile = manager._reconcile_discovered_state
+
+        def spy(discovered_state, unstable_paths):
+            # The new source is NOT yet registered when reconcile starts: it is
+            # added by reconcile (batch), not streamed during the walk.
+            seen_at_reconcile.append(len(server.registered))
+            return orig_reconcile(discovered_state, unstable_paths)
+
+        monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
+        manager._handle_rescan()
+
+        assert seen_at_reconcile == [2]  # only the original two before reconcile
+        assert len(server.registered) == 3
+
+    def test_retried_first_scan_does_not_unregister_streamed_sources(
+        self, tmp_path, monkeypatch
+    ):
+        # A first scan that streams its sources then fails (before flipping
+        # _initial_scan_done) must, on retry, NOT re-commit -> never hit the
+        # duplicate-rollback that would unregister them.
+        server, manager = self._manager(tmp_path, n_sources=2)
+
+        calls = {"n": 0}
+        orig_reconcile = manager._reconcile_discovered_state
+
+        def flaky(discovered_state, unstable_paths):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("reconcile failed")
+            return orig_reconcile(discovered_state, unstable_paths)
+
+        monkeypatch.setattr(manager, "_reconcile_discovered_state", flaky)
+
+        with pytest.raises(RuntimeError, match="reconcile failed"):
+            manager._handle_rescan()
+
+        # Both sources were streamed before the failure and remain registered.
+        assert len(server.registered) == 2
+        assert manager._initial_scan_done is False
+
+        # Retry (still force-full: timestamp never advanced) completes cleanly
+        # without re-registering or unregistering anything.
+        manager._handle_rescan()
+        assert manager._initial_scan_done is True
+        assert len(server.registered) == 2  # not 4
+        assert server.unregistered == []
+
+    def test_unstable_first_scan_claim_is_not_streamed(self, tmp_path):
+        # stable_rescans_required=2: a fresh entry needs two unchanged
+        # observations before it is eligible, so the first scan defers it and
+        # streams nothing -- the same stability gate the batch path uses.
+        server, manager = self._manager(
+            tmp_path, n_sources=1, stable_rescans_required=2
+        )
+
+        manager._handle_rescan()  # first (force-full) scan
+
+        assert server.registered == []  # deferred, not streamed
+        assert manager._initial_scan_done is True  # scan still completed
+        assert server.last_full_scan_at is not None
+
+        # Not lost: once stable, a later rescan registers it (batch path).
+        for _ in range(5):
+            if server.registered:
+                break
+            manager._handle_rescan()
+        assert len(server.registered) == 1
