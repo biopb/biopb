@@ -451,6 +451,43 @@ class TestTiffSequenceStackAll:
             assert adapter.full_shape == [3, 4, 8, 8]
             assert adapter.dim_labels == ["i", "z", "y", "x"]
 
+    def test_trailing_singleton_samples_axis(self):
+        """`(Y, X, 1)` TIFFs (series.axes 'YXQ') read back intact (#220).
+
+        Files written from a `(Y, X, 1)` array carry a trailing singleton
+        samples axis, so `series.aszarr()` yields a 3-D `(Y, X, 1)` store. The
+        reader must take Y/X from the axes string -- not `shape[-2:]` (which is
+        `(X, samples)`) -- and must not treat the 3-D shape as `(page, Y, X)`,
+        which collapsed every plane to its first column.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            planes = [
+                np.arange(8 * 8, dtype=np.uint16).reshape(8, 8) + i * 100
+                for i in range(3)
+            ]
+            for i, plane in enumerate(planes):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"img_{i}.tif"), plane.reshape(8, 8, 1)
+                )
+                # sanity: the fixture really has the trailing samples axis
+                with tifffile.TiffFile(str(Path(tmpdir) / f"img_{i}.tif")) as tf:
+                    assert tf.series[0].axes == "YXQ"
+
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            # descriptor stays 2-D spatial: the samples axis is not modeled
+            assert adapter.full_shape == [3, 8, 8]
+            assert adapter.dim_labels == ["i", "y", "x"]
+
+            out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 8, 8]))
+            assert out.shape == (3, 8, 8)
+            for i, plane in enumerate(planes):
+                np.testing.assert_array_equal(out[i], plane)
+
+            # a sub-region read must also map Y/X correctly (not just full plane)
+            sub = adapter.get_data(ChunkBounds(start=[1, 2, 3], stop=[2, 6, 7]))
+            assert sub.shape == (1, 4, 4)
+            np.testing.assert_array_equal(sub[0], planes[1][2:6, 3:7])
+
     def test_tiled_tiff(self):
         """Tiled TIFFs drive the tile-info branch and chunk shape."""
         with tempfile.TemporaryDirectory() as tmpdir:
