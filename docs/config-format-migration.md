@@ -67,23 +67,36 @@ Back-compat is total: an existing `~/.config/biopb/biopb.toml` still loads and i
 still picked up by every default-path resolver (it only loses to a `biopb.json`
 sitting beside it).
 
-## Deferred (not part of "coexistence for now")
+4. **Value validation (#34 proper).** Out-of-range / bad-enum knobs used to be
+   accepted silently and blow up later on the request path (`downscale_factor=0`
+   → `ZeroDivisionError` in `GetFlightInfo`; `pixel_budget_cubic_root<=0` →
+   infinite loop in the precache worker; `reduction_method="bogus"` → a read-time
+   error; `downscale_factor=1` → a silently single-level pyramid). A single
+   declarative `_CONSTRAINTS` table (`_Range` / `_Enum` per field) is enforced in
+   each config dataclass's `__post_init__`, so **every** construction path — both
+   file formats and direct dataclass construction — is covered. Messages name the
+   section, key, value, and accepted range/enum.
+
+   Severity is **warn** during the deprecation window (`_STRICT_VALIDATION =
+   False`): a config that loaded before must not become a hard startup failure on
+   upgrade. The disable sentinel `full_rescan_interval <= 0` is intentionally
+   *not* constrained. Flip `_STRICT_VALIDATION → True` (warn → raise) when the
+   legacy read path is removed.
+
+## Deferred
 
 - **Installer writes JSON.** Replace the TOML text templating in `install.sh` /
   `biopb-engine.ps1` with `json.dumps` / `ConvertTo-Json` and write `biopb.json`.
   Once shipped, new installs are JSON-native; old TOML installs keep working.
-- **Value validation (#34 proper).** The `CONSTRAINTS` table + `__post_init__`
-  enforcement (severity = warn during the window). Format-independent, lands on
-  the same data model.
-- **JSON Schema emitter.** Generated from `CONSTRAINTS`, feeding the config
-  generator + editor autocomplete + optional pre-flight validation.
+- **JSON Schema emitter.** Generated from the same `_CONSTRAINTS` table, feeding
+  the config generator + editor autocomplete + optional pre-flight validation.
 - **End state.** Drop the `.toml` read path and flip validation warn → raise.
 
 ## Sequencing (from #34)
 
-1. ~~Read-side coexistence (this doc).~~ ✅
-2. Installer emits JSON; value-validation `CONSTRAINTS` (warn).
-3. Schema emitter; make JSON the only documented format.
+1. ~~Read-side coexistence.~~ ✅
+2. ~~Value-validation `_CONSTRAINTS` (warn).~~ ✅
+3. Installer emits JSON; schema emitter; make JSON the only documented format.
 4. Drop `.toml` read path; flip warn → hard-fail.
 
 ## Equivalent configs
