@@ -156,6 +156,26 @@ describe("TensorHttpClient.readyz", () => {
     const r = await c.readyz();
     expect(r.ready).toBe(true);
   });
+
+  it("surfaces the backend freshness fields (progressive discovery)", async () => {
+    const body = {
+      status: "ok", timestamp: "", ready: true,
+      dev_mode: false, service: "biopb-tensor-web", version: "0.1.0",
+      source_count: 3,
+      backend_health: {
+        status: "SERVING",
+        source_count: 3,
+        full_scan_in_progress: true,
+        last_full_scan_finished_at: null,
+      },
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(body));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const r = await c.readyz();
+    expect(r.backend_health?.full_scan_in_progress).toBe(true);
+    expect(r.backend_health?.last_full_scan_finished_at).toBeNull();
+    expect(r.source_count).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------

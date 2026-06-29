@@ -1,6 +1,6 @@
 # Progressive Discovery — Implementation Plan
 
-**Status:** Implementation plan — Phases 0 (audit) & 1 (freshness fields) complete; Phases 2–5 not started
+**Status:** Implementation plan — Phases 0–2 complete (audit, freshness fields, client indexing/empty UI); Phases 3–5 not started
 **Component:** `biopb-tensor-server` (+ a small client-gating change in `biopb-mcp`)
 **Design:** [progressive-discovery.md](progressive-discovery.md) — read first; this doc
 turns that design's *Changes by file* and *Suggested sequence* into PR-sized,
@@ -141,7 +141,35 @@ all existing tests green. **Risk:** ~none (additive read-only fields).
 
 ---
 
-## Phase 2 — Distinguish "indexing" from "empty" in two UIs (client side)
+## Phase 2 — Distinguish "indexing" from "empty" in two UIs ✅ (complete)
+
+**Landed:**
+- **biopb-mcp** — `TensorConnection` caches the last-observed health dict
+  (`last_health`, populated by the connect probe *and* the source-watch poll) and
+  exposes `scan_in_progress()` / `scan_source_count()` (cached, no round-trip;
+  absence of the field ⇒ "not scanning", preserving old behavior). The napari
+  widget's two empty-catalog sites (`_on_connect_done`, `_refresh`) now call a
+  shared `_show_empty_state()` that shows a grey "Indexing… (N so far)" status
+  (and keeps Refresh enabled) while a scan runs, falling back to the
+  "No sources found" error otherwise.
+- **webapp** — `ReadyzSnapshot` gains a typed `backend_health` (incl.
+  `full_scan_in_progress`); the store carries a `scanning` flag seeded from
+  `/readyz` at bootstrap and refreshed in the catalog poller; `SourceTree`
+  renders "Indexing data folder…" instead of "No sources" when the catalog is
+  empty *and* scanning (guarded by `sources.length === 0` so a filtered-to-empty
+  search still says "No sources").
+- **Tests** — connection freshness helpers + `last_health` caching (5),
+  widget indexing-state render (1), `readyz()` freshness round-trip (1). Affected
+  suites green (175 Python; 50 tensor-flight-client; web `tsc --noEmit` clean).
+
+Sidecar `/readyz` needed no change — it already forwards the full
+`backend_health`, and its `ready=true`-early semantics ("service is up") are
+correct. Optional polish (server_status hint, watcher re-list on scan-done,
+faster webapp polling while scanning) deferred.
+
+---
+
+### Original plan (for reference)
 
 **Goal:** before Phase 3 makes a `SERVING`-but-still-scanning catalog real, fix
 the only two surfaces the Phase 0 audit found that *mislead* in that state — both

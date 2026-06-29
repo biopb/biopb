@@ -306,6 +306,64 @@ class TestConnectReadiness:
         assert "up 0s" in msg
 
 
+class TestScanFreshness:
+    """Cached health freshness fields (progressive discovery #212)."""
+
+    def _connect(self, monkeypatch, health):
+        client = _fake_client({})
+        client.health_check.return_value = health
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        return conn
+
+    def test_connect_caches_health_and_reports_scan(self, monkeypatch):
+        conn = self._connect(
+            monkeypatch,
+            {"status": "SERVING", "source_count": 4, "full_scan_in_progress": True},
+        )
+        assert conn.last_health["full_scan_in_progress"] is True
+        assert conn.scan_in_progress() is True
+        assert conn.scan_source_count() == 4
+
+    def test_not_scanning_when_field_false(self, monkeypatch):
+        conn = self._connect(
+            monkeypatch,
+            {"status": "SERVING", "source_count": 9, "full_scan_in_progress": False},
+        )
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 9
+
+    def test_older_server_without_field_is_not_scanning(self, monkeypatch):
+        # No freshness field -> absence is treated as "not scanning" (old UX).
+        conn = self._connect(monkeypatch, {"status": "SERVING", "source_count": 2})
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 2
+
+    def test_defaults_before_any_health(self):
+        conn = TensorConnection(config={})
+        assert conn.last_health is None
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 0
+
+    def test_watch_loop_refreshes_cached_health(self, monkeypatch):
+        conn, client = _connected_conn(
+            monkeypatch,
+            {"a": MagicMock()},
+            [{"source_count": 1, "full_scan_in_progress": False}],
+        )
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)
+
+        assert conn.last_health == {
+            "source_count": 1,
+            "full_scan_in_progress": False,
+        }
+
+
 class TestConnectWhenBooted:
     def test_waits_through_refused_and_starting(self, monkeypatch):
         conn = TensorConnection(config={})

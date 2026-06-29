@@ -827,8 +827,11 @@ class TensorBrowserWidget(QWidget):
 
         sources = self._conn.sources
         if not sources:
-            self._show_error("No sources found on server")
-            self._refresh_button.setEnabled(False)
+            # While the server is still indexing, keep Refresh enabled (more
+            # sources are coming, and the watcher re-lists as they appear); a
+            # genuinely empty server leaves it disabled, as before.
+            indexing = self._show_empty_state()
+            self._refresh_button.setEnabled(indexing)
             return
 
         if self._use_server_query:
@@ -851,6 +854,29 @@ class TensorBrowserWidget(QWidget):
         else:
             self._token_input.setEchoMode(QLineEdit.Password)
             self._show_token_btn.setText("Show")
+
+    def _show_empty_state(self) -> bool:
+        """Render the no-sources state, distinguishing indexing from empty.
+
+        With progressive discovery the server reports ``SERVING`` while its
+        data-folder scan is still running, so an empty catalog right after
+        connect is often "not done indexing yet," not "nothing here." When the
+        last-observed health says a full scan is in progress, show a transient
+        grey status instead of an error -- the background source watcher re-lists
+        the tree automatically as sources are found. Returns True in that case,
+        False when the catalog is genuinely empty (an error is shown).
+        """
+        if self._conn.scan_in_progress():
+            self._clear_error()
+            self._show_status(
+                f"Indexing data folder… "
+                f"({self._conn.scan_source_count()} sources so far). "
+                "The list updates automatically as sources are found."
+            )
+            return True
+        self._clear_status()
+        self._show_error("No sources found on server")
+        return False
 
     def _show_error(self, msg: str):
         """Display error message."""
@@ -896,7 +922,7 @@ class TensorBrowserWidget(QWidget):
             sources = self._conn.refresh()
 
             if not sources:
-                self._show_error("No sources found on server")
+                self._show_empty_state()
                 self._tree_widget.clear()
                 return
 

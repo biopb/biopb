@@ -70,9 +70,14 @@ export function ClientBootstrap() {
         // Wait for server to be ready (handles startup gracefully)
         const status = await waitForServer(apiBase);
 
+        // Seed the scan-in-progress flag so an empty catalog at startup renders
+        // as "Indexing…" rather than "No sources" (progressive discovery).
+        const scanning = !!status.backend_health?.full_scan_in_progress;
+
         if (status.dev_mode) {
           // Dev mode active - bypass token requirement
           initClient(apiBase, null, true);
+          useAppStore.setState({ scanning });
           await loadSources();
           startCatalogPolling();
           return;
@@ -86,6 +91,7 @@ export function ClientBootstrap() {
         }
 
         initClient(apiBase, token, false);
+        useAppStore.setState({ scanning });
         await loadSources();
         startCatalogPolling();
       } catch (err) {
