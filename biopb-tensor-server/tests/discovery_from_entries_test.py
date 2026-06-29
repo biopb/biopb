@@ -213,3 +213,123 @@ class TestSignaturePlumbing:
         """Live-walk / join contexts carry no signature, so probes run uncached."""
         assert ClaimContext("/some/file.tif").signature is None
         assert ClaimContext("/d", is_dir=True).join("img.tif").signature is None
+
+
+class TestCachedGlobNoReaddir:
+    """Snapshot-driven claim globs are served from the cached child listing
+    instead of re-reading the directory (biopb/biopb#65).
+
+    A directory-claiming adapter globs its candidate directory up to 6× per
+    rescan cycle; on cloud storage each glob is a directory-enumeration
+    round-trip. The state walk already enumerated every directory's children, so
+    the claim phase reuses that listing.
+    """
+
+    def _explode_on_readdir(self, monkeypatch):
+        """Make any real directory read (Path.glob) raise, so a test fails loudly
+        if a glob falls through to the filesystem instead of the cached listing."""
+
+        def boom(self, pattern):
+            raise AssertionError(f"Path.glob({pattern!r}) hit the filesystem")
+
+        monkeypatch.setattr(Path, "glob", boom)
+
+    def test_glob_matches_real_glob(self, tmp_path):
+        """Cached glob is byte-identical to a real glob for the adapters' patterns."""
+        for name in ["a.tif", "b.tif", "c.tiff", "C.TIF", "metadata.txt", "x.dcm"]:
+            (tmp_path / name).write_text("x")
+        listing = [str(p) for p in tmp_path.iterdir()]
+        ctx = ClaimContext(tmp_path, is_dir=True, child_listing=listing)
+
+        for pattern in ["*.tif", "*.tiff", "*.companion.ome", "metadata.txt", "*.dcm"]:
+            cached = sorted(c.name for c in ctx.glob(pattern))
+            real = sorted(p.name for p in tmp_path.glob(pattern))
+            assert cached == real, pattern
+
+    def test_glob_served_without_reading_directory(self, tmp_path, monkeypatch):
+        """With a cached listing, glob never touches the filesystem."""
+        listing = [
+            str(tmp_path / "a.tif"),
+            str(tmp_path / "b.tif"),
+            str(tmp_path / "notes.txt"),
+        ]
+        ctx = ClaimContext(tmp_path, is_dir=True, child_listing=listing)
+        self._explode_on_readdir(monkeypatch)
+
+        tifs = sorted(c.name for c in ctx.glob("*.tif"))
+        assert tifs == ["a.tif", "b.tif"]
+        assert [c.name for c in ctx.glob("notes.txt")] == ["notes.txt"]
+        assert ctx.glob("*.nope") == []
+
+    def test_no_listing_falls_back_to_real_glob(self, tmp_path):
+        """Without a cached listing, glob reads the directory as before."""
+        (tmp_path / "a.tif").write_text("x")
+        ctx = ClaimContext(tmp_path, is_dir=True)  # no child_listing
+        assert [c.name for c in ctx.glob("*.tif")] == ["a.tif"]
+
+    def test_multilevel_pattern_falls_back(self, tmp_path, monkeypatch):
+        """A pattern spanning directory levels can't be served from a flat
+        single-level listing, so it falls back to a real glob even when cached."""
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.tif").write_text("x")
+        ctx = ClaimContext(tmp_path, is_dir=True, child_listing=[str(tmp_path / "sub")])
+        # The cached path would never match a nested pattern; prove it falls
+        # through by checking it finds the nested file a real glob would.
+        assert [c.name for c in ctx.glob("sub/*.tif")] == ["a.tif"]
+
+        # ...and that single-level patterns on the same ctx do NOT read disk.
+        self._explode_on_readdir(monkeypatch)
+        assert ctx.glob("*.tif") == []
+
+    def test_snapshot_dir_ctx_carries_child_listing(self, tmp_path):
+        """discover_sources_from_entries hands each directory its recorded
+        children, and files carry no listing."""
+        (tmp_path / "a.tif").write_text("x")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.tif").write_text("x")
+
+        listings = {}
+
+        def spy(ctx, state):
+            listings[str(ctx.path_str)] = ctx._child_listing
+            return []
+
+        registry = get_default_registry()
+        registry.get_claims_for_path = spy
+        discover_sources_from_entries(_snapshot(tmp_path), registry)
+
+        root = str(tmp_path.resolve())
+        assert set(listings[root]) == {
+            str(tmp_path.resolve() / "a.tif"),
+            str(tmp_path.resolve() / "sub"),
+        }
+        # The directory's listing holds its own children.
+        assert listings[str(tmp_path.resolve() / "sub")] == [
+            str(tmp_path.resolve() / "sub" / "b.tif")
+        ]
+        # A file entry carries no listing (files never glob).
+        assert listings[str(tmp_path.resolve() / "a.tif")] is None
+
+    def test_tiff_sequence_claimed_from_snapshot_without_readdir(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: a TIFF sequence is claimed off the snapshot with the
+        whole claim phase's globs served from memory (no directory reads)."""
+        tifffile = pytest.importorskip("tifffile")
+        import numpy as np
+
+        seq = tmp_path / "seq"
+        seq.mkdir()
+        # Naming that _group_tiff_sequence treats as one ordered sequence (one
+        # varying numeric field); see tiff_sequence_test.py.
+        for i in range(1, 6):
+            tifffile.imwrite(
+                str(seq / f"s1-{i:04d}_bf.tif"), np.zeros((4, 4), dtype="uint8")
+            )
+
+        snapshot = _snapshot(tmp_path)
+        self._explode_on_readdir(monkeypatch)
+        state = discover_sources_from_entries(snapshot, get_default_registry())
+
+        claims = {c.primary_path: c.source_type for c in state.claims.values()}
+        assert claims == {str(seq.resolve()): "tiff-sequence"}

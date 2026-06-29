@@ -445,12 +445,14 @@ class DicomSeriesAdapter(SourceAdapter, TensorAdapter):
         if ctx.cloud_root:
             return None
 
-        # Find DICOM files
-        dcm_files = (
-            list(ctx._path.glob("*.dcm"))
-            + list(ctx._path.glob("*.DICOM"))
-            + list(ctx._path.glob("*.dicom"))
-        )
+        # Find DICOM files. Route through ctx.glob (not ctx._path.glob) so the
+        # snapshot's cached child listing serves the match without re-reading the
+        # directory (biopb/biopb#65); unwrap to the underlying Path objects the
+        # rest of this method (dcmread / try_claim_path) consumes.
+        dcm_files = [
+            c._path
+            for c in (ctx.glob("*.dcm") + ctx.glob("*.DICOM") + ctx.glob("*.dicom"))
+        ]
 
         # Need at least 2 files for a series
         if len(dcm_files) < 2:
