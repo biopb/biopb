@@ -152,6 +152,166 @@ def _default_cache_backend() -> str:
     return "file"
 
 
+# --- Declarative config validation (biopb/biopb#34) ---------------------------
+#
+# Out-of-range / bad-enum values used to be accepted silently and blow up later:
+# downscale_factor=0 -> ZeroDivisionError in GetFlightInfo; pixel_budget_cubic_root
+# <= 0 -> infinite loop in the precache worker; reduction_method="bogus" -> a
+# read-time ValueError; downscale_factor=1 -> a silently single-level pyramid.
+# Validate at construction instead, in each dataclass's __post_init__, so EVERY
+# path that builds a config -- both file formats AND direct dataclass
+# construction (resolve_all_sources, the future generator) -- is covered by one
+# declarative source of truth.
+#
+# Severity is WARN during the TOML deprecation window: a config that loaded
+# before must not become a hard startup failure on upgrade. Flip
+# _STRICT_VALIDATION -> True (warn -> raise) when the legacy read path is removed
+# (the "fail fast at startup" end state). The same table feeds the planned JSON
+# Schema emitter, so the constraints are declared once.
+
+_STRICT_VALIDATION = False
+
+# Normalized methods + aliases accepted by downsample.normalize_reduction_method
+# (matched case-insensitively, mirroring that function).
+_REDUCTION_METHODS = {
+    "area",
+    "linear",
+    "nearest",
+    "precompute",
+    "stride",
+    "decimate",
+    "mean",
+    "precomputed",
+}
+
+
+class _Range:
+    """A numeric bound; ``min``/``max`` are inclusive, either may be omitted."""
+
+    def __init__(self, *, min=None, max=None):
+        self.min = min
+        self.max = max
+
+    def ok(self, value) -> bool:
+        # bool is an int subclass; a bool where a number is expected is wrong.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        below = self.min is not None and value < self.min
+        above = self.max is not None and value > self.max
+        return not (below or above)
+
+    def describe(self) -> str:
+        if self.min is not None and self.max is not None:
+            return f"a number in [{self.min}, {self.max}]"
+        if self.min is not None:
+            return f"a number >= {self.min}"
+        return f"a number <= {self.max}"
+
+
+class _Enum:
+    """Membership in a fixed set, optionally case-insensitive for strings."""
+
+    def __init__(self, allowed, *, case_insensitive=False):
+        self.case_insensitive = case_insensitive
+        self._display = set(allowed)
+        # When case-insensitive, fold the allowed set too so the comparison is
+        # symmetric (else a lowercased value never matches an upper-case member).
+        self.allowed = {
+            a.lower() if (case_insensitive and isinstance(a, str)) else a
+            for a in allowed
+        }
+
+    def ok(self, value) -> bool:
+        if self.case_insensitive and isinstance(value, str):
+            value = value.strip().lower()
+        return value in self.allowed
+
+    def describe(self) -> str:
+        return "one of: " + ", ".join(sorted(map(str, self._display)))
+
+
+# Per-dataclass field constraints, keyed by class name (so this table can sit
+# above the class definitions). full_rescan_interval is intentionally absent:
+# a value <= 0 *disables* the periodic full-scan backstop (documented sentinel).
+_CONSTRAINTS = {
+    "CacheConfig": {
+        "backend": _Enum({"memory", "file"}),
+        "memory_max_entries": _Range(min=1),
+        "memory_max_bytes": _Range(min=1),
+        "file_max_segment_bytes": _Range(min=1),
+        "file_max_total_bytes": _Range(min=1),
+    },
+    "PyramidConfig": {
+        "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
+        "threshold": _Range(min=1),
+        "downscale_factor": _Range(min=2),
+        "pixel_budget_cubic_root": _Range(min=1),
+    },
+    "PrecacheConfig": {
+        "idle_debounce_seconds": _Range(min=0),
+        "backlog_high_water": _Range(min=0.0, max=1.0),
+        "backlog_idle_recheck_seconds": _Range(min=0),
+    },
+    "MetadataDbConfig": {
+        "max_query_results": _Range(min=1),
+        "max_list_flights_results": _Range(min=1),
+        "query_timeout_ms": _Range(min=1),
+    },
+    "ServerConfig": {
+        "port": _Range(min=1, max=65535),
+        "log_level": _Enum(
+            {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
+        ),
+        # compute_backend is matched case-sensitively, as configure_compute_backend
+        # does (it raises on anything outside this set).
+        "compute_backend": _Enum({"auto", "cpu", "gpu"}),
+        "gpu_min_input_mb": _Range(min=0),
+        "gpu_min_linear_input_mb": _Range(min=0),
+        "gpu_memory_safety_factor": _Range(min=1),
+        "gpu_min_merged_chunks": _Range(min=1),
+        "rescan_interval": _Range(min=0),
+        "stability_window": _Range(min=0),
+        "stable_rescans_required": _Range(min=0),
+    },
+}
+
+# Class name -> the config section it maps to, for friendlier messages.
+_SECTION_FOR = {
+    "CacheConfig": "cache",
+    "PyramidConfig": "pyramid",
+    "PrecacheConfig": "precache",
+    "MetadataDbConfig": "metadata_db",
+    "ServerConfig": "server",
+}
+
+
+def _validate_config(instance) -> None:
+    """Check *instance*'s fields against :data:`_CONSTRAINTS` (warn, or raise
+    when ``_STRICT_VALIDATION``). Called from each config dataclass's
+    ``__post_init__`` so every construction path is covered."""
+    name = type(instance).__name__
+    constraints = _CONSTRAINTS.get(name)
+    if not constraints:
+        return
+    problems = [
+        f"{key}={getattr(instance, key)!r} (expected {c.describe()})"
+        for key, c in constraints.items()
+        if not c.ok(getattr(instance, key))
+    ]
+    if not problems:
+        return
+    msg = f"Invalid config value(s) in [{_SECTION_FOR.get(name, name)}]: " + "; ".join(
+        problems
+    )
+    if _STRICT_VALIDATION:
+        raise ValueError(msg)
+    logger.warning(
+        "%s. Used as-is for now; this will become an error in a future release. "
+        "See biopb/biopb#34.",
+        msg,
+    )
+
+
 @dataclass
 class SourceConfig:
     """Configuration for a single data source.
@@ -257,6 +417,7 @@ class CacheConfig:
     def __post_init__(self):
         if isinstance(self.file_cache_dir, str):
             self.file_cache_dir = Path(self.file_cache_dir)
+        _validate_config(self)
 
 
 @dataclass
@@ -285,6 +446,9 @@ class PyramidConfig:
     threshold: int = 4096
     downscale_factor: int = 4
     pixel_budget_cubic_root: int = 512
+
+    def __post_init__(self):
+        _validate_config(self)
 
 
 @dataclass
@@ -317,6 +481,9 @@ class PrecacheConfig:
     backlog_high_water: float = 0.8
     backlog_idle_recheck_seconds: float = 5.0
 
+    def __post_init__(self):
+        _validate_config(self)
+
 
 @dataclass
 class MetadataDbConfig:
@@ -336,6 +503,9 @@ class MetadataDbConfig:
     max_query_results: int = 100000
     max_list_flights_results: int = 100000
     query_timeout_ms: int = 30000
+
+    def __post_init__(self):
+        _validate_config(self)
 
 
 @dataclass
@@ -402,6 +572,9 @@ class ServerConfig:
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
     sources: List[SourceConfig] = field(default_factory=list)
+
+    def __post_init__(self):
+        _validate_config(self)
 
 
 def load_config(path: Path) -> ServerConfig:
