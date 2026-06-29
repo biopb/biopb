@@ -86,9 +86,17 @@ def _default_config() -> Path:
     """
     config_dir = Path.home() / ".config" / "biopb"
     json_path = config_dir / "biopb.json"
-    if json_path.exists():
-        return json_path
     toml_path = config_dir / "biopb.toml"
+    if json_path.exists():
+        if toml_path.exists():
+            # Legacy TOML is shadowed -- warn to stderr so stdout stays clean
+            # for scripted use. Only fires in the rare both-exist transition.
+            Console(stderr=True).print(
+                f"[yellow]Both biopb.json and biopb.toml exist in {config_dir}; "
+                "using biopb.json and ignoring the legacy biopb.toml. Remove the "
+                "TOML file to silence this (biopb/biopb#34).[/yellow]"
+            )
+        return json_path
     if toml_path.exists():
         return toml_path
     return json_path

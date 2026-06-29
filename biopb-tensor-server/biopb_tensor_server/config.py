@@ -126,14 +126,27 @@ def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     forward-looking name. Callers that need a guaranteed-existing file should
     still check ``.exists()`` on the result.
 
+    When *both* files exist the legacy TOML is silently shadowed, so this logs a
+    warning naming the file that is being ignored.
+
     This is the single source of truth for the default-config preference; the
     umbrella ``biopb`` CLI and ``biopb-mcp`` mirror it (the latter cannot import
     this package at runtime, so it keeps a 4-line twin).
     """
     json_path = config_dir / CANONICAL_CONFIG_NAME
-    if json_path.exists():
-        return json_path
     toml_path = config_dir / LEGACY_CONFIG_NAME
+    if json_path.exists():
+        if toml_path.exists():
+            logger.warning(
+                "Both %s and %s exist in %s; using %s and ignoring the legacy "
+                "%s. Remove the TOML file to silence this. See biopb/biopb#34.",
+                CANONICAL_CONFIG_NAME,
+                LEGACY_CONFIG_NAME,
+                config_dir,
+                CANONICAL_CONFIG_NAME,
+                LEGACY_CONFIG_NAME,
+            )
+        return json_path
     if toml_path.exists():
         return toml_path
     return json_path
@@ -519,8 +532,11 @@ def _warn_toml_deprecated(path: Path) -> None:
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Parse configuration from a dictionary.
 
+    Format-agnostic: ``data`` is a plain dict already read from JSON or TOML by
+    :func:`load_config`.
+
     Args:
-        data: Config dictionary (from TOML)
+        data: Config dictionary (from JSON or TOML)
 
     Returns:
         ServerConfig object

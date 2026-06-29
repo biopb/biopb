@@ -48,9 +48,16 @@ SERVER_QUERY_THRESHOLD = 1000
 def _default_server_config() -> Path:
     config_dir = Path.home() / ".config" / "biopb"
     json_path = config_dir / "biopb.json"
-    if json_path.exists():
-        return json_path
     toml_path = config_dir / "biopb.toml"
+    if json_path.exists():
+        if toml_path.exists():
+            logger.warning(
+                "Both biopb.json and biopb.toml exist in %s; using biopb.json "
+                "and ignoring the legacy biopb.toml. Remove the TOML file to "
+                "silence this. See biopb/biopb#34.",
+                config_dir,
+            )
+        return json_path
     return toml_path if toml_path.exists() else json_path
 
 

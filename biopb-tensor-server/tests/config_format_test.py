@@ -130,6 +130,24 @@ def test_find_config_prefers_json(tmp_path):
     assert find_config(tmp_path) == tmp_path / CANONICAL_CONFIG_NAME
 
 
+def test_find_config_warns_when_both_exist(tmp_path, caplog):
+    (tmp_path / LEGACY_CONFIG_NAME).write_text(_TOML)
+    (tmp_path / CANONICAL_CONFIG_NAME).write_text(json.dumps(_JSON))
+    with caplog.at_level(logging.WARNING):
+        find_config(tmp_path)
+    assert any(
+        "biopb.toml" in r.message and "ignoring" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+def test_find_config_does_not_warn_with_single_file(tmp_path, caplog):
+    (tmp_path / CANONICAL_CONFIG_NAME).write_text(json.dumps(_JSON))
+    with caplog.at_level(logging.WARNING):
+        find_config(tmp_path)
+    assert not caplog.records
+
+
 def test_find_config_falls_back_to_toml(tmp_path):
     (tmp_path / LEGACY_CONFIG_NAME).write_text(_TOML)
     assert find_config(tmp_path) == tmp_path / LEGACY_CONFIG_NAME

@@ -47,8 +47,10 @@ load_config(path)
 
 2. **JSON-preferred default-path resolution.** `find_config(dir)` returns the
    first of `biopb.json` → `biopb.toml` that exists, else the canonical
-   `biopb.json` path. The three entry points that hardcoded `biopb.toml` now
-   prefer JSON:
+   `biopb.json` path. When **both** exist the legacy TOML is silently shadowed,
+   so resolution logs a warning naming the ignored file (stderr for the umbrella
+   CLI, so stdout stays scriptable). The three entry points that hardcoded
+   `biopb.toml` now prefer JSON:
    - `biopb_tensor_server.config.find_config` (source of truth)
    - `biopb.cli._default_config` (umbrella `biopb server …`)
    - `biopb_mcp._connection._default_server_config` (auto-start spawner) — a
