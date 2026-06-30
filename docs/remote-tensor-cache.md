@@ -339,7 +339,7 @@ own surfaces:
   Already-cached chunks keep serving from the segment cache through an outage.
 
 > **Implemented (unreachable-upstream policy).** The catalog/serve split above is
-> in `RemoteTensorAdapter` (`_safe_list_sources`, `_reachable`,
+> in `RemoteTensorAdapter` (`_reachable`, `_mark_unreachable`,
 > `is_resident()→_reachable`, `list_tensor_descriptors`/`get_metadata` →
 > empty-on-unreachable; serve methods unchanged). Two URL forms:
 > **single-source** `grpc://host/<id>` down at boot → registers as an empty
@@ -353,6 +353,31 @@ own surfaces:
 > `remote_tensor_adapter_test.py::TestUnreachableUpstream` (catalog placeholder,
 > serve-still-raises, transparent recovery via port reuse) +
 > `test_unreachable_sole_monitored_upstream_does_not_block_startup`.
+
+> **Implemented (catalog correctness — two fixes).**
+> *(1) Metadata source.* `list_flights`/`list_sources` is lean (empty
+> `metadata_json`); the only live RPC that fills it (`GetFlightInfo(with_metadata)`)
+> returns it *wrapped* (`{"type","dim_label","metadata"}`), which `get_metadata()`
+> would have had to unwrap and which it can't even get from `list_sources`. So
+> `get_metadata()` reads the **upstream's DuckDB `sources.metadata_json` column**
+> via `query_sources` — that column stores `json.dumps(get_metadata())` verbatim
+> (the *raw* dict, no envelope), exactly this method's contract; the local server
+> re-wraps it once on serialize. `_localize_descriptor` clears `metadata_json` +
+> `pyramid` so mirrored descriptors stay lean (the local server fills both itself).
+> *(2) Truncation-safe enumeration.* `list_sources()` is **capped**
+> (`max_list_flights_results`), so building a catalog from it silently drops
+> sources past the cap — and reconciling against a truncated list would
+> *spuriously remove* them. The new `list_upstream_source_ids(client) →
+> (ids, complete)` prefers the complete `query_sources("SELECT source_id FROM
+> sources")` and only falls back to the capped `list_sources()` (flagged
+> `complete=False`) when the upstream has no metadata DB. The bare-host expansion
+> and the monitor re-list both use it; the re-list applies **removals only when
+> `complete`**. And `list_tensor_descriptors` no longer scans the whole catalog to
+> find one source (capped + O(N²)) — it fetches that source's descriptor directly
+> via `get_descriptor` (a multi-tensor upstream source is advertised by its default
+> field; reading other fields still works). Tests: `test_get_metadata_*`,
+> `test_metadata_flows_through_proxy_single_wrapped`,
+> `test_expansion_complete_despite_list_flights_truncation`.
 
 > **Implemented (expansion + namespacing + collision check; mirror-once).**
 > `config.discover_sources` gained a `credentials_config` param and a

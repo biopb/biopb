@@ -1276,6 +1276,7 @@ class SourceManager:
         from biopb_tensor_server.adapters.remote_tensor import (
             _resolve_upstream_token,
             _split_grpc_url,
+            list_upstream_source_ids,
         )
         from biopb_tensor_server.config import _namespaced_source_id
 
@@ -1285,7 +1286,9 @@ class SourceManager:
 
         client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
         try:
-            upstream_ids = list(client.list_sources().keys())
+            # Complete enumeration -- list_sources() truncates, which would both
+            # miss sources AND spuriously remove the ones past the cap below.
+            upstream_ids, complete = list_upstream_source_ids(client)
         finally:
             close = getattr(client, "close", None)
             if close is not None:
@@ -1305,7 +1308,9 @@ class SourceManager:
             }
 
         added = set(desired) - current
-        removed = current - set(desired)
+        # Only remove when the upstream list is COMPLETE: a truncated/incomplete
+        # enumeration must never drop a mirrored source it simply failed to see.
+        removed = (current - set(desired)) if complete else set()
 
         for source_id in sorted(removed):
             self._commit_remove_source(source_id)

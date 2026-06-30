@@ -89,6 +89,38 @@ def _serve(server):
     return t
 
 
+def _db_upstream(zarr_path, source_ids, max_list_flights_results=None):
+    """An upstream with a populated metadata DB (so query_sources is complete).
+
+    Returns ``(upstream, register, unregister)``; register/unregister keep the
+    DuckDB catalog in sync so a re-list's ``query_sources`` reflects the change.
+    Not yet served -- the caller decides when (e.g. after configuring a cap).
+    """
+    import zarr
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+
+    arr = zarr.open_array(zarr_path, mode="r")
+    db = MetadataDatabase()
+    kwargs = {}
+    if max_list_flights_results is not None:
+        kwargs["max_list_flights_results"] = max_list_flights_results
+    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db, **kwargs)
+
+    def register(sid):
+        adapter = ZarrAdapter(arr, sid, ["y", "x"])
+        upstream.register_source(sid, adapter)
+        db.sync_source_added(sid, adapter)
+
+    def unregister(sid):
+        upstream.unregister_source(sid)
+        db.sync_source_removed(sid)
+
+    for sid in source_ids:
+        register(sid)
+    return upstream, register, unregister
+
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestRemoteTensorProxy:
     def _upstream(self, zarr_path):
@@ -195,15 +227,11 @@ class TestBareHostExpansion:
     """A bare grpc://host:port source mirrors *every* upstream source (§3)."""
 
     def test_expansion_mirrors_all_sources_namespaced(self, simple_zarr_array):
-        import zarr
-        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.config import SourceConfig, discover_sources
 
         zarr_path, shape, _ = simple_zarr_array
-        arr = zarr.open_array(zarr_path, mode="r")
-        upstream = TensorFlightServer("grpc://localhost:0")
-        upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
-        upstream.register_source("img2", ZarrAdapter(arr, "img2", ["y", "x"]))
+        upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
         _serve(upstream)
         try:
             expanded = discover_sources(
@@ -234,6 +262,35 @@ class TestBareHostExpansion:
         finally:
             upstream.shutdown()
 
+    def test_expansion_complete_despite_list_flights_truncation(
+        self, simple_zarr_array
+    ):
+        """list_sources() is capped (max_list_flights_results), but the bare-host
+        expansion must mirror EVERY upstream source via the complete server-side
+        catalog -- otherwise a large upstream is silently under-mirrored."""
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.config import SourceConfig, discover_sources
+
+        zarr_path, _, _ = simple_zarr_array
+        # cap list_flights at 1 while registering 3 sources
+        upstream, _, _ = _db_upstream(
+            zarr_path, ["a", "b", "c"], max_list_flights_results=1
+        )
+        _serve(upstream)
+        try:
+            # sanity: the capped list_sources IS truncated to 1...
+            probe = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            assert len(probe.list_sources()) == 1
+            probe.close()
+
+            # ...but the expansion mirrors all 3 (via the complete SQL catalog)
+            expanded = discover_sources(
+                SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+            )
+            assert {s.source_id for s in expanded} == {"lab__a", "lab__b", "lab__c"}
+        finally:
+            upstream.shutdown()
+
 
 def test_create_from_config_resolves_token_from_credentials_profile():
     """A per-upstream credentials profile (storage_type=biopb-tensor) supplies the
@@ -257,23 +314,131 @@ def test_create_from_config_resolves_token_from_credentials_profile():
     assert adapter._upstream_location == "grpc://lab:8815"
 
 
+def _meta_zarr_cls():
+    from biopb_tensor_server import ZarrAdapter
+
+    class _MetaZarr(ZarrAdapter):
+        def get_metadata(self):
+            return {"ome": {"channel": "DAPI"}}
+
+    return _MetaZarr
+
+
+def _upstream_with_metadata(zarr_path):
+    """An upstream server whose metadata DB holds one source ('img') with metadata."""
+    import zarr
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+
+    arr = zarr.open_array(zarr_path, mode="r")
+    db = MetadataDatabase()  # in-memory, enabled
+    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    up_adapter = _meta_zarr_cls()(arr, "img", ["y", "x"])
+    upstream.register_source("img", up_adapter)
+    db.sync_source_added("img", up_adapter)  # populate the DuckDB sources row
+    _serve(upstream)
+    return upstream
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_get_metadata_reads_from_upstream_metadata_db(simple_zarr_array):
+    """Source metadata is read from the upstream's metadata catalog via a SQL query
+    (sources.metadata_json stores the raw dict) -- list_flights is lean and the
+    buggy list_sources() path returned {}."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream = _upstream_with_metadata(zarr_path)
+    try:
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
+        )
+        assert adapter.get_metadata() == {"ome": {"channel": "DAPI"}}
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
+    """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
+    metadata, wrapped exactly once (not empty, not double-wrapped)."""
+    import json
+
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream = _upstream_with_metadata(zarr_path)
+    try:
+        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy.register_source(
+            "lab__img",
+            RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location=f"grpc://localhost:{upstream.port}",
+                upstream_source_id="img",
+            ),
+        )
+        _serve(proxy)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+            desc = client.get_descriptor("lab__img")  # GetFlightInfo(with_metadata)
+            assert desc.metadata_json  # was empty under the bug
+            wrapped = json.loads(desc.metadata_json)
+            assert wrapped["metadata"] == {"ome": {"channel": "DAPI"}}
+            # single wrap: the inner payload is the raw dict, not another envelope
+            assert "metadata" not in wrapped["metadata"]
+            client.close()
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
+    """No fallback: a reachable upstream whose metadata DB is absent yields {}
+    (best-effort) -- the source still mirrors/serves, only metadata is empty."""
+    import zarr
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    upstream = TensorFlightServer("grpc://localhost:0")  # no metadata_db
+    upstream.register_source("img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    try:
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
+        )
+        assert adapter.list_tensor_descriptors()  # reachable -> mirrored
+        assert adapter.get_metadata() == {}  # query fails -> graceful empty
+    finally:
+        upstream.shutdown()
+
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     """A monitored bare-host upstream is periodically re-listed: sources that
-    appear/disappear on the upstream are mirrored/dropped on the proxy (§3 refresh)."""
-    import zarr
+    appear/disappear on the upstream are mirrored/dropped on the proxy (§3 refresh).
+
+    The upstream has a metadata DB so the re-list enumerates via the complete
+    query_sources catalog -- removals are only applied on a complete list."""
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
     from biopb_tensor_server.source_manager import SourceManager
 
     zarr_path, shape, _ = simple_zarr_array
-    arr = zarr.open_array(zarr_path, mode="r")
-
-    upstream = TensorFlightServer("grpc://localhost:0")
-    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    upstream, up_register, up_unregister = _db_upstream(zarr_path, ["img"])
     _serve(upstream)
     try:
         proxy = TensorFlightServer("grpc://localhost:0")
@@ -297,13 +462,13 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
             assert set(client.list_sources()) == {"lab__img"}
 
             # a new upstream source appears -> mirrored on the next re-list
-            upstream.register_source("img2", ZarrAdapter(arr, "img2", ["y", "x"]))
+            up_register("img2")
             manager._reconcile_upstreams()
             assert set(client.list_sources()) == {"lab__img", "lab__img2"}
             assert client.get_tensor("lab__img2").shape == shape
 
             # an upstream source disappears -> dropped on the next re-list
-            upstream.unregister_source("img")
+            up_unregister("img")
             manager._reconcile_upstreams()
             assert set(client.list_sources()) == {"lab__img2"}
 

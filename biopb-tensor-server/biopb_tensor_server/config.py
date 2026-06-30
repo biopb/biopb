@@ -1461,6 +1461,7 @@ def _discover_tensor_server(
     from biopb_tensor_server.adapters.remote_tensor import (
         _resolve_upstream_token,
         _split_grpc_url,
+        list_upstream_source_ids,
     )
 
     endpoint, upstream_source_id = _split_grpc_url(source.url)
@@ -1470,13 +1471,17 @@ def _discover_tensor_server(
         local_id = _namespaced_source_id(source.alias, upstream_source_id)
         return [replace(source, source_id=local_id)]
 
-    # Bare-host form: mirror every source on the upstream.
+    # Bare-host form: mirror every source on the upstream. Enumerate via the
+    # complete server-side catalog (not the capped list_sources -- see
+    # list_upstream_source_ids); an incomplete fallback list still mirrors what
+    # it can.
     from biopb.tensor import TensorFlightClient
 
     token = _resolve_upstream_token(source, credentials_config)
     client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
     try:
-        upstream_ids = sorted(client.list_sources().keys())
+        ids, _complete = list_upstream_source_ids(client)
+        upstream_ids = sorted(ids)
     finally:
         close = getattr(client, "close", None)
         if close is not None:

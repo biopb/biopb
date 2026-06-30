@@ -72,6 +72,36 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
+def list_upstream_source_ids(client) -> tuple[List[str], bool]:
+    """Every source_id on an upstream tensor server. Returns ``(ids, complete)``.
+
+    Enumerating a catalog with ``list_sources()`` is **unsafe**: it is capped at
+    the server's ``max_list_flights_results``, so a large upstream is silently
+    truncated -- mirroring it would drop sources, and reconciling against a
+    truncated list would spuriously *remove* the ones past the cap. Use the
+    server-side DuckDB catalog instead (``query_sources`` -- complete, not
+    truncated; the canonical browse surface, biopb/biopb#225). Fall back to the
+    capped ``list_sources()`` only when the upstream has no metadata DB, and flag
+    the result ``complete=False`` so a caller (e.g. the monitor re-list) can avoid
+    destructive reconciliation on a partial list.
+    """
+    try:
+        rows = client.query_sources("SELECT source_id FROM sources", format="records")
+        return [row["source_id"] for row in rows], True
+    except Exception as exc:
+        ids = list(client.list_sources().keys())
+        logger.warning(
+            "upstream %s has no SQL catalog (query_sources failed: %s); falling "
+            "back to the capped list_sources() -- the mirror may be incomplete "
+            "(%d sources seen). Enable the upstream's metadata DB for a complete "
+            "mirror.",
+            getattr(client, "_location", "?"),
+            exc,
+            len(ids),
+        )
+        return ids, False
+
+
 class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
@@ -146,11 +176,29 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         return self.source_id + field
 
     def _localize_descriptor(self, desc: TensorDescriptor) -> TensorDescriptor:
-        """Copy an upstream TensorDescriptor with its array_id rewritten local-ward."""
+        """Copy an upstream TensorDescriptor with its array_id rewritten local-ward.
+
+        ``metadata_json`` and ``pyramid`` are cleared so the mirrored descriptor
+        stays lean, exactly like a native adapter's: the LOCAL server fills both
+        itself on a ``GetFlightInfo`` (metadata from ``get_metadata()``; the
+        advertised pyramid from its own config). The upstream's ``get_descriptor``
+        result carries them, so without clearing they would leak onto the proxy's
+        catalog surface and the metadata would get double-wrapped on re-serialize.
+        """
         out = TensorDescriptor()
         out.CopyFrom(desc)
         out.array_id = self._to_local_array_id(desc.array_id)
+        out.metadata_json = ""
+        out.ClearField("pyramid")
         return out
+
+    def _mark_unreachable(self, exc: Exception) -> None:
+        """Record an upstream connectivity failure (catalog-surface degradation)."""
+        self._reachable = False
+        self._client = None  # drop the dead client so the next call reconnects
+        logger.warning(
+            "upstream tensor server %s unreachable: %s", self._upstream_location, exc
+        )
 
     # -------------------------------------------------------------- source layer
 
@@ -182,60 +230,71 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             token=token,
         )
 
-    def _safe_list_sources(self):
-        """``list_sources`` with reachability tracking; ``None`` if unreachable.
-
-        Used only by the *catalog* surface, which degrades to a placeholder when
-        the upstream is down (vs the serve surface, which raises so the client
-        gets a retryable error).
-        """
-        try:
-            out = self.client.list_sources()
-        except Exception as exc:
-            self._reachable = False
-            self._client = None  # drop the dead client so the next call reconnects
-            logger.warning(
-                "upstream tensor server %s unreachable: %s",
-                self._upstream_location,
-                exc,
-            )
-            return None
-        self._reachable = True
-        return out
-
     def get_metadata(self) -> dict:
-        """Mirror the upstream source's metadata dict (OME etc.), best-effort."""
+        """Mirror the upstream source's metadata dict (OME etc.), best-effort.
+
+        ``list_flights`` / ``list_sources`` is deliberately lean and leaves
+        ``metadata_json`` empty, and the only *live* RPC that fills it
+        (``GetFlightInfo(with_metadata=True)``) returns it *wrapped* in a
+        ``{"type","dim_label","metadata"}`` envelope. Instead read it from the
+        upstream's metadata catalog with a server-side SQL query: the DuckDB
+        ``sources.metadata_json`` column stores ``json.dumps(get_metadata())``
+        verbatim -- the **raw** dict, no envelope -- which is exactly this
+        method's contract (the LOCAL server adds the envelope when it serializes
+        the response on a ``GetFlightInfo(with_metadata=True)``). Best-effort: an
+        unreachable upstream, a metadata-DB-disabled upstream, or a not-yet-synced
+        source all degrade to ``{}`` (metadata is non-critical for serving).
+        """
         import json
 
-        descriptors = self._safe_list_sources()
-        if descriptors is None:
+        escaped = self._upstream_source_id.replace("'", "''")
+        sql = f"SELECT metadata_json FROM sources WHERE source_id = '{escaped}'"
+        try:
+            rows = self.client.query_sources(sql, format="records")
+        except Exception as exc:
+            logger.debug(
+                "upstream metadata query failed for %s: %s", self.source_id, exc
+            )
             return {}
-        src = descriptors.get(self._upstream_source_id)
-        if src is None or not src.metadata_json:
+        if not rows:
+            return {}
+        raw = rows[0].get("metadata_json")
+        if not raw:
             return {}
         try:
-            return json.loads(src.metadata_json)
-        except (json.JSONDecodeError, ValueError):
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
             return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """Mirror the upstream source's tensor descriptors (ids rewritten local).
+        """Mirror this one upstream source's tensor descriptor(s).
 
-        Catalog surface: if the upstream is **unreachable**, return ``[]`` (an
-        empty placeholder catalog row) instead of raising. The source therefore
-        registers and stays in the catalog while the upstream is down; ListFlights
-        / GetFlightInfo are live, so the real tensors reappear transparently once
-        the upstream is back -- no consented resolve step is needed (a proxy
-        "resolve" is just a cheap reconnect, unlike a cloud download).
+        Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
+        by scanning the upstream's whole ``list_sources()`` catalog: that call is
+        *capped* (``max_list_flights_results``), so for a large upstream this
+        source could be truncated out of it -- and it would re-fetch the entire
+        catalog on every ListFlights, an O(N^2) cost. A single source's
+        descriptor has no such cap.
+
+        Catalog surface: an **unreachable** (or upstream-unresolved) source
+        degrades to ``[]`` (an empty placeholder row) rather than raising, so the
+        source stays catalogued while the upstream is down and reappears
+        transparently once it is back. The serve surface still raises.
+
+        Limitation: this returns the upstream source's *default* tensor. A
+        multi-tensor (multi-field) upstream source is advertised by its default
+        field only -- reading a specific other field still works (the chunk_id
+        carries the full array_id), but the upstream exposes no cheap,
+        non-truncatable way to enumerate a single source's full field list.
         """
-        descriptors = self._safe_list_sources()
-        if descriptors is None:
-            return []  # upstream unreachable -> placeholder row
-        src = descriptors.get(self._upstream_source_id)
-        if src is None:
-            # Reachable, but not enumerated by list_sources -> per-tensor probe.
-            return [self.get_tensor_descriptor()]
-        return [self._localize_descriptor(t) for t in src.tensors]
+        try:
+            desc = self.client.get_descriptor(self._to_upstream_array_id(self.array_id))
+        except Exception as exc:
+            self._mark_unreachable(exc)
+            return []  # unreachable / unresolved upstream -> placeholder row
+        self._reachable = True
+        return [self._localize_descriptor(desc)]
 
     def is_resident(self) -> bool:
         """Best-effort: is the upstream reachable right now?
