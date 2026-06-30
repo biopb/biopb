@@ -761,6 +761,114 @@ class TestWindowClosePipe:
             host.shutdown()
 
 
+class TestWindowClosePoll:
+    """Windows fallback for the POSIX pipe: poll the in-kernel window-alive
+    probe and reap the kernel when the user closes the napari window. The tick
+    logic is unit-tested (no kernel/display) by forcing the poll path on and
+    stubbing the probe; one integration test drives the real poll loop against a
+    plain kernel with the probe symbol injected."""
+
+    def _host(self):
+        host = KernelHost(
+            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
+        )
+        # Force the Windows poll path regardless of the test platform.
+        host._window_close_poll = True
+        return host
+
+    def test_tick_tears_down_when_window_gone(self, monkeypatch):
+        host = self._host()
+        host._ready.set()
+        calls = {}
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "ok", "stdout": "False\n"},
+        )
+        monkeypatch.setattr(host, "shutdown", lambda: calls.setdefault("down", True))
+        assert host._window_close_tick() is True
+        assert calls.get("down")
+        assert host._teardown_reason and "window" in host._teardown_reason
+
+    def test_tick_noop_when_window_alive(self, monkeypatch):
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "ok", "stdout": "True\n"},
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down a live window")
+        )
+        assert host._window_close_tick() is False
+        assert host._teardown_reason is None
+
+    def test_tick_skips_busy_kernel(self, monkeypatch):
+        # A running job holds the lock: never probe or tear down mid-job.
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: True)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: pytest.fail("probed a busy kernel"),
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down a busy kernel")
+        )
+        assert host._window_close_tick() is False
+
+    def test_tick_inconclusive_probe_is_noop(self, monkeypatch):
+        # A busy/timeout/error probe must not be read as "window gone".
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "busy", "stdout": ""},
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down on inconclusive probe")
+        )
+        assert host._window_close_tick() is False
+
+    def test_tick_skips_until_ready(self, monkeypatch):
+        # _ready unset (mid (re)spawn): don't probe a half-built kernel.
+        host = self._host()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: pytest.fail("probed before ready"),
+        )
+        assert host._window_close_tick() is False
+
+    def test_poll_loop_reaps_on_real_probe(self):
+        # End-to-end against a plain kernel: the bootstrap normally injects
+        # _viewer_window_alive; here we inject it returning False and let the
+        # real poll thread (started by start()) detect the close and reap.
+        host = self._host()
+        host._window_poll_interval = 0.05
+        try:
+            host.start()
+            assert host._window_thread is not None and host._window_thread.is_alive()
+            host.execute("_viewer_window_alive = lambda: False")
+            deadline = time.time() + 10
+            while host.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
+            assert not host.is_alive()
+            assert host._teardown_reason and "window" in host._teardown_reason
+            res = host.execute("1 + 1")
+            assert res["status"] == "not_started"
+            assert "window" in res["error_text"]
+        finally:
+            host.shutdown()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="token-report pipe is POSIX-only")
 class TestTokenReportPipe:
     """End-to-end token persistence across a kernel restart (issue #86)."""
