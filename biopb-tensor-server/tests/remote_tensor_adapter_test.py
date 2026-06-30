@@ -324,6 +324,21 @@ def _meta_zarr_cls():
     return _MetaZarr
 
 
+# physical scale/unit for the 2D (y, x) fixture
+_PHYS_SCALE = [0.5, 0.25]
+_PHYS_UNIT = ["micrometer", "micrometer"]
+
+
+def _phys_zarr_cls():
+    from biopb_tensor_server import ZarrAdapter
+
+    class _PhysZarr(ZarrAdapter):
+        def get_physical_scale(self, tensor_id=None):
+            return list(_PHYS_SCALE), list(_PHYS_UNIT)
+
+    return _PhysZarr
+
+
 def _upstream_with_metadata(zarr_path):
     """An upstream server whose metadata DB holds one source ('img') with metadata."""
     import zarr
@@ -419,6 +434,68 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
         )
         assert adapter.list_tensor_descriptors()  # reachable -> mirrored
         assert adapter.get_metadata() == {}  # query fails -> graceful empty
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_get_physical_scale_mirrors_upstream(simple_zarr_array):
+    """The proxy must mirror the upstream's physical_scale/physical_unit: the
+    server fills these from get_physical_scale() (clearing first), so the base
+    default of None would silently drop physical sizes the upstream has."""
+    import zarr
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    upstream = TensorFlightServer("grpc://localhost:0")
+    upstream.register_source("img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    try:
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
+        )
+        assert adapter.get_physical_scale() == (_PHYS_SCALE, _PHYS_UNIT)
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_physical_scale_flows_through_proxy(simple_zarr_array):
+    """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
+    physical_scale/physical_unit on the descriptor."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    upstream = TensorFlightServer("grpc://localhost:0")
+    upstream.register_source("img", _phys_zarr_cls()(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    try:
+        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy.register_source(
+            "lab__img",
+            RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location=f"grpc://localhost:{upstream.port}",
+                upstream_source_id="img",
+            ),
+        )
+        _serve(proxy)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+            desc = client.get_descriptor("lab__img")
+            assert list(desc.physical_scale) == _PHYS_SCALE
+            assert list(desc.physical_unit) == _PHYS_UNIT
+            client.close()
+        finally:
+            proxy.shutdown()
     finally:
         upstream.shutdown()
 

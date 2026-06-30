@@ -378,6 +378,14 @@ own surfaces:
 > field; reading other fields still works). Tests: `test_get_metadata_*`,
 > `test_metadata_flows_through_proxy_single_wrapped`,
 > `test_expansion_complete_despite_list_flights_truncation`.
+> *(3) Physical scale.* `physical_scale` / `physical_unit` are, like the pyramid,
+> *cleared and refilled* by the server on every `GetFlightInfo` from a dedicated
+> `get_physical_scale()` (the compact #31 summary) — they are **not** carried
+> implicitly by `get_tensor_descriptor`, so the base default of `None` silently
+> dropped the upstream's physical pixel sizes. `RemoteTensorAdapter` now overrides
+> `get_physical_scale()` to read them from the upstream's `get_descriptor`
+> response (its server fills them identically). Tests:
+> `test_get_physical_scale_mirrors_upstream`, `test_physical_scale_flows_through_proxy`.
 
 > **Implemented (expansion + namespacing + collision check; mirror-once).**
 > `config.discover_sources` gained a `credentials_config` param and a
