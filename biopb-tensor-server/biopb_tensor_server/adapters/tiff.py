@@ -404,7 +404,15 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         self.source_id = source_id
         self._source_url = str(directory)
         self._source_type = "tiff-sequence"
-        self._io_lock = threading.Lock()
+        # Per-file locking (biopb): serialize concurrent reads of the *same* TIFF
+        # while reads of *different* files run in parallel. A single adapter-wide
+        # lock serialized every get_data, so one slow read (a cloud/VM I/O stall)
+        # blocked every other frame the async viewer and the precache worker asked
+        # for -- turning a single hiccup into a multi-second freeze across
+        # unrelated frames. Keyed per file, a stall holds only its own file's
+        # lock; the frame you scrub to takes a different lock and runs.
+        self._locks_guard = threading.Lock()
+        self._file_locks: Dict[Path, threading.Lock] = {}
 
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
@@ -540,6 +548,22 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         return [self.get_tensor_descriptor()]
 
+    def _lock_for(self, path: Path) -> threading.Lock:
+        """Return the per-file lock for ``path``, creating it on first use.
+
+        Replaces the former adapter-wide ``_io_lock``: reads of different files
+        no longer serialize, so one slow/stalled file read can't freeze the
+        frames the async viewer or the precache worker ask for next. The registry
+        holds one small ``Lock`` per distinct file (185 for a 185-frame sequence
+        -- negligible) and never needs pruning.
+        """
+        with self._locks_guard:
+            lock = self._file_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self._file_locks[path] = lock
+            return lock
+
     def _read_padded_plane(
         self,
         zarr_arr: Any,
@@ -599,52 +623,51 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         super().get_data(bounds)
         slices = tuple(slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop))
 
-        with self._io_lock:
-            pages_per_file = self._file_ifd_map[0][1] if self._file_ifd_map else 1
-            original_ndim = len(slices)
+        # Slice math (no I/O) needs no lock; only the per-file read below is
+        # synchronized, and per file -- so a slow read of one frame no longer
+        # blocks reads of other frames.
+        pages_per_file = self._file_ifd_map[0][1] if self._file_ifd_map else 1
+        original_ndim = len(slices)
 
-            # Build slice tuple: (file_slice, [page_slice], y_slice, x_slice)
-            if original_ndim == 4:
-                file_slice, page_slice, y_slice, x_slice = slices
-            elif original_ndim == 3:
-                file_slice, y_slice, x_slice = slices
-                page_slice = (
-                    slice(0, pages_per_file) if pages_per_file > 1 else slice(0, 1)
-                )
-            else:
-                # Handle other dimensionalities
-                file_slice = slices[0]
-                page_slice = (
-                    slice(0, pages_per_file) if len(slices) > 3 else slice(0, 1)
-                )
-                y_slice = slices[-2] if len(slices) >= 2 else slice(None)
-                x_slice = slices[-1] if len(slices) >= 1 else slice(None)
+        # Build slice tuple: (file_slice, [page_slice], y_slice, x_slice)
+        if original_ndim == 4:
+            file_slice, page_slice, y_slice, x_slice = slices
+        elif original_ndim == 3:
+            file_slice, y_slice, x_slice = slices
+            page_slice = slice(0, pages_per_file) if pages_per_file > 1 else slice(0, 1)
+        else:
+            # Handle other dimensionalities
+            file_slice = slices[0]
+            page_slice = slice(0, pages_per_file) if len(slices) > 3 else slice(0, 1)
+            y_slice = slices[-2] if len(slices) >= 2 else slice(None)
+            x_slice = slices[-1] if len(slices) >= 1 else slice(None)
 
-            # Determine which files and pages to read
-            file_indices = range(
-                file_slice.start or 0,
-                min(
-                    file_slice.stop or len(self._file_ifd_map), len(self._file_ifd_map)
-                ),
-            )
-            page_indices = range(
-                page_slice.start or 0,
-                min(page_slice.stop or pages_per_file, pages_per_file),
-            )
+        # Determine which files and pages to read
+        file_indices = range(
+            file_slice.start or 0,
+            min(file_slice.stop or len(self._file_ifd_map), len(self._file_ifd_map)),
+        )
+        page_indices = range(
+            page_slice.start or 0,
+            min(page_slice.stop or pages_per_file, pages_per_file),
+        )
 
-            n_files = (file_slice.stop or len(self._file_ifd_map)) - (
-                file_slice.start or 0
-            )
-            n_pages = (page_slice.stop or pages_per_file) - (page_slice.start or 0)
+        n_files = (file_slice.stop or len(self._file_ifd_map)) - (file_slice.start or 0)
+        n_pages = (page_slice.stop or pages_per_file) - (page_slice.start or 0)
 
-            # Read data via aszarr() for tile-level access. Each plane is read
-            # into a zero-filled buffer of the requested extent and cast to the
-            # descriptor dtype (#198): a frame smaller than the per-axis max reads
-            # back zero-padded (bottom/right), and a narrower-dtype frame is
-            # promoted up -- so heterogeneous members stack uniformly.
-            result_pages = []
-            for file_idx in file_indices:
-                file_path, n_pages_in_file = self._file_ifd_map[file_idx]
+        # Read data via aszarr() for tile-level access. Each plane is read
+        # into a zero-filled buffer of the requested extent and cast to the
+        # descriptor dtype (#198): a frame smaller than the per-axis max reads
+        # back zero-padded (bottom/right), and a narrower-dtype frame is
+        # promoted up -- so heterogeneous members stack uniformly.
+        result_pages = []
+        for file_idx in file_indices:
+            file_path, n_pages_in_file = self._file_ifd_map[file_idx]
+            # Per-file lock (not adapter-wide): serialize concurrent reads of the
+            # SAME file while different files read in parallel. A scrub reads one
+            # file per call, so this is a brief, usually-uncontended acquire -- and
+            # a stalled read holds only this file's lock, not every frame's.
+            with self._lock_for(file_path):
                 with tifffile.TiffFile(str(file_path)) as tf:
                     series = tf.series[0]
                     zarr_arr = zarr.open_array(series.aszarr(), mode="r")
@@ -668,26 +691,26 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
                                 )
                             )
 
-            # Stack into result array
-            if result_pages:
-                result_4d = np.stack(result_pages, axis=0)
-                h, w = result_4d.shape[-2:]
-                result_4d = result_4d.reshape(n_files, n_pages, h, w)
-            else:
-                result_4d = np.array([])
+        # Stack into result array
+        if result_pages:
+            result_4d = np.stack(result_pages, axis=0)
+            h, w = result_4d.shape[-2:]
+            result_4d = result_4d.reshape(n_files, n_pages, h, w)
+        else:
+            result_4d = np.array([])
 
-            # Reshape to match original ndim
-            if original_ndim == 3:
-                if pages_per_file > 1:
-                    result = result_4d.reshape(n_files * n_pages, h, w)
-                else:
-                    result = result_4d.squeeze(axis=1)
-            elif original_ndim == 4:
-                result = result_4d
+        # Reshape to match original ndim
+        if original_ndim == 3:
+            if pages_per_file > 1:
+                result = result_4d.reshape(n_files * n_pages, h, w)
             else:
-                result = result_4d
+                result = result_4d.squeeze(axis=1)
+        elif original_ndim == 4:
+            result = result_4d
+        else:
+            result = result_4d
 
-            return result
+        return result
 
     def get_metadata(self) -> dict:
         """Expose per-file provenance so the agent can interpret the file axis.

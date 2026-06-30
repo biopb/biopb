@@ -558,3 +558,82 @@ class TestGroupHelper:
             for j, f in enumerate(files):
                 _write_tiff(f, seed=j)
             assert _group_tiff_sequence(files, exclude_ome=False) == files
+
+
+class TestTiffSequencePerFileLock:
+    """get_data locks per file, not adapter-wide: a stalled read of one file must
+    not block reads of *other* files (the interactive-scrub freeze). The former
+    single ``_io_lock`` serialized every get_data, so one slow read (a cloud/VM
+    I/O stall) froze every other frame the async viewer / precache asked for."""
+
+    def test_distinct_files_use_distinct_locks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [Path(tmpdir) / f"img_{i:03d}.tif" for i in range(3)]
+            for j, f in enumerate(files):
+                _write_tiff(f, seed=j + 1)
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+            a, b = adapter._tiff_files[0], adapter._tiff_files[1]
+            assert adapter._lock_for(a) is adapter._lock_for(a)  # stable per file
+            assert adapter._lock_for(a) is not adapter._lock_for(b)  # not shared
+
+    def test_slow_read_of_one_file_does_not_block_another(self, monkeypatch):
+        import threading
+
+        import tifffile as tifffile_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [Path(tmpdir) / f"img_{i:03d}.tif" for i in range(3)]
+            for j, f in enumerate(files):
+                _write_tiff(f, seed=j + 1)
+            adapter = TiffSequenceAdapter(str(tmpdir), "sid")
+
+            # Stall the read of the first stacked member's file (held *inside* its
+            # per-file lock, since get_data acquires the lock then opens the file).
+            blocked_path = str(adapter._tiff_files[0])
+            entered = threading.Event()  # frame-0 read is now holding file-0's lock
+            gate = threading.Event()  # release frame-0
+            real_TiffFile = tifffile_mod.TiffFile
+
+            def gated_TiffFile(path, *a, **k):
+                if str(path) == blocked_path:
+                    entered.set()
+                    assert gate.wait(timeout=5), "gate never released"
+                return real_TiffFile(path, *a, **k)
+
+            monkeypatch.setattr(tifffile_mod, "TiffFile", gated_TiffFile)
+
+            errors: dict = {}
+
+            def read_frame0():
+                try:
+                    adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
+                except Exception as e:  # pragma: no cover - safety net
+                    errors["f0"] = e
+
+            out: dict = {}
+            done = threading.Event()
+
+            def read_frame1():
+                out["v"] = adapter.get_data(
+                    ChunkBounds(start=[1, 0, 0], stop=[2, 8, 8])
+                )
+                done.set()
+
+            t0 = threading.Thread(target=read_frame0)
+            t0.start()
+            assert entered.wait(timeout=5), "frame-0 read never started"
+            try:
+                # Frame 1 is a DIFFERENT file -> different lock -> must complete
+                # while frame 0 is stalled. With the old adapter-wide lock this
+                # would hang until the gate releases (asserts on timeout).
+                t1 = threading.Thread(target=read_frame1)
+                t1.start()
+                assert done.wait(timeout=3), (
+                    "frame-1 read blocked behind stalled frame-0"
+                )
+                t1.join()
+                assert out["v"].shape == (1, 8, 8)
+            finally:
+                gate.set()
+                t0.join(timeout=5)
+            assert not errors
