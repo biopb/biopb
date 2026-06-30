@@ -183,6 +183,12 @@ html, body {
   color: #e2e8f0; font-family: ui-monospace, monospace; font-size: 12px; padding: 0.6rem;
   resize: vertical;
 }
+.admin-raw.invalid { border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626; }
+.advanced-error-tag {
+  margin-left: 0.5rem; font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.03em; background: #450a0a; color: #fca5a5;
+  border: 1px solid #dc2626; border-radius: 4px; padding: 1px 6px;
+}
 
 .admin-actions { display: flex; align-items: center; gap: 0.85rem; }
 .admin-actions .submit-btn { width: auto; padding: 0.5rem 1.4rem; }
