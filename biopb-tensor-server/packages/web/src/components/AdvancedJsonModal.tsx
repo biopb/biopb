@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Modal } from "./Modal";
 
 /**
@@ -6,8 +6,8 @@ import { Modal } from "./Modal";
  *
  * Owns a local text draft seeded from the current config and only commits on
  * Apply, so a malformed edit never touches the canonical config and the
- * structured Sources editor never sees a half-typed object. Invalid JSON is
- * shown prominently inside the dialog and blocks Apply.
+ * structured Sources editor never sees a half-typed object. Validity is derived
+ * live from the draft: invalid JSON is shown in-dialog and disables Apply.
  */
 
 interface AdvancedJsonModalProps {
@@ -16,23 +16,29 @@ interface AdvancedJsonModalProps {
   onClose: () => void;
 }
 
+function parseConfig(text: string): {
+  value?: Record<string, unknown>;
+  error: string | null;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "Invalid JSON" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { error: "Config must be a JSON object." };
+  }
+  return { value: parsed as Record<string, unknown>, error: null };
+}
+
 export function AdvancedJsonModal({ config, onApply, onClose }: AdvancedJsonModalProps) {
   const [text, setText] = useState(() => JSON.stringify(config, null, 2));
-  const [error, setError] = useState<string | null>(null);
+  const { value, error } = useMemo(() => parseConfig(text), [text]);
 
   function apply() {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Invalid JSON");
-      return;
-    }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      setError("Config must be a JSON object.");
-      return;
-    }
-    onApply(parsed as Record<string, unknown>);
+    if (!value) return;
+    onApply(value);
     onClose();
   }
 
@@ -53,16 +59,18 @@ export function AdvancedJsonModal({ config, onApply, onClose }: AdvancedJsonModa
         spellCheck={false}
         value={text}
         autoFocus
-        onChange={(e) => {
-          setText(e.target.value);
-          if (error) setError(null);
-        }}
+        onChange={(e) => setText(e.target.value)}
       />
       <div className="admin-modal-actions">
         <button type="button" className="icon-btn" onClick={onClose}>
           Cancel
         </button>
-        <button type="button" className="submit-btn" onClick={apply}>
+        <button
+          type="button"
+          className="submit-btn"
+          onClick={apply}
+          disabled={!!error}
+        >
           Apply
         </button>
       </div>
