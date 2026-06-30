@@ -8,8 +8,10 @@
     Idempotent: rerun to upgrade to latest version.
 
     This is the INTERACTIVE CONSOLE front-end. It collects the user's choices
-    (component toggles, data directory) with friendly prompts, then hands them to
-    the headless install engine (biopb-engine.ps1), which does the real work.
+    (data directory, remote-plugin consent) with friendly prompts, then hands them
+    to the headless install engine (biopb-engine.ps1), which does the real work.
+    Component selection is no longer prompted -- the web interface installs by
+    default and Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS.
     The Inno Setup GUI wizard is a second front-end over the same engine -- one
     install brain, two skins, so the console and GUI can never drift.
 
@@ -20,6 +22,11 @@
     This installs prebuilt wheels from the latest biopb release-v* GitHub
     deployment. By default it tracks the latest STABLE release; set
     $env:BIOPB_INSTALL_RC = "1" to track the latest release candidate.
+
+    Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
+    prompt (keeps an existing config; leaves remote plugins off unless
+    $env:BIOPB_REMOTE_PLUGINS = "1"). It is an upgrade feature -- a FRESH unattended
+    install must also set $env:BIOPB_DATA_DIR or it errors out.
 
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
 #>
@@ -33,6 +40,14 @@ $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
 $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 
+# Non-interactive / unmanned mode: $env:BIOPB_NONINTERACTIVE = "1" suppresses every
+# prompt so the installer can upgrade unattended (Task Scheduler, CI, image bakes).
+# The upgrade path is the common case: an existing config is kept untouched. A fresh
+# unattended install uses $env:BIOPB_DATA_DIR (else a default) and leaves the remote
+# algorithm plugins OFF unless $env:BIOPB_REMOTE_PLUGINS = "1" -- consent can't be
+# asked unattended, so the off-site IP-logging servers are never silently enabled.
+$script:NonInteractive = [bool]$env:BIOPB_NONINTERACTIVE -and ($env:BIOPB_NONINTERACTIVE -ne '0')
+
 # ----- Output helpers used by the front-end's own prompts/summary -------------
 function Write-Step { param([string]$Msg) Write-Host ""; Write-Host $Msg -ForegroundColor White }
 function Write-Ok   { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Green }
@@ -45,6 +60,7 @@ function Write-Cmd  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor C
 # Pause before the script ends so the final message stays readable. Skipped when
 # input is non-interactive (CI, piped stdin) so automation does not hang.
 function Wait-ForExit {
+    if ($script:NonInteractive) { return }
     if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
         Write-Host ""
         Read-Host "  Press Enter to exit" | Out-Null
@@ -69,39 +85,6 @@ function Resolve-EnginePath {
     $tmp = Join-Path $env:TEMP "biopb-engine.ps1"
     Set-Content -LiteralPath $tmp -Value $engineSrc -Encoding UTF8
     return $tmp
-}
-
-# Interactive component selector (replaces the engine's parameters with prompts).
-# Components default ON unless -Defaults supplies a per-label initial state; user
-# types a number to toggle, Enter to confirm. Returns a bool[] aligned with $Labels.
-function Select-Components {
-    param([string[]]$Labels, [bool[]]$Defaults)
-    $n = $Labels.Count
-    $sel = New-Object bool[] $n
-    for ($i = 0; $i -lt $n; $i++) {
-        $sel[$i] = if ($Defaults -and $i -lt $Defaults.Count) { $Defaults[$i] } else { $true }
-    }
-
-    while ($true) {
-        Write-Host ""
-        Write-Host "  Optional components:" -ForegroundColor White
-        Write-Host ""
-        for ($i = 0; $i -lt $n; $i++) {
-            $mark  = if ($sel[$i]) { "[x]" } else { "[ ]" }
-            $color = if ($sel[$i]) { "Green" } else { "DarkGray" }
-            Write-Host ("    {0}. " -f ($i + 1)) -NoNewline
-            Write-Host $mark -ForegroundColor $color -NoNewline
-            Write-Host ("  {0}" -f $Labels[$i])
-        }
-        Write-Host ""
-        $choice = Read-Host "  Toggle [1-$n] or Enter to confirm"
-        if ([string]::IsNullOrWhiteSpace($choice)) { break }
-        if ($choice -match '^\d+$') {
-            $idx = [int]$choice - 1
-            if ($idx -ge 0 -and $idx -lt $n) { $sel[$idx] = -not $sel[$idx] }
-        }
-    }
-    return $sel
 }
 
 # Prompt for a data directory; returns the chosen path string. With -KeepOption an
@@ -170,6 +153,9 @@ function Show-Banner {
 # Two light-hearted pre-flight confirmations. Returns $true if the user opted in
 # to filing a bug report should things go sideways. Exits if they bail.
 function Invoke-Preflight {
+    # Unattended runs skip the pre-flight banter; don't nag with a bug-report
+    # offer no one is watching for.
+    if ($script:NonInteractive) { return $false }
     Write-Host ""
     Write-Host "  --- Before we begin ---" -ForegroundColor Yellow
     Write-Host ""
@@ -215,7 +201,7 @@ function Show-Summary {
     Write-Host ""
 
     if ($Result.WebappInstalled) {
-        Write-Inf "Data browser available at http://localhost:8815"
+        Write-Inf "Web interface available at http://localhost:8814"
         Write-Host ""
     }
 
@@ -231,8 +217,8 @@ function Show-Summary {
     Write-Host ""
 
     if (-not $Result.WebappInstalled) {
-        Write-Warn2 "Data browser not installed"
-        Write-Inf "  rerun this script to install it"
+        Write-Warn2 "Web interface not installed (`$env:BIOPB_INSTALL_WEBAPP = `"0`")"
+        Write-Inf "  rerun without that env var to install it"
         Write-Host ""
     }
 
@@ -261,24 +247,32 @@ try {
     $configFile = Join-Path $configDir "biopb.json"
     $legacyConfig = Join-Path $configDir "biopb.toml"
 
-    # ----- Collect choices interactively (the GUI collects these on wizard pages) -----
+    # ----- Resolve component choices (no longer prompted -- biopb/biopb#237) -----
 
-    # biopb-mcp is always installed (primary interface), so it is not offered.
-    # Bio-Formats defaults off (heavyweight Java toolchain most labs don't need).
-    $sel = Select-Components -Labels @(
-        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)",
-        "Bio-Formats (more image formats; needs Java and extra setup during first run)"
-    ) -Defaults @($true, $false)
-    $installWebapp     = $sel[0]
-    $installBioformats = $sel[1]
+    # Components are no longer offered interactively. The web interface now carries
+    # the server admin page (config / status / restart) on top of the image viewer,
+    # so it installs by default. Bio-Formats stays off by default: the Python
+    # adapters cover the formats most labs use, and it pulls a heavyweight Java
+    # toolchain. Both remain overridable for scripted installs via env vars:
+    #   $env:BIOPB_INSTALL_WEBAPP = "0"      skip the web interface (API-only server)
+    #   $env:BIOPB_INSTALL_BIOFORMATS = "1"  add Bio-Formats (Java fetched on first use)
+    $installWebapp     = ($env:BIOPB_INSTALL_WEBAPP -ne '0')
+    $installBioformats = ($env:BIOPB_INSTALL_BIOFORMATS -eq '1')
 
     # Data directory / keep-config decision, mirroring the original flow.
     $dataDir = ""
     $keepConfig = $false
     $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
-        $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
-        if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
+        # Existing config + no override: keep it. Non-interactive skips the prompt
+        # (the unmanned-upgrade fast path); interactive offers "0) keep" as default.
+        if ($script:NonInteractive) {
+            $keepConfig = $true
+            Write-Note "Non-interactive: keeping existing config."
+        } else {
+            $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
+            if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
+        }
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
@@ -289,6 +283,16 @@ try {
     elseif ($env:BIOPB_DATA_DIR) {
         $dataDir = $env:BIOPB_DATA_DIR
         Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
+    }
+    elseif ($script:NonInteractive) {
+        # Non-interactive is an UPGRADE feature (no existing config = fresh install).
+        # We won't guess a data directory unattended, so require BIOPB_DATA_DIR and
+        # fail clearly rather than silently indexing some default folder.
+        Write-Err2 "Non-interactive mode needs an existing install or an explicit data directory."
+        Write-Inf "  No config found at $configFile -- this looks like a fresh install."
+        Write-Inf "  Set `$env:BIOPB_DATA_DIR to provision unattended, or rerun without"
+        Write-Inf "  `$env:BIOPB_NONINTERACTIVE to choose interactively."
+        exit 1
     }
     else {
         $dataDir = Select-DataDir -BiopbHome $BiopbHome
@@ -303,13 +307,23 @@ try {
     $noRemotePlugins = $false
     $mcpConfig = Join-Path $BiopbHome ".config\biopb-mcp\config.json"
     if (-not (Test-Path -LiteralPath $mcpConfig)) {
-        Write-Host ""
-        Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
-        Write-Inf "certain computations, e.g. cell segmentation. The servers are"
-        Write-Inf "hosted at UConn Health and log client IP addresses."
-        Write-Host ""
-        $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
-        if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
+        if ($script:NonInteractive) {
+            # Consent can't be asked unattended: enable only on explicit opt-in.
+            if ($env:BIOPB_REMOTE_PLUGINS -eq '1') {
+                Write-Ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            } else {
+                $noRemotePlugins = $true
+                Write-Ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            }
+        } else {
+            Write-Host ""
+            Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
+            Write-Inf "certain computations, e.g. cell segmentation. The servers are"
+            Write-Inf "hosted at UConn Health and log client IP addresses."
+            Write-Host ""
+            $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
+            if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
+        }
     }
 
     # ----- Drive the engine in-process, rendering its progress in color (-Mode console) -----

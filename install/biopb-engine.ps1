@@ -45,10 +45,13 @@ param(
     # else falls back to a dedicated data subfolder (never the profile root).
     [string]$DataDir = "",
 
-    # Install the browser data viewer (webapp.tar.gz).
+    # Install the web interface (webapp.tar.gz) -- the image viewer plus the
+    # server admin page (config / status / restart). Default ON when neither this
+    # switch nor $env:BIOPB_INSTALL_WEBAPP is given; set the env var to "0" to skip.
     [switch]$Webapp,
 
-    # Add the Bio-Formats extra (pulls a Java toolchain on first use).
+    # Add the Bio-Formats extra (pulls a Java toolchain on first use). Default OFF;
+    # an explicit switch wins, else honors $env:BIOPB_INSTALL_BIOFORMATS = "1".
     [switch]$Bioformats,
 
     # Track the latest release CANDIDATE (a/b/rc prerelease) instead of stable.
@@ -801,13 +804,13 @@ function Invoke-BiopbInstall {
         $BiopbHome  = $env:USERPROFILE
         $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
         $configFile = Join-Path $ConfigDir "biopb.json"
-        $InstallWebapp = [bool]$Webapp
+        $InstallWebapp = if ($PSBoundParameters.ContainsKey('Webapp')) { [bool]$Webapp } else { $env:BIOPB_INSTALL_WEBAPP -ne '0' }
         $stepMsgs = @(
             "Checking system...",
             "Ensuring build tools...",
             "Ensuring Python...",
             "Installing biopb packages...",
-            "Installing data browser...",
+            "Installing web interface...",
             "Config...",
             "Starting data server...",
             "Configuring MCP client..."
@@ -870,8 +873,12 @@ function Invoke-BiopbInstall {
     }
     Report-Ok "System check passed"
 
-    $InstallWebapp     = [bool]$Webapp
-    $InstallBioformats = [bool]$Bioformats
+    # Component selection is no longer prompted (biopb/biopb#237). An explicit
+    # -Webapp/-Bioformats from a front-end wins; absent that, fall back to env vars
+    # with the web interface (now carrying the admin page) defaulting ON and
+    # Bio-Formats OFF -- so a direct engine invocation behaves the same way.
+    $InstallWebapp     = if ($PSBoundParameters.ContainsKey('Webapp'))     { [bool]$Webapp }     else { $env:BIOPB_INSTALL_WEBAPP -ne '0' }
+    $InstallBioformats = if ($PSBoundParameters.ContainsKey('Bioformats')) { [bool]$Bioformats } else { $env:BIOPB_INSTALL_BIOFORMATS -eq '1' }
 
     # ===== 1. Install uv (if needed) =====
     Report-Step 1 "Ensuring build tools..."
@@ -1100,7 +1107,7 @@ function Invoke-BiopbInstall {
     }
 
     # ===== 4. Webapp =====
-    Report-Step 4 "Installing data browser..."
+    Report-Step 4 "Installing web interface..."
 
     if ($InstallWebapp) {
         if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
@@ -1109,7 +1116,7 @@ function Invoke-BiopbInstall {
         $latestTag = if ($release) { $release.tag_name } else { "" }
 
         if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
-            Report-Warn "Unexpected tag format, skipping data browser install"
+            Report-Warn "Unexpected tag format, skipping web interface install"
             $latestTag = ""
         }
 
@@ -1117,7 +1124,7 @@ function Invoke-BiopbInstall {
             $versionFile = Join-Path $WebappDir ".version"
             $installedTag = if (Test-Path -LiteralPath $versionFile) { (Get-Content -Raw -LiteralPath $versionFile).Trim() } else { "" }
             if ($installedTag -eq $latestTag) {
-                Report-Ok "Data browser already up to date ($latestTag)"
+                Report-Ok "Web interface already up to date ($latestTag)"
             } else {
                 Report-Info "Downloading $latestTag..."
                 Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -1132,13 +1139,13 @@ function Invoke-BiopbInstall {
                     tar -xzf $tarball -C $WebappDir --strip-components=1
                     Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
                     Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
-                    Report-Ok "Data browser installed to: $WebappDir"
+                    Report-Ok "Web interface installed to: $WebappDir"
                 } else {
                     Report-Warn "No webapp.tar.gz in release $latestTag; server will run in API-only mode"
                 }
             }
         } else {
-            Report-Warn "Could not fetch latest release, data browser not installed"
+            Report-Warn "Could not fetch latest release, web interface not installed"
             Report-Detail "Server will run in API-only mode"
         }
     } else {
@@ -1345,17 +1352,22 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         # Out-Null: the returned object must not leak onto stdout and pollute the
         # tagged stream. Invoke-BiopbInstall emits RESULT/DONE itself.
-        Invoke-BiopbInstall `
-            -DataDir $DataDir `
-            -Webapp:$Webapp `
-            -Bioformats:$Bioformats `
-            -Rc:$Rc `
-            -NoServerStart:$NoServerStart `
-            -KeepConfig:$KeepConfig `
-            -DryRun:$DryRun `
-            -NoRemotePlugins:$NoRemotePlugins `
-            -LogFile $LogFile `
-            -Mode $Mode | Out-Null
+        $invokeArgs = @{
+            DataDir         = $DataDir
+            Rc              = $Rc
+            NoServerStart   = $NoServerStart
+            KeepConfig      = $KeepConfig
+            DryRun          = $DryRun
+            NoRemotePlugins = $NoRemotePlugins
+            LogFile         = $LogFile
+            Mode            = $Mode
+        }
+        # Forward -Webapp/-Bioformats only when explicitly passed to the script, so
+        # an unset switch falls through to Invoke-BiopbInstall's env-var default
+        # (web interface ON, Bio-Formats OFF) rather than being pinned to $false.
+        if ($PSBoundParameters.ContainsKey('Webapp'))     { $invokeArgs.Webapp     = $Webapp }
+        if ($PSBoundParameters.ContainsKey('Bioformats')) { $invokeArgs.Bioformats = $Bioformats }
+        Invoke-BiopbInstall @invokeArgs | Out-Null
         exit 0
     } catch {
         # Invoke-BiopbInstall already reported the error and (gui) emitted DONE|1.

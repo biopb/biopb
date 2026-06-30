@@ -60,8 +60,9 @@ are produced.
   biopb-mcp release, into a single `uv` tool environment so the components can
   import and drive each other (`biopb server start`, the napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
-- **Data browser** (optional) — `webapp.tar.gz` from the same biopb-mcp release,
-  unpacked to `~/.local/share/biopb/webapp`.
+- **Web interface** — `webapp.tar.gz` from the same biopb-mcp release, unpacked to
+  `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
+  page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
@@ -78,6 +79,21 @@ are produced.
 - Webapp: `~/.local/share/biopb/webapp`
 
 Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
+
+### Unattended / unmanned upgrades
+
+Set `BIOPB_NONINTERACTIVE=1` to suppress **every** prompt, so the installer can
+run from cron / Task Scheduler / CI to upgrade in place. The common case — a
+rerun with an existing config — keeps that config untouched and asks nothing.
+
+It is an **upgrade** feature, not a fresh-install one: with no existing config
+the installer won't guess a data directory, so a *fresh* unattended install
+**errors out unless `BIOPB_DATA_DIR` is set** (which lets you provision a new box
+unattended on purpose). The remote algorithm plugins stay **off** unless
+`BIOPB_REMOTE_PLUGINS=1` (consent can't be asked unattended, so the off-site
+IP-logging servers are never enabled silently). Both console front-ends
+(`install.sh`, `install.ps1`) honor these; the env vars apply to the `curl|bash`
+and `irm|iex` paths alike.
 
 ## Uninstall
 
