@@ -14,7 +14,7 @@ console one-liner share **one install brain**.
 `install.ps1` is **not a file-copy install** — it is a multi-minute network
 *orchestration*: install `uv`, provision Python ≥3.10, download the wheel triple
 from the latest `release-v*`, pull `napari[all]` from PyPI, unpack the webapp,
-write `biopb.toml`, start the tensor server, and wire MCP clients. It is
+write `biopb.json`, start the tensor server, and wire MCP clients. It is
 idempotent and already handles the interactive choices.
 
 That rules out a classic **MSI**, whose declarative file-transaction model fights
@@ -120,14 +120,17 @@ release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring h
 | Finish | `RESULT` records | the console summary |
 
 **Existing config / keep behavior.** On leaving the Options page the wizard
-checks for `%USERPROFILE%\.config\biopb\biopb.toml` (a fixed path, so it catches
-both prior GUI *and* `irm|iex` console installs). If present, a Yes/No dialog
-offers to keep the current configuration — the GUI equivalent of the
-console/Linux "Keep my current config file (default)". **Yes** passes
-`-KeepConfig` (engine leaves `biopb.toml` untouched) and skips the data-dir page;
-**No** shows the data-dir page and the engine backs up + rewrites. We do not
-pre-read the existing data dir (a config may hold multiple `[[sources]]` and the
-engine rewrites a fixed template anyway, so "keep" means *don't touch the file*).
+checks for `%USERPROFILE%\.config\biopb\biopb.json` (canonical, biopb/biopb#34),
+falling back to a legacy `biopb.toml` (fixed paths, so it catches both prior GUI
+*and* `irm|iex` console installs). If present, a Yes/No dialog offers to keep the
+current configuration — the GUI equivalent of the console/Linux "Keep my current
+config file (default)". **Yes** passes `-KeepConfig` (engine leaves the existing
+config untouched) and skips the data-dir page; **No** shows the data-dir page and
+the engine writes `biopb.json`, preserving the prior server/cache settings and
+replacing only the `sources` list (a legacy `biopb.toml` is migrated to JSON and
+backed up). We do not pre-read the existing data dir (a config may hold multiple
+`sources` and the engine replaces them with the chosen folder, so "keep" means
+*don't touch the file*).
 The data-dir default is `%USERPROFILE%\Microscopy`, not Documents, matching the
 console's OneDrive-avoiding choice.
 

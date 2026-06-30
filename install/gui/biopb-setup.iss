@@ -279,14 +279,18 @@ begin
   { Detect a previous install the same way the engine/console do: the config is
     at a fixed home-relative path (covers both GUI and `irm|iex` console
     installs). If present, we offer to keep it (see NextButtonClick). }
-  ConfigPath   := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.toml';
+  { Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
+    pre-#34 install still counts. Prefer the JSON path for display when present. }
+  ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.json';
+  if not FileExists(ConfigPath) then
+    ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.toml';
   ConfigExists := FileExists(ConfigPath);
   KeepConfig   := False;
 
   DataDirPage := CreateInputDirPage(OptionsPage.ID,
     'Microscopy data directory',
     'Where are the images biopb should serve?',
-    'biopb will index this folder. You can change it later in biopb.toml.',
+    'biopb will index this folder. You can change it later in biopb.json.',
     False, '');
   DataDirPage.Add('');
   { Default under the profile root, NOT the Documents folder: Documents is
@@ -370,8 +374,8 @@ begin
   Args := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\biopb-engine.ps1') + '"';
   Args := Args + ' -Mode gui';
   Args := Args + ' -LogFile "' + LogPath + '"';
-  { Keep -> leave biopb.toml untouched (engine honors -KeepConfig); otherwise
-    (re)write it pointing at the chosen folder. }
+  { Keep -> leave the existing config untouched (engine honors -KeepConfig);
+    otherwise (re)write biopb.json pointing at the chosen folder. }
   if KeepConfig then
     Args := Args + ' -KeepConfig'
   else begin
@@ -545,14 +549,15 @@ begin
   { Leaving the options page with an existing config present: ask whether to keep
     it -- the GUI equivalent of the console/Linux "Keep my current config file
     (default)" choice. Yes -> keep untouched and skip the data-dir page; No ->
-    pick a new data folder (the engine backs up the old config and rewrites). }
+    pick a new data folder (the engine preserves your other settings and replaces
+    only the data folder). }
   if (CurPageID = OptionsPage.ID) and ConfigExists then
     KeepConfig := (MsgBox(
       'An existing biopb configuration was found:' + #13#10 +
       ConfigPath + #13#10#13#10 +
       'Keep your current configuration (data folder and settings)?' + #13#10#13#10 +
       'Yes  -  keep it unchanged' + #13#10 +
-      'No   -  choose a new microscopy data folder (the old config is backed up)',
+      'No   -  choose a new microscopy data folder (your other settings are kept)',
       mbConfirmation, MB_YESNO) = IDYES);
 end;
 

@@ -94,7 +94,8 @@ _checkbox() {
 # When the second arg is non-empty ("keep" mode), an extra "0) Keep my current
 # config file" option is shown as the *default*; choosing it (or Enter, or any
 # invalid input) returns the empty string as a sentinel meaning "don't touch the
-# existing config." Callers pass this when a biopb.toml already exists.
+# existing config." Callers pass this when a config (biopb.json or legacy
+# biopb.toml) already exists.
 _pick_data_dir() {
     # Caller passes the name of a variable to receive the result. We assign into
     # it with `printf -v` rather than a `local -n` nameref, because namerefs need
@@ -261,6 +262,64 @@ with os.fdopen(fd, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
 os.replace(tmp, path)
+PY
+}
+
+# Write the tensor-server config as JSON (biopb.json) -- the canonical format
+# (biopb/biopb#34). JSON generation is stdlib on both ends (json.dump), so the
+# old hand-rolled TOML escaping is gone.
+#
+# Usage: _write_server_config <out-json> <data-dir> [prior-config]
+# When <prior-config> exists, its settings (server/cache/...) are loaded and
+# *preserved*; only the `sources` list is replaced with the chosen data dir, so
+# re-running with a new folder no longer discards the user's tuning. A prior
+# JSON is read with the stdlib; a legacy TOML is read for migration when this
+# Python has a TOML parser (3.11+ stdlib `tomllib`, else `tomli`) and otherwise
+# falls back to fresh defaults. The caller retires the legacy TOML. Writes
+# atomically; returns non-zero on any error.
+_write_server_config() {
+    local out="$1" data_dir="$2" prior="${3:-}"
+    mkdir -p "$(dirname "$out")"
+    _py - "$out" "$data_dir" "$prior" <<'PY'
+import json, os, sys
+
+out, data_dir, prior = sys.argv[1], sys.argv[2], sys.argv[3]
+
+data = {}
+if prior and os.path.exists(prior):
+    try:
+        if prior.endswith(".toml"):
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib  # 3.10 fallback
+            with open(prior, "rb") as fh:
+                data = tomllib.load(fh)
+        else:
+            with open(prior, encoding="utf-8") as fh:
+                data = json.load(fh)
+    except Exception:
+        # Unreadable/unparseable prior config: start clean rather than abort
+        # the install. The new data dir is written either way.
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+
+# A fresh config ships the installer defaults; an existing one keeps whatever
+# server/cache/... values it already had. `metadata_db.enabled` is intentionally
+# omitted -- the DB is on by default and the flag is deprecated (biopb/biopb#225).
+data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
+                           "aggressive_dir_pruning": True})
+data.setdefault("cache", {"backend": "file", "file_max_segment_mb": 256,
+                          "file_max_total_gb": 128})
+# Point the server at exactly one watched folder, replacing any prior sources.
+data["sources"] = [{"url": data_dir, "monitor": True}]
+
+tmp = out + ".biopb.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, out)
 PY
 }
 
@@ -728,7 +787,7 @@ _start_data_server() {
     if [ -z "$count" ] || [ "$count" = "0" ]; then
         _warn "Data server is running but found no data sources"
         _info "  check that your data folder holds supported images (see config):"
-        _cmd "  $CONFIG_FILE"
+        _cmd "  ${ACTIVE_CONFIG:-$CONFIG_FILE}"
         _tail_log "$log_file"
         return 0
     fi
@@ -1112,21 +1171,31 @@ install_biopb() {
     _step "[5/7] Config..."
 
     mkdir -p "$CONFIG_DIR"
-    CONFIG_FILE="$CONFIG_DIR/biopb.toml"
+    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # canonical format (biopb/biopb#34)
+    LEGACY_CONFIG="$CONFIG_DIR/biopb.toml"      # pre-#34 installs
 
-    # We never edit an existing biopb.toml in place — hand-editing TOML is
-    # error-prone and most users can't do it. Instead the data-directory prompt is
-    # always offered; when a config already exists it gains a default "0) Keep my
-    # current config file" option, and choosing a fresh data dir backs up the old
-    # config and writes a brand-new one. An empty DATA_DIR is the "keep" sentinel.
+    # An existing config in either format counts for the keep-vs-rewrite decision.
+    # biopb.json wins when both are present (matches the server's find_config).
+    local EXISTING_CONFIG=""
+    if [ -f "$CONFIG_FILE" ]; then
+        EXISTING_CONFIG="$CONFIG_FILE"
+    elif [ -f "$LEGACY_CONFIG" ]; then
+        EXISTING_CONFIG="$LEGACY_CONFIG"
+    fi
+
+    # The data-directory prompt is always offered; when a config already exists it
+    # gains a default "0) Keep my current config file" option. Choosing a fresh
+    # data dir no longer rewrites the whole file: we load the existing config,
+    # preserve its settings, and replace only the `sources` list (biopb/biopb#34).
+    # An empty DATA_DIR is the "keep" sentinel.
     local DATA_DIR
-    if [ -f "$CONFIG_FILE" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
+    if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
         _pick_data_dir DATA_DIR keep
         echo ""
-    elif [ -f "$CONFIG_FILE" ]; then
+    elif [ -n "$EXISTING_CONFIG" ]; then
         # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
         # install. With a config already present we keep it (its data dir wins).
-        _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $CONFIG_FILE to apply BIOPB_DATA_DIR)."
+        _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $EXISTING_CONFIG to apply BIOPB_DATA_DIR)."
         DATA_DIR=""
     elif [ -n "${BIOPB_DATA_DIR:-}" ]; then
         DATA_DIR="$BIOPB_DATA_DIR"
@@ -1137,41 +1206,33 @@ install_biopb() {
         _ok "Data directory: $DATA_DIR"
     fi
 
+    # ACTIVE_CONFIG is the file the running server will read -- the JSON we write,
+    # or the untouched existing file when the user keeps it (shown in the summary).
+    local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        _ok "Keeping current config: $CONFIG_FILE"
+        _ok "Keeping current config: $EXISTING_CONFIG"
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
             exit 1
         fi
-        # Preserve the previous config (a chosen new data dir must never silently
-        # discard the user's old settings) by renaming it to a timestamped backup.
-        if [ -f "$CONFIG_FILE" ]; then
-            local _config_backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
-            mv "$CONFIG_FILE" "$_config_backup"
-            _info "Backed up previous config to $_config_backup"
+        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$EXISTING_CONFIG"; then
+            _err "Failed to write config: $CONFIG_FILE"
+            exit 1
         fi
-        TOML_DATA_DIR="${DATA_DIR//\\/\\\\}"
-        TOML_DATA_DIR="${TOML_DATA_DIR//\"/\\\"}"
-        cat > "$CONFIG_FILE" << EOF
-[server]
-host = "127.0.0.1"
-port = 8815
-aggressive_dir_pruning = true
-
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
-
-[metadata_db]
-enabled = true
-
-[[sources]]
-url = "$TOML_DATA_DIR"
-monitor = true
-EOF
-        _ok "Created: $CONFIG_FILE"
+        ACTIVE_CONFIG="$CONFIG_FILE"
+        # Retire a legacy TOML we just superseded so the server does not warn
+        # about both files shadowing (find_config prefers biopb.json). Its
+        # settings were carried into the new JSON above.
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && [ -f "$LEGACY_CONFIG" ]; then
+            mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+            _info "Migrated legacy TOML config to JSON (old file backed up)"
+        fi
+        if [ -n "$EXISTING_CONFIG" ]; then
+            _ok "Updated: $CONFIG_FILE"
+        else
+            _ok "Created: $CONFIG_FILE"
+        fi
     fi
 
     # ===== 6. Start the data server =====
@@ -1224,7 +1285,7 @@ EOF
     echo ""
 
     _info "Data server configuration file:"
-    _cmd "  $CONFIG_FILE"
+    _cmd "  $ACTIVE_CONFIG"
     echo ""
 
     _info "To upgrade: rerun this script"

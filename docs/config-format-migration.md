@@ -1,6 +1,6 @@
 # Config Format Migration — TOML → JSON (coexistence phase)
 
-**Status:** Phases 1–2 done — read-side JSON/TOML coexistence (`biopb._config_location` + TOML deprecation warning) and warn-level value validation (`_CONSTRAINTS`, `config.py`). Phase 3 deferred — installer still writes TOML (`install/biopb-engine.ps1`); JSON Schema emitter not built.
+**Status:** Phases 1–3 done — read-side JSON/TOML coexistence (`biopb._config_location` + TOML deprecation warning), warn-level value validation (`_CONSTRAINTS`, `config.py`), and the installer now writing `biopb.json` (all four front-ends: `install/install.sh`, `install/biopb-engine.ps1`, `install/install.ps1`, `install/gui/biopb-setup.iss`). Remaining: JSON Schema emitter not built; `.toml` read path not yet dropped.
 **Component:** `biopb-tensor-server` (config), `biopb` umbrella CLI, `biopb-mcp`
 **Tracking:** biopb/biopb#34 (the agreed plan lives in that issue's first comment)
 
@@ -83,11 +83,29 @@ sitting beside it).
    *not* constrained. Flip `_STRICT_VALIDATION → True` (warn → raise) when the
    legacy read path is removed.
 
+## Installer writes JSON (done)
+
+The TOML text-templating in the installers is replaced by stdlib JSON generation
+(`json.dump` on POSIX, `ConvertTo-Json` on Windows), so the fragile hand-rolled
+escaping (`biopb-engine.ps1`'s `-replace '\\','\\' -replace '"','\"'` + the BOM
+workaround) is gone. The four front-ends — `install.sh` (POSIX), `biopb-engine.ps1`
+(Windows engine), `install.ps1` and `gui/biopb-setup.iss` (Windows front-ends) —
+now write `~/.config/biopb/biopb.json` and detect an existing config in **either**
+format for the keep prompt (`biopb.json` wins, matching `find_config`).
+
+Because JSON has a stdlib *reader*, a re-run that points at a new data folder no
+longer rewrites the whole file: the existing config is loaded, its
+server/cache/… settings are **preserved**, and only the `sources` list is
+replaced with the chosen folder (a `[[sources]]`-clobbering rewrite before). A
+legacy `biopb.toml` is migrated to JSON on that path (POSIX reads it via
+`tomllib`/`tomli` to carry settings; Windows has no TOML parser so it starts from
+installer defaults) and the old file is backed up so the server's both-files
+shadow warning never fires. The default template also drops the now-deprecated
+`[metadata_db] enabled = true` (DB on by default, biopb/biopb#225). New installs
+are JSON-native; old TOML installs keep working until they next change folders.
+
 ## Deferred
 
-- **Installer writes JSON.** Replace the TOML text templating in `install.sh` /
-  `biopb-engine.ps1` with `json.dumps` / `ConvertTo-Json` and write `biopb.json`.
-  Once shipped, new installs are JSON-native; old TOML installs keep working.
 - **JSON Schema emitter.** Generated from the same `_CONSTRAINTS` table, feeding
   the config generator + editor autocomplete + optional pre-flight validation.
 - **End state.** Drop the `.toml` read path and flip validation warn → raise.
@@ -96,7 +114,7 @@ sitting beside it).
 
 1. ~~Read-side coexistence.~~ ✅
 2. ~~Value-validation `_CONSTRAINTS` (warn).~~ ✅
-3. Installer emits JSON; schema emitter; make JSON the only documented format.
+3. ~~Installer emits JSON~~ ✅; schema emitter; make JSON the only documented format.
 4. Drop `.toml` read path; flip warn → hard-fail.
 
 ## Equivalent configs
