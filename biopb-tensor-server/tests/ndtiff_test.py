@@ -346,4 +346,9 @@ class TestNdTiffCreateFromConfig:
             adapter = NdTiffAdapter.create_from_config(source)
 
             assert adapter.source_id == "test-source"
-            mock_ndtiff.assert_called_once_with("/test/ndtiff/path")
+            # create_from_config passes the *resolved* path to NDTiffDataset, so
+            # compare against the normalized form rather than the raw URL — on
+            # POSIX resolve() is a fixed point here, but on Windows the call is
+            # NDTiffDataset('C:\\test\\ndtiff\\path') (biopb#179).
+            expected_path = str(Path("/test/ndtiff/path").resolve())
+            mock_ndtiff.assert_called_once_with(expected_path)
