@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
-import { TensorApiError } from "@biopb/tensor-flight-client";
+import { TensorApiError, splitConfigErrors } from "@biopb/tensor-flight-client";
 import type { AdminConfigError, AdminStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
@@ -13,25 +13,6 @@ const RESTART_TIMEOUT_MS = 60_000;
 function getSources(config: Config | null): SourceEntry[] {
   const s = config?.sources;
   return Array.isArray(s) ? (s as SourceEntry[]) : [];
-}
-
-/** Split the flat 422 errors into per-source-row messages + a general summary. */
-function splitErrors(errors: AdminConfigError[]): {
-  byIndex: Record<number, string[]>;
-  general: string[];
-} {
-  const byIndex: Record<number, string[]> = {};
-  const general: string[] = [];
-  for (const e of errors) {
-    if (e.path[0] === "sources" && typeof e.path[1] === "number") {
-      const i = e.path[1];
-      (byIndex[i] ??= []).push(`${e.path.slice(2).join(".") || "source"}: ${e.message}`);
-    } else {
-      const where = e.path.length ? e.path.join(".") + ": " : "";
-      general.push(where + e.message);
-    }
-  }
-  return { byIndex, general };
 }
 
 export function AdminPage() {
@@ -151,7 +132,7 @@ export function AdminPage() {
       if (!mounted.current) return;
       if (err instanceof TensorApiError && err.status === 422) {
         const body = err.detail as { errors?: AdminConfigError[] } | undefined;
-        const { byIndex, general } = splitErrors(body?.errors ?? []);
+        const { byIndex, general } = splitConfigErrors(body?.errors ?? []);
         setErrorsByIndex(byIndex);
         setGeneralErrors(general.length ? general : ["Config failed validation."]);
       } else {
