@@ -591,6 +591,128 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
+    """An upstream down at boot is retried on the fast incremental cadence -- not
+    only the slow force-full (1h) one: recovery happens on a rescan that is NOT a
+    force-full pass, because the failed upstream is marked for prompt retry."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.source_manager import SourceManager
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+
+    # reserve a port and leave it closed -- the upstream is "down at boot"
+    seed = TensorFlightServer("grpc://localhost:0")
+    port = seed.port
+    seed.shutdown()
+    url = f"grpc://localhost:{port}"
+
+    proxy = TensorFlightServer("grpc://localhost:0")
+    _serve(proxy)
+    try:
+        manager = SourceManager(
+            server=proxy,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(),
+            metadata_db=None,
+            monitored_upstreams=[SourceConfig(url=url, alias="lab")],
+        )
+        client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+
+        # first rescan is force-full (last-full = -inf) -> tries the dead upstream
+        assert manager._should_force_full_rescan() is True
+        manager._handle_rescan()
+        assert url in manager._failed_upstreams  # recorded as failed
+        # the force-full was consumed, so the next rescan is NOT force-full
+        assert manager._should_force_full_rescan() is False
+        assert set(client.list_sources()) == set()  # nothing mirrored yet
+
+        # the upstream comes up on the SAME port with a populated metadata DB
+        db = MetadataDatabase()
+        up = TensorFlightServer(url, metadata_db=db)
+        adapter = ZarrAdapter(arr, "img", ["y", "x"])
+        up.register_source("img", adapter)
+        db.sync_source_added("img", adapter)
+        _serve(up)
+        try:
+            # this rescan is NOT a force-full pass, yet the failed upstream is
+            # retried and recovers -- the whole point of the fast cadence
+            assert manager._should_force_full_rescan() is False
+            manager._handle_rescan()
+            assert set(client.list_sources()) == {"lab__img"}
+            assert manager._failed_upstreams == set()  # cleared on recovery
+            client.close()
+        finally:
+            up.shutdown()
+    finally:
+        proxy.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
+    """A stable upstream is re-listed less often (period doubles in ticks while the
+    source set is unchanged); a new source resets it to the fast every-tick cadence."""
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.source_manager import SourceManager
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream, up_register, _ = _db_upstream(zarr_path, ["img"])
+    _serve(upstream)
+    url = f"grpc://localhost:{upstream.port}"
+    try:
+        proxy = TensorFlightServer("grpc://localhost:0")
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                watcher=None,
+                monitored_dirs=set(),
+                metadata_db=None,
+                monitored_upstreams=[SourceConfig(url=url, alias="lab")],
+            )
+            client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+
+            def period():
+                return manager._upstream_relist[url]["period"]
+
+            manager._handle_rescan()  # mirrors lab__img (a change) -> stays fast
+            assert period() == 1
+            manager._handle_rescan()  # unchanged -> back off to every 2 ticks
+            assert period() == 2
+            manager._handle_rescan()  # skipped (not due this tick)
+            manager._handle_rescan()  # due, unchanged -> every 4 ticks
+            assert period() == 4
+
+            # a new upstream source appears: the next DUE re-list mirrors it and
+            # resets the cadence to fast (every tick)
+            up_register("img2")
+            for _ in range(4):  # advance past the skipped ticks to the next due
+                manager._handle_rescan()
+            assert period() == 1
+            assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+
+            client.close()
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestUnreachableUpstream:
     """Unresolved/unreachable upstream policy (#178).
 

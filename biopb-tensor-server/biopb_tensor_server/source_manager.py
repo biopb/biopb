@@ -39,6 +39,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Backoff ceiling for the tensor-server upstream re-list, in rescan ticks
+# (biopb/biopb#178). A re-list runs every tick while an upstream is changing or
+# failing; while it stays stable the spacing doubles up to this many ticks, so a
+# fully-stable upstream settles to re-listing about once an hour at the default
+# 30s rescan tick (instead of querying it every 30s forever).
+_UPSTREAM_RELIST_MAX_TICKS = 120
+
 # Hard backstop against unbounded recursion in the rescan walk. visited_identities
 # breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
 # identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
@@ -95,10 +102,24 @@ class SourceManager:
         # sources that resolve lazily on first access (cloud-storage phase 2).
         self._cloud_roots: Set[Path] = cloud_roots or set()
         # Monitored tensor-server (bare-host grpc://) upstreams: their catalog is
-        # re-listed on the force-full cadence and reconciled like a directory walk
+        # periodically re-listed and reconciled like a directory walk
         # (biopb/biopb#178). Single-source grpc://host/<id> entries are not here --
         # there is nothing to re-list for one fixed source.
         self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
+        # Per-upstream re-list cadence (keyed by url), counted in rescan ticks (no
+        # wall-clock interval -- the rescan tick is the unit). A re-list runs every
+        # tick by default; when it finds the source set UNCHANGED the spacing
+        # doubles (a stable upstream is skipped for more ticks, up to
+        # _UPSTREAM_RELIST_MAX_TICKS, so we are not querying it every tick forever),
+        # and any change OR failure resets it to every tick -- so a new source / a
+        # recovering upstream is picked up within ~one tick, not after the full
+        # backoff. `countdown` ticks down to 0 (re-list due); `period` is the
+        # current spacing in ticks.
+        self._upstream_relist: Dict[str, Dict[str, int]] = {}
+        self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
+        # Upstreams (by url) whose last re-list failed -- a status signal (the fast
+        # retry itself is driven by the period reset above).
+        self._failed_upstreams: Set[str] = set()
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
         self._stability_window = stability_window
@@ -262,26 +283,10 @@ class SourceManager:
 
     def _handle_rescan(self) -> None:
         """Run one periodic rescan: re-list monitored upstreams, then walk dirs."""
-        # tensor-server upstream re-list (biopb/biopb#178) runs on the force-full
-        # cadence only -- a network list_flights is too costly per incremental
-        # tick (this mirrors the cloud-subtree force-full gate). When there are no
-        # monitored *dirs*, this is the sole reconcile, so it also drives the
-        # progressive-discovery freshness signals + first-scan gate the dir path
-        # below would otherwise own.
-        if self._monitored_upstreams and self._should_force_full_rescan():
-            upstream_only = not self._monitored_dirs
-            if upstream_only:
-                self._server.set_full_scan_in_progress(True)
-            try:
-                self._reconcile_upstreams()
-            finally:
-                if upstream_only:
-                    self._last_full_rescan_at = time.time()
-                    self._server.set_last_full_scan(self._last_full_rescan_at)
-                    self._server.set_full_scan_in_progress(False)
-                    if not self._initial_scan_done:
-                        self._initial_scan_done = True
-                        self._fire_initial_scan_complete()
+        # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
+        # cadence -- fast (every tick) while changing/failing, backing off toward
+        # full_rescan_interval while a source set stays stable.
+        self._reconcile_due_upstreams()
 
         if not self._monitored_dirs:
             return
@@ -1247,24 +1252,102 @@ class SourceManager:
             self._clear_failed_source_attempt(source_id)
         return True
 
-    def _reconcile_upstreams(self) -> None:
-        """Re-list each monitored tensor-server upstream and add/remove its sources.
+    def _reconcile_due_upstreams(self) -> None:
+        """Re-list the upstreams that are due this tick (adaptive backoff).
+
+        Each upstream re-lists on the fast rescan tick while it is changing or
+        failing, and backs off (period doubles per unchanged re-list, capped at
+        full_rescan_interval) while it is stable -- so a stable lab store is not
+        queried every 30s forever, yet a new source / a recovered upstream is
+        mirrored within ~one tick. When there are no monitored *dirs* this is the
+        sole reconcile, so the first pass also drives the progressive-discovery
+        freshness signals + first-scan gate the dir path would otherwise own.
+        """
+        if not self._monitored_upstreams:
+            return
+        due: List[SourceConfig] = []
+        for upstream in self._monitored_upstreams:
+            state = self._upstream_relist.setdefault(
+                upstream.url, {"period": 1, "countdown": 0}
+            )
+            state["countdown"] -= 1
+            if state["countdown"] <= 0:
+                due.append(upstream)
+        if not due:
+            return
+
+        upstream_only = not self._monitored_dirs
+        first_pass = upstream_only and not self._initial_scan_done
+        if first_pass:
+            self._server.set_full_scan_in_progress(True)
+        try:
+            for upstream in due:
+                self._reconcile_and_reschedule(upstream)
+        finally:
+            if upstream_only:
+                # Each completed pass re-verifies the (remote) catalog -> advance
+                # freshness. in_progress / the first-scan gate fire once, on boot.
+                self._last_full_rescan_at = time.time()
+                self._server.set_last_full_scan(self._last_full_rescan_at)
+                if first_pass:
+                    self._server.set_full_scan_in_progress(False)
+                    self._initial_scan_done = True
+                    self._fire_initial_scan_complete()
+
+    def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
+        """Re-list one upstream and set its next-due period from the outcome."""
+        state = self._upstream_relist[upstream.url]
+        try:
+            changed = self._reconcile_one_upstream(upstream)
+        except Exception:
+            # Failure (unreachable): retry on the fast cadence next tick.
+            self._failed_upstreams.add(upstream.url)
+            state["period"] = 1
+            state["countdown"] = state["period"]
+            logger.warning(
+                "Upstream re-list failed for %s; keeping its current catalog "
+                "(retrying on the next rescan)",
+                upstream.url,
+                exc_info=True,
+            )
+            return
+        self._failed_upstreams.discard(upstream.url)
+        if changed:
+            state["period"] = 1  # the catalog moved -> stay fast
+        else:
+            # Stable -> back off (double, capped at full_rescan_interval).
+            state["period"] = min(state["period"] * 2, self._upstream_max_period)
+        state["countdown"] = state["period"]
+
+    def _reconcile_upstreams(
+        self, upstreams: Optional[List[SourceConfig]] = None
+    ) -> None:
+        """Re-list each given tensor-server upstream now (ignoring the backoff
+        schedule); used by tests and any caller that wants an immediate pass.
 
         Best-effort per upstream: an unreachable upstream leaves its currently
-        mirrored sources in place (no spurious removals) and is retried next pass.
+        mirrored sources in place (no spurious removals) and is marked failed.
         """
-        for upstream in self._monitored_upstreams:
+        if upstreams is None:
+            upstreams = self._monitored_upstreams
+        for upstream in upstreams:
             try:
                 self._reconcile_one_upstream(upstream)
             except Exception:
+                self._failed_upstreams.add(upstream.url)
                 logger.warning(
-                    "Upstream re-list failed for %s; keeping its current catalog",
+                    "Upstream re-list failed for %s; keeping its current catalog "
+                    "(will retry on the next rescan)",
                     upstream.url,
                     exc_info=True,
                 )
+            else:
+                self._failed_upstreams.discard(upstream.url)
 
-    def _reconcile_one_upstream(self, upstream: SourceConfig) -> None:
+    def _reconcile_one_upstream(self, upstream: SourceConfig) -> bool:
         """Diff one upstream's live source list against the mirrored catalog.
+
+        Returns whether the mirrored set changed (a source was added or removed).
 
         The diff is the same add/remove model as the filesystem reconcile, but the
         "scan" is a remote ``list_sources()`` and the unit is a source_id (not a
@@ -1336,6 +1419,8 @@ class SourceManager:
                 len(added),
                 len(removed),
             )
+        # Whether the mirrored set moved -- drives the adaptive re-list cadence.
+        return bool(added or removed)
 
     def _should_retry_source(self, source_id: str) -> bool:
         """Return True when a failed source is eligible for another add attempt."""

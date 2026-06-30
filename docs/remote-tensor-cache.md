@@ -301,25 +301,31 @@ instead of a filesystem walk — the `SourceManager` diff model applies unchange
 once the "scan" is a remote list. (`monitor` for fs watching does not apply to a
 remote url today; this generalizes it.)
 
-> **Implemented (monitor → upstream re-list).** `create_source_manager` collects
-> the **bare-host** `tensor-server` sources with `monitor=true` into
-> `SourceManager._monitored_upstreams` (single-source `grpc://host/<id>` entries
-> are excluded — nothing to re-list). `_handle_rescan` runs `_reconcile_upstreams`
-> on the **force-full cadence** (`full_rescan_interval`, default 1 h — a network
-> `list_flights` is too costly per incremental tick, matching the cloud-subtree
-> gate); for an *upstream-only* config (no monitored dirs) it also drives the
-> progressive-discovery freshness signals (`full_scan_in_progress` /
-> `last_full_scan_finished_at`) and the first-scan gate the dir path would
-> otherwise own. `_reconcile_one_upstream` re-lists the upstream and diffs the
-> alias-namespaced desired id set against the currently-mirrored claims for that
-> endpoint, applying adds/removes through the **same** `_commit_add_claim` /
-> `_commit_remove_source` primitives as the filesystem reconcile (the "scan" is a
-> remote list, the unit is a source_id instead of a path signature). It is
-> best-effort per upstream: an unreachable upstream keeps its mirrored sources in
-> place and retries next pass. The watcher ticks on a timer independent of its
-> directory set, so the loop runs even with zero monitored dirs. Tests:
-> `remote_tensor_adapter_test.py::test_monitored_upstream_relist_adds_and_removes`
-> (a source appears then disappears upstream and the proxy mirror follows) and
+> **Implemented (monitor → upstream re-list, adaptive cadence).**
+> `create_source_manager` collects the **bare-host** `tensor-server` sources with
+> `monitor=true` into `SourceManager._monitored_upstreams` (single-source
+> `grpc://host/<id>` entries are excluded — nothing to re-list). `_handle_rescan`
+> runs `_reconcile_due_upstreams` every rescan tick (default 30 s) with an
+> **adaptive per-upstream cadence counted in ticks** (no wall-clock interval — the
+> rescan tick is the unit): a re-list runs every tick while an upstream is
+> *changing* or *failing*, and its spacing **doubles per unchanged re-list** (a
+> stable upstream is skipped for more ticks, capped at `_UPSTREAM_RELIST_MAX_TICKS`
+> = 120 ≈ 1 h, so it isn't queried every 30 s forever). Any change *or* failure
+> resets it to every-tick, so a new source / a recovered upstream is mirrored
+> within ~one tick rather than after the full backoff (the original
+> force-full-only gate made recovery take up to 1 h). `_reconcile_one_upstream`
+> returns whether the mirrored set moved (drives the backoff), diffing the
+> alias-namespaced desired id set against the currently-mirrored claims and
+> applying adds/removes through the **same** `_commit_add_claim` /
+> `_commit_remove_source` primitives as the filesystem reconcile. Best-effort per
+> upstream: an unreachable one keeps its mirrored sources in place and retries
+> next tick. For an *upstream-only* config (no monitored dirs) each pass also
+> advances the progressive-discovery freshness signals; `full_scan_in_progress` /
+> the first-scan gate fire once, on boot. The watcher ticks on a timer independent
+> of its directory set, so the loop runs even with zero monitored dirs. Tests:
+> `test_monitored_upstream_relist_adds_and_removes`,
+> `test_failed_upstream_retried_on_fast_incremental_cadence`,
+> `test_stable_upstream_backs_off_then_resets_on_change`,
 > `test_create_source_manager_captures_bare_host_monitored_upstream`.
 
 **Unreachable upstream.** A proxy "resolve" is a *cheap reconnect*, not a cloud
