@@ -55,6 +55,47 @@ export function AdminPage() {
     restartingRef.current = restarting;
   }, [restarting]);
 
+  // Restart-confirm modal: Esc to dismiss, focus trap, and restore focus to the
+  // trigger on close (an accessible dialog, since it gates a destructive action).
+  const modalRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!confirmRestart) return;
+    const prevFocus = document.activeElement as HTMLElement | null;
+    const focusable = (): HTMLElement[] =>
+      Array.from(
+        modalRef.current?.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      ).filter((el) => !el.hasAttribute("disabled"));
+    // Focus the non-destructive action first (Cancel), so a stray Enter doesn't
+    // fire Restart.
+    focusable()[0]?.focus();
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setConfirmRestart(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = focusable();
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!first || !last) return;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      prevFocus?.focus?.();
+    };
+  }, [confirmRestart]);
+
   // Route every config mutation through here so the structured editor and the
   // raw-JSON textarea stay in sync over one canonical object.
   const applyConfig = useCallback((next: Config, markDirty = true) => {
@@ -279,6 +320,13 @@ export function AdminPage() {
           </div>
         )}
 
+        {rawError && (
+          <div className="admin-banner error" role="alert">
+            <strong>Invalid JSON in the advanced editor</strong> — fix it before
+            saving: {rawError}
+          </div>
+        )}
+
         {generalErrors.length > 0 && (
           <div className="admin-banner error">
             <strong>Config not saved — fix these:</strong>
@@ -313,10 +361,13 @@ export function AdminPage() {
               disabled={restarting}
             />
 
-            <details className="admin-advanced">
-              <summary>Advanced — full config (raw JSON)</summary>
+            <details className="admin-advanced" open={!!rawError || undefined}>
+              <summary>
+                Advanced — full config (raw JSON)
+                {rawError && <span className="advanced-error-tag">invalid JSON</span>}
+              </summary>
               <textarea
-                className="admin-raw"
+                className={`admin-raw${rawError ? " invalid" : ""}`}
                 spellCheck={false}
                 value={rawText}
                 disabled={restarting}
@@ -347,8 +398,15 @@ export function AdminPage() {
 
       {confirmRestart && (
         <div className="admin-modal-backdrop" onClick={() => setConfirmRestart(false)}>
-          <div className="admin-modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Restart the server?</h2>
+          <div
+            className="admin-modal"
+            ref={modalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="admin-restart-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="admin-restart-title">Restart the server?</h2>
             <p>
               Restart interrupts the shared live session: connected clients (the
               napari/MCP kernel, browser viewers, in-flight analyses) drop while the
