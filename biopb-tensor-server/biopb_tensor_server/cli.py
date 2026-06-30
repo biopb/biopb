@@ -414,6 +414,7 @@ def _setup_flight_server(
         watcher=watcher,
         monitored_sources=monitored_sources,
         static_sources=static_sources,
+        metadata_db=metadata_db,
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
         probe_open_files=server_config.probe_open_files,
@@ -426,9 +427,10 @@ def _setup_flight_server(
         console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
-    # Initial sync of metadata database (batch insert all discovered sources)
-    if metadata_db is not None:
-        metadata_db.initial_sync(server._sources)
+    # Note: the metadata DB is already populated at this point. Static sources
+    # are seeded via SourceManager._commit_add_claim -> _register_source_claim
+    # (which syncs each), and monitored sources stream in through the background
+    # first scan -- both before this line. No separate initial_sync is needed.
 
     # Background precache worker: warm the file cache for sources added live.
     # Wire the commit hook BEFORE source_manager.start(). Under progressive

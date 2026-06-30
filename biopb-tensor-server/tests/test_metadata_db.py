@@ -194,80 +194,26 @@ class TestSourceSync:
         # Database should not be initialized
         assert db._conn is None
 
-    def test_initial_sync_batch_insert(self):
-        """Test batch insert of existing sources."""
-        db = MetadataDatabase(enabled=True)
-
-        sources = {
-            "plate-001": MockAdapter(
-                "plate-001", "/data/plate1.zarr", "ome-zarr", [256, 256], "uint8"
-            ),
-            "plate-002": MockAdapter(
-                "plate-002", "/data/plate2.zarr", "ome-zarr", [512, 512], "uint16"
-            ),
-            "plate-003": MockAdapter(
-                "plate-003", "/data/plate3.zarr", "ome-zarr", [1024, 1024], "float32"
-            ),
-        }
-
-        db.initial_sync(sources)
-
-        conn = db._get_connection()
-        result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
-        assert result[0] == 3
-
-        # Check each source
-        for source_id in sources:
-            row = conn.execute(
-                "SELECT source_id FROM sources WHERE source_id=?", [source_id]
-            ).fetchone()
-            assert row is not None
-
-    def test_initial_sync_continues_on_error(self):
-        """Test that initial_sync continues even if one source fails."""
-        import numpy as np
+    def test_sync_source_added_propagates_failure(self):
+        """A descriptor-read error surfaces to the caller instead of being
+        swallowed, so the registration path can roll back (issue #223)."""
 
         class FailingAdapter(MockAdapter):
             def get_source_descriptor(self):
                 raise RuntimeError("Simulated failure")
 
-        class NumpyAdapter(MockAdapter):
-            def get_metadata(self):
-                return {"value": np.int16(42)}
-
         db = MetadataDatabase(enabled=True)
 
-        sources = {
-            "good-1": MockAdapter(
-                "good-1", "/data/g1.zarr", "ome-zarr", [100, 100], "uint8"
-            ),
-            "failing": FailingAdapter(
-                "failing", "/data/fail.zarr", "ome-zarr", [100, 100], "uint8"
-            ),
-            "numpy": NumpyAdapter(
-                "numpy", "/data/numpy.nii", "nifti", [64, 64], "int16"
-            ),
-        }
+        with pytest.raises(RuntimeError, match="Simulated failure"):
+            db.sync_source_added(
+                "failing",
+                FailingAdapter(
+                    "failing", "/data/fail.zarr", "ome-zarr", [100, 100], "uint8"
+                ),
+            )
 
-        db.initial_sync(sources)
-
+        # Nothing partially written for the failed source.
         conn = db._get_connection()
-        # Only good-1 and numpy should be synced (failing adapter raises error)
-        result = conn.execute("SELECT COUNT(*) FROM sources").fetchone()
-        assert result[0] == 2
-
-        # Verify the good sources are present
-        row = conn.execute(
-            "SELECT source_id FROM sources WHERE source_id='good-1'"
-        ).fetchone()
-        assert row is not None
-
-        row = conn.execute(
-            "SELECT source_id FROM sources WHERE source_id='numpy'"
-        ).fetchone()
-        assert row is not None
-
-        # Verify failing source is not present
         row = conn.execute(
             "SELECT source_id FROM sources WHERE source_id='failing'"
         ).fetchone()
@@ -745,23 +691,6 @@ class TestDataResidentColumn:
             "SELECT source_id FROM sources WHERE NOT data_resident"
         ).fetchall()
         assert [r[0] for r in unresolved] == ["cloud-1"]
-
-    def test_initial_sync_populates_residency(self):
-        db = MetadataDatabase(enabled=True)
-        db.initial_sync(
-            {
-                "local-1": MockAdapter(
-                    "local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"
-                ),
-                "cloud-1": self._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
-            }
-        )
-        rows = dict(
-            db._get_connection()
-            .execute("SELECT source_id, data_resident FROM sources")
-            .fetchall()
-        )
-        assert rows == {"local-1": True, "cloud-1": False}
 
     def test_column_is_not_null_with_false_default(self):
         # The NOT NULL DEFAULT FALSE constraint: an insert omitting data_resident

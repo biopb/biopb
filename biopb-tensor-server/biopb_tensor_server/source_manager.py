@@ -34,6 +34,7 @@ from biopb_tensor_server.watcher import (
 )
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.metadata_db import MetadataDatabase
     from biopb_tensor_server.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class SourceManager:
         discovery_state: DiscoveryState,
         watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
+        metadata_db: Optional[MetadataDatabase] = None,
         dim_labels: Optional[List[str]] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -79,6 +81,10 @@ class SourceManager:
         cloud_roots: Optional[Set[Path]] = None,
     ):
         self._server = server
+        # First-class catalog dependency: injected by create_source_manager so
+        # all DB sync routes through self._metadata_db instead of poking through
+        # the server. None when the metadata DB feature is disabled.
+        self._metadata_db = metadata_db
         self._registry = registry
         self._state = discovery_state
         self._watcher = watcher
@@ -1275,12 +1281,9 @@ class SourceManager:
         concrete descriptor. Persistence across restart is phase 3 (file-backed
         DB); here the backfill lives for the process lifetime.
         """
-        if (
-            hasattr(self._server, "_metadata_db")
-            and self._server._metadata_db is not None
-        ):
+        if self._metadata_db is not None:
             try:
-                self._server._metadata_db.sync_source_added(source_id, adapter)
+                self._metadata_db.sync_source_added(source_id, adapter)
             except Exception:
                 logger.exception(
                     "metadata-DB backfill failed for resolved source %s", source_id
@@ -1339,11 +1342,11 @@ class SourceManager:
             self._server.register_source(claim.source_id, adapter)
             registered = True
 
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_added(claim.source_id, adapter)
+            # Raises on failure -> the except below rolls back register_source,
+            # so a catalog write error never leaves a source visible in
+            # ListFlights but absent from DuckDB.
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_added(claim.source_id, adapter)
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
             logger.info(f"Registered source with server: {claim.source_id}")
@@ -1371,11 +1374,8 @@ class SourceManager:
             )
 
         try:
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_removed(source_id)
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_removed(source_id)
         except Exception:
             logger.error(
                 "Rollback failed to remove source %s from metadata DB",
@@ -1390,25 +1390,20 @@ class SourceManager:
             self._path_to_source_id.pop(path, None)
 
     def _unregister_source_claim(self, source_id: str) -> bool:
-        """Remove a source from the server and metadata DB."""
+        """Remove a source from the server and metadata DB.
+
+        A server-unregister failure aborts (returns False, leaving the claim in
+        state for a later retry). A catalog-delete failure does NOT abort: like
+        ``_rollback_source_registration`` the ``sync_source_removed`` call is
+        isolated in its own try/except so the server-side unregister and the
+        ``_path_to_source_id`` cleanup still complete -- a stale path-map entry
+        pointing at an already-unregistered ``source_id`` would otherwise
+        mislead a later re-add/reconcile of the same path. The worst case is a
+        leaked catalog row (logged), matching the remove-site log-and-continue
+        policy and the pre-raise behavior.
+        """
         try:
             self._server.unregister_source(source_id)
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_removed(source_id)
-
-            paths_to_remove = [
-                path
-                for path, sid in self._path_to_source_id.items()
-                if sid == source_id
-            ]
-            for path in paths_to_remove:
-                self._path_to_source_id.pop(path, None)
-
-            logger.info(f"Unregistered source from server: {source_id}")
-            return True
         except Exception as e:
             logger.error(
                 "Failed to unregister source %s: %s",
@@ -1418,6 +1413,25 @@ class SourceManager:
             )
             return False
 
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_removed(source_id)
+            except Exception:
+                logger.error(
+                    "Failed to remove source %s from metadata DB",
+                    source_id,
+                    exc_info=True,
+                )
+
+        paths_to_remove = [
+            path for path, sid in self._path_to_source_id.items() if sid == source_id
+        ]
+        for path in paths_to_remove:
+            self._path_to_source_id.pop(path, None)
+
+        logger.info(f"Unregistered source from server: {source_id}")
+        return True
+
 
 def create_source_manager(
     server: TensorFlightServer,
@@ -1425,6 +1439,7 @@ def create_source_manager(
     watcher: Optional[DirectoryWatcher],
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
+    metadata_db: Optional[MetadataDatabase] = None,
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
     probe_open_files: bool = True,
@@ -1449,6 +1464,8 @@ def create_source_manager(
         watcher: DirectoryWatcher for filesystem events (None for static-only)
         monitored_sources: SourceConfig entries with monitor=True
         static_sources: Explicit SourceConfig entries (monitor=False)
+        metadata_db: MetadataDatabase to keep in sync as sources are added/removed
+            (None when the feature is disabled)
         credentials_config: CredentialsConfig for remote storage authentication
 
     Returns:
@@ -1503,6 +1520,7 @@ def create_source_manager(
         discovery_state=discovery_state,
         watcher=watcher,
         monitored_dirs=monitored_dirs,
+        metadata_db=metadata_db,
         dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
         credentials_config=credentials_config,
         stability_window=stability_window,

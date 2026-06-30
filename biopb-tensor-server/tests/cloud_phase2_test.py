@@ -437,6 +437,7 @@ def _make_manager(server, cloud_roots=None, monitored=None):
 
     return SourceManager(
         server=server,
+        metadata_db=server._metadata_db,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
         watcher=None,

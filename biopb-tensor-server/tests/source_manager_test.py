@@ -136,6 +136,15 @@ class _RegistryWithFlakyAdapter(_FakeRegistry):
         return None
 
 
+def _make_manager(server, **kwargs):
+    """Construct a SourceManager wired to the fake server's metadata DB.
+
+    Centralizes the ``metadata_db=server._metadata_db`` injection so individual
+    tests don't repeat it; all other SourceManager kwargs pass straight through.
+    """
+    return SourceManager(server=server, metadata_db=server._metadata_db, **kwargs)
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
@@ -146,8 +155,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -175,8 +184,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -207,8 +216,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -249,8 +258,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -290,8 +299,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -324,8 +333,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -380,8 +389,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -419,8 +428,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -443,8 +452,8 @@ class TestSourceManagerRegressions:
         data_path.write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -472,8 +481,8 @@ class TestSourceManagerRegressions:
         data_path.write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -500,8 +509,8 @@ class TestSourceManagerRegressions:
         data_path.write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -537,8 +546,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -575,8 +584,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -622,8 +631,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -684,8 +693,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -769,8 +778,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -837,8 +846,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -874,8 +883,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_RegistryWithFailingAdapter(),
             discovery_state=state,
             watcher=None,
@@ -901,8 +910,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -946,8 +955,8 @@ class TestSourceManagerRegressions:
         server = _FakeServer()
         server._metadata_db = _FailingMetadataDb(fail_add=True)
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -971,8 +980,8 @@ class TestSourceManagerRegressions:
 
         server = _FailingUnregisterServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -992,6 +1001,47 @@ class TestSourceManagerRegressions:
         assert manager._commit_remove_source(claim.source_id) is False
         assert claim.source_id in state.claims
 
+    def test_unregister_source_claim_completes_when_metadata_remove_fails(
+        self, tmp_path
+    ):
+        """A catalog-delete failure must not skip the server-unregister or the
+        _path_to_source_id cleanup (issue #223 follow-up). The removal still
+        completes; only the leaked catalog row is logged.
+        """
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        server._metadata_db = _FailingMetadataDb(fail_remove=True)
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        claim = SourceClaim(
+            source_type="fake",
+            primary_path=str(data_path.resolve()),
+            source_id=generate_source_id(str(data_path.resolve()), "fake"),
+            member_paths={str(data_path.resolve())},
+        )
+        assert manager._commit_add_claim(claim) is True
+        assert claim.primary_path in manager._path_to_source_id
+
+        # The catalog DELETE raises, but the removal still completes.
+        assert manager._commit_remove_source(claim.source_id) is True
+        assert server.unregistered == [claim.source_id]
+        # Path map cleaned -- no stale entry to mislead a later re-add/reconcile.
+        assert claim.primary_path not in manager._path_to_source_id
+        assert claim.source_id not in state.claims
+
     def test_reconcile_changed_source_removes_old_source_when_readd_fails(
         self, tmp_path
     ):
@@ -1002,8 +1052,8 @@ class TestSourceManagerRegressions:
 
         server = _FakeServer()
         state = DiscoveryState()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=state,
             watcher=None,
@@ -1038,8 +1088,8 @@ class TestSourceManagerRegressions:
 
         server = _FailingUnregisterServer()
         server._metadata_db = _FailingMetadataDb(fail_remove=True)
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -1060,8 +1110,8 @@ class TestSourceManagerRegressions:
         data_path.write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -1101,8 +1151,8 @@ class TestSourceManagerRegressions:
         data_path.write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -1144,8 +1194,8 @@ class TestSourceManagerRegressions:
 
 def _make_signature_manager(monitored_dirs):
     """A SourceManager wired only enough to exercise the signature scan."""
-    return SourceManager(
-        server=_FakeServer(),
+    return _make_manager(
+        _FakeServer(),
         registry=_FakeRegistry(),
         discovery_state=DiscoveryState(),
         watcher=None,
@@ -1442,8 +1492,8 @@ class TestProgressiveDiscoveryFreshness:
         (monitored_dir / "sample.dat").write_text("hello")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -1523,8 +1573,8 @@ class TestProgressiveStreaming:
             (monitored_dir / f"s{i}.dat").write_text(f"data{i}")
 
         server = _FakeServer()
-        manager = SourceManager(
-            server=server,
+        manager = _make_manager(
+            server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
             watcher=None,
@@ -1635,3 +1685,74 @@ class TestProgressiveStreaming:
                 break
             manager._handle_rescan()
         assert len(server.registered) == 1
+
+
+class _CatalogStubAdapter:
+    """Adapter whose descriptor/metadata the real MetadataDatabase can index.
+
+    Unlike _FakeAdapter (returns a bare dict), this implements the
+    get_source_descriptor()/get_metadata() surface that
+    MetadataDatabase.sync_source_added reads, so a static source can flow
+    through the real registration + catalog-sync path.
+    """
+
+    def __init__(self, source_id, source_url):
+        self._source_id = source_id
+        self._source_url = source_url
+
+    @classmethod
+    def create_from_config(cls, source_config, credentials_config=None):
+        return cls(source_config.source_id, source_config.url)
+
+    def get_source_descriptor(self):
+        from biopb.tensor.descriptor_pb2 import (
+            DataSourceDescriptor,
+            TensorDescriptor,
+        )
+
+        return DataSourceDescriptor(
+            source_id=self._source_id,
+            source_url=self._source_url,
+            source_type="zarr",
+            data_resident=True,
+            tensors=[
+                TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")
+            ],
+        )
+
+    def get_metadata(self):
+        return {}
+
+
+class _CatalogStubRegistry(_FakeRegistry):
+    def get_adapter_for_type(self, source_type):
+        return _CatalogStubAdapter
+
+
+class TestStaticCatalogSeeding:
+    """Guard for issue #223 item 1: static sources populate the metadata DB via
+    the normal registration path, so the vestigial initial_sync is unnecessary.
+    """
+
+    def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
+        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.metadata_db import MetadataDatabase
+        from biopb_tensor_server.source_manager import create_source_manager
+
+        db = MetadataDatabase(enabled=True)
+        server = _FakeServer()
+        static = SourceConfig(url=str(tmp_path / "plate.zarr"), type="zarr")
+
+        manager = create_source_manager(
+            server=server,
+            registry=_CatalogStubRegistry(),
+            watcher=None,
+            static_sources=[static],
+            metadata_db=db,
+        )
+
+        assert manager is not None
+        # No initial_sync was called -- the catalog is already populated.
+        rows = db._get_connection().execute("SELECT source_id FROM sources").fetchall()
+        assert [r[0] for r in rows] == [static.source_id]
+        assert server.registered == [static.source_id]
