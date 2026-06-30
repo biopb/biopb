@@ -308,10 +308,21 @@ if not isinstance(data, dict):
 # A fresh config ships the installer defaults; an existing one keeps whatever
 # server/cache/... values it already had. `metadata_db.enabled` is intentionally
 # omitted -- the DB is on by default and the flag is deprecated (biopb/biopb#225).
+# When migrating a prior config that still carries the flag, strip the noisy
+# `enabled = true` form (it's the default) so the server doesn't warn on every
+# startup. `enabled = false` is a deliberate user choice (read-only mount, disk
+# constraints, etc.) -- preserve it; the deprecation warning on startup is the
+# intended informational signal, and Phase 4 is the single hard cutover.
 data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
                            "aggressive_dir_pruning": True})
 data.setdefault("cache", {"backend": "file", "file_max_segment_mb": 256,
                           "file_max_total_gb": 128})
+md = data.pop("metadata_db", None)
+if isinstance(md, dict):
+    if md.get("enabled", True):
+        md.pop("enabled", None)
+    if md:
+        data["metadata_db"] = md
 # Point the server at exactly one watched folder, replacing any prior sources.
 data["sources"] = [{"url": data_dir, "monitor": True}]
 

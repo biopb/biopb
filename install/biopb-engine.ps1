@@ -242,6 +242,26 @@ function Write-ServerConfig {
         $data | Add-Member -NotePropertyName sources -NotePropertyValue $sources -Force
     }
 
+    # Strip the noisy `metadata_db.enabled = true` (the default) if a prior
+    # config carried it, mirroring the fresh-template skip -- the DB is on by
+    # default and the flag warns on every startup. `enabled = false` is a
+    # deliberate user choice (read-only mount, disk constraints, etc.) -- preserve
+    # it; the deprecation warning on startup is the intended signal, and Phase 4
+    # is the single hard cutover.
+    if ($data.PSObject.Properties.Name -contains 'metadata_db') {
+        $md = $data.metadata_db
+        if ($null -ne $md -and $md.PSObject.Properties.Name -contains 'enabled') {
+            if ($md.enabled -ne $false) {
+                $remaining = @($md.PSObject.Properties.Name)
+                if ($remaining.Count -le 1) {
+                    $data.PSObject.Properties.Remove('metadata_db')
+                } else {
+                    $md.PSObject.Properties.Remove('enabled')
+                }
+            }
+        }
+    }
+
     Set-FileUtf8NoBom -Path $Path -Content ($data | ConvertTo-Json -Depth 20)
 }
 
