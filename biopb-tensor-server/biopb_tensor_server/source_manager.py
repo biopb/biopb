@@ -717,15 +717,15 @@ class SourceManager:
         already covered by the `not pending_scan` clause in the prune gate, so it
         is skipped here.
         """
-        root_path = Path(root_path_str)
+        # String-prefix, not Path(cached_path).is_relative_to(root_path): same
+        # per-entry pathlib-parse cost as _copy_cached_subtree_entries, on the
+        # same large carried-forward entry set. Keys are resolved path strings.
+        prefix = root_path_str + os.sep
         for cached_path, pending in self._entry_pending_scan.items():
             if not pending or cached_path == root_path_str:
                 continue
-            try:
-                if Path(cached_path).is_relative_to(root_path):
-                    return True
-            except OSError:
-                continue
+            if cached_path.startswith(prefix):
+                return True
         return False
 
     def _copy_cached_subtree_entries(
@@ -735,23 +735,34 @@ class SourceManager:
         next_stable_observations: Dict[str, int],
         next_pending_scan: Dict[str, bool],
     ) -> None:
-        """Carry forward cached descendants when a stable subtree is skipped."""
-        root_path = Path(root_path_str)
+        """Carry forward cached descendants when a stable subtree is skipped.
+
+        Hot path: this runs every rescan for each skipped (stable **or cloud**)
+        root and scans the entire cached entry set. Match descendants with a
+        string-prefix test, not ``Path(cached_path).is_relative_to(root_path)``:
+        the latter parses a pathlib ``Path`` per entry, and on a large cloud
+        catalog (tens of thousands of carried-forward entries, walked only hourly
+        but *re-copied* on every 30 s incremental) that per-entry parsing was the
+        single dominant cost of the rescan thread -- it held the GIL for tens of
+        seconds and starved the Flight serving threads, stalling reads
+        (biopb/biopb). Entry keys are resolved path strings produced by the same
+        walk, so a prefix test is exact; this mirrors the string-prefix prune the
+        claim phase already uses (``discover_sources_from_entries._under``).
+        """
+        prefix = root_path_str + os.sep
         for cached_path, entry in self._entry_state.items():
             if cached_path == root_path_str or cached_path in next_state:
                 continue
-            try:
-                if Path(cached_path).is_relative_to(root_path):
-                    next_state[cached_path] = entry
-                    next_stable_observations[cached_path] = (
-                        self._entry_stable_observations.get(cached_path, 0)
-                    )
-                    next_pending_scan[cached_path] = self._entry_pending_scan.get(
-                        cached_path,
-                        False,
-                    )
-            except OSError:
+            if not cached_path.startswith(prefix):
                 continue
+            next_state[cached_path] = entry
+            next_stable_observations[cached_path] = self._entry_stable_observations.get(
+                cached_path, 0
+            )
+            next_pending_scan[cached_path] = self._entry_pending_scan.get(
+                cached_path,
+                False,
+            )
 
     def _should_force_full_rescan(self) -> bool:
         """Return True when a full tree walk should bypass subtree pruning."""

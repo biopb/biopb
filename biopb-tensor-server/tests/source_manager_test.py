@@ -1756,3 +1756,74 @@ class TestStaticCatalogSeeding:
         rows = db._get_connection().execute("SELECT source_id FROM sources").fetchall()
         assert [r[0] for r in rows] == [static.source_id]
         assert server.registered == [static.source_id]
+
+
+class TestRescanCarryForwardPrefix:
+    """The per-rescan carry-forward and pending-scan scans match descendants by an
+    exact path-prefix (``root + os.sep``) over the cached entry set -- not a
+    pathlib ``Path(cached_path).is_relative_to(root)`` per entry. The pathlib
+    variant parsed a ``Path`` for every one of (potentially tens of thousands of)
+    carried-forward cloud entries on every 30s incremental rescan, holding the GIL
+    and stalling reads (biopb/biopb). These pin the cheap-string behavior and the
+    exact-prefix boundary a bare ``startswith(root)`` would get wrong.
+    """
+
+    def _manager(self, tmp_path):
+        return SourceManager(
+            server=_FakeServer(),
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs={tmp_path / "data"},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+    def test_copy_cached_subtree_entries_matches_exact_prefix(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        root = str(tmp_path / "data")
+        child = str(tmp_path / "data" / "sub" / "f.tif")
+        deep = str(tmp_path / "data" / "a.tif")
+        # Sibling sharing the *string* prefix "data" but NOT under "data/" -- the
+        # case a bare startswith(root) (no separator) would wrongly include.
+        decoy = str(tmp_path / "data_backup" / "x.tif")
+        unrelated = str(tmp_path / "other" / "y.tif")
+        sig = (False, (0, 0), 0.0)
+        mgr._entry_state = {
+            root: (True, (0, 0), 0.0),
+            child: sig,
+            deep: sig,
+            decoy: sig,
+            unrelated: sig,
+        }
+        mgr._entry_stable_observations = {child: 3, deep: 2}
+        mgr._entry_pending_scan = {child: True}
+
+        next_state = {root: (True, (0, 0), 0.0)}  # root already recorded by the walk
+        nso: dict = {}
+        nps: dict = {}
+        mgr._copy_cached_subtree_entries(root, next_state, nso, nps)
+
+        assert set(next_state) - {root} == {child, deep}
+        assert decoy not in next_state  # exact-prefix guard (root + os.sep)
+        assert unrelated not in next_state
+        assert nso == {child: 3, deep: 2}
+        assert nps[child] is True
+        assert nps[deep] is False  # default when no pending record exists
+
+    def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        root = str(tmp_path / "data")
+
+        # bare-prefix sibling must not count
+        mgr._entry_pending_scan = {str(tmp_path / "data_backup" / "x.tif"): True}
+        assert mgr._subtree_has_pending_scan(root) is False
+        # a real pending descendant counts
+        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): True}
+        assert mgr._subtree_has_pending_scan(root) is True
+        # the root's own pending flag does not count (the prune gate handles it)
+        mgr._entry_pending_scan = {root: True}
+        assert mgr._subtree_has_pending_scan(root) is False
+        # a non-pending descendant does not count
+        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): False}
+        assert mgr._subtree_has_pending_scan(root) is False
