@@ -360,6 +360,11 @@ def create_app(
     _client_lock = threading.Lock()
     _client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
 
+    # Latches once POST /api/admin/restart spawns the detached restart child, so a
+    # rapid second request can't spawn a competing `biopb server restart` that
+    # would race on the PID file / port (biopb/biopb#237).
+    _restart_state: Dict[str, bool] = {"in_progress": False}
+
     diag = _DiagnosticsState()
 
     def _get_client() -> TensorFlightClient:
@@ -1286,7 +1291,10 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail="This server has no config path"
             )
-        from biopb_tensor_server.config import _read_config_file
+        from biopb_tensor_server.config import (
+            _read_config_file,
+            redact_config_secrets,
+        )
         from biopb_tensor_server.config_schema import build_config_schema
 
         p = Path(config_path)
@@ -1298,8 +1306,14 @@ def create_app(
                 raise HTTPException(
                     status_code=500, detail=f"Config on disk is unreadable: {e}"
                 )
+        # Mask credential secrets so they never reach the browser; the PUT route
+        # restores them from disk (biopb/biopb#237).
         return JSONResponse(
-            {"path": str(p), "config": raw, "schema": build_config_schema()}
+            {
+                "path": str(p),
+                "config": redact_config_secrets(raw),
+                "schema": build_config_schema(),
+            }
         )
 
     @app.put("/api/config")
@@ -1323,8 +1337,24 @@ def create_app(
 
         from jsonschema import Draft202012Validator
 
-        from biopb_tensor_server.config import save_config
+        from biopb_tensor_server.config import (
+            _read_config_file,
+            restore_redacted_secrets,
+            save_config,
+        )
         from biopb_tensor_server.config_schema import build_config_schema
+
+        # The form round-trips redacted secrets back as a sentinel; resolve those
+        # from the on-disk config so a save never clobbers a real credential with
+        # the mask (biopb/biopb#237).
+        existing: Dict[str, Any] = {}
+        cfg_file = Path(config_path)
+        if cfg_file.exists():
+            try:
+                existing = _read_config_file(cfg_file)
+            except ValueError:
+                existing = {}
+        body = restore_redacted_secrets(body, existing)
 
         validator = Draft202012Validator(build_config_schema())
         errors = [
@@ -1377,6 +1407,15 @@ def create_app(
     async def admin_restart(request: Request) -> JSONResponse:
         _check_token(request)
         _require_same_origin(request)
+        # Refuse a second restart while one is already underway (e.g. a
+        # double-click): two `biopb server restart` children would race on the
+        # PID file and the freed port. This async handler has no await before the
+        # latch, so the check-and-set is atomic on the event loop.
+        if _restart_state["in_progress"]:
+            raise HTTPException(
+                status_code=409, detail="A restart is already in progress"
+            )
+        _restart_state["in_progress"] = True
         import subprocess
 
         from biopb.cli import _detach_kwargs
@@ -1407,6 +1446,8 @@ def create_app(
         try:
             subprocess.Popen(cmd, env=env, **_detach_kwargs())
         except Exception as e:
+            # Spawn failed: nothing is bouncing, so clear the latch to allow retry.
+            _restart_state["in_progress"] = False
             raise HTTPException(status_code=500, detail=f"Could not spawn restart: {e}")
         return JSONResponse(status_code=202, content={"restarting": True})
 
