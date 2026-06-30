@@ -106,29 +106,46 @@ are JSON-native; old TOML installs keep working until they next change folders.
 
 ## JSON Schema emitter (done)
 
-`biopb_tensor_server.config_schema.build_config_schema()` projects the same
-`_CONSTRAINTS` table as a Draft 2020-12 JSON Schema for the **on-disk** config,
-so the value bounds and enums in the schema match exactly what the server
-enforces at startup — one definition, no drift. Bounds/enums come straight from
-the `_Range`/`_Enum` objects (each grew a `to_json_schema()`), types from the
-config dataclasses; the only declarative piece is `_ONDISK_OVERRIDES`, the few
-fields whose wire form differs from the dataclass (`[compute]` is read into
-`ServerConfig`; `cache.*_mb`/`*_gb` convert to byte fields). Sections keep
-`additionalProperties: true`, so the schema enforces the dangerous values #34
-exists to catch and documents them for autocomplete without being a closed
+`biopb_tensor_server.config_schema.build_config_schema()` projects the config
+dataclasses + the `_CONSTRAINTS` table as a Draft 2020-12 JSON Schema for the
+**on-disk** config, so the key set and value bounds in the schema match exactly
+what the server reads and enforces at startup — one definition, no drift. The
+key set + types come from the dataclasses (introspected, routed to their on-disk
+section), bounds/enums from the `_Range`/`_Enum` objects (each grew a
+`to_json_schema()`). Two small declarative pieces remain: `_ONDISK_OVERRIDES`
+(the few fields whose wire form differs — `[compute]` is read into `ServerConfig`;
+`cache.*_mb`/`*_gb` convert to byte fields) and `_DEPRECATED_ALIASES` (legacy
+keys the parser still accepts but that aren't dataclass fields: `watcher_type`/
+`poll_interval`, source `path`, the pyramid knobs under `[precache]`, plus the
+deprecated `metadata_db.enabled`). Sections keep `additionalProperties: true`, so
+the schema enforces the dangerous values #34 exists to catch and documents every
+known key (deprecated ones flagged `deprecated: true`) without being a closed
 dictionary.
 
 Case-insensitive enums (`log_level`, `reduction_method`) emit **no** hard
 `enum` — the server folds case, so a canonical-set enum would reject values it
 accepts — and instead carry the accepted set in the property `description`.
 
+**Subsumes the unknown-key warning (#234).** That feature warned on unrecognized
+config keys (the silent drop-to-default trap, e.g. `[cache] memory_max_entries`
+instead of `max_entries`) from three hardcoded `_KNOWN_*` tables — a second
+source of truth parallel to `_CONSTRAINTS`, the exact drift this work removes.
+`config._warn_unknown_config_keys` now derives its known-section / known-key sets
+by walking `build_config_schema()`'s properties (`config_schema.known_config_keys`),
+and those three tables are deleted. Runtime behavior is unchanged (warn-only,
+same messages, legacy aliases stay quiet); the schema is simply the single source
+for the key set too. The published schema stays `additionalProperties: true` —
+editor autocomplete shouldn't error on unknown keys during the migration window —
+while the server emits the warnings.
+
 Emit it with `biopb-tensor-server config-schema [-o file.json]`. Reference the
 saved file from a config via `"$schema"` for editor autocomplete, or feed it to
-any JSON Schema validator for pre-flight checks. A drift-guard test
-(`tests/config_schema_test.py`) asserts every `_CONSTRAINTS` entry is reflected
-in the schema and that it accepts the installer default while rejecting each
-known-bad value (`downscale_factor` 0/1, `pixel_budget_cubic_root` 0,
-out-of-range `port`, bad `backend`, `backlog_high_water > 1`, …).
+any JSON Schema validator for pre-flight checks. Drift-guard tests
+(`tests/config_schema_test.py`) assert every `_CONSTRAINTS` entry **and** every
+scalar dataclass field is reflected in the schema, that the runtime warning uses
+the schema-derived sets, and that the schema accepts the installer default while
+rejecting each known-bad value (`downscale_factor` 0/1, `pixel_budget_cubic_root`
+0, out-of-range `port`, bad `backend`, `backlog_high_water > 1`, …).
 
 ## Deferred
 

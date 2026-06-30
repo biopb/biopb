@@ -6,14 +6,28 @@ the server enforces at startup must be reflected in the schema, and the schema
 must accept what the server accepts and reject what the server rejects.
 """
 
+import dataclasses
+
 import jsonschema
 import pytest
-from biopb_tensor_server.config import _CONSTRAINTS, _Enum, _Range
+from biopb_tensor_server.config import (
+    _CONSTRAINTS,
+    CacheConfig,
+    MetadataDbConfig,
+    PrecacheConfig,
+    PyramidConfig,
+    ServerConfig,
+    SourceConfig,
+    _Enum,
+    _Range,
+)
 from biopb_tensor_server.config_schema import (
     build_config_schema,
     constrained_ondisk_keys,
+    known_config_keys,
     ondisk_location,
 )
+from biopb_tensor_server.remote import CredentialProfile
 from jsonschema import Draft202012Validator
 
 
@@ -152,3 +166,73 @@ def test_schema_matches_dataclass_validation_on_known_bad():
 def test_jsonschema_importable():
     """The schema test relies on jsonschema being in the [test] extra."""
     assert jsonschema.__name__ == "jsonschema"
+
+
+# --- known-key set (the schema is now also the source for #234's warning) -----
+
+
+def _public_scalar_fields(cls):
+    """Public dataclass fields that are scalar config keys (not nested
+    sections / source lists)."""
+    inst = cls()
+    out = []
+    for f in dataclasses.fields(cls):
+        if f.name.startswith("_"):
+            continue
+        value = getattr(inst, f.name)
+        if dataclasses.is_dataclass(value) or isinstance(value, list):
+            continue
+        out.append(f.name)
+    return out
+
+
+@pytest.mark.parametrize(
+    "cls", [ServerConfig, CacheConfig, PyramidConfig, PrecacheConfig, MetadataDbConfig]
+)
+def test_known_keys_cover_every_dataclass_field(schema, cls):
+    """Drift guard for the key set: every scalar field the parser can read is a
+    schema property under its on-disk section, so the runtime warning (derived
+    from the schema) never mis-warns on a valid key."""
+    _, section_keys, _, _ = known_config_keys(schema)
+    for field in _public_scalar_fields(cls):
+        section, key = ondisk_location(cls.__name__, field)
+        assert key in section_keys.get(section, set()), (
+            f"{cls.__name__}.{field} -> [{section}].{key} missing from schema"
+        )
+
+
+def test_source_keys_cover_sourceconfig_fields(schema):
+    _, _, source_keys, _ = known_config_keys(schema)
+    for f in dataclasses.fields(SourceConfig):
+        if f.name.startswith("_"):
+            continue
+        assert f.name in source_keys, f"source field {f.name} missing from schema"
+    assert "path" in source_keys  # deprecated alias declared
+
+
+def test_profile_keys_match_credentialprofile(schema):
+    _, _, _, profile_keys = known_config_keys(schema)
+    expected = {f.name for f in dataclasses.fields(CredentialProfile)}
+    assert profile_keys == expected
+
+
+def test_legacy_aliases_present_and_marked_deprecated(schema):
+    """The aliases #234 accepted silently are now declared (and deprecated) so
+    the schema documents them and the warning stays quiet on back-compat configs."""
+    server = _section_props(schema, "server")
+    assert server["watcher_type"]["deprecated"] is True
+    assert server["poll_interval"]["deprecated"] is True
+    precache = _section_props(schema, "precache")
+    assert precache["downscale_factor"]["deprecated"] is True
+    # the back-compat pyramid knob keeps its bound under [precache] too
+    assert precache["downscale_factor"]["minimum"] == 2
+    assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
+    assert _section_props(schema, "metadata_db")["enabled"]["deprecated"] is True
+
+
+def test_runtime_warning_uses_schema_keys():
+    """config._warn_unknown_config_keys derives its sets from the schema."""
+    from biopb_tensor_server.config import _known_config_keys
+
+    sections, section_keys, source_keys, profile_keys = _known_config_keys()
+    assert (sections, section_keys, source_keys, profile_keys) == known_config_keys()
