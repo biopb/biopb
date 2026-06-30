@@ -152,7 +152,11 @@ rejecting each known-bad value (`downscale_factor` 0/1, `pixel_budget_cubic_root
 - **Embed `$schema` in generated configs.** Have the installer write a
   `"$schema"` pointer (needs the schema hosted at a stable URL, e.g. the `$id`
   `https://biopb.org/schemas/tensor-server-config.json`) so editors validate
-  out of the box.
+  out of the box. **Resolution path:** the planned `save_config` writer
+  (`docs/tensor-server-admin-endpoint.md`) drops a sibling `biopb.schema.json`
+  and embeds a **relative** `"$schema": "./biopb.schema.json"`, giving editor
+  auto-validation offline with **no hosting dependency**; switch the pointer to
+  the hosted `$id` URL once it is published.
 - **End state.** Drop the `.toml` read path and flip validation warn → raise.
 
 ## Sequencing (from #34)

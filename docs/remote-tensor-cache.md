@@ -511,6 +511,14 @@ dock widget as the v1 surface** (it is what the napari user lost), with the
 editing backend in `biopb` root so a web `/api/config` page can be a second
 frontend later. See [§10](#10-open-questions--follow-ups).
 
+> **Resolved → web app.** This decision has since been taken the *other* way: the
+> **web-app surface is v1** (`GET`/`PUT /api/config` + `GET /api/admin/status` +
+> `POST /api/admin/restart` on the existing `:8814` sidecar), with napari
+> integration reduced to a single "open admin" browser action rather than a Qt
+> form. The detailed design — routes, the detached-`biopb server restart`
+> self-restart, `save_config`, the same-origin auth guard, and the post-restart
+> scan-progress UX — lives in **`docs/tensor-server-admin-endpoint.md`**.
+
 ---
 
 ## 9. Relationship to `#178`
