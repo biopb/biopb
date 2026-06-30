@@ -155,3 +155,74 @@ def test_strict_mode_raises(monkeypatch):
 def test_strict_mode_allows_valid(monkeypatch):
     monkeypatch.setattr(cfg, "_STRICT_VALIDATION", True)
     ServerConfig()  # no raise
+
+
+# --- unknown-key warnings (the silent drop-to-default trap) ------------------
+
+
+def _unknown(caplog):
+    return [m for m in caplog.messages if m.startswith("Unknown config ")]
+
+
+def test_misnamed_cache_key_warns_naming_the_right_key(caplog):
+    # The reported trap: the dataclass field name `memory_max_entries` instead
+    # of the file key `max_entries` -> silently keeps the default. Must warn and
+    # point at the real key.
+    with caplog.at_level(logging.WARNING):
+        cfgobj = parse_config(
+            {"cache": {"backend": "memory", "memory_max_entries": 1, "max_bytes": 1}}
+        )
+    msgs = _unknown(caplog)
+    assert any("memory_max_entries" in m and "[cache]" in m for m in msgs)
+    # The warning lists the accepted keys so the fix is discoverable.
+    assert any("max_entries" in m and "max_bytes" in m for m in msgs)
+    # The recognized key still took effect; the bogus one was ignored.
+    assert cfgobj.cache.memory_max_bytes == 1
+    assert cfgobj.cache.memory_max_entries == 1024  # default (key was dropped)
+
+
+def test_unknown_top_level_section_warns(caplog):
+    with caplog.at_level(logging.WARNING):
+        parse_config({"kache": {"backend": "memory"}})
+    assert any(
+        "[kache]" in m and "Unknown config section" in m for m in _unknown(caplog)
+    )
+
+
+def test_unknown_keys_in_sources_and_profiles_warn(caplog):
+    with caplog.at_level(logging.WARNING):
+        parse_config(
+            {
+                "sources": [{"url": "/data/a.zarr", "kloud": True}],
+                "credentials": {
+                    "profiles": [{"name": "p", "storage_type": "s3", "secrt": "x"}]
+                },
+            }
+        )
+    joined = "\n".join(_unknown(caplog))
+    assert "kloud" in joined and "[sources]" in joined
+    assert "secrt" in joined and "[credentials.profiles]" in joined
+
+
+def test_valid_config_does_not_warn_unknown(caplog):
+    # A full config of legitimate keys -- including legacy aliases -- stays quiet.
+    with caplog.at_level(logging.WARNING):
+        parse_config(
+            {
+                "server": {
+                    "host": "127.0.0.1",
+                    "port": 8815,
+                    "watcher_type": "off",  # legacy alias
+                    "poll_interval": 15.0,  # legacy alias
+                    "aggressive_dir_pruning": True,
+                },
+                "cache": {"backend": "memory", "max_entries": 1, "max_bytes": 1},
+                "precache": {
+                    "enabled": True,
+                    "downscale_factor": 4,
+                },  # back-compat knob
+                "metadata_db": {"max_query_results": 100},
+                "sources": [{"path": "/data/a.zarr", "cloud": True}],  # legacy `path`
+            }
+        )
+    assert not _unknown(caplog)
