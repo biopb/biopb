@@ -107,8 +107,9 @@ their `source_id`s cannot collide with each other or with the local sources (see
   carries (see [§3](#3-catalog-mirroring--expansion)).
 - **`alias`** (optional, slash-free) — the namespace prefix applied to this
   upstream's mirrored `source_id`s. Optional for a lone upstream with no name
-  clashes; **required** when a collision is detected (multiple upstreams, or a
-  local source sharing an id) — registration fails with a message naming the fix.
+  clashes; **recommended** when a collision is possible (multiple upstreams, or a
+  local source sharing an id) — a collider is dropped (first wins) and warned, not
+  fatal, so set an `alias` to keep the shadowed source.
 - **`grpc+tls://`** is recognized identically (TLS upstream).
 
 ### Scheme / type plumbing (small, mechanical)
@@ -285,10 +286,12 @@ multiplexing layer.
 
 **Collision check at registration.** `register_source` rejects a duplicate local
 `source_id`. The expansion runs this check across *all* configured entries
-(every upstream's mirrored ids + the local sources) and, on a clash, fails fast
-with a message naming the offending id and the fix (*"set an `alias` on
-`grpc://…`"*). With distinct aliases the namespaces are disjoint by construction,
-so this only fires on a genuine misconfiguration (two upstreams sharing an alias,
+(every upstream's mirrored ids + the local sources) and, on a clash, **drops the
+colliding entry (keeping the first) and logs a warning** naming the offending id
+and the fix (*"set an `alias` on `grpc://…`"*) — it does **not** abort, so one
+bad source can't take down the whole catalog. With distinct aliases the
+namespaces are disjoint by construction, so this only fires on a genuine
+misconfiguration (two upstreams sharing an alias,
 or a local source literally named `<alias>__…`).
 
 **Refresh (follow-up).** The upstream catalog can change. v1 mirrors **once at
@@ -395,8 +398,9 @@ own surfaces:
 > bare-host `grpc://host:port` form connects (`TensorFlightClient(cache_bytes=0,
 > token)`), `list_sources()`, and yields one concrete single-source `SourceConfig`
 > per upstream source. `resolve_all_sources` threads `config.credentials` through
-> and runs `_check_tensor_server_id_collisions` over the flattened set — a
-> source_id clash involving a proxy fails fast naming the `alias` fix (non-proxy
+> and runs `_resolve_tensor_server_id_collisions` over the flattened set — a
+> source_id clash involving a proxy **drops the collider (first wins) and warns**
+> rather than aborting, so one bad source can't take down the catalog (non-proxy
 > clashes keep historical last-wins). Per-upstream tokens reach the adapter because
 > the static-seed `SourceClaim.extra_config` now carries `credentials_profile` and
 > `_register_source_claim` rebuilds it onto the `SourceConfig` (it was previously

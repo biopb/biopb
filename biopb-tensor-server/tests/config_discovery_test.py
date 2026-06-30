@@ -414,12 +414,14 @@ class TestTensorServerSourceType:
         assert _namespaced_source_id("lab", "img") == "lab__img"
         assert _namespaced_source_id(None, "img") == "img"
 
-    def test_alias_clash_collision_raises(self):
-        import pytest
+    def test_alias_clash_collision_is_tolerated(self, caplog):
+        import logging
+
         from biopb_tensor_server.config import parse_config, resolve_all_sources
 
         # Two upstreams sharing alias "lab", each mirroring a same-named source
-        # -> both namespace to "lab__img": a flat-catalog collision.
+        # -> both namespace to "lab__img": a flat-catalog collision. It must NOT
+        # abort the whole resolve -- the first wins, the collider is dropped+warned.
         cfg = parse_config(
             {
                 "sources": [
@@ -428,8 +430,28 @@ class TestTensorServerSourceType:
                 ]
             }
         )
-        with pytest.raises(ValueError, match="Duplicate source_id 'lab__img'"):
-            resolve_all_sources(cfg)
+        with caplog.at_level(logging.WARNING):
+            resolved = resolve_all_sources(cfg)
+        # one survivor (the first), not an exception
+        assert [s.source_id for s in resolved] == ["lab__img"]
+        assert resolved[0].url == "grpc://a:8815/img"
+        assert any("lab__img" in r.message for r in caplog.records)
+
+    def test_collision_does_not_drop_unrelated_sources(self):
+        # a colliding pair must not take down the OTHER, valid sources
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "lab"},  # collides -> dropped
+                    {"url": "grpc://c:8815/other", "alias": "arc"},  # unrelated
+                ]
+            }
+        )
+        ids = [s.source_id for s in resolve_all_sources(cfg)]
+        assert ids == ["lab__img", "arc__other"]
 
     def test_distinct_aliases_do_not_collide(self):
         from biopb_tensor_server.config import parse_config, resolve_all_sources

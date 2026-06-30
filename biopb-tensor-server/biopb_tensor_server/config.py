@@ -1501,23 +1501,37 @@ def _discover_tensor_server(
     return expanded
 
 
-def _check_tensor_server_id_collisions(sources: List[SourceConfig]) -> None:
-    """Raise if a tensor-server source_id collides with any other source.
+def _resolve_tensor_server_id_collisions(
+    sources: List[SourceConfig],
+) -> List[SourceConfig]:
+    """Drop -- don't abort on -- source_id collisions involving a tensor-server proxy.
 
-    With distinct aliases the namespaces are disjoint by construction, so this
-    only fires on a genuine misconfiguration. The message names the offending id
-    and the fix.
+    With distinct aliases the namespaces are disjoint by construction, so a clash
+    is a misconfiguration (two upstreams sharing an alias, or a local source named
+    like a proxied id). A single bad entry must not take down the whole catalog,
+    so keep the first source for each id and skip later colliders, logging the fix
+    (set a distinct alias). Non-proxy collisions are left untouched (the historical
+    last-wins at registration).
     """
-    by_id: Dict[str, SourceConfig] = {}
+    seen: Dict[str, SourceConfig] = {}
+    result: List[SourceConfig] = []
     for src in sources:
-        prior = by_id.get(src.source_id)
+        prior = seen.get(src.source_id)
         if prior is not None and "tensor-server" in (src.type, prior.type):
-            raise ValueError(
-                f"Duplicate source_id {src.source_id!r} from {prior.url} and "
-                f"{src.url}. Set a distinct 'alias' on the conflicting "
-                f"tensor-server entry to namespace its mirrored sources."
+            logger.warning(
+                "Skipping source_id %r from %s (%s): it collides with %s (%s) "
+                "already in the catalog. Set a distinct 'alias' on the conflicting "
+                "tensor-server entry to namespace its mirrored sources.",
+                src.source_id,
+                src.url,
+                src.type,
+                prior.url,
+                prior.type,
             )
-        by_id[src.source_id] = src
+            continue
+        seen.setdefault(src.source_id, src)
+        result.append(src)
+    return result
 
 
 def discover_sources(
@@ -1749,9 +1763,10 @@ def resolve_all_sources(
     # source_id collisions involving a tensor-server proxy are a misconfiguration
     # (two upstreams sharing an alias, or a local source named like a proxied id):
     # the catalog is one flat source_id space, so a clash would silently shadow a
-    # source. Fail fast with the fix (set/disambiguate the alias). Non-proxy
-    # collisions keep the historical last-wins behavior.
-    _check_tensor_server_id_collisions(all_sources)
+    # source. Drop the colliding entry (keeping the first) and warn with the fix --
+    # a single bad source must not abort the whole catalog. Non-proxy collisions
+    # keep the historical last-wins behavior.
+    all_sources = _resolve_tensor_server_id_collisions(all_sources)
 
     # Print warnings for HDF5 files that need explicit dataset
     if hdf5_warnings:
