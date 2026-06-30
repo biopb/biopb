@@ -180,12 +180,20 @@ idle and the kernel-dependent tools funnel through `KernelHost.execute()`, which
 returns a structured not-ready status — `not_started` (idle → call
 `start_kernel`), `error`/`dead` (call `start_kernel` to retry), or `starting` (a
 watchdog respawn in flight, derived from `is_alive() && !ready`). Conversely,
-**closing the napari window tears the kernel back down to idle**: a reverse of
-the parent-death pipe (the kernel holds the write end of a `BIOPB_WINDOW_CLOSE_FD`
-pipe and the bootstrap fires it from the window's `destroyed` signal; a server
-reader thread calls `shutdown()` on the byte). A user-attributed
-`_teardown_reason` is then surfaced via `execute()` / `server_status` so the
-agent learns *why* a running job vanished. Rebuild with `start_kernel`.
+**closing the napari window tears the kernel back down to idle**: on POSIX a
+reverse of the parent-death pipe (the kernel holds the write end of a
+`BIOPB_WINDOW_CLOSE_FD` pipe and the bootstrap fires it from the window's
+`destroyed` signal; a server reader thread calls `shutdown()` on the byte). On
+**Windows** the inherited fd isn't available (no `subprocess` `pass_fds`), so the
+launcher instead **polls** the in-kernel `_viewer_window_alive()` probe on a
+thread (`_poll_window_close`, default every 2 s) and calls the same `shutdown()`
+on a confirmed close. The poll only acts on a clean "window gone" reading from a
+ready, idle kernel — a busy kernel (a job holds the lock), a not-ready kernel, or
+an in-flight stop are skipped — so it never aborts a running job; the trade-off
+vs. the POSIX byte is that a close during a long job is detected on the next idle
+tick rather than immediately. Either way a user-attributed `_teardown_reason` is
+surfaced via `execute()` / `server_status` so the agent learns *why* a running
+job vanished. Rebuild with `start_kernel`.
 
 **Async job model (`_jobs.py`):** `execute_code` runs agent code in a
 **background daemon thread inside the kernel**, so the kernel main thread (and
@@ -220,8 +228,9 @@ output is not captured (code is exec'd, not run via `run_cell`).
   quick call holds the lock). `ensure_started()` is the synchronous, idempotent
   on-demand start (no eager boot); `restart()` releases dask then group-kills and
   respawns (re-running bootstrap, which clears job state). `_watch_window_close`
-  (a reader thread on the inherited window-close pipe) tears the kernel down to
-  idle when the user closes the viewer, recording a `_teardown_reason`.
+  (POSIX: a reader thread on the inherited window-close pipe) / `_poll_window_close`
+  (Windows: a thread polling the `_viewer_window_alive()` probe) tears the kernel
+  down to idle when the user closes the viewer, recording a `_teardown_reason`.
 - `_bootstrap.py` — runs *inside* the kernel via `exec_lines`. Enables `%gui qt`,
   configures dask, constructs the `TensorConnection`, opens the napari viewer +
   Tensor Browser, builds `ops`, installs the job runner (`_jobs.install`) and

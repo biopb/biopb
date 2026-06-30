@@ -31,6 +31,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # close_hook (kept in sync by this comment, like _deathwatch.ENV_FD).
 ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 
+# Windows window-close fallback (no inherited fd there): the launcher polls this
+# probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
+# kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the
+# kernel down when it prints False. The timeout bounds a wedged kernel main
+# thread; the probe itself is instant.
+_WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
+_WINDOW_PROBE_TIMEOUT = 10.0
+
 # Env var carrying the inherited *write* end of the token-report pipe (issue
 # #86). On every successful tensor-server connect the in-kernel bootstrap writes
 # one "url\ttoken\n" line to this fd; the launcher's reader thread caches the
@@ -119,6 +127,7 @@ class KernelHost:
         watchdog_respawn_window: float = 60.0,
         parent_death_pipe: bool = True,
         window_close_pipe: bool = True,
+        window_poll_interval: float = 2.0,
     ):
         self._extra_arguments = list(extra_arguments or [])
         self._kernel_name = kernel_name
@@ -182,6 +191,14 @@ class KernelHost:
         self._window_close_pipe = window_close_pipe and os.name == "posix"
         self._window_r = None
         self._window_thread = None
+        # Windows can't inherit the pipe fd (subprocess has no pass_fds there),
+        # so the window-close -> shutdown feature falls back to polling the
+        # in-kernel _viewer_window_alive() probe on a thread and tearing the
+        # kernel down to idle once the user closes the napari window. Same
+        # feature flag, same teardown path -- only the transport differs by OS.
+        self._window_close_poll = window_close_pipe and os.name == "nt"
+        self._window_poll_interval = window_poll_interval
+        self._window_poll_stop = threading.Event()
         # Token-report pipe (issue #86): the *kernel* holds the write end and
         # writes "url\ttoken" on each successful connect; the launcher holds this
         # read end and a reader thread caches the latest (url, token) so the next
@@ -700,6 +717,10 @@ class KernelHost:
             self._death_w = None
 
     def _close_window_pipe(self):
+        # Signal the Windows poll thread to exit on the next tick (it never
+        # joins, so this is just a flag; no-op on POSIX where the poll is
+        # unused). Cleared again by _start_window_watch on the next launch.
+        self._window_poll_stop.set()
         # Sole closer of the read end (the reader thread never closes it), so a
         # teardown by any path closes it exactly once. The reader thread is a
         # daemon that exits on EOF once the kernel's write end is gone.  Safe to
@@ -731,7 +752,17 @@ class KernelHost:
     # -- window-close watcher -------------------------------------------
 
     def _start_window_watch(self):
-        """Start the window-close reader thread if the pipe is configured."""
+        """Start the window-close watcher: the POSIX pipe reader, or the Windows
+        poll thread, whichever transport is configured. No-op for neither."""
+        if self._window_close_poll:
+            self._window_poll_stop.clear()
+            self._window_thread = threading.Thread(
+                target=self._poll_window_close,
+                name="window-close-poll",
+                daemon=True,
+            )
+            self._window_thread.start()
+            return
         fd = self._window_r
         if fd is None:
             return
@@ -769,6 +800,50 @@ class KernelHost:
             self.shutdown()
         except Exception:
             logger.exception("teardown after window close failed")
+
+    def _poll_window_close(self):
+        """Windows fallback for the POSIX window-close pipe.
+
+        Windows can't inherit the kernel's write-end fd, so instead of a
+        byte-on-close we poll the in-kernel ``_viewer_window_alive()`` probe
+        (injected by the bootstrap) and tear the kernel down to idle once the
+        user closes the napari window. The loop exits on the first teardown or
+        when signalled to stop (a restart/shutdown via _close_window_pipe).
+        """
+        while not self._window_poll_stop.wait(self._window_poll_interval):
+            if self._window_close_tick():
+                return
+
+    def _window_close_tick(self) -> bool:
+        """One window-close poll iteration. Returns True if the window was found
+        closed and the kernel was torn down (the poll loop then exits).
+
+        Acts only on a *positive* "window gone" reading from a healthy, idle
+        kernel. Skipped (return False, retry next tick) when: an intentional
+        stop is in flight; the kernel isn't ready (mid (re)spawn); or the kernel
+        is busy -- a job holds the lock, the window is in use, and we must
+        neither contend with it nor abort it. A busy/timeout/error probe is
+        inconclusive and likewise retried; only a clean ``False`` reading (the
+        Qt window's C++ object is gone) triggers teardown. Unlike the POSIX byte
+        signal, this cannot fire mid-job (the probe can't run while the lock is
+        held) -- the close is detected on the next idle tick instead.
+        """
+        if self._stopping or not self._ready.is_set() or self.is_busy():
+            return False
+        res = self._execute_internal(_WINDOW_ALIVE_PROBE, timeout=_WINDOW_PROBE_TIMEOUT)
+        if res.get("status") != "ok" or res.get("stdout", "").strip() != "False":
+            return False  # alive, or an inconclusive (busy/timeout/error) probe
+        if self._stopping or self._window_poll_stop.is_set():
+            return False  # a concurrent restart/shutdown started -- don't race it
+        self._teardown_reason = (
+            "the user closed the napari viewer window; the kernel was shut "
+            "down and any running job was stopped"
+        )
+        try:
+            self.shutdown()
+        except Exception:
+            logger.exception("teardown after window close failed")
+        return True
 
     # -- token-report watcher (issue #86) -------------------------------
 
