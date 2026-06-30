@@ -349,6 +349,110 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestUnreachableUpstream:
+    """Unresolved/unreachable upstream policy (#178).
+
+    Catalog surface degrades to an empty placeholder (no raise, no startup
+    hard-fail); the serve surface stays live so the source recovers transparently
+    once the upstream is back -- no consented resolve step (a proxy resolve is a
+    cheap reconnect, unlike a cloud download).
+    """
+
+    def _dead_port(self):
+        # Start then immediately stop a server to obtain a now-closed port.
+        from biopb_tensor_server import TensorFlightServer
+
+        s = TensorFlightServer("grpc://localhost:0")
+        port = s.port
+        s.shutdown()
+        return port
+
+    def test_catalog_degrades_to_placeholder_when_unreachable(self):
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{self._dead_port()}",
+            upstream_source_id="img",
+        )
+        # no raise: empty placeholder catalog row, marked non-resident
+        assert adapter.list_tensor_descriptors() == []
+        assert adapter.is_resident() is False
+        desc = adapter.get_source_descriptor()
+        assert list(desc.tensors) == []
+        assert desc.data_resident is False
+
+    def test_serve_surface_still_raises_when_unreachable(self):
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{self._dead_port()}",
+            upstream_source_id="img",
+        )
+        # the serve path must NOT silently degrade -- a missing chunk is an error
+        with pytest.raises(Exception):
+            adapter.get_data(ChunkBounds(start=[0, 0], stop=[8, 8]))
+
+    def test_transparent_recovery_when_upstream_returns(self, simple_zarr_array):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        zarr_path, shape, _ = simple_zarr_array
+        arr = zarr.open_array(zarr_path, mode="r")
+
+        # pick a port, leave it closed, point the adapter at it
+        seed = TensorFlightServer("grpc://localhost:0")
+        port = seed.port
+        seed.shutdown()
+
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{port}",
+            upstream_source_id="img",
+        )
+        assert adapter.list_tensor_descriptors() == []  # down -> placeholder
+
+        # bring an upstream up on that same port; the SAME adapter now serves live
+        upstream = TensorFlightServer(f"grpc://localhost:{port}")
+        upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+        _serve(upstream)
+        try:
+            descs = adapter.list_tensor_descriptors()
+            assert len(descs) == 1
+            assert descs[0].array_id == "lab__img"  # localized
+            assert adapter.is_resident() is True
+            assert tuple(adapter.get_tensor_descriptor().shape) == shape
+        finally:
+            upstream.shutdown()
+
+
+def test_unreachable_sole_monitored_upstream_does_not_block_startup():
+    """A sole bare-host monitor=true upstream that is down at boot must not stop
+    the server starting -- the re-list recovers it once reachable (#178)."""
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.source_manager import create_source_manager
+
+    server = TensorFlightServer("grpc://localhost:0")
+    manager = create_source_manager(
+        server=server,
+        registry=get_default_registry(),
+        watcher=None,
+        static_sources=[],  # expansion of the down upstream yielded nothing
+        monitored_sources=[
+            SourceConfig(url="grpc://localhost:59599", alias="lab", monitor=True)
+        ],
+        metadata_db=None,
+    )
+    assert manager is not None  # would have been None (hard-fail) before the fix
+    assert [u.url for u in manager._monitored_upstreams] == ["grpc://localhost:59599"]
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     """A second resolve_chunk_data for the same chunk is served from the file
     cache without a second upstream fetch -- the proxy inherits the segment cache."""

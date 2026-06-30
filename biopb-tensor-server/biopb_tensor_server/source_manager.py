@@ -1706,10 +1706,6 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
 
-    if not monitored_dirs and not static_sources:
-        logger.warning("No valid sources to serve")
-        return None
-
     # Monitored tensor-server upstreams (bare-host grpc://, monitor=true): their
     # catalog is periodically re-listed and reconciled (biopb/biopb#178). A
     # single-source grpc://host/<id> entry has nothing to re-list, so it is
@@ -1723,6 +1719,14 @@ def create_source_manager(
         and ms.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
         and _split_grpc_url(ms.url)[1] is None
     ]
+
+    # An unreachable monitored upstream contributes no static sources at startup
+    # (its bare-host expansion was skipped), but the re-list will populate it once
+    # it is reachable -- so it counts as "something to serve" and must not let the
+    # server hard-fail to start (#178: require monitor=true for bare-host recovery).
+    if not monitored_dirs and not static_sources and not monitored_upstreams:
+        logger.warning("No valid sources to serve")
+        return None
 
     # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
     # across both monitored and static sources. Under a monitored cloud root the

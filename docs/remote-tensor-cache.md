@@ -319,11 +319,40 @@ remote url today; this generalizes it.)
 > (a source appears then disappears upstream and the proxy mirror follows) and
 > `test_create_source_manager_captures_bare_host_monitored_upstream`.
 
-**Unreachable upstream at startup.** Register the source through
-`UnresolvedSourceAdapter` (the existing cloud-phase-2 proxy: a catalog row with
-empty tensors / `data_resident=false`) and resolve on first `GetFlightInfo`. This
-reuses the exact catalog-surface/serve-surface split already built for cloud, and
-keeps a momentarily-down upstream from aborting startup.
+**Unreachable upstream.** A proxy "resolve" is a *cheap reconnect*, not a cloud
+download, so the consented refuse-on-serve model of `UnresolvedSourceAdapter` is
+the wrong fit — recovery should be **transparent**. Instead the proxy splits its
+own surfaces:
+
+- **Catalog surface degrades to a placeholder.** `list_tensor_descriptors()` /
+  `get_metadata()` catch an unreachable upstream and return empty (`[]` / `{}`),
+  and `is_resident()` tracks reachability (`_reachable`, updated by those calls),
+  so `get_source_descriptor()` yields a catalog row with **empty tensors /
+  `data_resident=false`** rather than raising. The source therefore registers and
+  stays in the catalog while the upstream is down — registration's metadata-DB
+  sync no longer fails-and-rolls-back, so the source is not silently dropped.
+- **Serve surface stays live.** `get_tensor_descriptor` / `get_data` /
+  `resolve_chunk_data` still raise (→ retryable `UNAVAILABLE`) on a miss, and
+  `ListFlights`/`GetFlightInfo` are live, so the **real tensors reappear the
+  moment the upstream is back** — no explicit `resolve` action, no consent step
+  (a failed catalog call also drops the dead client so the next call reconnects).
+  Already-cached chunks keep serving from the segment cache through an outage.
+
+> **Implemented (unreachable-upstream policy).** The catalog/serve split above is
+> in `RemoteTensorAdapter` (`_safe_list_sources`, `_reachable`,
+> `is_resident()→_reachable`, `list_tensor_descriptors`/`get_metadata` →
+> empty-on-unreachable; serve methods unchanged). Two URL forms:
+> **single-source** `grpc://host/<id>` down at boot → registers as an empty
+> placeholder (no rollback) and recovers transparently; **bare-host**
+> `grpc://host` down at boot → its expansion is skipped (no per-source ids are
+> knowable until the upstream answers), and recovery requires `monitor=true` (the
+> re-list populates it on the next force-full pass once reachable). And
+> `create_source_manager` no longer hard-fails to start when the *only* source is
+> an unreachable monitored upstream — its guard now counts `monitored_upstreams`,
+> so the server boots empty and the re-list fills it in. Tests:
+> `remote_tensor_adapter_test.py::TestUnreachableUpstream` (catalog placeholder,
+> serve-still-raises, transparent recovery via port reuse) +
+> `test_unreachable_sole_monitored_upstream_does_not_block_startup`.
 
 > **Implemented (expansion + namespacing + collision check; mirror-once).**
 > `config.discover_sources` gained a `credentials_config` param and a

@@ -28,6 +28,7 @@ monitor->re-list refresh are the next slice (§3).
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from typing import TYPE_CHECKING, Any, List, Optional
 from urllib.parse import urlsplit
@@ -48,6 +49,8 @@ from biopb_tensor_server.chunk import (
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
+
+logger = logging.getLogger(__name__)
 
 # Env-var convenience fallback for the single-upstream case (a per-upstream
 # credentials profile -- storage_type="biopb-tensor" -- is the multi-upstream
@@ -110,6 +113,10 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         self.token: Optional[str] = None
 
         self._client = None  # lazy TensorFlightClient to the upstream
+        # Best-effort reachability, updated by every catalog-surface call to the
+        # upstream. Optimistic until proven otherwise so a never-yet-listed source
+        # is not pre-emptively reported unresolved.
+        self._reachable = True
 
     # ------------------------------------------------------------------ upstream
 
@@ -175,13 +182,33 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             token=token,
         )
 
+    def _safe_list_sources(self):
+        """``list_sources`` with reachability tracking; ``None`` if unreachable.
+
+        Used only by the *catalog* surface, which degrades to a placeholder when
+        the upstream is down (vs the serve surface, which raises so the client
+        gets a retryable error).
+        """
+        try:
+            out = self.client.list_sources()
+        except Exception as exc:
+            self._reachable = False
+            self._client = None  # drop the dead client so the next call reconnects
+            logger.warning(
+                "upstream tensor server %s unreachable: %s",
+                self._upstream_location,
+                exc,
+            )
+            return None
+        self._reachable = True
+        return out
+
     def get_metadata(self) -> dict:
         """Mirror the upstream source's metadata dict (OME etc.), best-effort."""
         import json
 
-        try:
-            descriptors = self.client.list_sources()
-        except Exception:
+        descriptors = self._safe_list_sources()
+        if descriptors is None:
             return {}
         src = descriptors.get(self._upstream_source_id)
         if src is None or not src.metadata_json:
@@ -192,23 +219,34 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             return {}
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """Mirror the upstream source's tensor descriptors (ids rewritten local)."""
-        descriptors = self.client.list_sources()
+        """Mirror the upstream source's tensor descriptors (ids rewritten local).
+
+        Catalog surface: if the upstream is **unreachable**, return ``[]`` (an
+        empty placeholder catalog row) instead of raising. The source therefore
+        registers and stays in the catalog while the upstream is down; ListFlights
+        / GetFlightInfo are live, so the real tensors reappear transparently once
+        the upstream is back -- no consented resolve step is needed (a proxy
+        "resolve" is just a cheap reconnect, unlike a cloud download).
+        """
+        descriptors = self._safe_list_sources()
+        if descriptors is None:
+            return []  # upstream unreachable -> placeholder row
         src = descriptors.get(self._upstream_source_id)
         if src is None:
-            # Fall back to the default tensor via the per-tensor probe.
+            # Reachable, but not enumerated by list_sources -> per-tensor probe.
             return [self.get_tensor_descriptor()]
         return [self._localize_descriptor(t) for t in src.tensors]
 
     def is_resident(self) -> bool:
-        """A reachable upstream source is treated as resident.
+        """Best-effort: is the upstream reachable right now?
 
-        The base implementation would call it non-resident (a ``grpc://`` url is a
-        remote scheme), which would wrongly steer the server's serve path toward
-        unresolved-source handling. An *unreachable* upstream is a separate case
-        handled by the UnresolvedSourceAdapter deferral in the §3 slice.
+        The base implementation would call a ``grpc://`` source non-resident (a
+        remote scheme), wrongly tripping unresolved-source handling. Instead track
+        reachability from the catalog-surface upstream calls: a reachable upstream
+        is resident; an unreachable one reports ``data_resident=False`` (paired
+        with the empty placeholder tensor list above) until it recovers.
         """
-        return True
+        return self._reachable
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):
         """Return a tensor-layer view bound to the requested within-source field."""
