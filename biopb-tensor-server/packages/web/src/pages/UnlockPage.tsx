@@ -1,8 +1,9 @@
 import { useState, FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 export function UnlockPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [value, setValue] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -15,7 +16,10 @@ export function UnlockPage() {
       return;
     }
     sessionStorage.setItem("biopb_token", token);
-    navigate("/");
+    // Return to the page that sent us here (e.g. /admin); only allow same-site
+    // app paths to avoid an open-redirect via the query string.
+    const next = searchParams.get("next");
+    navigate(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
   }
 
   return (

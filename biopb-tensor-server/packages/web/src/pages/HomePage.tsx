@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useAppStore } from "../store";
 import { ImageViewer } from "../components/ImageViewer";
 import { MetaPanel } from "../components/MetaPanel";
@@ -24,6 +25,9 @@ export function HomePage() {
                 ? "Error"
                 : "Idle"}
         </span>
+        <Link className="icon-btn" to="/admin" title="Server admin">
+          ⚙
+        </Link>
         <button className="icon-btn" onClick={clearSession} title="Lock session">
           Lock
         </button>

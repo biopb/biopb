@@ -102,6 +102,54 @@ export interface QuerySourcesResult {
   truncated: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Admin endpoint (GET/PUT /api/config, /api/admin/status, /api/admin/restart)
+// ---------------------------------------------------------------------------
+
+/** Response of `GET /api/config`: the on-disk config plus its path and schema. */
+export interface AdminConfigResponse {
+  /** Absolute path of the config file on the server. */
+  path: string;
+  /** The raw config dict, exactly as it sits on disk (round-trippable). */
+  config: Record<string, unknown>;
+  /** The JSON Schema (build_config_schema output) describing the config. */
+  schema: Record<string, unknown>;
+}
+
+/** One schema-validation failure from a rejected `PUT /api/config` (422 body). */
+export interface AdminConfigError {
+  /** JSON path to the offending field, e.g. ["sources", 0, "url"]. */
+  path: (string | number)[];
+  message: string;
+}
+
+/** Body of a `422` from `PUT /api/config`. Carried on `TensorApiError.detail`. */
+export interface AdminConfigValidationBody {
+  detail: string;
+  errors: AdminConfigError[];
+}
+
+/** Response of `PUT /api/config` on success (200). */
+export interface AdminConfigSaveResult {
+  saved: boolean;
+  restart_required: boolean;
+  path: string;
+}
+
+/** Response of `GET /api/admin/status`: backend health merged with process facts. */
+export interface AdminStatus {
+  running: boolean;
+  pid: number;
+  version: string;
+  config_path: string | null;
+  health: string | null;
+  source_count: number | null;
+  writable: boolean | null;
+  uptime_seconds: number | null;
+  full_scan_in_progress: boolean | null;
+  last_full_scan_finished_at: number | null;
+}
+
 /** Parameters for backend rendering request. */
 export interface RenderRequest {
   source_id: string;

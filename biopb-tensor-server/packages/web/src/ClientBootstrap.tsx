@@ -86,7 +86,10 @@ export function ClientBootstrap() {
         // Production mode - require token
         const token = sessionStorage.getItem("biopb_token") ?? "";
         if (!token) {
-          navigate("/unlock");
+          // Preserve the current path so unlock returns here (e.g. /admin).
+          const here = window.location.pathname;
+          const next = here && here !== "/unlock" ? `?next=${encodeURIComponent(here)}` : "";
+          navigate(`/unlock${next}`);
           return;
         }
 
