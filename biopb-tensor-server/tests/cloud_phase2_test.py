@@ -721,6 +721,109 @@ class TestCloudRescanGating:
         assert root_key not in mgr._skipped_stable_dirs
         assert set(server.registered) == {sid}
 
+    @staticmethod
+    def _make_cloud_store(root, name="img.zarr"):
+        store = root / name
+        store.mkdir(parents=True, exist_ok=True)
+        (store / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+        (store / ".zattrs").write_text(json.dumps({"multiscales": [{"datasets": []}]}))
+        return store
+
+    def test_incremental_does_no_cloud_entry_work(
+        self, tmp_path, force_nonresident, monkeypatch
+    ):
+        # After the startup force_full, cloud entries live in the cloud partition,
+        # NOT in _entry_state, and an incremental rescan touches none of them: the
+        # per-entry carry-forward must never run, and the partition is carried
+        # forward by reference (unchanged), while the cloud source stays registered.
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        self._make_cloud_store(root)
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
+        root_key = str(root.resolve())
+
+        mgr._handle_rescan()  # force_full
+        sid = next(iter(server.registered))
+        assert mgr._cloud_entry_state  # cloud entries partitioned out
+        assert root_key in mgr._cloud_entry_state
+        # Nothing under the cloud root lingers in _entry_state.
+        assert not any(
+            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_state
+        )
+        assert sid in mgr._cloud_source_ids
+
+        # Incremental: the per-entry cloud carry-forward must never be invoked.
+        def _boom(*a, **k):
+            raise AssertionError("incremental must not iterate cloud entries")
+
+        monkeypatch.setattr(mgr, "_copy_cached_subtree_entries", _boom)
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
+        partition_before = dict(mgr._cloud_entry_state)
+
+        mgr._handle_rescan()  # must not raise
+
+        assert set(server.registered) == {sid}  # preserved
+        assert mgr._cloud_entry_state == partition_before  # carried, not rebuilt
+
+    def test_incremental_preserves_cloud_without_diff_or_churn(
+        self, tmp_path, force_nonresident, monkeypatch
+    ):
+        # On an incremental, a cloud source is never signature-diffed (so no live
+        # member stat) and never re-added (no metadata-DB churn) -- it is simply
+        # left untouched by the reconcile scoping.
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        self._make_cloud_store(root)
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
+
+        mgr._handle_rescan()  # force_full registers + partitions
+        sid = next(iter(server.registered))
+        added_before = len(server._metadata_db.added)
+
+        orig_sig = mgr._build_claim_signatures
+
+        def guard(claim):
+            assert claim.source_id not in mgr._cloud_source_ids, (
+                "cloud source must not be signature-diffed on an incremental"
+            )
+            return orig_sig(claim)
+
+        monkeypatch.setattr(mgr, "_build_claim_signatures", guard)
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
+
+        mgr._handle_rescan()
+
+        assert set(server.registered) == {sid}
+        assert len(server._metadata_db.added) == added_before  # no re-add churn
+
+    def test_new_cloud_dataset_surfaces_only_on_force_full(
+        self, tmp_path, force_nonresident, monkeypatch
+    ):
+        # A dataset added under the cloud root after startup is invisible to the
+        # frequent incrementals (they skip the cloud subtree) and surfaces only on
+        # the next force_full re-walk, which also rebuilds the partition.
+        root = tmp_path / "cloudroot"
+        root.mkdir()
+        self._make_cloud_store(root, "img.zarr")
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
+
+        mgr._handle_rescan()  # force_full -> 1 source
+        assert len(server.registered) == 1
+
+        self._make_cloud_store(root, "img2.zarr")  # new dataset under the cloud root
+
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
+        mgr._handle_rescan()  # incremental: cloud skipped -> not discovered yet
+        assert len(server.registered) == 1
+
+        monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
+        mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
+        assert len(server.registered) == 2
+        assert all(sid in mgr._cloud_source_ids for sid in server.registered)
+
 
 # --------------------------------------------------------------------------- #
 # Server `resolve` action (streaming do_action)
