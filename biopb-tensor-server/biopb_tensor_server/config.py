@@ -207,6 +207,15 @@ class _Range:
             return f"a number >= {self.min}"
         return f"a number <= {self.max}"
 
+    def to_json_schema(self) -> dict:
+        """Inclusive bounds as JSON Schema keywords (for the schema emitter)."""
+        out: dict = {}
+        if self.min is not None:
+            out["minimum"] = self.min
+        if self.max is not None:
+            out["maximum"] = self.max
+        return out
+
 
 class _Enum:
     """Membership in a fixed set, optionally case-insensitive for strings."""
@@ -228,6 +237,17 @@ class _Enum:
 
     def describe(self) -> str:
         return "one of: " + ", ".join(sorted(map(str, self._display)))
+
+    def to_json_schema(self) -> dict:
+        """The allowed set as a JSON Schema ``enum`` -- but only for
+        case-sensitive enums. A case-insensitive set (``log_level``,
+        ``reduction_method``) accepts any casing the server folds, so a hard
+        ``enum`` of the canonical members would reject values the server
+        actually honors; there we stay lenient and surface the set via
+        :meth:`describe` in the property description instead."""
+        if self.case_insensitive:
+            return {}
+        return {"enum": sorted(self._display, key=str)}
 
 
 # Per-dataclass field constraints, keyed by class name (so this table can sit

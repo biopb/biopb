@@ -36,6 +36,8 @@ dependencies = [
     "pytest >= 7.0.0",
     "pytest-timeout >= 2.1.0",
     "httpx >= 0.25.0",
+    # config_schema_test.py validates configs against the emitted JSON Schema.
+    "jsonschema >= 4.18.0",
     # The test suite imports the web stack at collection time (cli_test.py pulls
     # in cli -> http_server -> fastapi; http_server_test.py uses TestClient), so
     # the web extra is required to run `pytest tests/`. Kept as a self-reference

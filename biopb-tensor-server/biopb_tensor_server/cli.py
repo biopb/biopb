@@ -771,6 +771,38 @@ def version():
     console.print(f"biopb: {biopb_version}")
 
 
+@app.command(name="config-schema")
+def config_schema(
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write the schema to this file instead of stdout.",
+    ),
+):
+    """Print the JSON Schema for the config file.
+
+    The schema is generated from the server's own validation table, so its
+    value bounds and enums match what the server enforces at startup. Save it
+    and reference it from a config via "$schema" for editor autocomplete, or
+    feed it to a JSON Schema validator for pre-flight checks (biopb/biopb#34).
+
+    Example:
+        biopb-tensor-server config-schema -o biopb-config.schema.json
+    """
+    import json
+
+    from biopb_tensor_server.config_schema import build_config_schema
+
+    text = json.dumps(build_config_schema(), indent=2) + "\n"
+    if output is not None:
+        output.write_text(text, encoding="utf-8")
+        console.print(f"[green]✓ Wrote schema to {output}[/green]")
+    else:
+        # Raw stdout (not console.print) so the output is clean, pipeable JSON.
+        typer.echo(text, nl=False)
+
+
 @app.command()
 def launch(
     config: Path = typer.Option(

@@ -1,6 +1,6 @@
 # Config Format Migration — TOML → JSON (coexistence phase)
 
-**Status:** Phases 1–3 done — read-side JSON/TOML coexistence (`biopb._config_location` + TOML deprecation warning), warn-level value validation (`_CONSTRAINTS`, `config.py`), and the installer now writing `biopb.json` (all four front-ends: `install/install.sh`, `install/biopb-engine.ps1`, `install/install.ps1`, `install/gui/biopb-setup.iss`). Remaining: JSON Schema emitter not built; `.toml` read path not yet dropped.
+**Status:** Phases 1–3 done — read-side JSON/TOML coexistence (`biopb._config_location` + TOML deprecation warning), warn-level value validation (`_CONSTRAINTS`, `config.py`), the installer now writing `biopb.json` (all four front-ends: `install/install.sh`, `install/biopb-engine.ps1`, `install/install.ps1`, `install/gui/biopb-setup.iss`), and the JSON Schema emitter (`config_schema.py` + `biopb-tensor-server config-schema`). Remaining: `.toml` read path not yet dropped; `$schema` not yet embedded in generated configs.
 **Component:** `biopb-tensor-server` (config), `biopb` umbrella CLI, `biopb-mcp`
 **Tracking:** biopb/biopb#34 (the agreed plan lives in that issue's first comment)
 
@@ -104,17 +104,45 @@ shadow warning never fires. The default template also drops the now-deprecated
 `[metadata_db] enabled = true` (DB on by default, biopb/biopb#225). New installs
 are JSON-native; old TOML installs keep working until they next change folders.
 
+## JSON Schema emitter (done)
+
+`biopb_tensor_server.config_schema.build_config_schema()` projects the same
+`_CONSTRAINTS` table as a Draft 2020-12 JSON Schema for the **on-disk** config,
+so the value bounds and enums in the schema match exactly what the server
+enforces at startup — one definition, no drift. Bounds/enums come straight from
+the `_Range`/`_Enum` objects (each grew a `to_json_schema()`), types from the
+config dataclasses; the only declarative piece is `_ONDISK_OVERRIDES`, the few
+fields whose wire form differs from the dataclass (`[compute]` is read into
+`ServerConfig`; `cache.*_mb`/`*_gb` convert to byte fields). Sections keep
+`additionalProperties: true`, so the schema enforces the dangerous values #34
+exists to catch and documents them for autocomplete without being a closed
+dictionary.
+
+Case-insensitive enums (`log_level`, `reduction_method`) emit **no** hard
+`enum` — the server folds case, so a canonical-set enum would reject values it
+accepts — and instead carry the accepted set in the property `description`.
+
+Emit it with `biopb-tensor-server config-schema [-o file.json]`. Reference the
+saved file from a config via `"$schema"` for editor autocomplete, or feed it to
+any JSON Schema validator for pre-flight checks. A drift-guard test
+(`tests/config_schema_test.py`) asserts every `_CONSTRAINTS` entry is reflected
+in the schema and that it accepts the installer default while rejecting each
+known-bad value (`downscale_factor` 0/1, `pixel_budget_cubic_root` 0,
+out-of-range `port`, bad `backend`, `backlog_high_water > 1`, …).
+
 ## Deferred
 
-- **JSON Schema emitter.** Generated from the same `_CONSTRAINTS` table, feeding
-  the config generator + editor autocomplete + optional pre-flight validation.
+- **Embed `$schema` in generated configs.** Have the installer write a
+  `"$schema"` pointer (needs the schema hosted at a stable URL, e.g. the `$id`
+  `https://biopb.org/schemas/tensor-server-config.json`) so editors validate
+  out of the box.
 - **End state.** Drop the `.toml` read path and flip validation warn → raise.
 
 ## Sequencing (from #34)
 
 1. ~~Read-side coexistence.~~ ✅
 2. ~~Value-validation `_CONSTRAINTS` (warn).~~ ✅
-3. ~~Installer emits JSON~~ ✅; schema emitter; make JSON the only documented format.
+3. ~~Installer emits JSON~~ ✅; ~~schema emitter~~ ✅; make JSON the only documented format.
 4. Drop `.toml` read path; flip warn → hard-fail.
 
 ## Equivalent configs
