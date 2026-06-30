@@ -303,6 +303,9 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
         wsRef.current = null;
       }
     };
+    // connect/cleanupUrl are stable useCallbacks (ref-based); fire on mount and
+    // enabled-toggle only, not on their identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]); // Only depend on enabled - connect is stable
 
   return {
