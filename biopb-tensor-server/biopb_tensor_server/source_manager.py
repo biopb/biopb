@@ -141,6 +141,20 @@ class SourceManager:
         # Rescan bookkeeping for low-overhead subtree pruning.
         self._skipped_stable_dirs: Set[str] = set()
         self._last_full_rescan_at: float = float("-inf")
+        # Cloud-subtree entry partition. Cloud (synced-folder) subtrees are walked
+        # only on the hourly force_full pass; on the frequent incremental rescans
+        # they are skipped entirely. To keep that O(non-cloud), cloud entries live
+        # here -- rebuilt only at the end of a successful force_full -- instead of
+        # being re-materialized into ``_entry_state``/``next_state`` every cycle
+        # (which made every per-entry rescan loop O(whole cloud catalog) and
+        # stalled the Flight serving threads via the GIL). Same tuple shape as
+        # ``_entry_state``. Never mutated on a failed rescan, so the last good
+        # snapshot survives a force_full failure (no rollback variable needed).
+        self._cloud_entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        # source_ids whose primary_path is under a cloud root, maintained at commit
+        # time (O(1) per source). Lets the incremental reconcile preserve cloud
+        # sources by a hash-set check instead of resolving every cloud member path.
+        self._cloud_source_ids: Set[str] = set()
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
@@ -316,7 +330,9 @@ class SourceManager:
                 self._preserve_skipped_claims(discovered_state, skipped_dirs)
 
                 unstable_paths = self._get_unstable_paths()
-                self._reconcile_discovered_state(discovered_state, unstable_paths)
+                self._reconcile_discovered_state(
+                    discovered_state, unstable_paths, force_full=force_full_rescan
+                )
                 rescan_succeeded = True
             finally:
                 if not rescan_succeeded:
@@ -328,6 +344,25 @@ class SourceManager:
             if force_full_rescan and rescan_succeeded:
                 self._last_full_rescan_at = time.time()
                 self._server.set_last_full_scan(self._last_full_rescan_at)
+                # Partition the just-walked cloud entries out of _entry_state into
+                # the cloud partition. This runs only after the force_full claim +
+                # reconcile have already seen the full _entry_state (cloud included),
+                # so cloud sources reconcile normally here; afterwards _entry_state
+                # holds non-cloud only, so the frequent incremental rescans never
+                # iterate cloud entries (the GIL-stall fix). next_state is
+                # self._entry_state (and the companions are aliased too, set above),
+                # so popping trims them in place. Only on success -> a failed
+                # force_full leaves the previous _cloud_entry_state intact.
+                cloud_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+                for path_str, is_cloud in next_cloud.items():
+                    if not is_cloud:
+                        continue
+                    entry = next_state.pop(path_str, None)
+                    if entry is not None:
+                        cloud_state[path_str] = entry
+                    next_stable_observations.pop(path_str, None)
+                    next_pending_scan.pop(path_str, None)
+                self._cloud_entry_state = cloud_state
                 # First full scan done: flip the precache gate (live additions
                 # now prompt-enqueue) and let the launcher seed the backlog with
                 # the established catalog. Fired once, best-effort.
@@ -398,6 +433,16 @@ class SourceManager:
         for path_str in entry_paths_to_remove:
             self._entry_state.pop(path_str, None)
             self._entry_pending_scan.pop(path_str, None)
+
+        # Cloud entries live in the partition, not _entry_state; prune them too.
+        cloud_paths_to_remove = [
+            path_str
+            for path_str in self._cloud_entry_state
+            if path_str == deleted_root_str
+            or Path(path_str).is_relative_to(deleted_root)
+        ]
+        for path_str in cloud_paths_to_remove:
+            self._cloud_entry_state.pop(path_str, None)
 
         if removed_source_ids:
             logger.warning(
@@ -587,7 +632,12 @@ class SourceManager:
 
         path_str = str(resolved_path)
         signature = self._build_entry_signature(stat_result, is_directory, cloud=cloud)
-        previous_entry = self._entry_state.get(path_str)
+        # Cloud entries live in the cloud partition (walked only on force_full);
+        # read the prior signature from there so last_changed stays continuous
+        # across the hourly re-walk. Non-cloud reads _entry_state as before.
+        previous_entry = (self._cloud_entry_state if cloud else self._entry_state).get(
+            path_str
+        )
         last_changed = self._get_entry_change_time(stat_result, now)
         stable_observations = 0
         if previous_entry is not None and previous_entry[:2] == (
@@ -627,20 +677,17 @@ class SourceManager:
 
         # Cloud subtree: re-walked only on a force_full pass. Enumerating a cloud
         # root is expensive and its mtime signature is unreliable (doc S1.2), so the
-        # frequent incremental rescans silently skip it -- carrying the cached claims
-        # forward untouched -- and only the periodic force_full rescan re-walks it.
-        # The first rescan is force_full (last-full == -inf), so a cloud root is still
+        # frequent incremental rescans skip it entirely -- they neither descend nor
+        # re-materialize its descendants. Cloud entries persist in
+        # ``_cloud_entry_state`` (rebuilt only on force_full); the cloud sources are
+        # kept registered across incrementals by the reconcile scoping (see
+        # ``_reconcile_discovered_state``), not by carrying entries forward. The first
+        # rescan is force_full (last-full == -inf), so a cloud root is still
         # catalogued at startup, and a brand-new cloud dataset surfaces on the next
-        # force_full pass. (Replaces the earlier "always full-walk cloud, never prune"
-        # behavior.)
+        # force_full pass. ``skipped_dirs.add`` records the skip (asserted by tests)
+        # and prunes the cloud root that was just recorded into ``next_state``.
         if cloud and not force_full:
             skipped_dirs.add(path_str)
-            self._copy_cached_subtree_entries(
-                path_str,
-                next_state,
-                next_stable_observations,
-                next_pending_scan,
-            )
             return
 
         if (
@@ -824,6 +871,22 @@ class SourceManager:
 
         return now
 
+    def _entry_for(
+        self, path_str: str
+    ) -> Optional[Tuple[bool, Tuple[Any, ...], float]]:
+        """Cached signature entry for a path, from either partition.
+
+        Cloud entries live in ``_cloud_entry_state`` (walked only on force_full),
+        non-cloud in ``_entry_state``. Readers that may receive a cloud member path
+        outside the force_full walk (signature diff, stability gate) use this so a
+        cloud member is found in the partition instead of falling through to a live
+        ``Path(member).stat()`` -- a cloud network round-trip.
+        """
+        entry = self._entry_state.get(path_str)
+        if entry is None:
+            entry = self._cloud_entry_state.get(path_str)
+        return entry
+
     def _should_scan_path(self, path: Path) -> bool:
         """Return True when a path is stable enough to participate in discovery."""
         try:
@@ -848,7 +911,7 @@ class SourceManager:
         if resolved_str in self._skipped_stable_dirs:
             return False
 
-        entry = self._entry_state.get(resolved_str)
+        entry = self._entry_for(resolved_str)
         if entry is None:
             return False
 
@@ -915,13 +978,24 @@ class SourceManager:
         self,
         discovered_state: DiscoveryState,
         unstable_paths: List[Path],
+        force_full: bool = False,
     ) -> None:
-        """Apply add/remove/update diffs between the current and discovered states."""
+        """Apply add/remove/update diffs between the current and discovered states.
+
+        On an incremental rescan, cloud-root sources are excluded from the
+        candidate set: their subtree was not walked, so they are absent from
+        ``discovered_state`` and would otherwise be diffed/removed. Excluding them
+        by a hash-set check (``_cloud_source_ids``) preserves them untouched -- no
+        removal, no signature diff, no per-member ``Path.resolve()`` -- without the
+        ``_preserve_skipped_claims`` re-injection loop. On a force_full pass cloud
+        sources ARE walked, so they participate in the full reconcile.
+        """
         with self._lock:
             current_claims = {
                 source_id: claim
                 for source_id, claim in self._state.claims.items()
                 if self._is_monitored_claim(claim)
+                and (force_full or source_id not in self._cloud_source_ids)
             }
 
         discovered_claims = discovered_state.claims
@@ -1007,7 +1081,7 @@ class SourceManager:
         # ``cloud`` flag).
         cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
-            entry = self._entry_state.get(member_path)
+            entry = self._entry_for(member_path)
             if entry is not None:
                 signatures[member_path] = entry[1]
                 continue
@@ -1042,6 +1116,13 @@ class SourceManager:
             current_claims = list(self._state.claims.values())
 
         for claim in current_claims:
+            if claim.source_id in self._cloud_source_ids:
+                # Cloud sources are preserved by the reconcile scoping (excluded
+                # from the candidate set on incrementals), not re-injected here.
+                # Re-injecting would place them in ``discovered_ids`` while reconcile
+                # drops them from ``current_ids`` -> a spurious re-add every cycle.
+                # Skipping also retires the per-cloud-claim ``Path.resolve()`` loop.
+                continue
             if not self._is_monitored_claim(claim):
                 continue
             if claim.source_id in discovered_state.claims:
@@ -1102,6 +1183,10 @@ class SourceManager:
             self._source_signatures[claim.source_id] = self._build_claim_signatures(
                 claim
             )
+            # Track cloud-root sources so the incremental reconcile can preserve
+            # them by a hash-set check (see _reconcile_discovered_state).
+            if self._is_under_cloud_root(claim.primary_path):
+                self._cloud_source_ids.add(claim.source_id)
             self._clear_failed_source_attempt(claim.source_id)
 
         # Notify the precache worker of live additions only -- those discovered
@@ -1131,6 +1216,7 @@ class SourceManager:
         with self._lock:
             self._state.remove_claim(claim.primary_path, notify=False)
             self._source_signatures.pop(source_id, None)
+            self._cloud_source_ids.discard(source_id)
             self._clear_failed_source_attempt(source_id)
         return True
 
@@ -1399,6 +1485,7 @@ class SourceManager:
         ]
         for path in paths_to_remove:
             self._path_to_source_id.pop(path, None)
+        self._cloud_source_ids.discard(source_id)
 
     def _unregister_source_claim(self, source_id: str) -> bool:
         """Remove a source from the server and metadata DB.

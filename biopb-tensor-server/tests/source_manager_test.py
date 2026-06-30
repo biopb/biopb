@@ -409,9 +409,7 @@ class TestSourceManagerRegressions:
         monkeypatch.setattr(
             manager,
             "_reconcile_discovered_state",
-            lambda discovered_state, unstable_paths: (_ for _ in ()).throw(
-                RuntimeError("reconcile failed")
-            ),
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reconcile failed")),
         )
 
         with pytest.raises(RuntimeError, match="reconcile failed"):
@@ -1594,9 +1592,11 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths):
+        def spy(discovered_state, unstable_paths, force_full=False):
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, unstable_paths)
+            return orig_reconcile(
+                discovered_state, unstable_paths, force_full=force_full
+            )
 
         monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
 
@@ -1620,11 +1620,13 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths):
+        def spy(discovered_state, unstable_paths, force_full=False):
             # The new source is NOT yet registered when reconcile starts: it is
             # added by reconcile (batch), not streamed during the walk.
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, unstable_paths)
+            return orig_reconcile(
+                discovered_state, unstable_paths, force_full=force_full
+            )
 
         monkeypatch.setattr(manager, "_reconcile_discovered_state", spy)
         manager._handle_rescan()
@@ -1643,11 +1645,13 @@ class TestProgressiveStreaming:
         calls = {"n": 0}
         orig_reconcile = manager._reconcile_discovered_state
 
-        def flaky(discovered_state, unstable_paths):
+        def flaky(discovered_state, unstable_paths, force_full=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("reconcile failed")
-            return orig_reconcile(discovered_state, unstable_paths)
+            return orig_reconcile(
+                discovered_state, unstable_paths, force_full=force_full
+            )
 
         monkeypatch.setattr(manager, "_reconcile_discovered_state", flaky)
 
