@@ -1274,5 +1274,8 @@ def is_remote_url(url: str) -> bool:
         "ftp://",
         "az://",
         "azure://",
+        "grpc://",
+        "grpc+tls://",
+        "grpcs://",
     )
     return url.lower().startswith(remote_prefixes)

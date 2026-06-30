@@ -71,7 +71,7 @@ import logging
 import os
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -342,8 +342,9 @@ class SourceConfig:
 
     Attributes:
         url: URL or path to the data source (supports local paths and remote URLs)
-        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs", or "aics".
-              Optional - auto-detected if None (only for local files).
+        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs",
+              "aics", or "tensor-server" (an upstream biopb tensor server, fronted as a caching proxy).
+              Optional - auto-detected if None (local files, or a grpc:// endpoint -> "tensor-server").
         source_id: Unique identifier for the data source (auto-generated from URL if None)
         dim_labels: Dimension labels (optional, applies to all tensors in source)
         dataset: HDF5 dataset path (required for HDF5 type)
@@ -356,6 +357,12 @@ class SourceConfig:
                shape/dtype is resolved lazily on first access (cloud-storage phase 2).
                Opt-in only -- it does not weaken the global placeholder guard elsewhere.
         credentials_profile: Name of credential profile for remote URLs (overrides global default)
+        alias: Namespace prefix for an upstream "tensor-server" source. The proxy
+               mirrors the upstream's sources under "<alias>__<upstream_source_id>"
+               so multiple upstreams (and local sources) coexist in one flat,
+               source_id-keyed catalog without id collisions. Must be slash-free
+               (it becomes part of a slash-free source_id). Ignored for non-proxy
+               source types.
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
 
@@ -369,6 +376,7 @@ class SourceConfig:
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",
+            "tensor-server",
         ]
     ] = None
     source_id: Optional[str] = None
@@ -377,6 +385,7 @@ class SourceConfig:
     monitor: bool = False  # Enable live filesystem monitoring
     cloud: bool = False  # Treat as cloud/synced-folder root (admit unresolved sources)
     credentials_profile: Optional[str] = None  # Override global credential profile
+    alias: Optional[str] = None  # Namespace prefix for a "tensor-server" upstream
     _is_remote: Optional[bool] = field(
         default=None, init=False
     )  # Internal field, computed from URL
@@ -392,6 +401,13 @@ class SourceConfig:
     def __post_init__(self):
         if self.url is None or self.url == "":
             raise ValueError("SourceConfig requires a valid 'url'")
+
+        # An alias becomes part of a slash-free source_id (<alias>__<upstream_id>),
+        # so it must not contain '/' (the array_id source boundary).
+        if self.alias is not None and "/" in self.alias:
+            raise ValueError(
+                f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
+            )
 
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
@@ -1102,6 +1118,9 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
             monitor=src_data.get("monitor", False),  # Optional - default False
             cloud=src_data.get("cloud", False),  # Optional - default False
             credentials_profile=src_data.get("credentials_profile", None),  # NEW
+            alias=src_data.get(
+                "alias", None
+            ),  # Optional - tensor-server proxy namespace
         )
         sources.append(source)
 
@@ -1137,13 +1156,19 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 def detect_source_type(url: str) -> Optional[str]:
     """Detect source type from URL characteristics.
 
-    Returns one of: "zarr", "ome-zarr", "ome-zarr-hcs", "ome-tiff", "ome-tiff-multifile", "aics"
-    or None if type cannot be determined.
+    Returns one of: "zarr", "ome-zarr", "ome-zarr-hcs", "ome-tiff", "ome-tiff-multifile", "aics",
+    "tensor-server", or None if type cannot be determined.
 
     Note: HDF5 is NOT auto-detected because it requires explicit dataset path.
-    Note: Remote URLs cannot be auto-detected - requires explicit 'type' in config.
+    Note: Remote URLs cannot be auto-detected (require explicit 'type' in config),
+          except a grpc(+tls) endpoint, which is unambiguously an upstream biopb
+          tensor server (the "tensor-server" caching-proxy source type).
     """
     import json
+
+    # A grpc(+tls) endpoint is always an upstream biopb tensor server.
+    if url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
+        return "tensor-server"
 
     # Remote URLs cannot be auto-detected
     if _is_remote_url(url):
@@ -1437,12 +1462,17 @@ def discover_sources(
     if registry is None:
         registry = get_default_registry()
 
-    # Case 0: Remote URLs require explicit type
+    # Case 0: Remote URLs require an explicit (or auto-detectable) type.
+    # A grpc(+tls) endpoint auto-detects to "tensor-server"; other remote
+    # schemes (s3://, http://, ...) still require an explicit 'type'.
     if source.is_remote:
-        if source.type is None:
+        resolved_type = source.type or detect_source_type(source.url)
+        if resolved_type is None:
             raise ValueError(
                 f"Remote URL requires explicit 'type' in config: {source.url}"
             )
+        if source.type is None:
+            source = replace(source, type=resolved_type)
         # For remote URLs, return the source as-is (no directory discovery)
         return [source]
 

@@ -167,6 +167,13 @@ def _sources_schema() -> Dict[str, Any]:
                 "description": "Treat as a cloud/synced root; admit offline placeholders.",
             },
             "credentials_profile": {"type": "string"},
+            "alias": {
+                "type": "string",
+                "description": (
+                    "Namespace prefix for an upstream 'tensor-server' source "
+                    "(<alias>__<upstream_source_id>); must be slash-free."
+                ),
+            },
             "path": {
                 "type": "string",
                 "description": "Deprecated alias for url.",

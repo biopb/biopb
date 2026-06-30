@@ -126,6 +126,23 @@ Three existing functions learn about `grpc`:
   `tensor-server` instead of erroring, and routes to the new expansion in
   [§3](#3-catalog-mirroring--expansion).
 
+> **Implemented (scheme/type plumbing only).** The recognition layer is in:
+> `discovery.is_remote_url` accepts `grpc://` / `grpc+tls://` / `grpcs://`
+> (one source of truth — `config._is_remote_url` is its alias);
+> `detect_source_type` maps a `grpc*` scheme to `"tensor-server"` (before the
+> remote-bail); `SourceConfig.type`'s `Literal` gained `"tensor-server"` and the
+> dataclass gained the optional slash-free `alias` field (parsed from the config
+> dict, validated in `__post_init__`, surfaced in the JSON-schema emitter +
+> unknown-key warner); and `discover_sources` Case 0 auto-detects the type for a
+> bare `grpc://` source (other remote schemes still require an explicit `type`).
+> A configured `grpc://` source is now *classified* as `tensor-server` and
+> returned as-is — it is **not yet served**: `RemoteTensorAdapter`
+> ([§2](#2-the-adapter--a-three-layer-passthrough-that-understands-nothing)) and
+> the catalog expansion ([§3](#3-catalog-mirroring--expansion)) are the next
+> slice, so until then such a source errors cleanly at adapter creation
+> (*"Unknown source type: tensor-server"*). Tests:
+> `tests/config_discovery_test.py::TestTensorServerSourceType`.
+
 `SourceConfig.type`'s `Literal` gains `"tensor-server"` and the dataclass gains an
 optional `alias` field (the namespace prefix, [§4](#4-identifier-policy)). Upstream
 auth rides on the existing `credentials_profile` field via a new

@@ -314,3 +314,79 @@ class TestDiscoveryFailureIsolation:
             claim = next(iter(state.claims.values()))
             assert claim.primary_path == str(root / "good.dat")
             assert str(root / "bad.dat") not in state.path_to_source
+
+
+class TestTensorServerSourceType:
+    """The ``tensor-server`` source type: a grpc:// upstream fronted as a proxy.
+
+    Covers only the §1 scheme/type plumbing (recognition + classification +
+    the alias namespace field). The RemoteTensorAdapter / catalog expansion is
+    a separate slice; here a grpc source is simply classified and returned
+    as-is by ``discover_sources``.
+    """
+
+    def test_is_remote_url_recognizes_grpc_schemes(self):
+        from biopb_tensor_server.discovery import is_remote_url
+
+        assert is_remote_url("grpc://lab-store:8815") is True
+        assert is_remote_url("grpc+tls://lab-store:8815") is True
+        assert is_remote_url("grpcs://lab-store:8815") is True
+        assert is_remote_url("GRPC://Lab-Store:8815") is True  # case-insensitive
+        # unchanged behaviour for local + other remote schemes
+        assert is_remote_url("/data/scratch") is False
+        assert is_remote_url("s3://bucket/key") is True
+
+    def test_detect_source_type_maps_grpc_to_tensor_server(self):
+        from biopb_tensor_server.config import detect_source_type
+
+        assert detect_source_type("grpc://lab:8815") == "tensor-server"
+        assert detect_source_type("grpc+tls://lab:8815") == "tensor-server"
+        assert detect_source_type("grpcs://lab:8815") == "tensor-server"
+        # other remote schemes remain non-auto-detectable
+        assert detect_source_type("s3://bucket/key") is None
+
+    def test_tensor_server_in_type_literal(self):
+        # explicit type still round-trips through SourceConfig
+        s = SourceConfig(url="grpc://lab:8815", type="tensor-server")
+        assert s.type == "tensor-server"
+        assert s.is_remote is True
+
+    def test_bare_grpc_source_auto_classifies_to_tensor_server(self):
+        # No explicit type: Case 0 auto-detects grpc -> tensor-server instead
+        # of raising "Remote URL requires explicit 'type'".
+        src = SourceConfig(url="grpc://lab:8815", alias="lab")
+        assert src.type is None  # not set at construction
+        out = discover_sources(src)
+        assert len(out) == 1
+        assert out[0].type == "tensor-server"
+        assert out[0].alias == "lab"
+        assert out[0].url == "grpc://lab:8815"
+
+    def test_non_grpc_remote_without_type_still_errors(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="requires explicit 'type'"):
+            discover_sources(SourceConfig(url="s3://bucket/key"))
+
+    def test_alias_must_be_slash_free(self):
+        import pytest
+
+        # source_id boundary is the first '/', so an alias prefix cannot contain it
+        with pytest.raises(ValueError, match="slash-free"):
+            SourceConfig(url="grpc://lab:8815", alias="lab/sub")
+        # a slash-free alias is accepted
+        assert SourceConfig(url="grpc://lab:8815", alias="lab").alias == "lab"
+
+    def test_alias_parsed_from_config_dict(self):
+        from biopb_tensor_server.config import parse_config
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://lab:8815", "alias": "lab"},
+                    {"url": "grpc://arc:8815", "type": "tensor-server", "alias": "arc"},
+                ]
+            }
+        )
+        aliases = {s.url: s.alias for s in cfg.sources}
+        assert aliases == {"grpc://lab:8815": "lab", "grpc://arc:8815": "arc"}
