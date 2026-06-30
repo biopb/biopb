@@ -327,6 +327,9 @@ def create_app(
     static_dir: Optional[
         str
     ] = None,  # Directory for static webapp files (None = API only)
+    config_path: Optional[str] = None,
+    web_host: Optional[str] = None,
+    web_port: Optional[int] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -337,6 +340,11 @@ def create_app(
         cache_bytes: Bytes for the in-process chunk cache (default 0, disabled
             since sidecar runs on same machine as gRPC server which already caches).
         cors_origins: Allowed CORS origins. Defaults to localhost variants.
+        config_path: Path to the config file this daemon was launched with. The
+            admin routes read/write it and echo it into the restart command so a
+            self-restart comes back identically (biopb/biopb#237).
+        web_host: Host this HTTP sidecar was bound to (echoed into restart).
+        web_port: Port this HTTP sidecar was bound to (echoed into restart).
 
     Returns:
         Configured FastAPI application.
@@ -382,7 +390,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT"],
         allow_headers=["Authorization", "X-Biopb-Token", "Content-Type"],
         expose_headers=[
             "X-Shape",
@@ -1246,6 +1254,163 @@ def create_app(
             await websocket.close(code=1011, reason="Internal error")
 
     # -----------------------------------------------------------------------
+    # Admin: config read/write, status, restart (biopb/biopb#237)
+    # -----------------------------------------------------------------------
+
+    from pathlib import Path
+
+    def _require_same_origin(request: Request) -> None:
+        """Refuse drive-by cross-origin state changes on the mutating routes.
+
+        The admin routes are the sidecar's first *mutating* surface. A page the
+        user merely visits can fire a cross-origin ``POST``/``PUT`` at the
+        loopback sidecar; it cannot read the response (CORS) but a state change
+        does not need to. So require a signal a cross-origin browser ``fetch``
+        cannot forge without a CORS preflight (which the localhost-only allowlist
+        fails): an explicit token header, or ``Sec-Fetch-Site`` that is not
+        cross-origin. Non-browser clients (curl) send no ``Sec-Fetch-Site`` and
+        are not a CSRF vector, so a missing header is allowed -- a token-gated
+        server still enforces ``_check_token`` independently.
+        """
+        if request.headers.get("Authorization") or request.headers.get("X-Biopb-Token"):
+            return
+        sec_fetch_site = request.headers.get("Sec-Fetch-Site")
+        if sec_fetch_site is None or sec_fetch_site in ("same-origin", "none"):
+            return
+        raise HTTPException(status_code=403, detail="Cross-origin request refused")
+
+    @app.get("/api/config")
+    async def get_config(request: Request) -> JSONResponse:
+        _check_token(request)
+        if not config_path:
+            raise HTTPException(
+                status_code=404, detail="This server has no config path"
+            )
+        from biopb_tensor_server.config import _read_config_file
+        from biopb_tensor_server.config_schema import build_config_schema
+
+        p = Path(config_path)
+        raw: Dict[str, Any] = {}
+        if p.exists():
+            try:
+                raw = _read_config_file(p)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=500, detail=f"Config on disk is unreadable: {e}"
+                )
+        return JSONResponse(
+            {"path": str(p), "config": raw, "schema": build_config_schema()}
+        )
+
+    @app.put("/api/config")
+    async def put_config(request: Request) -> JSONResponse:
+        _check_token(request)
+        _require_same_origin(request)
+        if not config_path:
+            raise HTTPException(
+                status_code=404, detail="This server has no config path"
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=422, detail="Request body is not valid JSON"
+            )
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=422, detail="Config body must be a JSON object"
+            )
+
+        from jsonschema import Draft202012Validator
+
+        from biopb_tensor_server.config import save_config
+        from biopb_tensor_server.config_schema import build_config_schema
+
+        validator = Draft202012Validator(build_config_schema())
+        errors = [
+            {"path": [str(x) for x in e.absolute_path], "message": e.message}
+            for e in validator.iter_errors(body)
+        ]
+        if errors:
+            errors.sort(key=lambda d: d["path"])
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Config failed schema validation", "errors": errors},
+            )
+        try:
+            written = save_config(body, Path(config_path))
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not write config: {e}")
+        return JSONResponse(
+            {"saved": True, "restart_required": True, "path": str(written)}
+        )
+
+    @app.get("/api/admin/status")
+    async def admin_status(request: Request) -> JSONResponse:
+        _check_token(request)
+        health: Optional[Dict[str, Any]] = None
+        try:
+            health = _get_client().health_check()
+        except Exception as e:
+            logger.warning("admin status: backend health check failed: %s", e)
+        running = bool(health and health.get("status") == "SERVING")
+
+        def _h(key: str) -> Any:
+            return health.get(key) if health else None
+
+        return JSONResponse(
+            {
+                "running": running,
+                "pid": os.getpid(),
+                "version": _VERSION,
+                "config_path": str(config_path) if config_path else None,
+                "health": _h("status"),
+                "source_count": _h("source_count"),
+                "writable": _h("writable"),
+                "uptime_seconds": _h("uptime_seconds"),
+                "full_scan_in_progress": _h("full_scan_in_progress"),
+                "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            }
+        )
+
+    @app.post("/api/admin/restart")
+    async def admin_restart(request: Request) -> JSONResponse:
+        _check_token(request)
+        _require_same_origin(request)
+        import subprocess
+
+        from biopb.cli import _detach_kwargs
+
+        # Echo this daemon's own launch args so the restart comes back identically
+        # (same config / port / host / static dir); a bare restart would fall back
+        # to defaults and return mismatched (biopb/biopb#237).
+        cmd = [sys.executable, "-m", "biopb.cli", "server", "restart"]
+        if config_path:
+            cmd += ["--config", str(config_path)]
+        if web_port is not None:
+            cmd += ["--web-port", str(web_port)]
+        if web_host:
+            cmd += ["--web-host", str(web_host)]
+        if static_dir:
+            cmd += ["--static-dir", str(static_dir)]
+
+        # The token rides the child's environment (never the visible command
+        # line), matching how `biopb server start` hands it to the daemon.
+        env = dict(os.environ)
+        if token:
+            env["BIOPB_TENSOR_TOKEN"] = token
+        elif dev_mode:
+            env["BIOPB_WEB_DEV_BYPASS"] = "1"
+
+        # Detach so the child outlives this dying parent: `restart` SIGTERMs us,
+        # waits for the port to free, then relaunches a fresh daemon.
+        try:
+            subprocess.Popen(cmd, env=env, **_detach_kwargs())
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not spawn restart: {e}")
+        return JSONResponse(status_code=202, content={"restarting": True})
+
+    # -----------------------------------------------------------------------
     # Static files (optional)
     # -----------------------------------------------------------------------
 
@@ -1383,6 +1548,7 @@ def run(
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     static_dir: Optional[str] = None,  # Directory for static webapp files
+    config_path: Optional[str] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -1394,6 +1560,9 @@ def run(
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         static_dir=static_dir,
+        config_path=config_path,
+        web_host=host,
+        web_port=port,
     )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher
