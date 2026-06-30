@@ -207,6 +207,15 @@ class _Range:
             return f"a number >= {self.min}"
         return f"a number <= {self.max}"
 
+    def to_json_schema(self) -> dict:
+        """Inclusive bounds as JSON Schema keywords (for the schema emitter)."""
+        out: dict = {}
+        if self.min is not None:
+            out["minimum"] = self.min
+        if self.max is not None:
+            out["maximum"] = self.max
+        return out
+
 
 class _Enum:
     """Membership in a fixed set, optionally case-insensitive for strings."""
@@ -228,6 +237,17 @@ class _Enum:
 
     def describe(self) -> str:
         return "one of: " + ", ".join(sorted(map(str, self._display)))
+
+    def to_json_schema(self) -> dict:
+        """The allowed set as a JSON Schema ``enum`` -- but only for
+        case-sensitive enums. A case-insensitive set (``log_level``,
+        ``reduction_method``) accepts any casing the server folds, so a hard
+        ``enum`` of the canonical members would reject values the server
+        actually honors; there we stay lenient and surface the set via
+        :meth:`describe` in the property description instead."""
+        if self.case_insensitive:
+            return {}
+        return {"enum": sorted(self._display, key=str)}
 
 
 # Per-dataclass field constraints, keyed by class name (so this table can sit
@@ -669,106 +689,23 @@ def _warn_toml_deprecated(path: Path) -> None:
     )
 
 
-# Known keys per config section, for the unknown-key warning. Kept adjacent to
-# parse_config (the sole reader of these keys) so the two stay in sync: a key the
-# parser reads MUST be listed here or it mis-warns; a stale key listed here that
-# the parser no longer reads is harmless (it just won't warn). Accepted legacy
-# aliases are included so a valid back-compat config stays quiet: `watcher_type`
-# / `poll_interval` under [server], `path` under a source, and the pyramid knobs
-# that may still live under [precache]. Warn-only -- like _STRICT_VALIDATION,
-# this never raises during the migration window; it only catches the silent
-# drop-to-default a misnamed key (e.g. [cache] `memory_max_entries` instead of
-# `max_entries`, the dataclass field name vs. the file key) otherwise causes.
-_KNOWN_TOP_LEVEL_SECTIONS = {
-    "server",
-    "compute",
-    "cache",
-    "pyramid",
-    "precache",
-    "credentials",
-    "metadata_db",
-    "sources",
-}
-_KNOWN_SECTION_KEYS = {
-    "server": {
-        "host",
-        "port",
-        "log_level",
-        "log_scope_to_biopb",
-        "monitor_mode",
-        "watcher_type",  # legacy alias for monitor_mode
-        "rescan_interval",
-        "poll_interval",  # legacy alias for rescan_interval
-        "full_rescan_interval",
-        "stability_window",
-        "stable_rescans_required",
-        "probe_open_files",
-        "aggressive_dir_pruning",
-        "claim_generic_images",
-        "writable",
-        "write_dir",
-    },
-    "compute": {
-        "backend",
-        "gpu_min_input_mb",
-        "gpu_min_linear_input_mb",
-        "gpu_memory_safety_factor",
-        "gpu_min_merged_chunks",
-    },
-    "cache": {
-        "backend",
-        "max_entries",
-        "max_bytes",
-        "file_cache_dir",
-        "file_max_segment_mb",
-        "file_max_total_gb",
-    },
-    "pyramid": {
-        "reduction_method",
-        "threshold",
-        "downscale_factor",
-        "pixel_budget_cubic_root",
-    },
-    "precache": {
-        "enabled",
-        "idle_debounce_seconds",
-        "backlog_enabled",
-        "backlog_high_water",
-        "backlog_idle_recheck_seconds",
-        # back-compat: the pyramid knobs are still honored under [precache]
-        "reduction_method",
-        "threshold",
-        "downscale_factor",
-        "pixel_budget_cubic_root",
-    },
-    "credentials": {"default_profile", "profiles"},
-    "metadata_db": {
-        "enabled",
-        "max_query_results",
-        "max_list_flights_results",
-        "query_timeout_ms",
-    },
-}
-_KNOWN_SOURCE_KEYS = {
-    "type",
-    "url",
-    "path",  # legacy alias for url
-    "source_id",
-    "dim_labels",
-    "dataset",
-    "monitor",
-    "cloud",
-    "credentials_profile",
-}
-_KNOWN_CREDENTIAL_PROFILE_KEYS = {
-    "name",
-    "storage_type",
-    "key",
-    "secret",
-    "region",
-    "token",
-    "endpoint_url",
-}
+# The known-key set for the unknown-key warning is the config JSON Schema's
+# property lists, derived once and cached. The schema is generated from these
+# same dataclasses + _CONSTRAINTS (config_schema.build_config_schema), so the
+# warning, the published schema, and the value validation can no longer drift
+# from one hand-maintained key table -- they share one source (biopb/biopb#34,
+# superseding #234's hardcoded _KNOWN_* sets). Imported lazily to avoid a config
+# <-> config_schema import cycle (config_schema imports the dataclasses here).
+_KNOWN_KEYS_CACHE: Optional[tuple] = None
+
+
+def _known_config_keys() -> tuple:
+    global _KNOWN_KEYS_CACHE
+    if _KNOWN_KEYS_CACHE is None:
+        from biopb_tensor_server.config_schema import known_config_keys
+
+        _KNOWN_KEYS_CACHE = known_config_keys()
+    return _KNOWN_KEYS_CACHE
 
 
 def _warn_extra_keys(table: Dict[str, Any], known: set, label: str) -> None:
@@ -790,16 +727,19 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
     the classic trap is ``[cache] memory_max_entries`` (the dataclass field
     name) where the parser reads ``max_entries``, so a 1-entry cache silently
     stays at the 1024/512MB default. Value validation (range/enum) lives in the
-    dataclasses; this only flags *keys the parser never reads*. Warn-only.
+    dataclasses; this only flags *keys the parser never reads*. The known-key
+    set is the config JSON Schema's property lists (see :func:`_known_config_keys`).
+    Warn-only.
     """
     if not isinstance(data, dict):
         return
+    sections, section_keys, source_keys, profile_keys = _known_config_keys()
     for section in sorted(data):
-        if section not in _KNOWN_TOP_LEVEL_SECTIONS:
+        if section not in sections:
             logger.warning(
                 "Unknown config section [%s]; it is ignored. Known sections: %s.",
                 section,
-                ", ".join(sorted(_KNOWN_TOP_LEVEL_SECTIONS)),
+                ", ".join(sorted(sections)),
             )
             continue
         value = data[section]
@@ -807,19 +747,15 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
             # [[sources]] is a list of tables; validate each item's keys.
             for src in value if isinstance(value, list) else []:
                 if isinstance(src, dict):
-                    _warn_extra_keys(src, _KNOWN_SOURCE_KEYS, "sources")
+                    _warn_extra_keys(src, source_keys, "sources")
             continue
         if not isinstance(value, dict):
             continue
-        _warn_extra_keys(value, _KNOWN_SECTION_KEYS.get(section, set()), section)
+        _warn_extra_keys(value, section_keys.get(section, set()), section)
         if section == "credentials":
             for prof in value.get("profiles", []) or []:
                 if isinstance(prof, dict):
-                    _warn_extra_keys(
-                        prof,
-                        _KNOWN_CREDENTIAL_PROFILE_KEYS,
-                        "credentials.profiles",
-                    )
+                    _warn_extra_keys(prof, profile_keys, "credentials.profiles")
 
 
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
