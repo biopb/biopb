@@ -340,9 +340,16 @@ class MetadataDatabase:
         return result
 
     def sync_source_added(self, source_id: str, adapter: BackendAdapter) -> None:
-        """Sync a source to the metadata database.
+        """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
-        Called by SourceManager._on_source_added callback.
+        Called by ``SourceManager`` when a source is registered and, for a
+        previously-unresolved cloud source, again when it resolves (the upsert
+        overwrites the placeholder row with the concrete descriptor).
+
+        Raises on failure (descriptor read, JSON encode, or DB write) rather
+        than swallowing, so the caller can react -- the registration path rolls
+        back the matching ``register_source`` so the catalog and ``ListFlights``
+        never silently disagree. Logging is the caller's responsibility.
 
         Args:
             source_id: Unique source identifier
@@ -351,56 +358,53 @@ class MetadataDatabase:
         if not self._enabled:
             return
 
-        try:
-            conn = self._get_connection()
+        conn = self._get_connection()
 
-            # Get source descriptor
-            source_desc = adapter.get_source_descriptor()
+        # Get source descriptor and metadata
+        source_desc = adapter.get_source_descriptor()
+        metadata = adapter.get_metadata()
 
-            # Get metadata
-            metadata = adapter.get_metadata()
+        # Build shape_summary from first tensor
+        shape_summary = None
+        dtype = None
+        if source_desc.tensors:
+            first_tensor = source_desc.tensors[0]
+            shape_summary = json.dumps(list(first_tensor.shape))
+            dtype = first_tensor.dtype
 
-            # Build shape_summary from first tensor
-            shape_summary = None
-            dtype = None
-            if source_desc.tensors:
-                first_tensor = source_desc.tensors[0]
-                shape_summary = json.dumps(list(first_tensor.shape))
-                dtype = first_tensor.dtype
+        # Build row data
+        indexed_at = datetime.now()
+        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
-            # Build row data
-            indexed_at = datetime.now()
-            metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
+        # Insert or replace (upsert) - serialize writes with lock
+        with self._write_lock:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sources
+                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                [
+                    source_id,
+                    source_desc.source_url,
+                    source_desc.source_type,
+                    dtype,
+                    indexed_at,
+                    metadata_json,
+                    shape_summary,
+                    source_desc.data_resident,
+                ],
+            )
 
-            # Insert or replace (upsert) - serialize writes with lock
-            with self._write_lock:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    [
-                        source_id,
-                        source_desc.source_url,
-                        source_desc.source_type,
-                        dtype,
-                        indexed_at,
-                        metadata_json,
-                        shape_summary,
-                        source_desc.data_resident,
-                    ],
-                )
-
-            logger.debug(f"Synced source to metadata database: {source_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to sync source {source_id}: {e}", exc_info=True)
+        logger.debug(f"Synced source to metadata database: {source_id}")
 
     def sync_source_removed(self, source_id: str) -> None:
         """Remove a source from the metadata database.
 
-        Called by SourceManager._on_source_removed callback.
+        Called by ``SourceManager`` when a source is unregistered or rolled back.
+
+        Raises on DB failure rather than swallowing, so the caller can react;
+        logging is the caller's responsibility.
 
         Args:
             source_id: Unique source identifier
@@ -408,79 +412,10 @@ class MetadataDatabase:
         if not self._enabled:
             return
 
-        try:
-            conn = self._get_connection()
-            with self._write_lock:
-                conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
-            logger.debug(f"Removed source from metadata database: {source_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to remove source {source_id}: {e}", exc_info=True)
-
-    def initial_sync(self, server_sources: Dict[str, BackendAdapter]) -> None:
-        """Batch insert all existing sources on startup.
-
-        Called once after SourceManager is created to sync sources
-        that were discovered during initial discovery (before callbacks
-        were registered).
-
-        Args:
-            server_sources: Dict of source_id to BackendAdapter from server._sources
-        """
-        if not self._enabled:
-            return
-
-        if not server_sources:
-            return
-
         conn = self._get_connection()
-
-        # Build batch of rows (skip sources that fail to sync)
-        batch = []
-        failed_count = 0
-        for source_id, adapter in server_sources.items():
-            try:
-                source_desc = adapter.get_source_descriptor()
-                metadata = adapter.get_metadata()
-
-                shape_summary = None
-                dtype = None
-                if source_desc.tensors:
-                    first_tensor = source_desc.tensors[0]
-                    shape_summary = json.dumps(list(first_tensor.shape))
-                    dtype = first_tensor.dtype
-
-                batch.append(
-                    [
-                        source_id,
-                        source_desc.source_url,
-                        source_desc.source_type,
-                        dtype,
-                        datetime.now(),
-                        json.dumps(metadata, cls=NumpyEncoder) if metadata else None,
-                        shape_summary,
-                        source_desc.data_resident,
-                    ]
-                )
-            except Exception as e:
-                logger.error(f"Failed to sync source {source_id}: {e}", exc_info=True)
-                failed_count += 1
-
-        # Batch insert - serialize writes with lock
-        if batch:
-            with self._write_lock:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    batch,
-                )
-
-        logger.info(
-            f"Initial sync: inserted {len(batch)} sources into metadata database"
-        )
+        with self._write_lock:
+            conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+        logger.debug(f"Removed source from metadata database: {source_id}")
 
     def close(self) -> None:
         """Close the DuckDB connection."""
