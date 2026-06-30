@@ -1110,3 +1110,50 @@ class TestAdminRestartRoute:
             retry = tc.post("/api/admin/restart", headers=hdr)
         assert retry.status_code == 202
         popen.assert_called_once()
+
+
+# ===========================================================================
+# WebSocket render endpoint (/ws/render)
+#
+# The render pipeline itself is exercised by the HTTP /api/render path; these
+# lock in the auth + message-dispatch behaviour that the refactor split out of
+# the monolithic websocket handler (biopb/biopb#181).
+# ===========================================================================
+
+
+class TestWebSocketRender:
+    def test_unknown_action_returns_error(self, dev_client):
+        tc, _ = dev_client
+        with tc.websocket_connect("/ws/render") as ws:
+            ws.send_json({"action": "nope"})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"] == "Unknown action: nope"
+
+    def test_invalid_params_returns_error(self, dev_client):
+        tc, _ = dev_client
+        with tc.websocket_connect("/ws/render") as ws:
+            # RenderRequest requires source_id/tensor_id → validation error
+            ws.send_json({"action": "render", "params": {}})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"].startswith("Invalid params")
+
+    def test_missing_token_rejected(self, auth_client):
+        from fastapi import WebSocketDisconnect
+
+        tc, _ = auth_client
+        # Token enforced (auth_client) and none supplied → server closes 4001.
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with tc.websocket_connect("/ws/render") as ws:
+                ws.receive_json()
+        assert excinfo.value.code == 4001
+
+    def test_valid_query_token_accepts(self, auth_client):
+        tc, _ = auth_client
+        # Token via query param (browsers can't set WS headers).
+        with tc.websocket_connect(f"/ws/render?token={_TOKEN}") as ws:
+            ws.send_json({"action": "nope"})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"] == "Unknown action: nope"
