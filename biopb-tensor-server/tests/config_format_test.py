@@ -15,6 +15,7 @@ from biopb_tensor_server.config import (
     LEGACY_CONFIG_NAME,
     find_config,
     load_config,
+    parse_config,
 )
 
 # A config exercising server scalars, a nested table (cache), and a [[sources]]
@@ -159,3 +160,34 @@ def test_find_config_falls_back_to_toml(tmp_path):
 def test_find_config_defaults_to_canonical_when_absent(tmp_path):
     assert find_config(tmp_path) == tmp_path / CANONICAL_CONFIG_NAME
     assert isinstance(find_config(tmp_path), Path)
+
+
+# --- metadata_db.enabled deprecation (biopb/biopb#225) -----------------------
+
+
+def test_metadata_db_enabled_true_warns_deprecated(caplog):
+    """Explicitly setting the (now-deprecated) flag earns a warning even when on."""
+    with caplog.at_level(logging.WARNING):
+        cfg = parse_config({"metadata_db": {"enabled": True}})
+    assert cfg.metadata_db.enabled is True  # still honored during the window
+    msgs = [r.message for r in caplog.records if "metadata_db.enabled" in r.message]
+    assert msgs and any("deprecated" in m.lower() for m in msgs)
+    assert any("#225" in m for m in msgs)
+
+
+def test_metadata_db_enabled_false_warns_with_query_path(caplog):
+    """Disabling is the harmful case: the warning names the broken SQL catalog."""
+    with caplog.at_level(logging.WARNING):
+        cfg = parse_config({"metadata_db": {"enabled": False}})
+    assert cfg.metadata_db.enabled is False
+    msgs = [r.message for r in caplog.records if "metadata_db.enabled" in r.message]
+    assert msgs and any("deprecated" in m.lower() for m in msgs)
+    assert any("query_sources" in m for m in msgs)
+
+
+def test_metadata_db_absent_does_not_warn(caplog):
+    """The default path (flag omitted) stays silent -- DB is on by default."""
+    with caplog.at_level(logging.WARNING):
+        cfg = parse_config({})
+    assert cfg.metadata_db.enabled is True
+    assert not any("metadata_db.enabled" in r.message for r in caplog.records)
