@@ -858,3 +858,142 @@ class TestWindowsShutdownListener:
             _install_windows_shutdown_listener(server)  # must not raise
         assert threading.active_count() == before  # no watcher thread started
         assert server.should_exit is False
+
+
+# ===========================================================================
+# Admin routes — config read/write, status, restart (biopb/biopb#237)
+# ===========================================================================
+
+
+@pytest.fixture()
+def admin_client(tmp_path):
+    """Dev-mode TestClient wired with a config path and a health-reporting mock."""
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        '{"server": {"host": "127.0.0.1", "port": 8815}, "keep_me": {"x": 1}}'
+    )
+    mock_fc = _build_mock_client()
+    mock_fc.health_check.return_value = {
+        "status": "SERVING",
+        "source_count": 7,
+        "writable": True,
+        "uptime_seconds": 42,
+        "full_scan_in_progress": True,
+        "last_full_scan_finished_at": None,
+    }
+    with patch(
+        "biopb_tensor_server.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(
+            token=None,
+            dev_mode=True,
+            config_path=str(config_path),
+            web_host="127.0.0.1",
+            web_port=8814,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, config_path
+
+
+class TestAdminConfigRoutes:
+    def test_get_config_returns_path_config_and_schema(self, admin_client):
+        tc, config_path = admin_client
+        r = tc.get("/api/config")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["path"] == str(config_path)
+        assert body["config"]["server"]["port"] == 8815
+        assert "properties" in body["schema"]
+
+    def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        # downscale_factor of 1 is out of range (#34) -> schema rejects it.
+        r = tc.put(
+            "/api/config",
+            json={"pyramid": {"downscale_factor": 1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["errors"]
+        assert any("downscale_factor" in err["path"] for err in body["errors"])
+        # Nothing written: disk untouched.
+        assert config_path.read_text() == before
+
+    def test_put_valid_saves_and_preserves_unsurfaced_keys(self, admin_client):
+        import json
+
+        tc, config_path = admin_client
+        r = tc.put(
+            "/api/config",
+            json={"server": {"host": "127.0.0.1", "port": 9000}, "keep_me": {"x": 1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["saved"] is True and body["restart_required"] is True
+        on_disk = json.loads(config_path.read_text())
+        assert on_disk["server"]["port"] == 9000
+        assert on_disk["keep_me"] == {"x": 1}  # unsurfaced key survived
+        assert on_disk["$schema"] == "./biopb.schema.json"
+
+    def test_put_blocks_cross_origin_without_token_header(self, admin_client):
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": {"port": 9000}},
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        assert r.status_code == 403
+        assert config_path.read_text() == before  # guarded before any write
+
+
+class TestAdminStatusRoute:
+    def test_status_merges_health_and_process_facts(self, admin_client):
+        tc, config_path = admin_client
+        r = tc.get("/api/admin/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["running"] is True
+        assert body["health"] == "SERVING"
+        assert body["source_count"] == 7
+        assert body["full_scan_in_progress"] is True
+        assert body["last_full_scan_finished_at"] is None
+        assert body["config_path"] == str(config_path)
+        assert isinstance(body["pid"], int)
+        assert body["version"]
+
+
+class TestAdminRestartRoute:
+    def test_restart_spawns_detached_child_and_returns_202(self, admin_client):
+        tc, _ = admin_client
+        with patch("subprocess.Popen") as popen:
+            r = tc.post(
+                "/api/admin/restart",
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+        assert r.status_code == 202
+        assert r.json() == {"restarting": True}
+        popen.assert_called_once()
+        cmd = popen.call_args.args[0]
+        assert cmd[1:5] == ["-m", "biopb.cli", "server", "restart"]
+        # The daemon echoes its own launch args so restart comes back identically.
+        assert cmd[cmd.index("--web-port") + 1] == "8814"
+        assert cmd[cmd.index("--web-host") + 1] == "127.0.0.1"
+        assert "--config" in cmd
+        # dev-bypass token rides the child env (never the command line).
+        assert popen.call_args.kwargs["env"].get("BIOPB_WEB_DEV_BYPASS") == "1"
+        assert not any(str(arg).startswith("BIOPB") for arg in cmd)
+
+    def test_restart_blocks_cross_origin(self, admin_client):
+        tc, _ = admin_client
+        with patch("subprocess.Popen") as popen:
+            r = tc.post(
+                "/api/admin/restart",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+        assert r.status_code == 403
+        popen.assert_not_called()

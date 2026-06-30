@@ -1042,6 +1042,7 @@ def launch(
             port=web_port,
             cors_origins=effective_cors,
             static_dir=str(static_dir) if static_dir else None,
+            config_path=str(config),
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
