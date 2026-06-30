@@ -64,6 +64,7 @@ credentials_profile = "aws-prod"
 
 from __future__ import annotations
 
+import copy
 import getpass
 import json
 import logging
@@ -631,6 +632,158 @@ def load_config(path: Path) -> ServerConfig:
     return parse_config(data)
 
 
+# Name of the sibling JSON Schema file save_config drops next to the config so
+# editors validate it offline (relative $schema), independent of any hosted URL.
+SCHEMA_SIDECAR_NAME = "biopb.schema.json"
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write *data* as pretty JSON to *path* atomically (temp file + os.replace).
+
+    Writing to a sibling temp file and renaming over the target means a reader
+    never sees a half-written file, and a failed write leaves the original
+    untouched. Unlike biopb-mcp's same-named helper this *raises* on failure --
+    the admin endpoint surfaces a write/permission error to the user rather than
+    silently swallowing it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def save_config(data: Dict[str, Any], path: Path) -> Path:
+    """Write *data* to disk as canonical JSON, atomically, and return the path.
+
+    The admin endpoint's config writer (biopb/biopb#237). The inverse of
+    :func:`load_config`, but it round-trips on the **raw dict** the caller
+    supplies -- not a dataclass -- so advanced or future keys the form never
+    surfaced survive the write. Routing through ``parse_config`` -> dataclass ->
+    ``asdict`` would clobber them (and there is no dataclass->dict projection).
+
+    Behavior:
+    - JSON is canonical. If *path* points at a legacy ``biopb.toml`` the write
+      targets the sibling ``biopb.json`` and the old TOML is renamed to
+      ``biopb.toml.bak``, so :func:`find_config`'s both-files shadow warning
+      never fires (biopb/biopb#34).
+    - A sibling ``biopb.schema.json`` (the output of ``build_config_schema``) is
+      written next to the config and a *relative* ``"$schema":
+      "./biopb.schema.json"`` pointer is embedded, so editors validate the
+      config offline with no hosted schema URL.
+    - The write is atomic; on failure the file on disk is untouched and the error
+      propagates so the caller can surface it.
+    """
+    if isinstance(path, str):
+        path = Path(path)
+
+    # JSON is canonical: redirect a .toml target to its sibling biopb.json and
+    # back the legacy file up so find_config's both-files warning never fires.
+    legacy_toml: Optional[Path] = None
+    if path.suffix.lower() == ".toml":
+        legacy_toml = path
+        path = path.with_name(CANONICAL_CONFIG_NAME)
+
+    schema_path = path.with_name(SCHEMA_SIDECAR_NAME)
+
+    # build_config_schema lives in config_schema, which imports the dataclasses
+    # here -- import lazily to avoid the cycle (see _known_config_keys).
+    from biopb_tensor_server.config_schema import build_config_schema
+
+    # Embed a relative $schema pointer (offline editor validation, no hosted URL).
+    payload = dict(data)
+    payload["$schema"] = f"./{SCHEMA_SIDECAR_NAME}"
+
+    _atomic_write_json(schema_path, build_config_schema())
+    _atomic_write_json(path, payload)
+
+    if legacy_toml is not None and legacy_toml.exists():
+        backup = legacy_toml.with_name(legacy_toml.name + ".bak")
+        legacy_toml.replace(backup)
+        logger.info(
+            "Migrated legacy %s to %s; backed up the old file to %s (biopb/biopb#34).",
+            legacy_toml.name,
+            path.name,
+            backup.name,
+        )
+
+    return path
+
+
+# Secret-bearing keys on a [[credentials.profiles]] entry. These are at-rest
+# secrets (S3/GCS/Azure credentials, per remote.CredentialProfile); the admin
+# endpoint redacts them out of GET /api/config so they never reach the browser,
+# and restores them from disk on PUT so saving the redacted form does not
+# clobber them (biopb/biopb#237).
+REDACTED_SENTINEL = "***REDACTED***"
+_SECRET_PROFILE_KEYS = ("key", "secret", "token")
+
+
+def _iter_profile_dicts(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The `[[credentials.profiles]]` dicts in a raw config, or [] if absent."""
+    if not isinstance(config, dict):
+        return []
+    creds = config.get("credentials")
+    profiles = creds.get("profiles") if isinstance(creds, dict) else None
+    if not isinstance(profiles, list):
+        return []
+    return [p for p in profiles if isinstance(p, dict)]
+
+
+def redact_config_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep copy of *config* with credential-profile secrets masked.
+
+    Each present, non-empty ``key``/``secret``/``token`` on every credential
+    profile is replaced with :data:`REDACTED_SENTINEL` so it is never sent to
+    the browser by ``GET /api/config``. The on-disk file is untouched;
+    :func:`restore_redacted_secrets` puts the real values back on a later PUT.
+    """
+    redacted = copy.deepcopy(config)
+    for profile in _iter_profile_dicts(redacted):
+        for key in _SECRET_PROFILE_KEYS:
+            if profile.get(key):
+                profile[key] = REDACTED_SENTINEL
+    return redacted
+
+
+def restore_redacted_secrets(
+    incoming: Dict[str, Any], existing: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return a copy of *incoming* with redaction sentinels resolved from disk.
+
+    For every credential-profile secret whose incoming value is the redaction
+    sentinel (the UI round-tripped the masked GET response unchanged), substitute
+    the real value from the matching profile in *existing* (matched by ``name``).
+    If no prior value exists the sentinel key is dropped rather than persisted, so
+    the literal sentinel is never written to disk. A profile that supplies a real
+    new value overwrites as usual.
+    """
+    merged = copy.deepcopy(incoming)
+    existing_by_name = {
+        p.get("name"): p for p in _iter_profile_dicts(existing) if p.get("name")
+    }
+    for profile in _iter_profile_dicts(merged):
+        prior = existing_by_name.get(profile.get("name"), {})
+        for key in _SECRET_PROFILE_KEYS:
+            if profile.get(key) == REDACTED_SENTINEL:
+                if prior.get(key):
+                    profile[key] = prior[key]
+                else:
+                    profile.pop(key, None)
+    return merged
+
+
 def _read_config_file(path: Path) -> Dict[str, Any]:
     """Read a config file into a plain dict, dispatching on format.
 
@@ -735,6 +888,10 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
         return
     sections, section_keys, source_keys, profile_keys = _known_config_keys()
     for section in sorted(data):
+        if section.startswith("$"):
+            # `$schema` / `$id` are tolerated meta keys (save_config embeds a
+            # relative `$schema`); they are neither config sections nor typos.
+            continue
         if section not in sections:
             logger.warning(
                 "Unknown config section [%s]; it is ignored. Known sections: %s.",

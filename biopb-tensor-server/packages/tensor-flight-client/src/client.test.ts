@@ -357,3 +357,86 @@ describe("TensorHttpClient.diagnostics", () => {
     expect(d.metrics_ready).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Admin (config read/write, status, restart)
+// ---------------------------------------------------------------------------
+
+describe("TensorHttpClient.getAdminConfig", () => {
+  it("GETs /api/config and returns path, config, schema", async () => {
+    const body = {
+      path: "/home/u/.config/biopb/biopb.json",
+      config: { server: { port: 8815 }, keep_me: { x: 1 } },
+      schema: { properties: {} },
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(body));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const r = await c.getAdminConfig();
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/config`);
+    expect(r.path).toBe(body.path);
+    expect(r.config.keep_me).toEqual({ x: 1 });
+    expect(r.schema).toHaveProperty("properties");
+  });
+});
+
+describe("TensorHttpClient.putAdminConfig", () => {
+  it("PUTs /api/config with the config body and returns the save result", async () => {
+    const result = { saved: true, restart_required: true, path: "/cfg/biopb.json" };
+    mockFetch.mockResolvedValueOnce(jsonResponse(result));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const r = await c.putAdminConfig({ server: { port: 9000 } });
+    const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${BASE}/api/config`);
+    expect(opts.method).toBe("PUT");
+    expect(JSON.parse(opts.body as string)).toEqual({ server: { port: 9000 } });
+    expect(r.restart_required).toBe(true);
+  });
+
+  it("throws TensorApiError carrying the 422 validation errors on detail", async () => {
+    const body = {
+      detail: "Config failed schema validation",
+      errors: [{ path: ["pyramid", "downscale_factor"], message: "1 is less than the minimum of 2" }],
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(body, 422));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    await c.putAdminConfig({ pyramid: { downscale_factor: 1 } }).then(
+      () => { throw new Error("should have thrown"); },
+      (e: unknown) => {
+        expect(e).toBeInstanceOf(TensorApiError);
+        const err = e as TensorApiError;
+        expect(err.status).toBe(422);
+        const detail = err.detail as typeof body;
+        expect(detail.errors[0]!.path).toEqual(["pyramid", "downscale_factor"]);
+      },
+    );
+  });
+});
+
+describe("TensorHttpClient.getAdminStatus", () => {
+  it("GETs /api/admin/status and returns merged health + process facts", async () => {
+    const body = {
+      running: true, pid: 123, version: "0.4.7", config_path: "/cfg/biopb.json",
+      health: "SERVING", source_count: 7, writable: false, uptime_seconds: 42,
+      full_scan_in_progress: true, last_full_scan_finished_at: null,
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(body));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const r = await c.getAdminStatus();
+    expect(mockFetch.mock.calls[0]![0]).toBe(`${BASE}/api/admin/status`);
+    expect(r.running).toBe(true);
+    expect(r.full_scan_in_progress).toBe(true);
+    expect(r.source_count).toBe(7);
+  });
+});
+
+describe("TensorHttpClient.restartServer", () => {
+  it("POSTs /api/admin/restart and returns the 202 body", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ restarting: true }, 202));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const r = await c.restartServer();
+    const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${BASE}/api/admin/restart`);
+    expect(opts.method).toBe("POST");
+    expect(r.restarting).toBe(true);
+  });
+});
