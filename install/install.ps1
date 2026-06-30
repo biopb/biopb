@@ -255,7 +255,11 @@ try {
     . (Resolve-EnginePath)
 
     $BiopbHome  = $env:USERPROFILE
-    $configFile = Join-Path $BiopbHome ".config\biopb\biopb.toml"
+    # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
+    # pre-#34 install still counts as "a config exists" for the keep prompt.
+    $configDir  = Join-Path $BiopbHome ".config\biopb"
+    $configFile = Join-Path $configDir "biopb.json"
+    $legacyConfig = Join-Path $configDir "biopb.toml"
 
     # ----- Collect choices interactively (the GUI collects these on wizard pages) -----
 
@@ -271,14 +275,15 @@ try {
     # Data directory / keep-config decision, mirroring the original flow.
     $dataDir = ""
     $keepConfig = $false
-    $configExists = Test-Path -LiteralPath $configFile
+    $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
         $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
         if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
-        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $configFile to apply it)."
+        $existing = if (Test-Path -LiteralPath $configFile) { $configFile } else { $legacyConfig }
+        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $existing to apply it)."
         $keepConfig = $true
     }
     elseif ($env:BIOPB_DATA_DIR) {

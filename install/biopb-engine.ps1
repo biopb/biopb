@@ -41,8 +41,8 @@
 [CmdletBinding()]
 param(
     # Target microscopy data directory. When empty AND -KeepConfig is not set, the
-    # engine keeps an existing biopb.toml if present, else falls back to a
-    # dedicated data subfolder (never the profile root).
+    # engine keeps an existing config (biopb.json or legacy biopb.toml) if present,
+    # else falls back to a dedicated data subfolder (never the profile root).
     [string]$DataDir = "",
 
     # Install the browser data viewer (webapp.tar.gz).
@@ -58,7 +58,7 @@ param(
     # Skip starting the data server at the end (BIOPB_NO_SERVER_START=1 equivalent).
     [switch]$NoServerStart,
 
-    # Explicitly keep an existing biopb.toml untouched (do not rewrite it).
+    # Explicitly keep an existing config untouched (do not rewrite it).
     [switch]$KeepConfig,
 
     # Mark the written source as cloud/synced storage (OneDrive, Dropbox, iCloud):
@@ -191,6 +191,78 @@ function Report-Error {
 function Set-FileUtf8NoBom {
     param([string]$Path, [string]$Content)
     [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Write the tensor-server config as JSON (biopb.json) -- the canonical format
+# (biopb/biopb#34). JSON generation is stdlib here (ConvertTo-Json), so the old
+# hand-rolled TOML escaping (`-replace '\\','\\' -replace '"','\"'`) is gone.
+#
+# When -Prior points at an existing biopb.json its settings (server/cache/...)
+# are loaded and *preserved*; only the `sources` list is replaced with the chosen
+# data dir, so re-running with a new folder no longer discards tuning. PowerShell
+# has no TOML parser, so migrating from a legacy biopb.toml starts from the
+# installer defaults instead (the caller retires the .toml). `metadata_db.enabled`
+# is intentionally omitted -- the DB is on by default and the flag is deprecated
+# (biopb/biopb#225).
+function Write-ServerConfig {
+    param(
+        [string]$Path,         # biopb.json to write
+        [string]$DataDir,
+        [bool]$Cloud,
+        [string]$Prior = ""    # existing config to preserve (.json) or migrate (.toml)
+    )
+
+    $data = $null
+    if ($Prior -and $Prior.EndsWith(".json") -and (Test-Path -LiteralPath $Prior)) {
+        try { $data = Get-Content -Raw -LiteralPath $Prior | ConvertFrom-Json } catch { $data = $null }
+    }
+    if ($null -eq $data) {
+        $data = [pscustomobject]@{
+            server = [pscustomobject]@{
+                host                   = "127.0.0.1"
+                port                   = 8815
+                aggressive_dir_pruning = $true
+            }
+            cache = [pscustomobject]@{
+                backend             = "file"
+                file_max_segment_mb = 256
+                file_max_total_gb   = 128
+            }
+        }
+    }
+
+    # One watched folder, replacing any prior sources. A cloud/synced root admits
+    # Files-On-Demand placeholders as unresolved sources (cloud = true).
+    $src = [ordered]@{ url = $DataDir; monitor = $true }
+    if ($Cloud) { $src["cloud"] = $true }
+    $sources = @([pscustomobject]$src)
+    if ($data.PSObject.Properties.Name -contains 'sources') {
+        $data.sources = $sources
+    } else {
+        $data | Add-Member -NotePropertyName sources -NotePropertyValue $sources -Force
+    }
+
+    # Strip the noisy `metadata_db.enabled = true` (the default) if a prior
+    # config carried it, mirroring the fresh-template skip -- the DB is on by
+    # default and the flag warns on every startup. `enabled = false` is a
+    # deliberate user choice (read-only mount, disk constraints, etc.) -- preserve
+    # it; the deprecation warning on startup is the intended signal, and Phase 4
+    # is the single hard cutover.
+    if ($data.PSObject.Properties.Name -contains 'metadata_db') {
+        $md = $data.metadata_db
+        if ($null -ne $md -and $md.PSObject.Properties.Name -contains 'enabled') {
+            if ($md.enabled -ne $false) {
+                $remaining = @($md.PSObject.Properties.Name)
+                if ($remaining.Count -le 1) {
+                    $data.PSObject.Properties.Remove('metadata_db')
+                } else {
+                    $md.PSObject.Properties.Remove('enabled')
+                }
+            }
+        }
+    }
+
+    Set-FileUtf8NoBom -Path $Path -Content ($data | ConvertTo-Json -Depth 20)
 }
 
 # Abort if the most recent native command failed. PowerShell does not honor
@@ -728,7 +800,7 @@ function Invoke-BiopbInstall {
     if ($DryRun) {
         $BiopbHome  = $env:USERPROFILE
         $ConfigDir  = Join-Path $BiopbHome ".config\biopb"
-        $configFile = Join-Path $ConfigDir "biopb.toml"
+        $configFile = Join-Path $ConfigDir "biopb.json"
         $InstallWebapp = [bool]$Webapp
         $stepMsgs = @(
             "Checking system...",
@@ -1077,8 +1149,15 @@ function Invoke-BiopbInstall {
     Report-Step 5 "Config..."
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    $configFile = Join-Path $ConfigDir "biopb.toml"
-    $configExists = Test-Path -LiteralPath $configFile
+    $configFile   = Join-Path $ConfigDir "biopb.json"   # canonical (biopb/biopb#34)
+    $legacyConfig = Join-Path $ConfigDir "biopb.toml"   # pre-#34 installs
+
+    # An existing config in either format counts; biopb.json wins when both exist
+    # (matches the server's find_config).
+    $existingConfig = ""
+    if (Test-Path -LiteralPath $configFile)        { $existingConfig = $configFile }
+    elseif (Test-Path -LiteralPath $legacyConfig)  { $existingConfig = $legacyConfig }
+    $configExists = [bool]$existingConfig
 
     # Decide keep-vs-write. The interactive prompt now lives in the front-end; the
     # engine just honors the resolved choice:
@@ -1092,71 +1171,44 @@ function Invoke-BiopbInstall {
         $effectiveDataDir = Join-Path $BiopbHome 'Microscopy'
     }
 
+    # $activeConfig is the file the running server will read -- the JSON we write,
+    # or the untouched existing file when the user keeps it.
+    $activeConfig = $existingConfig
     if ($effectiveKeep) {
-        Report-Ok "Keeping current config: $configFile"
+        Report-Ok "Keeping current config: $existingConfig"
     } else {
-        # Preserve any previous config by renaming it to a timestamped backup.
-        if ($configExists) {
-            $backup = "$configFile.bak." + (Get-Date -Format "yyyyMMddHHmmss")
-            Move-Item -LiteralPath $configFile -Destination $backup -Force
-            Report-Info "Backed up previous config to $backup"
-        }
-
-        # Escape for a TOML basic string: backslashes first, then quotes.
-        $tomlDataDir = $effectiveDataDir -replace '\\', '\\' -replace '"', '\"'
-
         # Cloud/synced root? Auto-detect from the path so any front-end (GUI,
         # console menu, manual entry, BIOPB_DATA_DIR) gets it right; -Cloud forces
         # it on for roots the probes miss. A cloud source admits dehydrated
         # Files-On-Demand placeholders as unresolved sources instead of hanging
         # discovery -- see the tensor server's cloud-storage phase 2.
         $isCloud = [bool]$Cloud -or (Test-IsCloudPath -Path $effectiveDataDir)
-        $sourceBlock = @"
-[[sources]]
-url = "$tomlDataDir"
-monitor = true
-"@
-        if ($isCloud) {
-            $sourceBlock += "`n" + @"
-# Cloud/synced folder (OneDrive/Dropbox/iCloud): index Files-On-Demand
-# placeholders as unresolved sources without downloading them; each resolves
-# lazily on first read.
-cloud = true
-"@
+
+        # Load existing settings (json) / migrate from defaults (toml) and replace
+        # only the sources block -- a new data dir no longer discards tuning (#34).
+        Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Prior $existingConfig
+        $activeConfig = $configFile
+
+        # Retire a legacy TOML we just superseded so the server does not warn about
+        # both files shadowing (find_config prefers biopb.json).
+        if ($existingConfig -eq $legacyConfig -and (Test-Path -LiteralPath $legacyConfig)) {
+            $backup = "$legacyConfig.bak." + (Get-Date -Format "yyyyMMddHHmmss")
+            Move-Item -LiteralPath $legacyConfig -Destination $backup -Force
+            Report-Info "Migrated legacy TOML config to JSON (old file backed up)"
         }
 
-        $tomlContent = @"
-[server]
-host = "127.0.0.1"
-port = 8815
-aggressive_dir_pruning = true
-
-# Cache decoded chunks on disk as Arrow IPC segments so repeat reads skip
-# re-decoding the raw format. The file backend is now Windows-safe -- it copies
-# batches off the segment mmap so eviction can unlink the file (copy-on-read,
-# biopb/biopb#5). Matches the POSIX installer.
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
-
-[metadata_db]
-enabled = true
-
-$sourceBlock
-"@
-        Set-FileUtf8NoBom -Path $configFile -Content $tomlContent
+        $verb = if ($existingConfig) { "Updated" } else { "Created" }
         if ($isCloud) {
-            Report-Ok "Created: $configFile (cloud data dir: $effectiveDataDir)"
+            Report-Ok "${verb}: $configFile (cloud data dir: $effectiveDataDir)"
             Report-Info "Cloud-synced folder: images are indexed without downloading (cloud = true)."
         } else {
-            Report-Ok "Created: $configFile (data dir: $effectiveDataDir)"
+            Report-Ok "${verb}: $configFile (data dir: $effectiveDataDir)"
         }
     }
 
     # ===== 6. Start the data server =====
     Report-Step 6 "Starting data server..."
-    Start-DataServer -BiopbHome $BiopbHome -ConfigFile $configFile -NoStart ([bool]$NoServerStart)
+    Start-DataServer -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
 
     # ===== 7. Wire biopb-mcp into the user's agent system =====
     Report-Step 7 "Configuring MCP client..."
@@ -1166,7 +1218,7 @@ $sourceBlock
     # the summary wording is a front-end concern, not the engine's.
     $result = [pscustomobject]@{
         BiopbHome      = $BiopbHome
-        ConfigFile     = $configFile
+        ConfigFile     = $activeConfig
         ConfigDir      = $ConfigDir
         WebappInstalled = $InstallWebapp
         McpNeedsManual = $script:McpNeedsManual

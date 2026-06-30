@@ -70,7 +70,9 @@ are produced.
 
 ## Config & data locations
 
-- Data-server config: `~/.config/biopb/biopb.toml` (preserved on rerun)
+- Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
+  legacy `biopb.toml` still loads and is migrated to JSON when you pick a new
+  data folder)
 - biopb-mcp config: `~/.config/biopb-mcp/config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Webapp: `~/.local/share/biopb/webapp`
