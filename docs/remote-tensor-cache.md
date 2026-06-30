@@ -710,6 +710,12 @@ upstream and local+proxy add no new dispatch layer — they fall out of the flat
   server the compute plane is pointed at.
 - **Per-user eviction budget.** The proxy `file_max_total_bytes` should default
   to a whole-user budget, not a per-worker slice (`#178`).
+- **Share one upstream connection per endpoint** (`biopb/biopb#249`). Each
+  `RemoteTensorAdapter` builds its own `TensorFlightClient`, so a bare-host
+  upstream mirrored into N sources opens N connections to the same
+  `(endpoint, token)` (plus the expansion + re-list throwaways). Pool them by
+  `(normalized_location, token)`. Connection-efficiency only — the data path is
+  unaffected.
 - **Auth shape.** Confirm `storage_type="biopb-tensor"` credential profile vs a
   direct `SourceConfig.token` field vs env var. (Profile recommended for
   consistency with the existing remote-credential machinery.)
