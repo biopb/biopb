@@ -234,6 +234,29 @@ and re-implements no chunking. The segment cache — already wired into `do_get`
 turns it into the persistent shared cache of `#178` goal 2, **shared across all
 upstreams and local sources** of this proxy.
 
+> **Implemented (adapter + data path).** `adapters/remote_tensor.py`
+> `RemoteTensorAdapter(SourceAdapter, TensorAdapter)`, registered
+> `register_with_type("tensor-server", …)` in `adapters/__init__.py`. It holds a
+> lazy `TensorFlightClient(upstream, cache_bytes=0, token)`, mirrors the upstream
+> source/tensor descriptors with `array_id` rewritten local-ward, overrides
+> `is_resident()` → `True` (a `grpc://` url is a remote scheme, so the base would
+> wrongly call it non-resident and trip unresolved-source handling), and overrides
+> `resolve_chunk_data` to forward the rewritten `chunk_id` to the upstream
+> `do_get` and cache the returned `RecordBatch` under the **local** key. The
+> `array_id` byte-splice is `chunk.rewrite_chunk_id_array_id` (pure splice on the
+> length-prefixed field; bounds/scale tail untouched). `get_read_plan` is the
+> **inherited uniform-grid planner** for this slice — correct because a scaled
+> `chunk_id` forwarded to the upstream is downsampled there regardless of which
+> levels it advertised; mirroring the upstream's *advertised* pyramid (so native
+> OME-Zarr levels are reused rather than recomputed) is the read-plan-delegation
+> follow-up in [§10](#10-open-questions--follow-ups). `create_from_config` handles
+> the single-source `grpc://host:port/<upstream_source_id>` url form; the bare-host
+> "mirror everything" expansion + alias-namespaced registration is the §3 slice.
+> Tests: `tests/remote_tensor_adapter_test.py` (byte-splice unit + end-to-end
+> proxy of an in-process upstream: mirrored catalog, byte-identical pixels, scaled
+> read, and the inherited segment cache — upstream hit exactly once on a re-read,
+> entry `locate_entry`-able for the mmap fast path).
+
 ---
 
 ## 3. Catalog mirroring & expansion

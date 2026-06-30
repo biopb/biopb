@@ -79,6 +79,34 @@ def encode_chunk_id(
     return b"".join(parts)
 
 
+def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
+    """Replace only the array_id field of a chunk_id, preserving everything else.
+
+    The array_id is a self-describing length-prefixed field at the very front of
+    the chunk_id (``[uint32 len][array_id utf-8]``); every byte after it -- ndim,
+    the start/stop bounds, and any scale suffix on a scaled chunk_id -- is
+    independent of the array_id string. So a remote-tensor *proxy* can map a
+    chunk_id between its local (possibly alias-namespaced) array_id and the
+    upstream's array_id with a pure byte splice, without understanding bounds or
+    scale encoding ("understands nothing"). The splice round-trips for both
+    regular and scaled chunk_ids because ``decode_chunk_id`` / ``is_scaled_chunk``
+    / ``decode_scale_info`` all recompute their offsets from the (new) length
+    prefix.
+
+    Args:
+        chunk_id: An encoded chunk_id (regular or scaled).
+        new_array_id: The array_id to substitute in.
+
+    Returns:
+        A new chunk_id with the array_id field replaced and all trailing bytes
+        (ndim/bounds/scale) preserved verbatim.
+    """
+    old_len = struct.unpack(">I", chunk_id[:4])[0]
+    tail = chunk_id[4 + old_len :]
+    new_bytes = new_array_id.encode("utf-8")
+    return struct.pack(">I", len(new_bytes)) + new_bytes + tail
+
+
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload).
