@@ -64,6 +64,7 @@ credentials_profile = "aws-prod"
 
 from __future__ import annotations
 
+import copy
 import getpass
 import json
 import logging
@@ -718,6 +719,69 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
         )
 
     return path
+
+
+# Secret-bearing keys on a [[credentials.profiles]] entry. These are at-rest
+# secrets (S3/GCS/Azure credentials, per remote.CredentialProfile); the admin
+# endpoint redacts them out of GET /api/config so they never reach the browser,
+# and restores them from disk on PUT so saving the redacted form does not
+# clobber them (biopb/biopb#237).
+REDACTED_SENTINEL = "***REDACTED***"
+_SECRET_PROFILE_KEYS = ("key", "secret", "token")
+
+
+def _iter_profile_dicts(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The `[[credentials.profiles]]` dicts in a raw config, or [] if absent."""
+    if not isinstance(config, dict):
+        return []
+    creds = config.get("credentials")
+    profiles = creds.get("profiles") if isinstance(creds, dict) else None
+    if not isinstance(profiles, list):
+        return []
+    return [p for p in profiles if isinstance(p, dict)]
+
+
+def redact_config_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep copy of *config* with credential-profile secrets masked.
+
+    Each present, non-empty ``key``/``secret``/``token`` on every credential
+    profile is replaced with :data:`REDACTED_SENTINEL` so it is never sent to
+    the browser by ``GET /api/config``. The on-disk file is untouched;
+    :func:`restore_redacted_secrets` puts the real values back on a later PUT.
+    """
+    redacted = copy.deepcopy(config)
+    for profile in _iter_profile_dicts(redacted):
+        for key in _SECRET_PROFILE_KEYS:
+            if profile.get(key):
+                profile[key] = REDACTED_SENTINEL
+    return redacted
+
+
+def restore_redacted_secrets(
+    incoming: Dict[str, Any], existing: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Return a copy of *incoming* with redaction sentinels resolved from disk.
+
+    For every credential-profile secret whose incoming value is the redaction
+    sentinel (the UI round-tripped the masked GET response unchanged), substitute
+    the real value from the matching profile in *existing* (matched by ``name``).
+    If no prior value exists the sentinel key is dropped rather than persisted, so
+    the literal sentinel is never written to disk. A profile that supplies a real
+    new value overwrites as usual.
+    """
+    merged = copy.deepcopy(incoming)
+    existing_by_name = {
+        p.get("name"): p for p in _iter_profile_dicts(existing) if p.get("name")
+    }
+    for profile in _iter_profile_dicts(merged):
+        prior = existing_by_name.get(profile.get("name"), {})
+        for key in _SECRET_PROFILE_KEYS:
+            if profile.get(key) == REDACTED_SENTINEL:
+                if prior.get(key):
+                    profile[key] = prior[key]
+                else:
+                    profile.pop(key, None)
+    return merged
 
 
 def _read_config_file(path: Path) -> Dict[str, Any]:
