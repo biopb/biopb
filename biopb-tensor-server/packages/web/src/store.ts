@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
-import { type ColorValue, guessDefaultColor, extractChannelNames } from "./utils/colorUtils";
+import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
@@ -177,7 +177,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   getChannelColor(sourceId, channelIdx) {
-    const { channelColors, channelNames } = get();
+    const { channelColors } = get();
     const sourceColors = channelColors[sourceId];
     if (sourceColors && sourceColors[channelIdx]) {
       return sourceColors[channelIdx];
