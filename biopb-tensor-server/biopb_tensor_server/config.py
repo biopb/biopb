@@ -493,7 +493,12 @@ class MetadataDbConfig:
     Replaces O(n) in-memory scans with indexed DuckDB queries.
 
     Attributes:
-        enabled: Enable metadata database for source filtering queries
+        enabled: DEPRECATED (biopb/biopb#225) -- the metadata database is
+            becoming mandatory and this flag will be removed. Setting it (and
+            especially ``enabled = false``) emits a deprecation warning at config
+            load; disabling breaks the server-side ``query_sources`` SQL catalog
+            the biopb-mcp guide relies on. Still honored during the migration
+            window. Enable metadata database for source filtering queries.
         max_query_results: Safety cap on SQL query returned rows (truncation signaled via schema metadata)
         max_list_flights_results: Safety cap on list_flights() returned sources (truncation signaled via schema metadata)
         query_timeout_ms: Query execution timeout in milliseconds
@@ -795,6 +800,27 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
     # Parse metadata_db settings
     metadata_db_data = data.get("metadata_db", {})
+    # `metadata_db.enabled` is deprecated: the metadata DB (server-side DuckDB
+    # catalog) is becoming mandatory because it is the canonical source-browsing
+    # surface the rest of the system assumes -- the biopb-mcp guide steers agents
+    # to `client.query_sources(sql, ...)` (complete, server-side) over the capped
+    # `list_sources()`, and that SQL path only exists when the DB is enabled.
+    # Warn during the migration window; removal (always-on) is biopb/biopb#225.
+    if "enabled" in metadata_db_data:
+        if metadata_db_data.get("enabled"):
+            logger.warning(
+                "Config option `metadata_db.enabled` is deprecated and will be "
+                "removed; the metadata database is becoming mandatory (always on). "
+                "Drop the flag from your config. See biopb/biopb#225."
+            )
+        else:
+            logger.warning(
+                "Config option `metadata_db.enabled = false` is deprecated and "
+                "will stop being honored; the metadata database is becoming "
+                "mandatory. Disabling it breaks the server-side SQL catalog "
+                "(`client.query_sources(...)`) the biopb-mcp guide relies on, "
+                "forcing the capped `list_sources()` fallback. See biopb/biopb#225."
+            )
     metadata_db_enabled = metadata_db_data.get("enabled", True)
     metadata_db_max_query_results = metadata_db_data.get("max_query_results", 100000)
     metadata_db_max_list_flights_results = metadata_db_data.get(
