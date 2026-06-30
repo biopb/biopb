@@ -191,6 +191,73 @@ class TestRemoteTensorProxy:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+class TestBareHostExpansion:
+    """A bare grpc://host:port source mirrors *every* upstream source (§3)."""
+
+    def test_expansion_mirrors_all_sources_namespaced(self, simple_zarr_array):
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.config import SourceConfig, discover_sources
+
+        zarr_path, shape, _ = simple_zarr_array
+        arr = zarr.open_array(zarr_path, mode="r")
+        upstream = TensorFlightServer("grpc://localhost:0")
+        upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+        upstream.register_source("img2", ZarrAdapter(arr, "img2", ["y", "x"]))
+        _serve(upstream)
+        try:
+            expanded = discover_sources(
+                SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+            )
+            by_id = {s.source_id: s for s in expanded}
+            assert set(by_id) == {"lab__img", "lab__img2"}
+            assert by_id["lab__img"].url == f"grpc://localhost:{upstream.port}/img"
+            assert all(s.type == "tensor-server" for s in expanded)
+
+            # the expanded configs build working adapters that serve through a proxy
+            from biopb.tensor import TensorFlightClient
+            from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+            proxy = TensorFlightServer("grpc://localhost:0")
+            for cfg in expanded:
+                proxy.register_source(
+                    cfg.source_id, RemoteTensorAdapter.create_from_config(cfg)
+                )
+            _serve(proxy)
+            try:
+                client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+                assert client.get_tensor("lab__img2").shape == shape
+                client.close()
+            finally:
+                proxy.shutdown()
+        finally:
+            upstream.shutdown()
+
+
+def test_create_from_config_resolves_token_from_credentials_profile():
+    """A per-upstream credentials profile (storage_type=biopb-tensor) supplies the
+    upstream bearer token to the adapter -- the multi-upstream auth path (§1/§3)."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
+
+    creds = CredentialsConfig(
+        default_profile=None,
+        profiles=[
+            CredentialProfile(
+                name="lab-store", storage_type="biopb-tensor", token="s3cr3t"
+            )
+        ],
+    )
+    source = SourceConfig(url="grpc://lab:8815/img", credentials_profile="lab-store")
+    adapter = RemoteTensorAdapter.create_from_config(source, creds)
+    assert adapter._token == "s3cr3t"
+    assert adapter._upstream_source_id == "img"
+    assert adapter._upstream_location == "grpc://lab:8815"
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     """A second resolve_chunk_data for the same chunk is served from the file
     cache without a second upstream fetch -- the proxy inherits the segment cache."""

@@ -351,16 +351,18 @@ class TestTensorServerSourceType:
         assert s.type == "tensor-server"
         assert s.is_remote is True
 
-    def test_bare_grpc_source_auto_classifies_to_tensor_server(self):
-        # No explicit type: Case 0 auto-detects grpc -> tensor-server instead
-        # of raising "Remote URL requires explicit 'type'".
-        src = SourceConfig(url="grpc://lab:8815", alias="lab")
+    def test_grpc_source_auto_classifies_to_tensor_server(self):
+        # No explicit type: Case 0 auto-detects grpc -> tensor-server instead of
+        # raising "Remote URL requires explicit 'type'". Uses the single-source
+        # url form so discovery does not reach out to an upstream (bare-host
+        # expansion is exercised in the proxy integration test).
+        src = SourceConfig(url="grpc://lab:8815/img", alias="lab")
         assert src.type is None  # not set at construction
         out = discover_sources(src)
         assert len(out) == 1
         assert out[0].type == "tensor-server"
         assert out[0].alias == "lab"
-        assert out[0].url == "grpc://lab:8815"
+        assert out[0].url == "grpc://lab:8815/img"
 
     def test_non_grpc_remote_without_type_still_errors(self):
         import pytest
@@ -390,3 +392,55 @@ class TestTensorServerSourceType:
         )
         aliases = {s.url: s.alias for s in cfg.sources}
         assert aliases == {"grpc://lab:8815": "lab", "grpc://arc:8815": "arc"}
+
+    def test_single_source_form_namespaces_source_id(self):
+        # grpc://host:port/<id> mirrors one upstream source under <alias>__<id>
+        out = discover_sources(
+            SourceConfig(url="grpc://lab:8815/experiment1", alias="lab")
+        )
+        assert len(out) == 1
+        assert out[0].source_id == "lab__experiment1"
+        assert out[0].url == "grpc://lab:8815/experiment1"
+        assert out[0].type == "tensor-server"
+
+    def test_single_source_form_no_alias_keeps_verbatim_id(self):
+        out = discover_sources(SourceConfig(url="grpc://lab:8815/experiment1"))
+        assert len(out) == 1
+        assert out[0].source_id == "experiment1"
+
+    def test_namespaced_source_id_helper(self):
+        from biopb_tensor_server.config import _namespaced_source_id
+
+        assert _namespaced_source_id("lab", "img") == "lab__img"
+        assert _namespaced_source_id(None, "img") == "img"
+
+    def test_alias_clash_collision_raises(self):
+        import pytest
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        # Two upstreams sharing alias "lab", each mirroring a same-named source
+        # -> both namespace to "lab__img": a flat-catalog collision.
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "lab"},
+                ]
+            }
+        )
+        with pytest.raises(ValueError, match="Duplicate source_id 'lab__img'"):
+            resolve_all_sources(cfg)
+
+    def test_distinct_aliases_do_not_collide(self):
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "arc"},
+                ]
+            }
+        )
+        ids = {s.source_id for s in resolve_all_sources(cfg)}
+        assert ids == {"lab__img", "arc__img"}

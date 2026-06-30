@@ -1395,6 +1395,7 @@ class SourceManager:
                 source_id=claim.source_id,
                 dim_labels=claim.dim_labels,
                 dataset=claim.extra_config.get("dataset"),
+                credentials_profile=claim.extra_config.get("credentials_profile"),
             )
 
             if self._claim_is_unresolved(claim):
@@ -1632,12 +1633,21 @@ def create_source_manager(
     # Seed static sources as direct claims (explicit config, no filesystem walk)
     # These are added first so monitored discovery skips paths already claimed.
     for source in static_sources:
+        extra_config = {}
+        if source.dataset:
+            extra_config["dataset"] = source.dataset
+        # credentials_profile is dropped by the claim->SourceConfig rebuild in
+        # _register_source_claim; carry it here so a tensor-server proxy's
+        # per-upstream token (and any remote source's profile) reaches
+        # create_from_config.
+        if source.credentials_profile:
+            extra_config["credentials_profile"] = source.credentials_profile
         claim = SourceClaim(
             source_type=source.type,
             primary_path=source.url,  # str for URL support
             source_id=source.source_id,
             dim_labels=source.dim_labels,
-            extra_config={"dataset": source.dataset} if source.dataset else {},
+            extra_config=extra_config,
             # A static source explicitly flagged cloud is always deferred: the
             # user said "don't open it eagerly". If it is in fact resident, the
             # first access still resolves it cheaply.

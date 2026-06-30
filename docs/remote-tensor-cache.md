@@ -304,6 +304,30 @@ empty tensors / `data_resident=false`) and resolve on first `GetFlightInfo`. Thi
 reuses the exact catalog-surface/serve-surface split already built for cloud, and
 keeps a momentarily-down upstream from aborting startup.
 
+> **Implemented (expansion + namespacing + collision check; mirror-once).**
+> `config.discover_sources` gained a `credentials_config` param and a
+> `tensor-server` branch (`_discover_tensor_server`): the single-source
+> `grpc://host:port/<id>` form registers under the alias-namespaced local id
+> (`_namespaced_source_id` → `<alias>__<id>`, verbatim when no alias); the
+> bare-host `grpc://host:port` form connects (`TensorFlightClient(cache_bytes=0,
+> token)`), `list_sources()`, and yields one concrete single-source `SourceConfig`
+> per upstream source. `resolve_all_sources` threads `config.credentials` through
+> and runs `_check_tensor_server_id_collisions` over the flattened set — a
+> source_id clash involving a proxy fails fast naming the `alias` fix (non-proxy
+> clashes keep historical last-wins). Per-upstream tokens reach the adapter because
+> the static-seed `SourceClaim.extra_config` now carries `credentials_profile` and
+> `_register_source_claim` rebuilds it onto the `SourceConfig` (it was previously
+> dropped). Expansion is **synchronous at startup** under the serve path's
+> `tolerant=True`, so an unreachable upstream is warned-and-skipped rather than
+> aborting — the `UnresolvedSourceAdapter` deferral above and backgrounding the
+> upstream list are still follow-ups. The `monitor=true → upstream re-list`
+> reconcile below is **not** yet wired (a `tensor-server` source's `monitor` flag
+> is currently inert — `_is_monitored_claim` rejects remote urls). Tests:
+> `config_discovery_test.py::TestTensorServerSourceType` (single-source
+> namespacing, collision, distinct-alias) and
+> `remote_tensor_adapter_test.py::TestBareHostExpansion` + the credentials-profile
+> token test.
+
 ---
 
 ## 4. Identifier policy
