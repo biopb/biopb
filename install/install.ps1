@@ -23,6 +23,10 @@
     deployment. By default it tracks the latest STABLE release; set
     $env:BIOPB_INSTALL_RC = "1" to track the latest release candidate.
 
+    Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
+    prompt (keeps an existing config; a fresh install uses $env:BIOPB_DATA_DIR or
+    a default, and leaves remote plugins off unless $env:BIOPB_REMOTE_PLUGINS = "1").
+
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
 #>
 
@@ -34,6 +38,14 @@ $ProgressPreference = 'SilentlyContinue'
 $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
 $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
+
+# Non-interactive / unmanned mode: $env:BIOPB_NONINTERACTIVE = "1" suppresses every
+# prompt so the installer can upgrade unattended (Task Scheduler, CI, image bakes).
+# The upgrade path is the common case: an existing config is kept untouched. A fresh
+# unattended install uses $env:BIOPB_DATA_DIR (else a default) and leaves the remote
+# algorithm plugins OFF unless $env:BIOPB_REMOTE_PLUGINS = "1" -- consent can't be
+# asked unattended, so the off-site IP-logging servers are never silently enabled.
+$script:NonInteractive = [bool]$env:BIOPB_NONINTERACTIVE -and ($env:BIOPB_NONINTERACTIVE -ne '0')
 
 # ----- Output helpers used by the front-end's own prompts/summary -------------
 function Write-Step { param([string]$Msg) Write-Host ""; Write-Host $Msg -ForegroundColor White }
@@ -47,6 +59,7 @@ function Write-Cmd  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor C
 # Pause before the script ends so the final message stays readable. Skipped when
 # input is non-interactive (CI, piped stdin) so automation does not hang.
 function Wait-ForExit {
+    if ($script:NonInteractive) { return }
     if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
         Write-Host ""
         Read-Host "  Press Enter to exit" | Out-Null
@@ -139,6 +152,9 @@ function Show-Banner {
 # Two light-hearted pre-flight confirmations. Returns $true if the user opted in
 # to filing a bug report should things go sideways. Exits if they bail.
 function Invoke-Preflight {
+    # Unattended runs skip the pre-flight banter; don't nag with a bug-report
+    # offer no one is watching for.
+    if ($script:NonInteractive) { return $false }
     Write-Host ""
     Write-Host "  --- Before we begin ---" -ForegroundColor Yellow
     Write-Host ""
@@ -247,8 +263,15 @@ try {
     $keepConfig = $false
     $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
-        $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
-        if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
+        # Existing config + no override: keep it. Non-interactive skips the prompt
+        # (the unmanned-upgrade fast path); interactive offers "0) keep" as default.
+        if ($script:NonInteractive) {
+            $keepConfig = $true
+            Write-Note "Non-interactive: keeping existing config."
+        } else {
+            $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
+            if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
+        }
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
@@ -259,6 +282,12 @@ try {
     elseif ($env:BIOPB_DATA_DIR) {
         $dataDir = $env:BIOPB_DATA_DIR
         Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
+    }
+    elseif ($script:NonInteractive) {
+        # Fresh unattended install with no data dir given: fall back to a dedicated
+        # subfolder (never the profile root, which OneDrive placeholders can hang).
+        $dataDir = Join-Path $BiopbHome 'Microscopy'
+        Write-Note "Non-interactive: no BIOPB_DATA_DIR set; defaulting to $dataDir"
     }
     else {
         $dataDir = Select-DataDir -BiopbHome $BiopbHome
@@ -273,13 +302,23 @@ try {
     $noRemotePlugins = $false
     $mcpConfig = Join-Path $BiopbHome ".config\biopb-mcp\config.json"
     if (-not (Test-Path -LiteralPath $mcpConfig)) {
-        Write-Host ""
-        Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
-        Write-Inf "certain computations, e.g. cell segmentation. The servers are"
-        Write-Inf "hosted at UConn Health and log client IP addresses."
-        Write-Host ""
-        $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
-        if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
+        if ($script:NonInteractive) {
+            # Consent can't be asked unattended: enable only on explicit opt-in.
+            if ($env:BIOPB_REMOTE_PLUGINS -eq '1') {
+                Write-Ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            } else {
+                $noRemotePlugins = $true
+                Write-Ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            }
+        } else {
+            Write-Host ""
+            Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
+            Write-Inf "certain computations, e.g. cell segmentation. The servers are"
+            Write-Inf "hosted at UConn Health and log client IP addresses."
+            Write-Host ""
+            $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
+            if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
+        }
     }
 
     # ----- Drive the engine in-process, rendering its progress in color (-Mode console) -----

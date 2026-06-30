@@ -5,6 +5,11 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
+# Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
+# an existing config; a fresh install uses BIOPB_DATA_DIR or a default, and leaves
+# the remote algorithm plugins off unless BIOPB_REMOTE_PLUGINS=1). Example:
+#   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
+#
 # This installs prebuilt wheels from the latest biopb GitHub release-v*
 # deployment (the single release that carries all three mutually-paired wheels).
 # By default it tracks the latest STABLE release (clean X.Y.Z). Set
@@ -435,7 +440,16 @@ _setup_mcp() {
         _info "hosted at UConn Health and log client IP addresses."
         _info ""
         local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
-        if _confirm "Enable the remote algorithm plugins?"; then
+        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+            # Consent can't be asked unattended: enable only on explicit opt-in,
+            # otherwise leave the IP-logging servers off.
+            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
+                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            else
+                process_image_servers=''
+                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            fi
+        elif _confirm "Enable the remote algorithm plugins?"; then
             _ok "Remote algorithm plugins enabled"
         else
             process_image_servers=''
@@ -891,6 +905,21 @@ install_biopb() {
     if [ "${BIOPB_INSTALL_WEBAPP:-1}" != "0" ]; then INSTALL_WEBAPP=1; else INSTALL_WEBAPP=0; fi
     if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
 
+    # ===== Non-interactive / unmanned mode =====
+    # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
+    # unattended (cron upgrades, CI, image bakes). The upgrade path is the common
+    # case: an existing config is kept untouched, no questions asked. For a fresh
+    # unattended install, the data dir comes from BIOPB_DATA_DIR (else a default),
+    # and the remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1
+    # — consent can't be asked unattended, so we never silently enable the off-site
+    # IP-logging servers.
+    if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
+        NONINTERACTIVE=1
+        _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
+    else
+        NONINTERACTIVE=0
+    fi
+
     # ===== 1. Install uv (if needed) =====
     _step "[1/7] Ensuring build tools..."
 
@@ -1158,8 +1187,15 @@ install_biopb() {
     # An empty DATA_DIR is the "keep" sentinel.
     local DATA_DIR
     if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
-        _pick_data_dir DATA_DIR keep
-        echo ""
+        # Existing config + no override: keep it. Non-interactive skips the prompt
+        # (the unmanned-upgrade fast path); interactive offers "0) keep" as default.
+        if [ "$NONINTERACTIVE" = "1" ]; then
+            DATA_DIR=""
+            _note "Non-interactive: keeping existing config ($EXISTING_CONFIG)."
+        else
+            _pick_data_dir DATA_DIR keep
+            echo ""
+        fi
     elif [ -n "$EXISTING_CONFIG" ]; then
         # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
         # install. With a config already present we keep it (its data dir wins).
@@ -1168,6 +1204,11 @@ install_biopb() {
     elif [ -n "${BIOPB_DATA_DIR:-}" ]; then
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
+    elif [ "$NONINTERACTIVE" = "1" ]; then
+        # Fresh unattended install with no data dir given: fall back to a dedicated
+        # subfolder (never the home root, which would walk AppData / OneDrive).
+        DATA_DIR="$HOME/Microscopy"
+        _note "Non-interactive: no BIOPB_DATA_DIR set; defaulting to $DATA_DIR"
     else
         _pick_data_dir DATA_DIR
         echo ""
@@ -1218,6 +1259,8 @@ install_biopb() {
     _detect_agents
     if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
         _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
+    elif [ "$NONINTERACTIVE" = "1" ]; then
+        _note "Non-interactive: no AI agent detected and none installed; set one up later and rerun to wire it in."
     else
         _info ""
         _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
