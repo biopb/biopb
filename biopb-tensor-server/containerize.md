@@ -74,12 +74,12 @@ docker run -d \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to TOML config file. If set, all other variables below are ignored |
+| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file. If set, all other variables below are ignored |
 | `DATA_DIR` | `/data` | Container path of microscopy files; mount the host dir onto it with `-v /host/data:/data` (used when generating config) |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port in container - HTTP=BASE+4, gRPC=BASE+5 |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
-| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written. **Not to be confused with**  `$TMPDIR` |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written. **Not to be confused with**  `$TMPDIR` |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Unset → cache lands on the container's **ephemeral writable layer** at `/tmp/biopb-cache-0`. Set it (e.g. `-e TMPDIR=/cache` with `-v vol:/cache`) to move the cache onto a volume — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB |
 | `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB |
@@ -92,7 +92,7 @@ The server keeps a **file-backed cache of decoded chunks** (Arrow IPC segments).
 
 **Size.** When config is generated from env vars, the cap defaults to
 **`CACHE_MAX_TOTAL_GB=16`** (16 GB). Under Docker that means up to **16 GB can
-accumulate on the writable layer**. 
+accumulate on the writable layer**.
 
 **Safely increase cache size** by putting the cache on a mounted volume instead of the writable layer.
 
@@ -106,7 +106,7 @@ docker run \
 
 > Note: `CACHE_MAX_TOTAL_GB` / `CACHE_MAX_SEGMENT_MB` only apply when the
 > entrypoint **generates** the config from env vars. If you supply your own
-> `CONFIG_FILE`, set the limits in its `[cache]` block (`file_max_total_gb`,
+> `CONFIG_FILE`, set the limits in its `cache` object (`file_max_total_gb`,
 > `file_max_segment_mb`, `file_cache_dir`) instead.
 
 ### Examples
@@ -120,9 +120,9 @@ docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
 
 # With custom config file
 docker run -d -p 8814:8814 -p 8815:8815 \
-    -v ~/my-config.toml:/custom.toml \
+    -v ~/my-config.json:/custom.json \
     -v ~/data:/data \
-    -e CONFIG_FILE=/custom.toml \
+    -e CONFIG_FILE=/custom.json \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server:latest
 
@@ -165,14 +165,14 @@ singularity run \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_FILE` | (unset) | Path to TOML config file (if set and exists, uses this file; otherwise config is generated from env vars) |
+| `CONFIG_FILE` | (unset) | Path to JSON (or legacy TOML) config file (if set and exists, uses this file; otherwise config is generated from env vars) |
 | `DATA_DIR` | `/data` | Path of microscopy files. Singularity auto-mounts `$HOME`, `/tmp`, `$PWD` (and usually `/scratch`, `/project`). Use `--bind /host:/container` for locations the site doesn't auto-mount. |
 | `MONITOR` | `true` | Enable live filesystem monitoring (poll-based) |
 | `BIOPB_BASE_PORT` | `8810` | Base port - HTTP=BASE+4, gRPC=BASE+5 |
 | `BIOPB_TENSOR_TOKEN` | (auto-generated) | Access token for webapp and gRPC; printed once in the logs when auto-generated |
 | `BIOPB_WEB_DEV_BYPASS` | (unset) | Set to `true` for dev mode (no token check). **Takes effect only together with `BIOPB_BIND_LOCALHOST=true`** — dev bypass is permitted only on a loopback `--web-host`. Use only on a trusted node reached via localhost. |
 | `BIOPB_BIND_LOCALHOST` | (unset) | Set to `true` to bind both HTTP and gRPC to localhost (useful on shared nodes; also the prerequisite for `BIOPB_WEB_DEV_BYPASS`). |
-| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.toml` is written |
+| `BIOPB_TMP` | `/tmp/biopb-${USER}` | Where the generated `runtime-config.json` is written |
 | `TMPDIR/TEMP/TMP` | `/tmp` | Cache parent dir. Singularity auto-binds host `/tmp`, so the cache lands at `/tmp/biopb-cache-<uid>` on host disk (persistent). Set it to relocate — see [Cache Storage](#cache-storage) |
 | `CACHE_MAX_TOTAL_GB` | `16` | Max total size of the on-disk file cache, in GB (only applies when generating config from env vars; ignored if `CONFIG_FILE` is set) |
 | `CACHE_MAX_SEGMENT_MB` | `256` | Max size of each cache segment file, in MB (same applicability as above) |
@@ -189,7 +189,7 @@ singularity run \
 
 # Custom config file (point CONFIG_FILE at the host path directly; no --bind)
 singularity run \
-    --env CONFIG_FILE=$HOME/my-config.toml \
+    --env CONFIG_FILE=$HOME/my-config.json \
     --env BIOPB_TENSOR_TOKEN=mytoken \
     biopb-tensor-server.sif
 
@@ -291,8 +291,8 @@ docker logs biopb-tensor
 ```
 
 Common causes:
-- A mounted `CONFIG_FILE` that is malformed (TOML parse/validation error) — check `docker logs` for the traceback
-- A `CONFIG_FILE` with no `[[sources]]` → "No data sources configured" (exit 1)
+- A mounted `CONFIG_FILE` that is malformed (JSON/TOML parse or validation error) — check `docker logs` for the traceback
+- A `CONFIG_FILE` with no `sources` (JSON) / `[[sources]]` (TOML) → "No data sources configured" (exit 1)
 - A custom config whose sources are all invalid/unreachable (bad paths, or remote sources that all fail auth) → "No sources loaded successfully" (exit 1)
 - A port already in use inside the container (e.g. `--network host` colliding with a host process on 8814/8815)
 

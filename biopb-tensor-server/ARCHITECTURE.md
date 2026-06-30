@@ -226,7 +226,7 @@ argument to `create_app`, or via `--cors` / `--web-url` on the CLI launcher.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb-tensor.toml [--web-port 8814] [--web-host 127.0.0.1] [--static-dir /app/webapp] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--web-port 8814] [--web-host 127.0.0.1] [--static-dir /app/webapp] [--dev] [--open] [--web-url URL] [--cors ORIGIN]
 
 # for grpc only (no web server)
 biopb-tensor-server serve ...
@@ -239,7 +239,7 @@ Startup sequence:
 2. Resolve token: `--token` flag → `BIOPB_TENSOR_TOKEN` env var → interactive
    prompt (3 attempts) → `secrets.token_urlsafe(32)` auto-generated.
 3. Print the one-time access token.
-4. Load `biopb-tensor.toml` config; instantiate adapters and register sources.
+4. Load `biopb.json` config; instantiate adapters and register sources.
 5. Start `TensorFlightServer` in a **daemon thread**.
 6. Derive CORS origins from `--web-url` (default `http://localhost:8814`) or
    explicit `--cors` flags; optionally schedule `webbrowser.open(--web-url)`.
@@ -462,23 +462,29 @@ class SourceManager:
 
 #### Configuration
 
-Enable monitoring per source in TOML:
+Enable monitoring per source:
 
-```toml
-[[sources]]
-url = "/data/acquisition/"
-monitor = true  # Enable live filesystem monitoring
+```json
+{
+  "sources": [
+    { "url": "/data/acquisition/", "monitor": true }
+  ]
+}
 ```
 
 Only local directories can be monitored (remote URLs not supported).
 
 #### Cloud / synced-folder sources (`cloud = true`, cloud-storage phase 2)
 
-```toml
-[[sources]]
-url = "/home/u/OneDrive/microscopy/"
-cloud = true   # admit dehydrated (offline-placeholder) data as *unresolved* sources
+```json
+{
+  "sources": [
+    { "url": "/home/u/OneDrive/microscopy/", "cloud": true }
+  ]
+}
 ```
+
+(`cloud = true` admits dehydrated (offline-placeholder) data as *unresolved* sources.)
 
 On a synced folder (OneDrive/Dropbox/iCloud "Files-On-Demand"), data appears as
 local paths but content is *dehydrated* until accessed — and reading any byte
@@ -606,36 +612,41 @@ watcher.stop()          # Then: signal subprocess shutdown
 
 ---
 
-## Configuration (`biopb-tensor.toml`)
+## Configuration (`biopb.json`)
 
-```toml
-[server]
-host = "0.0.0.0"
-port = 8815
-
-[cache]
-max_bytes = 2_000_000_000   # 2 GB in-process
-
-[pyramid]                    # authoritative resolution-level definition
-threshold = 4096             # max X/Y extent of the coarsest level
-downscale_factor = 4         # per-level step
-pixel_budget_cubic_root = 512  # coarsest level voxel budget = this**3
-reduction_method = "area"    # on-the-fly downsampling for computed levels
-
-[[sources]]
-url        = "/data/" # triggers recursive discovery
-
-[[sources]]
-source_id  = "my-zarr"
-type       = "zarr"
-url        = "/data/experiment.zarr"
-dim_labels = ["z", "y", "x"]
-
-[[sources]]
-source_id  = "ome"
-type       = "ome-zarr"
-url        = "/data/multiscale.zarr"
+```json
+{
+  "server": { "host": "0.0.0.0", "port": 8815 },
+  "cache": { "max_bytes": 2000000000 },
+  "pyramid": {
+    "threshold": 4096,
+    "downscale_factor": 4,
+    "pixel_budget_cubic_root": 512,
+    "reduction_method": "area"
+  },
+  "sources": [
+    { "url": "/data/" },
+    {
+      "source_id": "my-zarr",
+      "type": "zarr",
+      "url": "/data/experiment.zarr",
+      "dim_labels": ["z", "y", "x"]
+    },
+    {
+      "source_id": "ome",
+      "type": "ome-zarr",
+      "url": "/data/multiscale.zarr"
+    }
+  ]
+}
 ```
+
+Notes: `cache.max_bytes` is the in-process limit (2 GB above); `[pyramid]` is the
+authoritative resolution-level definition (`threshold` = max X/Y extent of the
+coarsest level, `downscale_factor` = per-level step, `pixel_budget_cubic_root`
+= coarsest-level voxel budget cubed, `reduction_method` = on-the-fly
+downsampling for computed levels); the bare `/data/` source triggers recursive
+discovery.
 
 ---
 
@@ -800,7 +811,7 @@ location /api/ {
 The API server (`http://localhost:8814`) must be reachable from the browser — configure CORS origins accordingly:
 
 ```
-biopb-tensor-server launch config.toml --web-url https://yourdomain.com --token mytoken...
+biopb-tensor-server launch config.json --web-url https://yourdomain.com --token mytoken...
 ```
 
 ### Auth flow
