@@ -24,8 +24,9 @@
     $env:BIOPB_INSTALL_RC = "1" to track the latest release candidate.
 
     Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
-    prompt (keeps an existing config; a fresh install uses $env:BIOPB_DATA_DIR or
-    a default, and leaves remote plugins off unless $env:BIOPB_REMOTE_PLUGINS = "1").
+    prompt (keeps an existing config; leaves remote plugins off unless
+    $env:BIOPB_REMOTE_PLUGINS = "1"). It is an upgrade feature -- a FRESH unattended
+    install must also set $env:BIOPB_DATA_DIR or it errors out.
 
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
 #>
@@ -284,10 +285,14 @@ try {
         Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
     }
     elseif ($script:NonInteractive) {
-        # Fresh unattended install with no data dir given: fall back to a dedicated
-        # subfolder (never the profile root, which OneDrive placeholders can hang).
-        $dataDir = Join-Path $BiopbHome 'Microscopy'
-        Write-Note "Non-interactive: no BIOPB_DATA_DIR set; defaulting to $dataDir"
+        # Non-interactive is an UPGRADE feature (no existing config = fresh install).
+        # We won't guess a data directory unattended, so require BIOPB_DATA_DIR and
+        # fail clearly rather than silently indexing some default folder.
+        Write-Err2 "Non-interactive mode needs an existing install or an explicit data directory."
+        Write-Inf "  No config found at $configFile -- this looks like a fresh install."
+        Write-Inf "  Set `$env:BIOPB_DATA_DIR to provision unattended, or rerun without"
+        Write-Inf "  `$env:BIOPB_NONINTERACTIVE to choose interactively."
+        exit 1
     }
     else {
         $dataDir = Select-DataDir -BiopbHome $BiopbHome

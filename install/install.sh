@@ -6,8 +6,9 @@
 # Idempotent: rerun to upgrade to latest version
 #
 # Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
-# an existing config; a fresh install uses BIOPB_DATA_DIR or a default, and leaves
-# the remote algorithm plugins off unless BIOPB_REMOTE_PLUGINS=1). Example:
+# an existing config; leaves the remote algorithm plugins off unless
+# BIOPB_REMOTE_PLUGINS=1). It is an upgrade feature — a FRESH unattended install
+# must also pass BIOPB_DATA_DIR or it errors out. Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
 # This installs prebuilt wheels from the latest biopb GitHub release-v*
@@ -907,12 +908,13 @@ install_biopb() {
 
     # ===== Non-interactive / unmanned mode =====
     # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
-    # unattended (cron upgrades, CI, image bakes). The upgrade path is the common
-    # case: an existing config is kept untouched, no questions asked. For a fresh
-    # unattended install, the data dir comes from BIOPB_DATA_DIR (else a default),
-    # and the remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1
-    # — consent can't be asked unattended, so we never silently enable the off-site
-    # IP-logging servers.
+    # unattended (cron upgrades, CI, image bakes). It is primarily an UPGRADE
+    # feature: with an existing config, that config is kept untouched and nothing
+    # is asked. A fresh unattended install must pass BIOPB_DATA_DIR (we will not
+    # guess a data directory) — without it the run errors out (see step 5) rather
+    # than indexing a default folder. Either way the remote algorithm plugins stay
+    # DISABLED unless BIOPB_REMOTE_PLUGINS=1 — consent can't be asked unattended,
+    # so we never silently enable the off-site IP-logging servers.
     if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
         NONINTERACTIVE=1
         _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
@@ -1205,10 +1207,14 @@ install_biopb() {
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
     elif [ "$NONINTERACTIVE" = "1" ]; then
-        # Fresh unattended install with no data dir given: fall back to a dedicated
-        # subfolder (never the home root, which would walk AppData / OneDrive).
-        DATA_DIR="$HOME/Microscopy"
-        _note "Non-interactive: no BIOPB_DATA_DIR set; defaulting to $DATA_DIR"
+        # Non-interactive is an UPGRADE feature (no existing config = fresh install).
+        # We won't guess a data directory unattended, so require BIOPB_DATA_DIR and
+        # fail clearly rather than silently indexing some default folder.
+        _err "Non-interactive mode needs an existing install or an explicit data directory."
+        _info "  No config found at $CONFIG_FILE — this looks like a fresh install."
+        _info "  Set BIOPB_DATA_DIR=/path/to/microscopy to provision unattended, or"
+        _info "  rerun without BIOPB_NONINTERACTIVE to choose interactively."
+        exit 1
     else
         _pick_data_dir DATA_DIR
         echo ""

@@ -85,10 +85,13 @@ Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
 Set `BIOPB_NONINTERACTIVE=1` to suppress **every** prompt, so the installer can
 run from cron / Task Scheduler / CI to upgrade in place. The common case — a
 rerun with an existing config — keeps that config untouched and asks nothing.
-For a *fresh* unattended install: the data directory comes from `BIOPB_DATA_DIR`
-(else a `~/Microscopy` default), and the remote algorithm plugins stay **off**
-unless `BIOPB_REMOTE_PLUGINS=1` (consent can't be asked unattended, so the
-off-site IP-logging servers are never enabled silently). Both console front-ends
+
+It is an **upgrade** feature, not a fresh-install one: with no existing config
+the installer won't guess a data directory, so a *fresh* unattended install
+**errors out unless `BIOPB_DATA_DIR` is set** (which lets you provision a new box
+unattended on purpose). The remote algorithm plugins stay **off** unless
+`BIOPB_REMOTE_PLUGINS=1` (consent can't be asked unattended, so the off-site
+IP-logging servers are never enabled silently). Both console front-ends
 (`install.sh`, `install.ps1`) honor these; the env vars apply to the `curl|bash`
 and `irm|iex` paths alike.
 
