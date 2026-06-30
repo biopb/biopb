@@ -79,6 +79,7 @@ class SourceManager:
         stable_rescans_required: int = 0,
         aggressive_dir_pruning: bool = False,
         cloud_roots: Optional[Set[Path]] = None,
+        monitored_upstreams: Optional[List[SourceConfig]] = None,
     ):
         self._server = server
         # First-class catalog dependency: injected by create_source_manager so
@@ -93,6 +94,11 @@ class SourceManager:
         # Under these, dehydrated entries are admitted and registered as unresolved
         # sources that resolve lazily on first access (cloud-storage phase 2).
         self._cloud_roots: Set[Path] = cloud_roots or set()
+        # Monitored tensor-server (bare-host grpc://) upstreams: their catalog is
+        # re-listed on the force-full cadence and reconciled like a directory walk
+        # (biopb/biopb#178). Single-source grpc://host/<id> entries are not here --
+        # there is nothing to re-list for one fixed source.
+        self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
         self._stability_window = stability_window
@@ -255,7 +261,28 @@ class SourceManager:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan across monitored directories."""
+        """Run one periodic rescan: re-list monitored upstreams, then walk dirs."""
+        # tensor-server upstream re-list (biopb/biopb#178) runs on the force-full
+        # cadence only -- a network list_flights is too costly per incremental
+        # tick (this mirrors the cloud-subtree force-full gate). When there are no
+        # monitored *dirs*, this is the sole reconcile, so it also drives the
+        # progressive-discovery freshness signals + first-scan gate the dir path
+        # below would otherwise own.
+        if self._monitored_upstreams and self._should_force_full_rescan():
+            upstream_only = not self._monitored_dirs
+            if upstream_only:
+                self._server.set_full_scan_in_progress(True)
+            try:
+                self._reconcile_upstreams()
+            finally:
+                if upstream_only:
+                    self._last_full_rescan_at = time.time()
+                    self._server.set_last_full_scan(self._last_full_rescan_at)
+                    self._server.set_full_scan_in_progress(False)
+                    if not self._initial_scan_done:
+                        self._initial_scan_done = True
+                        self._fire_initial_scan_complete()
+
         if not self._monitored_dirs:
             return
 
@@ -1220,6 +1247,91 @@ class SourceManager:
             self._clear_failed_source_attempt(source_id)
         return True
 
+    def _reconcile_upstreams(self) -> None:
+        """Re-list each monitored tensor-server upstream and add/remove its sources.
+
+        Best-effort per upstream: an unreachable upstream leaves its currently
+        mirrored sources in place (no spurious removals) and is retried next pass.
+        """
+        for upstream in self._monitored_upstreams:
+            try:
+                self._reconcile_one_upstream(upstream)
+            except Exception:
+                logger.warning(
+                    "Upstream re-list failed for %s; keeping its current catalog",
+                    upstream.url,
+                    exc_info=True,
+                )
+
+    def _reconcile_one_upstream(self, upstream: SourceConfig) -> None:
+        """Diff one upstream's live source list against the mirrored catalog.
+
+        The diff is the same add/remove model as the filesystem reconcile, but the
+        "scan" is a remote ``list_sources()`` and the unit is a source_id (not a
+        path signature): desired = the alias-namespaced ids the upstream lists now;
+        current = the tensor-server claims already mirrored from this endpoint.
+        """
+        from biopb.tensor import TensorFlightClient
+
+        from biopb_tensor_server.adapters.remote_tensor import (
+            _resolve_upstream_token,
+            _split_grpc_url,
+        )
+        from biopb_tensor_server.config import _namespaced_source_id
+
+        endpoint, _ = _split_grpc_url(upstream.url)
+        alias = upstream.alias
+        token = _resolve_upstream_token(upstream, self._credentials_config)
+
+        client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+        try:
+            upstream_ids = list(client.list_sources().keys())
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+
+        desired = {_namespaced_source_id(alias, up_id): up_id for up_id in upstream_ids}
+
+        prefix = f"{endpoint}/"
+        alias_prefix = f"{alias}__" if alias else None
+        with self._lock:
+            current = {
+                source_id
+                for source_id, claim in self._state.claims.items()
+                if claim.source_type == "tensor-server"
+                and str(claim.primary_path).startswith(prefix)
+                and (alias_prefix is None or source_id.startswith(alias_prefix))
+            }
+
+        added = set(desired) - current
+        removed = current - set(desired)
+
+        for source_id in sorted(removed):
+            self._commit_remove_source(source_id)
+
+        extra_config = {}
+        if upstream.credentials_profile:
+            extra_config["credentials_profile"] = upstream.credentials_profile
+        for source_id in sorted(added):
+            up_id = desired[source_id]
+            self._commit_add_claim(
+                SourceClaim(
+                    source_type="tensor-server",
+                    primary_path=f"{endpoint}/{up_id}",
+                    source_id=source_id,
+                    extra_config=dict(extra_config),
+                )
+            )
+
+        if added or removed:
+            logger.info(
+                "Upstream %s re-list: +%d / -%d sources",
+                endpoint,
+                len(added),
+                len(removed),
+            )
+
     def _should_retry_source(self, source_id: str) -> bool:
         """Return True when a failed source is eligible for another add attempt."""
         tracker = self._failed_sources.get(source_id)
@@ -1598,6 +1710,20 @@ def create_source_manager(
         logger.warning("No valid sources to serve")
         return None
 
+    # Monitored tensor-server upstreams (bare-host grpc://, monitor=true): their
+    # catalog is periodically re-listed and reconciled (biopb/biopb#178). A
+    # single-source grpc://host/<id> entry has nothing to re-list, so it is
+    # excluded -- only the bare-host "mirror everything" form qualifies.
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    monitored_upstreams = [
+        ms
+        for ms in monitored_sources
+        if ms.is_remote
+        and ms.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+        and _split_grpc_url(ms.url)[1] is None
+    ]
+
     # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
     # across both monitored and static sources. Under a monitored cloud root the
     # walk admits dehydrated entries; for any cloud source the registration path
@@ -1628,6 +1754,7 @@ def create_source_manager(
         stable_rescans_required=stable_rescans_required,
         aggressive_dir_pruning=aggressive_dir_pruning,
         cloud_roots=cloud_roots,
+        monitored_upstreams=monitored_upstreams,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)

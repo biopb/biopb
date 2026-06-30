@@ -298,6 +298,27 @@ instead of a filesystem walk — the `SourceManager` diff model applies unchange
 once the "scan" is a remote list. (`monitor` for fs watching does not apply to a
 remote url today; this generalizes it.)
 
+> **Implemented (monitor → upstream re-list).** `create_source_manager` collects
+> the **bare-host** `tensor-server` sources with `monitor=true` into
+> `SourceManager._monitored_upstreams` (single-source `grpc://host/<id>` entries
+> are excluded — nothing to re-list). `_handle_rescan` runs `_reconcile_upstreams`
+> on the **force-full cadence** (`full_rescan_interval`, default 1 h — a network
+> `list_flights` is too costly per incremental tick, matching the cloud-subtree
+> gate); for an *upstream-only* config (no monitored dirs) it also drives the
+> progressive-discovery freshness signals (`full_scan_in_progress` /
+> `last_full_scan_finished_at`) and the first-scan gate the dir path would
+> otherwise own. `_reconcile_one_upstream` re-lists the upstream and diffs the
+> alias-namespaced desired id set against the currently-mirrored claims for that
+> endpoint, applying adds/removes through the **same** `_commit_add_claim` /
+> `_commit_remove_source` primitives as the filesystem reconcile (the "scan" is a
+> remote list, the unit is a source_id instead of a path signature). It is
+> best-effort per upstream: an unreachable upstream keeps its mirrored sources in
+> place and retries next pass. The watcher ticks on a timer independent of its
+> directory set, so the loop runs even with zero monitored dirs. Tests:
+> `remote_tensor_adapter_test.py::test_monitored_upstream_relist_adds_and_removes`
+> (a source appears then disappears upstream and the proxy mirror follows) and
+> `test_create_source_manager_captures_bare_host_monitored_upstream`.
+
 **Unreachable upstream at startup.** Register the source through
 `UnresolvedSourceAdapter` (the existing cloud-phase-2 proxy: a catalog row with
 empty tensors / `data_resident=false`) and resolve on first `GetFlightInfo`. This

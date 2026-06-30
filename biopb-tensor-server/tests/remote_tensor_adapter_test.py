@@ -258,6 +258,97 @@ def test_create_from_config_resolves_token_from_credentials_profile():
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
+    """A monitored bare-host upstream is periodically re-listed: sources that
+    appear/disappear on the upstream are mirrored/dropped on the proxy (§3 refresh)."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.source_manager import SourceManager
+
+    zarr_path, shape, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+
+    upstream = TensorFlightServer("grpc://localhost:0")
+    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    try:
+        proxy = TensorFlightServer("grpc://localhost:0")
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                watcher=None,
+                monitored_dirs=set(),
+                metadata_db=None,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+
+            # initial re-list mirrors the upstream's single source
+            manager._reconcile_upstreams()
+            assert set(client.list_sources()) == {"lab__img"}
+
+            # a new upstream source appears -> mirrored on the next re-list
+            upstream.register_source("img2", ZarrAdapter(arr, "img2", ["y", "x"]))
+            manager._reconcile_upstreams()
+            assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+            assert client.get_tensor("lab__img2").shape == shape
+
+            # an upstream source disappears -> dropped on the next re-list
+            upstream.unregister_source("img")
+            manager._reconcile_upstreams()
+            assert set(client.list_sources()) == {"lab__img2"}
+
+            client.close()
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr_array):
+    """create_source_manager records a monitored bare-host grpc:// source as a
+    re-list upstream, and excludes the single-source grpc://host/<id> form."""
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.source_manager import create_source_manager
+
+    zarr_path, _, _ = simple_zarr_array
+    server = TensorFlightServer("grpc://localhost:0")
+    manager = create_source_manager(
+        server=server,
+        registry=get_default_registry(),
+        watcher=None,
+        # a local static source so there is something to serve (else it bails)
+        static_sources=[
+            SourceConfig(
+                type="zarr", url=zarr_path, source_id="local", dim_labels=["y", "x"]
+            )
+        ],
+        monitored_sources=[
+            SourceConfig(url="grpc://lab:8815", alias="lab", monitor=True),
+            SourceConfig(url="grpc://lab:8815/one", alias="lab", monitor=True),
+        ],
+        metadata_db=None,
+    )
+    urls = [u.url for u in manager._monitored_upstreams]
+    assert "grpc://lab:8815" in urls
+    assert (
+        "grpc://lab:8815/one" not in urls
+    )  # single-source form has nothing to re-list
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     """A second resolve_chunk_data for the same chunk is served from the file
     cache without a second upstream fetch -- the proxy inherits the segment cache."""
