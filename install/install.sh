@@ -43,50 +43,6 @@ _confirm() {
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
-# Interactive checkbox menu. Redraws in place; all output goes to /dev/tty.
-# Usage: _checkbox "Label one" "Label two" ...
-# Prints space-separated 1/0 values (one per label) to stdout.
-# Items default to checked; set the global CHECKBOX_DEFAULTS array (one 1/0 per
-# label) before calling to override individual initial states.
-_checkbox() {
-    local labels=("$@")
-    local n=${#labels[@]}
-    local sel=()
-    for ((i=0; i<n; i++)); do
-        sel+=("${CHECKBOX_DEFAULTS[$i]:-1}")
-    done
-    local first=1
-
-    while true; do
-        # On subsequent iterations move cursor up and clear to redraw in place.
-        # Lines printed: 1 blank + 1 header + 1 blank + n items + 1 blank + 1 prompt + 1 (Enter newline) = n+5
-        [ "$first" = "0" ] && printf "\033[%dA\033[J" "$((n + 5))" >/dev/tty
-        first=0
-
-        printf "\n  %sOptional components:%s\n\n" "$BOLD" "$RESET" >/dev/tty
-        for ((i=0; i<n; i++)); do
-            local mark
-            if [ "${sel[$i]}" = "1" ]; then
-                mark="${GREEN}[x]${RESET}"
-            else
-                mark="${DIM}[ ]${RESET}"
-            fi
-            printf "    %d. %b  %s\n" "$((i+1))" "$mark" "${labels[$i]}" >/dev/tty
-        done
-        printf "\n  ${DIM}Toggle [1-%d] or Enter to confirm:${RESET} " "$n" >/dev/tty
-
-        local choice; read -r choice </dev/tty
-        if [ -z "$choice" ]; then
-            break
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            local idx=$((choice - 1))
-            [ "${sel[idx]}" = "1" ] && sel[idx]=0 || sel[idx]=1
-        fi
-    done
-
-    printf '%s' "${sel[*]}"
-}
-
 # Prompt the user to choose a data directory.
 # Usage: _pick_data_dir <varname> [keep]  — writes result into caller's variable
 # (no subshell). All prompts go to /dev/tty. Requires PLATFORM to be set first.
@@ -615,13 +571,13 @@ _ensure_local_bin_on_path() {
 }
 
 # --- Release-based install helpers -------------------------------------------
-# The default install path pulls prebuilt wheels (and the data browser) from the
+# The default install path pulls prebuilt wheels (and the web interface) from the
 # most recent GitHub release rather than building HEAD from git. That drops the
 # git/buf/proto-generation step and keeps the self-contained server wheel paired
 # with the exact biopb wheel it was built against (no PyPI version-coupling).
 
 # Fetch the latest release metadata once and cache it in RELEASE_JSON / RELEASE_TAG.
-# One API call serves both the wheels and the data browser, keeping us under the
+# One API call serves both the wheels and the web interface, keeping us under the
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
@@ -924,15 +880,16 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # biopb-mcp is always installed (it is the primary interface), so it is not
-    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
-    # toolchain that most labs don't need (only legacy/proprietary formats need it).
-    CHECKBOX_DEFAULTS=(1 0)
-    read -r INSTALL_WEBAPP INSTALL_BIOFORMATS <<< "$(_checkbox \
-        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)" \
-        "Bio-Formats (more image formats; needs Java and extra setup during first run)")"
-    unset CHECKBOX_DEFAULTS
-    echo ""
+    # No longer offered interactively (biopb/biopb#237). The web interface now
+    # carries the server admin page (config / status / restart) on top of the
+    # image viewer, so it is installed by default rather than being optional.
+    # Bio-Formats stays off by default: the Python adapters now cover the formats
+    # most labs use, and it pulls in a heavyweight Java toolchain. Both remain
+    # overridable for scripted installs via env vars:
+    #   BIOPB_INSTALL_WEBAPP=0      skip the web interface (API-only server)
+    #   BIOPB_INSTALL_BIOFORMATS=1  add Bio-Formats (Java fetched on first use)
+    if [ "${BIOPB_INSTALL_WEBAPP:-1}" != "0" ]; then INSTALL_WEBAPP=1; else INSTALL_WEBAPP=0; fi
+    if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
 
     # ===== 1. Install uv (if needed) =====
     _step "[1/7] Ensuring build tools..."
@@ -1141,7 +1098,7 @@ install_biopb() {
     fi
 
     # ===== 4. Webapp =====
-    _step "[4/7] Installing data browser..."
+    _step "[4/7] Installing web interface..."
 
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
@@ -1151,7 +1108,7 @@ install_biopb() {
             INSTALLED_TAG=""
             [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
             if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
-                _ok "Data browser already up to date ($RELEASE_TAG)"
+                _ok "Web interface already up to date ($RELEASE_TAG)"
             else
                 _info "Downloading $RELEASE_TAG..."
                 rm -rf "${WEBAPP_DIR:?}"
@@ -1164,14 +1121,14 @@ install_biopb() {
                 if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
                     tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
                     printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
-                    _ok "Data browser installed to: $WEBAPP_DIR"
+                    _ok "Web interface installed to: $WEBAPP_DIR"
                 else
                     _warn "No webapp.tar.gz in release $RELEASE_TAG; server will run in API-only mode"
                 fi
                 rm -f "$tmp"
             fi
         else
-            _warn "Could not fetch latest release, data browser not installed"
+            _warn "Could not fetch latest release, web interface not installed"
             _info "Server will run in API-only mode"
         fi
     else
@@ -1287,7 +1244,7 @@ install_biopb() {
     # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
     # --- informational blocks ---
     if [ "$INSTALL_WEBAPP" = "1" ]; then
-        _info "Data browser available at http://localhost:8815"
+        _info "Web interface available at http://localhost:8814"
         echo ""
     fi
 
@@ -1310,8 +1267,8 @@ install_biopb() {
     fi
 
     if [ "$INSTALL_WEBAPP" = "0" ]; then
-        _warn "Data browser not installed"
-        _info "  rerun this script to install it"
+        _warn "Web interface not installed (BIOPB_INSTALL_WEBAPP=0)"
+        _info "  rerun without that env var to install it"
         echo ""
     fi
 

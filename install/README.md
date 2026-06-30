@@ -60,8 +60,9 @@ are produced.
   biopb-mcp release, into a single `uv` tool environment so the components can
   import and drive each other (`biopb server start`, the napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
-- **Data browser** (optional) — `webapp.tar.gz` from the same biopb-mcp release,
-  unpacked to `~/.local/share/biopb/webapp`.
+- **Web interface** — `webapp.tar.gz` from the same biopb-mcp release, unpacked to
+  `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
+  page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns

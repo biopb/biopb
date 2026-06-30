@@ -7,8 +7,9 @@
 #   uv-preinstalled  uv already on PATH before installer runs
 #   old-python       System Python 3.7 present (too old, should fall back)
 #   rerun            Pre-staged env simulating a prior install (idempotency)
-#   bioformats       Bio-Formats/ZVI end-to-end (tick Bio-Formats at install,
-#                    then run /verify_bioformats.sh; no system Java present)
+#   bioformats       Bio-Formats/ZVI end-to-end (install with
+#                    BIOPB_INSTALL_BIOFORMATS=1, then run /verify_bioformats.sh;
+#                    no system Java present)
 #
 # Mount a ZVI sample for the bioformats scenario:
 #   BIOPB_TEST_DATA=/dir/with/zvi ./run.sh bioformats
@@ -35,10 +36,12 @@ docker build \
 
 echo ""
 echo "Launching — run the installer with:"
-echo "  bash /install.sh"
 if [ "$SCENARIO" = "bioformats" ]; then
+    echo "  BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh"
     echo "then verify Bio-Formats/ZVI support with:"
     echo "  /verify_bioformats.sh"
+else
+    echo "  bash /install.sh"
 fi
 echo ""
 

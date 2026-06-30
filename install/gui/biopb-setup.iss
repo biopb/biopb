@@ -63,10 +63,12 @@ WizardStyle=modern
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-; No [Components]/[Types]: the options are presented on a custom page (see
-; [Code] InitializeWizard) so each checkbox carries its OWN description on the
-; line directly beneath it, rather than one shared block of text. Defaults
-; (viewer on, Bio-Formats off, remote plugins on) match install.sh / the console.
+; No [Components]/[Types]: component selection was removed (biopb/biopb#237) --
+; the web interface (now carrying the server admin page) is always installed and
+; Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS. The one remaining
+; choice (remote-plugin consent, default on) is presented on a custom page (see
+; [Code] InitializeWizard) with its description on the line beneath the checkbox,
+; matching install.sh / the console front-end.
 
 [Files]
 ; Stage the headless engine. The online model ships just this; everything else
@@ -76,8 +78,6 @@ Source: "..\biopb-engine.ps1"; DestDir: "{app}"; Flags: ignoreversion
 [Code]
 var
   OptionsPage:  TWizardPage;
-  CbViewer:     TNewCheckBox;
-  CbBioformats: TNewCheckBox;
   CbRemote:     TNewCheckBox;
   DataDirPage:  TInputDirWizardPage;
   ProgressPage: TOutputMarqueeProgressWizardPage;
@@ -256,21 +256,16 @@ var
   T: Integer;
   i: Integer;
 begin
-  { Options page: each checkbox carries its own description on the line(s)
-    directly beneath it (TNewCheckBox + TNewStaticText pairs), instead of one
-    shared block. biopb-mcp and the data server are always installed. Defaults
-    match install.sh / the console (viewer on, Bio-Formats off, remote on).
+  { Component selection is no longer offered (biopb/biopb#237): biopb-mcp, the
+    data server, and the web interface (image viewer + server admin page) are
+    always installed; Bio-Formats is opt-in only via $env:BIOPB_INSTALL_BIOFORMATS.
+    The page now carries a single privacy choice -- the remote-plugin consent --
+    with its description on the line(s) directly beneath the checkbox.
     ASCII-only text keeps the .iss codepage-safe. }
   OptionsPage := CreateCustomPage(wpWelcome,
-    'Installation options',
-    'biopb-mcp and the data server are always installed. Choose the optional pieces below.');
+    'Remote algorithm plugins',
+    'biopb-mcp, the data server, and the web interface are always installed.');
   T := ScaleY(4);
-  CbViewer := AddOption(T, 'Built-in data viewer',
-    'Browse all your images in any web browser (Chrome, Safari, and others).',
-    True, ScaleY(18));
-  CbBioformats := AddOption(T, 'Bio-Formats support',
-    'Adds many extra and proprietary image formats. Needs Java and some setup on first run, so it is off by default.',
-    False, ScaleY(34));
   CbRemote := AddOption(T, 'Remote algorithm plugins',
     'Use off-site servers (hosted at UConn Health) for tasks like cell segmentation. Those servers log your IP address; uncheck to keep them disabled.',
     True, ScaleY(50));
@@ -385,8 +380,10 @@ begin
     if (CbCloud <> nil) and CbCloud.Checked then
       Args := Args + ' -Cloud';
   end;
-  if CbViewer.Checked     then Args := Args + ' -Webapp';
-  if CbBioformats.Checked then Args := Args + ' -Bioformats';
+  { The web interface is always installed now (it carries the server admin page);
+    Bio-Formats is no longer a GUI option (opt in via $env:BIOPB_INSTALL_BIOFORMATS
+    before launching, or rerun the console installer). }
+  Args := Args + ' -Webapp';
   { Default ON; unchecking it disables the off-site cellpose server (IP logging). }
   if not CbRemote.Checked then Args := Args + ' -NoRemotePlugins';
 #ifdef DryRun
@@ -576,7 +573,7 @@ begin
     Msg := 'biopb is installed. Start your AI agent (Claude Code/Desktop, Cursor,' + #13#10 +
            'opencode) and a napari window opens with it.';
     if ResWebapp then
-      Msg := Msg + #13#10#13#10 + 'Data browser: http://localhost:8815';
+      Msg := Msg + #13#10#13#10 + 'Web interface: http://localhost:8814';
     if ResConfig <> '' then
       Msg := Msg + #13#10#13#10 + 'Config: ' + ResConfig;
     if ResMcpManual then
@@ -601,7 +598,7 @@ begin
 
   purgeArg := '';
   if MsgBox('Also remove biopb configuration and cached data?' + #13#10 +
-            '(config files, the data browser, caches and logs)' + #13#10#13#10 +
+            '(config files, the web interface, caches and logs)' + #13#10#13#10 +
             'Your microscopy images are NOT affected.',
             mbConfirmation, MB_YESNO) = IDYES then
     purgeArg := ' -Purge';
