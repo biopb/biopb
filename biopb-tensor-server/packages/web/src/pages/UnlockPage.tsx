@@ -25,6 +25,13 @@ export function UnlockPage() {
   return (
     <main className="unlock-page">
       <div className="unlock-card">
+        <img
+          className="unlock-logo"
+          src="/biopb-logo.png"
+          alt="BioPB"
+          width={48}
+          height={48}
+        />
         <h1>BioPB Tensor Viewer</h1>
         <p className="subtitle">
           Enter the access token shown in the launcher terminal to continue.
@@ -83,7 +90,8 @@ export function UnlockPage() {
           width: 100%;
           max-width: 440px;
         }
-        h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
+        .unlock-logo { display: block; margin: 0 auto 0.75rem; border-radius: 8px; }
+        h1 { margin: 0 0 0.5rem; font-size: 1.5rem; text-align: center; }
         .subtitle {
           font-size: 0.875rem;
           color: #94a3b8;

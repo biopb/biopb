@@ -4,6 +4,8 @@ import { TensorApiError, splitConfigErrors } from "@biopb/tensor-flight-client";
 import type { AdminConfigError, AdminStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
+import { Modal } from "../components/Modal";
+import { AdvancedJsonModal } from "../components/AdvancedJsonModal";
 
 type Config = Record<string, unknown>;
 
@@ -15,6 +17,16 @@ function getSources(config: Config | null): SourceEntry[] {
   return Array.isArray(s) ? (s as SourceEntry[]) : [];
 }
 
+/** "up 4m" / "up 1h 3m" / "up 12s" for the topbar read-out (doc UX). */
+function formatUptime(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return "";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `up ${h}h ${m}m`;
+  if (m > 0) return `up ${m}m`;
+  return `up ${Math.floor(seconds)}s`;
+}
+
 export function AdminPage() {
   const client = useAppStore((s) => s.client);
   const connectionState = useAppStore((s) => s.connectionState);
@@ -22,9 +34,8 @@ export function AdminPage() {
 
   const [config, setConfig] = useState<Config | null>(null);
   const [path, setPath] = useState<string>("");
-  const [rawText, setRawText] = useState<string>("");
-  const [rawError, setRawError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -55,53 +66,10 @@ export function AdminPage() {
     restartingRef.current = restarting;
   }, [restarting]);
 
-  // Restart-confirm modal: Esc to dismiss, focus trap, and restore focus to the
-  // trigger on close (an accessible dialog, since it gates a destructive action).
-  const modalRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!confirmRestart) return;
-    const prevFocus = document.activeElement as HTMLElement | null;
-    const focusable = (): HTMLElement[] =>
-      Array.from(
-        modalRef.current?.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        ) ?? [],
-      ).filter((el) => !el.hasAttribute("disabled"));
-    // Focus the non-destructive action first (Cancel), so a stray Enter doesn't
-    // fire Restart.
-    focusable()[0]?.focus();
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        setConfirmRestart(false);
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const items = focusable();
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first || !last) return;
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      prevFocus?.focus?.();
-    };
-  }, [confirmRestart]);
-
-  // Route every config mutation through here so the structured editor and the
-  // raw-JSON textarea stay in sync over one canonical object.
+  // The one canonical config object. Both the structured Sources editor and the
+  // Advanced raw-JSON modal commit through here.
   const applyConfig = useCallback((next: Config, markDirty = true) => {
     setConfig(next);
-    setRawText(JSON.stringify(next, null, 2));
-    setRawError(null);
     if (markDirty) {
       setDirty(true);
       setSaved(false);
@@ -143,19 +111,6 @@ export function AdminPage() {
   function onSourcesChange(next: SourceEntry[]) {
     if (!config) return;
     applyConfig({ ...config, sources: next });
-  }
-
-  function onRawBlur() {
-    try {
-      const parsed = JSON.parse(rawText) as Config;
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        setRawError("Config must be a JSON object.");
-        return;
-      }
-      applyConfig(parsed);
-    } catch (e) {
-      setRawError(e instanceof Error ? e.message : "Invalid JSON");
-    }
   }
 
   async function onSave() {
@@ -281,7 +236,13 @@ export function AdminPage() {
         : status
           ? {
               cls: "connected",
-              text: `${status.health ?? "–"} · ${status.source_count ?? 0} sources`,
+              text: [
+                `● ${status.health ?? "–"}`,
+                `${status.source_count ?? 0} sources`,
+                formatUptime(status.uptime_seconds),
+              ]
+                .filter(Boolean)
+                .join(" · "),
             }
           : { cls: "connecting", text: "Loading…" };
 
@@ -290,6 +251,7 @@ export function AdminPage() {
   return (
     <div className="app-shell admin-shell">
       <header className="app-topbar">
+        <img className="topbar-logo" src="/biopb-logo.png" alt="" aria-hidden="true" />
         <h1>BioPB · Admin</h1>
         <span className={`status-pill ${pill.cls}`}>{pill.text}</span>
         <div className="topbar-spacer" />
@@ -317,13 +279,6 @@ export function AdminPage() {
         {path && (
           <div className="admin-config-path">
             Editing <code>{path}</code>
-          </div>
-        )}
-
-        {rawError && (
-          <div className="admin-banner error" role="alert">
-            <strong>Invalid JSON in the advanced editor</strong> — fix it before
-            saving: {rawError}
           </div>
         )}
 
@@ -361,27 +316,25 @@ export function AdminPage() {
               disabled={restarting}
             />
 
-            <details className="admin-advanced" open={!!rawError || undefined}>
-              <summary>
-                Advanced — full config (raw JSON)
-                {rawError && <span className="advanced-error-tag">invalid JSON</span>}
-              </summary>
-              <textarea
-                className={`admin-raw${rawError ? " invalid" : ""}`}
-                spellCheck={false}
-                value={rawText}
+            <div className="admin-advanced-row">
+              <button
+                type="button"
+                className="icon-btn"
                 disabled={restarting}
-                onChange={(e) => setRawText(e.target.value)}
-                onBlur={onRawBlur}
-              />
-              {rawError && <p className="error-msg">Invalid JSON: {rawError}</p>}
-            </details>
+                onClick={() => setAdvancedOpen(true)}
+              >
+                Advanced — edit raw config…
+              </button>
+              <span className="admin-hint">
+                Server, cache &amp; pyramid knobs, and any advanced keys.
+              </span>
+            </div>
 
             <div className="admin-actions">
               <button
                 type="button"
                 className="submit-btn"
-                disabled={!dirty || saving || restarting || !!rawError}
+                disabled={!dirty || saving || restarting}
                 onClick={onSave}
               >
                 {saving ? "Saving…" : "Save"}
@@ -397,31 +350,33 @@ export function AdminPage() {
       </main>
 
       {confirmRestart && (
-        <div className="admin-modal-backdrop" onClick={() => setConfirmRestart(false)}>
-          <div
-            className="admin-modal"
-            ref={modalRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="admin-restart-title"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 id="admin-restart-title">Restart the server?</h2>
-            <p>
-              Restart interrupts the shared live session: connected clients (the
-              napari/MCP kernel, browser viewers, in-flight analyses) drop while the
-              daemon bounces.
-            </p>
-            <div className="admin-modal-actions">
-              <button className="icon-btn" onClick={() => setConfirmRestart(false)}>
-                Cancel
-              </button>
-              <button className="submit-btn" onClick={doRestart}>
-                Restart
-              </button>
-            </div>
+        <Modal
+          title="Restart the server?"
+          onClose={() => setConfirmRestart(false)}
+          labelId="admin-restart-title"
+        >
+          <p>
+            Restart interrupts the shared live session: connected clients (the
+            napari/MCP kernel, browser viewers, in-flight analyses) drop while the
+            daemon bounces.
+          </p>
+          <div className="admin-modal-actions">
+            <button type="button" className="icon-btn" onClick={() => setConfirmRestart(false)}>
+              Cancel
+            </button>
+            <button type="button" className="submit-btn" onClick={doRestart}>
+              Restart
+            </button>
           </div>
-        </div>
+        </Modal>
+      )}
+
+      {advancedOpen && config && (
+        <AdvancedJsonModal
+          config={config}
+          onApply={applyConfig}
+          onClose={() => setAdvancedOpen(false)}
+        />
       )}
 
       {saveError && (
