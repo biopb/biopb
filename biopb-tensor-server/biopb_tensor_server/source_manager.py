@@ -1390,22 +1390,20 @@ class SourceManager:
             self._path_to_source_id.pop(path, None)
 
     def _unregister_source_claim(self, source_id: str) -> bool:
-        """Remove a source from the server and metadata DB."""
+        """Remove a source from the server and metadata DB.
+
+        A server-unregister failure aborts (returns False, leaving the claim in
+        state for a later retry). A catalog-delete failure does NOT abort: like
+        ``_rollback_source_registration`` the ``sync_source_removed`` call is
+        isolated in its own try/except so the server-side unregister and the
+        ``_path_to_source_id`` cleanup still complete -- a stale path-map entry
+        pointing at an already-unregistered ``source_id`` would otherwise
+        mislead a later re-add/reconcile of the same path. The worst case is a
+        leaked catalog row (logged), matching the remove-site log-and-continue
+        policy and the pre-raise behavior.
+        """
         try:
             self._server.unregister_source(source_id)
-            if self._metadata_db is not None:
-                self._metadata_db.sync_source_removed(source_id)
-
-            paths_to_remove = [
-                path
-                for path, sid in self._path_to_source_id.items()
-                if sid == source_id
-            ]
-            for path in paths_to_remove:
-                self._path_to_source_id.pop(path, None)
-
-            logger.info(f"Unregistered source from server: {source_id}")
-            return True
         except Exception as e:
             logger.error(
                 "Failed to unregister source %s: %s",
@@ -1414,6 +1412,25 @@ class SourceManager:
                 exc_info=True,
             )
             return False
+
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_removed(source_id)
+            except Exception:
+                logger.error(
+                    "Failed to remove source %s from metadata DB",
+                    source_id,
+                    exc_info=True,
+                )
+
+        paths_to_remove = [
+            path for path, sid in self._path_to_source_id.items() if sid == source_id
+        ]
+        for path in paths_to_remove:
+            self._path_to_source_id.pop(path, None)
+
+        logger.info(f"Unregistered source from server: {source_id}")
+        return True
 
 
 def create_source_manager(

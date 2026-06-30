@@ -1001,6 +1001,47 @@ class TestSourceManagerRegressions:
         assert manager._commit_remove_source(claim.source_id) is False
         assert claim.source_id in state.claims
 
+    def test_unregister_source_claim_completes_when_metadata_remove_fails(
+        self, tmp_path
+    ):
+        """A catalog-delete failure must not skip the server-unregister or the
+        _path_to_source_id cleanup (issue #223 follow-up). The removal still
+        completes; only the leaked catalog row is logged.
+        """
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        server._metadata_db = _FailingMetadataDb(fail_remove=True)
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            watcher=None,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+            probe_open_files=False,
+        )
+
+        claim = SourceClaim(
+            source_type="fake",
+            primary_path=str(data_path.resolve()),
+            source_id=generate_source_id(str(data_path.resolve()), "fake"),
+            member_paths={str(data_path.resolve())},
+        )
+        assert manager._commit_add_claim(claim) is True
+        assert claim.primary_path in manager._path_to_source_id
+
+        # The catalog DELETE raises, but the removal still completes.
+        assert manager._commit_remove_source(claim.source_id) is True
+        assert server.unregistered == [claim.source_id]
+        # Path map cleaned -- no stale entry to mislead a later re-add/reconcile.
+        assert claim.primary_path not in manager._path_to_source_id
+        assert claim.source_id not in state.claims
+
     def test_reconcile_changed_source_removes_old_source_when_readd_fails(
         self, tmp_path
     ):
