@@ -1143,6 +1143,21 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         except Exception:
             return {}
 
+    def release_retained_metadata(self) -> None:
+        """Drop the cached raw OME-XML string (biopb/biopb#253).
+
+        ``_raw_ome_xml`` is the raw ``<OME>`` document (MB-scale for a big
+        MMStack) cached at registration so ``get_metadata()`` parses the file at
+        most once. It feeds ``get_metadata()`` *only* -- the pixel path reads
+        ``_dask_data``/``_aics_image`` and ``get_physical_scale()`` reads the
+        live ``_aics_image.ome_metadata`` handle -- so once the catalog holds the
+        metadata it is dead weight. Leave ``_raw_ome_xml_probed`` True so a
+        later ``get_metadata()`` (only the no-catalog fallback path) recomputes
+        via aicsimageio rather than re-pinning the string.
+        """
+        self._raw_ome_xml = None
+        self._raw_ome_xml_probed = True
+
     def get_physical_scale(self):
         """Per-dim physical pixel size + unit from the resident OME model.
 

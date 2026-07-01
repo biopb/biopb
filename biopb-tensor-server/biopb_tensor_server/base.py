@@ -309,6 +309,25 @@ class SourceAdapter(ABC):
         """
         return True
 
+    def release_retained_metadata(self) -> None:
+        """Release per-instance state kept *solely* to answer ``get_metadata()``.
+
+        Once a source is registered, its metadata is persisted in the DuckDB
+        catalog and the serve path reads it back from there (biopb/biopb#253,
+        #269), so an adapter no longer needs to pin the (potentially MB-scale,
+        one-copy-per-source) metadata model on the Python heap for the process
+        lifetime. The registration sync calls this after the catalog row is
+        written (and only when ``metadata_covers_all_tensors()`` is True, so HCS
+        plates -- which still serve per-tensor metadata off the adapter -- keep
+        theirs).
+
+        Default no-op. Override only to drop state that is (a) used *only* by
+        ``get_metadata()`` and (b) not needed by any read path. Must stay
+        idempotent and must not break a later ``get_metadata()`` (adapters may
+        recompute lazily instead).
+        """
+        return None
+
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
 
