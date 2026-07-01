@@ -23,6 +23,21 @@ from biopb_tensor_server.fixtures import (
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _reset_upstream_client_pool():
+    """Isolate the process-wide upstream client pool (biopb/biopb#266 B1).
+
+    Pooled clients are keyed by ``(endpoint, token)`` and live until eviction or
+    process exit, so a client dialed at a random port in one test could be
+    handed back in a later test that happens to reuse the port. Clear the pool
+    around every test to keep them independent (and to close leaked clients)."""
+    from biopb_tensor_server.adapters.remote_tensor import _clear_client_pool
+
+    _clear_client_pool()
+    yield
+    _clear_client_pool()
+
+
 @pytest.fixture
 def temp_dir():
     """Provide a temporary directory that is cleaned up after the test."""
