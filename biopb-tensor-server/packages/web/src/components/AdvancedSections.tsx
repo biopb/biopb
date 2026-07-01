@@ -194,12 +194,17 @@ function Field({ fieldKey, prop, value, errs, disabled, onChange }: FieldProps) 
       </select>
     );
   } else if (type === "boolean") {
+    // Render the *effective* value (the schema default when the key is omitted),
+    // so a default-true boolean shows checked; toggling back to the default drops
+    // the key rather than writing an explicit override.
+    const def = prop.default === true;
+    const effective = value === undefined ? def : value === true;
     control = (
       <input
         type="checkbox"
-        checked={value === true}
+        checked={effective}
         disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
+        onChange={(e) => onChange(e.target.checked === def ? undefined : e.target.checked)}
       />
     );
   } else if (hardEnum) {

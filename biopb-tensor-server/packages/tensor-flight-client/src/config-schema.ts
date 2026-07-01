@@ -25,6 +25,8 @@ export interface SchemaProp {
   maximum?: number;
   description?: string;
   deprecated?: boolean;
+  /** The dataclass default for this field (omitted when the default is null). */
+  default?: unknown;
   required?: string[];
   properties?: Record<string, SchemaProp>;
   items?: SchemaProp;

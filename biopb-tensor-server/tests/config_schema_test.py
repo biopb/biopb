@@ -50,6 +50,36 @@ def test_schema_is_valid_draft202012(schema):
     Draft202012Validator.check_schema(schema)
 
 
+def test_scalar_defaults_emitted_and_match_dataclasses(schema):
+    """Each scalar section field echoes its dataclass default (so a config editor
+    can render the effective value of an omitted key); None defaults are omitted."""
+    for cls in (
+        ServerConfig,
+        CacheConfig,
+        PyramidConfig,
+        PrecacheConfig,
+        MetadataDbConfig,
+    ):
+        inst = cls()
+        for f in dataclasses.fields(cls):
+            if f.name.startswith("_"):
+                continue
+            value = getattr(inst, f.name)
+            if dataclasses.is_dataclass(value) or isinstance(value, list):
+                continue
+            section, key = ondisk_location(cls.__name__, f.name)
+            prop = _section_props(schema, section)[key]
+            if value is None:
+                assert "default" not in prop, (
+                    f"{section}.{key} should omit null default"
+                )
+            else:
+                expected = (
+                    value if isinstance(value, (bool, int, float, str)) else str(value)
+                )
+                assert prop.get("default") == expected, f"{section}.{key} default drift"
+
+
 def test_top_level_sections_present(schema):
     props = schema["properties"]
     for section in (
