@@ -122,7 +122,11 @@ def _read_release_version() -> str:
     so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
     'unknown' rather than propagating."""
     try:
-        return _RELEASE_VERSION_FILE.read_text().strip() or "unknown"
+        # Explicit utf-8 (the installer writes a plain ASCII/utf-8 version), so
+        # decoding is deterministic across platforms rather than dependent on the
+        # reader's locale (cp1252 on Windows would decode a corrupt marker to
+        # garbage instead of failing to 'unknown').
+        return _RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
     except OSError:
         return "unknown"
     except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
