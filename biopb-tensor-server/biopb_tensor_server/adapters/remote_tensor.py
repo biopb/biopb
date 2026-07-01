@@ -160,6 +160,16 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         # upstream. Optimistic until proven otherwise so a never-yet-listed source
         # is not pre-emptively reported unresolved.
         self._reachable = True
+        # Cached localized descriptor(s) for the catalog surface, populated on the
+        # first successful upstream fetch. A source's descriptor (shape/dtype/dim
+        # labels) is immutable for its lifetime, so ListFlights ->
+        # get_source_descriptor -> list_tensor_descriptors serves it WITHOUT a
+        # network round-trip. Without this, a ListFlights over N mirrored sources
+        # fired N serial upstream RPCs -- list_sources() took ~0.5s/source (137s
+        # for 241 sources) instead of being a cheap local call (biopb/biopb#178).
+        # Only a *successful* fetch is cached; an unreachable upstream keeps
+        # returning the empty placeholder and retries, so recovery still works.
+        self._descriptors_cache: Optional[List[TensorDescriptor]] = None
 
     # ------------------------------------------------------------------ upstream
 
@@ -284,12 +294,15 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """Mirror this one upstream source's tensor descriptor(s).
 
-        Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
-        by scanning the upstream's whole ``list_sources()`` catalog: that call is
-        *capped* (``max_list_flights_results``), so for a large upstream this
-        source could be truncated out of it -- and it would re-fetch the entire
-        catalog on every ListFlights, an O(N^2) cost. A single source's
-        descriptor has no such cap.
+        Fetched once per-source via ``get_descriptor`` (a targeted GetFlightInfo),
+        then **cached** (``_descriptors_cache``): the descriptor is immutable for
+        the source's lifetime, so the catalog surface (ListFlights ->
+        get_source_descriptor -> here, and the metadata-DB sync) never re-dials the
+        upstream. Without the cache a ListFlights over N mirrored sources fired N
+        serial upstream RPCs on every call. It is *not* fetched by scanning the
+        upstream's whole ``list_sources()`` catalog: that call is *capped*
+        (``max_list_flights_results``), so for a large upstream this source could be
+        truncated out of it. A single source's descriptor has no such cap.
 
         Catalog surface: an **unreachable** (or upstream-unresolved) source
         degrades to ``[]`` (an empty placeholder row) rather than raising, so the
@@ -302,13 +315,19 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         carries the full array_id), but the upstream exposes no cheap,
         non-truncatable way to enumerate a single source's full field list.
         """
+        if self._descriptors_cache is not None:
+            return self._descriptors_cache
         try:
             desc = self.client.get_descriptor(self._to_upstream_array_id(self.array_id))
         except Exception as exc:
             self._mark_unreachable(exc)
             return []  # unreachable / unresolved upstream -> placeholder row
         self._reachable = True
-        return [self._localize_descriptor(desc)]
+        localized = [self._localize_descriptor(desc)]
+        # Cache the successful result so the catalog surface never re-dials the
+        # upstream for this source (see _descriptors_cache in __init__).
+        self._descriptors_cache = localized
+        return localized
 
     def is_resident(self) -> bool:
         """Best-effort: is the upstream reachable right now?

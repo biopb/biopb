@@ -826,6 +826,43 @@ class TestUnreachableUpstream:
             upstream.shutdown()
 
 
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_list_tensor_descriptors_cached_after_first_fetch(simple_zarr_array):
+    """The catalog surface caches the descriptor after the first successful fetch,
+    so a later ListFlights never re-dials the upstream. This is what keeps
+    list_sources() a cheap local call for a large mirrored upstream (biopb/biopb#178):
+    proof-by-construction is that the second call still returns the descriptor
+    after the upstream has been shut down entirely."""
+    import zarr
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+
+    upstream = TensorFlightServer("grpc://localhost:0")
+    port = upstream.port
+    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    _serve(upstream)
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location=f"grpc://localhost:{port}",
+        upstream_source_id="img",
+    )
+    # first call warms the cache from the live upstream
+    descs = adapter.list_tensor_descriptors()
+    assert len(descs) == 1 and descs[0].array_id == "lab__img"
+
+    # upstream goes away entirely -> any real round-trip would now fail
+    upstream.shutdown()
+
+    # served from cache: still the descriptor, no round-trip
+    cached = adapter.list_tensor_descriptors()
+    assert cached == descs
+    assert adapter.get_source_descriptor().tensors[0].array_id == "lab__img"
+
+
 def test_unreachable_sole_monitored_upstream_does_not_block_startup():
     """A sole bare-host monitor=true upstream that is down at boot must not stop
     the server starting -- the re-list recovers it once reachable (#178)."""
