@@ -327,7 +327,7 @@ class TestPerTensorCatalog:
         connection the other tests use. UNNEST(tensors) must pass _validate_query
         (it references the column, not a table) and the nested LIST(STRUCT) column
         must round-trip whole through the Arrow serialization behind DoGet."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
