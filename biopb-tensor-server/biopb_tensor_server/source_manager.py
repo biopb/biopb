@@ -143,6 +143,15 @@ class SourceManager:
         # so this -- not "are we past start()" -- is the correct startup/runtime
         # boundary for the precache gate.
         self._initial_scan_done = False
+        # Set only for the duration of the boot-tick upstream re-list, when the
+        # local walk earlier in the *same* rescan already flipped
+        # ``_initial_scan_done`` True (see ``_handle_rescan``). It keeps the
+        # startup upstream mirror -- committed after that flip -- routed to the
+        # slow backlog instead of the prompt enqueue, exactly as the startup set
+        # is meant to be (the mirror is part of the startup catalog regardless of
+        # which half of the tick registers it). Event-loop thread only, so a plain
+        # flag is safe.
+        self._suppress_live_precache = False
         # Best-effort callback fired once, when the first full scan completes
         # (from the event-loop thread). The launcher uses it to seed the precache
         # backlog with the startup set at the moment the catalog is established.
@@ -292,13 +301,31 @@ class SourceManager:
         ordering keeps it off the local catalog's critical path -- previously the
         re-list ran first, so on the boot tick local sources surfaced only after
         every upstream source had been registered, minutes later.)
+
+        Precache routing subtlety: on the boot tick the local walk flips
+        ``_initial_scan_done`` True *before* the upstream re-list runs, which
+        would otherwise make ``_commit_add_claim`` prompt-enqueue the entire
+        startup upstream mirror at the precache worker's un-idle-gated live tier
+        (hundreds of upstream chunk fetches competing with serving -- the very
+        thing this reorder protects the local catalog from). The whole tick is a
+        startup tick if the scan had not completed when it began, so the upstream
+        mirror it registers is startup set and must route to the slow backlog. We
+        suppress the live enqueue across just that re-list.
         """
+        startup_tick = not self._initial_scan_done
         self._rescan_monitored_dirs()
         # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
         # cadence -- fast (every tick) while changing/failing, backing off toward
         # full_rescan_interval while a source set stays stable. Runs AFTER the
         # local walk (see docstring).
-        self._reconcile_due_upstreams()
+        if startup_tick:
+            self._suppress_live_precache = True
+            try:
+                self._reconcile_due_upstreams()
+            finally:
+                self._suppress_live_precache = False
+        else:
+            self._reconcile_due_upstreams()
 
     def _rescan_monitored_dirs(self) -> None:
         """Walk the monitored directories and reconcile the discovered catalog.
@@ -1241,9 +1268,14 @@ class SourceManager:
 
         # Notify the precache worker of live additions only -- those discovered
         # after the initial scan completes. The startup set (committed while
-        # _initial_scan_done is False) is seeded into the slow backlog instead.
-        # Best-effort: a hook failure must never abort a source commit.
-        if self._initial_scan_done and self._on_source_committed is not None:
+        # _initial_scan_done is False, or during the boot-tick upstream re-list
+        # guarded by _suppress_live_precache) is seeded into the slow backlog
+        # instead. Best-effort: a hook failure must never abort a source commit.
+        if (
+            self._initial_scan_done
+            and not self._suppress_live_precache
+            and self._on_source_committed is not None
+        ):
             try:
                 self._on_source_committed(claim.source_id)
             except Exception:
