@@ -145,6 +145,49 @@ class TestResolveServeSources:
         assert [s.url for s in monitored_sources] == ["s3://bucket/data.zarr"]
         assert [s.url for s in static_sources] == ["s3://bucket/data.zarr"]
 
+    def test_monitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
+        """A monitored bare-host ``grpc://host:port`` tensor-server upstream is
+        routed to monitored_sources ONLY -- never expanded into static sources.
+
+        Inline expansion would run one blocking upstream RPC per mirrored source
+        before mark_ready(), stalling startup for a large upstream. The
+        SourceManager's background re-list owns discovering its sources instead,
+        so _resolve_serve_sources must not touch the network at all here.
+        """
+        import biopb_tensor_server.config as cfg_mod
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never be reached
+            raise AssertionError("upstream must not be enumerated at startup")
+
+        monkeypatch.setattr(
+            "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+            _boom,
+        )
+        # Guard the import site used inside _discover_tensor_server too.
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom, raising=False)
+
+        upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=True)
+        cfg = _config(upstream)
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
+        assert static_sources == []
+
+    def test_monitored_single_source_upstream_is_static(self):
+        """A monitored single-source ``grpc://host:port/<id>`` names exactly one
+        upstream source (nothing to re-list), so it is still registered as a
+        static source (expanded without any upstream RPC)."""
+        upstream = SourceConfig(url="grpc://host:8815/raw", alias="hpc", monitor=True)
+        cfg = _config(upstream)
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert [s.url for s in monitored_sources] == ["grpc://host:8815/raw"]
+        assert [s.url for s in static_sources] == ["grpc://host:8815/raw"]
+        # Namespaced under the alias by the single-source expansion path.
+        assert static_sources[0].source_id == "hpc__raw"
+
     def test_missing_static_source_is_skipped_not_fatal(self, tmp_path):
         """A missing non-monitored source is warned-and-skipped; the rest serve.
 
