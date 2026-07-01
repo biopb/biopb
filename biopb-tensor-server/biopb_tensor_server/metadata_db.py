@@ -431,6 +431,25 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+        # The catalog row is now the metadata cache for this source (biopb#253),
+        # so let the adapter release any metadata it retained purely to answer
+        # get_metadata(). Skip sources whose serve path still reads per-tensor
+        # metadata off the adapter (HCS plates -> metadata_covers_all_tensors()
+        # is False, biopb#269). Best-effort: a release failure must never fail
+        # registration (the row is already committed). getattr-guarded so a
+        # duck-typed adapter without these hooks is simply left alone.
+        release = getattr(adapter, "release_retained_metadata", None)
+        covers_all = getattr(adapter, "metadata_covers_all_tensors", None)
+        if callable(release) and (not callable(covers_all) or covers_all()):
+            try:
+                release()
+            except Exception as exc:
+                logger.warning(
+                    "release_retained_metadata failed for source %s: %s",
+                    source_id,
+                    exc,
+                )
+
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
         """Return a source's stored metadata as a dict, or ``None`` to fall back.
 
