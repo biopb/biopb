@@ -1458,6 +1458,16 @@ def _discover_tensor_server(
     the adapter (``RemoteTensorAdapter.create_from_config``) and the rest of the
     server machinery treat it like any other source.
     """
+    # EXPERIMENTAL: the tensor-server remote-source proxy is not yet stable. Its
+    # config surface (url forms, `alias`, monitor re-list) and the on-disk
+    # segment-cache keys for proxied sources may change without notice in a future
+    # release (biopb/biopb#178). Warned once per configured upstream at expansion.
+    logger.warning(
+        "Source %r uses the EXPERIMENTAL tensor-server remote proxy: its config "
+        "surface (url forms, 'alias', monitor re-list) and the on-disk cache keys "
+        "for proxied sources may change without notice in a future release.",
+        source.url,
+    )
     from biopb_tensor_server.adapters.remote_tensor import (
         _resolve_upstream_token,
         _split_grpc_url,

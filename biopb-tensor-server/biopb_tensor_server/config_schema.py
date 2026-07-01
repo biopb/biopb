@@ -164,14 +164,17 @@ def _sources_schema() -> Dict[str, Any]:
             },
             "cloud": {
                 "type": "boolean",
-                "description": "Treat as a cloud/synced root; admit offline placeholders.",
+                "description": (
+                    "(experimental) Treat as a cloud/synced root; admit offline "
+                    "placeholders resolved lazily on first access."
+                ),
             },
             "credentials_profile": {"type": "string"},
             "alias": {
                 "type": "string",
                 "description": (
-                    "Namespace prefix for an upstream 'tensor-server' source "
-                    "(<alias>__<upstream_source_id>); must be slash-free."
+                    "(experimental) Namespace prefix for an upstream 'tensor-server' "
+                    "source (<alias>__<upstream_source_id>); must be slash-free."
                 ),
             },
             "path": {
@@ -184,7 +187,10 @@ def _sources_schema() -> Dict[str, Any]:
     type_enum = _source_type_enum()
     type_prop: Dict[str, Any] = {
         "type": ["string", "null"],
-        "description": "Storage type; auto-detected for local files when omitted.",
+        "description": (
+            "Storage type; auto-detected for local files when omitted. "
+            "('tensor-server' is experimental.)"
+        ),
     }
     if type_enum:
         type_prop["enum"] = list(type_enum) + [None]

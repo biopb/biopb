@@ -1,6 +1,7 @@
 # Remote Tensor Server as a Source Type — Local Caching Proxy (+ Proxy-First Client)
 
-**Status:** Design / not yet implemented
+**Status:** Implemented — **experimental** (the config surface and the on-disk
+segment-cache keys for proxied sources may change without notice; `biopb/biopb#178`, PR #248)
 **Component:** `biopb-tensor-server`, `biopb-mcp` (client §§7–8)
 **Related:** `biopb/biopb#178` (shared segment cache for remote),
 `biopb/biopb#34` (config validation), `biopb/biopb#212` (startup-scan progress),

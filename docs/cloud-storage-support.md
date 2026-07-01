@@ -1,6 +1,8 @@
 # Cloud storage support in the tensor server (proposal)
 
-> **Status: Phase 2 implemented and shipping.** Cloud/synced-folder data is
+> **Status: Phase 2 implemented — experimental.** The `cloud` source flag and its
+> lazy-resolve behavior may still change without notice in a future release.
+> Cloud/synced-folder data is
 > registered as *unresolved* sources (`adapters/unresolved.py`) and lazily hydrated
 > via a streaming `do_action("resolve")` (`server.py`), gated by `SourceConfig.cloud`,
 > with the `TensorFlightClient.resolve()` SDK method and napari integration
