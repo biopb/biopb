@@ -398,6 +398,44 @@ class TestRuntimePhaseGating:
         finally:
             server.shutdown()
 
+    def test_suppress_live_precache_overrides_the_gate(self, monkeypatch):
+        """A commit during the boot-tick upstream re-list stays off the prompt
+        enqueue even though the initial scan is already done.
+
+        On the both-present boot tick the local walk flips _initial_scan_done
+        True before the upstream re-list runs; _suppress_live_precache keeps that
+        startup upstream mirror routed to the slow backlog (see _handle_rescan)."""
+        from types import SimpleNamespace
+
+        server, sm = self._bare_source_manager()
+        try:
+            monkeypatch.setattr(
+                sm, "_register_source_claim", lambda claim, catalog_seed=None: True
+            )
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
+            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
+            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+
+            fired = []
+            sm._on_source_committed = fired.append
+            sm._initial_scan_done = True
+            claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
+
+            # Suppressed: initial scan done, but this is the boot-tick upstream
+            # re-list -> backlog, not prompt enqueue.
+            sm._suppress_live_precache = True
+            assert sm._commit_add_claim(claim) is True
+            assert fired == []
+
+            # Not suppressed (a later live delta): the hook fires as usual.
+            sm._suppress_live_precache = False
+            assert sm._commit_add_claim(claim) is True
+            assert fired == ["up1"]
+        finally:
+            server.shutdown()
+
     def test_hook_exception_does_not_abort_commit(self, monkeypatch):
         from types import SimpleNamespace
 

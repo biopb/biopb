@@ -13,7 +13,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from ._config_location import find_config
+from ._config_location import DEFAULT_CONFIG_DIR, find_config
 from ._proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
@@ -100,15 +100,67 @@ MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
 
+# The installer records the release-v* deployment version it pulled the wheels
+# from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
+# auto-updater's baseline. This is the *deployment* version and is distinct from
+# any single package's version: one release bundles the mutually-paired
+# biopb / biopb-tensor-server / biopb-mcp triple. Kept in sync with
+# CONFIG_DIR/release.version in install/install.sh.
+_RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
+
+# The three wheels the installer bundles in one release-v* deployment (see
+# install/install.sh). `biopb version` reports each separately so a version skew
+# within the installed set is visible; any may be absent, hence "not installed".
+_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp")
+
+
+def _read_release_version() -> str:
+    """The installed deployment version from the installer's marker file, or
+    'unknown' when it is absent (a dev checkout or non-installer setup that never
+    wrote CONFIG_DIR/release.version) or unreadable. Best-effort like
+    ``_package_version`` -- reading a version must never crash ``biopb version``,
+    so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
+    'unknown' rather than propagating."""
+    try:
+        # Explicit utf-8 (the installer writes a plain ASCII/utf-8 version), so
+        # decoding is deterministic across platforms rather than dependent on the
+        # reader's locale (cp1252 on Windows would decode a corrupt marker to
+        # garbage instead of failing to 'unknown').
+        return _RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+    except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
+        return "unknown"
+
+
+def _package_version(dist_name: str) -> str:
+    """Installed version of distribution `dist_name`, or 'not installed'.
+
+    Reads distribution metadata (like biopb.__init__ does for its own version)
+    instead of importing the package, so `biopb version` never drags in the
+    packages' heavy optional stacks just to print a number, and still reports a
+    version when a package is installed but its runtime imports are broken.
+    """
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    try:
+        return _dist_version(dist_name)
+    except PackageNotFoundError:
+        return "not installed"
+    except Exception:  # noqa: BLE001 - metadata read is best-effort
+        return "unknown"
+
+
 @app.command()
 def version():
-    """Show version information."""
-    try:
-        from biopb import __version__ as biopb_version
-    except Exception:
-        biopb_version = "unknown"
+    """Show the installed release version and each bundled package's version."""
+    rows = [("release", _read_release_version())]
+    rows += [(name, _package_version(name)) for name in _RELEASE_PACKAGES]
 
-    console.print(f"biopb: {biopb_version}")
+    # Left-align the labels so the versions line up in a readable column.
+    width = max(len(name) for name, _ in rows) + 1  # +1 for the trailing ':'
+    for name, ver in rows:
+        console.print(f"{name + ':':<{width}} {ver}")
 
 
 def _ensure_dirs():

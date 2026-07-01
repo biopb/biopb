@@ -590,6 +590,87 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
     )  # single-source form has nothing to re-list
 
 
+def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
+    """A rescan walks the monitored local dirs BEFORE re-listing upstreams.
+
+    The upstream re-list registers one proxy per mirrored source, each a network
+    round-trip; a large upstream can take minutes. Running the local walk first
+    means local directory sources surface promptly instead of waiting behind the
+    whole upstream mirror (biopb/biopb#178 ordering)."""
+    from unittest.mock import MagicMock
+
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.source_manager import SourceManager
+
+    manager = SourceManager(
+        server=MagicMock(),
+        registry=get_default_registry(),
+        discovery_state=DiscoveryState(),
+        watcher=None,
+        monitored_dirs={tmp_path},
+        metadata_db=None,
+        monitored_upstreams=[SourceConfig(url="grpc://lab:8815", alias="lab")],
+    )
+
+    order = []
+    manager._rescan_monitored_dirs = lambda: order.append("local")
+    manager._reconcile_due_upstreams = lambda: order.append("upstream")
+
+    manager._handle_rescan()
+
+    assert order == ["local", "upstream"]
+
+
+def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path):
+    """On the boot tick the local walk flips _initial_scan_done True before the
+    upstream re-list; _handle_rescan suppresses the live-precache enqueue across
+    that re-list so the startup upstream mirror routes to the slow backlog, not
+    the un-idle-gated prompt tier. Steady-state ticks never suppress."""
+    from unittest.mock import MagicMock
+
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.source_manager import SourceManager
+
+    manager = SourceManager(
+        server=MagicMock(),
+        registry=get_default_registry(),
+        discovery_state=DiscoveryState(),
+        watcher=None,
+        monitored_dirs={tmp_path},
+        metadata_db=None,
+        monitored_upstreams=[SourceConfig(url="grpc://lab:8815", alias="lab")],
+    )
+
+    seen = {}
+
+    # The local walk flips the gate mid-tick, exactly as the first full scan does.
+    def _walk():
+        seen["during_local"] = manager._suppress_live_precache
+        manager._initial_scan_done = True
+
+    manager._rescan_monitored_dirs = _walk
+    manager._reconcile_due_upstreams = lambda: seen.update(
+        during_upstream=manager._suppress_live_precache
+    )
+
+    # Boot tick: initial scan not yet done at tick start.
+    manager._initial_scan_done = False
+    manager._handle_rescan()
+    assert seen["during_local"] is False  # local walk is not suppressed
+    assert seen["during_upstream"] is True  # startup upstream mirror is
+    assert manager._suppress_live_precache is False  # reset after the re-list
+
+    # Steady-state tick: initial scan already done at tick start -> no suppression.
+    seen.clear()
+    manager._handle_rescan()
+    assert seen["during_upstream"] is False
+    assert manager._suppress_live_precache is False
+
+
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     """An upstream down at boot is retried on the fast incremental cadence -- not
