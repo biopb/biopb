@@ -371,6 +371,14 @@ class TestPerTensorCatalog:
 class TestListSourceDescriptors:
     """Rebuild lean ListFlights descriptors from the catalog (biopb/biopb#265)."""
 
+    def test_empty_catalog_returns_no_rows_and_zero_total(self):
+        # The COUNT(*) OVER () window yields no rows on an empty table, so the
+        # total must fall back to 0 rather than indexing an empty result.
+        db = MetadataDatabase()
+        descriptors, total = db.list_source_descriptors()
+        assert descriptors == []
+        assert total == 0
+
     def test_reconstructs_lean_descriptor(self):
         db = MetadataDatabase()
         db.sync_source_added(

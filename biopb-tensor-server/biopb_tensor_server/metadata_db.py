@@ -449,7 +449,12 @@ class MetadataDatabase:
         field is advisory/volatile by contract (the authoritative gate is a fresh
         ``adapter.is_resident()``), so a point-in-time value is acceptable here.
 
-        Uses ``cursor()`` for a thread-safe read (no lock).
+        Uses ``cursor()`` for a thread-safe read (no lock). The full count is
+        carried by a ``COUNT(*) OVER ()`` window in the SAME statement as the
+        rows (window functions run before ``LIMIT``), so ``total`` and the
+        clipped rows come from one consistent snapshot -- a separate
+        ``SELECT COUNT(*)`` could race a concurrent upload and report
+        ``returned > total``.
 
         Args:
             limit: Max rows to return (the ListFlights safety cap). ``None`` =
@@ -460,10 +465,10 @@ class MetadataDatabase:
             count (so the caller can signal truncation when ``limit`` clips it).
         """
         cursor = self._get_cursor()
-        total = cursor.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
 
         sql = (
-            "SELECT source_id, source_url, source_type, data_resident, tensors "
+            "SELECT source_id, source_url, source_type, data_resident, tensors, "
+            "COUNT(*) OVER () AS total_count "
             "FROM sources ORDER BY source_id"
         )
         params: list = []
@@ -472,8 +477,11 @@ class MetadataDatabase:
             params.append(limit)
         rows = cursor.execute(sql, params).fetchall()
 
+        # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
+        total = rows[0][-1] if rows else 0
+
         descriptors: List[DataSourceDescriptor] = []
-        for source_id, source_url, source_type, data_resident, tensors in rows:
+        for source_id, source_url, source_type, data_resident, tensors, _ in rows:
             tensor_descs = [
                 TensorDescriptor(
                     array_id=t["array_id"],
