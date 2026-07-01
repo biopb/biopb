@@ -739,6 +739,7 @@ class TestWinRequestShutdown:
         assert sentinel.read_text() == "stop"
         assert sentinel == tmp_path / "tensor-server.stop"  # not pid-keyed
         cli._win_remove_sentinel()
+        assert not sentinel.exists()
 
 
 class TestMigrateConfig:
