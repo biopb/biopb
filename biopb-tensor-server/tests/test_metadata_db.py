@@ -459,6 +459,47 @@ class TestListSourceDescriptors:
         assert descriptors[0].data_resident is False
 
 
+class TestGetMetadataJson:
+    """Local metadata_json read-back for the serve path (biopb/biopb#253)."""
+
+    def test_returns_stored_raw_json(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        raw = db.get_metadata_json("s1")
+        assert json.loads(raw) == {
+            "test_key": "test_value",
+            "nested": {"a": 1, "b": 2},
+        }
+
+    def test_none_for_empty_metadata(self):
+        # MultiTensorAdapter.get_metadata() -> {} -> stored as SQL NULL.
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s2",
+            MultiTensorAdapter(
+                "s2",
+                "/d/s2.zarr",
+                "zarr",
+                [
+                    {
+                        "array_id": "s2",
+                        "dim_labels": ["y", "x"],
+                        "shape": [4, 4],
+                        "chunk_shape": [4, 4],
+                        "dtype": "uint8",
+                    }
+                ],
+            ),
+        )
+        assert db.get_metadata_json("s2") is None
+
+    def test_none_for_absent_source(self):
+        db = MetadataDatabase()
+        assert db.get_metadata_json("nope") is None
+
+
 class TestQueryHandling:
     """Test SQL query handling."""
 

@@ -431,6 +431,27 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+    def get_metadata_json(self, source_id: str) -> Optional[str]:
+        """Return a source's stored ``metadata_json``, or ``None``.
+
+        The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
+        dict, no envelope -- so the serve path can read metadata back with a
+        cheap local ``SELECT`` instead of recomputing it on the adapter
+        (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
+        the local mirror row directly, never ``adapter.get_metadata()``).
+
+        Returns ``None`` when the source is absent OR its metadata is SQL NULL
+        (empty metadata is stored as NULL) -- the caller then falls back to
+        ``adapter.get_metadata()``. Uses ``cursor()`` for a thread-safe read.
+        """
+        cursor = self._get_cursor()
+        row = cursor.execute(
+            "SELECT metadata_json FROM sources WHERE source_id = ?", [source_id]
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0]
+
     def list_source_descriptors(
         self, limit: Optional[int] = None
     ) -> Tuple[List[DataSourceDescriptor], int]:

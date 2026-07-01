@@ -1209,7 +1209,23 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                raw_metadata = tensor_adapter.get_metadata()
+                # Prefer the catalog's stored metadata_json (biopb/biopb#253):
+                # computed once at registration, read back with a cheap local
+                # SELECT -- no adapter recompute, and for a remote proxy no
+                # upstream RPC (read the local mirror row directly, never
+                # adapter.get_metadata()). Fall back to the adapter only when
+                # there is no DB or the row is NULL (empty metadata, or an
+                # unresolved source whose real row isn't written yet).
+                raw_metadata = None
+                if self._metadata_db is not None:
+                    stored = self._metadata_db.get_metadata_json(source_id)
+                    if stored:
+                        try:
+                            raw_metadata = json.loads(stored)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            raw_metadata = None
+                if raw_metadata is None:
+                    raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter._source_type,
