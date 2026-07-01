@@ -739,4 +739,83 @@ class TestWinRequestShutdown:
         assert sentinel.read_text() == "stop"
         assert sentinel == tmp_path / "tensor-server.stop"  # not pid-keyed
         cli._win_remove_sentinel()
-        assert not sentinel.exists()
+
+
+class TestMigrateConfig:
+    """`biopb server migrate-config`: legacy biopb.toml -> canonical biopb.json."""
+
+    _TOML = (
+        "[server]\n"
+        'host = "127.0.0.1"\n'
+        "port = 8815\n\n"
+        "[cache]\n"
+        "max_bytes = 3000000000\n\n"
+        "[[sources]]\n"
+        'url = "/data/microscopy"\n'
+        "monitor = true\n\n"
+        "# advanced/unknown key that must survive the migration\n"
+        "[experimental]\n"
+        'foo = "bar"\n'
+    )
+
+    def _run(self, config_dir, *extra):
+        return CliRunner().invoke(
+            cli.app, ["server", "migrate-config", "--config", str(config_dir), *extra]
+        )
+
+    def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
+        (tmp_path / "biopb.toml").write_text(self._TOML)
+        res = self._run(tmp_path)
+        assert res.exit_code == 0, res.output
+
+        json_path = tmp_path / "biopb.json"
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert data["server"]["port"] == 8815
+        assert data["cache"]["max_bytes"] == 3000000000
+        assert data["sources"][0]["url"] == "/data/microscopy"
+        # The unknown table survives (raw-dict round-trip, not dataclass).
+        assert data["experimental"] == {"foo": "bar"}
+        # Legacy file retired to .bak; schema sidecar written.
+        assert (tmp_path / "biopb.toml.bak").exists()
+        assert not (tmp_path / "biopb.toml").exists()
+        assert (tmp_path / "biopb.schema.json").exists()
+
+    def test_dry_run_writes_nothing(self, tmp_path):
+        (tmp_path / "biopb.toml").write_text(self._TOML)
+        res = self._run(tmp_path, "--dry-run")
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.toml").exists()  # untouched
+        assert not (tmp_path / "biopb.json").exists()
+        assert not (tmp_path / "biopb.toml.bak").exists()
+
+    def test_already_json_is_noop(self, tmp_path):
+        (tmp_path / "biopb.json").write_text('{"server": {"port": 8815}}')
+        res = self._run(tmp_path)
+        assert res.exit_code == 0
+        assert "Already canonical" in res.output
+        assert not (tmp_path / "biopb.toml.bak").exists()
+
+    def test_both_present_retires_toml_without_touching_json(self, tmp_path):
+        (tmp_path / "biopb.toml").write_text("[server]\nport = 8815\n")
+        # A JSON that must be left byte-for-byte untouched (it already wins).
+        original = '{"server": {"port": 9999}}'
+        (tmp_path / "biopb.json").write_text(original)
+        res = self._run(tmp_path)
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.json").read_text() == original  # untouched
+        assert (tmp_path / "biopb.toml.bak").exists()
+        assert not (tmp_path / "biopb.toml").exists()
+
+    def test_no_config_present(self, tmp_path):
+        res = self._run(tmp_path)
+        assert res.exit_code == 0
+        assert "No legacy config found" in res.output
+
+    def test_config_pointing_at_file_uses_its_dir(self, tmp_path):
+        # --config may name the file itself, not just the directory.
+        toml = tmp_path / "biopb.toml"
+        toml.write_text(self._TOML)
+        res = self._run(toml)
+        assert res.exit_code == 0, res.output
+        assert (tmp_path / "biopb.json").exists()
