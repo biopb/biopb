@@ -73,7 +73,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI and biopb-mcp share one definition (all three depend on
@@ -306,23 +306,34 @@ _SECTION_FOR = {
 }
 
 
+def _config_problems(instance) -> List[Tuple[str, str]]:
+    """``(field, message)`` for each :data:`_CONSTRAINTS` violation on *instance*
+    (empty when valid).
+
+    The shared core of the two validation surfaces, so both judge a value by the
+    exact same rule: the warn/raise :func:`_validate_config` policy run at
+    construction, and the endpoint's :func:`validate_config_dict` gate.
+    """
+    constraints = _CONSTRAINTS.get(type(instance).__name__)
+    if not constraints:
+        return []
+    return [
+        (key, f"{key}={getattr(instance, key)!r} (expected {c.describe()})")
+        for key, c in constraints.items()
+        if not c.ok(getattr(instance, key))
+    ]
+
+
 def _validate_config(instance) -> None:
     """Check *instance*'s fields against :data:`_CONSTRAINTS` (warn, or raise
     when ``_STRICT_VALIDATION``). Called from each config dataclass's
     ``__post_init__`` so every construction path is covered."""
-    name = type(instance).__name__
-    constraints = _CONSTRAINTS.get(name)
-    if not constraints:
-        return
-    problems = [
-        f"{key}={getattr(instance, key)!r} (expected {c.describe()})"
-        for key, c in constraints.items()
-        if not c.ok(getattr(instance, key))
-    ]
+    problems = _config_problems(instance)
     if not problems:
         return
+    name = type(instance).__name__
     msg = f"Invalid config value(s) in [{_SECTION_FOR.get(name, name)}]: " + "; ".join(
-        problems
+        message for _field, message in problems
     )
     if _STRICT_VALIDATION:
         raise ValueError(msg)
@@ -1151,6 +1162,44 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         metadata_db=metadata_db_config,
         sources=sources,
     )
+
+
+def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Validate a raw config dict with the SAME rules the server enforces at
+    load, independent of the warn/raise policy (:data:`_STRICT_VALIDATION`).
+
+    Returns ``[{"path": [section, key], "message": str}, ...]`` (empty = valid),
+    using the on-disk ``(section, key)`` paths
+    :func:`config_schema.ondisk_location` assigns, so a caller can merge/dedupe
+    these against JSON-Schema errors by path.
+
+    This is the authoritative *semantic* gate. It catches everything
+    :data:`_CONSTRAINTS` covers -- notably the case-insensitive enums
+    (``log_level``, ``reduction_method``) the published JSON Schema deliberately
+    cannot express (``_Enum.to_json_schema`` emits no hard ``enum`` for them, so
+    a schema-only check waves a bad value through). The admin config-save
+    endpoint runs this alongside JSON-Schema validation so a config the form
+    accepts is one the server will actually load. See biopb/biopb#34.
+    """
+    try:
+        cfg = parse_config(data)
+    except (ValueError, TypeError) as exc:
+        # Structural failure (missing url, un-coercible number, or -- once
+        # _STRICT_VALIDATION flips -- a strict sub-parse): report as a single
+        # root-level problem rather than letting it crash the caller.
+        return [{"path": [], "message": str(exc)}]
+
+    # Lazy import: config_schema imports this module, so importing it at module
+    # scope is a cycle (mirrors save_config's build_config_schema import).
+    from biopb_tensor_server.config_schema import ondisk_location
+
+    problems: List[Dict[str, Any]] = []
+    for inst in (cfg, cfg.cache, cfg.pyramid, cfg.precache, cfg.metadata_db):
+        class_name = type(inst).__name__
+        for field_name, message in _config_problems(inst):
+            section, key = ondisk_location(class_name, field_name)
+            problems.append({"path": [section, key], "message": message})
+    return problems
 
 
 def detect_source_type(url: str) -> Optional[str]:

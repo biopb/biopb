@@ -923,6 +923,26 @@ class TestAdminConfigRoutes:
         # Nothing written: disk untouched.
         assert config_path.read_text() == before
 
+    def test_put_rejects_bad_case_insensitive_enum_the_schema_cannot_express(
+        self, admin_client
+    ):
+        # log_level is a case-insensitive enum, so the published JSON Schema
+        # emits no hard `enum` (it would reject valid differently-cased values).
+        # The endpoint's semantic pass (validate_config_dict) must still reject a
+        # value the server would refuse at load, so "the form accepted it" always
+        # implies "the server will load it" (biopb/biopb#34).
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": {"log_level": "VERBOSE"}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert any(err["path"] == ["server", "log_level"] for err in body["errors"])
+        assert config_path.read_text() == before  # nothing written
+
     def test_put_valid_saves_and_preserves_unsurfaced_keys(self, admin_client):
         import json
 

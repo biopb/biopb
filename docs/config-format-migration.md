@@ -126,6 +126,19 @@ Case-insensitive enums (`log_level`, `reduction_method`) emit **no** hard
 `enum` — the server folds case, so a canonical-set enum would reject values it
 accepts — and instead carry the accepted set in the property `description`.
 
+**The admin endpoint pairs the schema with the server's real validator.**
+Because the schema deliberately can't express those case-insensitive enums, a
+schema-only check at the config-save endpoint (`PUT /api/config`) would accept a
+`log_level` / `reduction_method` the server then refuses at load. So the endpoint
+validates a submitted config with **both** the JSON Schema **and**
+`config.validate_config_dict` — the same `_CONSTRAINTS` gate the server runs at
+load, exposed as structured `{path, message}` problems on the schema's on-disk
+paths (via `config_schema.ondisk_location`) so the two dedupe by path with no
+duplicate messages. A config the form accepts is therefore always one the server
+will load. `validate_config_dict` shares its core (`_config_problems`) with the
+load-time `_validate_config` and is independent of the warn/raise
+`_STRICT_VALIDATION` policy, so there is one rule set behind both surfaces.
+
 **Subsumes the unknown-key warning (#234).** That feature warned on unrecognized
 config keys (the silent drop-to-default trap, e.g. `[cache] memory_max_entries`
 instead of `max_entries`) from three hardcoded `_KNOWN_*` tables — a second

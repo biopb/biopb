@@ -1253,6 +1253,7 @@ async def put_config(request: Request) -> JSONResponse:
         _read_config_file,
         restore_redacted_secrets,
         save_config,
+        validate_config_dict,
     )
     from biopb_tensor_server.config_schema import build_config_schema
 
@@ -1273,11 +1274,21 @@ async def put_config(request: Request) -> JSONResponse:
         {"path": [str(x) for x in e.absolute_path], "message": e.message}
         for e in validator.iter_errors(body)
     ]
+    # The published JSON Schema deliberately can't express the case-insensitive
+    # enums (log_level / reduction_method), so also run the server's real
+    # load-time validation and add any problem the schema did not already flag
+    # (deduped by path). This keeps "the form accepted it" == "the server will
+    # load it" -- one rule set gates both surfaces. See biopb/biopb#34.
+    schema_paths = {tuple(e["path"]) for e in errors}
+    for problem in validate_config_dict(body):
+        path = [str(x) for x in problem["path"]]
+        if tuple(path) not in schema_paths:
+            errors.append({"path": path, "message": problem["message"]})
     if errors:
         errors.sort(key=lambda d: d["path"])
         return JSONResponse(
             status_code=422,
-            content={"detail": "Config failed schema validation", "errors": errors},
+            content={"detail": "Config failed validation", "errors": errors},
         )
     try:
         written = save_config(body, Path(ctx.config_path))
