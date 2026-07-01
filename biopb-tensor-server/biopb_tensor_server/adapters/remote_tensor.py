@@ -115,6 +115,7 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         *,
         token: Optional[str] = None,
         tensor_name: Optional[str] = None,
+        alias: Optional[str] = None,
     ):
         """Bind a proxy to one upstream source.
 
@@ -128,11 +129,23 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             token: Bearer token for the upstream (auth). ``None`` disables auth.
             tensor_name: Within-source field for a tensor-layer view (set by
                 ``get_tensor_adapter``); ``None`` is the source / default tensor.
+            alias: The configured namespace alias for this upstream, used only to
+                build a display-friendly catalog ``source_url`` (``<alias>:<id>``);
+                ``None`` falls back to the upstream host.
         """
         self.source_id = source_id
-        self._source_url = upstream_location
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
+        self._alias = alias
+        # Display-friendly catalog source_url: keep the grpc:// scheme (so it fits
+        # the URL pattern and passes to_catalog_url through unchanged), but put the
+        # alias -- or the host:port when there is none -- in the authority slot and
+        # the upstream source_id after it: grpc://lab:experiment1 (aliased) or
+        # grpc://lab-store:8815:experiment1 (no alias). Far more legible in a
+        # listing than the bare endpoint, which is identical for every source of an
+        # upstream. (self._upstream_location keeps the real endpoint for dialing.)
+        authority = alias or (urlsplit(upstream_location).netloc or upstream_location)
+        self._source_url = f"grpc://{authority}:{upstream_source_id}"
 
         self._upstream_location = upstream_location
         self._upstream_source_id = upstream_source_id
@@ -228,6 +241,7 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             upstream_location=endpoint,
             upstream_source_id=upstream_source_id,
             token=token,
+            alias=source.alias,
         )
 
     def get_metadata(self) -> dict:

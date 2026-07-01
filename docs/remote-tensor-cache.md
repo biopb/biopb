@@ -177,8 +177,13 @@ selected automatically; each instance then rewrites to its own upstream.
   (from `client.get_descriptor` / `list_sources`), **with `array_id` rewritten**
   local-ward (`<source_id>` → `<alias>__<source_id>`, preserving any `/field`).
 - `get_source_descriptor()` → mirror the upstream `DataSourceDescriptor` under the
-  local namespaced `source_id`, with `source_url` left as the upstream `grpc://…`
-  for provenance.
+  local namespaced `source_id`. `source_url` is a **display-friendly** proxied
+  form — `grpc://<alias>:<upstream_source_id>` (e.g. `grpc://lab:experiment1`), or
+  `grpc://<host:port>:<id>` when no alias — set on `_source_url` at construction.
+  It keeps the `grpc://` scheme so it fits the URL pattern and passes
+  `to_catalog_url` through unchanged, while being far more legible in a catalog
+  listing than the bare `grpc://host:port` endpoint (identical for every source of
+  an upstream). The real endpoint stays on `_upstream_location` for dialing.
 - `is_resident()` → `True` once the upstream descriptor is fetched (the proxy
   treats a reachable upstream source as resident; an *unreachable* one is a
   natural fit for the `UnresolvedSourceAdapter` deferral pattern — see

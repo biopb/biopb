@@ -817,6 +817,52 @@ def test_unreachable_sole_monitored_upstream_does_not_block_startup():
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_display_friendly_proxied_source_url(simple_zarr_array):
+    """A proxied source's catalog source_url is grpc://<alias-or-host:port>:<id>
+    (keeps the grpc:// scheme, but far more legible than the bare endpoint that is
+    identical for every source of an upstream)."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    upstream = TensorFlightServer("grpc://localhost:0")
+    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    up = f"grpc://localhost:{upstream.port}"
+    try:
+        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy.register_source(  # aliased -> grpc://lab:img
+            "lab__img",
+            RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location=up,
+                upstream_source_id="img",
+                alias="lab",
+            ),
+        )
+        proxy.register_source(  # no alias -> grpc://<host:port>:img
+            "img",
+            RemoteTensorAdapter(
+                source_id="img", upstream_location=up, upstream_source_id="img"
+            ),
+        )
+        _serve(proxy)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+            sources = client.list_sources()
+            assert sources["lab__img"].source_url == "grpc://lab:img"
+            assert sources["img"].source_url == f"grpc://localhost:{upstream.port}:img"
+            client.close()
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_inherited_segment_cache(simple_zarr_array, tmp_path):
     """A second resolve_chunk_data for the same chunk is served from the file
     cache without a second upstream fetch -- the proxy inherits the segment cache."""
