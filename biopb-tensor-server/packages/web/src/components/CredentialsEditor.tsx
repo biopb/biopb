@@ -101,7 +101,16 @@ export function CredentialsEditor({
       else copy[key] = value;
       return copy;
     });
-    commit(next);
+    // Renaming the profile that `default_profile` points at must follow the
+    // rename, or the reference dangles (a blanked name clears it).
+    let nextDefault: string | undefined;
+    if (key === "name") {
+      const oldName = str(profiles[i]?.name);
+      if (oldName && oldName === str(credentials(config).default_profile)) {
+        nextDefault = value == null ? "" : str(value);
+      }
+    }
+    commit(next, nextDefault);
   }
 
   function addProfile() {
