@@ -765,6 +765,12 @@ class TestMigrateConfig:
         )
 
     def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
+        # The actual migration reuses biopb_tensor_server.config (save_config /
+        # _read_config_file). That package ships only with the full installer,
+        # not on PyPI, so it is absent from the lightweight `biopb[test,tensor]`
+        # CI env -- skip there; the command's own "unavailable" fallback is what
+        # runs in that case.
+        pytest.importorskip("biopb_tensor_server")
         (tmp_path / "biopb.toml").write_text(self._TOML)
         res = self._run(tmp_path)
         assert res.exit_code == 0, res.output
@@ -783,6 +789,7 @@ class TestMigrateConfig:
         assert (tmp_path / "biopb.schema.json").exists()
 
     def test_dry_run_writes_nothing(self, tmp_path):
+        pytest.importorskip("biopb_tensor_server")  # see note above
         (tmp_path / "biopb.toml").write_text(self._TOML)
         res = self._run(tmp_path, "--dry-run")
         assert res.exit_code == 0, res.output
@@ -814,6 +821,7 @@ class TestMigrateConfig:
         assert "No legacy config found" in res.output
 
     def test_config_pointing_at_file_uses_its_dir(self, tmp_path):
+        pytest.importorskip("biopb_tensor_server")  # see note above
         # --config may name the file itself, not just the directory.
         toml = tmp_path / "biopb.toml"
         toml.write_text(self._TOML)
