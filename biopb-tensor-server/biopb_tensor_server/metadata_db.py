@@ -194,7 +194,26 @@ class MetadataDatabase:
                 -- three-valued-logic gap where a NULL row silently drops from
                 -- both. FALSE is the conservative default (unknown -> treat as
                 -- non-resident; still discoverable via `WHERE NOT data_resident`).
-                data_resident BOOLEAN NOT NULL DEFAULT FALSE
+                data_resident BOOLEAN NOT NULL DEFAULT FALSE,
+                -- Full per-tensor structural info (biopb/biopb#224): one struct
+                -- per tensor, so multi-field / HCS sources are queryable per
+                -- tensor instead of via the first-tensor projection only. Only
+                -- cheap/structural fields (already in the lean ListFlights
+                -- descriptor) are stored here -- the expensive/lazy fields
+                -- (metadata_json, pyramid, physical_scale) are deliberately left
+                -- out, filled only by GetFlightInfo. A single nested column (not a
+                -- child table) keeps the whole row a single-statement upsert, so
+                -- shrinking a source's tensor set can't leave ghost rows and a
+                -- read never straddles a torn sources-tensors join. Unresolved
+                -- cloud sources carry an empty list. Query per tensor with
+                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
+                tensors STRUCT(
+                    array_id VARCHAR,
+                    dim_labels VARCHAR[],
+                    shape BIGINT[],
+                    chunk_shape BIGINT[],
+                    dtype VARCHAR
+                )[]
             )
         """)
         # Index on source_url for path filtering
@@ -364,13 +383,33 @@ class MetadataDatabase:
         source_desc = adapter.get_source_descriptor()
         metadata = adapter.get_metadata()
 
-        # Build shape_summary from first tensor
+        # Scalar first-tensor projection, kept for back-compat: the MCP guide's
+        # `WHERE dtype='uint16'` / `shape_summary` predicates keep working, and
+        # since they are written in the SAME upsert as the tensors struct below
+        # they can never desync from it.
         shape_summary = None
         dtype = None
         if source_desc.tensors:
             first_tensor = source_desc.tensors[0]
             shape_summary = json.dumps(list(first_tensor.shape))
             dtype = first_tensor.dtype
+
+        # Full per-tensor structural info (biopb/biopb#224): one struct per tensor,
+        # not just tensors[0]. Every field here is already populated in the lean
+        # ListFlights descriptor (source_desc.tensors), so this adds no adapter
+        # call and no recall. Expensive/lazy fields (metadata_json, pyramid,
+        # physical_scale) are intentionally omitted -- they are filled only by
+        # GetFlightInfo. Unresolved cloud sources have no tensors -> empty list.
+        tensors = [
+            {
+                "array_id": t.array_id,
+                "dim_labels": list(t.dim_labels),
+                "shape": [int(s) for s in t.shape],
+                "chunk_shape": [int(c) for c in t.chunk_shape],
+                "dtype": t.dtype,
+            }
+            for t in source_desc.tensors
+        ]
 
         # Build row data
         indexed_at = datetime.now()
@@ -381,8 +420,8 @@ class MetadataDatabase:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     source_id,
@@ -393,6 +432,7 @@ class MetadataDatabase:
                     metadata_json,
                     shape_summary,
                     source_desc.data_resident,
+                    tensors,
                 ],
             )
 
