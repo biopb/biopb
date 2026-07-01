@@ -1743,7 +1743,7 @@ class TestStaticCatalogSeeding:
         from biopb_tensor_server.metadata_db import MetadataDatabase
         from biopb_tensor_server.source_manager import create_source_manager
 
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         server = _FakeServer()
         static = SourceConfig(url=str(tmp_path / "plate.zarr"), type="zarr")
 

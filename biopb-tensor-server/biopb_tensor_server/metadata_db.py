@@ -72,8 +72,11 @@ class MetadataDatabase:
     Thread-safe: All operations are protected by a lock.
     Lazy initialization: Database created on first access.
 
+    The metadata DB is mandatory (biopb/biopb#225): it is the canonical
+    source-browsing surface (``client.query_sources``), so there is no
+    off switch -- constructing this object means the catalog is live.
+
     Args:
-        enabled: If False, all operations are no-ops (for disabling feature)
         max_query_results: Safety cap on returned rows (truncation signaled via schema metadata)
         query_timeout_ms: Query execution timeout in milliseconds
 
@@ -115,11 +118,9 @@ class MetadataDatabase:
 
     def __init__(
         self,
-        enabled: bool = True,
         max_query_results: int = 100000,
         query_timeout_ms: int = 30000,
     ):
-        self._enabled = enabled
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
 
@@ -127,12 +128,9 @@ class MetadataDatabase:
         self._write_lock = threading.Lock()  # Lock for write operations only
         self._initialized = False
 
-        if self._enabled:
-            logger.info(
-                "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
-            )
-        else:
-            logger.info("MetadataDatabase disabled")
+        logger.info(
+            "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
+        )
 
         # Pending query results for DoGet (stored by ticket)
         self._pending_results: Dict[str, pa.Table] = {}
@@ -278,9 +276,6 @@ class MetadataDatabase:
         Raises:
             ValueError: If query is invalid or violates security rules
         """
-        if not self._enabled:
-            raise ValueError("Metadata database is disabled")
-
         self._validate_query(sql)
 
         # Use cursor for thread-safe read (no lock needed for SELECT)
@@ -374,9 +369,6 @@ class MetadataDatabase:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
         """
-        if not self._enabled:
-            return
-
         conn = self._get_connection()
 
         # Get source descriptor and metadata
@@ -449,9 +441,6 @@ class MetadataDatabase:
         Args:
             source_id: Unique source identifier
         """
-        if not self._enabled:
-            return
-
         conn = self._get_connection()
         with self._write_lock:
             conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])

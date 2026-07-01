@@ -88,6 +88,16 @@ _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
         "watcher_type": ("string", "Deprecated alias for monitor_mode."),
         "poll_interval": ("number", "Deprecated alias for rescan_interval."),
     },
+    "metadata_db": {
+        # Removed (biopb/biopb#225): the metadata DB is mandatory. Kept in the
+        # schema as a tolerated no-op so an old config with the flag is warned by
+        # parse_config, not flagged as an unknown key here.
+        "enabled": (
+            "boolean",
+            "Removed (biopb/biopb#225): the metadata database is mandatory "
+            "(always on); this flag is ignored. Drop it from your config.",
+        ),
+    },
 }
 
 # Default instances give each field's runtime value -> its JSON type. Defaults
@@ -278,15 +288,6 @@ def build_config_schema() -> Dict[str, Any]:
             f"Deprecated under [precache]; set it under [pyramid]. {base}".strip()
         )
         sections["precache"]["properties"][key] = mirrored
-
-    # 4. metadata_db.enabled is deprecated (#225) though still read.
-    enabled = sections.get("metadata_db", {}).get("properties", {}).get("enabled")
-    if enabled is not None:
-        enabled["deprecated"] = True
-        enabled["description"] = (
-            "Deprecated (biopb/biopb#225): the metadata database is becoming "
-            "mandatory; drop this flag."
-        )
 
     properties: Dict[str, Any] = dict(sections)
     properties["sources"] = _sources_schema()

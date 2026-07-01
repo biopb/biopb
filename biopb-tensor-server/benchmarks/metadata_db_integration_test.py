@@ -92,7 +92,7 @@ def _create_server_with_sources(n_sources: int):
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"
 
-    db = MetadataDatabase(enabled=True)
+    db = MetadataDatabase()
     server = TensorFlightServer(location, metadata_db=db)
 
     server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -146,7 +146,7 @@ def server_with_metadata_db():
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"
 
-    db = MetadataDatabase(enabled=True)
+    db = MetadataDatabase()
     server = TensorFlightServer(location, metadata_db=db)
 
     server_thread = threading.Thread(target=server.serve, daemon=True)
