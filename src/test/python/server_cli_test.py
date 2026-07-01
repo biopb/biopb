@@ -828,3 +828,75 @@ class TestMigrateConfig:
         res = self._run(toml)
         assert res.exit_code == 0, res.output
         assert (tmp_path / "biopb.json").exists()
+
+
+class TestVersionCommand:
+    """`biopb version` reports the release-v* deployment version (from the
+    installer's marker file) plus each of the three bundled wheels, resolved
+    independently so an absent one shows 'not installed' rather than breaking
+    the command. The release line is deliberately NOT any single wheel's
+    version."""
+
+    @staticmethod
+    def _labels(output: str) -> dict:
+        """Map each `label: value` line to its value, collapsing the alignment
+        padding the command inserts between the label and the version."""
+        out = {}
+        for line in output.splitlines():
+            if ":" in line:
+                label, _, value = line.partition(":")
+                out[label.strip()] = value.strip()
+        return out
+
+    def test_reports_release_and_bundled_packages(self, monkeypatch, tmp_path):
+        # Release version comes from the installer's marker file, not a package.
+        marker = tmp_path / "release.version"
+        marker.write_text("1.2.3\n")
+        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
+        # A stand-in metadata lookup: two of the triple installed, one absent.
+        installed = {"biopb": "1.2.3.dev9+gabc", "biopb-tensor-server": "1.2.3"}
+        monkeypatch.setattr(
+            cli, "_package_version", lambda name: installed.get(name, "not installed")
+        )
+
+        res = CliRunner().invoke(cli.app, ["version"])
+
+        assert res.exit_code == 0, res.output
+        labels = self._labels(res.output)
+        # Deployment version is the marker's contents, distinct from biopb's own.
+        assert labels["release"] == "1.2.3"
+        assert labels["biopb"] == "1.2.3.dev9+gabc"
+        assert labels["biopb-tensor-server"] == "1.2.3"
+        # The absent third wheel is reported, not silently dropped.
+        assert labels["biopb-mcp"] == "not installed"
+
+    def test_release_version_unknown_when_marker_absent(self, monkeypatch, tmp_path):
+        # A dev checkout / non-installer setup has no marker: report 'unknown',
+        # never crash.
+        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", tmp_path / "missing.version")
+
+        res = CliRunner().invoke(cli.app, ["version"])
+
+        assert res.exit_code == 0, res.output
+        assert self._labels(res.output)["release"] == "unknown"
+
+    def test_read_release_version_strips_marker_contents(self, monkeypatch, tmp_path):
+        marker = tmp_path / "release.version"
+        # The installer writes no trailing newline; be tolerant of both.
+        marker.write_text("  9.9.9\n")
+        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
+        assert cli._read_release_version() == "9.9.9"
+
+    def test_package_version_missing_is_not_installed(self):
+        # A distribution name that is guaranteed absent maps to 'not installed'.
+        assert (
+            cli._package_version("biopb-definitely-not-a-real-package")
+            == "not installed"
+        )
+
+    def test_package_version_present_returns_metadata_version(self):
+        # biopb itself is always installed in the test env; its reported version
+        # matches importlib.metadata, confirming we read metadata not an import.
+        from importlib.metadata import version as _v
+
+        assert cli._package_version("biopb") == _v("biopb")
