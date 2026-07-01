@@ -217,6 +217,26 @@ class MetadataDatabase:
         """)
         # Index on source_url for path filtering
         conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
+
+        # Per-tensor physical scale/unit cache (biopb/biopb#253). A lazy,
+        # populate-on-first-serve cache: GetFlightInfo reads it instead of
+        # recomputing on the adapter (an OME-XML reparse) or, for a remote proxy,
+        # dialing upstream. Keyed per tensor (source_id, array_id); NOT the
+        # browse `sources` STRUCT, since scale is a serve-time field, not a query
+        # predicate, and per-tensor lazy upsert into a nested LIST is awkward.
+        # Empty `scale`/`unit` arrays cache a genuine "no physical scale", so a
+        # scale-less source is not recomputed on every open. Not exposed to
+        # client SQL (validator allows only `sources`); the server reads it
+        # directly.
+        conn.execute("""
+            CREATE TABLE tensor_physical_scale (
+                source_id TEXT,
+                array_id TEXT,
+                scale DOUBLE[],
+                unit VARCHAR[],
+                PRIMARY KEY (source_id, array_id)
+            )
+        """)
         logger.debug("Created sources table and indexes")
 
     def _validate_query(self, sql: str) -> None:
@@ -474,6 +494,62 @@ class MetadataDatabase:
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def get_physical_scale(
+        self, source_id: str, array_id: str
+    ) -> Optional[Tuple[List[float], List[str]]]:
+        """Return a tensor's cached ``(scale, unit)``, or ``None`` if not cached.
+
+        A cache **miss** (no row) returns ``None`` -- the caller computes it and
+        calls :meth:`set_physical_scale`. A cached "no physical scale" is the
+        empty tuple ``([], [])`` (distinct from a miss), so a scale-less tensor is
+        not recomputed on every open (biopb/biopb#253). Never raises: a read error
+        degrades to a miss (recompute) rather than failing the serve.
+        """
+        try:
+            cursor = self._get_cursor()
+            row = cursor.execute(
+                "SELECT scale, unit FROM tensor_physical_scale "
+                "WHERE source_id = ? AND array_id = ?",
+                [source_id, array_id],
+            ).fetchone()
+        except Exception as exc:
+            logger.warning(
+                "physical_scale read failed for %s/%s: %s", source_id, array_id, exc
+            )
+            return None
+        if row is None:
+            return None
+        return list(row[0] or []), list(row[1] or [])
+
+    def set_physical_scale(
+        self, source_id: str, array_id: str, scale: List[float], unit: List[str]
+    ) -> None:
+        """Cache a tensor's physical ``scale``/``unit`` (empty lists = no scale).
+
+        Best-effort populate-on-serve (biopb/biopb#253): a cache write must never
+        fail the serve, so DB errors are swallowed (the next open recomputes).
+        """
+        try:
+            conn = self._get_connection()
+            with self._write_lock:
+                conn.execute(
+                    "INSERT OR REPLACE INTO tensor_physical_scale "
+                    "(source_id, array_id, scale, unit) VALUES (?, ?, ?, ?)",
+                    [
+                        source_id,
+                        array_id,
+                        [float(s) for s in scale],
+                        [str(u) for u in unit],
+                    ],
+                )
+        except Exception as exc:
+            logger.warning(
+                "physical_scale cache write failed for %s/%s: %s",
+                source_id,
+                array_id,
+                exc,
+            )
+
     def list_source_descriptors(
         self, limit: Optional[int] = None
     ) -> Tuple[List[DataSourceDescriptor], int]:
@@ -561,6 +637,12 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+            # Drop cached physical scales too, so a remove+re-add on a content
+            # change (the reconcile's edit model) can't serve stale scale
+            # (biopb/biopb#253).
+            conn.execute(
+                "DELETE FROM tensor_physical_scale WHERE source_id = ?", [source_id]
+            )
         logger.debug(f"Removed source from metadata database: {source_id}")
 
     def close(self) -> None:

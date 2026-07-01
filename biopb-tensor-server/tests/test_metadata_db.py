@@ -527,6 +527,63 @@ class TestGetMetadataJson:
         assert db.get_metadata_json("nope") is None
 
 
+class TestPhysicalScaleCache:
+    """Per-tensor physical-scale populate-on-serve cache (biopb/biopb#253)."""
+
+    def test_miss_then_roundtrip(self):
+        db = MetadataDatabase()
+        db.sync_source_added(  # create the schema/connection
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        assert db.get_physical_scale("s1", "s1") is None  # miss
+        db.set_physical_scale("s1", "s1", [0.5, 0.5], ["um", "um"])
+        assert db.get_physical_scale("s1", "s1") == ([0.5, 0.5], ["um", "um"])
+
+    def test_empty_is_cached_no_scale_distinct_from_miss(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        db.set_physical_scale("s1", "s1", [], [])  # cache a genuine "no scale"
+        assert db.get_physical_scale("s1", "s1") == ([], [])  # not None (a hit)
+        assert db.get_physical_scale("s1", "other") is None  # still a miss
+
+    def test_removed_clears_cache(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        db.set_physical_scale("s1", "s1", [1.0], ["um"])
+        db.sync_source_removed("s1")
+        assert db.get_physical_scale("s1", "s1") is None
+
+    def test_read_error_degrades_to_miss(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+
+        class _BoomCursor:
+            def execute(self, *a, **k):
+                raise RuntimeError("duckdb read boom")
+
+        db._get_cursor = lambda: _BoomCursor()
+        assert db.get_physical_scale("s1", "s1") is None  # miss, not raise
+
+    def test_set_error_is_swallowed(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+
+        class _BoomConn:
+            def execute(self, *a, **k):
+                raise RuntimeError("duckdb write boom")
+
+        db._get_connection = lambda: _BoomConn()
+        db.set_physical_scale("s1", "s1", [1.0], ["um"])  # must not raise
+
+
 class TestQueryHandling:
     """Test SQL query handling."""
 

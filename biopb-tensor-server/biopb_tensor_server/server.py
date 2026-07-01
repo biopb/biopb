@@ -1196,10 +1196,27 @@ class TensorFlightServer(flight.FlightServerBase):
             # do not scale by scale_hint (napari multiscale scale is level-0).
             read_plan.descriptor.ClearField("physical_scale")
             read_plan.descriptor.ClearField("physical_unit")
-            try:
-                phys = tensor_adapter.get_physical_scale(field)
-            except Exception:
-                phys = None
+            # Cached per-tensor physical scale (biopb/biopb#253): read it from the
+            # catalog instead of recomputing on the adapter (an OME-XML reparse)
+            # or, for a remote proxy, dialing upstream. On a cache miss, compute
+            # once and store -- including an empty ([], []) for a genuine "no
+            # scale", so a scale-less tensor isn't recomputed on every open.
+            array_id = read_plan.descriptor.array_id
+            cached = None
+            if self._metadata_db is not None and array_id:
+                cached = self._metadata_db.get_physical_scale(source_id, array_id)
+            if cached is not None:
+                phys = cached if cached[0] else None
+            else:
+                try:
+                    phys = tensor_adapter.get_physical_scale(field)
+                except Exception:
+                    phys = None
+                if self._metadata_db is not None and array_id:
+                    scale_vec, unit_vec = phys if phys else ([], [])
+                    self._metadata_db.set_physical_scale(
+                        source_id, array_id, scale_vec, unit_vec
+                    )
             if phys is not None:
                 scale_vec, unit_vec = phys
                 ndim = len(read_plan.descriptor.dim_labels)

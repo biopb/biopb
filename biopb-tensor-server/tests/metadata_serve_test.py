@@ -188,3 +188,85 @@ def test_serve_hcs_like_source_uses_per_tensor_metadata_not_catalog(simple_zarr_
         client.close()
     finally:
         server.shutdown()
+
+
+def _scale_zarr_cls():
+    """A ZarrAdapter whose get_physical_scale() is controllable + call-counted."""
+    from biopb_tensor_server import ZarrAdapter
+
+    class _ScaleZarr(ZarrAdapter):
+        def __init__(self, *a, scale, **k):
+            super().__init__(*a, **k)
+            self._scale = scale  # (scale, unit) tuple or None
+            self.scale_calls = 0
+
+        def get_physical_scale(self, tensor_id=None):
+            self.scale_calls += 1
+            return self._scale
+
+    return _ScaleZarr
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_physical_scale_cached_after_first_serve(simple_zarr_array):
+    """First GetFlightInfo computes the scale on the adapter and caches it; a
+    second serve reads it from the catalog without recomputing (biopb#253)."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    _ScaleZarr = _scale_zarr_cls()
+
+    db = MetadataDatabase()
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    adapter = _ScaleZarr(arr, "img", ["y", "x"], scale=([0.5, 0.5], ["um", "um"]))
+    server.register_source("img", adapter)
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        d1 = client.get_descriptor("img")
+        assert list(d1.physical_scale) == [0.5, 0.5]
+        assert list(d1.physical_unit) == ["um", "um"]
+        assert adapter.scale_calls == 1  # computed once, cached
+
+        d2 = client.get_descriptor("img")
+        assert list(d2.physical_scale) == [0.5, 0.5]
+        assert adapter.scale_calls == 1  # served from cache, no recompute
+        client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_no_physical_scale_is_negatively_cached(simple_zarr_array):
+    """A scale-less tensor caches the empty result, so the adapter isn't
+    recomputed on every open (biopb#253)."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    _ScaleZarr = _scale_zarr_cls()
+
+    db = MetadataDatabase()
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    adapter = _ScaleZarr(arr, "img", ["y", "x"], scale=None)  # no physical scale
+    server.register_source("img", adapter)
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        d1 = client.get_descriptor("img")
+        assert not d1.physical_scale
+        assert adapter.scale_calls == 1
+
+        d2 = client.get_descriptor("img")
+        assert not d2.physical_scale
+        assert adapter.scale_calls == 1  # negative cache -> no recompute
+        client.close()
+    finally:
+        server.shutdown()
