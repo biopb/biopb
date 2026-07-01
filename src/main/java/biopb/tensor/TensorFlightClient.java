@@ -564,10 +564,15 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>Returns a {@link PhysicalScale} whose {@code scale} and {@code unit}
      * arrays are aligned with the tensor's {@code dim_labels} (source axis order),
      * or {@code null} when no physical sizes are known (an older server, or a
-     * format that carries none). This is a compact summary carried on the tensor
-     * descriptor, so it is much cheaper than reading the full
-     * {@link #getSourceMetadata}. When a prior {@link #getTensor} already cached
-     * the descriptor it costs no extra RPC.
+     * format that carries none).
+     *
+     * <p>{@code physical_scale}/{@code physical_unit} are {@code TensorDescriptor}
+     * fields the server fills on every {@code GetFlightInfo} (issue #31), so this
+     * reads the descriptor a prior {@link #getTensor} already cached -- no extra
+     * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
+     * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
+     * forces {@code with_metadata} to ship the whole OME tree; do not dig physical
+     * sizes out of that -- this is the compact projection meant for display scale.)
      *
      * @param arrayId Globally-unique tensor id ({@code source_id} or
      *                {@code source_id/field}). A bare source id anchors on the
