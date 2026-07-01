@@ -1106,7 +1106,7 @@ def migrate_config(
         console.print(
             "[red]Config migration is unavailable:[/red] "
             f"{exc}\n"
-            r"[yellow]Install it with: pip install 'biopb\[tensor]'[/yellow]"
+            "[yellow]Re-run the BioPB installer to fix.[/yellow]"
         )
         raise typer.Exit(1)
 
