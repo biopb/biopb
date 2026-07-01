@@ -1824,6 +1824,16 @@ def create_source_manager(
     # defers a non-resident dataset to lazy resolution (cloud-storage phase 2).
     cloud_roots: Set[Path] = set()
     for source in (*monitored_sources, *static_sources):
+        if source.cloud:
+            # EXPERIMENTAL: cloud/synced-folder mode (offline placeholders resolved
+            # lazily on first access) is not yet stable. Warned once per configured
+            # cloud source at startup.
+            logger.warning(
+                "Source %r uses the EXPERIMENTAL 'cloud' mode (offline/synced-folder "
+                "placeholders resolved lazily on first access): its behavior and "
+                "config surface may change without notice in a future release.",
+                source.url,
+            )
         if source.cloud and not source.is_remote:
             local_path = source.local_path
             if local_path is not None:
