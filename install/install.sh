@@ -759,22 +759,35 @@ _start_data_server() {
     count=$(printf '%s' "$out" | sed -n 's/.*"source_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
 
     if [ "$health" != "SERVING" ]; then
-        _warn "Data server did not come up cleanly"
-        _info "  it may still be scanning a large folder, or failed to start:"
+        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
+        # folder scan: the server reaches SERVING as soon as it binds and scans in
+        # the background, so a big folder no longer holds it out of SERVING. Not
+        # SERVING after 60s therefore points to a real startup failure (crash,
+        # port already in use, or a wedged bind), not a slow scan.
+        _warn "Data server did not reach SERVING within 60s"
+        _info "  it likely failed to start or is wedged (a slow folder scan no"
+        _info "  longer blocks SERVING, so this is not just \"still scanning\"):"
         _tail_log "$log_file"
         _info "  full log: ${CYAN}$log_file${RESET}"
+        _info "  recheck once with: ${CYAN}biopb server status -w 30${RESET}"
         return 0
     fi
 
     if [ -z "$count" ] || [ "$count" = "0" ]; then
-        _warn "Data server is running but found no data sources"
-        _info "  check that your data folder holds supported images (see config):"
+        # SERVING no longer implies a complete catalog: the folder scan runs in
+        # the background and registers sources as it walks. status --wait returns
+        # at the first SERVING, which is normally *before* the scan has indexed
+        # anything -- so 0 sources here usually just means "scan not finished
+        # yet," not "empty folder." The count climbs on its own shortly after.
+        _info "Data server is up; catalog is still building in the background"
+        _info "  no sources indexed yet — normal right after a (re)start"
+        _info "  recheck in a moment: ${CYAN}biopb server status${RESET}"
+        _info "  if it stays at 0, confirm the data folder holds supported images:"
         _cmd "  ${ACTIVE_CONFIG:-$CONFIG_FILE}"
-        _tail_log "$log_file"
         return 0
     fi
 
-    _ok "Data server ready — $count data source(s) found; pre-caching overviews"
+    _ok "Data server ready — $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
 # Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
