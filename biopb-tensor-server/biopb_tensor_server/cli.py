@@ -106,6 +106,23 @@ def _graceful_shutdown(
             console.print(f"[yellow]Error closing cache: {e}[/yellow]")
 
 
+def _is_bare_host_upstream(source: SourceConfig) -> bool:
+    """True for a bare-host ``grpc://host:port`` tensor-server upstream (no ``/<id>``).
+
+    Only the bare-host "mirror everything" form has an upstream catalog to
+    re-list; a single-source ``grpc://host:port/<id>`` names exactly one source
+    and is registered directly. Mirrors the ``monitored_upstreams`` filter in
+    ``source_manager.create_source_manager``.
+    """
+    if not source.is_remote:
+        return False
+    if not source.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
+        return False
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    return _split_grpc_url(source.url)[1] is None
+
+
 def _resolve_serve_sources(
     server_config: ServerConfig,
     registry: Optional[AdapterRegistry] = None,
@@ -164,10 +181,20 @@ def _resolve_serve_sources(
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 
-        # Remote monitor entries keep current behavior: registered statically
-        # AND passed to create_source_manager (which logs the no-monitor notice).
+        # Remote monitor entries are also handed to create_source_manager.
         if s.monitor:
             monitored_sources.append(s)
+        # A monitored bare-host tensor-server upstream ("mirror everything") must
+        # NOT be expanded inline here. Inline expansion runs one blocking upstream
+        # RPC per mirrored source *before* mark_ready(), so a large upstream keeps
+        # the server STARTING for minutes -- it never reaches SERVING (observed:
+        # 900s+ stuck registering hundreds of hpc__* proxies). Its sources are
+        # instead discovered and registered in the background by the SourceManager's
+        # periodic upstream re-list (biopb/biopb#178); the first rescan fires
+        # immediately, so the catalog populates progressively -- exactly like a
+        # monitored local directory. Skip the inline expansion.
+        if s.monitor and _is_bare_host_upstream(s):
+            continue
         to_expand.append(s)
 
     # Expand only the non-monitored-dir entries. tolerant=True so one missing or
