@@ -475,7 +475,27 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     # -------------------------------------------------------------- tensor layer
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Mirror the upstream tensor descriptor under the local array_id."""
+        """Mirror the upstream tensor descriptor under the local array_id.
+
+        Served from the bulk-seeded cache when available (biopb/biopb#266 B2):
+        ``seed_catalog`` already localized every tensor's structural fields
+        (shape/chunk/dtype/dim_labels) from a single upstream ``query_sources``,
+        so the serve-path ``GetFlightInfo`` reads the descriptor locally instead
+        of a per-open ``get_descriptor`` RPC. This removes the last structural
+        upstream call on the serve path; together with metadata served from the
+        local catalog (#253 core) it leaves ``get_physical_scale`` as the only
+        residual ``GetFlightInfo`` RPC (dropped separately, #266/#274) before
+        ``do_get`` is the sole upstream contact. Falls back to a live fetch when
+        this tensor was not seeded (a single-source static remote, or a field
+        absent from the seed).
+        """
+        if self._descriptors_cache is not None:
+            for desc in self._descriptors_cache:
+                if desc.array_id == self.array_id:
+                    out = TensorDescriptor()
+                    out.CopyFrom(desc)
+                    return out
+
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         desc = self.client.get_descriptor(upstream_array_id)
         return self._localize_descriptor(desc)
