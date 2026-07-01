@@ -943,6 +943,27 @@ class TestAdminConfigRoutes:
         assert any(err["path"] == ["server", "log_level"] for err in body["errors"])
         assert config_path.read_text() == before  # nothing written
 
+    def test_put_malformed_section_returns_422_not_500(self, admin_client):
+        # A wrong-typed section (a string where an object is expected) makes the
+        # server's semantic validator's parse step raise while walking a non-dict.
+        # The endpoint must degrade to a clean 422 (the JSON Schema's precise type
+        # error), never a 500, and write nothing. Regression guard: the semantic
+        # pass used to let that exception escape.
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": "not-a-dict"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["errors"]
+        # Schema's per-field error only -- no redundant root-level ([]) duplicate
+        # from the semantic pass's structural fallback.
+        assert not any(err["path"] == [] for err in body["errors"])
+        assert config_path.read_text() == before  # nothing written
+
     def test_put_valid_saves_and_preserves_unsurfaced_keys(self, admin_client):
         import json
 

@@ -1183,10 +1183,13 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     try:
         cfg = parse_config(data)
-    except (ValueError, TypeError) as exc:
-        # Structural failure (missing url, un-coercible number, or -- once
-        # _STRICT_VALIDATION flips -- a strict sub-parse): report as a single
-        # root-level problem rather than letting it crash the caller.
+    except Exception as exc:  # noqa: BLE001 - untrusted input must never crash the gate
+        # Structural failure: a missing url or un-coercible number (ValueError /
+        # TypeError), a wrong-typed section that makes parse_config walk a
+        # non-dict (AttributeError, e.g. {"server": "x"}), or -- once
+        # _STRICT_VALIDATION flips -- a strict sub-parse. Report as a single
+        # root-level problem rather than letting it crash the caller (the admin
+        # endpoint would otherwise 500 instead of returning a clean 422).
         return [{"path": [], "message": str(exc)}]
 
     # Lazy import: config_schema imports this module, so importing it at module

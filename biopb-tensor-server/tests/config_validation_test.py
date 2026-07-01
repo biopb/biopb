@@ -202,6 +202,15 @@ def test_validate_config_dict_structural_error_is_reported():
     assert problems and problems[0]["path"] == []
 
 
+def test_validate_config_dict_malformed_section_is_reported_not_raised():
+    # A wrong-typed section makes parse_config walk a non-dict (str.get ->
+    # AttributeError, not ValueError/TypeError). It must still be reported as a
+    # root problem, never propagate -- otherwise the admin endpoint 500s instead
+    # of returning a clean 422.
+    problems = validate_config_dict({"server": "not-a-dict"})
+    assert problems and problems[0]["path"] == []
+
+
 # --- unknown-key warnings (the silent drop-to-default trap) ------------------
 
 

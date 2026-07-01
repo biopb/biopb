@@ -1282,6 +1282,14 @@ async def put_config(request: Request) -> JSONResponse:
     schema_paths = {tuple(e["path"]) for e in errors}
     for problem in validate_config_dict(body):
         path = [str(x) for x in problem["path"]]
+        # A root-level ([]) problem is validate_config_dict's structural-failure
+        # fallback (parse_config could not build the config). The JSON Schema is
+        # the structural layer, so when it already reported errors its precise
+        # per-field paths supersede this catch-all -- skip it to avoid a
+        # redundant root error. Keep it only when the schema found nothing (the
+        # rare schema-valid-but-unparseable body).
+        if not path and errors:
+            continue
         if tuple(path) not in schema_paths:
             errors.append({"path": path, "message": problem["message"]})
     if errors:
