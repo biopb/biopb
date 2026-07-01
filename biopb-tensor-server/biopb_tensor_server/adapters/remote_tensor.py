@@ -447,30 +447,19 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     def get_physical_scale(
         self, tensor_id: Optional[str] = None
     ) -> Optional[Tuple[List[float], List[str]]]:
-        """Mirror the upstream tensor's per-dimension physical pixel size + unit.
+        """Not implemented for the caching proxy yet -- always ``None``.
 
         The local server fills ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``
-        (clearing first -- so it is NOT carried implicitly by ``get_tensor_descriptor``;
-        the base default of ``None`` would silently drop physical sizes the
-        upstream actually has). The upstream's own ``get_descriptor`` response
-        carries these fields (its server fills them identically), so read them
-        back from there. Best-effort: an unreachable upstream returns ``None``
-        (no physical scale) rather than raising.
+        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``,
+        so mirroring the upstream's scale would mean a per-open ``get_descriptor``
+        RPC to the upstream on every serve. That is the wrong layer: the mirror
+        catalog is bulk-seeded from a single upstream ``query_sources``
+        (biopb/biopb#266), and physical scale should ride that seed / the mirrored
+        descriptor rather than a lazy per-open round-trip. Until #266 carries it,
+        return ``None`` -- the proxy advertises no physical scale, exactly like a
+        format that carries none. Tracked by #266.
         """
-        field = self._within_source_field(tensor_id)
-        local_array_id = self.array_id if field is None else f"{self.source_id}/{field}"
-        try:
-            desc = self.client.get_descriptor(
-                self._to_upstream_array_id(local_array_id)
-            )
-        except Exception as exc:
-            self._mark_unreachable(exc)
-            return None
-        self._reachable = True
-        if not desc.physical_scale:
-            return None
-        return list(desc.physical_scale), list(desc.physical_unit)
+        return None
 
     # -------------------------------------------------------------- tensor layer
 
