@@ -220,6 +220,174 @@ class TestSourceSync:
         assert row is None
 
 
+class MultiTensorAdapter:
+    """Mock adapter exposing several tensors (multi-field / HCS source)."""
+
+    def __init__(self, source_id, source_url, source_type, tensors, data_resident=True):
+        self.source_id = source_id
+        self._source_url = source_url
+        self._source_type = source_type
+        self._tensors = (
+            tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
+        )
+        self._data_resident = data_resident
+
+    def get_source_descriptor(self):
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
+        return DataSourceDescriptor(
+            source_id=self.source_id,
+            source_url=self._source_url,
+            source_type=self._source_type,
+            data_resident=self._data_resident,
+            tensors=[TensorDescriptor(**t) for t in self._tensors],
+        )
+
+    def get_metadata(self):
+        return {}
+
+
+class TestPerTensorCatalog:
+    """Full per-tensor catalog column (biopb/biopb#224)."""
+
+    def _fields(self):
+        return [
+            {
+                "array_id": "hcs/A1/0",
+                "dim_labels": ["y", "x"],
+                "shape": [512, 512],
+                "chunk_shape": [512, 512],
+                "dtype": "uint16",
+            },
+            {
+                "array_id": "hcs/A2/0",
+                "dim_labels": ["z", "y", "x"],
+                "shape": [8, 256, 256],
+                "chunk_shape": [1, 256, 256],
+                "dtype": "uint8",
+            },
+        ]
+
+    def test_all_tensors_stored_not_just_first(self):
+        """Every tensor is persisted, with its full structural fields -- not the
+        old first-tensor projection only."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "hcs",
+            MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
+        )
+
+        conn = db._get_connection()
+        rows = conn.execute(
+            "SELECT u.t.array_id, u.t.dim_labels, u.t.shape, u.t.chunk_shape, u.t.dtype "
+            "FROM sources, UNNEST(tensors) AS u(t) ORDER BY u.t.array_id"
+        ).fetchall()
+
+        assert rows == [
+            ("hcs/A1/0", ["y", "x"], [512, 512], [512, 512], "uint16"),
+            ("hcs/A2/0", ["z", "y", "x"], [8, 256, 256], [1, 256, 256], "uint8"),
+        ]
+
+    def test_per_tensor_dtype_filter(self):
+        """A dtype predicate over the nested list finds a source by ANY of its
+        tensors -- the multi-field case the first-tensor projection missed."""
+        db = MetadataDatabase(enabled=True)
+        # first tensor is uint16; the uint8 tensor is only reachable per-tensor
+        db.sync_source_added(
+            "hcs",
+            MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
+        )
+        db.sync_source_added(
+            "plain",
+            MockAdapter("plain", "/data/p.zarr", "zarr", [10, 10], "float32"),
+        )
+
+        conn = db._get_connection()
+        rows = conn.execute(
+            "SELECT source_id FROM sources "
+            "WHERE len(list_filter(tensors, t -> t.dtype = 'uint8')) > 0"
+        ).fetchall()
+        assert rows == [("hcs",)]
+
+    def test_scalar_projection_still_first_tensor(self):
+        """The back-compat scalar dtype/shape_summary stay the first-tensor
+        projection, written in the same upsert so they can't desync."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "hcs",
+            MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
+        )
+        conn = db._get_connection()
+        dtype, shape_summary = conn.execute(
+            "SELECT dtype, shape_summary FROM sources WHERE source_id='hcs'"
+        ).fetchone()
+        assert dtype == "uint16"  # tensors[0]
+        assert shape_summary == "[512, 512]"
+
+    def test_no_tensors_is_empty_list(self):
+        """An unresolved (no-tensor) source stores an empty list, so per-tensor
+        predicates exclude it while `WHERE NOT data_resident` still finds it."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "unresolved",
+            MultiTensorAdapter(
+                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+            ),
+        )
+        conn = db._get_connection()
+        tensors, resident = conn.execute(
+            "SELECT tensors, data_resident FROM sources WHERE source_id='unresolved'"
+        ).fetchone()
+        assert tensors == []
+        assert resident is False
+
+    def test_per_tensor_query_roundtrips_through_handle_query(self):
+        """The documented per-tensor idiom works through the real query path
+        (handle_query: SQL validator -> Arrow -> Flight ticket), not just the raw
+        connection the other tests use. UNNEST(tensors) must pass _validate_query
+        (it references the column, not a table) and the nested LIST(STRUCT) column
+        must round-trip whole through the Arrow serialization behind DoGet."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "hcs",
+            MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
+        )
+        db.sync_source_added(
+            "unresolved",
+            MultiTensorAdapter(
+                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+            ),
+        )
+
+        # UNNEST -> one row per tensor, through the validator + Arrow path.
+        info = db.handle_query(
+            "SELECT source_id, t.array_id, t.dtype "
+            "FROM sources, UNNEST(tensors) AS u(t) ORDER BY t.array_id"
+        )
+        rows = db.get_pending_result(
+            info.endpoints[0].ticket.ticket.decode()
+        ).to_pylist()
+        assert rows == [
+            {"source_id": "hcs", "array_id": "hcs/A1/0", "dtype": "uint16"},
+            {"source_id": "hcs", "array_id": "hcs/A2/0", "dtype": "uint8"},
+        ]
+
+        # The nested column itself round-trips whole -- including the empty list
+        # for the unresolved source (Arrow/Flight handles the LIST(STRUCT) type).
+        info = db.handle_query(
+            "SELECT source_id, tensors FROM sources ORDER BY source_id"
+        )
+        by_id = {
+            r["source_id"]: r["tensors"]
+            for r in db.get_pending_result(
+                info.endpoints[0].ticket.ticket.decode()
+            ).to_pylist()
+        }
+        assert by_id["unresolved"] == []
+        assert [t["dtype"] for t in by_id["hcs"]] == ["uint16", "uint8"]
+        assert by_id["hcs"][1]["shape"] == [8, 256, 256]  # full struct, not projection
+
+
 class TestQueryHandling:
     """Test SQL query handling."""
 

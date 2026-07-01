@@ -183,9 +183,21 @@ else:
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
-# indexed_at, metadata_json, shape_summary
+# indexed_at, metadata_json, shape_summary, data_resident, and `tensors`
+# (a LIST of STRUCT(array_id, dim_labels, shape, chunk_shape, dtype) -- one
+# per tensor; `dtype`/`shape_summary` are just the first-tensor projection).
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
+
+# Per-tensor queries (multi-field / HCS sources): use the nested `tensors`
+# column with UNNEST or list_filter -- the scalar dtype/shape_summary only
+# describe tensors[0].
+client.query_sources(  # every tensor, one row each
+    "SELECT source_id, t.array_id, t.shape, t.dtype "
+    "FROM sources, UNNEST(tensors) AS u(t)", format="pandas")
+client.query_sources(  # sources having ANY uint16 tensor
+    "SELECT source_id FROM sources "
+    "WHERE len(list_filter(tensors, t -> t.dtype = 'uint16')) > 0", format="pandas")
 
 # Convenience listing (NOTE: capped by the server for large catalogs)
 for sid, src in client.list_sources().items():
