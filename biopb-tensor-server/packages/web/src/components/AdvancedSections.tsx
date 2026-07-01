@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ADVANCED_SECTIONS,
   enumValues,
@@ -64,6 +64,26 @@ export function AdvancedSections({
   onEditRaw,
 }: AdvancedSectionsProps) {
   const [userOpen, setUserOpen] = useState<Record<string, boolean>>({});
+
+  // Latch a section open the moment it acquires an error, so that *fixing* the
+  // error (which clears `hasError`) doesn't collapse the section and unmount the
+  // input being edited mid-keystroke. `open` still ORs `hasError`, so an errored
+  // section can't be collapsed until fixed.
+  useEffect(() => {
+    const errored = new Set(errors.map((e) => String(e.path[0])));
+    if (errored.size === 0) return;
+    setUserOpen((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const s of errored) {
+        if ((ADVANCED_SECTIONS as readonly string[]).includes(s) && !next[s]) {
+          next[s] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [errors]);
 
   if (!schema) return null;
 
@@ -155,7 +175,25 @@ function Field({ fieldKey, prop, value, errs, disabled, onChange }: FieldProps) 
   const invalid = errs.length > 0;
 
   let control;
-  if (type === "boolean") {
+  if (type === "boolean" && deprecated) {
+    // A deprecated boolean (e.g. metadata_db.enabled) must be *removable* — the
+    // hint says to drop it — so it gets an unset-able tri-state rather than a
+    // checkbox that can only write true/false.
+    control = (
+      <select
+        value={value === true ? "true" : value === false ? "false" : ""}
+        disabled={disabled}
+        className={invalid ? "invalid" : undefined}
+        onChange={(e) =>
+          onChange(e.target.value === "" ? undefined : e.target.value === "true")
+        }
+      >
+        <option value="">(unset)</option>
+        <option value="true">true</option>
+        <option value="false">false</option>
+      </select>
+    );
+  } else if (type === "boolean") {
     control = (
       <input
         type="checkbox"

@@ -175,6 +175,12 @@ describe("validateConfig", () => {
     ]);
   });
 
+  it("accepts a legacy `path`-only source (deprecated alias for url)", () => {
+    // The server reads `url or path`, so a path-only source is valid and must
+    // not trip the required-url check (regression: greyed-out Save on load).
+    expect(validateConfig({ sources: [{ path: "/legacy" }] }, SCHEMA)).toEqual([]);
+  });
+
   it("accepts null for a nullable source type enum", () => {
     expect(
       validateConfig({ sources: [{ url: "/d", type: null }] }, SCHEMA),

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   credentialProfileProperties,
   enumValues,
@@ -71,6 +71,10 @@ export function CredentialsEditor({
   // Section carries an error → force open (mirrors AdvancedSections).
   const hasError = errors.some((e) => e.path[0] === "credentials");
   const [userOpen, setUserOpen] = useState(false);
+  // Latch open on error so fixing it doesn't collapse the section mid-edit.
+  useEffect(() => {
+    if (hasError) setUserOpen(true);
+  }, [hasError]);
   if (!schema) return null;
   const open = userOpen || hasError;
 
@@ -106,7 +110,13 @@ export function CredentialsEditor({
   }
 
   function removeProfile(i: number) {
-    commit(profiles.filter((_, idx) => idx !== i));
+    // If the removed profile was the default, clear the dangling reference.
+    const removedName = str(profiles[i]?.name);
+    const clearsDefault = removedName && removedName === str(credentials(config).default_profile);
+    commit(
+      profiles.filter((_, idx) => idx !== i),
+      clearsDefault ? "" : undefined,
+    );
   }
 
   const currentDefault = str(credentials(config).default_profile);
@@ -160,11 +170,20 @@ export function CredentialsEditor({
             </p>
           ) : (
             <ul className="creds-rows">
-              {profiles.map((p, i) => (
+              {profiles.map((p, i) => {
+                // The server restores masked secrets by matching profile *name*
+                // (restore_redacted_secrets), so renaming a profile that still
+                // carries a masked secret would silently drop it. Lock the name
+                // until the secrets are re-entered (or the profile has none).
+                const hasMaskedSecret = orderedKeys.some(
+                  (k) => isSecretProfileKey(k) && str(p[k]) === REDACTED_SENTINEL,
+                );
+                return (
                 <li key={i} className="creds-row">
                   <div className="creds-row-grid">
                     {orderedKeys.map((key) => {
                       const secret = isSecretProfileKey(key);
+                      const locked = key === "name" && hasMaskedSecret;
                       const errs = fieldErrors(errors, [
                         "credentials",
                         "profiles",
@@ -206,7 +225,7 @@ export function CredentialsEditor({
                             <input
                               type={secret ? "password" : "text"}
                               value={value}
-                              disabled={disabled}
+                              disabled={disabled || locked}
                               autoComplete={secret ? "new-password" : "off"}
                               placeholder={
                                 secret ? "(stored — leave to keep)" : undefined
@@ -220,6 +239,12 @@ export function CredentialsEditor({
                                 )
                               }
                             />
+                          )}
+                          {locked && (
+                            <span className="adv-field-help">
+                              Rename disabled — stored secrets are keyed by name.
+                              Clear a secret field to rename.
+                            </span>
                           )}
                           {secret && value === REDACTED_SENTINEL && (
                             <span className="adv-field-help">
@@ -245,7 +270,8 @@ export function CredentialsEditor({
                     ✕
                   </button>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
 

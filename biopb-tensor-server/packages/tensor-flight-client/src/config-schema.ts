@@ -216,6 +216,11 @@ export function validateConfig(
       if (src == null || typeof src !== "object" || Array.isArray(src)) return;
       const obj = src as Record<string, unknown>;
       for (const req of required) {
+        // The deprecated `path` is a back-compat alias for `url` (the server
+        // reads `url or path`), so a legacy `path`-only source is valid and must
+        // not be flagged — otherwise Save is greyed out on load for a config the
+        // server would happily accept.
+        if (req === "url" && !isBlank(obj.path)) continue;
         if (isBlank(obj[req])) {
           out.push({ path: ["sources", i, req], message: `${req} is required` });
         }

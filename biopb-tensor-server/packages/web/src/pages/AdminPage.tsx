@@ -102,8 +102,13 @@ export function AdminPage() {
     () => [...clientErrors, ...serverErrors],
     [clientErrors, serverErrors],
   );
-  const { byIndex: sourceErrors, general: generalErrors } = useMemo(
-    () => splitConfigErrors(combinedErrors),
+  // Source errors render inline on their rows (by index). Advanced / credentials
+  // client errors render inline in their own components; they are deliberately
+  // NOT rolled into a top banner (that duplicated each inline error and leaked
+  // dotted-path notation). The top summary is reserved for server-side 422 lines
+  // that aren't attributable to a field (`serverGeneral`).
+  const sourceErrors = useMemo(
+    () => splitConfigErrors(combinedErrors).byIndex,
     [combinedErrors],
   );
   const hasErrors = combinedErrors.length > 0;
@@ -267,9 +272,12 @@ export function AdminPage() {
     );
   }
 
-  // The backend daemon is down when status reports it (the config file is still
-  // editable via the sidecar, but the Flight server isn't serving).
-  const daemonDown = !restarting && !!status && status.running === false;
+  // "Not running" means the backend health check couldn't reach the Flight
+  // server at all (`health == null`) — a true down process. A reachable server
+  // that is merely warming up (`health` is a non-SERVING string like STARTING /
+  // NOT_SERVING) is NOT down: it keeps the normal read-out + Restart, not Start.
+  const daemonDown =
+    !restarting && !!status && status.running === false && status.health == null;
   const restartVerb = daemonDown ? "Start" : "Restart";
 
   const pill = restartScanning
@@ -344,17 +352,7 @@ export function AdminPage() {
           </div>
         )}
 
-        {generalErrors.length > 0 && (
-          <div className="admin-banner error">
-            <strong>Fix these before saving:</strong>
-            <ul>
-              {generalErrors.map((m, i) => (
-                <li key={i}>{m}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {serverGeneral.length > 0 && generalErrors.length === 0 && (
+        {serverGeneral.length > 0 && (
           <div className="admin-banner error">
             <strong>Config not saved — fix these:</strong>
             <ul>
