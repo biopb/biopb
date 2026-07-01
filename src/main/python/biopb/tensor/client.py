@@ -1348,10 +1348,15 @@ class TensorFlightClient:
 
         Returns ``(scale, unit)``: two lists aligned with the tensor's
         ``dim_labels`` (source axis order), or ``None`` when no physical sizes
-        are known (an older server, or a format that carries none). This is a
-        compact summary carried on the tensor descriptor, so it is much cheaper
-        than reading the full :meth:`get_source_metadata`. When a prior
-        :meth:`get_tensor` already cached the descriptor it costs no extra RPC.
+        are known (an older server, or a format that carries none).
+
+        ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
+        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
+        descriptor a prior :meth:`get_tensor` already cached -- no extra RPC when
+        it is cached, and it never requests the opt-in ``metadata_json`` field on
+        that same descriptor. (Contrast :meth:`get_source_metadata`, which forces
+        ``with_metadata`` to ship the whole OME tree; do not dig physical sizes
+        out of that -- this is the compact projection meant for display scale.)
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
