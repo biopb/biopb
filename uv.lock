@@ -426,7 +426,7 @@ provides-extras = ["test", "tensor"]
 
 [[package]]
 name = "biopb-image-base"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "biopb-image-runtime" }
 dependencies = [
     { name = "biopb", extra = ["tensor"] },
