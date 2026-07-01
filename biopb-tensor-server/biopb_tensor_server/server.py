@@ -1214,16 +1214,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 # SELECT -- no adapter recompute, and for a remote proxy no
                 # upstream RPC (read the local mirror row directly, never
                 # adapter.get_metadata()). Fall back to the adapter only when
-                # there is no DB or the row is NULL (empty metadata, or an
-                # unresolved source whose real row isn't written yet).
+                # there is no DB, or get_metadata_json returns None -- an absent/
+                # NULL row (empty metadata, or an unresolved source whose real row
+                # isn't written yet), unparseable JSON, or a catalog read error
+                # (it parses and degrades internally, never raising).
                 raw_metadata = None
                 if self._metadata_db is not None:
-                    stored = self._metadata_db.get_metadata_json(source_id)
-                    if stored:
-                        try:
-                            raw_metadata = json.loads(stored)
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            raw_metadata = None
+                    raw_metadata = self._metadata_db.get_metadata_json(source_id)
                 if raw_metadata is None:
                     raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:

@@ -460,18 +460,45 @@ class TestListSourceDescriptors:
 
 
 class TestGetMetadataJson:
-    """Local metadata_json read-back for the serve path (biopb/biopb#253)."""
+    """Local metadata read-back for the serve path (biopb/biopb#253)."""
 
-    def test_returns_stored_raw_json(self):
+    def test_returns_parsed_dict(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
         )
-        raw = db.get_metadata_json("s1")
-        assert json.loads(raw) == {
+        assert db.get_metadata_json("s1") == {
             "test_key": "test_value",
             "nested": {"a": 1, "b": 2},
         }
+
+    def test_none_on_read_error(self):
+        """A DuckDB read failure degrades to None (serve falls back), not raise."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+
+        class _BoomCursor:
+            def execute(self, *a, **k):
+                raise RuntimeError("duckdb read boom")
+
+        # Force the read to raise; the method must swallow it and return None.
+        db._get_cursor = lambda: _BoomCursor()
+        assert db.get_metadata_json("s1") is None
+
+    def test_none_on_corrupt_json(self):
+        """A non-JSON stored value degrades to None rather than propagating."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        with db._write_lock:
+            db._get_connection().execute(
+                "UPDATE sources SET metadata_json = ? WHERE source_id = ?",
+                ["{not valid json", "s1"],
+            )
+        assert db.get_metadata_json("s1") is None
 
     def test_none_for_empty_metadata(self):
         # MultiTensorAdapter.get_metadata() -> {} -> stored as SQL NULL.
