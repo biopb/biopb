@@ -71,7 +71,7 @@ import logging
 import os
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -342,8 +342,9 @@ class SourceConfig:
 
     Attributes:
         url: URL or path to the data source (supports local paths and remote URLs)
-        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs", or "aics".
-              Optional - auto-detected if None (only for local files).
+        type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs",
+              "aics", or "tensor-server" (an upstream biopb tensor server, fronted as a caching proxy).
+              Optional - auto-detected if None (local files, or a grpc:// endpoint -> "tensor-server").
         source_id: Unique identifier for the data source (auto-generated from URL if None)
         dim_labels: Dimension labels (optional, applies to all tensors in source)
         dataset: HDF5 dataset path (required for HDF5 type)
@@ -356,6 +357,12 @@ class SourceConfig:
                shape/dtype is resolved lazily on first access (cloud-storage phase 2).
                Opt-in only -- it does not weaken the global placeholder guard elsewhere.
         credentials_profile: Name of credential profile for remote URLs (overrides global default)
+        alias: Namespace prefix for an upstream "tensor-server" source. The proxy
+               mirrors the upstream's sources under "<alias>__<upstream_source_id>"
+               so multiple upstreams (and local sources) coexist in one flat,
+               source_id-keyed catalog without id collisions. Must be slash-free
+               (it becomes part of a slash-free source_id). Ignored for non-proxy
+               source types.
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
 
@@ -369,6 +376,7 @@ class SourceConfig:
             "ome-zarr",
             "ome-zarr-hcs",
             "aics",
+            "tensor-server",
         ]
     ] = None
     source_id: Optional[str] = None
@@ -377,6 +385,7 @@ class SourceConfig:
     monitor: bool = False  # Enable live filesystem monitoring
     cloud: bool = False  # Treat as cloud/synced-folder root (admit unresolved sources)
     credentials_profile: Optional[str] = None  # Override global credential profile
+    alias: Optional[str] = None  # Namespace prefix for a "tensor-server" upstream
     _is_remote: Optional[bool] = field(
         default=None, init=False
     )  # Internal field, computed from URL
@@ -392,6 +401,13 @@ class SourceConfig:
     def __post_init__(self):
         if self.url is None or self.url == "":
             raise ValueError("SourceConfig requires a valid 'url'")
+
+        # An alias becomes part of a slash-free source_id (<alias>__<upstream_id>),
+        # so it must not contain '/' (the array_id source boundary).
+        if self.alias is not None and "/" in self.alias:
+            raise ValueError(
+                f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
+            )
 
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
@@ -1102,6 +1118,9 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
             monitor=src_data.get("monitor", False),  # Optional - default False
             cloud=src_data.get("cloud", False),  # Optional - default False
             credentials_profile=src_data.get("credentials_profile", None),  # NEW
+            alias=src_data.get(
+                "alias", None
+            ),  # Optional - tensor-server proxy namespace
         )
         sources.append(source)
 
@@ -1137,13 +1156,19 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 def detect_source_type(url: str) -> Optional[str]:
     """Detect source type from URL characteristics.
 
-    Returns one of: "zarr", "ome-zarr", "ome-zarr-hcs", "ome-tiff", "ome-tiff-multifile", "aics"
-    or None if type cannot be determined.
+    Returns one of: "zarr", "ome-zarr", "ome-zarr-hcs", "ome-tiff", "ome-tiff-multifile", "aics",
+    "tensor-server", or None if type cannot be determined.
 
     Note: HDF5 is NOT auto-detected because it requires explicit dataset path.
-    Note: Remote URLs cannot be auto-detected - requires explicit 'type' in config.
+    Note: Remote URLs cannot be auto-detected (require explicit 'type' in config),
+          except a grpc(+tls) endpoint, which is unambiguously an upstream biopb
+          tensor server (the "tensor-server" caching-proxy source type).
     """
     import json
+
+    # A grpc(+tls) endpoint is always an upstream biopb tensor server.
+    if url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
+        return "tensor-server"
 
     # Remote URLs cannot be auto-detected
     if _is_remote_url(url):
@@ -1409,8 +1434,110 @@ def _discover_by_type(
     return discovered
 
 
+def _namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
+    """Local source_id for a mirrored upstream source.
+
+    The proxy serves many upstreams + local sources from one flat, source_id-keyed
+    catalog, so an upstream's ids are namespaced by the configured ``alias``:
+    ``<alias>__<upstream_source_id>`` (slash-free -- ``__`` is a cosmetic
+    separator, and the upstream id is slash-free by the array_id spec). A lone
+    upstream with no alias keeps the verbatim id.
+    """
+    return f"{alias}__{upstream_source_id}" if alias else upstream_source_id
+
+
+def _discover_tensor_server(
+    source: SourceConfig, credentials_config: Optional[Any]
+) -> List[SourceConfig]:
+    """Expand a ``tensor-server`` source into one concrete source per upstream tensor.
+
+    ``grpc://host:port/<id>`` mirrors a single upstream source; a bare
+    ``grpc://host:port`` connects to the upstream and mirrors *every* source it
+    lists (the network analogue of directory discovery). Each concrete source
+    carries the single-source url form and an alias-namespaced ``source_id`` so
+    the adapter (``RemoteTensorAdapter.create_from_config``) and the rest of the
+    server machinery treat it like any other source.
+    """
+    from biopb_tensor_server.adapters.remote_tensor import (
+        _resolve_upstream_token,
+        _split_grpc_url,
+        list_upstream_source_ids,
+    )
+
+    endpoint, upstream_source_id = _split_grpc_url(source.url)
+
+    if upstream_source_id is not None:
+        # Single-source form: register under the alias-namespaced local id.
+        local_id = _namespaced_source_id(source.alias, upstream_source_id)
+        return [replace(source, source_id=local_id)]
+
+    # Bare-host form: mirror every source on the upstream. Enumerate via the
+    # complete server-side catalog (not the capped list_sources -- see
+    # list_upstream_source_ids); an incomplete fallback list still mirrors what
+    # it can.
+    from biopb.tensor import TensorFlightClient
+
+    token = _resolve_upstream_token(source, credentials_config)
+    client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+    try:
+        ids, _complete = list_upstream_source_ids(client)
+        upstream_ids = sorted(ids)
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+
+    expanded = []
+    for upstream_id in upstream_ids:
+        local_id = _namespaced_source_id(source.alias, upstream_id)
+        expanded.append(
+            replace(
+                source,
+                url=f"{endpoint}/{upstream_id}",
+                source_id=local_id,
+                type="tensor-server",
+            )
+        )
+    return expanded
+
+
+def _resolve_tensor_server_id_collisions(
+    sources: List[SourceConfig],
+) -> List[SourceConfig]:
+    """Drop -- don't abort on -- source_id collisions involving a tensor-server proxy.
+
+    With distinct aliases the namespaces are disjoint by construction, so a clash
+    is a misconfiguration (two upstreams sharing an alias, or a local source named
+    like a proxied id). A single bad entry must not take down the whole catalog,
+    so keep the first source for each id and skip later colliders, logging the fix
+    (set a distinct alias). Non-proxy collisions are left untouched (the historical
+    last-wins at registration).
+    """
+    seen: Dict[str, SourceConfig] = {}
+    result: List[SourceConfig] = []
+    for src in sources:
+        prior = seen.get(src.source_id)
+        if prior is not None and "tensor-server" in (src.type, prior.type):
+            logger.warning(
+                "Skipping source_id %r from %s (%s): it collides with %s (%s) "
+                "already in the catalog. Set a distinct 'alias' on the conflicting "
+                "tensor-server entry to namespace its mirrored sources.",
+                src.source_id,
+                src.url,
+                src.type,
+                prior.url,
+                prior.type,
+            )
+            continue
+        seen.setdefault(src.source_id, src)
+        result.append(src)
+    return result
+
+
 def discover_sources(
-    source: SourceConfig, registry: Optional[AdapterRegistry] = None
+    source: SourceConfig,
+    registry: Optional[AdapterRegistry] = None,
+    credentials_config: Optional[Any] = None,
 ) -> List[SourceConfig]:
     """Expand a source config to actual data sources.
 
@@ -1420,6 +1547,10 @@ def discover_sources(
     Supports multiple modes:
     - Explicit source: type + source_id both set -> single source
     - Remote URL: requires explicit 'type' in config (cannot auto-discover)
+    - tensor-server (grpc://) URL: a caching proxy in front of an upstream biopb
+      tensor server -- a bare ``grpc://host:port`` mirrors *every* upstream source
+      (one concrete source each, alias-namespaced), and ``grpc://host:port/<id>``
+      mirrors a single upstream source.
     - Local file with no type: try to detect type from file characteristics
     - Local directory with type but no source_id: discover by type (backward compatible)
     - Local directory with no type and no source_id: claim-based discovery
@@ -1427,6 +1558,8 @@ def discover_sources(
     Args:
         source: Source configuration
         registry: Optional adapter registry (uses default if None)
+        credentials_config: Optional CredentialsConfig, used to authenticate the
+            upstream ``list_sources`` call when expanding a tensor-server source.
 
     Returns:
         List of concrete SourceConfig objects (one per data source, NOT expanded to tensors)
@@ -1437,13 +1570,20 @@ def discover_sources(
     if registry is None:
         registry = get_default_registry()
 
-    # Case 0: Remote URLs require explicit type
+    # Case 0: Remote URLs require an explicit (or auto-detectable) type.
+    # A grpc(+tls) endpoint auto-detects to "tensor-server"; other remote
+    # schemes (s3://, http://, ...) still require an explicit 'type'.
     if source.is_remote:
-        if source.type is None:
+        resolved_type = source.type or detect_source_type(source.url)
+        if resolved_type is None:
             raise ValueError(
                 f"Remote URL requires explicit 'type' in config: {source.url}"
             )
-        # For remote URLs, return the source as-is (no directory discovery)
+        if source.type is None:
+            source = replace(source, type=resolved_type)
+        if resolved_type == "tensor-server":
+            return _discover_tensor_server(source, credentials_config)
+        # For other remote URLs, return the source as-is (no directory discovery)
         return [source]
 
     # Local filesystem handling
@@ -1597,13 +1737,14 @@ def resolve_all_sources(
         registry = get_default_registry()
 
     source_list = sources if sources is not None else config.sources
+    credentials_config = getattr(config, "credentials", None)
 
     all_sources = []
     hdf5_warnings = []
 
     for source in source_list:
         try:
-            discovered = discover_sources(source, registry)
+            discovered = discover_sources(source, registry, credentials_config)
         except Exception as e:
             if not tolerant:
                 raise
@@ -1618,6 +1759,14 @@ def resolve_all_sources(
             if src.type == "hdf5" and src.dataset is None:
                 hdf5_warnings.append(src.url)
             all_sources.append(src)
+
+    # source_id collisions involving a tensor-server proxy are a misconfiguration
+    # (two upstreams sharing an alias, or a local source named like a proxied id):
+    # the catalog is one flat source_id space, so a clash would silently shadow a
+    # source. Drop the colliding entry (keeping the first) and warn with the fix --
+    # a single bad source must not abort the whole catalog. Non-proxy collisions
+    # keep the historical last-wins behavior.
+    all_sources = _resolve_tensor_server_id_collisions(all_sources)
 
     # Print warnings for HDF5 files that need explicit dataset
     if hdf5_warnings:

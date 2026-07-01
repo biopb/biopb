@@ -314,3 +314,155 @@ class TestDiscoveryFailureIsolation:
             claim = next(iter(state.claims.values()))
             assert claim.primary_path == str(root / "good.dat")
             assert str(root / "bad.dat") not in state.path_to_source
+
+
+class TestTensorServerSourceType:
+    """The ``tensor-server`` source type: a grpc:// upstream fronted as a proxy.
+
+    Covers only the §1 scheme/type plumbing (recognition + classification +
+    the alias namespace field). The RemoteTensorAdapter / catalog expansion is
+    a separate slice; here a grpc source is simply classified and returned
+    as-is by ``discover_sources``.
+    """
+
+    def test_is_remote_url_recognizes_grpc_schemes(self):
+        from biopb_tensor_server.discovery import is_remote_url
+
+        assert is_remote_url("grpc://lab-store:8815") is True
+        assert is_remote_url("grpc+tls://lab-store:8815") is True
+        assert is_remote_url("grpcs://lab-store:8815") is True
+        assert is_remote_url("GRPC://Lab-Store:8815") is True  # case-insensitive
+        # unchanged behaviour for local + other remote schemes
+        assert is_remote_url("/data/scratch") is False
+        assert is_remote_url("s3://bucket/key") is True
+
+    def test_detect_source_type_maps_grpc_to_tensor_server(self):
+        from biopb_tensor_server.config import detect_source_type
+
+        assert detect_source_type("grpc://lab:8815") == "tensor-server"
+        assert detect_source_type("grpc+tls://lab:8815") == "tensor-server"
+        assert detect_source_type("grpcs://lab:8815") == "tensor-server"
+        # other remote schemes remain non-auto-detectable
+        assert detect_source_type("s3://bucket/key") is None
+
+    def test_tensor_server_in_type_literal(self):
+        # explicit type still round-trips through SourceConfig
+        s = SourceConfig(url="grpc://lab:8815", type="tensor-server")
+        assert s.type == "tensor-server"
+        assert s.is_remote is True
+
+    def test_grpc_source_auto_classifies_to_tensor_server(self):
+        # No explicit type: Case 0 auto-detects grpc -> tensor-server instead of
+        # raising "Remote URL requires explicit 'type'". Uses the single-source
+        # url form so discovery does not reach out to an upstream (bare-host
+        # expansion is exercised in the proxy integration test).
+        src = SourceConfig(url="grpc://lab:8815/img", alias="lab")
+        assert src.type is None  # not set at construction
+        out = discover_sources(src)
+        assert len(out) == 1
+        assert out[0].type == "tensor-server"
+        assert out[0].alias == "lab"
+        assert out[0].url == "grpc://lab:8815/img"
+
+    def test_non_grpc_remote_without_type_still_errors(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="requires explicit 'type'"):
+            discover_sources(SourceConfig(url="s3://bucket/key"))
+
+    def test_alias_must_be_slash_free(self):
+        import pytest
+
+        # source_id boundary is the first '/', so an alias prefix cannot contain it
+        with pytest.raises(ValueError, match="slash-free"):
+            SourceConfig(url="grpc://lab:8815", alias="lab/sub")
+        # a slash-free alias is accepted
+        assert SourceConfig(url="grpc://lab:8815", alias="lab").alias == "lab"
+
+    def test_alias_parsed_from_config_dict(self):
+        from biopb_tensor_server.config import parse_config
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://lab:8815", "alias": "lab"},
+                    {"url": "grpc://arc:8815", "type": "tensor-server", "alias": "arc"},
+                ]
+            }
+        )
+        aliases = {s.url: s.alias for s in cfg.sources}
+        assert aliases == {"grpc://lab:8815": "lab", "grpc://arc:8815": "arc"}
+
+    def test_single_source_form_namespaces_source_id(self):
+        # grpc://host:port/<id> mirrors one upstream source under <alias>__<id>
+        out = discover_sources(
+            SourceConfig(url="grpc://lab:8815/experiment1", alias="lab")
+        )
+        assert len(out) == 1
+        assert out[0].source_id == "lab__experiment1"
+        assert out[0].url == "grpc://lab:8815/experiment1"
+        assert out[0].type == "tensor-server"
+
+    def test_single_source_form_no_alias_keeps_verbatim_id(self):
+        out = discover_sources(SourceConfig(url="grpc://lab:8815/experiment1"))
+        assert len(out) == 1
+        assert out[0].source_id == "experiment1"
+
+    def test_namespaced_source_id_helper(self):
+        from biopb_tensor_server.config import _namespaced_source_id
+
+        assert _namespaced_source_id("lab", "img") == "lab__img"
+        assert _namespaced_source_id(None, "img") == "img"
+
+    def test_alias_clash_collision_is_tolerated(self, caplog):
+        import logging
+
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        # Two upstreams sharing alias "lab", each mirroring a same-named source
+        # -> both namespace to "lab__img": a flat-catalog collision. It must NOT
+        # abort the whole resolve -- the first wins, the collider is dropped+warned.
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "lab"},
+                ]
+            }
+        )
+        with caplog.at_level(logging.WARNING):
+            resolved = resolve_all_sources(cfg)
+        # one survivor (the first), not an exception
+        assert [s.source_id for s in resolved] == ["lab__img"]
+        assert resolved[0].url == "grpc://a:8815/img"
+        assert any("lab__img" in r.message for r in caplog.records)
+
+    def test_collision_does_not_drop_unrelated_sources(self):
+        # a colliding pair must not take down the OTHER, valid sources
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "lab"},  # collides -> dropped
+                    {"url": "grpc://c:8815/other", "alias": "arc"},  # unrelated
+                ]
+            }
+        )
+        ids = [s.source_id for s in resolve_all_sources(cfg)]
+        assert ids == ["lab__img", "arc__other"]
+
+    def test_distinct_aliases_do_not_collide(self):
+        from biopb_tensor_server.config import parse_config, resolve_all_sources
+
+        cfg = parse_config(
+            {
+                "sources": [
+                    {"url": "grpc://a:8815/img", "alias": "lab"},
+                    {"url": "grpc://b:8815/img", "alias": "arc"},
+                ]
+            }
+        )
+        ids = {s.source_id for s in resolve_all_sources(cfg)}
+        assert ids == {"lab__img", "arc__img"}

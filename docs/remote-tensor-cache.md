@@ -107,8 +107,9 @@ their `source_id`s cannot collide with each other or with the local sources (see
   carries (see [§3](#3-catalog-mirroring--expansion)).
 - **`alias`** (optional, slash-free) — the namespace prefix applied to this
   upstream's mirrored `source_id`s. Optional for a lone upstream with no name
-  clashes; **required** when a collision is detected (multiple upstreams, or a
-  local source sharing an id) — registration fails with a message naming the fix.
+  clashes; **recommended** when a collision is possible (multiple upstreams, or a
+  local source sharing an id) — a collider is dropped (first wins) and warned, not
+  fatal, so set an `alias` to keep the shadowed source.
 - **`grpc+tls://`** is recognized identically (TLS upstream).
 
 ### Scheme / type plumbing (small, mechanical)
@@ -125,6 +126,23 @@ Three existing functions learn about `grpc`:
   `type` raises *"Remote URL requires explicit type"*. A `grpc*` url resolves to
   `tensor-server` instead of erroring, and routes to the new expansion in
   [§3](#3-catalog-mirroring--expansion).
+
+> **Implemented (scheme/type plumbing only).** The recognition layer is in:
+> `discovery.is_remote_url` accepts `grpc://` / `grpc+tls://` / `grpcs://`
+> (one source of truth — `config._is_remote_url` is its alias);
+> `detect_source_type` maps a `grpc*` scheme to `"tensor-server"` (before the
+> remote-bail); `SourceConfig.type`'s `Literal` gained `"tensor-server"` and the
+> dataclass gained the optional slash-free `alias` field (parsed from the config
+> dict, validated in `__post_init__`, surfaced in the JSON-schema emitter +
+> unknown-key warner); and `discover_sources` Case 0 auto-detects the type for a
+> bare `grpc://` source (other remote schemes still require an explicit `type`).
+> A configured `grpc://` source is now *classified* as `tensor-server` and
+> returned as-is — it is **not yet served**: `RemoteTensorAdapter`
+> ([§2](#2-the-adapter--a-three-layer-passthrough-that-understands-nothing)) and
+> the catalog expansion ([§3](#3-catalog-mirroring--expansion)) are the next
+> slice, so until then such a source errors cleanly at adapter creation
+> (*"Unknown source type: tensor-server"*). Tests:
+> `tests/config_discovery_test.py::TestTensorServerSourceType`.
 
 `SourceConfig.type`'s `Literal` gains `"tensor-server"` and the dataclass gains an
 optional `alias` field (the namespace prefix, [§4](#4-identifier-policy)). Upstream
@@ -159,8 +177,13 @@ selected automatically; each instance then rewrites to its own upstream.
   (from `client.get_descriptor` / `list_sources`), **with `array_id` rewritten**
   local-ward (`<source_id>` → `<alias>__<source_id>`, preserving any `/field`).
 - `get_source_descriptor()` → mirror the upstream `DataSourceDescriptor` under the
-  local namespaced `source_id`, with `source_url` left as the upstream `grpc://…`
-  for provenance.
+  local namespaced `source_id`. `source_url` is a **display-friendly** proxied
+  form — `grpc://<alias>:<upstream_source_id>` (e.g. `grpc://lab:experiment1`), or
+  `grpc://<host:port>:<id>` when no alias — set on `_source_url` at construction.
+  It keeps the `grpc://` scheme so it fits the URL pattern and passes
+  `to_catalog_url` through unchanged, while being far more legible in a catalog
+  listing than the bare `grpc://host:port` endpoint (identical for every source of
+  an upstream). The real endpoint stays on `_upstream_location` for dialing.
 - `is_resident()` → `True` once the upstream descriptor is fetched (the proxy
   treats a reachable upstream source as resident; an *unreachable* one is a
   natural fit for the `UnresolvedSourceAdapter` deferral pattern — see
@@ -217,6 +240,29 @@ and re-implements no chunking. The segment cache — already wired into `do_get`
 turns it into the persistent shared cache of `#178` goal 2, **shared across all
 upstreams and local sources** of this proxy.
 
+> **Implemented (adapter + data path).** `adapters/remote_tensor.py`
+> `RemoteTensorAdapter(SourceAdapter, TensorAdapter)`, registered
+> `register_with_type("tensor-server", …)` in `adapters/__init__.py`. It holds a
+> lazy `TensorFlightClient(upstream, cache_bytes=0, token)`, mirrors the upstream
+> source/tensor descriptors with `array_id` rewritten local-ward, overrides
+> `is_resident()` → `True` (a `grpc://` url is a remote scheme, so the base would
+> wrongly call it non-resident and trip unresolved-source handling), and overrides
+> `resolve_chunk_data` to forward the rewritten `chunk_id` to the upstream
+> `do_get` and cache the returned `RecordBatch` under the **local** key. The
+> `array_id` byte-splice is `chunk.rewrite_chunk_id_array_id` (pure splice on the
+> length-prefixed field; bounds/scale tail untouched). `get_read_plan` is the
+> **inherited uniform-grid planner** for this slice — correct because a scaled
+> `chunk_id` forwarded to the upstream is downsampled there regardless of which
+> levels it advertised; mirroring the upstream's *advertised* pyramid (so native
+> OME-Zarr levels are reused rather than recomputed) is the read-plan-delegation
+> follow-up in [§10](#10-open-questions--follow-ups). `create_from_config` handles
+> the single-source `grpc://host:port/<upstream_source_id>` url form; the bare-host
+> "mirror everything" expansion + alias-namespaced registration is the §3 slice.
+> Tests: `tests/remote_tensor_adapter_test.py` (byte-splice unit + end-to-end
+> proxy of an in-process upstream: mirrored catalog, byte-identical pixels, scaled
+> read, and the inherited segment cache — upstream hit exactly once on a re-read,
+> entry `locate_entry`-able for the mmap fast path).
+
 ---
 
 ## 3. Catalog mirroring & expansion
@@ -245,10 +291,12 @@ multiplexing layer.
 
 **Collision check at registration.** `register_source` rejects a duplicate local
 `source_id`. The expansion runs this check across *all* configured entries
-(every upstream's mirrored ids + the local sources) and, on a clash, fails fast
-with a message naming the offending id and the fix (*"set an `alias` on
-`grpc://…`"*). With distinct aliases the namespaces are disjoint by construction,
-so this only fires on a genuine misconfiguration (two upstreams sharing an alias,
+(every upstream's mirrored ids + the local sources) and, on a clash, **drops the
+colliding entry (keeping the first) and logs a warning** naming the offending id
+and the fix (*"set an `alias` on `grpc://…`"*) — it does **not** abort, so one
+bad source can't take down the whole catalog. With distinct aliases the
+namespaces are disjoint by construction, so this only fires on a genuine
+misconfiguration (two upstreams sharing an alias,
 or a local source literally named `<alias>__…`).
 
 **Refresh (follow-up).** The upstream catalog can change. v1 mirrors **once at
@@ -258,11 +306,125 @@ instead of a filesystem walk — the `SourceManager` diff model applies unchange
 once the "scan" is a remote list. (`monitor` for fs watching does not apply to a
 remote url today; this generalizes it.)
 
-**Unreachable upstream at startup.** Register the source through
-`UnresolvedSourceAdapter` (the existing cloud-phase-2 proxy: a catalog row with
-empty tensors / `data_resident=false`) and resolve on first `GetFlightInfo`. This
-reuses the exact catalog-surface/serve-surface split already built for cloud, and
-keeps a momentarily-down upstream from aborting startup.
+> **Implemented (monitor → upstream re-list, adaptive cadence).**
+> `create_source_manager` collects the **bare-host** `tensor-server` sources with
+> `monitor=true` into `SourceManager._monitored_upstreams` (single-source
+> `grpc://host/<id>` entries are excluded — nothing to re-list). `_handle_rescan`
+> runs `_reconcile_due_upstreams` every rescan tick (default 30 s) with an
+> **adaptive per-upstream cadence counted in ticks** (no wall-clock interval — the
+> rescan tick is the unit): a re-list runs every tick while an upstream is
+> *changing* or *failing*, and its spacing **doubles per unchanged re-list** (a
+> stable upstream is skipped for more ticks, capped at `_UPSTREAM_RELIST_MAX_TICKS`
+> = 120 ≈ 1 h, so it isn't queried every 30 s forever). Any change *or* failure
+> resets it to every-tick, so a new source / a recovered upstream is mirrored
+> within ~one tick rather than after the full backoff (the original
+> force-full-only gate made recovery take up to 1 h). `_reconcile_one_upstream`
+> returns whether the mirrored set moved (drives the backoff), diffing the
+> alias-namespaced desired id set against the currently-mirrored claims and
+> applying adds/removes through the **same** `_commit_add_claim` /
+> `_commit_remove_source` primitives as the filesystem reconcile. Best-effort per
+> upstream: an unreachable one keeps its mirrored sources in place and retries
+> next tick. For an *upstream-only* config (no monitored dirs) each pass also
+> advances the progressive-discovery freshness signals; `full_scan_in_progress` /
+> the first-scan gate fire once, on boot. The watcher ticks on a timer independent
+> of its directory set, so the loop runs even with zero monitored dirs. Tests:
+> `test_monitored_upstream_relist_adds_and_removes`,
+> `test_failed_upstream_retried_on_fast_incremental_cadence`,
+> `test_stable_upstream_backs_off_then_resets_on_change`,
+> `test_create_source_manager_captures_bare_host_monitored_upstream`.
+
+**Unreachable upstream.** A proxy "resolve" is a *cheap reconnect*, not a cloud
+download, so the consented refuse-on-serve model of `UnresolvedSourceAdapter` is
+the wrong fit — recovery should be **transparent**. Instead the proxy splits its
+own surfaces:
+
+- **Catalog surface degrades to a placeholder.** `list_tensor_descriptors()` /
+  `get_metadata()` catch an unreachable upstream and return empty (`[]` / `{}`),
+  and `is_resident()` tracks reachability (`_reachable`, updated by those calls),
+  so `get_source_descriptor()` yields a catalog row with **empty tensors /
+  `data_resident=false`** rather than raising. The source therefore registers and
+  stays in the catalog while the upstream is down — registration's metadata-DB
+  sync no longer fails-and-rolls-back, so the source is not silently dropped.
+- **Serve surface stays live.** `get_tensor_descriptor` / `get_data` /
+  `resolve_chunk_data` still raise (→ retryable `UNAVAILABLE`) on a miss, and
+  `ListFlights`/`GetFlightInfo` are live, so the **real tensors reappear the
+  moment the upstream is back** — no explicit `resolve` action, no consent step
+  (a failed catalog call also drops the dead client so the next call reconnects).
+  Already-cached chunks keep serving from the segment cache through an outage.
+
+> **Implemented (unreachable-upstream policy).** The catalog/serve split above is
+> in `RemoteTensorAdapter` (`_reachable`, `_mark_unreachable`,
+> `is_resident()→_reachable`, `list_tensor_descriptors`/`get_metadata` →
+> empty-on-unreachable; serve methods unchanged). Two URL forms:
+> **single-source** `grpc://host/<id>` down at boot → registers as an empty
+> placeholder (no rollback) and recovers transparently; **bare-host**
+> `grpc://host` down at boot → its expansion is skipped (no per-source ids are
+> knowable until the upstream answers), and recovery requires `monitor=true` (the
+> re-list populates it on the next force-full pass once reachable). And
+> `create_source_manager` no longer hard-fails to start when the *only* source is
+> an unreachable monitored upstream — its guard now counts `monitored_upstreams`,
+> so the server boots empty and the re-list fills it in. Tests:
+> `remote_tensor_adapter_test.py::TestUnreachableUpstream` (catalog placeholder,
+> serve-still-raises, transparent recovery via port reuse) +
+> `test_unreachable_sole_monitored_upstream_does_not_block_startup`.
+
+> **Implemented (catalog correctness — two fixes).**
+> *(1) Metadata source.* `list_flights`/`list_sources` is lean (empty
+> `metadata_json`); the only live RPC that fills it (`GetFlightInfo(with_metadata)`)
+> returns it *wrapped* (`{"type","dim_label","metadata"}`), which `get_metadata()`
+> would have had to unwrap and which it can't even get from `list_sources`. So
+> `get_metadata()` reads the **upstream's DuckDB `sources.metadata_json` column**
+> via `query_sources` — that column stores `json.dumps(get_metadata())` verbatim
+> (the *raw* dict, no envelope), exactly this method's contract; the local server
+> re-wraps it once on serialize. `_localize_descriptor` clears `metadata_json` +
+> `pyramid` so mirrored descriptors stay lean (the local server fills both itself).
+> *(2) Truncation-safe enumeration.* `list_sources()` is **capped**
+> (`max_list_flights_results`), so building a catalog from it silently drops
+> sources past the cap — and reconciling against a truncated list would
+> *spuriously remove* them. The new `list_upstream_source_ids(client) →
+> (ids, complete)` prefers the complete `query_sources("SELECT source_id FROM
+> sources")` and only falls back to the capped `list_sources()` (flagged
+> `complete=False`) when the upstream has no metadata DB. The bare-host expansion
+> and the monitor re-list both use it; the re-list applies **removals only when
+> `complete`**. And `list_tensor_descriptors` no longer scans the whole catalog to
+> find one source (capped + O(N²)) — it fetches that source's descriptor directly
+> via `get_descriptor` (a multi-tensor upstream source is advertised by its default
+> field; reading other fields still works). Tests: `test_get_metadata_*`,
+> `test_metadata_flows_through_proxy_single_wrapped`,
+> `test_expansion_complete_despite_list_flights_truncation`.
+> *(3) Physical scale.* `physical_scale` / `physical_unit` are, like the pyramid,
+> *cleared and refilled* by the server on every `GetFlightInfo` from a dedicated
+> `get_physical_scale()` (the compact #31 summary) — they are **not** carried
+> implicitly by `get_tensor_descriptor`, so the base default of `None` silently
+> dropped the upstream's physical pixel sizes. `RemoteTensorAdapter` now overrides
+> `get_physical_scale()` to read them from the upstream's `get_descriptor`
+> response (its server fills them identically). Tests:
+> `test_get_physical_scale_mirrors_upstream`, `test_physical_scale_flows_through_proxy`.
+
+> **Implemented (expansion + namespacing + collision check; mirror-once).**
+> `config.discover_sources` gained a `credentials_config` param and a
+> `tensor-server` branch (`_discover_tensor_server`): the single-source
+> `grpc://host:port/<id>` form registers under the alias-namespaced local id
+> (`_namespaced_source_id` → `<alias>__<id>`, verbatim when no alias); the
+> bare-host `grpc://host:port` form connects (`TensorFlightClient(cache_bytes=0,
+> token)`), `list_sources()`, and yields one concrete single-source `SourceConfig`
+> per upstream source. `resolve_all_sources` threads `config.credentials` through
+> and runs `_resolve_tensor_server_id_collisions` over the flattened set — a
+> source_id clash involving a proxy **drops the collider (first wins) and warns**
+> rather than aborting, so one bad source can't take down the catalog (non-proxy
+> clashes keep historical last-wins). Per-upstream tokens reach the adapter because
+> the static-seed `SourceClaim.extra_config` now carries `credentials_profile` and
+> `_register_source_claim` rebuilds it onto the `SourceConfig` (it was previously
+> dropped). Expansion is **synchronous at startup** under the serve path's
+> `tolerant=True`, so an unreachable upstream is warned-and-skipped rather than
+> aborting — the `UnresolvedSourceAdapter` deferral above and backgrounding the
+> upstream list are still follow-ups. The `monitor=true → upstream re-list`
+> reconcile below is **not** yet wired (a `tensor-server` source's `monitor` flag
+> is currently inert — `_is_monitored_claim` rejects remote urls). Tests:
+> `config_discovery_test.py::TestTensorServerSourceType` (single-source
+> namespacing, collision, distinct-alias) and
+> `remote_tensor_adapter_test.py::TestBareHostExpansion` + the credentials-profile
+> token test.
 
 ---
 
@@ -553,6 +715,12 @@ upstream and local+proxy add no new dispatch layer — they fall out of the flat
   server the compute plane is pointed at.
 - **Per-user eviction budget.** The proxy `file_max_total_bytes` should default
   to a whole-user budget, not a per-worker slice (`#178`).
+- **Share one upstream connection per endpoint** (`biopb/biopb#249`). Each
+  `RemoteTensorAdapter` builds its own `TensorFlightClient`, so a bare-host
+  upstream mirrored into N sources opens N connections to the same
+  `(endpoint, token)` (plus the expansion + re-list throwaways). Pool them by
+  `(normalized_location, token)`. Connection-efficiency only — the data path is
+  unaffected.
 - **Auth shape.** Confirm `storage_type="biopb-tensor"` credential profile vs a
   direct `SourceConfig.token` field vs env var. (Profile recommended for
   consistency with the existing remote-credential machinery.)

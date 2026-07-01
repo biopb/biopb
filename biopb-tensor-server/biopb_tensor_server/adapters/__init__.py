@@ -14,6 +14,7 @@ from biopb_tensor_server.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
 from .ome_zarr import OmeZarrAdapter
+from .remote_tensor import RemoteTensorAdapter
 from .tiff import (
     MicroManagerLegacyAdapter,
     TiffSequenceAdapter,
@@ -71,6 +72,7 @@ __all__ = [
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
     "OmeZarrAdapter",
+    "RemoteTensorAdapter",
     "NdTiffAdapter",
     "OmeTiffAdapter",
     "ZeissAdapter",
@@ -159,5 +161,10 @@ def get_default_registry() -> AdapterRegistry:
         registry.register_with_type("nifti", NiftiAdapter)
 
     registry.register_with_type("hdf5", Hdf5Adapter)
+
+    # Remote tensor server -- a caching passthrough proxy (biopb/biopb#178).
+    # Config-only (grpc:// url, like hdf5 it never claims a filesystem path), so
+    # its claim() default returns None and it only registers by explicit type.
+    registry.register_with_type("tensor-server", RemoteTensorAdapter)
 
     return registry

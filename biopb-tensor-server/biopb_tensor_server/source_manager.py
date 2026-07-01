@@ -39,6 +39,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Backoff ceiling for the tensor-server upstream re-list, in rescan ticks
+# (biopb/biopb#178). A re-list runs every tick while an upstream is changing or
+# failing; while it stays stable the spacing doubles up to this many ticks, so a
+# fully-stable upstream settles to re-listing about once an hour at the default
+# 30s rescan tick (instead of querying it every 30s forever).
+_UPSTREAM_RELIST_MAX_TICKS = 120
+
 # Hard backstop against unbounded recursion in the rescan walk. visited_identities
 # breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
 # identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
@@ -79,6 +86,7 @@ class SourceManager:
         stable_rescans_required: int = 0,
         aggressive_dir_pruning: bool = False,
         cloud_roots: Optional[Set[Path]] = None,
+        monitored_upstreams: Optional[List[SourceConfig]] = None,
     ):
         self._server = server
         # First-class catalog dependency: injected by create_source_manager so
@@ -93,6 +101,25 @@ class SourceManager:
         # Under these, dehydrated entries are admitted and registered as unresolved
         # sources that resolve lazily on first access (cloud-storage phase 2).
         self._cloud_roots: Set[Path] = cloud_roots or set()
+        # Monitored tensor-server (bare-host grpc://) upstreams: their catalog is
+        # periodically re-listed and reconciled like a directory walk
+        # (biopb/biopb#178). Single-source grpc://host/<id> entries are not here --
+        # there is nothing to re-list for one fixed source.
+        self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
+        # Per-upstream re-list cadence (keyed by url), counted in rescan ticks (no
+        # wall-clock interval -- the rescan tick is the unit). A re-list runs every
+        # tick by default; when it finds the source set UNCHANGED the spacing
+        # doubles (a stable upstream is skipped for more ticks, up to
+        # _UPSTREAM_RELIST_MAX_TICKS, so we are not querying it every tick forever),
+        # and any change OR failure resets it to every tick -- so a new source / a
+        # recovering upstream is picked up within ~one tick, not after the full
+        # backoff. `countdown` ticks down to 0 (re-list due); `period` is the
+        # current spacing in ticks.
+        self._upstream_relist: Dict[str, Dict[str, int]] = {}
+        self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
+        # Upstreams (by url) whose last re-list failed -- a status signal (the fast
+        # retry itself is driven by the period reset above).
+        self._failed_upstreams: Set[str] = set()
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
         self._stability_window = stability_window
@@ -255,7 +282,12 @@ class SourceManager:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan across monitored directories."""
+        """Run one periodic rescan: re-list monitored upstreams, then walk dirs."""
+        # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
+        # cadence -- fast (every tick) while changing/failing, backing off toward
+        # full_rescan_interval while a source set stays stable.
+        self._reconcile_due_upstreams()
+
         if not self._monitored_dirs:
             return
 
@@ -1220,6 +1252,176 @@ class SourceManager:
             self._clear_failed_source_attempt(source_id)
         return True
 
+    def _reconcile_due_upstreams(self) -> None:
+        """Re-list the upstreams that are due this tick (adaptive backoff).
+
+        Each upstream re-lists on the fast rescan tick while it is changing or
+        failing, and backs off (period doubles per unchanged re-list, capped at
+        full_rescan_interval) while it is stable -- so a stable lab store is not
+        queried every 30s forever, yet a new source / a recovered upstream is
+        mirrored within ~one tick. When there are no monitored *dirs* this is the
+        sole reconcile, so the first pass also drives the progressive-discovery
+        freshness signals + first-scan gate the dir path would otherwise own.
+        """
+        if not self._monitored_upstreams:
+            return
+        due: List[SourceConfig] = []
+        for upstream in self._monitored_upstreams:
+            state = self._upstream_relist.setdefault(
+                upstream.url, {"period": 1, "countdown": 0}
+            )
+            state["countdown"] -= 1
+            if state["countdown"] <= 0:
+                due.append(upstream)
+        if not due:
+            return
+
+        upstream_only = not self._monitored_dirs
+        first_pass = upstream_only and not self._initial_scan_done
+        if first_pass:
+            self._server.set_full_scan_in_progress(True)
+        try:
+            for upstream in due:
+                self._reconcile_and_reschedule(upstream)
+        finally:
+            if upstream_only:
+                # Each completed pass re-verifies the (remote) catalog -> advance
+                # freshness. in_progress / the first-scan gate fire once, on boot.
+                self._last_full_rescan_at = time.time()
+                self._server.set_last_full_scan(self._last_full_rescan_at)
+                if first_pass:
+                    self._server.set_full_scan_in_progress(False)
+                    self._initial_scan_done = True
+                    self._fire_initial_scan_complete()
+
+    def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
+        """Re-list one upstream and set its next-due period from the outcome."""
+        state = self._upstream_relist[upstream.url]
+        try:
+            changed = self._reconcile_one_upstream(upstream)
+        except Exception:
+            # Failure (unreachable): retry on the fast cadence next tick.
+            self._failed_upstreams.add(upstream.url)
+            state["period"] = 1
+            state["countdown"] = state["period"]
+            logger.warning(
+                "Upstream re-list failed for %s; keeping its current catalog "
+                "(retrying on the next rescan)",
+                upstream.url,
+                exc_info=True,
+            )
+            return
+        self._failed_upstreams.discard(upstream.url)
+        if changed:
+            state["period"] = 1  # the catalog moved -> stay fast
+        else:
+            # Stable -> back off (double, capped at full_rescan_interval).
+            state["period"] = min(state["period"] * 2, self._upstream_max_period)
+        state["countdown"] = state["period"]
+
+    def _reconcile_upstreams(
+        self, upstreams: Optional[List[SourceConfig]] = None
+    ) -> None:
+        """Re-list each given tensor-server upstream now (ignoring the backoff
+        schedule); used by tests and any caller that wants an immediate pass.
+
+        Best-effort per upstream: an unreachable upstream leaves its currently
+        mirrored sources in place (no spurious removals) and is marked failed.
+        """
+        if upstreams is None:
+            upstreams = self._monitored_upstreams
+        for upstream in upstreams:
+            try:
+                self._reconcile_one_upstream(upstream)
+            except Exception:
+                self._failed_upstreams.add(upstream.url)
+                logger.warning(
+                    "Upstream re-list failed for %s; keeping its current catalog "
+                    "(will retry on the next rescan)",
+                    upstream.url,
+                    exc_info=True,
+                )
+            else:
+                self._failed_upstreams.discard(upstream.url)
+
+    def _reconcile_one_upstream(self, upstream: SourceConfig) -> bool:
+        """Diff one upstream's live source list against the mirrored catalog.
+
+        Returns whether the mirrored set changed (a source was added or removed).
+
+        The diff is the same add/remove model as the filesystem reconcile, but the
+        "scan" is a remote ``list_sources()`` and the unit is a source_id (not a
+        path signature): desired = the alias-namespaced ids the upstream lists now;
+        current = the tensor-server claims already mirrored from this endpoint.
+        """
+        from biopb.tensor import TensorFlightClient
+
+        from biopb_tensor_server.adapters.remote_tensor import (
+            _resolve_upstream_token,
+            _split_grpc_url,
+            list_upstream_source_ids,
+        )
+        from biopb_tensor_server.config import _namespaced_source_id
+
+        endpoint, _ = _split_grpc_url(upstream.url)
+        alias = upstream.alias
+        token = _resolve_upstream_token(upstream, self._credentials_config)
+
+        client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+        try:
+            # Complete enumeration -- list_sources() truncates, which would both
+            # miss sources AND spuriously remove the ones past the cap below.
+            upstream_ids, complete = list_upstream_source_ids(client)
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+
+        desired = {_namespaced_source_id(alias, up_id): up_id for up_id in upstream_ids}
+
+        prefix = f"{endpoint}/"
+        alias_prefix = f"{alias}__" if alias else None
+        with self._lock:
+            current = {
+                source_id
+                for source_id, claim in self._state.claims.items()
+                if claim.source_type == "tensor-server"
+                and str(claim.primary_path).startswith(prefix)
+                and (alias_prefix is None or source_id.startswith(alias_prefix))
+            }
+
+        added = set(desired) - current
+        # Only remove when the upstream list is COMPLETE: a truncated/incomplete
+        # enumeration must never drop a mirrored source it simply failed to see.
+        removed = (current - set(desired)) if complete else set()
+
+        for source_id in sorted(removed):
+            self._commit_remove_source(source_id)
+
+        extra_config = {}
+        if upstream.credentials_profile:
+            extra_config["credentials_profile"] = upstream.credentials_profile
+        for source_id in sorted(added):
+            up_id = desired[source_id]
+            self._commit_add_claim(
+                SourceClaim(
+                    source_type="tensor-server",
+                    primary_path=f"{endpoint}/{up_id}",
+                    source_id=source_id,
+                    extra_config=dict(extra_config),
+                )
+            )
+
+        if added or removed:
+            logger.info(
+                "Upstream %s re-list: +%d / -%d sources",
+                endpoint,
+                len(added),
+                len(removed),
+            )
+        # Whether the mirrored set moved -- drives the adaptive re-list cadence.
+        return bool(added or removed)
+
     def _should_retry_source(self, source_id: str) -> bool:
         """Return True when a failed source is eligible for another add attempt."""
         tracker = self._failed_sources.get(source_id)
@@ -1395,6 +1597,7 @@ class SourceManager:
                 source_id=claim.source_id,
                 dim_labels=claim.dim_labels,
                 dataset=claim.extra_config.get("dataset"),
+                credentials_profile=claim.extra_config.get("credentials_profile"),
             )
 
             if self._claim_is_unresolved(claim):
@@ -1593,7 +1796,25 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
 
-    if not monitored_dirs and not static_sources:
+    # Monitored tensor-server upstreams (bare-host grpc://, monitor=true): their
+    # catalog is periodically re-listed and reconciled (biopb/biopb#178). A
+    # single-source grpc://host/<id> entry has nothing to re-list, so it is
+    # excluded -- only the bare-host "mirror everything" form qualifies.
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    monitored_upstreams = [
+        ms
+        for ms in monitored_sources
+        if ms.is_remote
+        and ms.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+        and _split_grpc_url(ms.url)[1] is None
+    ]
+
+    # An unreachable monitored upstream contributes no static sources at startup
+    # (its bare-host expansion was skipped), but the re-list will populate it once
+    # it is reachable -- so it counts as "something to serve" and must not let the
+    # server hard-fail to start (#178: require monitor=true for bare-host recovery).
+    if not monitored_dirs and not static_sources and not monitored_upstreams:
         logger.warning("No valid sources to serve")
         return None
 
@@ -1627,17 +1848,27 @@ def create_source_manager(
         stable_rescans_required=stable_rescans_required,
         aggressive_dir_pruning=aggressive_dir_pruning,
         cloud_roots=cloud_roots,
+        monitored_upstreams=monitored_upstreams,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
     # These are added first so monitored discovery skips paths already claimed.
     for source in static_sources:
+        extra_config = {}
+        if source.dataset:
+            extra_config["dataset"] = source.dataset
+        # credentials_profile is dropped by the claim->SourceConfig rebuild in
+        # _register_source_claim; carry it here so a tensor-server proxy's
+        # per-upstream token (and any remote source's profile) reaches
+        # create_from_config.
+        if source.credentials_profile:
+            extra_config["credentials_profile"] = source.credentials_profile
         claim = SourceClaim(
             source_type=source.type,
             primary_path=source.url,  # str for URL support
             source_id=source.source_id,
             dim_labels=source.dim_labels,
-            extra_config={"dataset": source.dataset} if source.dataset else {},
+            extra_config=extra_config,
             # A static source explicitly flagged cloud is always deferred: the
             # user said "don't open it eagerly". If it is in fact resident, the
             # first access still resolves it cheaply.
