@@ -121,7 +121,18 @@ def _empty_section() -> Dict[str, Any]:
 
 def _scalar_property(class_name: str, field: str) -> Dict[str, Any]:
     inst = _DEFAULT_INSTANCES[class_name]
-    prop: Dict[str, Any] = {"type": _json_type(getattr(inst, field))}
+    value = getattr(inst, field)
+    prop: Dict[str, Any] = {"type": _json_type(value)}
+    # The dataclass default, so a config editor can render the effective value of
+    # an omitted key (e.g. show a default-true boolean checked) and only write a
+    # key when it diverges. None (e.g. write_dir) is left out -- it is "unset",
+    # not a meaningful default to echo. Non-JSON-native defaults (e.g. a Path
+    # file_cache_dir) are coerced to str to match their "string" wire type and
+    # stay JSON-serializable (the schema is sent over HTTP by GET /api/config).
+    if value is not None:
+        prop["default"] = (
+            value if isinstance(value, (bool, int, float, str)) else str(value)
+        )
     constraint = _CONSTRAINTS.get(class_name, {}).get(field)
     if constraint is not None:
         prop.update(constraint.to_json_schema())
