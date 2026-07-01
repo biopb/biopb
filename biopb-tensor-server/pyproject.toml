@@ -22,7 +22,7 @@ dependencies = [
   "scipy < 1.16",  # scipy >=1.16 requires numpy>=2.0; pulled in transitively via dask[array]'s scipy.sparse import. Keep aligned with the numpy<2.0 pin above.
   "typer >= 0.12.0",
   "tomli >= 2.0.0; python_version < '3.11'",
-  "duckdb",
+  "duckdb >= 1.5.3",  # empty typed-list ([]) parameter binding for the physical_scale negative cache
 ]
 
 [project.optional-dependencies]

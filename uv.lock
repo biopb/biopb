@@ -630,7 +630,7 @@ requires-dist = [
     { name = "cachey", specifier = ">=0.1.0" },
     { name = "cjdk", marker = "extra == 'bioformats'", specifier = ">=0.5.0" },
     { name = "dask", extras = ["array"], specifier = ">=2024.0.0" },
-    { name = "duckdb" },
+    { name = "duckdb", specifier = ">=1.5.3" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.111.0" },
     { name = "fsspec" },
     { name = "h5py", marker = "extra == 'hdf5'", specifier = ">=3.0.0" },
