@@ -752,7 +752,7 @@ function Start-DataServer {
         Report-Detail "longer blocks SERVING, so this is not just still scanning):"
         Show-LogTail -LogFile $logFile
         Report-Detail "full log: $logFile"
-        Report-Detail "recheck once with: biopb server status -w 30"
+        Report-Detail "recheck once with: biopb server status --wait 30"
         return
     }
 

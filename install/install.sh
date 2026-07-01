@@ -769,7 +769,7 @@ _start_data_server() {
         _info "  longer blocks SERVING, so this is not just \"still scanning\"):"
         _tail_log "$log_file"
         _info "  full log: ${CYAN}$log_file${RESET}"
-        _info "  recheck once with: ${CYAN}biopb server status -w 30${RESET}"
+        _info "  recheck once with: ${CYAN}biopb server status --wait 30${RESET}"
         return 0
     fi
 
