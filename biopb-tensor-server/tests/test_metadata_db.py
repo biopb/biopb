@@ -1016,3 +1016,69 @@ class TestDataResidentColumn:
             conn.execute(
                 "INSERT INTO sources (source_id, data_resident) VALUES ('bad', NULL)"
             )
+
+
+class _ReleaseSpyAdapter(MockAdapter):
+    """A MockAdapter that records release_retained_metadata() calls and can
+    declare whether its metadata covers all tensors (biopb/biopb#253)."""
+
+    def __init__(self, *a, covers_all=True, **k):
+        super().__init__(*a, **k)
+        self._covers_all = covers_all
+        self.release_calls = 0
+
+    def metadata_covers_all_tensors(self):
+        return self._covers_all
+
+    def release_retained_metadata(self):
+        self.release_calls += 1
+
+
+class TestReleaseRetainedMetadataOnSync:
+    """sync_source_added tells the adapter to drop retained metadata once the
+    catalog row is written (biopb/biopb#253, #269)."""
+
+    def test_release_called_when_metadata_covers_all_tensors(self):
+        db = MetadataDatabase()
+        adapter = _ReleaseSpyAdapter(
+            "s1", "/s1.tiff", "ome-tiff", [8, 8], "uint16", covers_all=True
+        )
+        db.sync_source_added("s1", adapter)
+        assert adapter.release_calls == 1
+
+    def test_release_skipped_for_per_tensor_metadata(self):
+        """An HCS-like source (metadata_covers_all_tensors() False) keeps its
+        metadata: the serve path still reads it per-tensor off the adapter."""
+        db = MetadataDatabase()
+        adapter = _ReleaseSpyAdapter(
+            "plate", "/p.zarr", "ome-zarr-hcs", [8, 8], "uint16", covers_all=False
+        )
+        db.sync_source_added("plate", adapter)
+        assert adapter.release_calls == 0
+
+    def test_release_failure_does_not_break_sync(self):
+        """A release that raises is swallowed -- the row is already committed."""
+
+        class _BoomRelease(_ReleaseSpyAdapter):
+            def release_retained_metadata(self):
+                raise RuntimeError("boom")
+
+        db = MetadataDatabase()
+        adapter = _BoomRelease("s2", "/s2.tiff", "ome-tiff", [8, 8], "uint16")
+        db.sync_source_added("s2", adapter)  # must not raise
+        row = (
+            db._get_connection()
+            .execute("SELECT source_id FROM sources WHERE source_id='s2'")
+            .fetchone()
+        )
+        assert row is not None and row[0] == "s2"
+
+    def test_duck_typed_adapter_without_hooks_is_left_alone(self):
+        """A plain MockAdapter (no release/covers hooks) syncs without error."""
+        db = MetadataDatabase()
+        adapter = MockAdapter("s3", "/s3.zarr", "ome-zarr", [8, 8], "uint16")
+        db.sync_source_added("s3", adapter)  # must not raise
+        assert db.get_metadata_json("s3") == {
+            "test_key": "test_value",
+            "nested": {"a": 1, "b": 2},
+        }
