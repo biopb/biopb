@@ -431,6 +431,49 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+    def get_metadata_json(self, source_id: str) -> Optional[dict]:
+        """Return a source's stored metadata as a dict, or ``None`` to fall back.
+
+        The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
+        dict, no envelope -- so the serve path can read metadata back with a
+        cheap local ``SELECT`` instead of recomputing it on the adapter
+        (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
+        the local mirror row directly, never ``adapter.get_metadata()``). The
+        stored JSON is parsed here so callers get a ready dict.
+
+        Returns ``None`` in every "no usable catalog metadata" case -- so the
+        caller uniformly falls back to ``adapter.get_metadata()``:
+        - the source is absent, or its metadata is SQL NULL (empty is stored as
+          NULL),
+        - the stored value is not valid JSON / not a JSON object,
+        - the DuckDB read itself fails.
+
+        Never raises: a catalog read error degrades to the adapter path rather
+        than failing the serve. Uses ``cursor()`` for a thread-safe read.
+        """
+        try:
+            cursor = self._get_cursor()
+            row = cursor.execute(
+                "SELECT metadata_json FROM sources WHERE source_id = ?", [source_id]
+            ).fetchone()
+        except Exception as exc:
+            logger.warning(
+                "metadata_json read failed for source %s: %s", source_id, exc
+            )
+            return None
+
+        if row is None or not row[0]:
+            return None
+
+        try:
+            parsed = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "stored metadata_json for source %s is not valid JSON", source_id
+            )
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     def list_source_descriptors(
         self, limit: Optional[int] = None
     ) -> Tuple[List[DataSourceDescriptor], int]:

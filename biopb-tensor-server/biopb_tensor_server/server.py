@@ -1209,7 +1209,30 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                raw_metadata = tensor_adapter.get_metadata()
+                # Prefer the catalog's stored metadata_json (biopb/biopb#253):
+                # computed once at registration, read back with a cheap local
+                # SELECT -- no adapter recompute, and for a remote proxy no
+                # upstream RPC (read the local mirror row directly, never
+                # adapter.get_metadata()). Fall back to the adapter only when
+                # there is no DB, or get_metadata_json returns None -- an absent/
+                # NULL row (empty metadata, or an unresolved source whose real row
+                # isn't written yet), unparseable JSON, or a catalog read error
+                # (it parses and degrades internally, never raising).
+                #
+                # Escape hatch: the catalog row is source-level, so read it only
+                # when the source's metadata covers every tensor. HCS plates hold
+                # per-field metadata (the row is the plate .zattrs, not a field's
+                # OME metadata), so they fall through to the per-tensor adapter --
+                # preserving the field-level answer (biopb/biopb#253).
+                raw_metadata = None
+                if (
+                    self._metadata_db is not None
+                    and source_adapter is not None
+                    and source_adapter.metadata_covers_all_tensors()
+                ):
+                    raw_metadata = self._metadata_db.get_metadata_json(source_id)
+                if raw_metadata is None:
+                    raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter._source_type,
