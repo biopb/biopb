@@ -887,6 +887,17 @@ class TestVersionCommand:
         monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
         assert cli._read_release_version() == "9.9.9"
 
+    def test_read_release_version_corrupt_marker_is_unknown(
+        self, monkeypatch, tmp_path
+    ):
+        # A corrupt (non-UTF-8) marker must degrade to 'unknown', not raise a
+        # UnicodeDecodeError out of the command -- reading a version is
+        # best-effort, like _package_version.
+        marker = tmp_path / "release.version"
+        marker.write_bytes(b"\xff\xfe\x00bad")
+        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
+        assert cli._read_release_version() == "unknown"
+
     def test_package_version_missing_is_not_installed(self):
         # A distribution name that is guaranteed absent maps to 'not installed'.
         assert (

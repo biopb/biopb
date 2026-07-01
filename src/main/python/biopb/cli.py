@@ -116,11 +116,16 @@ _RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp")
 
 def _read_release_version() -> str:
     """The installed deployment version from the installer's marker file, or
-    'unknown' when it is absent -- a dev checkout or a non-installer setup that
-    never wrote CONFIG_DIR/release.version."""
+    'unknown' when it is absent (a dev checkout or non-installer setup that never
+    wrote CONFIG_DIR/release.version) or unreadable. Best-effort like
+    ``_package_version`` -- reading a version must never crash ``biopb version``,
+    so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
+    'unknown' rather than propagating."""
     try:
         return _RELEASE_VERSION_FILE.read_text().strip() or "unknown"
     except OSError:
+        return "unknown"
+    except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
         return "unknown"
 
 
