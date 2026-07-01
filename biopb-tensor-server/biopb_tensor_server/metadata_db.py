@@ -31,12 +31,13 @@ import re
 import threading
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
@@ -429,6 +430,71 @@ class MetadataDatabase:
             )
 
         logger.debug(f"Synced source to metadata database: {source_id}")
+
+    def list_source_descriptors(
+        self, limit: Optional[int] = None
+    ) -> Tuple[List[DataSourceDescriptor], int]:
+        """Rebuild the lean ListFlights descriptors from the catalog.
+
+        The DuckDB-backed equivalent of iterating adapters and calling
+        ``get_source_descriptor()``. Serving ``ListFlights`` from here makes the
+        catalog the single source of truth for browsing, so ``list_sources`` and
+        ``query_sources`` cannot drift (biopb/biopb#265).
+
+        Only the cheap/structural fields the lean descriptor carries are
+        reconstructed: per-tensor ``array_id``/``dim_labels``/``shape``/
+        ``chunk_shape``/``dtype`` from the ``tensors`` STRUCT[] (biopb/biopb#224).
+        ``metadata_json`` is left empty (filled by ``GetFlightInfo``), exactly
+        like the adapter path. ``data_resident`` is the stored snapshot -- the
+        field is advisory/volatile by contract (the authoritative gate is a fresh
+        ``adapter.is_resident()``), so a point-in-time value is acceptable here.
+
+        Uses ``cursor()`` for a thread-safe read (no lock).
+
+        Args:
+            limit: Max rows to return (the ListFlights safety cap). ``None`` =
+                no cap.
+
+        Returns:
+            ``(descriptors, total)`` where ``total`` is the full catalog row
+            count (so the caller can signal truncation when ``limit`` clips it).
+        """
+        cursor = self._get_cursor()
+        total = cursor.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+
+        sql = (
+            "SELECT source_id, source_url, source_type, data_resident, tensors "
+            "FROM sources ORDER BY source_id"
+        )
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = cursor.execute(sql, params).fetchall()
+
+        descriptors: List[DataSourceDescriptor] = []
+        for source_id, source_url, source_type, data_resident, tensors in rows:
+            tensor_descs = [
+                TensorDescriptor(
+                    array_id=t["array_id"],
+                    dim_labels=t["dim_labels"] or [],
+                    shape=t["shape"] or [],
+                    chunk_shape=t["chunk_shape"] or [],
+                    dtype=t["dtype"] or "",
+                )
+                for t in (tensors or [])
+            ]
+            descriptors.append(
+                DataSourceDescriptor(
+                    source_id=source_id,
+                    source_url=source_url or "",
+                    source_type=source_type or "",
+                    tensors=tensor_descs,
+                    metadata_json="",  # lean; filled by GetFlightInfo
+                    data_resident=bool(data_resident),
+                )
+            )
+        return descriptors, total
 
     def sync_source_removed(self, source_id: str) -> None:
         """Remove a source from the metadata database.

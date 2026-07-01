@@ -368,6 +368,89 @@ class TestPerTensorCatalog:
         assert by_id["hcs"][1]["shape"] == [8, 256, 256]  # full struct, not projection
 
 
+class TestListSourceDescriptors:
+    """Rebuild lean ListFlights descriptors from the catalog (biopb/biopb#265)."""
+
+    def test_reconstructs_lean_descriptor(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
+        )
+
+        descriptors, total = db.list_source_descriptors()
+        assert total == 1
+        assert len(descriptors) == 1
+        d = descriptors[0]
+        assert d.source_id == "s1"
+        assert d.source_url == "/data/s1.zarr"
+        assert d.source_type == "zarr"
+        assert d.data_resident is True
+        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
+        assert len(d.tensors) == 1
+        assert d.tensors[0].array_id == "s1"
+        assert list(d.tensors[0].shape) == [8, 512, 512]
+        assert d.tensors[0].dtype == "uint16"
+
+    def test_multi_tensor_all_reconstructed(self):
+        db = MetadataDatabase()
+        fields = [
+            {
+                "array_id": "hcs/A1/0",
+                "dim_labels": ["y", "x"],
+                "shape": [512, 512],
+                "chunk_shape": [512, 512],
+                "dtype": "uint16",
+            },
+            {
+                "array_id": "hcs/A2/0",
+                "dim_labels": ["z", "y", "x"],
+                "shape": [8, 256, 256],
+                "chunk_shape": [1, 256, 256],
+                "dtype": "uint8",
+            },
+        ]
+        db.sync_source_added(
+            "hcs", MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", fields)
+        )
+
+        descriptors, _ = db.list_source_descriptors()
+        tensors = descriptors[0].tensors
+        assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
+        assert list(tensors[1].dim_labels) == ["z", "y", "x"]
+        assert list(tensors[1].shape) == [8, 256, 256]
+        assert list(tensors[1].chunk_shape) == [1, 256, 256]
+        assert tensors[1].dtype == "uint8"
+
+    def test_ordered_by_source_id(self):
+        db = MetadataDatabase()
+        for sid in ("c", "a", "b"):
+            db.sync_source_added(
+                sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
+            )
+        descriptors, _ = db.list_source_descriptors()
+        assert [d.source_id for d in descriptors] == ["a", "b", "c"]
+
+    def test_limit_clips_and_total_reflects_full_count(self):
+        db = MetadataDatabase()
+        for sid in ("a", "b", "c"):
+            db.sync_source_added(
+                sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
+            )
+        descriptors, total = db.list_source_descriptors(limit=2)
+        assert total == 3
+        assert [d.source_id for d in descriptors] == ["a", "b"]
+
+    def test_unresolved_source_has_no_tensors(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "u",
+            MultiTensorAdapter("u", "s3://b/x.zarr", "zarr", [], data_resident=False),
+        )
+        descriptors, _ = db.list_source_descriptors()
+        assert len(descriptors[0].tensors) == 0
+        assert descriptors[0].data_resident is False
+
+
 class TestQueryHandling:
     """Test SQL query handling."""
 
