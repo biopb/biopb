@@ -742,22 +742,35 @@ function Start-DataServer {
     } catch { }
 
     if ($health -ne "SERVING") {
-        Report-Warn "Data server did not come up cleanly"
-        Report-Detail "it may still be scanning a large folder, or failed to start:"
+        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
+        # folder scan: the server reaches SERVING as soon as it binds and scans in
+        # the background, so a big folder no longer holds it out of SERVING. Not
+        # SERVING after 60s therefore points to a real startup failure (crash,
+        # port already in use, or a wedged bind), not a slow scan.
+        Report-Warn "Data server did not reach SERVING within 60s"
+        Report-Detail "it likely failed to start or is wedged (a slow folder scan no"
+        Report-Detail "longer blocks SERVING, so this is not just still scanning):"
         Show-LogTail -LogFile $logFile
         Report-Detail "full log: $logFile"
+        Report-Detail "recheck once with: biopb server status --wait 30"
         return
     }
 
     if ((-not $count) -or ($count -eq 0)) {
-        Report-Warn "Data server is running but found no data sources"
-        Report-Detail "check that your data folder holds supported images (see config):"
+        # SERVING no longer implies a complete catalog: the folder scan runs in
+        # the background and registers sources as it walks. status --wait returns
+        # at the first SERVING, which is normally *before* the scan has indexed
+        # anything -- so 0 sources here usually just means "scan not finished
+        # yet," not "empty folder." The count climbs on its own shortly after.
+        Report-Info "Data server is up; catalog is still building in the background"
+        Report-Detail "no sources indexed yet - normal right after a (re)start"
+        Report-Detail "recheck in a moment: biopb server status"
+        Report-Detail "if it stays at 0, confirm the data folder holds supported images:"
         Report-Cmd "$ConfigFile"
-        Show-LogTail -LogFile $logFile
         return
     }
 
-    Report-Ok "Data server ready - $count data source(s) found; pre-caching overviews"
+    Report-Ok "Data server ready - $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
 # ============================================================================
