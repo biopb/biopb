@@ -282,12 +282,30 @@ class SourceManager:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan: re-list monitored upstreams, then walk dirs."""
+        """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
+
+        Local directory sources are discovered *before* the tensor-server upstream
+        re-list so a slow/large upstream (hundreds of mirrored sources, each a
+        network round-trip) cannot delay the local catalog from appearing: the
+        local walk streams its sources first and the upstream mirror fills in
+        behind it on the same tick. (biopb/biopb#178 introduced the re-list; this
+        ordering keeps it off the local catalog's critical path -- previously the
+        re-list ran first, so on the boot tick local sources surfaced only after
+        every upstream source had been registered, minutes later.)
+        """
+        self._rescan_monitored_dirs()
         # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
         # cadence -- fast (every tick) while changing/failing, backing off toward
-        # full_rescan_interval while a source set stays stable.
+        # full_rescan_interval while a source set stays stable. Runs AFTER the
+        # local walk (see docstring).
         self._reconcile_due_upstreams()
 
+    def _rescan_monitored_dirs(self) -> None:
+        """Walk the monitored directories and reconcile the discovered catalog.
+
+        No-op for an upstream-only config (no monitored dirs); that case's
+        freshness signals + first-scan gate are driven by _reconcile_due_upstreams.
+        """
         if not self._monitored_dirs:
             return
 
