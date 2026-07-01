@@ -7,6 +7,7 @@ import {
   fieldErrors,
   isDeprecated,
   isSecretProfileKey,
+  normalizeConfigForSave,
   primaryType,
   REDACTED_SENTINEL,
   sectionProperties,
@@ -232,6 +233,38 @@ describe("validateConfig", () => {
     expect(errs).toEqual([
       { path: ["credentials", "profiles", 1, "name"], message: "name is required" },
     ]);
+  });
+});
+
+describe("normalizeConfigForSave", () => {
+  it("moves a path-only source to url and drops the deprecated key", () => {
+    const out = normalizeConfigForSave({ sources: [{ path: "/legacy" }] });
+    expect(out).toEqual({ sources: [{ url: "/legacy" }] });
+  });
+
+  it("keeps an existing url and just drops a redundant path", () => {
+    const out = normalizeConfigForSave({
+      sources: [{ url: "/data", path: "/old", monitor: true }],
+    });
+    expect(out).toEqual({ sources: [{ url: "/data", monitor: true }] });
+  });
+
+  it("leaves sources without a path untouched (same reference)", () => {
+    const cfg = { server: { port: 1 }, sources: [{ url: "/data" }] };
+    expect(normalizeConfigForSave(cfg)).toBe(cfg);
+  });
+
+  it("is null-safe and ignores a non-array sources", () => {
+    expect(normalizeConfigForSave(null)).toBeNull();
+    const cfg = { sources: "nope" };
+    expect(normalizeConfigForSave(cfg)).toBe(cfg);
+  });
+
+  it("produces a config the required-url schema check would accept", () => {
+    const normalized = normalizeConfigForSave({ sources: [{ path: "/legacy" }] });
+    expect(validateConfig(normalized as Record<string, unknown>, SCHEMA)).toEqual(
+      [],
+    );
   });
 });
 

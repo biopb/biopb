@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import {
   TensorApiError,
+  normalizeConfigForSave,
   splitConfigErrors,
   validateConfig,
 } from "@biopb/tensor-flight-client";
@@ -160,9 +161,14 @@ export function AdminPage() {
     setSaveError(null);
     setServerErrors([]);
     setServerGeneral([]);
+    // Resolve deprecated aliases the runtime tolerates but the server's schema
+    // validation rejects (source `path` -> `url`) before PUT, and reflect the
+    // migration in the editor so the deprecated field clears on success.
+    const payload = normalizeConfigForSave(config) as Config;
     try {
-      await client.http.putAdminConfig(config);
+      await client.http.putAdminConfig(payload);
       if (!mounted.current) return;
+      setConfig(payload);
       setSaved(true);
       setDirty(false);
     } catch (err) {

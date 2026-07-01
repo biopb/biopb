@@ -255,6 +255,34 @@ export function validateConfig(
   return out;
 }
 
+/**
+ * Migrate deprecated keys the *runtime* parser accepts but the published JSON
+ * Schema does not, so a save the server would 422 is normalized first. Today
+ * that is the source `path` alias: the parser reads `url or path`, but the
+ * schema marks source items `required: ["url"]`, so a `path`-only source must be
+ * rewritten to `url` before `PUT /api/config`. Returns the same object when
+ * nothing needed changing (referentially stable).
+ */
+export function normalizeConfigForSave(
+  config: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null | undefined {
+  if (!config) return config;
+  const sources = config.sources;
+  if (!Array.isArray(sources)) return config;
+  let touched = false;
+  const nextSources = sources.map((s) => {
+    if (s == null || typeof s !== "object" || Array.isArray(s)) return s;
+    const obj = s as Record<string, unknown>;
+    if (!("path" in obj)) return s;
+    touched = true;
+    const next = { ...obj };
+    if (isBlank(next.url) && !isBlank(next.path)) next.url = next.path;
+    delete next.path; // resolved into `url`; the deprecated alias is dropped
+    return next;
+  });
+  return touched ? { ...config, sources: nextSources } : config;
+}
+
 /** Messages whose path exactly equals `path` (string-compared element-wise). */
 export function fieldErrors(
   errors: ConfigError[],
