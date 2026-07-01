@@ -255,6 +255,26 @@ persistent status read-out lives in the topbar `status-pill`, extending its
 existing `idle|connecting|connected|error` vocabulary with `scanning` and
 `restarting`.
 
+> **Implemented (biopb/biopb#245).** The structured advanced sections
+> (`AdvancedSections.tsx`) render one collapsible pane per schema section
+> (`server`/`compute`/`cache`/`pyramid`/`precache`/`metadata_db`), each field a
+> schema-driven control (checkbox / enum `select` / bounded number / text) with
+> its `description` as helper text; the raw-JSON modal stays as an escape hatch.
+> Inline validation (`validateConfig()` in `@biopb/tensor-flight-client`,
+> unit-tested) mirrors the server's `PUT` checks — hard enum, numeric bounds,
+> required `url` — leaving the case-insensitive enums lenient (helper-text only),
+> disables **Save** while any field errors exist, and force-opens any section
+> holding an error. Deprecated keys (`watcher_type`, `poll_interval`, source
+> `path`, `metadata_db.enabled`, the pyramid knobs under `[precache]`) render
+> with a "deprecated" tag + canonical-key hint only when already present, and are
+> never offered fresh. A **not-running** `/api/admin/status` (`running: false`)
+> shows a degraded banner and relabels **Restart → Start**. A separate
+> **`CredentialsEditor.tsx`** handles the nested `credentials.profiles` array
+> (the home for `credentials_profile` targets): a profiles list + `default_profile`
+> picker, `name` required inline, and `key`/`secret`/`token` as password fields
+> seeded with the `REDACTED_SENTINEL` so an untouched secret round-trips and is
+> preserved by `restore_redacted_secrets` on `PUT`.
+
 ### Sources editor (the headline)
 
 A list of source rows, each showing **type · url · `source_id`/`alias` · monitor**

@@ -176,7 +176,83 @@ html, body {
 .source-row-remove:hover { color: #fca5a5; }
 .source-row-errors { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fca5a5; font-size: 12px; }
 
-.admin-advanced-row { display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap; }
+.admin-banner.degraded { background: #422006; color: #fcd34d; border: 1px solid #b45309; }
+
+/* Structured "advanced" sections (schema-driven per-field editors). */
+.advanced-sections { display: flex; flex-direction: column; gap: 0.5rem; }
+.advanced-sections-head {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.advanced-sections-head h2 { font-size: 14px; margin: 0; }
+.adv-section { border: 1px solid #2d3748; border-radius: 8px; background: #141820; }
+.adv-section.has-error { border-color: #dc2626; }
+.adv-section-header {
+  display: flex; align-items: center; gap: 0.6rem; width: 100%;
+  background: none; border: none; cursor: pointer; color: #e2e8f0;
+  font-size: 13px; padding: 0.65rem 0.85rem; text-align: left;
+}
+.adv-caret { color: #64748b; width: 0.9em; }
+.adv-section-title { font-weight: 500; }
+.adv-section-hint { color: #64748b; font-size: 11px; flex: 1; }
+.adv-section-errdot {
+  width: 8px; height: 8px; border-radius: 999px; background: #dc2626;
+}
+.adv-section-body {
+  border-top: 1px solid #2d3748; padding: 0.85rem;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.85rem;
+}
+.adv-field { display: flex; flex-direction: column; gap: 0.25rem; }
+.adv-field-label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 11px; color: #94a3b8; }
+.adv-field-name { display: flex; align-items: center; gap: 0.4rem; }
+.adv-field-name code { color: #cbd5e1; font-size: 12px; }
+.adv-field-label input[type="text"], .adv-field-label input[type="number"], .adv-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
+}
+.adv-field-label input.invalid, .adv-field-label select.invalid { border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626; }
+.adv-field-help { margin: 0; font-size: 11px; color: #64748b; }
+.adv-field-error { margin: 0; font-size: 11px; color: #fca5a5; }
+.deprecated-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
+  background: #422006; color: #fcd34d; border-radius: 4px; padding: 1px 5px;
+}
+.source-row-deprecated {
+  grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.25rem;
+  font-size: 11px; color: #94a3b8;
+}
+.source-row-deprecated input[type="text"] {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
+}
+.source-row-deprecated .adv-field-help code { color: #cbd5e1; }
+
+/* Credentials editor (nested profiles array with masked secrets). */
+.creds-body { display: flex !important; flex-direction: column; gap: 0.85rem; }
+.creds-default { max-width: 260px; }
+.creds-default .adv-field-label select {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem;
+}
+.creds-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+.creds-row {
+  position: relative; background: #0f1117; border: 1px solid #2d3748;
+  border-radius: 8px; padding: 0.75rem 2.25rem 0.75rem 0.85rem;
+}
+.creds-row-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.6rem 0.85rem;
+}
+.creds-row .adv-field-label input, .creds-row .adv-field-label select {
+  background: #141820; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 13px; padding: 0.4rem 0.55rem; width: 100%; box-sizing: border-box;
+}
+.creds-row .adv-field-label input.invalid, .creds-row .adv-field-label select.invalid {
+  border-color: #dc2626; box-shadow: 0 0 0 1px #dc2626;
+}
+.secret-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em;
+  background: #1e3a5f; color: #93c5fd; border-radius: 4px; padding: 1px 5px;
+}
+
 .admin-raw {
   width: 100%; min-height: 320px; margin: 0 0 1rem; box-sizing: border-box;
   background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
@@ -188,6 +264,7 @@ html, body {
 .admin-actions { display: flex; align-items: center; gap: 0.85rem; }
 .admin-actions .submit-btn { width: auto; padding: 0.5rem 1.4rem; }
 .admin-hint { font-size: 12px; color: #94a3b8; }
+.admin-hint.error { color: #fca5a5; }
 
 .admin-modal-backdrop {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);

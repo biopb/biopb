@@ -1,9 +1,19 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
-import { TensorApiError, splitConfigErrors } from "@biopb/tensor-flight-client";
-import type { AdminConfigError, AdminStatus } from "@biopb/tensor-flight-client";
+import {
+  TensorApiError,
+  splitConfigErrors,
+  validateConfig,
+} from "@biopb/tensor-flight-client";
+import type {
+  AdminConfigError,
+  AdminStatus,
+  ConfigSchema,
+} from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
+import { AdvancedSections } from "../components/AdvancedSections";
+import { CredentialsEditor } from "../components/CredentialsEditor";
 import { Modal } from "../components/Modal";
 import { AdvancedJsonModal } from "../components/AdvancedJsonModal";
 
@@ -33,6 +43,7 @@ export function AdminPage() {
   const clearSession = useAppStore((s) => s.clearSession);
 
   const [config, setConfig] = useState<Config | null>(null);
+  const [schema, setSchema] = useState<ConfigSchema | null>(null);
   const [path, setPath] = useState<string>("");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -41,8 +52,10 @@ export function AdminPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [generalErrors, setGeneralErrors] = useState<string[]>([]);
-  const [errorsByIndex, setErrorsByIndex] = useState<Record<number, string[]>>({});
+  // Server-reported (422) field errors and non-field summary lines. Client-side
+  // pre-flight errors are computed live below and merged for display.
+  const [serverErrors, setServerErrors] = useState<AdminConfigError[]>([]);
+  const [serverGeneral, setServerGeneral] = useState<string[]>([]);
 
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
@@ -66,15 +79,34 @@ export function AdminPage() {
     restartingRef.current = restarting;
   }, [restarting]);
 
-  // The one canonical config object. Both the structured Sources editor and the
-  // Advanced raw-JSON modal commit through here.
+  // The one canonical config object. The Sources editor, the structured
+  // Advanced sections, and the raw-JSON modal all commit through here. Editing
+  // invalidates any stale server-reported errors from a prior save attempt.
   const applyConfig = useCallback((next: Config, markDirty = true) => {
     setConfig(next);
     if (markDirty) {
       setDirty(true);
       setSaved(false);
+      setServerErrors([]);
+      setServerGeneral([]);
     }
   }, []);
+
+  // Live client-side validation mirroring the server's PUT checks (enum / range
+  // / required url), plus any not-yet-cleared server errors from the last save.
+  const clientErrors = useMemo(
+    () => validateConfig(config, schema),
+    [config, schema],
+  );
+  const combinedErrors = useMemo(
+    () => [...clientErrors, ...serverErrors],
+    [clientErrors, serverErrors],
+  );
+  const { byIndex: sourceErrors, general: generalErrors } = useMemo(
+    () => splitConfigErrors(combinedErrors),
+    [combinedErrors],
+  );
+  const hasErrors = combinedErrors.length > 0;
 
   const refreshStatus = useCallback(async () => {
     if (!client) return;
@@ -94,6 +126,7 @@ export function AdminPage() {
         const res = await client.http.getAdminConfig();
         if (cancelled) return;
         setPath(res.path);
+        setSchema(res.schema as ConfigSchema);
         applyConfig(res.config, false);
         setLoadError(null);
       } catch (err) {
@@ -115,10 +148,13 @@ export function AdminPage() {
 
   async function onSave() {
     if (!client || !config) return;
+    // Block save while client-side errors exist; never round-trip a known bad
+    // config just to have the server reject it.
+    if (hasErrors) return;
     setSaving(true);
     setSaveError(null);
-    setGeneralErrors([]);
-    setErrorsByIndex({});
+    setServerErrors([]);
+    setServerGeneral([]);
     try {
       await client.http.putAdminConfig(config);
       if (!mounted.current) return;
@@ -128,9 +164,12 @@ export function AdminPage() {
       if (!mounted.current) return;
       if (err instanceof TensorApiError && err.status === 422) {
         const body = err.detail as { errors?: AdminConfigError[] } | undefined;
-        const { byIndex, general } = splitConfigErrors(body?.errors ?? []);
-        setErrorsByIndex(byIndex);
-        setGeneralErrors(general.length ? general : ["Config failed validation."]);
+        const errs = body?.errors ?? [];
+        setServerErrors(errs);
+        // Anything the splitter can't attribute to a source row is a general
+        // line; keep at least one so a 422 is never silent.
+        const { general } = splitConfigErrors(errs);
+        setServerGeneral(general.length ? general : ["Config failed validation."]);
       } else {
         setSaveError(err instanceof Error ? err.message : String(err));
       }
@@ -192,6 +231,7 @@ export function AdminPage() {
             const res = await client.http.getAdminConfig();
             if (mounted.current) {
               setPath(res.path);
+              setSchema(res.schema as ConfigSchema);
               applyConfig(res.config, false);
             }
           } catch {
@@ -227,24 +267,31 @@ export function AdminPage() {
     );
   }
 
+  // The backend daemon is down when status reports it (the config file is still
+  // editable via the sidecar, but the Flight server isn't serving).
+  const daemonDown = !restarting && !!status && status.running === false;
+  const restartVerb = daemonDown ? "Start" : "Restart";
+
   const pill = restartScanning
     ? { cls: "scanning", text: restartMsg ?? "Scanning…" }
     : restarting
       ? { cls: "restarting", text: restartMsg ?? "Restarting…" }
-      : loadError
-        ? { cls: "error", text: "Error" }
-        : status
-          ? {
-              cls: "connected",
-              text: [
-                `● ${status.health ?? "–"}`,
-                `${status.source_count ?? 0} sources`,
-                formatUptime(status.uptime_seconds),
-              ]
-                .filter(Boolean)
-                .join(" · "),
-            }
-          : { cls: "connecting", text: "Loading…" };
+      : daemonDown
+        ? { cls: "error", text: "● Not running" }
+        : loadError
+          ? { cls: "error", text: "Error" }
+          : status
+            ? {
+                cls: "connected",
+                text: [
+                  `● ${status.health ?? "–"}`,
+                  `${status.source_count ?? 0} sources`,
+                  formatUptime(status.uptime_seconds),
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+              }
+            : { cls: "connecting", text: "Loading…" };
 
   const sources = getSources(config);
 
@@ -261,7 +308,7 @@ export function AdminPage() {
           disabled={restarting || !config}
           onClick={() => setConfirmRestart(true)}
         >
-          Restart
+          {restartVerb}
         </button>
         <Link className="icon-btn" to="/">
           ← Back
@@ -276,6 +323,21 @@ export function AdminPage() {
           <div className="admin-banner error">Could not load config: {loadError}</div>
         )}
 
+        {daemonDown && (
+          <div className="admin-banner degraded">
+            <strong>Server not running.</strong> The Flight server isn't serving
+            (the config file is still editable — Save, then <em>{restartVerb}</em>).
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={restarting}
+              onClick={() => setConfirmRestart(true)}
+            >
+              {restartVerb} now
+            </button>
+          </div>
+        )}
+
         {path && (
           <div className="admin-config-path">
             Editing <code>{path}</code>
@@ -284,9 +346,19 @@ export function AdminPage() {
 
         {generalErrors.length > 0 && (
           <div className="admin-banner error">
-            <strong>Config not saved — fix these:</strong>
+            <strong>Fix these before saving:</strong>
             <ul>
               {generalErrors.map((m, i) => (
+                <li key={i}>{m}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {serverGeneral.length > 0 && generalErrors.length === 0 && (
+          <div className="admin-banner error">
+            <strong>Config not saved — fix these:</strong>
+            <ul>
+              {serverGeneral.map((m, i) => (
                 <li key={i}>{m}</li>
               ))}
             </ul>
@@ -295,14 +367,14 @@ export function AdminPage() {
 
         {saved && (
           <div className="admin-banner saved">
-            Saved — restart required to apply.
+            Saved — {restartVerb.toLowerCase()} required to apply.
             <button
               type="button"
               className="icon-btn"
               disabled={restarting}
               onClick={() => setConfirmRestart(true)}
             >
-              Restart now
+              {restartVerb} now
             </button>
           </div>
         )}
@@ -312,37 +384,47 @@ export function AdminPage() {
             <SourcesEditor
               sources={sources}
               onChange={onSourcesChange}
-              errorsByIndex={errorsByIndex}
+              errorsByIndex={sourceErrors}
               disabled={restarting}
             />
 
-            <div className="admin-advanced-row">
-              <button
-                type="button"
-                className="icon-btn"
-                disabled={restarting}
-                onClick={() => setAdvancedOpen(true)}
-              >
-                Advanced — edit raw config…
-              </button>
-              <span className="admin-hint">
-                Server, cache &amp; pyramid knobs, and any advanced keys.
-              </span>
-            </div>
+            <AdvancedSections
+              config={config}
+              schema={schema}
+              errors={combinedErrors}
+              disabled={restarting}
+              onChange={applyConfig}
+              onEditRaw={() => setAdvancedOpen(true)}
+            />
+
+            <CredentialsEditor
+              config={config}
+              schema={schema}
+              errors={combinedErrors}
+              disabled={restarting}
+              onChange={applyConfig}
+            />
 
             <div className="admin-actions">
               <button
                 type="button"
                 className="submit-btn"
-                disabled={!dirty || saving || restarting}
+                disabled={!dirty || saving || restarting || hasErrors}
                 onClick={onSave}
               >
                 {saving ? "Saving…" : "Save"}
               </button>
-              {dirty && !saved && (
-                <span className="admin-hint">
-                  Unsaved changes — restart required to apply.
+              {hasErrors ? (
+                <span className="admin-hint error">
+                  Fix the highlighted fields to enable Save.
                 </span>
+              ) : (
+                dirty &&
+                !saved && (
+                  <span className="admin-hint">
+                    Unsaved changes — {restartVerb.toLowerCase()} required to apply.
+                  </span>
+                )
               )}
             </div>
           </>
@@ -351,21 +433,21 @@ export function AdminPage() {
 
       {confirmRestart && (
         <Modal
-          title="Restart the server?"
+          title={daemonDown ? "Start the server?" : "Restart the server?"}
           onClose={() => setConfirmRestart(false)}
           labelId="admin-restart-title"
         >
           <p>
-            Restart interrupts the shared live session: connected clients (the
-            napari/MCP kernel, browser viewers, in-flight analyses) drop while the
-            daemon bounces.
+            {daemonDown
+              ? "Start the tensor server daemon with the current config on disk."
+              : "Restart interrupts the shared live session: connected clients (the napari/MCP kernel, browser viewers, in-flight analyses) drop while the daemon bounces."}
           </p>
           <div className="admin-modal-actions">
             <button type="button" className="icon-btn" onClick={() => setConfirmRestart(false)}>
               Cancel
             </button>
             <button type="button" className="submit-btn" onClick={doRestart}>
-              Restart
+              {restartVerb}
             </button>
           </div>
         </Modal>
@@ -388,7 +470,7 @@ export function AdminPage() {
       )}
       {restartError && (
         <div className="error-toast">
-          <strong>Restart</strong>
+          <strong>{restartVerb}</strong>
           <br />
           {restartError}
         </div>

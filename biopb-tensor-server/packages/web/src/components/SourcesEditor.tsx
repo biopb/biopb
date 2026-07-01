@@ -184,6 +184,26 @@ export function SourcesEditor({
                     />
                     Monitor for changes
                   </label>
+
+                  {"path" in s && (
+                    <label className="source-row-deprecated">
+                      <span className="adv-field-name">
+                        path <span className="deprecated-tag">deprecated</span>
+                      </span>
+                      <input
+                        type="text"
+                        value={str(s.path)}
+                        disabled={disabled}
+                        onChange={(e) =>
+                          update(i, { path: e.target.value || undefined })
+                        }
+                      />
+                      <span className="adv-field-help">
+                        Deprecated alias for <code>url</code> — set the URL field
+                        above and clear this.
+                      </span>
+                    </label>
+                  )}
                 </div>
 
                 <button
