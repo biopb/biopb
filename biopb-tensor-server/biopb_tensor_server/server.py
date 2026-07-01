@@ -914,12 +914,74 @@ class TensorFlightServer(flight.FlightServerBase):
         Results are capped at `max_list_flights_results` for safety. Truncation
         is signaled via schema metadata on all returned FlightInfos.
 
+        Served from the DuckDB catalog when a metadata DB is present, so the
+        browse surface cannot drift from ``query_sources`` (biopb/biopb#265); an
+        embedded/test server built without a DB (``metadata_db=None``) falls back
+        to iterating adapters.
+
         Args:
             context: Server call context
             criteria: Unused criteria bytes
 
         Yields:
             FlightInfo for each registered data source (up to max_list_flights_results)
+        """
+        if self._metadata_db is not None:
+            yield from self._list_flights_from_catalog()
+        else:
+            yield from self._list_flights_from_adapters()
+
+    def _list_flights_from_catalog(self) -> Iterator[flight.FlightInfo]:
+        """Build ListFlights results from the DuckDB catalog (the default path).
+
+        One SQL read replaces the per-adapter ``get_source_descriptor()`` calls.
+        Token-protected sources never appear here: the only ones that exist live
+        in the embedded image-base server, which runs with ``metadata_db=None``
+        and therefore takes the adapter fallback instead -- so the DuckDB path
+        has no tokened source to leak (biopb/biopb#265).
+        """
+        max_sources = self._max_list_flights_results
+        descriptors, total_sources = self._metadata_db.list_source_descriptors(
+            limit=max_sources
+        )
+        returned_count = len(descriptors)
+        truncated = total_sources > returned_count
+
+        if truncated:
+            logger.warning(
+                f"list_flights truncated: returning {returned_count} of {total_sources} sources"
+            )
+
+        base_metadata = {
+            b"total_sources": str(total_sources).encode(),
+            b"max_sources": str(max_sources).encode(),
+            b"returned_sources": str(returned_count).encode(),
+            b"truncated": str(truncated).encode(),
+        }
+
+        for source_desc in descriptors:
+            schema = pa.schema([], metadata=base_metadata)
+            flight_descriptor = flight.FlightDescriptor.for_command(
+                source_desc.SerializeToString()
+            )
+            endpoint = flight.FlightEndpoint(
+                ticket=flight.Ticket(b""),  # Empty ticket for listing
+                locations=[],
+            )
+            yield flight.FlightInfo(
+                schema=schema,
+                descriptor=flight_descriptor,
+                endpoints=[endpoint],
+                total_records=-1,
+                total_bytes=-1,
+            )
+
+    def _list_flights_from_adapters(self) -> Iterator[flight.FlightInfo]:
+        """List sources by iterating adapters (fallback when no metadata DB).
+
+        Used by embedded/test servers built with ``metadata_db=None`` (e.g. the
+        image-base result-cache server). Honors per-source capability tokens by
+        skipping token-protected sources from enumeration.
         """
         source_items = self._get_sources_snapshot()
         total_sources = len(source_items)
@@ -1436,6 +1498,21 @@ class TensorFlightServer(flight.FlightServerBase):
             )
 
             self.register_source(source_id, adapter)
+            # File-backed uploads are durable (a real .zarr on disk), so add them
+            # to the catalog to be discoverable via list_sources/query_sources.
+            # Cache-backed uploads (the `cache:` branch above) are intentionally
+            # NOT synced: they are volatile and have no removal hook, so a row
+            # would dangle after eviction -- they stay readable by their returned
+            # id but are not enumerable (biopb/biopb#265). Best-effort: a catalog
+            # write must not fail the upload (the source is already usable by id).
+            if self._metadata_db is not None:
+                try:
+                    self._metadata_db.sync_source_added(source_id, adapter)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to sync uploaded source {source_id} to catalog "
+                        f"(readable by id, not listed): {e}"
+                    )
             self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")

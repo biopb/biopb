@@ -426,6 +426,65 @@ class TestServerDoPutHandler:
             zarr_dirs = list(Path(tmpdir).glob("*.zarr"))
             assert len(zarr_dirs) == 1
 
+    def test_ome_zarr_upload_synced_to_catalog(self):
+        """File-backed (durable) uploads are added to the catalog so they are
+        discoverable via list_sources/query_sources (biopb/biopb#265)."""
+        from biopb_tensor_server.metadata_db import MetadataDatabase
+        from biopb_tensor_server.server import TensorFlightServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = MetadataDatabase()
+            server = TensorFlightServer(
+                location="grpc://localhost:0",
+                writable=True,
+                write_dir=Path(tmpdir),
+                metadata_db=db,
+            )
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:persist",
+                shape=[64, 64],
+                dtype="uint8",
+                chunk_shape=[32, 32],
+                dim_labels=["y", "x"],
+            )
+            writer = MockMetadataWriter()
+            server._handle_create_source(req_desc, writer)
+            response_desc = TensorDescriptor()
+            response_desc.ParseFromString(writer.metadata)
+
+            # The durable upload appears in the catalog.
+            descriptors, _ = db.list_source_descriptors()
+            assert response_desc.array_id in {d.source_id for d in descriptors}
+
+    def test_cache_upload_not_synced_but_readable_by_id(self):
+        """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
+        the row would dangle), but stay readable by their returned id."""
+        from biopb_tensor_server.metadata_db import MetadataDatabase
+        from biopb_tensor_server.server import TensorFlightServer
+
+        db = MetadataDatabase()
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, metadata_db=db
+        )
+        req_desc = TensorDescriptor(
+            array_id="cache:ephemeral",
+            shape=[64, 64],
+            dtype="uint8",
+            chunk_shape=[32, 32],
+        )
+        writer = MockMetadataWriter()
+        server._handle_create_source(req_desc, writer)
+        response_desc = TensorDescriptor()
+        response_desc.ParseFromString(writer.metadata)
+
+        # Not enumerable via the catalog...
+        descriptors, _ = db.list_source_descriptors()
+        assert response_desc.array_id not in {d.source_id for d in descriptors}
+        # ...but still registered and readable by its returned id.
+        assert isinstance(
+            server._sources.get(response_desc.array_id), CachedSourceAdapter
+        )
+
     def test_create_source_invalid_prefix(self):
         """Invalid array_id prefix raises error."""
         from biopb_tensor_server.server import TensorFlightServer
