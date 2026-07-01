@@ -1031,6 +1031,110 @@ def cache_stats(
     _render_cache_stats(stats)
 
 
+@server_app.command("migrate-config")
+def migrate_config(
+    config: Path = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Config file (or dir) to migrate; defaults to ~/.config/biopb",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Report what would happen; write nothing"
+    ),
+):
+    """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
+
+    JSON is the canonical on-disk format (biopb/biopb#34); TOML stays readable
+    through a deprecation window. This converts a legacy TOML config in place --
+    reading the raw table (so advanced/unknown keys survive) and writing the
+    sibling ``biopb.json`` (plus its schema sidecar), then backing the old TOML
+    up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running
+    server need not be restarted.
+    """
+    from ._config_location import (
+        CANONICAL_CONFIG_NAME,
+        DEFAULT_CONFIG_DIR,
+        LEGACY_CONFIG_NAME,
+    )
+
+    # Resolve the config directory. --config may point at a file (use its parent)
+    # or a directory; with nothing given, use the standard location.
+    if config is None:
+        config_dir = DEFAULT_CONFIG_DIR
+    elif config.is_dir():
+        config_dir = config
+    else:
+        config_dir = config.parent
+
+    toml_path = config_dir / LEGACY_CONFIG_NAME
+    json_path = config_dir / CANONICAL_CONFIG_NAME
+
+    if not toml_path.exists():
+        if json_path.exists():
+            console.print(
+                f"[green]Already canonical:[/green] {json_path} is JSON; "
+                "nothing to migrate."
+            )
+        else:
+            console.print(
+                f"[yellow]No legacy config found[/yellow] at {toml_path} "
+                "(and no JSON either); nothing to migrate."
+            )
+        raise typer.Exit(0)
+
+    # A legacy TOML exists. If a JSON also exists it already shadows the TOML
+    # (find_config prefers JSON), so we must NOT overwrite it from the TOML --
+    # just retire the stale TOML to clear the both-files shadow warning.
+    if json_path.exists():
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(
+            f"[yellow]Both configs present:[/yellow] {json_path} is already "
+            f"canonical and in use; the legacy {toml_path.name} is ignored."
+        )
+        if dry_run:
+            console.print(f"  [dim](dry run)[/dim] would back it up to {backup.name}")
+            raise typer.Exit(0)
+        toml_path.replace(backup)
+        console.print(f"  Retired the legacy TOML -> {backup.name}")
+        raise typer.Exit(0)
+
+    # The migration case: TOML only. Read the raw table and write canonical JSON.
+    try:
+        from biopb_tensor_server.config import _read_config_file, save_config
+    except Exception as exc:  # noqa: BLE001 - optional dependency
+        console.print(
+            "[red]Config migration is unavailable:[/red] "
+            f"{exc}\n"
+            r"[yellow]Install it with: pip install 'biopb\[tensor]'[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        data = _read_config_file(toml_path)
+    except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
+        console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(f"[cyan](dry run)[/cyan] would migrate {toml_path}")
+        console.print(f"  write  {json_path} (+ schema sidecar)")
+        console.print(f"  backup {toml_path.name} -> {backup.name}")
+        raise typer.Exit(0)
+
+    try:
+        written = save_config(data, toml_path)
+    except Exception as exc:  # noqa: BLE001 - write must surface, not crash
+        console.print(f"[red]Failed to write {json_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Migrated[/green] {toml_path} -> {written} "
+        f"(old file backed up to {toml_path.name}.bak)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # biopb-mcp daemon management (`biopb mcp ...`)
 #
