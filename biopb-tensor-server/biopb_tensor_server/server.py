@@ -1218,8 +1218,18 @@ class TensorFlightServer(flight.FlightServerBase):
                 # NULL row (empty metadata, or an unresolved source whose real row
                 # isn't written yet), unparseable JSON, or a catalog read error
                 # (it parses and degrades internally, never raising).
+                #
+                # Escape hatch: the catalog row is source-level, so read it only
+                # when the source's metadata covers every tensor. HCS plates hold
+                # per-field metadata (the row is the plate .zattrs, not a field's
+                # OME metadata), so they fall through to the per-tensor adapter --
+                # preserving the field-level answer (biopb/biopb#253).
                 raw_metadata = None
-                if self._metadata_db is not None:
+                if (
+                    self._metadata_db is not None
+                    and source_adapter is not None
+                    and source_adapter.metadata_covers_all_tensors()
+                ):
                     raw_metadata = self._metadata_db.get_metadata_json(source_id)
                 if raw_metadata is None:
                     raw_metadata = tensor_adapter.get_metadata()

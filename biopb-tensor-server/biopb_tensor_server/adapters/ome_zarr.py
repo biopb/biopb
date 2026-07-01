@@ -655,6 +655,14 @@ class OmeZarrAdapter(ZarrAdapter):
         """Return OME-Zarr .zattrs content directly."""
         return self.ome_metadata
 
+    def metadata_covers_all_tensors(self) -> bool:
+        """False for an HCS plate: the source row's metadata is the *plate*
+        ``.zattrs`` (rows/columns/wells layout), not any individual field's OME
+        metadata, so the serve path must read per-field metadata from the adapter
+        rather than the catalog (biopb/biopb#253). A regular multiscale image's
+        metadata does cover its (single) tensor."""
+        return not self._is_hcs_plate
+
     def get_physical_scale(self, tensor_id=None):
         """Per-dim physical pixel size + unit from the multiscales transforms.
 

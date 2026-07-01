@@ -226,6 +226,19 @@ class SourceAdapter(ABC):
         Will be serialized to metadata_json in TensorDescriptor.
         """
 
+    def metadata_covers_all_tensors(self) -> bool:
+        """Whether ``get_metadata()`` applies to *every* tensor of this source.
+
+        When True (the default), the catalog's source-level ``metadata_json`` is a
+        valid serve answer for any tensor, so ``GetFlightInfo(with_metadata)`` may
+        read it from the catalog instead of recomputing on the adapter
+        (biopb/biopb#253). Override to False when metadata is genuinely per-tensor
+        (OME-Zarr HCS plates: the source row holds the *plate* ``.zattrs``, which
+        is not any individual field's OME metadata) so the serve path falls back
+        to the per-tensor ``get_metadata()`` for correctness.
+        """
+        return True
+
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
 
