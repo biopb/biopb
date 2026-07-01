@@ -1419,20 +1419,22 @@ class SourceManager:
         for source_id in sorted(removed):
             self._commit_remove_source(source_id)
 
+        def _row_to_seed(row):
+            """(tensors, metadata, data_resident) for seed_catalog, or None."""
+            if row is None:
+                return None
+            raw = row.get("metadata_json")
+            try:
+                metadata = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                metadata = {}
+            return (row.get("tensors") or [], metadata, bool(row.get("data_resident")))
+
         extra_config = {}
         if upstream.credentials_profile:
             extra_config["credentials_profile"] = upstream.credentials_profile
         for source_id in sorted(added):
             up_id = desired[source_id]
-            catalog_seed = None
-            row = seed_by_up_id.get(up_id)
-            if row is not None:
-                raw = row.get("metadata_json")
-                try:
-                    metadata = json.loads(raw) if raw else {}
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    metadata = {}
-                catalog_seed = (row.get("tensors") or [], metadata)
             self._commit_add_claim(
                 SourceClaim(
                     source_type="tensor-server",
@@ -1440,8 +1442,31 @@ class SourceManager:
                     source_id=source_id,
                     extra_config=dict(extra_config),
                 ),
-                catalog_seed=catalog_seed,
+                catalog_seed=_row_to_seed(seed_by_up_id.get(up_id)),
             )
+
+        # Refresh already-mirrored sources from the same bulk result, so an
+        # in-place upstream change -- notably unresolved -> resolved (empty ->
+        # populated tensors, data_resident false -> true) -- is reflected on the
+        # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
+        # DuckDB row only when the seed actually changed, so a steady re-list does
+        # not churn indexed_at.
+        for source_id in sorted(current & set(desired)):
+            seed = _row_to_seed(seed_by_up_id.get(desired[source_id]))
+            if seed is None:
+                continue
+            adapter = self._server._get_source_adapter(source_id)
+            if adapter is None or not hasattr(adapter, "seed_catalog"):
+                continue
+            if adapter.seed_catalog(*seed) and self._metadata_db is not None:
+                try:
+                    self._metadata_db.sync_source_added(source_id, adapter)
+                except Exception:
+                    logger.warning(
+                        "failed to refresh mirrored catalog row for %s",
+                        source_id,
+                        exc_info=True,
+                    )
 
         if added or removed:
             logger.info(
@@ -1624,10 +1649,11 @@ class SourceManager:
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
 
-        ``catalog_seed`` (biopb/biopb#266) is an optional ``(tensors, metadata)``
-        pair from a bulk upstream ``query_sources``; when the adapter supports it
-        (the remote proxy), it is applied before ``sync_source_added`` so
-        registration needs no per-source upstream RPC.
+        ``catalog_seed`` (biopb/biopb#266) is an optional
+        ``(tensors, metadata, data_resident)`` tuple from a bulk upstream
+        ``query_sources``; when the adapter supports it (the remote proxy), it is
+        applied before ``sync_source_added`` so registration needs no per-source
+        upstream RPC.
         """
         try:
             source_config = SourceConfig(
@@ -1670,8 +1696,8 @@ class SourceManager:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata = catalog_seed
-                    adapter.seed_catalog(tensors, metadata)
+                    tensors, metadata, data_resident = catalog_seed
+                    adapter.seed_catalog(tensors, metadata, data_resident)
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
