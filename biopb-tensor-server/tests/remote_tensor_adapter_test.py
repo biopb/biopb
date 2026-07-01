@@ -995,3 +995,297 @@ def test_inherited_segment_cache(simple_zarr_array, tmp_path):
         cache_manager.close()
     finally:
         upstream.shutdown()
+
+
+# --- bulk-seed the mirror catalog (biopb/biopb#266-A) ------------------------
+
+
+def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
+    """A seeded proxy answers list_tensor_descriptors/get_metadata from the seed,
+    localizing array_ids, without ever dialing the upstream."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    adapter.seed_catalog(
+        [
+            {
+                "array_id": "img",  # upstream id -> localized to lab__img
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "chunk_shape": [4, 4],
+                "dtype": "uint8",
+            },
+            {
+                "array_id": "img/A2",  # multi-field: seeded too (live path can't)
+                "dim_labels": ["y", "x"],
+                "shape": [2, 2],
+                "chunk_shape": [2, 2],
+                "dtype": "uint16",
+            },
+        ],
+        {"ome": "meta"},
+    )
+
+    descs = adapter.list_tensor_descriptors()
+    assert [d.array_id for d in descs] == ["lab__img", "lab__img/A2"]
+    assert list(descs[0].shape) == [4, 4]
+    assert descs[1].dtype == "uint16"
+    assert adapter.get_metadata() == {"ome": "meta"}
+    # the whole point: no upstream RPC was made
+    assert adapter._client is None
+
+
+def test_seed_catalog_empty_metadata_normalizes_to_dict():
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__u",
+        upstream_location="grpc://localhost:1",
+        upstream_source_id="u",
+    )
+    adapter.seed_catalog([], None)  # unresolved upstream source: no tensors
+    assert adapter.list_tensor_descriptors() == []
+    assert adapter.get_metadata() == {}
+    assert adapter._client is None
+
+
+def test_fetch_upstream_catalog_returns_rows_and_complete():
+    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+
+    class _FakeClient:
+        _location = "grpc://fake"
+
+        def query_sources(self, sql, format="records"):
+            assert "tensors" in sql and format == "records"
+            return [{"source_id": "a", "tensors": [], "metadata_json": None}]
+
+    rows, complete = fetch_upstream_catalog(_FakeClient())
+    assert complete is True
+    assert rows == [{"source_id": "a", "tensors": [], "metadata_json": None}]
+
+
+def test_fetch_upstream_catalog_none_on_no_sql_catalog():
+    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+
+    class _FakeClient:
+        _location = "grpc://fake"
+
+        def query_sources(self, sql, format="records"):
+            raise RuntimeError("no metadata DB")
+
+    rows, complete = fetch_upstream_catalog(_FakeClient())
+    assert rows is None
+    assert complete is False
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array):
+    """A re-list mirrors every upstream source from ONE query_sources: the
+    adapters are bulk-seeded (their live per-source fetch never runs) and the
+    local catalog is populated from the same result."""
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.source_manager import SourceManager
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
+    _serve(upstream)
+    try:
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("grpc://localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                watcher=None,
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+
+            manager._reconcile_upstreams()
+
+            assert set(proxy._sources) == {"lab__img", "lab__img2"}
+            for sid in ("lab__img", "lab__img2"):
+                adapter = proxy._sources[sid]
+                assert adapter._descriptors_cache is not None  # seeded, not live
+                assert adapter._metadata_cache is not None
+                assert adapter._client is None  # no per-source upstream dial
+
+            # local catalog populated from the bulk seed
+            rows = (
+                local_db._get_connection()
+                .execute("SELECT source_id FROM sources ORDER BY source_id")
+                .fetchall()
+            )
+            assert [r[0] for r in rows] == ["lab__img", "lab__img2"]
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+# --- unresolved-upstream interaction + resolve refresh (biopb/biopb#266-A) ---
+
+
+class _CatalogRowAdapter:
+    """Minimal adapter to seed a controllable upstream catalog row
+    (data_resident / tensors / metadata)."""
+
+    def __init__(self, source_id, tensors, resident, metadata=None):
+        self.source_id = source_id
+        self._source_url = f"/data/{source_id}"
+        self._source_type = "zarr"
+        self._tensors = tensors
+        self._resident = resident
+        self._metadata = metadata or {}
+
+    def get_source_descriptor(self):
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
+        return DataSourceDescriptor(
+            source_id=self.source_id,
+            source_url=self._source_url,
+            source_type=self._source_type,
+            data_resident=self._resident,
+            tensors=[TensorDescriptor(**t) for t in self._tensors],
+        )
+
+    def get_metadata(self):
+        return self._metadata
+
+
+def test_seed_catalog_carries_residency_and_detects_change():
+    """An unresolved upstream source (data_resident=false, empty tensors) mirrors
+    as non-resident; re-seeding reports change only when something differs, and an
+    in-place resolution flips residency + tensors."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__cloud",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="cloud",
+    )
+
+    changed = adapter.seed_catalog([], None, data_resident=False)
+    assert changed is True
+    assert adapter.list_tensor_descriptors() == []
+    assert adapter.is_resident() is False  # unresolved upstream -> not resident
+    assert adapter._client is None
+
+    # identical re-seed -> no change (so the caller skips a redundant re-sync)
+    assert adapter.seed_catalog([], None, data_resident=False) is False
+
+    # in-place resolution upstream -> change detected, now resident with tensors
+    changed = adapter.seed_catalog(
+        [
+            {
+                "array_id": "cloud",
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "chunk_shape": [4, 4],
+                "dtype": "uint8",
+            }
+        ],
+        {"ome": "m"},
+        data_resident=True,
+    )
+    assert changed is True
+    assert adapter.is_resident() is True
+    assert [d.array_id for d in adapter.list_tensor_descriptors()] == ["lab__cloud"]
+    assert adapter._client is None
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
+    """A mirror of an unresolved upstream source is non-resident with no tensors;
+    when the upstream resolves it in place, the next re-list refreshes the local
+    catalog row (residency + tensors) without a per-source RPC."""
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.source_manager import SourceManager
+
+    up_db = MetadataDatabase()
+    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=up_db)
+    up_db.sync_source_added(
+        "cloud", _CatalogRowAdapter("cloud", tensors=[], resident=False)
+    )
+    _serve(upstream)
+    try:
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("grpc://localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                watcher=None,
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+
+            manager._reconcile_upstreams()
+
+            def _row():
+                return (
+                    local_db._get_connection()
+                    .execute(
+                        "SELECT data_resident, tensors FROM sources "
+                        "WHERE source_id='lab__cloud'"
+                    )
+                    .fetchone()
+                )
+
+            resident, tensors = _row()
+            assert resident is False  # unresolved mirror, not advertised resident
+            assert tensors == []
+            assert proxy._sources["lab__cloud"].is_resident() is False
+
+            # upstream resolves the source in place (same source_id)
+            up_db.sync_source_added(
+                "cloud",
+                _CatalogRowAdapter(
+                    "cloud",
+                    tensors=[
+                        {
+                            "array_id": "cloud",
+                            "dim_labels": ["y", "x"],
+                            "shape": [8, 8],
+                            "chunk_shape": [8, 8],
+                            "dtype": "uint8",
+                        }
+                    ],
+                    resident=True,
+                    metadata={"ome": "m"},
+                ),
+            )
+
+            manager._reconcile_upstreams()
+
+            resident, tensors = _row()
+            assert resident is True  # refreshed from the bulk re-list
+            assert len(tensors) == 1
+            assert tensors[0]["array_id"] == "lab__cloud"  # localized
+            assert proxy._sources["lab__cloud"].is_resident() is True
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()

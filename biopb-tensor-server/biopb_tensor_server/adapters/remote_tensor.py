@@ -102,6 +102,39 @@ def list_upstream_source_ids(client) -> tuple[List[str], bool]:
         return ids, False
 
 
+def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
+    """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
+
+    Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
+    ``source_type``, ``metadata_json``, ``data_resident`` and the per-tensor
+    ``tensors`` STRUCT[] (biopb/biopb#224) -- everything needed to seed a
+    mirrored source's catalog entry without a per-source upstream RPC
+    (biopb/biopb#266). ``data_resident`` is carried so an unresolved upstream
+    source (``data_resident=false``, empty ``tensors``) mirrors as non-resident
+    rather than being advertised resident. ``complete`` is True because the
+    server-side DuckDB catalog is not truncated like ``list_sources()``.
+
+    ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
+    errors) -- the caller then falls back to id-only enumeration
+    (``list_upstream_source_ids``) and the per-source live sync path.
+    """
+    try:
+        rows = client.query_sources(
+            "SELECT source_id, source_type, metadata_json, data_resident, tensors "
+            "FROM sources",
+            format="records",
+        )
+        return rows, True
+    except Exception as exc:
+        logger.warning(
+            "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
+            "enumeration + per-source sync",
+            getattr(client, "_location", "?"),
+            exc,
+        )
+        return None, False
+
+
 class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
@@ -160,6 +193,18 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         # upstream. Optimistic until proven otherwise so a never-yet-listed source
         # is not pre-emptively reported unresolved.
         self._reachable = True
+
+        # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
+        # the whole upstream catalog in one query_sources, it seeds these so
+        # registration (sync_source_added -> get_source_descriptor/get_metadata)
+        # needs no per-source upstream RPC. None = not seeded (fall back to a live
+        # per-source fetch). See seed_catalog().
+        self._descriptors_cache: Optional[List[TensorDescriptor]] = None
+        self._metadata_cache: Optional[dict] = None
+        # Whether the upstream *source* is resident (carried from the bulk row).
+        # None until seeded; is_resident() = reachable AND this (when seeded), so
+        # an unresolved upstream source mirrors as non-resident (biopb/biopb#266).
+        self._upstream_resident: Optional[bool] = None
 
     # ------------------------------------------------------------------ upstream
 
@@ -244,6 +289,58 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             alias=source.alias,
         )
 
+    def seed_catalog(
+        self,
+        upstream_tensors: List[dict],
+        metadata: Optional[dict],
+        data_resident: bool = True,
+    ) -> bool:
+        """(Re)populate the catalog surface from a bulk upstream ``query_sources``.
+
+        Called by the reconcile (biopb/biopb#266) with this source's row from a
+        single upstream catalog fetch, so ``sync_source_added``
+        (``get_source_descriptor`` + ``get_metadata``) needs no per-source upstream
+        RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
+        array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
+        exactly as the live path's ``_localize_descriptor`` would. Unlike the live
+        ``list_tensor_descriptors`` (default field only), this seeds **all** of the
+        source's tensors, so a multi-field upstream mirrors completely.
+
+        ``data_resident`` is the upstream *source*'s residency (from its row): an
+        unresolved upstream source (``data_resident=false``, empty tensors) must
+        mirror as non-resident, not be advertised resident. Idempotent and
+        re-appliable: the reconcile re-seeds every mirrored source each re-list,
+        so an in-place upstream resolution (empty -> populated tensors,
+        false -> true) refreshes here rather than going stale.
+
+        We just queried the upstream, so mark it reachable. Returns whether the
+        seeded catalog surface actually changed, so the caller can skip a
+        redundant metadata-DB re-sync (and its ``indexed_at`` churn).
+        """
+        descs: List[TensorDescriptor] = []
+        for t in upstream_tensors or []:
+            descs.append(
+                TensorDescriptor(
+                    array_id=self._to_local_array_id(t["array_id"]),
+                    dim_labels=t.get("dim_labels") or [],
+                    shape=t.get("shape") or [],
+                    chunk_shape=t.get("chunk_shape") or [],
+                    dtype=t.get("dtype") or "",
+                )
+            )
+        new_metadata = metadata or {}
+        new_resident = bool(data_resident)
+        changed = (
+            descs != self._descriptors_cache
+            or new_metadata != self._metadata_cache
+            or new_resident != self._upstream_resident
+        )
+        self._descriptors_cache = descs
+        self._metadata_cache = new_metadata
+        self._reachable = True
+        self._upstream_resident = new_resident
+        return changed
+
     def get_metadata(self) -> dict:
         """Mirror the upstream source's metadata dict (OME etc.), best-effort.
 
@@ -260,6 +357,10 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         source all degrade to ``{}`` (metadata is non-critical for serving).
         """
         import json
+
+        # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
+        if self._metadata_cache is not None:
+            return self._metadata_cache
 
         escaped = self._upstream_source_id.replace("'", "''")
         sql = f"SELECT metadata_json FROM sources WHERE source_id = '{escaped}'"
@@ -301,7 +402,13 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         field only -- reading a specific other field still works (the chunk_id
         carries the full array_id), but the upstream exposes no cheap,
         non-truncatable way to enumerate a single source's full field list.
+        (The bulk-seed path in ``seed_catalog`` does not have this limitation --
+        it mirrors every field from the upstream catalog row, biopb/biopb#266.)
         """
+        # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
+        if self._descriptors_cache is not None:
+            return self._descriptors_cache
+
         try:
             desc = self.client.get_descriptor(self._to_upstream_array_id(self.array_id))
         except Exception as exc:
@@ -311,14 +418,21 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         return [self._localize_descriptor(desc)]
 
     def is_resident(self) -> bool:
-        """Best-effort: is the upstream reachable right now?
+        """Best-effort residency of the mirrored source.
 
         The base implementation would call a ``grpc://`` source non-resident (a
         remote scheme), wrongly tripping unresolved-source handling. Instead track
-        reachability from the catalog-surface upstream calls: a reachable upstream
-        is resident; an unreachable one reports ``data_resident=False`` (paired
-        with the empty placeholder tensor list above) until it recovers.
+        reachability from the catalog-surface upstream calls: an unreachable
+        upstream reports ``data_resident=False`` (paired with the empty
+        placeholder tensor list above) until it recovers.
+
+        When bulk-seeded (biopb/biopb#266), also require the upstream *source* to
+        be resident -- so a mirror of an unresolved upstream source
+        (``data_resident=false`` on the upstream) reports non-resident rather
+        than being advertised resident just because the endpoint is reachable.
         """
+        if self._upstream_resident is not None:
+            return self._reachable and self._upstream_resident
         return self._reachable
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):

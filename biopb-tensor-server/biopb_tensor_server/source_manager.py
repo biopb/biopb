@@ -1245,9 +1245,15 @@ class SourceManager:
                 return
         self._commit_add_claim(claim)
 
-    def _commit_add_claim(self, claim: SourceClaim) -> bool:
-        """Register a discovered source, then commit it into confirmed state."""
-        if not self._register_source_claim(claim):
+    def _commit_add_claim(
+        self, claim: SourceClaim, catalog_seed: Optional[tuple] = None
+    ) -> bool:
+        """Register a discovered source, then commit it into confirmed state.
+
+        ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
+        remote bulk-seed); ``None`` for local sources.
+        """
+        if not self._register_source_claim(claim, catalog_seed=catalog_seed):
             self._record_failed_source_attempt(claim.source_id)
             return False
 
@@ -1404,11 +1410,14 @@ class SourceManager:
         path signature): desired = the alias-namespaced ids the upstream lists now;
         current = the tensor-server claims already mirrored from this endpoint.
         """
+        import json
+
         from biopb.tensor import TensorFlightClient
 
         from biopb_tensor_server.adapters.remote_tensor import (
             _resolve_upstream_token,
             _split_grpc_url,
+            fetch_upstream_catalog,
             list_upstream_source_ids,
         )
         from biopb_tensor_server.config import _namespaced_source_id
@@ -1419,9 +1428,21 @@ class SourceManager:
 
         client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
         try:
-            # Complete enumeration -- list_sources() truncates, which would both
-            # miss sources AND spuriously remove the ones past the cap below.
-            upstream_ids, complete = list_upstream_source_ids(client)
+            # ONE bulk query_sources fetches every upstream source's id AND its
+            # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
+            # instead of one per added source at registration (biopb/biopb#266).
+            # Complete: the server-side DuckDB catalog is not truncated like
+            # list_sources() (which would both miss sources AND spuriously remove
+            # the ones past the cap below).
+            rows, complete = fetch_upstream_catalog(client)
+            if rows is not None:
+                seed_by_up_id = {r["source_id"]: r for r in rows}
+                upstream_ids = list(seed_by_up_id.keys())
+            else:
+                # Legacy upstream without a SQL catalog: id-only enumeration, no
+                # seed -> each added source syncs via a live per-source RPC.
+                upstream_ids, complete = list_upstream_source_ids(client)
+                seed_by_up_id = {}
         finally:
             close = getattr(client, "close", None)
             if close is not None:
@@ -1448,6 +1469,17 @@ class SourceManager:
         for source_id in sorted(removed):
             self._commit_remove_source(source_id)
 
+        def _row_to_seed(row):
+            """(tensors, metadata, data_resident) for seed_catalog, or None."""
+            if row is None:
+                return None
+            raw = row.get("metadata_json")
+            try:
+                metadata = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                metadata = {}
+            return (row.get("tensors") or [], metadata, bool(row.get("data_resident")))
+
         extra_config = {}
         if upstream.credentials_profile:
             extra_config["credentials_profile"] = upstream.credentials_profile
@@ -1459,8 +1491,32 @@ class SourceManager:
                     primary_path=f"{endpoint}/{up_id}",
                     source_id=source_id,
                     extra_config=dict(extra_config),
-                )
+                ),
+                catalog_seed=_row_to_seed(seed_by_up_id.get(up_id)),
             )
+
+        # Refresh already-mirrored sources from the same bulk result, so an
+        # in-place upstream change -- notably unresolved -> resolved (empty ->
+        # populated tensors, data_resident false -> true) -- is reflected on the
+        # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
+        # DuckDB row only when the seed actually changed, so a steady re-list does
+        # not churn indexed_at.
+        for source_id in sorted(current & set(desired)):
+            seed = _row_to_seed(seed_by_up_id.get(desired[source_id]))
+            if seed is None:
+                continue
+            adapter = self._server._get_source_adapter(source_id)
+            if adapter is None or not hasattr(adapter, "seed_catalog"):
+                continue
+            if adapter.seed_catalog(*seed) and self._metadata_db is not None:
+                try:
+                    self._metadata_db.sync_source_added(source_id, adapter)
+                except Exception:
+                    logger.warning(
+                        "failed to refresh mirrored catalog row for %s",
+                        source_id,
+                        exc_info=True,
+                    )
 
         if added or removed:
             logger.info(
@@ -1638,8 +1694,17 @@ class SourceManager:
                     "metadata-DB backfill failed for resolved source %s", source_id
                 )
 
-    def _register_source_claim(self, claim: SourceClaim) -> bool:
-        """Create and register a source, rolling back on partial failure."""
+    def _register_source_claim(
+        self, claim: SourceClaim, catalog_seed: Optional[tuple] = None
+    ) -> bool:
+        """Create and register a source, rolling back on partial failure.
+
+        ``catalog_seed`` (biopb/biopb#266) is an optional
+        ``(tensors, metadata, data_resident)`` tuple from a bulk upstream
+        ``query_sources``; when the adapter supports it (the remote proxy), it is
+        applied before ``sync_source_added`` so registration needs no per-source
+        upstream RPC.
+        """
         try:
             source_config = SourceConfig(
                 type=claim.source_type,
@@ -1676,6 +1741,13 @@ class SourceManager:
                 adapter = adapter_cls.create_from_config(
                     source_config, self._credentials_config
                 )
+
+                # Bulk-seed the catalog surface so sync_source_added below needs
+                # no per-source upstream RPC (biopb/biopb#266). Guarded by the
+                # adapter opting in via seed_catalog (only the remote proxy does).
+                if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
+                    tensors, metadata, data_resident = catalog_seed
+                    adapter.seed_catalog(tensors, metadata, data_resident)
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
