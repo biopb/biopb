@@ -51,20 +51,14 @@ class MockAdapter:
 class TestMetadataDatabaseInit:
     """Test database initialization."""
 
-    def test_init_enabled(self):
-        """Test initialization with enabled=True."""
-        db = MetadataDatabase(enabled=True)
-        assert db._enabled is True
+    def test_init_lazy(self):
+        """The DB is mandatory (no enabled flag); the connection is still lazy."""
+        db = MetadataDatabase()
         assert db._conn is None  # Lazy initialization
-
-    def test_init_disabled(self):
-        """Test initialization with enabled=False."""
-        db = MetadataDatabase(enabled=False)
-        assert db._enabled is False
 
     def test_lazy_initialization(self):
         """Test that database is created on first access."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         assert db._conn is None
 
         # Trigger initialization via sync
@@ -77,7 +71,7 @@ class TestMetadataDatabaseInit:
 
     def test_schema_created(self):
         """Test that sources table is created with correct schema."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -98,7 +92,7 @@ class TestSourceSync:
 
     def test_sync_source_added(self):
         """Test adding a source to the database."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "plate-001", "/data/plate.ome.zarr", "ome-zarr", [512, 512, 64], "uint16"
         )
@@ -134,7 +128,7 @@ class TestSourceSync:
                     "bytes_binary": b"\xff\xfe",
                 }
 
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = NumpyMockAdapter(
             "numpy-test", "/data/test.nii", "nifti", [64, 64, 64], "int16"
         )
@@ -157,7 +151,7 @@ class TestSourceSync:
 
     def test_sync_source_removed(self):
         """Test removing a source from the database."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -180,20 +174,6 @@ class TestSourceSync:
         ).fetchone()
         assert result[0] == 0
 
-    def test_sync_disabled_noop(self):
-        """Test that sync operations are no-ops when disabled."""
-        db = MetadataDatabase(enabled=False)
-        adapter = MockAdapter(
-            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
-        )
-
-        # These should be no-ops
-        db.sync_source_added("test-1", adapter)
-        db.sync_source_removed("test-1")
-
-        # Database should not be initialized
-        assert db._conn is None
-
     def test_sync_source_added_propagates_failure(self):
         """A descriptor-read error surfaces to the caller instead of being
         swallowed, so the registration path can roll back (issue #223)."""
@@ -202,7 +182,7 @@ class TestSourceSync:
             def get_source_descriptor(self):
                 raise RuntimeError("Simulated failure")
 
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(RuntimeError, match="Simulated failure"):
             db.sync_source_added(
@@ -271,7 +251,7 @@ class TestPerTensorCatalog:
     def test_all_tensors_stored_not_just_first(self):
         """Every tensor is persisted, with its full structural fields -- not the
         old first-tensor projection only."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
@@ -291,7 +271,7 @@ class TestPerTensorCatalog:
     def test_per_tensor_dtype_filter(self):
         """A dtype predicate over the nested list finds a source by ANY of its
         tensors -- the multi-field case the first-tensor projection missed."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         # first tensor is uint16; the uint8 tensor is only reachable per-tensor
         db.sync_source_added(
             "hcs",
@@ -312,7 +292,7 @@ class TestPerTensorCatalog:
     def test_scalar_projection_still_first_tensor(self):
         """The back-compat scalar dtype/shape_summary stay the first-tensor
         projection, written in the same upsert so they can't desync."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
@@ -327,7 +307,7 @@ class TestPerTensorCatalog:
     def test_no_tensors_is_empty_list(self):
         """An unresolved (no-tensor) source stores an empty list, so per-tensor
         predicates exclude it while `WHERE NOT data_resident` still finds it."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "unresolved",
             MultiTensorAdapter(
@@ -347,7 +327,7 @@ class TestPerTensorCatalog:
         connection the other tests use. UNNEST(tensors) must pass _validate_query
         (it references the column, not a table) and the nested LIST(STRUCT) column
         must round-trip whole through the Arrow serialization behind DoGet."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
@@ -393,7 +373,7 @@ class TestQueryHandling:
 
     def test_handle_query_simple(self):
         """Test simple SELECT query."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -410,7 +390,7 @@ class TestQueryHandling:
 
     def test_handle_query_with_filter(self):
         """Test SELECT query with WHERE clause."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         # Add multiple sources
         db.sync_source_added(
@@ -438,7 +418,7 @@ class TestQueryHandling:
 
     def test_handle_query_json_field(self):
         """Test query using DuckDB JSON operators."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -456,7 +436,7 @@ class TestQueryHandling:
 
     def test_handle_query_truncation(self):
         """Test truncation signaling when results exceed max."""
-        db = MetadataDatabase(enabled=True, max_query_results=2)
+        db = MetadataDatabase(max_query_results=2)
 
         # Add 5 sources
         for i in range(5):
@@ -478,20 +458,13 @@ class TestQueryHandling:
         result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
         assert result.num_rows == 2
 
-    def test_handle_query_disabled_raises(self):
-        """Test that query raises when disabled."""
-        db = MetadataDatabase(enabled=False)
-
-        with pytest.raises(ValueError, match="disabled"):
-            db.handle_query("SELECT * FROM sources")
-
 
 class TestSQLValidation:
     """Test SQL query validation."""
 
     def test_validate_simple_select(self):
         """Test that simple SELECT passes validation."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         db._validate_query("SELECT * FROM sources")
         db._validate_query(
@@ -500,14 +473,14 @@ class TestSQLValidation:
 
     def test_validate_forbidden_insert(self):
         """Test that INSERT is blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query("INSERT INTO sources VALUES ('test', 'test')")
 
     def test_validate_forbidden_update(self):
         """Test that UPDATE is blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query(
@@ -516,28 +489,28 @@ class TestSQLValidation:
 
     def test_validate_forbidden_delete(self):
         """Test that DELETE is blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query("DELETE FROM sources WHERE source_id='test'")
 
     def test_validate_forbidden_drop(self):
         """Test that DROP is blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query("DROP TABLE sources")
 
     def test_validate_forbidden_create(self):
         """Test that CREATE is blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query("CREATE TABLE evil AS SELECT * FROM sources")
 
     def test_validate_disallowed_table(self):
         """Test that references to non-sources tables are blocked."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         # Should pass - sources table
         db._validate_query("SELECT * FROM sources")
@@ -554,7 +527,7 @@ class TestSQLValidation:
         enable_external_access=False: the query must fail rather than read the
         file.
         """
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "z1",
             MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
@@ -571,7 +544,7 @@ class TestSQLValidation:
 
     def test_set_external_access_cannot_be_reenabled(self):
         """An attacker can't turn external access back on mid-query."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "z1",
             MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
@@ -585,7 +558,7 @@ class TestFlightInfo:
 
     def test_flight_info_schema(self):
         """Test that FlightInfo has correct schema."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -598,7 +571,7 @@ class TestFlightInfo:
 
     def test_flight_info_metadata(self):
         """Test that FlightInfo schema metadata contains counts."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         for i in range(3):
             db.sync_source_added(
@@ -617,7 +590,7 @@ class TestFlightInfo:
 
     def test_get_pending_result(self):
         """Test retrieval of pending results."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -637,7 +610,7 @@ class TestFlightInfo:
 
     def test_get_pending_result_not_found(self):
         """Test retrieval of non-existent ticket."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         result = db.get_pending_result("nonexistent-ticket")
         assert result is None
@@ -648,7 +621,7 @@ class TestClose:
 
     def test_close(self):
         """Test that close() cleans up connection."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         adapter = MockAdapter(
             "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
         )
@@ -662,7 +635,7 @@ class TestClose:
 
     def test_close_without_init(self):
         """Test that close() works even if database wasn't initialized."""
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
 
         # Should not raise
         db.close()
@@ -811,7 +784,7 @@ class TestDataResidentColumn:
             return {}
 
     def test_resident_local_source_is_true(self):
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
             MockAdapter(
@@ -833,7 +806,7 @@ class TestDataResidentColumn:
     def test_unresolved_source_is_false_and_filterable(self):
         # An unresolved source has NULL dtype, so a dtype predicate hides it;
         # data_resident makes it filterable on purpose instead.
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
             MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
@@ -866,7 +839,7 @@ class TestDataResidentColumn:
         # an explicit NULL is rejected -- so the column always partitions cleanly.
         import duckdb
 
-        db = MetadataDatabase(enabled=True)
+        db = MetadataDatabase()
         db.sync_source_added(
             "seed", MockAdapter("seed", "/s.zarr", "ome-zarr", [4, 4], "uint8")
         )

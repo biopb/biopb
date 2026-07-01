@@ -100,8 +100,10 @@ replaced with the chosen folder (a `[[sources]]`-clobbering rewrite before). A
 legacy `biopb.toml` is migrated to JSON on that path (POSIX reads it via
 `tomllib`/`tomli` to carry settings; Windows has no TOML parser so it starts from
 installer defaults) and the old file is backed up so the server's both-files
-shadow warning never fires. The default template also drops the now-deprecated
-`[metadata_db] enabled = true` (DB on by default, biopb/biopb#225). New installs
+shadow warning never fires. The default template also drops the
+`[metadata_db] enabled` flag, which was **removed** — the metadata DB is now
+mandatory / always on (biopb/biopb#225); a lingering flag is ignored with a
+warning. New installs
 are JSON-native; old TOML installs keep working until they next change folders.
 
 ## JSON Schema emitter (done)
@@ -117,7 +119,8 @@ section), bounds/enums from the `_Range`/`_Enum` objects (each grew a
 `cache.*_mb`/`*_gb` convert to byte fields) and `_DEPRECATED_ALIASES` (legacy
 keys the parser still accepts but that aren't dataclass fields: `watcher_type`/
 `poll_interval`, source `path`, the pyramid knobs under `[precache]`, plus the
-deprecated `metadata_db.enabled`). Sections keep `additionalProperties: true`, so
+removed `metadata_db.enabled` — tolerated as an ignored no-op, #225). Sections
+keep `additionalProperties: true`, so
 the schema enforces the dangerous values #34 exists to catch and documents every
 known key (deprecated ones flagged `deprecated: true`) without being a closed
 dictionary.

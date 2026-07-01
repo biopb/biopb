@@ -1161,7 +1161,9 @@ class TensorFlightClient:
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:
         """Execute SQL query against server's source metadata database.
 
-        Requires server to have metadata_db.enabled=True in config.
+        The server-side metadata database is mandatory (biopb/biopb#225), so any
+        standard tensor-server supports this. Only an embedded server explicitly
+        constructed without a metadata database rejects the query.
 
         Args:
             sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")

@@ -263,16 +263,18 @@ public class TensorFlightClient implements AutoCloseable {
      * contain
      * "total_sources" key if result was truncated.
      *
-     * Requires server to have metadata_db.enabled=true in config.
+     * The server-side metadata database is mandatory (biopb/biopb#225), so any
+     * standard tensor-server supports this. Only an embedded server explicitly
+     * constructed without a metadata database rejects the query.
      *
      * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_url
      *            LIKE '%plate%'")
      * @return VectorSchemaRoot with query results (caller must close)
-     * @throws IOException If query fails or server does not have metadata database
-     *                     enabled
+     * @throws IOException If query fails or the server has no metadata database
+     *                     attached
      *
      *                     Example:
-     * 
+     *
      *                     <pre>
      *                     VectorSchemaRoot result = client.querySources("SELECT source_id, source_type FROM sources");
      *                     System.out.println("Found " + result.getRowCount() + " sources");

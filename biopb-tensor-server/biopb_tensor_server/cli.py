@@ -357,20 +357,18 @@ def _setup_flight_server(
         f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
     )
 
-    # Create metadata database if enabled
-    metadata_db: Optional[MetadataDatabase] = None
-    if server_config.metadata_db.enabled:
-        metadata_db = MetadataDatabase(
-            enabled=True,
-            max_query_results=server_config.metadata_db.max_query_results,
-            query_timeout_ms=server_config.metadata_db.query_timeout_ms,
-        )
-        console.print(
-            "[green]Metadata database initialized:[/green] "
-            f"max_query_results={server_config.metadata_db.max_query_results}, "
-            f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
-            f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
-        )
+    # The metadata database is mandatory (biopb/biopb#225): always constructed --
+    # it is the canonical source-browsing surface (`client.query_sources`).
+    metadata_db = MetadataDatabase(
+        max_query_results=server_config.metadata_db.max_query_results,
+        query_timeout_ms=server_config.metadata_db.query_timeout_ms,
+    )
+    console.print(
+        "[green]Metadata database initialized:[/green] "
+        f"max_query_results={server_config.metadata_db.max_query_results}, "
+        f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
+        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
+    )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
     location = _grpc_location(host, port)

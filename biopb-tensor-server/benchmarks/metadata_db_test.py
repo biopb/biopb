@@ -59,7 +59,7 @@ def populate_database(db: MetadataDatabase, n_sources: int) -> None:
 
 def _create_db_with_sources(n_sources: int):
     """Create a fresh MetadataDatabase with n_sources pre-populated."""
-    db = MetadataDatabase(enabled=True)
+    db = MetadataDatabase()
     populate_database(db, n_sources)
     return db
 
@@ -91,7 +91,7 @@ def populated_db_100k():
 @pytest.fixture
 def fresh_db():
     """Fresh database for populate benchmark tests (function-scoped)."""
-    db = MetadataDatabase(enabled=True)
+    db = MetadataDatabase()
     yield db
     db.close()
 

@@ -1020,8 +1020,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 sql = cmd.metadata_query.sql
                 logger.debug(f"get_flight_info: metadata_query sql={sql[:100]}...")
                 if self._metadata_db is None:
+                    # The CLI always attaches a metadata DB (mandatory,
+                    # biopb/biopb#225); reaching here means this server was
+                    # constructed without one (an embedded/test instance).
                     raise flight.FlightServerError(
-                        "Metadata database not enabled. Set metadata_db config to enable SQL queries."
+                        "This server has no metadata database attached, so SQL "
+                        "queries are unavailable."
                     )
                 try:
                     return self._metadata_db.handle_query(sql)
