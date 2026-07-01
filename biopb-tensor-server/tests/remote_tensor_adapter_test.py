@@ -439,10 +439,11 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_physical_scale_mirrors_upstream(simple_zarr_array):
-    """The proxy must mirror the upstream's physical_scale/physical_unit: the
-    server fills these from get_physical_scale() (clearing first), so the base
-    default of None would silently drop physical sizes the upstream has."""
+def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
+    """The caching proxy does not implement physical_scale yet (biopb/biopb#266):
+    reading it would be a per-open upstream get_descriptor RPC on every serve --
+    the wrong layer; it should ride the bulk mirror seed. So get_physical_scale
+    returns None even when the upstream advertises a scale."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -458,15 +459,16 @@ def test_get_physical_scale_mirrors_upstream(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.get_physical_scale() == (_PHYS_SCALE, _PHYS_UNIT)
+        assert adapter.get_physical_scale() is None
     finally:
         upstream.shutdown()
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_physical_scale_flows_through_proxy(simple_zarr_array):
-    """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
-    physical_scale/physical_unit on the descriptor."""
+def test_physical_scale_not_advertised_through_proxy(simple_zarr_array):
+    """End-to-end: even when the upstream carries physical_scale, a client
+    GetFlightInfo through the proxy advertises none -- the proxy leaves the
+    descriptor's physical_scale/physical_unit empty (unimplemented, #266)."""
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
@@ -491,8 +493,8 @@ def test_physical_scale_flows_through_proxy(simple_zarr_array):
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
             desc = client.get_descriptor("lab__img")
-            assert list(desc.physical_scale) == _PHYS_SCALE
-            assert list(desc.physical_unit) == _PHYS_UNIT
+            assert not desc.physical_scale
+            assert not desc.physical_unit
             client.close()
         finally:
             proxy.shutdown()
