@@ -341,6 +341,52 @@ class TestPerTensorCatalog:
         assert tensors == []
         assert resident is False
 
+    def test_per_tensor_query_roundtrips_through_handle_query(self):
+        """The documented per-tensor idiom works through the real query path
+        (handle_query: SQL validator -> Arrow -> Flight ticket), not just the raw
+        connection the other tests use. UNNEST(tensors) must pass _validate_query
+        (it references the column, not a table) and the nested LIST(STRUCT) column
+        must round-trip whole through the Arrow serialization behind DoGet."""
+        db = MetadataDatabase(enabled=True)
+        db.sync_source_added(
+            "hcs",
+            MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
+        )
+        db.sync_source_added(
+            "unresolved",
+            MultiTensorAdapter(
+                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+            ),
+        )
+
+        # UNNEST -> one row per tensor, through the validator + Arrow path.
+        info = db.handle_query(
+            "SELECT source_id, t.array_id, t.dtype "
+            "FROM sources, UNNEST(tensors) AS u(t) ORDER BY t.array_id"
+        )
+        rows = db.get_pending_result(
+            info.endpoints[0].ticket.ticket.decode()
+        ).to_pylist()
+        assert rows == [
+            {"source_id": "hcs", "array_id": "hcs/A1/0", "dtype": "uint16"},
+            {"source_id": "hcs", "array_id": "hcs/A2/0", "dtype": "uint8"},
+        ]
+
+        # The nested column itself round-trips whole -- including the empty list
+        # for the unresolved source (Arrow/Flight handles the LIST(STRUCT) type).
+        info = db.handle_query(
+            "SELECT source_id, tensors FROM sources ORDER BY source_id"
+        )
+        by_id = {
+            r["source_id"]: r["tensors"]
+            for r in db.get_pending_result(
+                info.endpoints[0].ticket.ticket.decode()
+            ).to_pylist()
+        }
+        assert by_id["unresolved"] == []
+        assert [t["dtype"] for t in by_id["hcs"]] == ["uint16", "uint8"]
+        assert by_id["hcs"][1]["shape"] == [8, 256, 256]  # full struct, not projection
+
 
 class TestQueryHandling:
     """Test SQL query handling."""
