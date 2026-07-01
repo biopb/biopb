@@ -17,6 +17,7 @@ from biopb_tensor_server.config import (
     PyramidConfig,
     ServerConfig,
     parse_config,
+    validate_config_dict,
 )
 
 
@@ -155,6 +156,59 @@ def test_strict_mode_raises(monkeypatch):
 def test_strict_mode_allows_valid(monkeypatch):
     monkeypatch.setattr(cfg, "_STRICT_VALIDATION", True)
     ServerConfig()  # no raise
+
+
+# --- validate_config_dict: the endpoint's semantic gate ----------------------
+# Same _CONSTRAINTS rules the server enforces at load, returned as structured
+# {path, message} problems and independent of the warn/raise policy, so the
+# admin config-save endpoint accepts exactly what the server will load.
+
+
+def test_validate_config_dict_valid_is_empty():
+    assert validate_config_dict({"server": {"port": 8815, "log_level": "info"}}) == []
+
+
+def test_validate_config_dict_flags_case_insensitive_enum():
+    # The gap the JSON Schema cannot express (no hard `enum` for a folded set):
+    # a bad log_level must still be caught here, on its on-disk path.
+    problems = validate_config_dict({"server": {"log_level": "VERBOSE"}})
+    assert [p["path"] for p in problems] == [["server", "log_level"]]
+    assert "log_level" in problems[0]["message"]
+
+
+def test_validate_config_dict_flags_reduction_method():
+    problems = validate_config_dict({"pyramid": {"reduction_method": "bogus"}})
+    assert [p["path"] for p in problems] == [["pyramid", "reduction_method"]]
+
+
+def test_validate_config_dict_uses_ondisk_paths():
+    # A field whose wire section diverges from the dataclass (compute_backend is
+    # a ServerConfig field but lives under [compute] on disk) reports the on-disk
+    # path, so it dedupes against the JSON Schema's path at the endpoint.
+    problems = validate_config_dict({"compute": {"backend": "quantum"}})
+    assert [p["path"] for p in problems] == [["compute", "backend"]]
+
+
+def test_validate_config_dict_independent_of_warn_policy(monkeypatch):
+    # Warn-only mode (the default deprecation window) must NOT suppress the
+    # returned problems -- the endpoint needs to reject regardless.
+    monkeypatch.setattr(cfg, "_STRICT_VALIDATION", False)
+    assert validate_config_dict({"server": {"port": 0}})
+
+
+def test_validate_config_dict_structural_error_is_reported():
+    # A source without url can't even be constructed; surface it, don't crash.
+    problems = validate_config_dict({"sources": [{"type": "zarr"}]})
+    assert problems and problems[0]["path"] == []
+
+
+def test_validate_config_dict_malformed_section_is_reported_not_raised():
+    # A wrong-typed section makes parse_config walk a non-dict (str.get ->
+    # AttributeError, not ValueError/TypeError). It must still be reported as a
+    # root problem, never propagate -- otherwise the admin endpoint 500s instead
+    # of returning a clean 422.
+    problems = validate_config_dict({"server": "not-a-dict"})
+    assert problems and problems[0]["path"] == []
 
 
 # --- unknown-key warnings (the silent drop-to-default trap) ------------------
