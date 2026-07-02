@@ -522,8 +522,8 @@ def build_pyramid_plan(
     same extent ``get_read_plan`` returns for that scale, so a client can size
     the level without a probe read. ``native`` is False (computed, not on-disk).
 
-    For sources that ship a real pyramid, the adapter overrides this with native
-    levels (see ``SourceAdapter.get_native_pyramid_levels``); this is the generic
+    For tensors that ship a real pyramid, the adapter overrides this with native
+    levels (see ``TensorAdapter.get_native_pyramid_levels``); this is the generic
     fallback for everything else.
     """
     scales = compute_pyramid_scale_hints(

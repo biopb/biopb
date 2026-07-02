@@ -409,27 +409,25 @@ class TensorFlightServer(flight.FlightServerBase):
 
     def _advertised_pyramid(
         self,
-        source_adapter: Optional[SourceAdapter],
-        tensor_id: Optional[str],
+        tensor_adapter: Optional[TensorAdapter],
         base_desc: TensorDescriptor,
     ) -> List["PyramidLevel"]:
         """The pyramid levels to advertise for a tensor.
 
-        Native (precomputed on-disk) levels when the source ships them, else a
+        Native (precomputed on-disk) levels when the tensor ships them, else a
         computed pyramid from the authoritative ``[pyramid]`` knobs. Filled only
         by ``get_flight_info`` -- ``list_flights`` leaves ``pyramid`` empty, like
         ``metadata_json``. Cheap (arithmetic + already-memoized level adapters),
         so it is recomputed per open rather than separately cached.
         """
         levels = None
-        if source_adapter is not None:
+        if tensor_adapter is not None:
             try:
-                levels = source_adapter.get_native_pyramid_levels(tensor_id)
+                levels = tensor_adapter.get_native_pyramid_levels()
             except Exception:
                 logger.exception(
-                    "pyramid: native enumeration failed for %s/%s",
-                    source_adapter.source_id,
-                    tensor_id,
+                    "pyramid: native enumeration failed for %s",
+                    base_desc.array_id,
                 )
                 levels = None
         if levels is None:
@@ -1190,7 +1188,7 @@ class TensorFlightServer(flight.FlightServerBase):
             # scale_hint path; native sources get their precomputed levels.
             read_plan.descriptor.ClearField("pyramid")
             read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(source_adapter, field, base_desc)
+                self._advertised_pyramid(tensor_adapter, base_desc)
             )
 
             # Compact per-dim physical scale summary. Filled here at open time
@@ -1201,7 +1199,7 @@ class TensorFlightServer(flight.FlightServerBase):
             read_plan.descriptor.ClearField("physical_scale")
             read_plan.descriptor.ClearField("physical_unit")
             try:
-                phys = tensor_adapter.get_physical_scale(field)
+                phys = tensor_adapter.get_physical_scale()
             except Exception:
                 phys = None
             if phys is not None:

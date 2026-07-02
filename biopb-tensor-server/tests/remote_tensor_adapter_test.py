@@ -333,7 +333,7 @@ def _phys_zarr_cls():
     from biopb_tensor_server import ZarrAdapter
 
     class _PhysZarr(ZarrAdapter):
-        def get_physical_scale(self, tensor_id=None):
+        def get_physical_scale(self):
             return list(_PHYS_SCALE), list(_PHYS_UNIT)
 
     return _PhysZarr
