@@ -324,9 +324,10 @@ def _setup_flight_server(
                     f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
                     f"lost={recovery_status.lost_entries} entries"
                 )
-                if recovery_status.errors:
-                    for err in recovery_status.errors[:3]:
-                        console.print(f"[red]  Error: {err}[/red]")
+                # (No per-segment error list here: recovery no longer scans
+                # segment bodies -- biopb/biopb#300 -- so it surfaces no read
+                # errors. Corrupt segments are detected, logged, and dropped by
+                # _rebuild_index_from_segments' own logger.error instead.)
         else:
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] backend=memory (fallback)"
