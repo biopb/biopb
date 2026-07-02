@@ -141,15 +141,10 @@ def _extract_signed_url_params(url: str) -> Dict[str, Any]:
 
     options: Dict[str, Any] = {}
 
-    # AWS S3 signed URL params
+    # AWS S3 signed URL params. Signature/Expires are carried in the URL itself
+    # and handled by fsspec, so only the credential params are extracted here.
     if "AWSAccessKeyId" in query_params:
         options["key"] = query_params["AWSAccessKeyId"][0]
-    if "Signature" in query_params:
-        # Signature is used differently - part of the URL auth
-        pass
-    if "Expires" in query_params or "X-Amz-Expires" in query_params:
-        # Expiration params - fsspec handles these
-        pass
     if "X-Amz-Security-Token" in query_params:
         options["token"] = query_params["X-Amz-Security-Token"][0]
 

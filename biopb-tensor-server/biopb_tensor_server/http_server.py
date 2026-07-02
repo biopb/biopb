@@ -229,11 +229,6 @@ def _redact(text: Optional[str]) -> Optional[str]:
     return text
 
 
-def _dtype_to_numpy(dtype_str: str) -> np.dtype:
-    """Convert numpy-style dtype string to np.dtype (handles common aliases)."""
-    return np.dtype(dtype_str)
-
-
 def _tensor_matches(td_array_id: str, req_tensor_id: str, source_id: str) -> bool:
     """Whether *req_tensor_id* refers to the descriptor whose array_id is
     *td_array_id*, tolerant of identity-policy forms.

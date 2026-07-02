@@ -1322,7 +1322,6 @@ def scan_directory_for_sources(
     """
     discovered = []
     skipped_hdf5 = []
-    skipped_unknown = []
 
     for item in directory.iterdir():
         # Skip hidden files/directories
@@ -1344,8 +1343,6 @@ def scan_directory_for_sources(
                 ".hdf5"
             ):
                 skipped_hdf5.append(item)
-            else:
-                skipped_unknown.append(item)
 
         elif item.is_dir():
             # Check if this directory itself is a data source
@@ -1365,15 +1362,15 @@ def scan_directory_for_sources(
                     scan_directory_for_sources(item, dim_labels, recursive)
                 )
 
-    # Print warnings for skipped files (only at top level to avoid spam)
-    if skipped_hdf5 and directory == directory:
-        print(
-            "Warning: Skipped HDF5 files (require explicit 'type' and 'dataset' in config):"
+    # Warn about skipped HDF5 files (they need explicit 'type'/'dataset' in config)
+    if skipped_hdf5:
+        shown = ", ".join(str(p) for p in skipped_hdf5[:5])
+        more = f" ... and {len(skipped_hdf5) - 5} more" if len(skipped_hdf5) > 5 else ""
+        logger.warning(
+            "Skipped HDF5 files (require explicit 'type' and 'dataset' in config): %s%s",
+            shown,
+            more,
         )
-        for h5_path in skipped_hdf5[:5]:  # Limit to 5 to avoid spam
-            print(f"  - {h5_path}")
-        if len(skipped_hdf5) > 5:
-            print(f"  ... and {len(skipped_hdf5) - 5} more")
 
     return discovered
 
