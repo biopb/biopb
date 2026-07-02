@@ -289,10 +289,16 @@ def _setup_flight_server(
             * 1024
             * 1024
         ),
-        gpu_memory_safety_factor=gpu_memory_safety_factor
-        or server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks
-        or server_config.gpu_min_merged_chunks,
+        gpu_memory_safety_factor=(
+            gpu_memory_safety_factor
+            if gpu_memory_safety_factor is not None
+            else server_config.gpu_memory_safety_factor
+        ),
+        gpu_min_merged_chunks=(
+            gpu_min_merged_chunks
+            if gpu_min_merged_chunks is not None
+            else server_config.gpu_min_merged_chunks
+        ),
     )
 
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
@@ -380,8 +386,8 @@ def _setup_flight_server(
         f"backend={compute_backend or server_config.compute_backend}, "
         f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
         f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
-        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
-        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
+        f"gpu_memory_safety_factor={gpu_memory_safety_factor if gpu_memory_safety_factor is not None else server_config.gpu_memory_safety_factor}, "
+        f"gpu_min_merged_chunks={gpu_min_merged_chunks if gpu_min_merged_chunks is not None else server_config.gpu_min_merged_chunks}"
     )
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
