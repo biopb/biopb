@@ -1,6 +1,5 @@
 package biopb.tensor;
 
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -11,16 +10,13 @@ import org.junit.Test;
 /**
  * Unit tests for the unified-binary chunk decode (biopb/biopb#293), focused on
  * the dtypes that regressed: float16 (no native Java decode) and uint64 (the
- * unsigned->signed overflow). Exercises the private static {@code decodeChunkBytes}
- * via reflection; the same method is duplicated in {@link TensorFlightClient}.
+ * unsigned->signed overflow). Exercises the shared {@link ChunkDecoder}, which
+ * both {@link SerializableTensorImg} and {@link TensorFlightClient} delegate to.
  */
 public class DecodeChunkBytesTest {
 
-    private static double[] decode(byte[] raw, String dtype) throws Exception {
-        Method m = SerializableTensorImg.class.getDeclaredMethod(
-                "decodeChunkBytes", byte[].class, String.class);
-        m.setAccessible(true);
-        return (double[]) m.invoke(null, raw, dtype);
+    private static double[] decode(byte[] raw, String dtype) {
+        return ChunkDecoder.decodeChunkBytes(raw, dtype);
     }
 
     private static byte[] leShort(int v) {
