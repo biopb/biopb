@@ -1010,3 +1010,53 @@ class TestGetData:
             bounds = ChunkBounds(start=[0], stop=[50])
             with pytest.raises(ValueError, match="dimensionality mismatch"):
                 adapter.get_data(bounds)
+
+    def test_micromanager_2d_get_data_rank_matches_descriptor(self):
+        """MicroManagerLegacyAdapter.get_data must not add a phantom leading axis.
+
+        A single-plane dataset (one position/time/channel/z) reduces to a genuine
+        2-D ``[y, x]`` tensor. ``get_data`` stacks pages with ``np.stack(axis=0)``,
+        so without the ``ndim == 2`` reshape it returns ``(1, y, x)`` -- a rank that
+        disagrees with the 2-D descriptor and breaks lazy dask/napari slicing.
+        """
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fname = "img_channel000_position000_time000000000_z000.tif"
+            expected = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+            tifffile.imwrite(
+                os.path.join(tmpdir, fname), expected, photometric="minisblack"
+            )
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Positions": 1,
+                    "Frames": 1,
+                    "Slices": 1,
+                    "AxisOrder": ["time", "channel", "z", "position"],
+                },
+                f"Coords-{fname}": {
+                    "PositionIndex": 0,
+                    "TimeIndex": 0,
+                    "ChannelIndex": 0,
+                    "SliceIndex": 0,
+                },
+                f"Metadata-{fname}": {"Width": 64, "Height": 64},
+            }
+            with open(os.path.join(tmpdir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            adapter = MicroManagerLegacyAdapter(tmpdir, "mm2d")
+
+            # Descriptor is a genuine 2-D [y, x].
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.shape) == [64, 64]
+            assert list(desc.dim_labels) == ["y", "x"]
+
+            # The served chunk must be 2-D to match, not (1, 64, 64).
+            data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[64, 64]))
+            assert data.shape == (64, 64)
+            np.testing.assert_array_equal(data, expected)

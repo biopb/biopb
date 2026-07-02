@@ -1241,7 +1241,12 @@ class MicroManagerLegacyAdapter(SourceAdapter, TensorAdapter):
             result = np.stack(result_pages, axis=0)
 
             # Reshape to (pos, time, chan, z, h, w) based on actual ranges
-            if ndim == 3:
+            if ndim == 2:
+                # Genuine 2-D [y, x] dataset (all non-spatial axes singleton and
+                # dropped from full_shape). result_pages holds exactly one page,
+                # so drop the leading stack axis to match the descriptor rank.
+                result = result.reshape(h, w)
+            elif ndim == 3:
                 result = result.reshape(n_chan, h, w)
             elif ndim == 4:
                 result = result.reshape(n_chan * n_z, h, w)
