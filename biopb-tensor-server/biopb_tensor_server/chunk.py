@@ -10,7 +10,6 @@ This module contains:
 import logging
 import struct
 from dataclasses import dataclass
-from math import lcm
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -224,102 +223,6 @@ def normalized_scale_hint(
         return None
 
     return scale_hint_tuple
-
-
-def logical_chunk_shape(
-    chunk_shape: Tuple[int, ...],
-    scale_hint: Tuple[int, ...],
-    logical_shape: Tuple[int, ...],
-) -> Tuple[int, ...]:
-    """Compute virtual chunk shape for scaled read.
-
-    Args:
-        chunk_shape: Base chunk shape
-        scale_hint: Scale factors per axis
-        logical_shape: Output shape at target scale
-
-    Returns:
-        Virtual chunk shape at target scale
-    """
-    virtual_chunk = []
-    for chunk, scale, axis_shape in zip(chunk_shape, scale_hint, logical_shape):
-        virtual_axis = lcm(chunk, scale) // scale
-        virtual_chunk.append(min(max(virtual_axis, 1), axis_shape))
-    return tuple(virtual_chunk)
-
-
-# =============================================================================
-# Chunk Splitting Helpers
-# =============================================================================
-
-
-def _choose_split_axis(
-    shape: Tuple[int, ...],
-    dim_labels: Optional[List[str]],
-    n_splits: int,
-) -> int:
-    """Choose axis for splitting with semantic priority.
-
-    Priority order (preserves Y-X spatial plane for common visualization patterns):
-    1. Any axis NOT in {y, x, z, c} — handles 't', 'v', 'frame', unlabeled, etc.
-       If multiple candidates, pick largest.
-    2. 'c' (channel)
-    3. 'z' (depth)
-    4. Larger of 'y' or 'x' (spatial plane)
-    5. Fallback: largest axis (current behavior)
-
-    Args:
-        shape: Chunk shape tuple
-        dim_labels: Optional dimension labels (may be None or partial)
-        n_splits: Number of splits needed (axis must have size >= n_splits)
-
-    Returns:
-        Axis index to split along
-    """
-    SPATIAL_LABELS = {"y", "x", "z", "c"}
-
-    # Build label -> axis mapping (case-insensitive)
-    label_to_axis: Dict[str, int] = {}
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            label_to_axis[label.lower()] = ax
-
-    # Priority 1: Non-spatial axes (t, v, frame, unlabeled, etc.)
-    non_spatial_candidates: List[int] = []
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            if label.lower() not in SPATIAL_LABELS and shape[ax] >= n_splits:
-                non_spatial_candidates.append(ax)
-    else:
-        # No labels: treat all axes as non-spatial candidates, pick largest
-        non_spatial_candidates = [
-            ax for ax in range(len(shape)) if shape[ax] >= n_splits
-        ]
-
-    if non_spatial_candidates:
-        return max(non_spatial_candidates, key=lambda ax: shape[ax])
-
-    # Priority 2: 'c' (channel)
-    if "c" in label_to_axis and shape[label_to_axis["c"]] >= n_splits:
-        return label_to_axis["c"]
-
-    # Priority 3: 'z' (depth)
-    if "z" in label_to_axis and shape[label_to_axis["z"]] >= n_splits:
-        return label_to_axis["z"]
-
-    # Priority 4: Larger of 'y' or 'x' (preserve spatial plane integrity)
-    y_axis = label_to_axis.get("y")
-    x_axis = label_to_axis.get("x")
-    if y_axis is not None and x_axis is not None:
-        if shape[y_axis] >= n_splits and shape[x_axis] >= n_splits:
-            return y_axis if shape[y_axis] >= shape[x_axis] else x_axis
-        elif shape[y_axis] >= n_splits:
-            return y_axis
-        elif shape[x_axis] >= n_splits:
-            return x_axis
-
-    # Fallback: largest axis (current behavior)
-    return max(range(len(shape)), key=lambda ax: shape[ax])
 
 
 # =============================================================================
@@ -687,7 +590,9 @@ def _choose_split_axis_excluding(
 ) -> Optional[int]:
     """Choose axis for splitting, excluding already-split axes.
 
-    Uses same priority as _choose_split_axis but skips excluded axes.
+    Priority (highest first): non-spatial axes (t/v/frame/unlabeled, largest
+    wins), then 'c', then 'z', then the larger of 'y'/'x' -- skipping any axis
+    in exclude_axes and any that cannot accommodate n_splits.
 
     Returns None if no eligible axis can accommodate n_splits.
     """

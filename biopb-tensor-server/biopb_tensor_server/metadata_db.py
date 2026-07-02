@@ -252,14 +252,6 @@ class MetadataDatabase:
                     f"Only the 'sources' table is accessible."
                 )
 
-        # Check for subqueries that might reference external resources
-        # (DuckDB can't actually access external resources without explicit config,
-        # but we validate anyway for clarity)
-        if "SELECT" in normalized and "(" in normalized:
-            # Has subquery - ensure it only references sources
-            # This is a simplified check; DuckDB's SQL parser would be more thorough
-            pass  # DuckDB won't allow external table references without explicit config
-
     def handle_query(self, sql: str) -> flight.FlightInfo:
         """Execute a safe SQL query and return FlightInfo.
 

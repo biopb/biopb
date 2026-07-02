@@ -661,10 +661,7 @@ def normalize_array_dims(
         squeeze_axes = tuple(
             i for i, label in enumerate(dim_labels_upper) if label in squeeze_dims
         )
-        if isinstance(arr, da.Array):
-            arr = arr.squeeze(axis=squeeze_axes)
-        else:
-            arr = arr.squeeze(axis=squeeze_axes)
+        arr = arr.squeeze(axis=squeeze_axes)
         dim_labels = [
             label for i, label in enumerate(dim_labels) if i not in squeeze_axes
         ]
