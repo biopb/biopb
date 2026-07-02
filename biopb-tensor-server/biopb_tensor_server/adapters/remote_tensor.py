@@ -580,36 +580,42 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         ``do_get`` on one forwards straight back to the upstream via
         ``resolve_chunk_data`` (the same array_id swap).
 
-        Falls back to the default local planner only when the upstream call fails
-        (unreachable / too-old upstream) so ``GetFlightInfo`` still returns a
-        (best-effort) plan -- never worse than a non-proxy adapter.
+        Falls back to the default local planner when the upstream call fails OR
+        its response can't be parsed (unreachable / too-old / unexpected upstream)
+        so ``GetFlightInfo`` still returns a (best-effort) plan -- never worse than
+        a non-proxy adapter.
         """
         try:
             info = self._upstream_flight_info(request_desc)
+            up_desc = TensorDescriptor.FromString(info.descriptor.command)
+            endpoints = []
+            for ep in info.endpoints:
+                ticket = TensorTicket.FromString(ep.ticket.ticket)
+                bounds = ChunkBounds.FromString(ep.app_metadata)
+                # Map the chunk's OWN upstream array_id local-ward -- decode it
+                # rather than blanket-stamping self.array_id, so a chunk_id the
+                # upstream keyed to a different (e.g. sibling-field) array_id still
+                # rewrites to the right local id. rewrite_chunk_id_array_id touches
+                # only the array_id field, so bounds/scale bytes are preserved and
+                # a later do_get forwards the chunk_id back verbatim.
+                upstream_aid, _ = decode_chunk_id(ticket.chunk_id)
+                local_chunk_id = rewrite_chunk_id_array_id(
+                    ticket.chunk_id, self._to_local_array_id(upstream_aid)
+                )
+                endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
+            return TensorReadPlan(
+                descriptor=self._localize_descriptor(up_desc),
+                chunk_endpoints=endpoints,
+            )
         except Exception as exc:
             logger.debug(
-                "upstream get_flight_info failed for %s (%r); falling back to the "
-                "local read planner",
+                "upstream read-plan forwarding failed for %s (%r); falling back to "
+                "the local read planner",
                 self.array_id,
                 exc,
                 exc_info=True,
             )
             return super().get_read_plan(request_desc)
-
-        up_desc = TensorDescriptor.FromString(info.descriptor.command)
-        endpoints = []
-        for ep in info.endpoints:
-            ticket = TensorTicket.FromString(ep.ticket.ticket)
-            bounds = ChunkBounds.FromString(ep.app_metadata)
-            # Swap only the array_id (upstream->local); bounds/scale bytes are
-            # untouched, so a scaled chunk_id keeps its scale suffix and a later
-            # do_get forwards it back verbatim.
-            local_chunk_id = rewrite_chunk_id_array_id(ticket.chunk_id, self.array_id)
-            endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
-        return TensorReadPlan(
-            descriptor=self._localize_descriptor(up_desc),
-            chunk_endpoints=endpoints,
-        )
 
     def _upstream_flight_info(self, request_desc: TensorDescriptor):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.

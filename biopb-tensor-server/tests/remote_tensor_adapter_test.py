@@ -350,6 +350,51 @@ class TestRemoteTensorProxy:
         plan = adapter.get_read_plan(req)  # must not raise
         assert len(plan.chunk_endpoints) >= 1
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_read_plan_falls_back_on_unparseable_upstream_endpoint(self):
+        """A malformed upstream endpoint must not blow up the whole plan: the
+        parse loop is guarded, so it falls back to the local planner."""
+        from types import SimpleNamespace
+
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="hpc__aics",
+            upstream_location="grpc://localhost:1",
+            upstream_source_id="aics",
+        )
+        adapter.seed_catalog(
+            upstream_tensors=[
+                {
+                    "array_id": "aics",
+                    "dim_labels": ["z", "y", "x"],
+                    "shape": [3, 40, 50],
+                    "chunk_shape": [1, 40, 50],
+                    "dtype": "<i2",
+                }
+            ],
+            metadata={},
+            data_resident=True,
+        )
+        # A valid descriptor but a junk endpoint (no .ticket) -> the parse loop
+        # raises inside the guarded block.
+        valid_cmd = adapter.get_tensor_descriptor().SerializeToString()
+        fake_info = SimpleNamespace(
+            descriptor=SimpleNamespace(command=valid_cmd),
+            endpoints=[SimpleNamespace()],  # missing .ticket
+        )
+        adapter._upstream_flight_info = lambda req: fake_info
+
+        req = TensorDescriptor(
+            array_id="hpc__aics",
+            dim_labels=["z", "y", "x"],
+            shape=[3, 40, 50],
+            dtype="<i2",
+        )
+        plan = adapter.get_read_plan(req)  # must not raise -> local planner
+        assert len(plan.chunk_endpoints) >= 1
+
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
 
