@@ -673,7 +673,7 @@ class OmeZarrAdapter(ZarrAdapter):
         otherwise a dimensionless (relative) downsample factor, so unit-less
         axes (and channel/index axes) get ``0.0`` / ``""``. Returns ``None``
         when no axis declares a unit (no physical information). See
-        ``SourceAdapter.get_physical_scale``.
+        ``TensorAdapter.get_physical_scale``.
         """
         try:
             multiscales = self.ome_metadata.get("multiscales", [])

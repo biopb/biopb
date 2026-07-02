@@ -86,7 +86,7 @@ level 0 is full resolution. The client reads each advertised level via the norma
 `scale_hint` path. Two sources of levels (`TensorFlightServer._advertised_pyramid`):
 
 - **Native** — adapters that ship a real on-disk pyramid override
-  `SourceAdapter.get_native_pyramid_levels()` (only `OmeZarrAdapter` today) to
+  `TensorAdapter.get_native_pyramid_levels()` (only `OmeZarrAdapter` today) to
   return one `native=True`, `reduction_method="precompute"` level per multiscales
   dataset, so the client requests the precomputed level directly. Each level's
   `scale_hint` is the value `_find_level_for_scale` matches on, so it round-trips.
