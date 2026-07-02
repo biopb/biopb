@@ -20,7 +20,17 @@ function getPathParts(url: string): string[] {
   if (!url) return [];
   try {
     const parsed = new URL(url);
-    return parsed.pathname.split("/").filter(Boolean);
+    const path = parsed.pathname.split("/").filter(Boolean);
+    // Authority URLs (remote tensor-server mirrors "grpc://host:port/remote/path",
+    // "s3://bucket/key", …) surface the endpoint "<protocol>//<host>" as the root,
+    // so mirrored sources nest by their remote filepath under an endpoint node
+    // instead of collapsing into a flat "grpc:" node (biopb/biopb#297). Local
+    // file:// has an empty host, so it is unchanged (just its path). Mirror of the
+    // napari plugin's _get_path_parts — keep the two behaviorally in lockstep.
+    if (parsed.host) {
+      return [`${parsed.protocol}//${parsed.host}`, ...path];
+    }
+    return path;
   } catch {
     return url.split("/").filter(Boolean);
   }

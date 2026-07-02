@@ -25,6 +25,52 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class TestGetPathParts:
+    """source_url -> tree path parts, incl. remote authority roots (biopb/biopb#297)."""
+
+    @staticmethod
+    def _parts(url):
+        from biopb_mcp.tensor_browser._widget import _get_path_parts
+
+        return _get_path_parts(url)
+
+    def test_local_file_url_is_just_its_path(self):
+        assert self._parts("file:///home/jiyu/data/img.tif") == [
+            "home",
+            "jiyu",
+            "data",
+            "img.tif",
+        ]
+
+    def test_bare_posix_path(self):
+        assert self._parts("/data/cells/img.tif") == ["data", "cells", "img.tif"]
+
+    def test_remote_grpc_endpoint_is_the_root(self):
+        assert self._parts("grpc://mantis-060:8815/labs/Yu/exp1/img.ome.tif") == [
+            "grpc://mantis-060:8815",
+            "labs",
+            "Yu",
+            "exp1",
+            "img.ome.tif",
+        ]
+
+    def test_remote_alias_endpoint_root(self):
+        assert self._parts("grpc://lab/data/x.tif") == ["grpc://lab", "data", "x.tif"]
+
+    def test_s3_bucket_nests_under_endpoint(self):
+        assert self._parts("s3://bucket/key/img.zarr") == [
+            "s3://bucket",
+            "key",
+            "img.zarr",
+        ]
+
+    def test_windows_drive_letter_dropped(self):
+        assert self._parts("file:///C:/Users/me/img.tif") == ["Users", "me", "img.tif"]
+
+    def test_empty_url(self):
+        assert self._parts("") == []
+
+
 @pytest.fixture
 def widget(make_napari_viewer, monkeypatch):
     from qtpy.QtCore import QTimer
