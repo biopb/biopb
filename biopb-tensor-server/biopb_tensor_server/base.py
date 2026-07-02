@@ -436,10 +436,18 @@ class TensorAdapter(ABC):
         applies everywhere else, so an empty/partial ``chunk_shape`` reads
         identically to one that was advertised.
 
+        An *unresolved* descriptor (empty shape/dtype -- e.g. a not-yet-hydrated
+        cloud/remote source) is rejected up front: the fallback would otherwise
+        reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
+        illegible ``TypeError``. ``require_resolved`` converts it to a clean
+        ``SourceUnresolvedError`` at this read-planning boundary, exactly as
+        ``get_arrow_schema`` and ``_get_read_plan`` already do.
+
         Returns:
             Tuple of chunk dimensions (e.g., (64, 64, 64) for 3D chunks)
         """
         desc = self.get_tensor_descriptor()
+        require_resolved(desc)
         chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
         shape = tuple(int(dim) for dim in desc.shape)
         if len(chunk_shape) == len(shape):

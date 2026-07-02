@@ -367,6 +367,25 @@ class TestEmptyChunkShapeFallback:
         )
         assert adapter.get_chunk_size() == (50, 50)
 
+    def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
+        # An unresolved descriptor (shape known, dtype still empty) must fail the
+        # read-planning boundary cleanly, not blow up on np.dtype("") in the
+        # default-grid fallback (biopb/biopb#292 follow-up).
+        from biopb_tensor_server.errors import SourceUnresolvedError
+
+        adapter = self._StubTensorAdapter(
+            [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
+        )
+        with pytest.raises(SourceUnresolvedError):
+            adapter.get_chunk_size()
+
+    def test_unresolved_empty_shape_raises_source_unresolved(self):
+        from biopb_tensor_server.errors import SourceUnresolvedError
+
+        adapter = self._StubTensorAdapter([], "", [])
+        with pytest.raises(SourceUnresolvedError):
+            adapter.get_chunk_size()
+
 
 class TestGetPhysicalScale:
     """Per-dim physical-scale summary folded onto the descriptor (issue #31)."""
