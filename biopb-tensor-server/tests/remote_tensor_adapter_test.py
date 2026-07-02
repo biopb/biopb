@@ -1041,6 +1041,60 @@ def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
     assert adapter._client is None
 
 
+def test_get_tensor_descriptor_served_from_seed_without_rpc():
+    """B2 (biopb/biopb#266): the serve-path get_tensor_descriptor reads the
+    seeded structural descriptor -- no get_descriptor RPC -- so a bulk-mirrored
+    GetFlightInfo makes no upstream call for the descriptor. Falls back to a live
+    fetch only when a tensor is not in the seed (covered by the e2e proxy tests,
+    which register without seeding)."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    adapter.seed_catalog(
+        [
+            {
+                "array_id": "img",
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "chunk_shape": [4, 4],
+                "dtype": "uint8",
+            },
+            {
+                "array_id": "img/A2",
+                "dim_labels": ["y", "x"],
+                "shape": [2, 2],
+                "chunk_shape": [2, 2],
+                "dtype": "uint16",
+            },
+        ],
+        {"ome": "meta"},
+    )
+
+    # default (first) tensor
+    desc = adapter.get_tensor_descriptor()
+    assert desc.array_id == "lab__img"
+    assert list(desc.shape) == [4, 4]
+    assert desc.dtype == "uint8"
+    # lean like a native descriptor -- the local server fills these itself
+    assert not desc.metadata_json
+    assert not desc.pyramid
+
+    # a specific field via the tensor-layer view, also from the seed
+    view = adapter.get_tensor_adapter("lab__img/A2")
+    fdesc = view.get_tensor_descriptor()
+    assert fdesc.array_id == "lab__img/A2"
+    assert list(fdesc.shape) == [2, 2]
+    assert fdesc.dtype == "uint16"
+
+    # neither the source adapter nor the view ever dialed the upstream
+    assert adapter._client is None
+    assert view._client is None
+
+
 def test_seed_catalog_empty_metadata_normalizes_to_dict():
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
