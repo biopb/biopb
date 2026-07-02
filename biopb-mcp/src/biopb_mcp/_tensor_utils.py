@@ -381,6 +381,24 @@ def build_layer_scale(
         return None, None
 
 
+def _to_native_byteorder(levels):
+    """Return *levels* with any non-native-endian array swapped to native order.
+
+    Workaround for a napari thumbnail bug (biopb/biopb#296): a big-endian array
+    (e.g. a FITS ``>i2`` source, preserved end-to-end by the #293 binary wire
+    schema) trips ``np.maximum(data, 0, out=data, dtype=data.dtype)`` in napari's
+    ``convert_to_uint8`` -- numpy rejects a ufunc ``dtype=`` that carries byte
+    order. The ``astype`` is lazy on a dask array, so the source bytes are never
+    materialized here and the values are unchanged (only the in-memory byte order
+    napari sees). Native levels pass through untouched. Remove when napari handles
+    non-native byte order upstream.
+    """
+    return [
+        lv.astype(lv.dtype.newbyteorder("=")) if not lv.dtype.isnative else lv
+        for lv in levels
+    ]
+
+
 def add_tensor_layer(
     viewer,
     client: TensorFlightClient,
@@ -420,6 +438,14 @@ def add_tensor_layer(
         source_desc=source_desc,
         config=config,
     )
+    # Present napari native-byte-order levels (biopb/biopb#296). napari's
+    # thumbnail path (convert_to_uint8) does np.maximum(data, 0, out=data,
+    # dtype=data.dtype), and numpy rejects a ufunc dtype= carrying byte order ->
+    # TypeError on a big-endian array (e.g. a FITS '>i2' source, now preserved
+    # end-to-end by the #293 binary wire schema). The swap is lazy and only
+    # affects what napari sees; the wire/source bytes stay faithful. Remove once
+    # napari handles non-native byte order (tracked upstream from #296).
+    levels = _to_native_byteorder(levels)
     # Levels are in canonical [..., Z, Y, X] order, so the scale maps onto the
     # output rank directly -- no reordering to keep in sync.
     out_ndim = levels[0].ndim

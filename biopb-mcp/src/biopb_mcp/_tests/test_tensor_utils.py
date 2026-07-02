@@ -564,3 +564,43 @@ class TestOriginInitialView:
         with _origin_initial_view(MagicMock()):
             pass
         assert not hasattr(MagicMock, "_go_to_center_step")
+
+
+class TestToNativeByteorder:
+    """#296: napari's thumbnail convert_to_uint8 rejects a non-native-endian
+    array, so add_tensor_layer normalizes levels to native byte order first."""
+
+    def test_swaps_big_endian_and_preserves_values(self):
+        import numpy as np
+
+        from biopb_mcp._tensor_utils import _to_native_byteorder
+
+        be = (np.arange(6, dtype=">i2").reshape(2, 3) - 1).astype(">i2")
+        lv_be = da.from_array(be, chunks=(2, 3))
+        lv_native = da.from_array(np.arange(6, dtype="<i2").reshape(2, 3))
+
+        out = _to_native_byteorder([lv_be, lv_native])
+
+        # Big-endian level -> native order, values identical (lazy swap).
+        assert out[0].dtype.isnative
+        np.testing.assert_array_equal(out[0].compute(), be)
+        # A native level passes through untouched (same object).
+        assert out[1] is lv_native
+
+    def test_unblocks_napari_convert_to_uint8(self):
+        import numpy as np
+
+        pytest.importorskip("napari")
+        from napari.layers.utils.layer_utils import convert_to_uint8
+
+        from biopb_mcp._tensor_utils import _to_native_byteorder
+
+        be = (np.arange(6, dtype=">i2").reshape(2, 3) * 5000).astype(">i2")
+        # The underlying napari bug (#296): the raw big-endian array trips the
+        # ufunc byte-order TypeError -- the reason this workaround exists.
+        with pytest.raises(TypeError):
+            convert_to_uint8(be.copy())
+        # After normalization the (native) array converts fine.
+        (native_lv,) = _to_native_byteorder([da.from_array(be, chunks=be.shape)])
+        out = convert_to_uint8(native_lv.compute())
+        assert out.dtype == np.uint8
