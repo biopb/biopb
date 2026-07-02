@@ -30,7 +30,8 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+import threading
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -57,6 +58,67 @@ logger = logging.getLogger(__name__)
 # credentials profile -- storage_type="biopb-tensor" -- is the multi-upstream
 # path, wired in the §3 expansion slice).
 _UPSTREAM_TOKEN_ENV = "BIOPB_UPSTREAM_TENSOR_TOKEN"
+
+
+# Process-wide pool of upstream clients, keyed by (endpoint, token) so N mirrored
+# sources of one upstream share a single connection instead of each opening its
+# own (biopb/biopb#266 B1, the former #249). Distinct tokens stay isolated (they
+# authenticate as different principals). Entries live until the process exits or
+# an unreachable failure evicts one: there is no per-source teardown (nothing
+# closes an upstream client today -- an adapter is dropped by GC), so a handful
+# of endpoints means a handful of clients. A dead entry is evicted on failure and
+# the next access rebuilds it.
+_CLIENT_POOL: Dict[Tuple[str, Optional[str]], Any] = {}
+_CLIENT_POOL_LOCK = threading.Lock()
+
+
+def _pooled_upstream_client(location: str, token: Optional[str]):
+    """Return the shared ``TensorFlightClient`` for ``(location, token)``.
+
+    Built lazily on first use and cached process-wide so mirrored sources of the
+    same upstream reuse one connection (biopb/biopb#266 B1). Construction happens
+    under the pool lock; ``TensorFlightClient`` opens its socket lazily, so the
+    critical section is short.
+    """
+    key = (location, token)
+    with _CLIENT_POOL_LOCK:
+        client = _CLIENT_POOL.get(key)
+        if client is None:
+            from biopb.tensor import TensorFlightClient
+
+            client = TensorFlightClient(location, cache_bytes=0, token=token)
+            _CLIENT_POOL[key] = client
+        return client
+
+
+def _evict_pooled_upstream_client(location: str, token: Optional[str]) -> None:
+    """Drop the pooled client for ``(location, token)`` so the next access rebuilds.
+
+    Called when an upstream call fails: the shared connection may be dead, so
+    remove it and best-effort close it. Other adapters still holding a reference
+    to the old client rediscover the failure on their own next call and re-evict
+    (idempotent) -- the same per-adapter reconnect behavior as before pooling.
+    """
+    key = (location, token)
+    with _CLIENT_POOL_LOCK:
+        client = _CLIENT_POOL.pop(key, None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _clear_client_pool() -> None:
+    """Close and drop all pooled clients (test isolation / shutdown helper)."""
+    with _CLIENT_POOL_LOCK:
+        clients = list(_CLIENT_POOL.values())
+        _CLIENT_POOL.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
@@ -211,17 +273,17 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
 
     @property
     def client(self):
-        """Lazily-built ``TensorFlightClient`` to the upstream (cache_bytes=0).
+        """The upstream ``TensorFlightClient``, shared per endpoint (cache_bytes=0).
 
-        Built lazily so constructing the adapter (e.g. at registration) does not
-        open a socket; the connection opens on the first metadata/chunk call.
+        Resolved from a process-wide pool keyed by ``(endpoint, token)`` so every
+        mirrored source of one upstream reuses a single connection
+        (biopb/biopb#266 B1). Still cached on ``self`` (the first access binds the
+        pooled client) so ``self._client is None`` keeps meaning "this adapter has
+        not dialed yet". Lazy: constructing/registering the adapter opens no
+        socket; the connection opens on the first metadata/chunk call.
         """
         if self._client is None:
-            from biopb.tensor import TensorFlightClient
-
-            self._client = TensorFlightClient(
-                self._upstream_location, cache_bytes=0, token=self._token
-            )
+            self._client = _pooled_upstream_client(self._upstream_location, self._token)
         return self._client
 
     def _to_upstream_array_id(self, local_array_id: str) -> str:
@@ -254,7 +316,10 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     def _mark_unreachable(self, exc: Exception) -> None:
         """Record an upstream connectivity failure (catalog-surface degradation)."""
         self._reachable = False
-        self._client = None  # drop the dead client so the next call reconnects
+        # Drop this adapter's reference and evict the shared pooled client so the
+        # next call (from any mirrored source of this endpoint) reconnects.
+        self._client = None
+        _evict_pooled_upstream_client(self._upstream_location, self._token)
         logger.warning(
             "upstream tensor server %s unreachable: %s", self._upstream_location, exc
         )

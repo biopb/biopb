@@ -1041,6 +1041,68 @@ def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
     assert adapter._client is None
 
 
+def test_upstream_clients_are_pooled_per_endpoint(monkeypatch):
+    """B1 (biopb/biopb#266): mirrored sources of one upstream share a single
+    client; distinct (endpoint, token) get distinct clients."""
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    built = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None):
+            built.append((location, token))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    a = rt.RemoteTensorAdapter("lab__a", "grpc://up:1", "a")
+    b = rt.RemoteTensorAdapter("lab__b", "grpc://up:1", "b")  # same endpoint+token
+    assert a.client is b.client  # one shared connection
+    assert built == [("grpc://up:1", None)]  # built exactly once
+
+    c = rt.RemoteTensorAdapter("lab__c", "grpc://up:2", "c")  # other endpoint
+    assert c.client is not a.client
+    d = rt.RemoteTensorAdapter("lab__d", "grpc://up:1", "d", token="t")  # other token
+    assert d.client is not a.client
+    assert len(built) == 3
+
+
+def test_mark_unreachable_evicts_shared_client(monkeypatch):
+    """A failure evicts (and closes) the pooled client so the next access rebuilds
+    it; another adapter keeps its own reference until its own next failure."""
+    import biopb.tensor as bt
+    from biopb_tensor_server.adapters import remote_tensor as rt
+
+    closed = []
+
+    class _FakeClient:
+        def __init__(self, location, cache_bytes=0, token=None):
+            pass
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(bt, "TensorFlightClient", _FakeClient)
+    rt._clear_client_pool()
+
+    a = rt.RemoteTensorAdapter("lab__a", "grpc://up:1", "a")
+    b = rt.RemoteTensorAdapter("lab__b", "grpc://up:1", "b")
+    shared = a.client
+    assert b.client is shared
+
+    a._mark_unreachable(RuntimeError("down"))
+    assert a._client is None  # dropped this adapter's reference
+    assert shared in closed  # evicted from the pool and closed
+    assert b._client is shared  # b keeps its stale ref until its own next failure
+
+    # the next access rebuilds a fresh shared client (not the closed one)
+    assert a.client is not shared
+
+
 def test_get_tensor_descriptor_served_from_seed_without_rpc():
     """B2 (biopb/biopb#266): the serve-path get_tensor_descriptor reads the
     seeded structural descriptor -- no get_descriptor RPC -- so a bulk-mirrored
