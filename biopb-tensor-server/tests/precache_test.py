@@ -320,6 +320,46 @@ class TestWarming:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
+    def test_skips_remote_source(self, tmp_path):
+        # #299: a non-local (remote-tensor proxy) source must be skipped before
+        # any tensor is read -- warming it would speculatively pull every chunk
+        # across the network from the upstream, and the proxy does not implement
+        # has_native_pyramid() so it would mis-warm a pyramidal upstream.
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            server = self._make_server_with_zarr(tmp_path, (8192, 8192))
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+
+            listed = []
+
+            class _RemoteAdapter:
+                # A caching-proxy source advertises a grpc:// source_url.
+                _source_url = "grpc://upstream:8815/img"
+
+                def list_tensor_descriptors(self):
+                    listed.append(True)  # must NOT be reached
+                    return []
+
+            server._get_source_adapter = lambda sid: _RemoteAdapter()
+
+            preempted = worker._process_source("remote-src")
+
+            assert preempted is False
+            assert listed == []  # skipped before enumerating the source's tensors
+            stats = CacheManager.get_instance().stats()
+            assert stats.misses == 0
+            assert stats.total_entries == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
     def test_memory_backend_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
