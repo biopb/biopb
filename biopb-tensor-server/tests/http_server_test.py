@@ -433,12 +433,13 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         # Mock do_get to return a table
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()
@@ -454,12 +455,13 @@ class TestChunkEndpoint:
         tc, mock_fc = auth_client
         ticket_hex = self._make_ticket_hex()
 
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()
@@ -476,12 +478,13 @@ class TestChunkEndpoint:
         tc, mock_fc = auth_client
         ticket_hex = self._make_ticket_hex()
 
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()

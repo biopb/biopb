@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pytest
 from biopb_tensor_server.cache import (
@@ -1110,7 +1111,8 @@ class TestSchemaPooling:
         return Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
 
     def test_alternating_schemas_pooled_separately(self):
-        """Alternating dtype writes create separate pools but not many small segments."""
+        """Alternating dtype writes share the unified binary schema, so they pool
+        together into few segments (biopb/biopb#293) -- not one segment per write."""
         cache_dir = self._make_temp_cache_dir()
         # Large segment size to allow many entries per segment
         config = ArrowFileConfig(
@@ -1121,23 +1123,12 @@ class TestSchemaPooling:
 
         backend = ArrowFileBackend(config)
 
-        # Create batches with different schemas (different dtypes)
-        int_data = pa.RecordBatch.from_arrays(
-            [
-                pa.array([[1, 2, 3]], type=pa.list_(pa.int32())),
-                pa.array([[3]]),
-                pa.array(["int32"]),
-            ],
-            ["data", "shape", "dtype"],
-        )
-        float_data = pa.RecordBatch.from_arrays(
-            [
-                pa.array([[1.0, 2.0, 3.0]], type=pa.list_(pa.float32())),
-                pa.array([[3]]),
-                pa.array(["float32"]),
-            ],
-            ["data", "shape", "dtype"],
-        )
+        # Different dtypes now all serialize to the ONE unified binary chunk
+        # schema (raw bytes + dtype string), so they share a pool.
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        int_data = pack_chunk_batch(np.array([1, 2, 3], dtype=np.int32))
+        float_data = pack_chunk_batch(np.array([1.0, 2.0, 3.0], dtype=np.float32))
 
         # Write alternating entries with different schemas
         # Each schema should get its own pool/segment

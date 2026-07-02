@@ -181,6 +181,76 @@ class TestRemoteTensorProxy:
         finally:
             upstream.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_big_endian_source_with_empty_seeded_chunk_shape(self):
+        """The exact reported failure: a big-endian upstream source mirrored with
+        a lean (empty chunk_shape) catalog seed reads end-to-end through the proxy.
+
+        Reproduces BOTH #292 (empty chunk_shape from the lean metadata-DB STRUCT
+        -> read-plan IndexError) and #293 (big-endian '>i2' -> Arrow byte-swap) at
+        once -- the way the mirrored AICS/FITS sources failed.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/be.zarr"
+            src = (
+                np.arange(3 * 40 * 50, dtype="<i2").reshape(3, 40, 50) - 1000
+            ).astype(">i2")
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype=">i2"
+            )
+            za[:] = src
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source(
+                "aics",
+                ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
+            )
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__aics",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="aics",
+                )
+                # Seed like the reconcile does from the metadata-DB STRUCT: an
+                # EMPTY chunk_shape (the #292 trigger).
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "aics",
+                            "dim_labels": ["z", "y", "x"],
+                            "shape": [3, 40, 50],
+                            "chunk_shape": [],
+                            "dtype": ">i2",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+                proxy = TensorFlightServer("grpc://localhost:0")
+                proxy.register_source("hpc__aics", adapter)
+                _serve(proxy)
+                try:
+                    client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
+                    darr = client.get_tensor("hpc__aics")  # was IndexError (#292)
+                    assert darr.shape == (3, 40, 50)
+                    # do_get used to raise ArrowNotImplementedError (#293).
+                    np.testing.assert_array_equal(
+                        darr.compute().astype("<i2"), src.astype("<i2")
+                    )
+                    client.close()
+                finally:
+                    proxy.shutdown()
+            finally:
+                upstream.shutdown()
+
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
 

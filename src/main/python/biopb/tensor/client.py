@@ -670,12 +670,10 @@ def _fetch_chunk_distributed(
         reader = client.do_get(
             flight.Ticket(ticket.SerializeToString()), options=call_options
         )
-        table = reader.read_all()
-        arr = table.column("data").to_numpy()[0]  # First row's data list
-
-        # Get shape from shape column (list<int64>)
-        shape = tuple(table.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
+        # do_get returns a single-row unified binary batch [data, shape, dtype];
+        # decode it exactly like the cache-file fast path (raw bytes reinterpreted
+        # via the dtype string, so endianness round-trips -- biopb/biopb#293).
+        arr = _array_from_unified_batch(reader.read_all().to_batches()[0])
 
     # Cache the result (skipped when caching is disabled)
     if cache is not None:

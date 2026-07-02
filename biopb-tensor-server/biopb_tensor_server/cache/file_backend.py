@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Literal, Optional, Tuple
 
-import numpy as np
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
@@ -99,87 +98,6 @@ CACHE_KEY_FIELD = "__biopb_cache_key__"
 # parse; the server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
 CACHE_FILE_FORMAT_VERSION = 1
-
-
-def _cast_to_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
-    """Cast typed batch to unified binary schema for caching.
-
-    Uses buffer-based casting to bypass Arrow's logical type validation.
-
-    Args:
-        batch: RecordBatch with schema [data: list<dtype>, shape: list<int64>, dtype: string]
-
-    Returns:
-        RecordBatch with unified schema [data: binary, shape: list<int64>, dtype: string]
-    """
-    data_col = batch.column("data")
-
-    # Get buffers from the list array
-    # ListArray: buffers = [validity, offsets], children = [values]
-    # Values: primitive array with buffers = [validity, data]
-    values = data_col.values
-
-    # Create binary array from values buffer
-    # Binary needs: [validity, offsets, data]
-    # For single binary blob: offsets = [0, N]
-    values_buf = values.buffers()[1]
-    num_bytes = values_buf.size
-    offsets_buf = pa.py_buffer(np.array([0, num_bytes], dtype=np.int32))
-
-    binary_arr = pa.Array.from_buffers(
-        pa.binary(),
-        1,  # one row (single binary blob)
-        [None, offsets_buf, values_buf],
-    )
-
-    return pa.RecordBatch.from_arrays(
-        [binary_arr, batch.column("shape"), batch.column("dtype")],
-        ["data", "shape", "dtype"],
-    )
-
-
-def _cast_from_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
-    """Cast unified binary batch back to typed schema for client consumption.
-
-    Uses buffer-based casting to bypass Arrow's logical type validation.
-
-    Args:
-        batch: RecordBatch with unified schema [data: binary, shape: list<int64>, dtype: string]
-
-    Returns:
-        RecordBatch with typed schema [data: list<dtype>, shape: list<int64>, dtype: string]
-    """
-    dtype_str = batch.column("dtype").to_pylist()[0]
-    dtype = np.dtype(dtype_str)
-    arrow_dtype = pa.from_numpy_dtype(dtype)
-
-    binary_col = batch.column("data")
-
-    # Binary array: buffers = [validity, offsets, data]
-    binary_bufs = binary_col.buffers()
-    data_buf = binary_bufs[2]  # the actual bytes
-
-    # Number of elements from byte length
-    num_elements = len(data_buf) // dtype.itemsize
-
-    # Create values array from data buffer directly
-    values_arr = pa.Array.from_buffers(arrow_dtype, num_elements, [None, data_buf])
-
-    # Create list array: buffers = [validity, offsets], children = [values]
-    # For single list containing all elements: offsets = [0, num_elements]
-    list_offsets = pa.py_buffer(np.array([0, num_elements], dtype=np.int32))
-
-    list_arr = pa.ListArray.from_buffers(
-        pa.list_(arrow_dtype),
-        1,  # one row
-        [None, list_offsets],
-        children=[values_arr],
-    )
-
-    return pa.RecordBatch.from_arrays(
-        [list_arr, batch.column("shape"), batch.column("dtype")],
-        ["data", "shape", "dtype"],
-    )
 
 
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -895,9 +813,17 @@ class ArrowFileBackend(CacheBackend):
                 # (issue #5). POSIX keeps the zero-copy mmap read.
                 if self._copy_on_read:
                     batch = _copy_batch_off_mmap(batch)
-                # Cast from unified binary schema back to typed schema
-                typed_batch = _cast_from_unified_schema(batch)
-                return typed_batch
+                # Serve the unified binary schema as-is (biopb/biopb#293); just
+                # strip the internal cache-key column so the wire batch is the
+                # clean [data, shape, dtype]. No binary->typed conversion.
+                return pa.RecordBatch.from_arrays(
+                    [
+                        batch.column("data"),
+                        batch.column("shape"),
+                        batch.column("dtype"),
+                    ],
+                    names=["data", "shape", "dtype"],
+                )
 
         return None
 
@@ -1224,11 +1150,12 @@ class ArrowFileBackend(CacheBackend):
                     if not self._evict_segment_sieve_k():
                         break
 
-                # Cast to unified schema (all dtypes share a pool) and attach the
-                # cache key as a per-row column (NOT schema metadata): Arrow IPC
-                # persists the schema once per segment, so schema metadata can't
-                # identify individual batches on rebuild.
-                unified_batch = _cast_to_unified_schema(data)
+                # compute_fn already emits the unified binary schema
+                # (biopb/biopb#293), so store it directly -- no typed->binary cast.
+                # Attach the cache key as a per-row column (NOT schema metadata):
+                # Arrow IPC persists the schema once per segment, so schema
+                # metadata can't identify individual batches on rebuild.
+                unified_batch = data
                 key_col = pa.array([key], type=pa.binary())
                 batch_with_key = pa.RecordBatch.from_arrays(
                     list(unified_batch.columns) + [key_col],

@@ -167,13 +167,10 @@ class TestCachedSourceAdapter:
         chunk_id = encode_chunk_id("test_resolve", bounds)
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
-        # Verify data matches - data column is list<uint16>
-        data_col = batch.column("data")
-        # Extract values from list array
-        arr = data_col.values.to_numpy()
-        shape = tuple(batch.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
+        # Verify data matches - the chunk is the unified binary schema now.
+        from biopb_tensor_server.base import unpack_chunk_array
 
+        arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
 
         CacheManager.reset()
@@ -206,12 +203,12 @@ class TestCachedSourceAdapter:
         CacheManager.reset()
 
     def test_write_chunk_with_file_backend_schema(self):
-        """Regression test: write_chunk batch schema must be compatible with _cast_to_unified_schema.
+        """Regression test: write_chunk must emit the unified binary chunk schema.
 
-        The batch must use ListArray (pa.array([flattened_data])) not primitive array,
-        since _cast_to_unified_schema expects data_col.values to be accessible.
-
-        Bug: AttributeError: 'pyarrow.lib.FloatArray' object has no attribute 'values'
+        A cache-backed source stores the batch it will later serve verbatim
+        (resolve_chunk_data returns entry.data), so write_chunk must produce the
+        same [data: binary, shape, dtype] wire schema every read path expects
+        (biopb/biopb#293).
         """
         import shutil
         import tempfile
@@ -245,23 +242,19 @@ class TestCachedSourceAdapter:
             chunk_id = encode_chunk_id("test_file_schema", bounds)
             cache_manager = CacheManager.get_instance()
 
-            # Read back via cache backend (triggers _cast_from_unified_schema)
+            # Read back via cache backend (served as the unified binary schema)
             entry = cache_manager.get_or_acquire(chunk_id, lambda: (None, 0))
             assert entry.state.name == "READY"
 
-            # Verify batch schema: should be [data: list<dtype>, shape: list<int64>, dtype: string]
+            # Verify batch schema: [data: binary, shape: list<int64>, dtype: string]
             batch = entry.data
             assert batch.schema.names == ["data", "shape", "dtype"]
-            assert isinstance(batch.column("data"), pa.ListArray)
+            assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            flat_data = batch.column("data").to_pylist()[0]
-            shape = batch.column("shape").to_pylist()[0]
-            dtype_str = batch.column("dtype").to_pylist()[0]
+            from biopb_tensor_server.base import unpack_chunk_array
 
-            reconstructed = np.array(flat_data, dtype=np.dtype(dtype_str)).reshape(
-                shape
-            )
+            reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
             assert reconstructed.dtype == data.dtype
 
@@ -637,10 +630,9 @@ class TestChunkUpload:
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        reconstructed = np.array(
-            stored_batch.column("data").to_pylist()[0],
-            dtype=np.dtype(stored_batch.column("dtype").to_pylist()[0]),
-        ).reshape(stored_batch.column("shape").to_pylist()[0])
+        from biopb_tensor_server.base import unpack_chunk_array
+
+        reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
         assert np.array_equal(reconstructed, data)
 

@@ -1224,28 +1224,27 @@ public class TensorFlightClient implements AutoCloseable {
             try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
                 double[] values = new double[0];
                 while (stream.next()) {
-                    List<FieldVector> vectors = stream.getRoot().getFieldVectors();
-                    if (vectors.isEmpty()) {
-                        throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
-                    }
-
+                    // Unified binary chunk schema (biopb/biopb#293): "data" is one
+                    // opaque byte[] per row, "dtype" names how to reinterpret it.
                     FieldVector dataVector = stream.getRoot().getVector("data");
-                    if (dataVector == null) {
-                        throw new IllegalStateException("Chunk payload missing 'data' column");
+                    FieldVector dtypeVector = stream.getRoot().getVector("dtype");
+                    if (dataVector == null || dtypeVector == null) {
+                        throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
                     }
 
                     int rowCount = stream.getRoot().getRowCount();
                     for (int row = 0; row < rowCount; row++) {
                         Object rowObj = dataVector.getObject(row);
-                        if (!(rowObj instanceof List)) {
-                            throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                        if (!(rowObj instanceof byte[])) {
+                            throw new IllegalStateException("Data column value is not binary: "
+                                    + (rowObj == null ? "null" : rowObj.getClass()));
                         }
-                        List<?> dataList = (List<?>) rowObj;
+                        Object dtypeObj = dtypeVector.getObject(row);
+                        double[] decoded = decodeChunkBytes((byte[]) rowObj,
+                                dtypeObj == null ? "" : dtypeObj.toString());
                         int offset = values.length;
-                        values = Arrays.copyOf(values, offset + dataList.size());
-                        for (int i = 0; i < dataList.size(); i++) {
-                            values[offset + i] = asDouble(dataList.get(i));
-                        }
+                        values = Arrays.copyOf(values, offset + decoded.length);
+                        System.arraycopy(decoded, 0, values, offset, decoded.length);
                     }
                 }
                 return values;
@@ -1692,30 +1691,27 @@ public class TensorFlightClient implements AutoCloseable {
         try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
             double[] values = new double[0];
             while (stream.next()) {
-                List<FieldVector> vectors = stream.getRoot().getFieldVectors();
-                if (vectors.isEmpty()) {
-                    throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
-                }
-
-                // Read "data" column - it's a ListArray with 1 row per chunk
+                // Unified binary chunk schema (biopb/biopb#293): "data" is one
+                // opaque byte[] per row, "dtype" names how to reinterpret it.
                 FieldVector dataVector = stream.getRoot().getVector("data");
-                if (dataVector == null) {
-                    throw new IllegalStateException("Chunk payload missing 'data' column");
+                FieldVector dtypeVector = stream.getRoot().getVector("dtype");
+                if (dataVector == null || dtypeVector == null) {
+                    throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
                 }
 
-                // Each row is one chunk's data as a list
                 int rowCount = stream.getRoot().getRowCount();
                 for (int row = 0; row < rowCount; row++) {
                     Object rowObj = dataVector.getObject(row);
-                    if (!(rowObj instanceof List)) {
-                        throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                    if (!(rowObj instanceof byte[])) {
+                        throw new IllegalStateException("Data column value is not binary: "
+                                + (rowObj == null ? "null" : rowObj.getClass()));
                     }
-                    List<?> dataList = (List<?>) rowObj;
+                    Object dtypeObj = dtypeVector.getObject(row);
+                    double[] decoded = decodeChunkBytes((byte[]) rowObj,
+                            dtypeObj == null ? "" : dtypeObj.toString());
                     int offset = values.length;
-                    values = Arrays.copyOf(values, offset + dataList.size());
-                    for (int i = 0; i < dataList.size(); i++) {
-                        values[offset + i] = asDouble(dataList.get(i));
-                    }
+                    values = Arrays.copyOf(values, offset + decoded.length);
+                    System.arraycopy(decoded, 0, values, offset, decoded.length);
                 }
             }
             return values;
@@ -1724,14 +1720,70 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    private static double asDouble(Object value) {
-        if (value == null) {
-            throw new IllegalStateException("Chunk payload contains null values");
+    /**
+     * Reinterpret a chunk's raw bytes as doubles per its numpy dtype string.
+     *
+     * <p>The dtype string carries byte order ('&lt;' little, '&gt;' big) and the
+     * element kind/size, so numpy-native and byte-swapped sources both decode
+     * correctly (biopb/biopb#293). Values widen to double. Unknown dtypes fall
+     * back to float32.
+     */
+    private static double[] decodeChunkBytes(byte[] raw, String dtypeStr) {
+        String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
+        java.nio.ByteOrder order = s.startsWith(">")
+                ? java.nio.ByteOrder.BIG_ENDIAN
+                : java.nio.ByteOrder.LITTLE_ENDIAN;
+        String body = s;
+        if (!body.isEmpty()) {
+            char c0 = body.charAt(0);
+            if (c0 == '<' || c0 == '>' || c0 == '|' || c0 == '=') {
+                body = body.substring(1);
+            }
         }
-        if (!(value instanceof Number)) {
-            throw new IllegalStateException("Chunk payload is not numeric: " + value.getClass().getName());
+
+        char kind;   // 'u' unsigned int, 'i' signed int, 'f' float
+        int size;    // bytes per element
+        switch (body) {
+            case "u1": case "uint8":   kind = 'u'; size = 1; break;
+            case "i1": case "int8":    kind = 'i'; size = 1; break;
+            case "u2": case "uint16":  kind = 'u'; size = 2; break;
+            case "i2": case "int16":   kind = 'i'; size = 2; break;
+            case "u4": case "uint32":  kind = 'u'; size = 4; break;
+            case "i4": case "int32":   kind = 'i'; size = 4; break;
+            case "u8": case "uint64":  kind = 'u'; size = 8; break;
+            case "i8": case "int64":   kind = 'i'; size = 8; break;
+            case "f8": case "float64": kind = 'f'; size = 8; break;
+            case "f4": case "float32":
+            default:                   kind = 'f'; size = 4; break;
         }
-        return ((Number) value).doubleValue();
+
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(raw).order(order);
+        int n = size == 0 ? 0 : raw.length / size;
+        double[] out = new double[n];
+        for (int i = 0; i < n; i++) {
+            switch (kind) {
+                case 'u':
+                    switch (size) {
+                        case 1: out[i] = buf.get() & 0xFF; break;
+                        case 2: out[i] = buf.getShort() & 0xFFFF; break;
+                        case 4: out[i] = buf.getInt() & 0xFFFFFFFFL; break;
+                        default: out[i] = (double) buf.getLong(); break; // u8
+                    }
+                    break;
+                case 'i':
+                    switch (size) {
+                        case 1: out[i] = buf.get(); break;
+                        case 2: out[i] = buf.getShort(); break;
+                        case 4: out[i] = buf.getInt(); break;
+                        default: out[i] = (double) buf.getLong(); break;
+                    }
+                    break;
+                default: // 'f'
+                    out[i] = size == 8 ? buf.getDouble() : buf.getFloat();
+                    break;
+            }
+        }
+        return out;
     }
 
     private static <T extends NativeType<T> & RealType<T>> void writeChunk(

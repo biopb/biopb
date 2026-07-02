@@ -746,22 +746,27 @@ public class TensorFlightClientTest {
                 return;
             }
 
-            // Create ListVector with Float4 inner type
-            Field innerField = new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null);
-            Field listField = new Field("data", FieldType.nullable(ArrowType.List.INSTANCE), Collections.singletonList(innerField));
-            ListVector dataVector = new ListVector(listField, allocator, null);
-            dataVector.allocateNew();
-
-            UnionListWriter writer = dataVector.getWriter();
-            writer.startList();
-            writer.setPosition(0);
+            // Unified binary chunk schema (biopb/biopb#293): data (binary) is the
+            // raw little-endian float32 bytes; dtype (utf8) says how to read them.
+            byte[] raw = new byte[values.length * 4];
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN);
             for (float v : values) {
-                writer.writeFloat4(v);
+                bb.putFloat(v);
             }
-            writer.endList();
+
+            org.apache.arrow.vector.VarBinaryVector dataVector =
+                    new org.apache.arrow.vector.VarBinaryVector("data", allocator);
+            dataVector.allocateNew();
+            dataVector.setSafe(0, raw);
             dataVector.setValueCount(1);
 
-            try (VectorSchemaRoot root = VectorSchemaRoot.of(dataVector)) {
+            org.apache.arrow.vector.VarCharVector dtypeVector =
+                    new org.apache.arrow.vector.VarCharVector("dtype", allocator);
+            dtypeVector.allocateNew();
+            dtypeVector.setSafe(0, "<f4".getBytes(StandardCharsets.UTF_8));
+            dtypeVector.setValueCount(1);
+
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(dataVector, dtypeVector)) {
                 root.setRowCount(1);
                 listener.start(root);
                 listener.putNext();
@@ -812,10 +817,10 @@ public class TensorFlightClientTest {
         }
 
         private static org.apache.arrow.vector.types.pojo.Schema createSchema(BufferAllocator allocator) {
-            // Schema: data (list<float4>)
-            Field innerField = new Field("item", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null);
-            Field listField = new Field("data", FieldType.nullable(ArrowType.List.INSTANCE), Collections.singletonList(innerField));
-            return new org.apache.arrow.vector.types.pojo.Schema(Collections.singletonList(listField));
+            // Unified binary chunk schema (biopb/biopb#293): data (binary), dtype (utf8).
+            Field dataField = new Field("data", FieldType.nullable(ArrowType.Binary.INSTANCE), null);
+            Field dtypeField = new Field("dtype", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+            return new org.apache.arrow.vector.types.pojo.Schema(Arrays.asList(dataField, dtypeField));
         }
 
         private static FlightCmd parseCmd(byte[] bytes) {

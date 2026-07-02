@@ -27,7 +27,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.base import CHUNK_WIRE_SCHEMA, SourceAdapter, TensorAdapter
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.chunk import encode_chunk_id
 
@@ -174,25 +174,22 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         if isinstance(data, pa.ChunkedArray):
             data = data.combine_chunks()
 
-        if pa.types.is_list(data.type):
-            list_arr = data
-            values = data.values
-        else:
-            offsets = pa.array([0, len(data)], type=pa.int32())
-            list_arr = pa.ListArray.from_arrays(offsets, data)
-            values = data
+        # Extract the flat value bytes regardless of whether the caller passed a
+        # list<T> or bare values, then store them as the unified binary wire
+        # schema (biopb/biopb#293) -- the same schema resolve_chunk_data serves,
+        # so a cache-backed source's uploaded chunks read back byte-identically.
+        values = data.values if pa.types.is_list(data.type) else data
 
         logical_shape = list(logical_shape)
         dtype_str = np.dtype(dtype).str
-        size_bytes = values.nbytes
+        values_buf = values.buffers()[1]  # primitive array: [validity, data]
+        size_bytes = values_buf.size
+        offsets = pa.py_buffer(np.array([0, size_bytes], dtype=np.int32))
+        data_col = pa.Array.from_buffers(pa.binary(), 1, [None, offsets, values_buf])
 
         batch = pa.RecordBatch.from_arrays(
-            [
-                list_arr,
-                pa.array([logical_shape]),
-                pa.array([dtype_str]),
-            ],
-            ["data", "shape", "dtype"],
+            [data_col, pa.array([logical_shape]), pa.array([dtype_str])],
+            schema=CHUNK_WIRE_SCHEMA,
         )
 
         entry, is_owner = cache_manager.start_compute(

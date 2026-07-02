@@ -715,11 +715,13 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
             options=client._call_options,
         )
 
-        # Read all data from the stream
-        table = reader.read_all()
+        # Read all data from the stream. do_get returns the unified binary chunk
+        # schema (biopb/biopb#293); decode it, then ensure native byte order +
+        # C-contiguous layout for the browser.
+        from biopb_tensor_server.base import unpack_chunk_array
 
-        # Convert to numpy and ensure native byte order + C-contiguous layout
-        arr = _normalize_array(table.column(0).to_numpy())
+        table = reader.read_all()
+        arr = _normalize_array(unpack_chunk_array(table.to_batches()[0]))
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
