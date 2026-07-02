@@ -32,7 +32,6 @@ from biopb_tensor_server.config import (
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.metadata_db import MetadataDatabase
@@ -237,11 +236,6 @@ def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
     port: Optional[int] = None,
-    compute_backend: Optional[str] = None,
-    gpu_min_input_mb: Optional[float] = None,
-    gpu_min_linear_input_mb: Optional[float] = None,
-    gpu_memory_safety_factor: Optional[int] = None,
-    gpu_min_merged_chunks: Optional[int] = None,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
 ) -> Tuple[
@@ -253,8 +247,6 @@ def _setup_flight_server(
         server_config: Loaded server configuration
         host: Override host
         port: Override port
-        compute_backend: Override compute backend policy
-        gpu_* params: Override GPU policy parameters
         token: Access token for Flight server authentication
 
     Returns:
@@ -268,32 +260,6 @@ def _setup_flight_server(
     port = port or server_config.port
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
-
-    configure_compute_backend(
-        force_backend=compute_backend or server_config.compute_backend,
-        gpu_min_input_bytes=int(
-            (
-                gpu_min_input_mb
-                if gpu_min_input_mb is not None
-                else server_config.gpu_min_input_mb
-            )
-            * 1024
-            * 1024
-        ),
-        gpu_min_linear_input_bytes=int(
-            (
-                gpu_min_linear_input_mb
-                if gpu_min_linear_input_mb is not None
-                else server_config.gpu_min_linear_input_mb
-            )
-            * 1024
-            * 1024
-        ),
-        gpu_memory_safety_factor=gpu_memory_safety_factor
-        or server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks
-        or server_config.gpu_min_merged_chunks,
-    )
 
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
     # Off by default so recursive scans don't register screenshots/icons/movies.
@@ -374,15 +340,6 @@ def _setup_flight_server(
         console.print(
             f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
         )
-
-    console.print(
-        "[green]Compute backend policy:[/green] "
-        f"backend={compute_backend or server_config.compute_backend}, "
-        f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
-        f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
-        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
-        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
-    )
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
     # it is the canonical source-browsing surface (`client.query_sources`).
@@ -591,31 +548,6 @@ def serve(
         "-p",
         help="Server port (overrides config)",
     ),
-    compute_backend: Optional[str] = typer.Option(
-        None,
-        "--compute-backend",
-        help="Compute backend policy: auto, cpu, or gpu",
-    ),
-    gpu_min_input_mb: Optional[float] = typer.Option(
-        None,
-        "--gpu-min-input-mb",
-        help="Minimum input size in MB before GPU is considered for area-like methods",
-    ),
-    gpu_min_linear_input_mb: Optional[float] = typer.Option(
-        None,
-        "--gpu-min-linear-input-mb",
-        help="Minimum input size in MB before GPU is considered for linear interpolation",
-    ),
-    gpu_memory_safety_factor: Optional[int] = typer.Option(
-        None,
-        "--gpu-memory-safety-factor",
-        help="Required free-GPU-memory multiplier over estimated working set",
-    ),
-    gpu_min_merged_chunks: Optional[int] = typer.Option(
-        None,
-        "--gpu-min-merged-chunks",
-        help="Minimum merged source chunk count before GPU is preferred",
-    ),
     writable: bool = typer.Option(
         False,
         "--writable",
@@ -644,11 +576,6 @@ def serve(
         server_config,
         host=host,
         port=port,
-        compute_backend=compute_backend,
-        gpu_min_input_mb=gpu_min_input_mb,
-        gpu_min_linear_input_mb=gpu_min_linear_input_mb,
-        gpu_memory_safety_factor=gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks,
         writable=writable,
         token=token,
     )
@@ -687,14 +614,6 @@ def validate(
 
         console.print("[green]✓ Config valid[/green]")
         console.print(f"  Server: {server_config.host}:{server_config.port}")
-        console.print(
-            "  Compute: "
-            f"backend={server_config.compute_backend}, "
-            f"gpu_min_input_mb={server_config.gpu_min_input_mb}, "
-            f"gpu_min_linear_input_mb={server_config.gpu_min_linear_input_mb}, "
-            f"gpu_memory_safety_factor={server_config.gpu_memory_safety_factor}, "
-            f"gpu_min_merged_chunks={server_config.gpu_min_merged_chunks}"
-        )
         console.print(f"  Cache: backend={server_config.cache.backend}, ")
         if server_config.cache.backend == "memory":
             console.print(

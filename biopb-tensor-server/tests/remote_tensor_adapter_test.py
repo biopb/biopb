@@ -439,10 +439,11 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_physical_scale_mirrors_upstream(simple_zarr_array):
-    """The proxy must mirror the upstream's physical_scale/physical_unit: the
-    server fills these from get_physical_scale() (clearing first), so the base
-    default of None would silently drop physical sizes the upstream has."""
+def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
+    """The caching proxy does not implement physical_scale yet (biopb/biopb#266):
+    reading it would be a per-open upstream get_descriptor RPC on every serve --
+    the wrong layer; it should ride the bulk mirror seed. So get_physical_scale
+    returns None even when the upstream advertises a scale."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -458,15 +459,16 @@ def test_get_physical_scale_mirrors_upstream(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.get_physical_scale() == (_PHYS_SCALE, _PHYS_UNIT)
+        assert adapter.get_physical_scale() is None
     finally:
         upstream.shutdown()
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_physical_scale_flows_through_proxy(simple_zarr_array):
-    """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
-    physical_scale/physical_unit on the descriptor."""
+def test_physical_scale_not_advertised_through_proxy(simple_zarr_array):
+    """End-to-end: even when the upstream carries physical_scale, a client
+    GetFlightInfo through the proxy advertises none -- the proxy leaves the
+    descriptor's physical_scale/physical_unit empty (unimplemented, #266)."""
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
@@ -491,8 +493,8 @@ def test_physical_scale_flows_through_proxy(simple_zarr_array):
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
             desc = client.get_descriptor("lab__img")
-            assert list(desc.physical_scale) == _PHYS_SCALE
-            assert list(desc.physical_unit) == _PHYS_UNIT
+            assert not desc.physical_scale
+            assert not desc.physical_unit
             client.close()
         finally:
             proxy.shutdown()
@@ -1099,6 +1101,60 @@ def test_mark_unreachable_evicts_shared_client(monkeypatch):
 
     # the next access rebuilds a fresh shared client (not the closed one)
     assert a.client is not shared
+
+
+def test_get_tensor_descriptor_served_from_seed_without_rpc():
+    """B2 (biopb/biopb#266): the serve-path get_tensor_descriptor reads the
+    seeded structural descriptor -- no get_descriptor RPC -- so a bulk-mirrored
+    GetFlightInfo makes no upstream call for the descriptor. Falls back to a live
+    fetch only when a tensor is not in the seed (covered by the e2e proxy tests,
+    which register without seeding)."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    adapter.seed_catalog(
+        [
+            {
+                "array_id": "img",
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "chunk_shape": [4, 4],
+                "dtype": "uint8",
+            },
+            {
+                "array_id": "img/A2",
+                "dim_labels": ["y", "x"],
+                "shape": [2, 2],
+                "chunk_shape": [2, 2],
+                "dtype": "uint16",
+            },
+        ],
+        {"ome": "meta"},
+    )
+
+    # default (first) tensor
+    desc = adapter.get_tensor_descriptor()
+    assert desc.array_id == "lab__img"
+    assert list(desc.shape) == [4, 4]
+    assert desc.dtype == "uint8"
+    # lean like a native descriptor -- the local server fills these itself
+    assert not desc.metadata_json
+    assert not desc.pyramid
+
+    # a specific field via the tensor-layer view, also from the seed
+    view = adapter.get_tensor_adapter("lab__img/A2")
+    fdesc = view.get_tensor_descriptor()
+    assert fdesc.array_id == "lab__img/A2"
+    assert list(fdesc.shape) == [2, 2]
+    assert fdesc.dtype == "uint16"
+
+    # neither the source adapter nor the view ever dialed the upstream
+    assert adapter._client is None
+    assert view._client is None
 
 
 def test_seed_catalog_empty_metadata_normalizes_to_dict():

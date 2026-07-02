@@ -353,24 +353,28 @@ public class TensorFlightClient implements AutoCloseable {
         // Create result root with enough capacity
         VectorSchemaRoot result = VectorSchemaRoot.create(schema, allocator);
         result.allocateNew();
-        VectorLoader loader = new VectorLoader(result);
 
-        // Load and copy each batch
+        // Load each batch into its OWN transient root, then copy its rows into
+        // result at the running offset. Loading every batch into result with a
+        // single VectorLoader (the previous approach) overwrites row 0 each
+        // time, so only the last batch survived -- multi-batch results were
+        // silently corrupted.
         int offset = 0;
         for (ArrowRecordBatch batch : batches) {
-            loader.load(batch);
-            // Copy values from current position to offset position
-            for (int i = 0; i < result.getFieldVectors().size(); i++) {
-                org.apache.arrow.vector.ValueVector srcVec = result.getVector(i);
-                org.apache.arrow.vector.ValueVector dstVec = result.getVector(i);
-                // Use slice to get the loaded portion and copy to offset
-                // Since loader loads starting at 0, we need to shift values
-                for (int row = 0; row < batch.getLength(); row++) {
-                    dstVec.copyFromSafe(row, offset + row, srcVec);
+            try (VectorSchemaRoot batchRoot = VectorSchemaRoot.create(schema, allocator)) {
+                new VectorLoader(batchRoot).load(batch);
+                int rows = batch.getLength();
+                for (int i = 0; i < result.getFieldVectors().size(); i++) {
+                    org.apache.arrow.vector.ValueVector srcVec = batchRoot.getVector(i);
+                    org.apache.arrow.vector.ValueVector dstVec = result.getVector(i);
+                    for (int row = 0; row < rows; row++) {
+                        dstVec.copyFromSafe(row, offset + row, srcVec);
+                    }
                 }
+                offset += rows;
+            } finally {
+                batch.close();
             }
-            offset += batch.getLength();
-            batch.close();
         }
 
         result.setRowCount(totalRows);
@@ -564,10 +568,15 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>Returns a {@link PhysicalScale} whose {@code scale} and {@code unit}
      * arrays are aligned with the tensor's {@code dim_labels} (source axis order),
      * or {@code null} when no physical sizes are known (an older server, or a
-     * format that carries none). This is a compact summary carried on the tensor
-     * descriptor, so it is much cheaper than reading the full
-     * {@link #getSourceMetadata}. When a prior {@link #getTensor} already cached
-     * the descriptor it costs no extra RPC.
+     * format that carries none).
+     *
+     * <p>{@code physical_scale}/{@code physical_unit} are {@code TensorDescriptor}
+     * fields the server fills on every {@code GetFlightInfo} (issue #31), so this
+     * reads the descriptor a prior {@link #getTensor} already cached -- no extra
+     * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
+     * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
+     * forces {@code with_metadata} to ship the whole OME tree; do not dig physical
+     * sizes out of that -- this is the compact projection meant for display scale.)
      *
      * @param arrayId Globally-unique tensor id ({@code source_id} or
      *                {@code source_id/field}). A bare source id anchors on the
@@ -1776,51 +1785,60 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     private static void checkSchemaVersion(FlightInfo info) {
-        java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
-        if (!schemaOpt.isPresent()) {
-            return;
-        }
-        Schema schema = schemaOpt.get();
-        Map<String, String> metadata = schema.getCustomMetadata();
-        if (metadata == null) {
-            return;
-        }
-        String serverVersion = metadata.get("tensor_schema_version");
-        if (serverVersion == null || serverVersion.isEmpty()) {
-            return;
-        }
-        String clientVersion = getClientVersion();
-        if (clientVersion == null) {
-            return;
-        }
-        int[] serverParsed = parseVersion(serverVersion);
-        int[] clientParsed = parseVersion(clientVersion);
-        if (clientParsed[0] < serverParsed[0]
-                || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
-                || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
-                        && clientParsed[2] < serverParsed[2])) {
-            LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
-                    + serverVersion + ". Consider upgrading biopb client for compatibility.");
+        // Advisory only: a malformed version string must never fail a read.
+        try {
+            java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
+            if (!schemaOpt.isPresent()) {
+                return;
+            }
+            Schema schema = schemaOpt.get();
+            Map<String, String> metadata = schema.getCustomMetadata();
+            if (metadata == null) {
+                return;
+            }
+            String serverVersion = metadata.get("tensor_schema_version");
+            if (serverVersion == null || serverVersion.isEmpty()) {
+                return;
+            }
+            String clientVersion = getClientVersion();
+            if (clientVersion == null) {
+                return;
+            }
+            int[] serverParsed = parseVersion(serverVersion);
+            int[] clientParsed = parseVersion(clientVersion);
+            if (clientParsed[0] < serverParsed[0]
+                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
+                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
+                            && clientParsed[2] < serverParsed[2])) {
+                LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
+                        + serverVersion + ". Consider upgrading biopb client for compatibility.");
+            }
+        } catch (RuntimeException e) {
+            LOGGER.fine("Skipping schema version check: " + e);
         }
     }
 
     private static String getClientVersion() {
-        try {
-            return System.getProperty("biopb.version",
-                    java.util.jar.Manifest.class.getProtectionDomain().getCodeSource().getLocation().toString());
-        } catch (Exception e) {
-            // Try package version from manifest
-            Package pkg = TensorFlightClient.class.getPackage();
-            if (pkg != null && pkg.getImplementationVersion() != null) {
-                return pkg.getImplementationVersion();
-            }
-            return null;
+        // Explicit override wins; otherwise fall back to the packaged
+        // implementation version. (Do NOT use it as System.getProperty's
+        // default -- getProperty never throws, so the manifest fallback below
+        // would be dead code and the jar URL would leak in as a "version".)
+        String override = System.getProperty("biopb.version");
+        if (override != null && !override.isEmpty()) {
+            return override;
         }
+        Package pkg = TensorFlightClient.class.getPackage();
+        if (pkg != null && pkg.getImplementationVersion() != null) {
+            return pkg.getImplementationVersion();
+        }
+        return null;
     }
 
     private static int[] parseVersion(String version) {
-        // Handle dev versions like "0.3.1.dev43+g..."
-        String base = version.split(".dev")[0].split("+")[0];
+        // Handle dev versions like "0.3.1.dev43+g...". split() takes a regex, so
+        // "." and "+" must be escaped (a bare "+" is a dangling-metacharacter
+        // error, and "." matches any char).
+        String base = version.split("\\.dev")[0].split("\\+")[0];
         String[] parts = base.split("\\.");
         int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
         int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;

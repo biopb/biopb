@@ -91,9 +91,11 @@ message TensorDescriptor {
   repeated int64 scale_hint = 7;
 
   // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",
-  // "linear", or "precompute" (serve a native on-disk pyramid level).
+  // or "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
-  // "precomputed" -> "precompute".
+  // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
+  // Advisory for caching: the server may serve an existing cached chunk
+  // computed under a different method at the same bounds/scale.
   string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
@@ -132,7 +134,7 @@ message PyramidLevel {
   // Level 0 is [1, 1, ...]; matches TensorDescriptor.scale_hint semantics.
   repeated int64 scale_hint = 1;
 
-  // Method to request this level: "area" | "nearest" | "linear" | "precompute".
+  // Method to request this level: "area" | "nearest" | "precompute".
   // "precompute" means the server serves a native on-disk level (see `native`).
   string reduction_method = 2;
 
@@ -191,10 +193,10 @@ message TensorReadOption {
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   repeated int64 scale_hint = 3;
 
-  // Dynamic reduction/downsampling method: "nearest", "area", "linear", or
+  // Dynamic reduction/downsampling method: "nearest", "area", or
   // "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
-  // "precomputed" -> "precompute".
+  // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
   string reduction_method = 4;
 
   // If true, server populates metadata_json with wrapped metadata.

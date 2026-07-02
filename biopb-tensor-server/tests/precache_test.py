@@ -6,6 +6,7 @@ import time
 import numpy as np
 import pytest
 from biopb_tensor_server.chunk import (
+    cache_key_for_chunk_id,
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
@@ -270,7 +271,12 @@ class TestWarming:
             assert len(plan.chunk_endpoints) > 0
             for ce in plan.chunk_endpoints:
                 assert is_scaled_chunk(ce.chunk_id)
-                assert cache_manager.locate_entry(ce.chunk_id) is not None
+                # Entries are keyed by the method-stripped canonical key, the
+                # same locate the server's chunk-locate handoff performs (#76).
+                assert (
+                    cache_manager.locate_entry(cache_key_for_chunk_id(ce.chunk_id))
+                    is not None
+                )
         finally:
             server.shutdown()
             CacheManager.get_instance().close()
@@ -589,7 +595,7 @@ def _located_all(server, cache_manager, source_ids):
         if not plan.chunk_endpoints:
             return False
         for ce in plan.chunk_endpoints:
-            if cache_manager.locate_entry(ce.chunk_id) is None:
+            if cache_manager.locate_entry(cache_key_for_chunk_id(ce.chunk_id)) is None:
                 return False
     return True
 

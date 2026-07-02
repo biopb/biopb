@@ -180,7 +180,6 @@ biopb-tensor-server version  Show version information
 | `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--host, -h` | (from config) | gRPC server host |
 | `--port, -p` | (from config) | gRPC server port |
-| `--compute-backend` | auto | auto, cpu, or gpu |
 | `--writable` | false | Enable write mode for data upload |
 
 ### Python Client

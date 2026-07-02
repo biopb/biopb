@@ -42,6 +42,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import (
+    cache_key_for_chunk_id,
     decode_chunk_id,
     encode_chunk_id,
     is_scaled_chunk,
@@ -512,35 +513,44 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
     def get_physical_scale(
         self, tensor_id: Optional[str] = None
     ) -> Optional[Tuple[List[float], List[str]]]:
-        """Mirror the upstream tensor's per-dimension physical pixel size + unit.
+        """Not implemented for the caching proxy yet -- always ``None``.
 
         The local server fills ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``
-        (clearing first -- so it is NOT carried implicitly by ``get_tensor_descriptor``;
-        the base default of ``None`` would silently drop physical sizes the
-        upstream actually has). The upstream's own ``get_descriptor`` response
-        carries these fields (its server fills them identically), so read them
-        back from there. Best-effort: an unreachable upstream returns ``None``
-        (no physical scale) rather than raising.
+        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``,
+        so mirroring the upstream's scale would mean a per-open ``get_descriptor``
+        RPC to the upstream on every serve. That is the wrong layer: the mirror
+        catalog is bulk-seeded from a single upstream ``query_sources``
+        (biopb/biopb#266), and physical scale should ride that seed / the mirrored
+        descriptor rather than a lazy per-open round-trip. Until #266 carries it,
+        return ``None`` -- the proxy advertises no physical scale, exactly like a
+        format that carries none. Tracked by #266.
         """
-        field = self._within_source_field(tensor_id)
-        local_array_id = self.array_id if field is None else f"{self.source_id}/{field}"
-        try:
-            desc = self.client.get_descriptor(
-                self._to_upstream_array_id(local_array_id)
-            )
-        except Exception as exc:
-            self._mark_unreachable(exc)
-            return None
-        self._reachable = True
-        if not desc.physical_scale:
-            return None
-        return list(desc.physical_scale), list(desc.physical_unit)
+        return None
 
     # -------------------------------------------------------------- tensor layer
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Mirror the upstream tensor descriptor under the local array_id."""
+        """Mirror the upstream tensor descriptor under the local array_id.
+
+        Served from the bulk-seeded cache when available (biopb/biopb#266 B2):
+        ``seed_catalog`` already localized every tensor's structural fields
+        (shape/chunk/dtype/dim_labels) from a single upstream ``query_sources``,
+        so the serve-path ``GetFlightInfo`` reads the descriptor locally instead
+        of a per-open ``get_descriptor`` RPC. This removes the last structural
+        upstream call on the serve path; together with metadata served from the
+        local catalog (#253 core) it leaves ``get_physical_scale`` as the only
+        residual ``GetFlightInfo`` RPC (dropped separately, #266/#274) before
+        ``do_get`` is the sole upstream contact. Falls back to a live fetch when
+        this tensor was not seeded (a single-source static remote, or a field
+        absent from the seed).
+        """
+        if self._descriptors_cache is not None:
+            for desc in self._descriptors_cache:
+                if desc.array_id == self.array_id:
+                    out = TensorDescriptor()
+                    out.CopyFrom(desc)
+                    return out
+
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         desc = self.client.get_descriptor(upstream_array_id)
         return self._localize_descriptor(desc)
@@ -586,11 +596,14 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             return batch, batch.nbytes
 
         if should_cache:
+            # Cache under the method-stripped canonical key (biopb/biopb#76);
+            # the full chunk_id, method included, is still forwarded upstream.
+            cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                chunk_id, compute_fn, metadata={"array_id": local_array_id}
+                cache_key, compute_fn, metadata={"array_id": local_array_id}
             )
             data = entry.data
-            cache_manager.release(chunk_id)
+            cache_manager.release(cache_key)
             return data
         data, _ = compute_fn()
         return data

@@ -964,23 +964,14 @@ class SourceManager:
             entry = self._cloud_entry_state.get(path_str)
         return entry
 
-    def _should_scan_path(self, path: Path) -> bool:
-        """Return True when a path is stable enough to participate in discovery."""
-        try:
-            resolved_path = path.resolve(strict=False)
-        except OSError:
-            return False
-        return self._should_scan_resolved(str(resolved_path))
-
     def _should_scan_resolved(self, resolved_str: str) -> bool:
         """Stability gate for an entry whose resolved path string is already known.
 
         The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
         keys, which ``_scan_tree_state`` already stored as resolved path strings, so
-        the per-entry ``Path.resolve()`` ``_should_scan_path`` would otherwise repeat
-        is pure waste. Same predicate and the same load-bearing
-        ``_entry_pending_scan`` clear-on-pass side effect (the #53 subtree-pending
-        prune gate depends on it) — only the redundant resolve is dropped.
+        a per-entry ``Path.resolve()`` would be pure waste. This carries the
+        load-bearing ``_entry_pending_scan`` clear-on-pass side effect (the #53
+        subtree-pending prune gate depends on it).
         """
         if os.path.basename(resolved_str).startswith("."):
             return False

@@ -667,6 +667,34 @@ class TestSQLValidation:
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query("CREATE TABLE evil AS SELECT * FROM sources")
 
+    def test_validate_keyword_inside_literal_or_identifier_allowed(self):
+        """Forbidden keywords appearing inside string literals or as substrings
+        of identifiers must not trip the denylist (regression: substring match
+        rejected legitimate queries).
+        """
+        db = MetadataDatabase()
+
+        # Keyword as a substring of a string literal
+        db._validate_query(
+            "SELECT source_id FROM sources WHERE source_url LIKE '%/uploads/%'"
+        )
+        db._validate_query(
+            "SELECT source_id FROM sources WHERE metadata_json LIKE '%update%'"
+        )
+        db._validate_query(
+            "SELECT source_id FROM sources WHERE metadata_json LIKE '%dropdown%'"
+        )
+        # Escaped single quote inside the literal
+        db._validate_query(
+            "SELECT source_id FROM sources WHERE source_url LIKE '%don''t delete%'"
+        )
+        # A real trailing statement is still blocked even after a benign literal
+        with pytest.raises(ValueError, match="forbidden keyword"):
+            db._validate_query(
+                "SELECT source_id FROM sources WHERE source_url LIKE '%ok%'; "
+                "DROP TABLE sources"
+            )
+
     def test_validate_disallowed_table(self):
         """Test that references to non-sources tables are blocked."""
         db = MetadataDatabase()

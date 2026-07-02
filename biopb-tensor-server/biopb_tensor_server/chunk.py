@@ -10,7 +10,6 @@ This module contains:
 import logging
 import struct
 from dataclasses import dataclass
-from math import lcm
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -226,102 +225,6 @@ def normalized_scale_hint(
     return scale_hint_tuple
 
 
-def logical_chunk_shape(
-    chunk_shape: Tuple[int, ...],
-    scale_hint: Tuple[int, ...],
-    logical_shape: Tuple[int, ...],
-) -> Tuple[int, ...]:
-    """Compute virtual chunk shape for scaled read.
-
-    Args:
-        chunk_shape: Base chunk shape
-        scale_hint: Scale factors per axis
-        logical_shape: Output shape at target scale
-
-    Returns:
-        Virtual chunk shape at target scale
-    """
-    virtual_chunk = []
-    for chunk, scale, axis_shape in zip(chunk_shape, scale_hint, logical_shape):
-        virtual_axis = lcm(chunk, scale) // scale
-        virtual_chunk.append(min(max(virtual_axis, 1), axis_shape))
-    return tuple(virtual_chunk)
-
-
-# =============================================================================
-# Chunk Splitting Helpers
-# =============================================================================
-
-
-def _choose_split_axis(
-    shape: Tuple[int, ...],
-    dim_labels: Optional[List[str]],
-    n_splits: int,
-) -> int:
-    """Choose axis for splitting with semantic priority.
-
-    Priority order (preserves Y-X spatial plane for common visualization patterns):
-    1. Any axis NOT in {y, x, z, c} — handles 't', 'v', 'frame', unlabeled, etc.
-       If multiple candidates, pick largest.
-    2. 'c' (channel)
-    3. 'z' (depth)
-    4. Larger of 'y' or 'x' (spatial plane)
-    5. Fallback: largest axis (current behavior)
-
-    Args:
-        shape: Chunk shape tuple
-        dim_labels: Optional dimension labels (may be None or partial)
-        n_splits: Number of splits needed (axis must have size >= n_splits)
-
-    Returns:
-        Axis index to split along
-    """
-    SPATIAL_LABELS = {"y", "x", "z", "c"}
-
-    # Build label -> axis mapping (case-insensitive)
-    label_to_axis: Dict[str, int] = {}
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            label_to_axis[label.lower()] = ax
-
-    # Priority 1: Non-spatial axes (t, v, frame, unlabeled, etc.)
-    non_spatial_candidates: List[int] = []
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            if label.lower() not in SPATIAL_LABELS and shape[ax] >= n_splits:
-                non_spatial_candidates.append(ax)
-    else:
-        # No labels: treat all axes as non-spatial candidates, pick largest
-        non_spatial_candidates = [
-            ax for ax in range(len(shape)) if shape[ax] >= n_splits
-        ]
-
-    if non_spatial_candidates:
-        return max(non_spatial_candidates, key=lambda ax: shape[ax])
-
-    # Priority 2: 'c' (channel)
-    if "c" in label_to_axis and shape[label_to_axis["c"]] >= n_splits:
-        return label_to_axis["c"]
-
-    # Priority 3: 'z' (depth)
-    if "z" in label_to_axis and shape[label_to_axis["z"]] >= n_splits:
-        return label_to_axis["z"]
-
-    # Priority 4: Larger of 'y' or 'x' (preserve spatial plane integrity)
-    y_axis = label_to_axis.get("y")
-    x_axis = label_to_axis.get("x")
-    if y_axis is not None and x_axis is not None:
-        if shape[y_axis] >= n_splits and shape[x_axis] >= n_splits:
-            return y_axis if shape[y_axis] >= shape[x_axis] else x_axis
-        elif shape[y_axis] >= n_splits:
-            return y_axis
-        elif shape[x_axis] >= n_splits:
-            return x_axis
-
-    # Fallback: largest axis (current behavior)
-    return max(range(len(shape)), key=lambda ax: shape[ax])
-
-
 # =============================================================================
 # Size Estimation Helpers
 # =============================================================================
@@ -399,6 +302,19 @@ def encode_chunk_id_with_scale(
     return base + scale_payload
 
 
+def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
+    """``(ndim, bounds_end)`` for a chunk_id.
+
+    ``bounds_end`` is where the standard encoding (array_id + ndim + start +
+    stop) ends; any bytes past it are the scale payload of a scaled chunk_id
+    (see :func:`encode_chunk_id_with_scale`).
+    """
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    return ndim, offset + 2 + ndim * 8 + ndim * 8
+
+
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds.
 
@@ -408,11 +324,26 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
     Returns:
         True if chunk_id contains scale info
     """
-    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    _, bounds_end = _bounds_end(chunk_id)
     return len(chunk_id) > bounds_end
+
+
+def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
+    """Canonical cache key for a chunk_id: the reduction method is advisory.
+
+    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
+    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
+    that differ only in reduction_method share one cache entry -- the method
+    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    chunk_ids are returned unchanged.
+
+    The result is an opaque cache key: it is NOT a valid chunk_id and must not
+    be fed to :func:`decode_scale_info` or forwarded on the wire.
+    """
+    ndim, bounds_end = _bounds_end(chunk_id)
+    if len(chunk_id) <= bounds_end:
+        return chunk_id
+    return chunk_id[: bounds_end + ndim * 8]
 
 
 def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
@@ -424,10 +355,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     Returns:
         Tuple of (scale_hint, reduction_method)
     """
-    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    ndim, bounds_end = _bounds_end(chunk_id)
 
     # Decode scale_hint
     scale_hint = []
@@ -687,7 +615,9 @@ def _choose_split_axis_excluding(
 ) -> Optional[int]:
     """Choose axis for splitting, excluding already-split axes.
 
-    Uses same priority as _choose_split_axis but skips excluded axes.
+    Priority (highest first): non-spatial axes (t/v/frame/unlabeled, largest
+    wins), then 'c', then 'z', then the larger of 'y'/'x' -- skipping any axis
+    in exclude_axes and any that cannot accommodate n_splits.
 
     Returns None if no eligible axis can accommodate n_splits.
     """
