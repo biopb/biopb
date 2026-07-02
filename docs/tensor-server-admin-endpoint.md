@@ -257,7 +257,7 @@ existing `idle|connecting|connected|error` vocabulary with `scanning` and
 
 > **Implemented (biopb/biopb#245).** The structured advanced sections
 > (`AdvancedSections.tsx`) render one collapsible pane per schema section
-> (`server`/`compute`/`cache`/`pyramid`/`precache`/`metadata_db`), each field a
+> (`server`/`cache`/`pyramid`/`precache`/`metadata_db`), each field a
 > schema-driven control (checkbox / enum `select` / bounded number / text) with
 > its `description` as helper text; the raw-JSON modal stays as an escape hatch.
 > Inline validation (`validateConfig()` in `@biopb/tensor-flight-client`,

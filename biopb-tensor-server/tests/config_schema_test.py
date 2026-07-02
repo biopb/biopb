@@ -84,7 +84,6 @@ def test_top_level_sections_present(schema):
     props = schema["properties"]
     for section in (
         "server",
-        "compute",
         "cache",
         "pyramid",
         "precache",
@@ -154,9 +153,11 @@ def test_installer_default_config_validates(validator):
         {"server": {"port": 65535}},  # boundary (max)
         {"server": {"log_level": "info"}},  # case-insensitive enum stays lenient
         {"cache": {"backend": "memory"}},
-        {"compute": {"backend": "gpu"}},
         {"sources": [{"url": "/d", "type": "ome-zarr"}]},
         {"server": {"future_unknown_knob": 7}},  # additionalProperties: true
+        # Removed [compute] section: tolerated by the schema (root
+        # additionalProperties), warn-and-ignore at parse time.
+        {"compute": {"backend": "gpu"}},
     ],
 )
 def test_accepts_valid(validator, cfg):
@@ -169,7 +170,6 @@ def test_accepts_valid(validator, cfg):
         {"server": {"port": 0}},
         {"server": {"port": 70000}},
         {"cache": {"backend": "bogus"}},
-        {"compute": {"backend": "bogus"}},  # case-sensitive enum
         {"pyramid": {"downscale_factor": 1}},  # silently single-level before
         {"pyramid": {"downscale_factor": 0}},  # ZeroDivisionError before
         {"pyramid": {"pixel_budget_cubic_root": 0}},  # infinite loop before

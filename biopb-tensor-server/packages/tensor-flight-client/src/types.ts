@@ -29,7 +29,7 @@ export interface SliceRequest {
   slice_stop?: number[];
   /** Per-dimension integer downsampling factors, e.g. [1, 8, 8]. */
   scale_hint?: number[];
-  /** "nearest" | "area" | "linear" (server also accepts "stride", "decimate", "mean"). */
+  /** "nearest" | "area" | "precompute" (server also accepts "stride", "decimate", "mean"). */
   reduction_method?: string;
   /** Informational: current viewport pixel budget (stored in diagnostics). */
   pixel_budget?: number;

@@ -318,6 +318,27 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
     return len(chunk_id) > bounds_end
 
 
+def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
+    """Canonical cache key for a chunk_id: the reduction method is advisory.
+
+    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
+    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
+    that differ only in reduction_method share one cache entry -- the method
+    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    chunk_ids are returned unchanged.
+
+    The result is an opaque cache key: it is NOT a valid chunk_id and must not
+    be fed to :func:`decode_scale_info` or forwarded on the wire.
+    """
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    if len(chunk_id) <= bounds_end:
+        return chunk_id
+    return chunk_id[: bounds_end + ndim * 8]
+
+
 def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     """Decode scale_hint and reduction_method from scaled chunk_id.
 

@@ -36,6 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.chunk import (
     ChunkEndpoint,
+    cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
     decode_scale_info,
@@ -535,11 +536,15 @@ class TensorAdapter(ABC):
             return result, result_arr.nbytes
 
         if should_cache:
+            # The reduction method is advisory: requests differing only in
+            # method share one entry, so precache-warmed chunks serve any
+            # method at the same bounds/scale (biopb/biopb#76).
+            cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                chunk_id, compute_fn, metadata={"array_id": array_id}
+                cache_key, compute_fn, metadata={"array_id": array_id}
             )
             data = entry.data
-            cache_manager.release(chunk_id)
+            cache_manager.release(cache_key)
         else:
             data, _ = compute_fn()
 

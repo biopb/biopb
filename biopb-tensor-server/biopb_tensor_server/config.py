@@ -172,17 +172,21 @@ def _default_cache_backend() -> str:
 
 _STRICT_VALIDATION = False
 
-# Normalized methods + aliases accepted by downsample.normalize_reduction_method
-# (matched case-insensitively, mirroring that function).
+# Methods PyramidConfig.reduction_method accepts (matched case-insensitively):
+# the *computable* subset of the protocol vocabulary, plus its aliases.
+# Intentionally narrower than downsample.normalize_reduction_method, which also
+# accepts "precompute"/"precomputed" -- that value is a protocol concern (a
+# client requesting a native on-disk level), not a way the server can compute a
+# pyramid level, so it is invalid here. "linear" stays as a tolerated deprecated
+# alias: old configs keep validating, and normalize_reduction_method folds it
+# to "area" with a warning at read time.
 _REDUCTION_METHODS = {
     "area",
     "linear",
     "nearest",
-    "precompute",
     "stride",
     "decimate",
     "mean",
-    "precomputed",
 }
 
 
@@ -283,13 +287,6 @@ _CONSTRAINTS = {
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
         ),
-        # compute_backend is matched case-sensitively, as configure_compute_backend
-        # does (it raises on anything outside this set).
-        "compute_backend": _Enum({"auto", "cpu", "gpu"}),
-        "gpu_min_input_mb": _Range(min=0),
-        "gpu_min_linear_input_mb": _Range(min=0),
-        "gpu_memory_safety_factor": _Range(min=1),
-        "gpu_min_merged_chunks": _Range(min=1),
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
         "stable_rescans_required": _Range(min=0),
@@ -602,11 +599,6 @@ class ServerConfig:
     port: int = 8815
     log_level: str = "INFO"
     log_scope_to_biopb: bool = True
-    compute_backend: str = "auto"
-    gpu_min_input_mb: float = 4.0
-    gpu_min_linear_input_mb: float = 2.0
-    gpu_memory_safety_factor: int = 4
-    gpu_min_merged_chunks: int = 4
     monitor_mode: str = "periodic"
     rescan_interval: float = 30.0
     full_rescan_interval: float = 3600.0
@@ -898,6 +890,11 @@ def _warn_extra_keys(table: Dict[str, Any], known: set, label: str) -> None:
         )
 
 
+# Sections that used to exist and are now silently dropped by the parser; they
+# get a tailored deprecation warning instead of the generic "unknown section".
+_DEPRECATED_SECTIONS = {"compute"}
+
+
 def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
     """Warn for unrecognized config sections / keys before they silently drop.
 
@@ -916,6 +913,13 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
         if section.startswith("$"):
             # `$schema` / `$id` are tolerated meta keys (save_config embeds a
             # relative `$schema`); they are neither config sections nor typos.
+            continue
+        if section in _DEPRECATED_SECTIONS:
+            logger.warning(
+                "Config section [%s] is deprecated and ignored; the GPU compute "
+                "backend was removed.",
+                section,
+            )
             continue
         if section not in sections:
             logger.warning(
@@ -978,14 +982,6 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     writable = server_data.get("writable", False)
     write_dir_str = server_data.get("write_dir", None)
     write_dir = Path(write_dir_str) if write_dir_str else None
-
-    # Parse compute settings
-    compute_data = data.get("compute", {})
-    compute_backend = compute_data.get("backend", "auto")
-    gpu_min_input_mb = compute_data.get("gpu_min_input_mb", 4.0)
-    gpu_min_linear_input_mb = compute_data.get("gpu_min_linear_input_mb", 2.0)
-    gpu_memory_safety_factor = compute_data.get("gpu_memory_safety_factor", 4)
-    gpu_min_merged_chunks = compute_data.get("gpu_min_merged_chunks", 4)
 
     # Parse cache settings
     cache_data = data.get("cache", {})
@@ -1145,11 +1141,6 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         probe_open_files=bool(probe_open_files),
         aggressive_dir_pruning=bool(aggressive_dir_pruning),
         claim_generic_images=bool(claim_generic_images),
-        compute_backend=compute_backend,
-        gpu_min_input_mb=float(gpu_min_input_mb),
-        gpu_min_linear_input_mb=float(gpu_min_linear_input_mb),
-        gpu_memory_safety_factor=int(gpu_memory_safety_factor),
-        gpu_min_merged_chunks=int(gpu_min_merged_chunks),
         writable=writable,
         write_dir=write_dir,
         cache=cache_config,
