@@ -981,6 +981,43 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
+    def test_recovery_accounting_is_cheap_and_correct(self):
+        """Recovery reports the entry count from the rebuilt index and the byte
+        total from segment file sizes -- it must NOT scan segment bodies just for
+        the status line (biopb/biopb#300).
+        """
+        import json
+
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+
+        # Three fully-committed entries.
+        backend1 = ArrowFileBackend(config)
+        for i in range(3):
+            key = f"key{i}".encode()
+            backend1.start_compute(key)
+            backend1.complete_entry(key, self._make_data([i, i + 1]), 16)
+            backend1.release(key)
+
+        # Crash, then leave a stale (dead-PID) lock so recovery is triggered.
+        self._simulate_crash(backend1)
+        with open(cache_dir / "lock", "w") as f:
+            json.dump({"pid": 99999, "acquired_at": time.time()}, f)
+
+        segments_dir = cache_dir / "segments"
+        expected_bytes = sum(f.stat().st_size for f in segments_dir.glob("seg_*.arrow"))
+
+        backend2 = ArrowFileBackend(config)
+        status = backend2.get_recovery_status()
+        assert status is not None, "stale lock must trigger recovery"
+        # Entry count is backfilled from the rebuilt index (all 3 survived).
+        assert status.recovered_entries == 3
+        # Byte total is the on-disk segment footprint (stat), not a sum of decoded
+        # batch.nbytes -- so it matches the segment file sizes exactly.
+        assert status.recovered_bytes == expected_bytes
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
 
 class TestBackendSelection:
     """Tests for CacheManager backend selection."""

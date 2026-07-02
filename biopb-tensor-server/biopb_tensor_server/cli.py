@@ -78,31 +78,44 @@ def _graceful_shutdown(
 ) -> None:
     """Best-effort orderly shutdown.
 
-    Stops the precache worker and source discovery and the filesystem watcher,
-    shuts down the Flight server, and closes the cache manager so the
-    file-backend process lock is released. Each step is isolated so a failure in
-    one still lets the cache lock be released (the important part for clean
-    restarts). The precache worker is stopped first so no new warm work starts
-    during teardown.
+    Step ORDER is load-bearing for clean restarts (biopb/biopb#300). ``restart``
+    force-kills the daemon after a bounded graceful window (``--timeout``, 10s by
+    default), so releasing the file-cache process lock must not sit behind the
+    slow teardown steps -- otherwise a mid-teardown SIGKILL leaves a stale lock
+    and the next boot pays the full crash-recovery scan (~110s on a large
+    caching-proxy cache):
+
+    1. Stop the precache worker -- no new warm writes.
+    2. Shut down the Flight server -- drains in-flight ``do_get`` streams, after
+       which nothing writes to the cache. On a caching proxy these streams are
+       upstream-latency-gated, so this is the step that can run long.
+    3. Close the cache immediately after -- clears the WAL and releases the
+       process lock while the state is quiescent, BEFORE the source manager's
+       up-to-5s thread join. So a SIGKILL during that join still finds the lock
+       released (no stale-lock recovery next boot).
+    4. Stop the source manager and watcher last -- neither touches the chunk
+       cache, so their teardown no longer gates the lock release.
+
+    Each step is isolated so a failure in one still lets the others run.
     """
+
+    def _close_cache() -> None:
+        # Clear the WAL + release the file-cache process lock (no-op for memory).
+        manager = CacheManager.get_instance()
+        if manager is not None:
+            manager.close()
+
     for label, action in (
         ("precache worker", lambda: precache_worker and precache_worker.stop()),
+        ("flight server", lambda: flight_server and flight_server.shutdown()),
+        ("cache", _close_cache),
         ("source manager", lambda: source_manager and source_manager.stop()),
         ("watcher", lambda: watcher and watcher.stop()),
-        ("flight server", lambda: flight_server and flight_server.shutdown()),
     ):
         try:
             action()
         except Exception as e:  # noqa: BLE001 - shutdown must not raise
             console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
-
-    # Release the file cache process lock (no-op for the memory backend).
-    manager = CacheManager.get_instance()
-    if manager is not None:
-        try:
-            manager.close()
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[yellow]Error closing cache: {e}[/yellow]")
 
 
 def _is_bare_host_upstream(source: SourceConfig) -> bool:
@@ -311,9 +324,10 @@ def _setup_flight_server(
                     f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
                     f"lost={recovery_status.lost_entries} entries"
                 )
-                if recovery_status.errors:
-                    for err in recovery_status.errors[:3]:
-                        console.print(f"[red]  Error: {err}[/red]")
+                # (No per-segment error list here: recovery no longer scans
+                # segment bodies -- biopb/biopb#300 -- so it surfaces no read
+                # errors. Corrupt segments are detected, logged, and dropped by
+                # _rebuild_index_from_segments' own logger.error instead.)
         else:
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] backend=memory (fallback)"
