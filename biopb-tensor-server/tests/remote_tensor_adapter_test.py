@@ -303,6 +303,150 @@ class TestRemoteTensorProxy:
             finally:
                 upstream.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_read_plan_forwards_upstream_native_grid(self):
+        """The proxy forwards GetFlightInfo to the upstream and returns ITS
+        endpoints on the native grid -- it re-derives no grid locally, so the
+        advisory (empty) catalog seed never drives planning (biopb/biopb#295).
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.chunk import decode_chunk_id
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.zeros((3, 40, 50), dtype="<i2")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source(
+                "aics",
+                ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
+            )
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__aics",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="aics",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "aics",
+                            "dim_labels": ["z", "y", "x"],
+                            "shape": [3, 40, 50],
+                            "chunk_shape": [],  # advisory + empty; must be ignored
+                            "dtype": "<i2",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+                req = TensorDescriptor(
+                    array_id="hpc__aics",
+                    dim_labels=["z", "y", "x"],
+                    shape=[3, 40, 50],
+                    dtype="<i2",
+                )
+                plan = adapter.get_read_plan(req)
+
+                # Native upstream grid (one z-plane per chunk), NOT the whole-volume
+                # (3,40,50) default grid an empty seed would otherwise produce.
+                assert list(plan.descriptor.chunk_shape) == [1, 40, 50]
+                assert len(plan.chunk_endpoints) == 3  # one endpoint per plane
+                # Endpoints carry LOCAL chunk_ids (upstream 'aics' rewritten).
+                for ce in plan.chunk_endpoints:
+                    aid, _ = decode_chunk_id(ce.chunk_id)
+                    assert aid == "hpc__aics"
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_read_plan_falls_back_when_upstream_unreachable(self):
+        """A failed upstream GetFlightInfo must not raise: fall back to the local
+        planner so the RPC still returns a (best-effort) plan."""
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="hpc__aics",
+            upstream_location="grpc://localhost:1",  # nothing listening
+            upstream_source_id="aics",
+        )
+        adapter.seed_catalog(
+            upstream_tensors=[
+                {
+                    "array_id": "aics",
+                    "dim_labels": ["z", "y", "x"],
+                    "shape": [3, 40, 50],
+                    "chunk_shape": [1, 40, 50],  # seed present -> base planner uses it
+                    "dtype": "<i2",
+                }
+            ],
+            metadata={},
+            data_resident=True,
+        )
+        req = TensorDescriptor(
+            array_id="hpc__aics",
+            dim_labels=["z", "y", "x"],
+            shape=[3, 40, 50],
+            dtype="<i2",
+        )
+        plan = adapter.get_read_plan(req)  # must not raise
+        assert len(plan.chunk_endpoints) >= 1
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_read_plan_falls_back_on_unparseable_upstream_endpoint(self):
+        """A malformed upstream endpoint must not blow up the whole plan: the
+        parse loop is guarded, so it falls back to the local planner."""
+        from types import SimpleNamespace
+
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="hpc__aics",
+            upstream_location="grpc://localhost:1",
+            upstream_source_id="aics",
+        )
+        adapter.seed_catalog(
+            upstream_tensors=[
+                {
+                    "array_id": "aics",
+                    "dim_labels": ["z", "y", "x"],
+                    "shape": [3, 40, 50],
+                    "chunk_shape": [1, 40, 50],
+                    "dtype": "<i2",
+                }
+            ],
+            metadata={},
+            data_resident=True,
+        )
+        # A valid descriptor but a junk endpoint (no .ticket) -> the parse loop
+        # raises inside the guarded block.
+        valid_cmd = adapter.get_tensor_descriptor().SerializeToString()
+        fake_info = SimpleNamespace(
+            descriptor=SimpleNamespace(command=valid_cmd),
+            endpoints=[SimpleNamespace()],  # missing .ticket
+        )
+        adapter._upstream_flight_info = lambda req: fake_info
+
+        req = TensorDescriptor(
+            array_id="hpc__aics",
+            dim_labels=["z", "y", "x"],
+            shape=[3, 40, 50],
+            dtype="<i2",
+        )
+        plan = adapter.get_read_plan(req)  # must not raise -> local planner
+        assert len(plan.chunk_endpoints) >= 1
+
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
 
