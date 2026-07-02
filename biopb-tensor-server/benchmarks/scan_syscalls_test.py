@@ -268,7 +268,7 @@ def _make_manager(root: Path) -> SourceManager:
 
 def _run_state_walk(manager: SourceManager) -> None:
     """Phase 1: the stat-signature sweep. publish=True so the claim walk's
-    ``_should_scan_path`` sees the freshly captured entry state."""
+    ``_should_scan_resolved`` gate sees the freshly captured entry state."""
     manager._refresh_entry_state(force_full=True, publish=True)
 
 
