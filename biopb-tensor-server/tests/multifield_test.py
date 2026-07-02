@@ -598,7 +598,7 @@ class MockImage0Adapter(BackendAdapter):
     def get_metadata(self) -> dict:
         return {}
 
-    def get_physical_scale(self, tensor_id=None):
+    def get_physical_scale(self):
         return list(self._physical_scale), list(self._physical_unit)
 
     def get_data(self, bounds) -> np.ndarray:

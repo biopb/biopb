@@ -663,7 +663,7 @@ class OmeZarrAdapter(ZarrAdapter):
         metadata does cover its (single) tensor."""
         return not self._is_hcs_plate
 
-    def get_physical_scale(self, tensor_id=None):
+    def get_physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
 
         Physical size of an axis = (optional multiscales-level scale transform)
@@ -733,9 +733,7 @@ class OmeZarrAdapter(ZarrAdapter):
         datasets = multiscales[0].get("datasets", [])
         return len(datasets) >= 2
 
-    def get_native_pyramid_levels(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[List[PyramidLevel]]:
+    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """Advertise the OME-Zarr multiscales datasets as native pyramid levels.
 
         One ``PyramidLevel`` per native dataset, ``native=True`` and

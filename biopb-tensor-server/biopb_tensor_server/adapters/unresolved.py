@@ -7,7 +7,7 @@ user freed, blocks offline). ``UnresolvedSourceAdapter`` is the placeholder the
 server registers for such a source. It is deliberately split into two surfaces:
 
 - A **catalog surface** -- ``list_tensor_descriptors``/``get_source_descriptor``/
-  ``get_metadata``/``has_native_pyramid`` -- that NEVER resolves. It reports an
+  ``get_metadata`` -- that NEVER resolves. It reports an
   empty, not-resident source so ListFlights, the metadata-DB sync, and the
   precache worker all stay cheap (precache loops ``list_tensor_descriptors`` and
   skips an empty source before it ever reaches a serving call).
@@ -29,7 +29,7 @@ A resolution failure (offline / declined / unrecognized) raises
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
@@ -40,7 +40,7 @@ from biopb_tensor_server.errors import (
 )
 
 if TYPE_CHECKING:
-    from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
+    from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import AdapterRegistry
@@ -120,24 +120,11 @@ class UnresolvedSourceAdapter(SourceAdapter):
             return self._resolved.is_resident()
         return False
 
-    def has_native_pyramid(self) -> bool:
-        if self._resolved is not None:
-            return self._resolved.has_native_pyramid()
-        return False
-
-    def get_native_pyramid_levels(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[List["PyramidLevel"]]:
-        if self._resolved is not None:
-            return self._resolved.get_native_pyramid_levels(tensor_id)
-        return None
-
-    def get_physical_scale(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[Tuple[List[float], List[str]]]:
-        if self._resolved is not None:
-            return self._resolved.get_physical_scale(tensor_id)
-        return None
+    # Pyramid / physical-scale are tensor-level (see TensorAdapter); an
+    # unresolved source exposes no tensors, so callers reach them only through
+    # the resolved adapter that ``get_tensor_adapter`` returns. Precache never
+    # needs a source-level pyramid check here: ``list_tensor_descriptors`` is
+    # empty, so the source is skipped with nothing to warm.
 
     # --- serve surface (NEVER resolves) -------------------------------------
 

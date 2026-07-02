@@ -489,17 +489,22 @@ class TestGetPhysicalScale:
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]
         assert unit == ["", "", "µm", "µm", "µm"]
 
-    def test_aics_physical_scale_resolves_scene_by_tensor_id(self):
-        """A multi-scene source resolves the right OME image by tensor_id."""
+    def test_aics_physical_scale_reads_bound_scene(self):
+        """A scene-bound tensor adapter reads the right OME image by its index.
+
+        Scene selection is via the bound ``scene_index`` (set by
+        ``get_tensor_adapter``), not a ``tensor_id`` argument -- the method is
+        tensor-scoped on ``TensorAdapter``.
+        """
         img0 = self._ome_pixels(1.0, 1.0, 0.0)
         img1 = self._ome_pixels(0.5, 0.5, 0.0)
         adapter = self._make_aics_adapter(
             ["C", "Y", "X"],
-            scene_index=None,
+            scene_index=1,
             scenes=["s0", "s1"],
             images=[img0, img1],
         )
-        scale, _ = adapter.get_physical_scale("s1")
+        scale, _ = adapter.get_physical_scale()
         assert scale == [0.0, 0.5, 0.5]
 
     def test_aics_physical_scale_none_when_no_sizes(self):

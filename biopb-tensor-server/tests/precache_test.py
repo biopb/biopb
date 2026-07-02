@@ -1231,7 +1231,7 @@ class TestPrecacheAdvertisedAlignment:
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()
-            advertised = server._advertised_pyramid(adapter, "big", base_desc)
+            advertised = server._advertised_pyramid(adapter, base_desc)
             # The worker warms build_pyramid_plan(...)[-1]; the server advertises
             # the same plan -- so their coarsest scales are identical.
             worker_coarsest = build_pyramid_plan(

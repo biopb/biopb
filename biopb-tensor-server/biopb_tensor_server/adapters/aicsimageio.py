@@ -1143,27 +1143,23 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         except Exception:
             return {}
 
-    def get_physical_scale(self, tensor_id=None):
+    def get_physical_scale(self):
         """Per-dim physical pixel size + unit from the resident OME model.
 
         Reads ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}``
         directly (no full ``model_dump``) and maps it onto this tensor's
         ``dim_labels`` by axis label. T/C axes get ``0.0`` / ``""``. Returns
         ``None`` when no positive physical size is known. See
-        ``SourceAdapter.get_physical_scale``.
+        ``TensorAdapter.get_physical_scale``.
         """
         try:
             ome = self._aics_image.ome_metadata
             if ome is None or not getattr(ome, "images", None):
                 return None
 
-            # OME images are in img.scenes order. A scene-level adapter knows
-            # its index directly; otherwise resolve the requested tensor_id.
+            # OME images are in img.scenes order; a tensor-bound adapter knows
+            # its scene index directly (callers reach this via get_tensor_adapter).
             idx = self.scene_index if self.scene_index is not None else 0
-            if tensor_id is not None:
-                scene_ids = list(self._aics_image.scenes)
-                if tensor_id in scene_ids:
-                    idx = scene_ids.index(tensor_id)
             if idx >= len(ome.images):
                 return None
 

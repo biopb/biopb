@@ -445,9 +445,7 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         view._tensor_name = field
         return view
 
-    def get_physical_scale(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[Tuple[List[float], List[str]]]:
+    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Not implemented for the caching proxy yet -- always ``None``.
 
         The local server fills ``TensorDescriptor.physical_scale`` /

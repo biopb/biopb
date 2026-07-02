@@ -318,9 +318,11 @@ class TestUnresolvedProxy:
 
     def test_catalog_surface_is_empty_and_not_resident(self):
         proxy = self._make_proxy("/data/cloud/x.zarr")
+        # Empty tensor list is what keeps precache off an unresolved source: it
+        # loops list_tensor_descriptors and skips before any tensor-level call
+        # (pyramid checks are now tensor-scoped on the resolved adapter).
         assert proxy.list_tensor_descriptors() == []
         assert proxy.is_resident() is False
-        assert proxy.has_native_pyramid() is False
         desc = proxy.get_source_descriptor()
         assert list(desc.tensors) == []
         assert desc.data_resident is False

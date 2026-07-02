@@ -333,53 +333,6 @@ class SourceAdapter(ABC):
             return tensor_id[len(self.source_id) + 1 :]
         return tensor_id
 
-    def has_native_pyramid(self) -> bool:
-        """Whether this source ships a well-formed multi-resolution pyramid.
-
-        Default False. Formats that natively store precomputed downsampled
-        levels (e.g. OME-Zarr multiscales) override this to report True, which
-        lets the precache worker skip them -- they already serve overviews
-        cheaply from their own coarse levels.
-        """
-        return False
-
-    def get_native_pyramid_levels(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[List[PyramidLevel]]:
-        """Native (precomputed on-disk) pyramid levels for *tensor_id*, or None.
-
-        Returns ``None`` for formats without a real on-disk pyramid (the default),
-        in which case the server advertises a *computed* pyramid via
-        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
-        natively (e.g. OME-Zarr multiscales) override this to return one
-        ``PyramidLevel`` per native dataset, each with ``native=True`` and
-        ``reduction_method="precompute"`` so the client requests the on-disk level
-        directly. Each level's ``scale_hint`` MUST be the value the adapter's own
-        ``get_read_plan`` "precompute" routing matches on, so an advertised level
-        round-trips to its dataset.
-        """
-        return None
-
-    def get_physical_scale(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[Tuple[List[float], List[str]]]:
-        """Per-dimension physical pixel size + unit, source axis order.
-
-        Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
-        ``dim_labels`` this source's ``get_tensor_descriptor()`` emits (so the
-        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` without remapping). Element ``i`` is the physical
-        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
-        dimension with no known physical size (e.g. T/C axes).
-
-        Returns ``None`` when no physical sizes are known. This is the compact
-        ~200-byte summary the tensor-load hot path needs (issue #31), so it must
-        be **cheap** -- read it straight off the resident metadata model, never
-        a full ``get_metadata()`` dump. Default ``None``; format adapters that
-        carry physical voxel sizes override it.
-        """
-        return None
-
 
 class TensorAdapter(ABC):
     """Abstract base class for tensor-level adapters.
@@ -565,9 +518,110 @@ class TensorAdapter(ABC):
         chunk_size = self.get_chunk_size()
         return _get_read_plan(base_desc, request_desc, chunk_size)
 
+    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+        """Native (precomputed on-disk) pyramid levels for this tensor, or None.
+
+        Returns ``None`` for formats without a real on-disk pyramid (the default),
+        in which case the server advertises a *computed* pyramid via
+        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
+        natively (e.g. OME-Zarr multiscales) override this to return one
+        ``PyramidLevel`` per native dataset, each with ``native=True`` and
+        ``reduction_method="precompute"`` so the client requests the on-disk level
+        directly. Each level's ``scale_hint`` MUST be the value the adapter's own
+        ``get_read_plan`` "precompute" routing matches on, so an advertised level
+        round-trips to its dataset.
+        """
+        return None
+
+    def has_native_pyramid(self) -> bool:
+        """Whether this tensor ships a well-formed multi-resolution pyramid.
+
+        Derived by default from :meth:`get_native_pyramid_levels` -- a tensor
+        has a native pyramid iff it advertises native levels -- so a new format
+        need only override the levels method. The precache worker skips a tensor
+        that reports True: it already serves overviews cheaply from its own coarse
+        levels. Adapters may override this with a cheaper check that avoids
+        enumerating level shapes (e.g. OME-Zarr reads its root ``.zattrs``).
+        """
+        return self.get_native_pyramid_levels() is not None
+
+    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dimension physical pixel size + unit for this tensor, axis order.
+
+        Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
+        ``dim_labels`` this tensor's ``get_tensor_descriptor()`` emits (so the
+        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
+        ``physical_unit`` without remapping). Element ``i`` is the physical
+        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
+        dimension with no known physical size (e.g. T/C axes).
+
+        Returns ``None`` when no physical sizes are known. This is the compact
+        ~200-byte summary the tensor-load hot path needs (issue #31), so it must
+        be **cheap** -- read it straight off the resident metadata model, never
+        a full ``get_metadata()`` dump. Default ``None``; format adapters that
+        carry physical voxel sizes override it.
+        """
+        return None
+
 
 class BackendAdapter(SourceAdapter, TensorAdapter):
     pass
+
+
+# --- role-scope enforcement -------------------------------------------------
+# The two role interfaces must stay disjoint and match their declared scope, so
+# a tensor-scoped method can never silently land on SourceAdapter again (the
+# past scramble that this split fixes). Adding a public method to either ABC
+# without classifying it here fails the equality check; any overlap fails the
+# disjointness check. Underscore-private helpers are intentionally excluded.
+_SOURCE_SCOPED_API = frozenset(
+    {
+        "array_id",
+        "claim",
+        "create_from_config",
+        "list_tensor_descriptors",
+        "get_metadata",
+        "metadata_covers_all_tensors",
+        "get_source_descriptor",
+        "resolve",
+        "is_resident",
+        "get_tensor_adapter",
+    }
+)
+_TENSOR_SCOPED_API = frozenset(
+    {
+        "get_tensor_descriptor",
+        "get_chunk_size",
+        "get_data",
+        "get_arrow_schema",
+        "resolve_chunk_data",
+        "get_read_plan",
+        "get_native_pyramid_levels",
+        "has_native_pyramid",
+        "get_physical_scale",
+    }
+)
+
+
+def _public_api(cls: type) -> frozenset:
+    """Public (non-underscore) attribute names declared directly on ``cls``."""
+    return frozenset(name for name in vars(cls) if not name.startswith("_"))
+
+
+assert _public_api(SourceAdapter) == _SOURCE_SCOPED_API, (
+    "SourceAdapter public API drifted from its declared source-level scope: "
+    f"{sorted(_public_api(SourceAdapter) ^ _SOURCE_SCOPED_API)} "
+    "(classify new methods in base._SOURCE_SCOPED_API / _TENSOR_SCOPED_API)"
+)
+assert _public_api(TensorAdapter) == _TENSOR_SCOPED_API, (
+    "TensorAdapter public API drifted from its declared tensor-level scope: "
+    f"{sorted(_public_api(TensorAdapter) ^ _TENSOR_SCOPED_API)} "
+    "(classify new methods in base._SOURCE_SCOPED_API / _TENSOR_SCOPED_API)"
+)
+assert _SOURCE_SCOPED_API.isdisjoint(_TENSOR_SCOPED_API), (
+    "source/tensor adapter scopes overlap: "
+    f"{sorted(_SOURCE_SCOPED_API & _TENSOR_SCOPED_API)}"
+)
 
 
 def _get_read_plan(
