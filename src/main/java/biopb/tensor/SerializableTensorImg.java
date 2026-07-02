@@ -522,6 +522,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             case "u8": case "uint64":  kind = 'u'; size = 8; break;
             case "i8": case "int64":   kind = 'i'; size = 8; break;
             case "f8": case "float64": kind = 'f'; size = 8; break;
+            case "f2": case "float16": kind = 'f'; size = 2; break;
             case "f4": case "float32":
             default:                   kind = 'f'; size = 4; break;
         }
@@ -536,7 +537,13 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                         case 1: out[i] = buf.get() & 0xFF; break;
                         case 2: out[i] = buf.getShort() & 0xFFFF; break;
                         case 4: out[i] = buf.getInt() & 0xFFFFFFFFL; break;
-                        default: out[i] = (double) buf.getLong(); break; // u8
+                        default: { // u8: interpret the 64 bits as UNSIGNED
+                            long u = buf.getLong();
+                            out[i] = u >= 0
+                                    ? (double) u
+                                    : (u & Long.MAX_VALUE) + 9223372036854775808.0; // + 2^63
+                            break;
+                        }
                     }
                     break;
                 case 'i':
@@ -548,11 +555,47 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                     }
                     break;
                 default: // 'f'
-                    out[i] = size == 8 ? buf.getDouble() : buf.getFloat();
+                    out[i] = size == 8
+                            ? buf.getDouble()
+                            : size == 2 ? halfToFloat(buf.getShort()) : buf.getFloat();
                     break;
             }
         }
         return out;
+    }
+
+    /**
+     * Convert an IEEE 754 half-precision (float16) bit pattern to a float.
+     *
+     * <p>Java 11 has no native float16 decode, so unpack the sign / 5-bit exponent /
+     * 10-bit mantissa by hand, handling subnormals, Inf and NaN. Used for chunks
+     * whose dtype string is {@code f2}/{@code float16}.
+     */
+    private static float halfToFloat(short half) {
+        int bits = half & 0xffff;
+        int sign = (bits >>> 15) & 0x1;
+        int exp = (bits >>> 10) & 0x1f;
+        int mant = bits & 0x3ff;
+        int out;
+        if (exp == 0) {
+            if (mant == 0) {
+                out = sign << 31; // +/- zero
+            } else {
+                // Subnormal half: normalize into a float32 normal.
+                exp = 1;
+                while ((mant & 0x400) == 0) {
+                    mant <<= 1;
+                    exp--;
+                }
+                mant &= 0x3ff;
+                out = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+            }
+        } else if (exp == 0x1f) {
+            out = (sign << 31) | (0xff << 23) | (mant << 13); // Inf / NaN
+        } else {
+            out = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+        }
+        return Float.intBitsToFloat(out);
     }
 
     private static <T extends NativeType<T> & RealType<T>> void writeChunk(
