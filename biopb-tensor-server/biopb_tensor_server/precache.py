@@ -294,6 +294,24 @@ class PrecacheWorker:
         source_adapter = self._server._get_source_adapter(source_id)
         if source_adapter is None:
             return False
+
+        # Skip non-local (remote) sources entirely (biopb/biopb#299). Warming a
+        # remote-tensor proxy source would speculatively pull every chunk across
+        # the network from the upstream at startup -- costly I/O of questionable
+        # value (the real read path caches on demand, and the upstream caches
+        # too), and it inflates the local file cache (feeding the slow-restart
+        # recovery, #300). It is also unsound today: the proxy does not implement
+        # has_native_pyramid(), so a pyramidal upstream would be warmed at a
+        # computed coarse level the upstream already serves natively -- caching
+        # chunks the native-pyramid skip below is meant to avoid.
+        from biopb_tensor_server.discovery import is_remote_url
+
+        if is_remote_url(getattr(source_adapter, "_source_url", "") or ""):
+            logger.debug(
+                "precache: skipping non-local source %s (warmed on demand)", source_id
+            )
+            return False
+
         try:
             descriptors = source_adapter.list_tensor_descriptors()
         except Exception:
