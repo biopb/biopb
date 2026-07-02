@@ -202,6 +202,23 @@ class TestCachedSourceAdapter:
         CacheManager.get_instance().release(chunk_id)
         CacheManager.reset()
 
+    def test_write_chunk_arrow_rejects_list_wrapper(self):
+        # The binary chunk schema stores the flat value buffer, and the upload
+        # dtype is derived from the primitive Arrow field type; a list<T> wrapper
+        # would corrupt both (buffer[1] is offsets, to_pandas_dtype() is wrong).
+        # write_chunk_arrow must refuse it rather than silently mis-store.
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        adapter = CachedSourceAdapter(
+            source_id="t", shape=[4], dtype="int16", chunk_shape=[4]
+        )
+        list_wrapper = pa.array([[1, 2, 3, 4]])  # list<int64>, not flat values
+        with pytest.raises(TypeError, match="not a list"):
+            adapter.write_chunk_arrow(
+                ChunkBounds(start=[0], stop=[4]), list_wrapper, [4], np.int16
+            )
+        CacheManager.reset()
+
     def test_write_chunk_with_file_backend_schema(self):
         """Regression test: write_chunk must emit the unified binary chunk schema.
 
