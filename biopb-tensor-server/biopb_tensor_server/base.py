@@ -504,12 +504,20 @@ class TensorAdapter(ABC):
         """
         import importlib.metadata
 
+        from biopb.tensor._wire_version import (
+            TENSOR_WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_METADATA_KEY,
+        )
+
         desc = desc or self.get_tensor_descriptor()
         require_resolved(desc)
 
-        # Schema metadata: server version for compatibility tracking and feature detection
+        # Schema metadata: the wire-protocol version is the hard compatibility
+        # gate the client enforces (biopb/biopb#293); tensor_schema_version is
+        # kept as an informational package-version tag.
         metadata = {
             "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
+            WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
 
         return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
