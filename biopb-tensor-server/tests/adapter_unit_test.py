@@ -1,7 +1,7 @@
-"""Server-side unit tests for adapters, config, and compute backend.
+"""Server-side unit tests for adapters, config, and downsampling.
 
-Tests for adapter behavior, configuration parsing, compute backend selection,
-and scaled read planning.
+Tests for adapter behavior, configuration parsing, reduction-method
+normalisation, and scaled read planning.
 """
 
 import os
@@ -60,29 +60,31 @@ class TestZarrAdapter:
 class TestTensorConfig:
     """Tests for tensor server config parsing."""
 
-    def test_parse_compute_backend_options(self):
-        config = parse_config(
-            {
-                "server": {
-                    "host": "127.0.0.1",
-                    "port": 9000,
-                },
-                "compute": {
-                    "backend": "gpu",
-                    "gpu_min_input_mb": 8,
-                    "gpu_min_linear_input_mb": 3,
-                    "gpu_memory_safety_factor": 6,
-                    "gpu_min_merged_chunks": 5,
-                },
-                "sources": [],
-            }
-        )
+    def test_legacy_compute_section_ignored_with_warning(self, caplog):
+        """The removed [compute] section is warn-and-ignore, never an error."""
+        import logging
 
-        assert config.compute_backend == "gpu"
-        assert config.gpu_min_input_mb == 8.0
-        assert config.gpu_min_linear_input_mb == 3.0
-        assert config.gpu_memory_safety_factor == 6
-        assert config.gpu_min_merged_chunks == 5
+        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.config"):
+            config = parse_config(
+                {
+                    "server": {
+                        "host": "127.0.0.1",
+                        "port": 9000,
+                    },
+                    "compute": {
+                        "backend": "gpu",
+                        "gpu_min_input_mb": 8,
+                    },
+                    "sources": [],
+                }
+            )
+
+        assert not hasattr(config, "compute_backend")
+        assert not hasattr(config, "gpu_min_input_mb")
+        assert any(
+            "deprecated" in rec.getMessage() and "compute" in rec.getMessage()
+            for rec in caplog.records
+        )
 
     def test_parse_periodic_monitor_settings(self):
         config = parse_config(
@@ -141,94 +143,98 @@ class TestTensorConfig:
         assert config.claim_generic_images is True
 
 
-class TestComputeBackendSelection:
-    """Tests for internal CPU/GPU backend heuristics."""
+class TestReductionMethodNormalization:
+    """Tests for normalize_reduction_method and the deprecated linear alias."""
 
-    def test_nearest_prefers_cpu(self, monkeypatch):
-        monkeypatch.setattr(_ds, "_HAS_CUPY", True)
-        monkeypatch.setattr(_ds, "_get_gpu_free_bytes", lambda: 1 << 30)
-        monkeypatch.delenv("BIOPB_TENSOR_FORCE_BACKEND", raising=False)
+    def test_supported_methods_and_aliases(self):
+        assert _ds.normalize_reduction_method("nearest") == "nearest"
+        assert _ds.normalize_reduction_method("area") == "area"
+        assert _ds.normalize_reduction_method("precompute") == "precompute"
+        assert _ds.normalize_reduction_method("stride") == "nearest"
+        assert _ds.normalize_reduction_method("decimate") == "nearest"
+        assert _ds.normalize_reduction_method("mean") == "area"
+        assert _ds.normalize_reduction_method("precomputed") == "precompute"
 
-        backend = _ds._select_compute_backend(
-            source_shape=(4096, 4096),
-            dtype=np.dtype("uint8"),
-            reduction_method="nearest",
-            scale_hint=(4, 4),
-            merged_chunk_count=8,
+    def test_default_is_area(self):
+        """Unspecified method resolves to area, matching PyramidConfig and
+        the advertised pyramid levels (descriptor consistency, biopb#76)."""
+        assert _ds.normalize_reduction_method("") == "area"
+        assert _ds.normalize_reduction_method(None) == "area"
+
+    def test_linear_aliases_to_area_with_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.downsample"):
+            assert _ds.normalize_reduction_method("linear") == "area"
+        assert any("deprecated" in rec.getMessage() for rec in caplog.records)
+
+    def test_unknown_method_raises(self):
+        with pytest.raises(ValueError, match="Unsupported reduction method"):
+            _ds.normalize_reduction_method("cubic")
+
+    def test_pyramid_config_accepts_linear_alias(self):
+        from biopb_tensor_server.config import PyramidConfig
+
+        # Tolerated deprecated alias: old configs must keep validating.
+        PyramidConfig(reduction_method="linear")
+
+
+class TestAdvisoryReductionCacheKey:
+    """reduction_method is advisory: excluded from the cache key (biopb#76)."""
+
+    def test_cache_key_strips_method(self):
+        from biopb_tensor_server.chunk import (
+            cache_key_for_chunk_id,
+            encode_chunk_id,
+            encode_chunk_id_with_scale,
         )
 
-        assert backend == "cpu"
+        bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
+        nearest_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "nearest")
+        area_id = encode_chunk_id_with_scale("arr", bounds, (4, 4), "area")
+        other_scale = encode_chunk_id_with_scale("arr", bounds, (2, 2), "area")
 
-    def test_large_linear_prefers_gpu(self, monkeypatch):
-        monkeypatch.setattr(_ds, "_HAS_CUPY", True)
-        monkeypatch.setattr(_ds, "cupy_ndimage", object())
-        monkeypatch.setattr(_ds, "_get_gpu_free_bytes", lambda: 1 << 30)
-        monkeypatch.delenv("BIOPB_TENSOR_FORCE_BACKEND", raising=False)
+        assert cache_key_for_chunk_id(nearest_id) == cache_key_for_chunk_id(area_id)
+        assert cache_key_for_chunk_id(nearest_id) != cache_key_for_chunk_id(other_scale)
 
-        backend = _ds._select_compute_backend(
-            source_shape=(4096, 4096),
-            dtype=np.dtype("uint16"),
-            reduction_method="linear",
-            scale_hint=(4, 4),
-            merged_chunk_count=8,
-        )
+        raw_id = encode_chunk_id("arr", bounds)
+        assert cache_key_for_chunk_id(raw_id) == raw_id
 
-        assert backend == "gpu"
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_cache_hit_across_reduction_methods(self):
+        """A chunk warmed under one method serves a request for another."""
+        import zarr
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.chunk import encode_chunk_id_with_scale
+        from biopb_tensor_server.config import CacheConfig
 
-    def test_force_cpu_override(self, monkeypatch):
-        monkeypatch.setattr(_ds, "_HAS_CUPY", True)
-        monkeypatch.setattr(_ds, "_get_gpu_free_bytes", lambda: 1 << 30)
-        monkeypatch.setenv("BIOPB_TENSOR_FORCE_BACKEND", "cpu")
-
-        backend = _ds._select_compute_backend(
-            source_shape=(8192, 8192),
-            dtype=np.dtype("uint16"),
-            reduction_method="area",
-            scale_hint=(4, 4),
-            merged_chunk_count=16,
-        )
-
-        assert backend == "cpu"
-
-    def test_force_gpu_falls_back_without_cupy(self, monkeypatch):
-        monkeypatch.setattr(_ds, "_HAS_CUPY", False)
-        monkeypatch.setenv("BIOPB_TENSOR_FORCE_BACKEND", "gpu")
-
-        backend = _ds._select_compute_backend(
-            source_shape=(8192, 8192),
-            dtype=np.dtype("uint16"),
-            reduction_method="area",
-            scale_hint=(4, 4),
-            merged_chunk_count=16,
-        )
-
-        assert backend == "cpu"
-
-    def test_configure_compute_backend_updates_thresholds(self, monkeypatch):
-        from biopb_tensor_server import (
-            configure_compute_backend,
-            get_compute_backend_options,
-        )
-
-        monkeypatch.delenv("BIOPB_TENSOR_FORCE_BACKEND", raising=False)
-        original = get_compute_backend_options()
-
-        try:
-            configure_compute_backend(
-                force_backend="gpu",
-                gpu_min_input_bytes=123,
-                gpu_min_linear_input_bytes=45,
-                gpu_memory_safety_factor=7,
-                gpu_min_merged_chunks=9,
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = os.path.join(tmpdir, "test.zarr")
+            arr = zarr.open_array(
+                zarr_path, mode="w", shape=(64, 64), chunks=(64, 64), dtype="uint16"
             )
-            options = get_compute_backend_options()
-            assert options.force_backend == "gpu"
-            assert options.gpu_min_input_bytes == 123
-            assert options.gpu_min_linear_input_bytes == 45
-            assert options.gpu_memory_safety_factor == 7
-            assert options.gpu_min_merged_chunks == 9
-        finally:
-            configure_compute_backend(**original.__dict__)
+            arr[:] = np.arange(64 * 64, dtype="uint16").reshape(64, 64)
+
+            adapter = ZarrAdapter(arr, "test-array", ["y", "x"])
+            cache_manager = CacheManager(CacheConfig(backend="memory"))
+
+            bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
+            area_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4), "area")
+            nearest_id = encode_chunk_id_with_scale(
+                "test-array", bounds, (4, 4), "nearest"
+            )
+
+            first = adapter.resolve_chunk_data(area_id, cache_manager)
+            stats = cache_manager.stats()
+            assert stats.misses == 1
+
+            second = adapter.resolve_chunk_data(nearest_id, cache_manager)
+            stats = cache_manager.stats()
+            assert stats.misses == 1
+            assert stats.hits == 1
+
+            # The advisory method means the warmed (area) data is served.
+            assert first.column("data").to_pylist() == second.column("data").to_pylist()
 
 
 class TestGetScaledReadPlan:

@@ -48,7 +48,7 @@ const SCHEMA: ConfigSchema = {
         downscale_factor: { type: "integer", minimum: 2 },
         reduction_method: {
           type: "string",
-          description: "one of: area, linear, nearest",
+          description: "one of: area, decimate, linear, mean, nearest, stride",
         },
       },
     },

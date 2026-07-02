@@ -107,7 +107,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     t: 0,
     z: 0,
     c: 0,
-    reductionMethod: "nearest",
+    reductionMethod: "area",
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
   },

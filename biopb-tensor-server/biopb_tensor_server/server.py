@@ -39,7 +39,11 @@ from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.chunk import build_pyramid_plan, encode_chunk_id
+from biopb_tensor_server.chunk import (
+    build_pyramid_plan,
+    cache_key_for_chunk_id,
+    encode_chunk_id,
+)
 from biopb_tensor_server.config import PyramidConfig
 from biopb_tensor_server.errors import (
     SourceResolveRetriableError,
@@ -1365,15 +1369,19 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"Adapter not found for chunk_id: {chunk_id[:16]}..."
             )
 
+        # Entries are stored under the method-stripped canonical key
+        # (biopb/biopb#76); locate with the same key or a warm chunk cached
+        # under a different reduction_method is never found.
+        cache_key = cache_key_for_chunk_id(chunk_id)
         try:
             # If the chunk is already cached, just locate it. Resolving first
             # would, on a chunk whose in-RAM entry has been trimmed, re-read the
             # whole chunk from its segment server-side for nothing. Only
             # materialize (same path as do_get) on a genuine cold miss.
-            location = cache_manager.locate_entry(chunk_id)
+            location = cache_manager.locate_entry(cache_key)
             if location is None:
                 adapter.resolve_chunk_data(chunk_id, cache_manager)
-                location = cache_manager.locate_entry(chunk_id)
+                location = cache_manager.locate_entry(cache_key)
         except (OSError, ValueError) as e:
             raise flight.FlightInternalError(
                 f"I/O error locating chunk data: {e}"

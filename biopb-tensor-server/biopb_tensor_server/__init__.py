@@ -59,11 +59,6 @@ from biopb_tensor_server.chunk import ChunkEndpoint
 from biopb_tensor_server.config import (
     CacheConfig,
 )
-from biopb_tensor_server.downsample import (
-    ComputeBackendOptions,
-    configure_compute_backend,
-    get_compute_backend_options,
-)
 from biopb_tensor_server.server import (
     TensorFlightServer,
     serve,
@@ -90,9 +85,6 @@ __all__ = [
     "BackendAdapter",
     "ChunkEndpoint",
     "TensorReadPlan",
-    "ComputeBackendOptions",
-    "configure_compute_backend",
-    "get_compute_backend_options",
     "ZarrAdapter",
     "Hdf5Adapter",
     "OmeTiffAdapter",

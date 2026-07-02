@@ -54,7 +54,6 @@ export const SECRET_PROFILE_KEYS = ["key", "secret", "token"] as const;
 /** The object-typed config sections we render structured editors for, in order. */
 export const ADVANCED_SECTIONS = [
   "server",
-  "compute",
   "cache",
   "pyramid",
   "precache",

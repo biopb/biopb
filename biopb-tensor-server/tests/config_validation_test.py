@@ -44,6 +44,18 @@ def _violations(caplog):
             "pyramid",
             "reduction_method",
         ),
+        # "precompute" is protocol vocabulary (request a native on-disk level),
+        # not a way to compute a pyramid level -- invalid as config.
+        (
+            lambda: PyramidConfig(reduction_method="precompute"),
+            "pyramid",
+            "reduction_method",
+        ),
+        (
+            lambda: PyramidConfig(reduction_method="PRECOMPUTED"),
+            "pyramid",
+            "reduction_method",
+        ),
         (lambda: CacheConfig(backend="bogus"), "cache", "backend"),
         (lambda: CacheConfig(memory_max_bytes=0), "cache", "memory_max_bytes"),
         (lambda: CacheConfig(file_max_total_bytes=-1), "cache", "file_max_total_bytes"),
@@ -69,7 +81,6 @@ def _violations(caplog):
         ),
         (lambda: ServerConfig(port=0), "server", "port"),
         (lambda: ServerConfig(port=99999), "server", "port"),
-        (lambda: ServerConfig(compute_backend="bogus"), "server", "compute_backend"),
         (lambda: ServerConfig(rescan_interval=-1.0), "server", "rescan_interval"),
     ],
 )
@@ -108,12 +119,14 @@ def test_valid_defaults_do_not_warn(caplog):
         # full_rescan_interval <= 0 disables the periodic full scan (sentinel).
         lambda: ServerConfig(full_rescan_interval=0.0),
         lambda: ServerConfig(full_rescan_interval=-1.0),
-        # reduction_method aliases + case-insensitivity (mirrors normalize_*).
+        # reduction_method aliases + case-insensitivity (mirrors normalize_*'s
+        # computable subset -- "precompute" is protocol-only, tested above).
         lambda: PyramidConfig(reduction_method="mean"),
-        lambda: PyramidConfig(reduction_method="PRECOMPUTED"),
-        # log_level / compute_backend accepted forms.
+        lambda: PyramidConfig(reduction_method="STRIDE"),
+        # "linear" is a tolerated deprecated alias (folds to "area" at read time).
+        lambda: PyramidConfig(reduction_method="linear"),
+        # log_level accepted forms.
         lambda: ServerConfig(log_level="debug"),
-        lambda: ServerConfig(compute_backend="gpu"),
         # boundaries are inclusive.
         lambda: PrecacheConfig(backlog_high_water=0.0),
         lambda: PrecacheConfig(backlog_high_water=1.0),
@@ -182,11 +195,18 @@ def test_validate_config_dict_flags_reduction_method():
 
 
 def test_validate_config_dict_uses_ondisk_paths():
-    # A field whose wire section diverges from the dataclass (compute_backend is
-    # a ServerConfig field but lives under [compute] on disk) reports the on-disk
-    # path, so it dedupes against the JSON Schema's path at the endpoint.
-    problems = validate_config_dict({"compute": {"backend": "quantum"}})
-    assert [p["path"] for p in problems] == [["compute", "backend"]]
+    # A field whose wire section diverges from the dataclass (memory_max_entries
+    # is a CacheConfig field but lives at [cache] max_entries on disk) reports
+    # the on-disk path, so it dedupes against the JSON Schema's path at the
+    # endpoint.
+    problems = validate_config_dict({"cache": {"max_entries": 0}})
+    assert [p["path"] for p in problems] == [["cache", "max_entries"]]
+
+
+def test_validate_config_dict_ignores_removed_compute_section():
+    # The [compute] section was removed with the GPU backend; it is
+    # warn-and-ignore at parse time and must NOT be a validation problem.
+    assert validate_config_dict({"compute": {"backend": "quantum"}}) == []
 
 
 def test_validate_config_dict_independent_of_warn_policy(monkeypatch):

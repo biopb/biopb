@@ -41,6 +41,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.chunk import (
+    cache_key_for_chunk_id,
     decode_chunk_id,
     encode_chunk_id,
     is_scaled_chunk,
@@ -530,11 +531,14 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             return batch, batch.nbytes
 
         if should_cache:
+            # Cache under the method-stripped canonical key (biopb/biopb#76);
+            # the full chunk_id, method included, is still forwarded upstream.
+            cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
-                chunk_id, compute_fn, metadata={"array_id": local_array_id}
+                cache_key, compute_fn, metadata={"array_id": local_array_id}
             )
             data = entry.data
-            cache_manager.release(chunk_id)
+            cache_manager.release(cache_key)
             return data
         data, _ = compute_fn()
         return data

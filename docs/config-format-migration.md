@@ -115,7 +115,7 @@ what the server reads and enforces at startup — one definition, no drift. The
 key set + types come from the dataclasses (introspected, routed to their on-disk
 section), bounds/enums from the `_Range`/`_Enum` objects (each grew a
 `to_json_schema()`). Two small declarative pieces remain: `_ONDISK_OVERRIDES`
-(the few fields whose wire form differs — `[compute]` is read into `ServerConfig`;
+(the few fields whose wire form differs —
 `cache.*_mb`/`*_gb` convert to byte fields) and `_DEPRECATED_ALIASES` (legacy
 keys the parser still accepts but that aren't dataclass fields: `watcher_type`/
 `poll_interval`, source `path`, the pyramid knobs under `[precache]`, plus the

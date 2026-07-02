@@ -14,8 +14,8 @@ module re-projects them as a JSON Schema (Draft 2020-12) describing the
 
 Almost nothing is hand-maintained per field: the key set + types come from the
 dataclasses, bounds/enums from ``_CONSTRAINTS``. The two declarative pieces are
-``_ONDISK_OVERRIDES`` (the few fields whose wire form differs -- ``[compute]`` is
-read into ``ServerConfig``, ``cache.*_mb``/``*_gb`` convert to byte fields) and
+``_ONDISK_OVERRIDES`` (the few fields whose wire form differs --
+``cache.*_mb``/``*_gb`` convert to byte fields) and
 ``_DEPRECATED_ALIASES`` (legacy keys the parser still accepts but that aren't
 dataclass fields). Both are small and change only when the *file layout* does.
 
@@ -58,18 +58,9 @@ _SECTION_CLASSES = (
 # (ClassName, dataclass field) -> (on-disk section, on-disk key) for the fields
 # whose wire form diverges from the dataclass. Everything else maps to
 # (_SECTION_FOR[class], field-name). See parse_config:
-#   - compute_backend / gpu_* live on ServerConfig but are read from [compute];
 #   - cache.max_entries/max_bytes feed memory_max_*; file_max_*_mb/_gb are
 #     converted to the *_bytes fields (the >= 1 bound stays sensible in MB/GB).
 _ONDISK_OVERRIDES: Dict[Tuple[str, str], Tuple[str, str]] = {
-    ("ServerConfig", "compute_backend"): ("compute", "backend"),
-    ("ServerConfig", "gpu_min_input_mb"): ("compute", "gpu_min_input_mb"),
-    ("ServerConfig", "gpu_min_linear_input_mb"): ("compute", "gpu_min_linear_input_mb"),
-    ("ServerConfig", "gpu_memory_safety_factor"): (
-        "compute",
-        "gpu_memory_safety_factor",
-    ),
-    ("ServerConfig", "gpu_min_merged_chunks"): ("compute", "gpu_min_merged_chunks"),
     ("CacheConfig", "memory_max_entries"): ("cache", "max_entries"),
     ("CacheConfig", "memory_max_bytes"): ("cache", "max_bytes"),
     ("CacheConfig", "file_max_segment_bytes"): ("cache", "file_max_segment_mb"),
