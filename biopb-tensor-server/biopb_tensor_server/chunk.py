@@ -302,6 +302,19 @@ def encode_chunk_id_with_scale(
     return base + scale_payload
 
 
+def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
+    """``(ndim, bounds_end)`` for a chunk_id.
+
+    ``bounds_end`` is where the standard encoding (array_id + ndim + start +
+    stop) ends; any bytes past it are the scale payload of a scaled chunk_id
+    (see :func:`encode_chunk_id_with_scale`).
+    """
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    return ndim, offset + 2 + ndim * 8 + ndim * 8
+
+
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds.
 
@@ -311,10 +324,7 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
     Returns:
         True if chunk_id contains scale info
     """
-    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    _, bounds_end = _bounds_end(chunk_id)
     return len(chunk_id) > bounds_end
 
 
@@ -330,10 +340,7 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     The result is an opaque cache key: it is NOT a valid chunk_id and must not
     be fed to :func:`decode_scale_info` or forwarded on the wire.
     """
-    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    ndim, bounds_end = _bounds_end(chunk_id)
     if len(chunk_id) <= bounds_end:
         return chunk_id
     return chunk_id[: bounds_end + ndim * 8]
@@ -348,10 +355,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     Returns:
         Tuple of (scale_hint, reduction_method)
     """
-    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    ndim, bounds_end = _bounds_end(chunk_id)
 
     # Decode scale_hint
     scale_hint = []
