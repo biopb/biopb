@@ -72,7 +72,7 @@ class _TreeNode:
 
 
 def _get_path_parts(url: str) -> List[str]:
-    """Extract path parts from source_url.
+    """Extract tree path parts from source_url.
 
     Splits on both POSIX (``/``) and Windows (``\\``) separators so a catalog
     indexed on Windows — whose ``source_url`` is a backslash path like
@@ -81,14 +81,28 @@ def _get_path_parts(url: str) -> List[str]:
     A leading drive-letter token (``C:``) is dropped: ``urlparse`` reads it as a
     URL scheme so it is usually already gone, but when it survives it is just
     noise in the folder hierarchy.
+
+    For an authority URL (a non-empty netloc — remote ``tensor-server`` mirrors
+    ``grpc://host:port/remote/path``, ``s3://bucket/key``, …) the endpoint
+    ``<scheme>://<netloc>`` is emitted as the FIRST part, so mirrored sources nest
+    by their remote filepath under an endpoint root rather than collapsing into a
+    flat ``grpc:`` node (biopb/biopb#297). A local ``file://`` url has an empty
+    netloc, so it is unchanged (still just its path).
+
+    Mirror of the web viewer's ``getPathParts`` in
+    ``biopb-tensor-server/packages/web/src/components/SourceTree.tsx`` — keep the
+    two behaviorally in lockstep.
     """
     if not url:
         return []
     try:
         parsed = urlparse(url)
-        raw = parsed.path or url
     except Exception:
-        raw = url
+        parsed = None
+    if parsed is not None and parsed.scheme and parsed.netloc:
+        path_parts = [p for p in re.split(r"[\\/]+", parsed.path) if p]
+        return [f"{parsed.scheme}://{parsed.netloc}"] + path_parts
+    raw = (parsed.path if parsed is not None else None) or url
     parts = [p for p in re.split(r"[\\/]+", raw) if p]
     if parts and re.fullmatch(r"[A-Za-z]:", parts[0]):
         parts = parts[1:]

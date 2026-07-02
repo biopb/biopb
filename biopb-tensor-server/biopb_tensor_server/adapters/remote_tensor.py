@@ -169,10 +169,12 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
     """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
-    ``source_type``, ``metadata_json``, ``data_resident`` and the per-tensor
-    ``tensors`` STRUCT[] (biopb/biopb#224) -- everything needed to seed a
-    mirrored source's catalog entry without a per-source upstream RPC
-    (biopb/biopb#266). ``data_resident`` is carried so an unresolved upstream
+    ``source_url``, ``source_type``, ``metadata_json``, ``data_resident`` and the
+    per-tensor ``tensors`` STRUCT[] (biopb/biopb#224) -- everything needed to seed
+    a mirrored source's catalog entry without a per-source upstream RPC
+    (biopb/biopb#266). ``source_url`` carries the upstream's real path so the
+    mirror can be treed by filepath in the browser (biopb/biopb#297).
+    ``data_resident`` is carried so an unresolved upstream
     source (``data_resident=false``, empty ``tensors``) mirrors as non-resident
     rather than being advertised resident. ``complete`` is True because the
     server-side DuckDB catalog is not truncated like ``list_sources()``.
@@ -183,8 +185,8 @@ def fetch_upstream_catalog(client) -> tuple[Optional[List[dict]], bool]:
     """
     try:
         rows = client.query_sources(
-            "SELECT source_id, source_type, metadata_json, data_resident, tensors "
-            "FROM sources",
+            "SELECT source_id, source_url, source_type, metadata_json, "
+            "data_resident, tensors FROM sources",
             format="records",
         )
         return rows, True
@@ -233,15 +235,18 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
         self._alias = alias
-        # Display-friendly catalog source_url: keep the grpc:// scheme (so it fits
-        # the URL pattern and passes to_catalog_url through unchanged), but put the
-        # alias -- or the host:port when there is none -- in the authority slot and
-        # the upstream source_id after it: grpc://lab:experiment1 (aliased) or
-        # grpc://lab-store:8815:experiment1 (no alias). Far more legible in a
-        # listing than the bare endpoint, which is identical for every source of an
-        # upstream. (self._upstream_location keeps the real endpoint for dialing.)
-        authority = alias or (urlsplit(upstream_location).netloc or upstream_location)
-        self._source_url = f"grpc://{authority}:{upstream_source_id}"
+        # Display authority for the catalog source_url: the alias, or the
+        # host:port when there is none. (self._upstream_location keeps the real
+        # endpoint for dialing.)
+        self._authority = alias or (
+            urlsplit(upstream_location).netloc or upstream_location
+        )
+        # Display-friendly catalog source_url. Until the upstream's real path is
+        # seeded (seed_catalog, biopb/biopb#297), fall back to the endpoint + the
+        # upstream source_id -- grpc://lab:experiment1 (aliased) or
+        # grpc://lab-store:8815:experiment1 (no alias) -- which is at least more
+        # legible than the bare endpoint shared by every source of an upstream.
+        self._source_url = f"grpc://{self._authority}:{upstream_source_id}"
 
         self._upstream_location = upstream_location
         self._upstream_source_id = upstream_source_id
@@ -355,11 +360,31 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             alias=source.alias,
         )
 
+    def _display_source_url(self, upstream_source_url: Optional[str]) -> str:
+        """Build the catalog ``source_url`` so a browser can tree a mirror by path.
+
+        Embeds the upstream source's REAL location under the (aliased) endpoint --
+        ``grpc://<authority>/<remote-path>`` -- so a client nests mirrored sources
+        by their upstream filepath beneath an endpoint root, instead of collapsing
+        every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297).
+        The upstream url is a normalized catalog url (e.g.
+        ``file:///labs/x/img.tif`` or ``s3://bucket/key``); keep its authority +
+        path, drop the scheme. Falls back to the endpoint + upstream source_id when
+        no usable path is available (empty/opaque upstream url).
+        """
+        if upstream_source_url:
+            parts = urlsplit(upstream_source_url)
+            remote = (parts.netloc + parts.path).strip("/")
+            if remote:
+                return f"grpc://{self._authority}/{remote}"
+        return f"grpc://{self._authority}:{self._upstream_source_id}"
+
     def seed_catalog(
         self,
         upstream_tensors: List[dict],
         metadata: Optional[dict],
         data_resident: bool = True,
+        source_url: Optional[str] = None,
     ) -> bool:
         """(Re)populate the catalog surface from a bulk upstream ``query_sources``.
 
@@ -379,6 +404,10 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         so an in-place upstream resolution (empty -> populated tensors,
         false -> true) refreshes here rather than going stale.
 
+        ``source_url`` is the upstream source's own catalog url; it is folded into
+        the mirror's display url so the browser can tree it by the remote path
+        (biopb/biopb#297).
+
         We just queried the upstream, so mark it reachable. Returns whether the
         seeded catalog surface actually changed, so the caller can skip a
         redundant metadata-DB re-sync (and its ``indexed_at`` churn).
@@ -396,15 +425,19 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             )
         new_metadata = metadata or {}
         new_resident = bool(data_resident)
+        # Mirror the upstream's real path into the display url (biopb/biopb#297).
+        new_url = self._display_source_url(source_url)
         changed = (
             descs != self._descriptors_cache
             or new_metadata != self._metadata_cache
             or new_resident != self._upstream_resident
+            or new_url != self._source_url
         )
         self._descriptors_cache = descs
         self._metadata_cache = new_metadata
         self._reachable = True
         self._upstream_resident = new_resident
+        self._source_url = new_url
         return changed
 
     def get_metadata(self) -> dict:

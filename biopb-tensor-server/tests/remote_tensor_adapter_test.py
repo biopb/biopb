@@ -79,6 +79,58 @@ class TestSplitGrpcUrl:
         assert source_id is None
 
 
+class TestMirrorSourceUrlTree:
+    """The mirror's display source_url carries the upstream path (biopb/biopb#297).
+
+    So a browser trees a mirrored source by its remote filepath under an endpoint
+    root, instead of collapsing every source of an upstream into a flat node.
+    """
+
+    def _adapter(self, alias=None):
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        return RemoteTensorAdapter(
+            source_id="lab__img" if alias else "img",
+            upstream_location="grpc://store:8815",
+            upstream_source_id="img",
+            alias=alias,
+        )
+
+    def test_seed_folds_upstream_path_into_display_url(self):
+        a = self._adapter()
+        a.seed_catalog([], {}, True, "file:///labs/Yu/exp1/img.tif")
+        assert a._source_url == "grpc://store:8815/labs/Yu/exp1/img.tif"
+
+    def test_alias_is_the_authority(self):
+        a = self._adapter(alias="lab")
+        a.seed_catalog([], {}, True, "file:///data/x.tif")
+        assert a._source_url == "grpc://lab/data/x.tif"
+
+    def test_remote_scheme_upstream_keeps_bucket(self):
+        a = self._adapter()
+        a.seed_catalog([], {}, True, "s3://bucket/key/img.zarr")
+        assert a._source_url == "grpc://store:8815/bucket/key/img.zarr"
+
+    def test_empty_upstream_url_falls_back_to_source_id_form(self):
+        a = self._adapter()
+        a.seed_catalog([], {}, True, None)
+        assert a._source_url == "grpc://store:8815:img"
+
+    def test_url_change_flags_changed_for_resync(self):
+        a = self._adapter()
+        assert a.seed_catalog([], {}, True, "file:///a/x.tif") is True
+        assert a.seed_catalog([], {}, True, "file:///a/x.tif") is False
+        assert a.seed_catalog([], {}, True, "file:///a/y.tif") is True
+
+    def test_descriptor_carries_the_tree_url(self):
+        # get_source_descriptor() is what the metadata-DB catalog stores.
+        a = self._adapter()
+        a.seed_catalog([], {}, True, "file:///labs/exp/img.tif")
+        assert (
+            a.get_source_descriptor().source_url == "grpc://store:8815/labs/exp/img.tif"
+        )
+
+
 # -------------------------------------------------------------------- end-to-end
 
 
@@ -1248,12 +1300,20 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
         _location = "grpc://fake"
 
         def query_sources(self, sql, format="records"):
-            assert "tensors" in sql and format == "records"
-            return [{"source_id": "a", "tensors": [], "metadata_json": None}]
+            # source_url is now fetched so the mirror can be treed by path (#297).
+            assert "tensors" in sql and "source_url" in sql and format == "records"
+            return [
+                {
+                    "source_id": "a",
+                    "source_url": "file:///d/a.zarr",
+                    "tensors": [],
+                    "metadata_json": None,
+                }
+            ]
 
     rows, complete = fetch_upstream_catalog(_FakeClient())
     assert complete is True
-    assert rows == [{"source_id": "a", "tensors": [], "metadata_json": None}]
+    assert rows[0]["source_url"] == "file:///d/a.zarr"
 
 
 def test_fetch_upstream_catalog_none_on_no_sql_catalog():
@@ -1310,6 +1370,12 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 assert adapter._descriptors_cache is not None  # seeded, not live
                 assert adapter._metadata_cache is not None
                 assert adapter._client is None  # no per-source upstream dial
+                # source_url mirrors the upstream path under the endpoint root, so
+                # a browser trees it by filepath instead of a flat node (#297).
+                assert adapter._source_url.startswith(
+                    f"grpc://localhost:{upstream.port}/"
+                )
+                assert adapter._source_url.endswith(".zarr")
 
             # local catalog populated from the bulk seed
             rows = (
