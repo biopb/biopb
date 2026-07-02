@@ -1461,7 +1461,7 @@ class SourceManager:
             self._commit_remove_source(source_id)
 
         def _row_to_seed(row):
-            """(tensors, metadata, data_resident) for seed_catalog, or None."""
+            """(tensors, metadata, data_resident, source_url) for seed_catalog, or None."""
             if row is None:
                 return None
             raw = row.get("metadata_json")
@@ -1469,7 +1469,12 @@ class SourceManager:
                 metadata = json.loads(raw) if raw else {}
             except (json.JSONDecodeError, TypeError, ValueError):
                 metadata = {}
-            return (row.get("tensors") or [], metadata, bool(row.get("data_resident")))
+            return (
+                row.get("tensors") or [],
+                metadata,
+                bool(row.get("data_resident")),
+                row.get("source_url"),
+            )
 
         extra_config = {}
         if upstream.credentials_profile:
@@ -1737,8 +1742,8 @@ class SourceManager:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata, data_resident = catalog_seed
-                    adapter.seed_catalog(tensors, metadata, data_resident)
+                    tensors, metadata, data_resident, source_url = catalog_seed
+                    adapter.seed_catalog(tensors, metadata, data_resident, source_url)
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
