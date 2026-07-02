@@ -68,6 +68,46 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
             mgr.close()
 
 
+def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
+    """The cache lock must be released BEFORE the (up-to-5s) source-manager join,
+    so a mid-teardown SIGKILL still finds it released (biopb/biopb#300). A slow or
+    raising source_manager.stop() must not keep the lock from being released.
+    """
+    cache_dir = tmp_path / "cache"
+    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    lock_path = cache_dir / "lock"
+    assert lock_path.exists()
+
+    order = []
+    state = {}
+
+    class _Flight:
+        def shutdown(self):
+            order.append("flight")
+
+    class _SourceManager:
+        def stop(self):
+            order.append("source_manager")
+            # The cache lock must already be gone by the time this slow step runs.
+            state["lock_at_stop"] = lock_path.exists()
+            raise RuntimeError("boom")  # a failure here must not matter
+
+    try:
+        cli._graceful_shutdown(
+            source_manager=_SourceManager(),
+            watcher=None,
+            flight_server=_Flight(),
+        )
+        # Cache closed (lock released) between the flight drain and the join.
+        assert order == ["flight", "source_manager"]
+        assert state["lock_at_stop"] is False  # released before the join ran
+        assert not lock_path.exists()  # released despite source_manager raising
+    finally:
+        mgr = CacheManager.get_instance()
+        if mgr is not None:
+            mgr.close()
+
+
 def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     """End-to-end: serve()'s shutdown path releases the cache lock."""
     cache_dir = tmp_path / "cache"

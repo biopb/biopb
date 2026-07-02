@@ -290,6 +290,12 @@ class ArrowFileBackend(CacheBackend):
         # Rebuild metadata index from segment files
         self._rebuild_index_from_segments()
 
+        # Backfill the recovered-entry count from the rebuilt index: _recover()
+        # deliberately skips the segment read (biopb/biopb#300), so the
+        # authoritative count comes from the walk that had to happen anyway.
+        if self._recovery_status is not None:
+            self._recovery_status.recovered_entries = len(self._metadata)
+
         # Find next segment ID (segments are created lazily when first write happens)
         all_segment_ids = set()
         for pool in self._pool_queues.values():
@@ -298,42 +304,42 @@ class ArrowFileBackend(CacheBackend):
         self._next_segment_id = max(all_segment_ids, default=0) + 1
 
     def _recover(self) -> RecoveryStatus:
-        """Recover from crash: clean up incomplete writes."""
-        errors = []
-        recovered_entries = 0
+        """Recover from crash: drop incomplete writes recorded in the WAL.
+
+        The recovered-entry accounting is deliberately cheap and does NOT read
+        segment bodies (biopb/biopb#300). Iterating every record batch to count
+        entries and sum ``batch.nbytes`` faults the entire cache in from disk --
+        tens of GB on a caching-proxy server -- purely for one startup log line,
+        and it duplicates the walk ``_rebuild_index_from_segments()`` does next
+        anyway. So take the recovered byte total from the segment files' on-disk
+        sizes (a ``stat``, no read) and let ``_initialize`` backfill
+        ``recovered_entries`` from the rebuilt index.
+        """
         lost_entries = 0
-        recovered_bytes = 0
-        lost_bytes = 0
 
-        # Get pending keys from WAL
-        pending_keys = self._wal.get_pending_keys()
-
-        # Clear WAL - incomplete writes are lost
-        for key in pending_keys:
+        # Clear WAL - pending (incomplete) writes never reached a segment, so lost.
+        for key in self._wal.get_pending_keys():
             lost_entries += 1
             logger.warning(f"Cache recovery: lost pending write for key {key.hex()}")
         self._wal.clear()
 
-        # Scan existing segments - valid entries survive
+        # Recovered byte total from file sizes -- no segment read (issue #300).
+        # (This is the on-disk footprint; corrupt segments are dropped, and any
+        # read errors are surfaced, by the rebuild pass that follows.)
         segments_dir = self._config.cache_dir / "segments"
+        recovered_bytes = 0
         for seg_file in segments_dir.glob("seg_*.arrow"):
             try:
-                # Just count what's recoverable - actual rebuild happens next
-                with pa.memory_map(str(seg_file), "r") as mmap:
-                    reader = pa.RecordBatchStreamReader(mmap)
-                    for batch in reader:
-                        recovered_entries += 1
-                        recovered_bytes += batch.nbytes
-            except Exception as e:
-                errors.append(f"Error reading {seg_file}: {e}")
-                logger.error(f"Cache recovery error: {e}")
+                recovered_bytes += seg_file.stat().st_size
+            except OSError:
+                pass
 
         return RecoveryStatus(
-            recovered_entries=recovered_entries,
+            recovered_entries=0,  # backfilled from the rebuilt index in _initialize
             lost_entries=lost_entries,
             recovered_bytes=recovered_bytes,
-            lost_bytes=lost_bytes,
-            errors=errors,
+            lost_bytes=0,
+            errors=[],
         )
 
     def _rebuild_index_from_segments(self) -> None:
