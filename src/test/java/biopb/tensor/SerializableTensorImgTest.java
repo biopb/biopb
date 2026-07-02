@@ -244,6 +244,44 @@ public class SerializableTensorImgTest {
     }
 
     @Test
+    public void testScaleHintSurvivesExternalizableRoundTrip() throws Exception {
+        // Regression test: SerializableTensorImg.deserializeLongArray used to
+        // return null unconditionally, silently dropping scaleHint on every
+        // deserialized tensor. The other scaleHint test above only asserts
+        // non-null, and the serialize/deserialize unit tests exercise this
+        // class's *local mirror* of the helper -- neither covers the real
+        // readExternal path, so this reads the field back via reflection.
+        Location location = Location.forGrpcInsecure("localhost", 8815);
+        long[] scaleHint = {2L, 3L};
+
+        TensorDescriptor descriptor = TensorDescriptor.newBuilder()
+                .setArrayId("test")
+                .addShape(64L)
+                .addShape(64L)
+                .setDtype("float32")
+                .build();
+
+        SerializableTensorImg<?> img = new SerializableTensorImg<>(
+                location, null, 100_000L, "source", "tensor",
+                null, scaleHint, "nearest", descriptor, null);
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(baos);
+        oos.writeObject(img);
+        oos.close();
+
+        ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
+        ObjectInputStream ois = new ObjectInputStream(bais);
+        SerializableTensorImg<?> deserialized = (SerializableTensorImg<?>) ois.readObject();
+
+        java.lang.reflect.Field field = SerializableTensorImg.class.getDeclaredField("scaleHint");
+        field.setAccessible(true);
+        long[] restored = (long[]) field.get(deserialized);
+
+        assertArrayEquals("scaleHint must survive the serialization round-trip", scaleHint, restored);
+    }
+
+    @Test
     public void testExternalizablePreservesLocationUri() throws Exception {
         Location location = Location.forGrpcInsecure("localhost", 8815);
         String expectedUri = location.getUri().toString();
