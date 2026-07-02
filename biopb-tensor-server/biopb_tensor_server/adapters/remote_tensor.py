@@ -37,7 +37,11 @@ from urllib.parse import urlsplit
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.descriptor_pb2 import (
+    FlightCmd,
+    TensorDescriptor,
+    TensorReadOption,
+)
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, unpack_chunk_array
@@ -264,6 +268,15 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
         self._metadata_cache: Optional[dict] = None
+        # Authoritative per-tensor native chunk grid, fetched live from the
+        # upstream and memoized by array_id (biopb/biopb#295). The bulk seed's
+        # chunk_shape is advisory only, so the read grid never comes from it; see
+        # get_chunk_size(). Keyed by array_id so each field of a multi-tensor
+        # source caches its own grid. The dict + lock are shared across the
+        # per-field views get_tensor_adapter() makes (copy.copy shares the
+        # references), so one probe serves every view of a tensor.
+        self._chunk_shape_cache: Dict[str, Tuple[int, ...]] = {}
+        self._chunk_shape_lock = threading.Lock()
         # Whether the upstream *source* is resident (carried from the bulk row).
         # None until seeded; is_resident() = reachable AND this (when seeded), so
         # an unresolved upstream source mirrors as non-resident (biopb/biopb#266).
@@ -552,6 +565,111 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         upstream_array_id = self._to_upstream_array_id(self.array_id)
         desc = self.client.get_descriptor(upstream_array_id)
         return self._localize_descriptor(desc)
+
+    def get_chunk_size(self) -> Tuple[int, ...]:
+        """Always source the read grid from the upstream's per-tensor descriptor.
+
+        The bulk seed's ``chunk_shape`` (biopb/biopb#266) is *advisory only* and
+        must never drive read planning:
+
+        - It is captured from the upstream's lean ListFlights / metadata-DB form,
+          which omits ``chunk_shape`` for the aicsimageio/OME-TIFF family
+          (``chunk_shape=[]``) -- 84% of a typical remote catalog.
+        - It is registration-level, so it cannot faithfully carry each field's
+          distinct native grid on a **multi-tensor** source.
+
+        Trusting it plans reads on the wrong grid: an empty seed falls through to
+        the default 64 MB transfer grid, ~125x the native 1-plane access unit for
+        a viewer scrub, which reads as a hang (biopb/biopb#295). So ignore the
+        seed here and fetch the authoritative grid for *this* ``array_id`` from
+        the upstream (one bounded, metadata-free ``GetFlightInfo``, memoized).
+
+        Falls back to the base policy (the seed's ``chunk_shape`` when present,
+        else the default transfer grid) only when the upstream probe cannot be
+        made -- an unreachable or too-old upstream. That is never worse than the
+        pre-#295 behavior; the amplification just recurs until the probe succeeds.
+        """
+        native = self._upstream_chunk_shape()
+        if native is not None:
+            return native
+        return super().get_chunk_size()
+
+    def _upstream_chunk_shape(self) -> Optional[Tuple[int, ...]]:
+        """Return this tensor's native chunk grid from the upstream, or ``None``.
+
+        Memoized per ``array_id``; ``None`` on a failed/absent probe is not
+        cached, so a later read retries once the upstream recovers.
+        """
+        array_id = self.array_id
+        with self._chunk_shape_lock:
+            cached = self._chunk_shape_cache.get(array_id)
+        if cached is not None:
+            return cached
+        try:
+            shape = self._probe_upstream_chunk_shape(array_id)
+        except Exception as exc:
+            # Side-effect-free on reachability: this is a read-planning refinement,
+            # not a catalog-surface call. The actual chunk read has its own
+            # error/degradation handling; here we just fall back to the seed grid.
+            logger.debug(
+                "upstream chunk_shape probe failed for %s: %r",
+                array_id,
+                exc,
+                exc_info=True,
+            )
+            return None
+        if not shape:
+            return None
+        shape = tuple(int(dim) for dim in shape)
+        with self._chunk_shape_lock:
+            self._chunk_shape_cache[array_id] = shape
+        return shape
+
+    def _probe_upstream_chunk_shape(self, local_array_id: str) -> List[int]:
+        """One bounded, metadata-free ``GetFlightInfo`` for the native chunk grid.
+
+        A single-voxel ``slice_hint`` bounds the upstream's read plan to ~1
+        endpoint instead of enumerating the whole tensor, and ``with_metadata`` is
+        left False -- the returned descriptor's ``chunk_shape`` is the native grid
+        regardless of the hint. When the tensor's rank is not known locally (an
+        unseeded source), the hint is omitted; correctness is unaffected, only the
+        upstream enumerates a fuller plan for this one-time probe.
+        """
+        upstream_array_id = self._to_upstream_array_id(local_array_id)
+        read_opt = TensorReadOption(
+            tensor_id=upstream_array_id,
+            with_metadata=False,
+        )
+        ndim = self._mirrored_ndim(local_array_id)
+        if ndim:
+            read_opt.slice_hint.start[:] = [0] * ndim
+            read_opt.slice_hint.stop[:] = [1] * ndim
+        # FlightCmd.source_id is the slash-free prefix of the array_id (identity
+        # policy); tensor_id carries the full array_id, which the upstream reduces
+        # to the within-source field -- so this works for multi-tensor sources.
+        cmd = FlightCmd(
+            source_id=upstream_array_id.split("/", 1)[0],
+            tensor_read=read_opt,
+        )
+        flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        info = self.client._client.get_flight_info(
+            flight_desc, options=self.client._call_options
+        )
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        return list(desc.chunk_shape)
+
+    def _mirrored_ndim(self, local_array_id: str) -> int:
+        """Rank of ``local_array_id`` from the local seed, without an upstream RPC.
+
+        Returns 0 when the tensor was not bulk-seeded (the probe then omits the
+        slice bound). Never triggers the live ``get_tensor_descriptor`` fetch --
+        keeping the chunk-shape probe purely additive.
+        """
+        if self._descriptors_cache is not None:
+            for desc in self._descriptors_cache:
+                if desc.array_id == local_array_id:
+                    return len(desc.shape)
+        return 0
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Fetch one region from the upstream (fallback / abstract-method satisfier).

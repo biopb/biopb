@@ -251,6 +251,95 @@ class TestRemoteTensorProxy:
             finally:
                 upstream.shutdown()
 
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_chunk_size_uses_upstream_native_grid_not_empty_seed(self):
+        """The read grid must come from the upstream's per-tensor descriptor, never
+        the advisory bulk seed (biopb/biopb#295).
+
+        The seed carries an EMPTY chunk_shape (the lean metadata-DB form), which
+        would otherwise fall back to ``compute_safe_chunk_size`` -- here the whole
+        (3,40,50) volume. The upstream's native grid is one z-plane (1,40,50); a
+        viewer scrub must read that plane, not 3x it. get_chunk_size() therefore
+        probes the upstream and returns its native grid.
+        """
+        import tempfile
+
+        import zarr
+        from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath = f"{tmp}/vol.zarr"
+            za = zarr.open_array(
+                zpath, mode="w", shape=(3, 40, 50), chunks=(1, 40, 50), dtype="<i2"
+            )
+            za[:] = np.zeros((3, 40, 50), dtype="<i2")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source(
+                "aics",
+                ZarrAdapter(zarr.open_array(zpath, mode="r"), "aics", ["z", "y", "x"]),
+            )
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__aics",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="aics",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "aics",
+                            "dim_labels": ["z", "y", "x"],
+                            "shape": [3, 40, 50],
+                            "chunk_shape": [],  # advisory + empty -- must be ignored
+                            "dtype": "<i2",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+
+                # Native upstream grid (1 plane), not the (3,40,50) default grid the
+                # empty seed would yield via compute_safe_chunk_size.
+                assert adapter.get_chunk_size() == (1, 40, 50)
+                # Memoized per array_id (no second upstream probe on re-read).
+                assert adapter._chunk_shape_cache == {"hpc__aics": (1, 40, 50)}
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_chunk_size_falls_back_when_upstream_unreachable(self):
+        """A failed probe must not raise: fall back to the base grid (the seed's
+        chunk_shape when present, else the default). None is not cached, so a later
+        read retries once the upstream recovers."""
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="hpc__aics",
+            upstream_location="grpc://localhost:1",  # nothing listening
+            upstream_source_id="aics",
+        )
+        adapter.seed_catalog(
+            upstream_tensors=[
+                {
+                    "array_id": "aics",
+                    "dim_labels": ["z", "y", "x"],
+                    "shape": [3, 40, 50],
+                    "chunk_shape": [1, 40, 50],  # seed present -> base uses it
+                    "dtype": "<i2",
+                }
+            ],
+            metadata={},
+            data_resident=True,
+        )
+
+        # Probe fails (unreachable) -> super().get_chunk_size() returns the seed.
+        assert adapter.get_chunk_size() == (1, 40, 50)
+        # A failed probe is NOT memoized, so a recovered upstream is retried.
+        assert adapter._chunk_shape_cache == {}
+
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
 
