@@ -105,6 +105,15 @@ class MetadataDatabase:
         "LOAD",
     }
 
+    # Match forbidden keywords only as whole words. A plain substring test
+    # rejects legitimate queries where the keyword appears inside an identifier
+    # or string literal (e.g. `LIKE '%/uploads/%'` contains LOAD, `%update%`
+    # contains UPDATE). The real defense against file/network access is
+    # enable_external_access=False on the connection; this is defense in depth.
+    FORBIDDEN_KEYWORD_PATTERN = re.compile(
+        r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
+    )
+
     # Only these tables can be referenced in queries
     ALLOWED_TABLES: Set[str] = {"sources"}
 
@@ -225,19 +234,22 @@ class MetadataDatabase:
         Raises:
             ValueError: If query contains forbidden keywords or references disallowed tables
         """
-        # Normalize SQL for checking
-        normalized = sql.upper()
+        # Strip single-quoted string literals before scanning so keywords that
+        # appear *inside* a literal (e.g. `LIKE '%update%'`) aren't mistaken for
+        # SQL keywords or table names. '' is DuckDB's escaped single quote.
+        literal_free = re.sub(r"'(?:''|[^'])*'", "''", sql)
+        normalized = literal_free.upper()
 
-        # Check for forbidden keywords
-        for keyword in self.FORBIDDEN_KEYWORDS:
-            if keyword in normalized:
-                raise ValueError(
-                    f"SQL query contains forbidden keyword: {keyword}. "
-                    f"Only SELECT queries are allowed."
-                )
+        # Check for forbidden keywords (whole-word match, see pattern above)
+        match = self.FORBIDDEN_KEYWORD_PATTERN.search(normalized)
+        if match:
+            raise ValueError(
+                f"SQL query contains forbidden keyword: {match.group(1)}. "
+                f"Only SELECT queries are allowed."
+            )
 
         # Check for table references
-        table_refs = self.TABLE_REFERENCE_PATTERN.findall(sql)
+        table_refs = self.TABLE_REFERENCE_PATTERN.findall(literal_free)
         referenced_tables = set()
         for match in table_refs:
             for table_name in match:

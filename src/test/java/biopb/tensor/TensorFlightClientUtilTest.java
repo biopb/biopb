@@ -216,6 +216,28 @@ public class TensorFlightClientUtilTest {
     }
 
     @Test
+    public void testRealParseVersionHandlesBuildMetadataSuffix() throws Exception {
+        // Regression: the real (private) parseVersion used split("+") -- an
+        // invalid regex that throws PatternSyntaxException on dev versions with
+        // a "+gHASH" build-metadata suffix. The local mirror above uses the
+        // correct split("\\+"), so it never covered the real method. Invoke the
+        // real one via reflection.
+        java.lang.reflect.Method m =
+                TensorFlightClient.class.getDeclaredMethod("parseVersion", String.class);
+        m.setAccessible(true);
+
+        int[] dev = (int[]) m.invoke(null, "0.3.1.dev43+gabc123");
+        assertEquals(0, dev[0]);
+        assertEquals(3, dev[1]);
+        assertEquals(1, dev[2]);
+
+        int[] plus = (int[]) m.invoke(null, "1.2.3+gabc");
+        assertEquals(1, plus[0]);
+        assertEquals(2, plus[1]);
+        assertEquals(3, plus[2]);
+    }
+
+    @Test
     public void testParseVersionPartial() {
         // Two-part version
         int[] version = parseVersion("1.2");
