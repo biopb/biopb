@@ -130,10 +130,8 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         Raises:
             FlightServerError: Cannot read data from cache-backed source
         """
-        # Validate bounds first (base class validation)
-        desc = self.get_tensor_descriptor()
-        shape = tuple(desc.shape)
-        self._validate_bounds(bounds, shape)
+        # Validate bounds via the base TensorAdapter.get_data contract.
+        super().get_data(bounds)
 
         raise flight.FlightServerError(
             f"Cannot read data from cache-backed source {self.source_id}. "

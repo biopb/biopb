@@ -132,7 +132,9 @@ class SourceAdapter(ABC):
     Each adapter handles a specific storage format (Zarr, HDF5, OME-TIFF, etc.)
     and provides methods to discover tensors and read metadata.
 
-    Adapters must implement the claim() method to detect if they handle a given path.
+    Adapters that participate in filesystem auto-discovery override the claim()
+    classmethod to detect whether they handle a given path; it is not abstract
+    (the default claims nothing) so a config-only format like HDF5 can opt out.
     """
 
     # Required fields
