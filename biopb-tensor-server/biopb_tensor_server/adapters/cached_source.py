@@ -27,7 +27,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.base import CHUNK_WIRE_SCHEMA, SourceAdapter, TensorAdapter
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.chunk import encode_chunk_id
 
@@ -147,8 +147,9 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data (any shape matching bounds)
         """
-        flat_data = pa.array([data.ravel()])
-        self.write_chunk_arrow(bounds, flat_data, data.shape, data.dtype)
+        # Pass the flat element values (a primitive Arrow array), NOT a list<T>
+        # wrapper -- write_chunk_arrow stores the raw value buffer directly.
+        self.write_chunk_arrow(bounds, pa.array(data.ravel()), data.shape, data.dtype)
 
     def write_chunk_arrow(
         self,
@@ -161,7 +162,11 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
 
         Args:
             bounds: Chunk start/stop coordinates
-            data: Flattened Arrow values or list array payload for the chunk
+            data: The chunk's flattened element *values* as a primitive Arrow
+                array (e.g. ``int16``) -- NOT a ``list<T>`` wrapper. Its raw value
+                buffer is stored directly as the unified binary chunk schema
+                (biopb/biopb#293), the same schema ``resolve_chunk_data`` serves,
+                so uploaded chunks read back byte-identically.
             logical_shape: Logical chunk shape matching bounds
             dtype: NumPy dtype or dtype string for the chunk data
         """
@@ -173,26 +178,25 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
 
         if isinstance(data, pa.ChunkedArray):
             data = data.combine_chunks()
-
         if pa.types.is_list(data.type):
-            list_arr = data
-            values = data.values
-        else:
-            offsets = pa.array([0, len(data)], type=pa.int32())
-            list_arr = pa.ListArray.from_arrays(offsets, data)
-            values = data
+            # A list<T> wrapper's buffer[1] is offsets, not the value bytes --
+            # storing it would silently corrupt the chunk. The binary schema takes
+            # the flat values directly (biopb/biopb#293), so reject the wrapper.
+            raise TypeError(
+                "write_chunk_arrow expects the flat element values (a primitive "
+                "array), not a list<T> wrapper"
+            )
 
         logical_shape = list(logical_shape)
         dtype_str = np.dtype(dtype).str
-        size_bytes = values.nbytes
+        values_buf = data.buffers()[1]  # primitive array buffers: [validity, data]
+        size_bytes = values_buf.size
+        offsets = pa.py_buffer(np.array([0, size_bytes], dtype=np.int32))
+        data_col = pa.Array.from_buffers(pa.binary(), 1, [None, offsets, values_buf])
 
         batch = pa.RecordBatch.from_arrays(
-            [
-                list_arr,
-                pa.array([logical_shape]),
-                pa.array([dtype_str]),
-            ],
-            ["data", "shape", "dtype"],
+            [data_col, pa.array([logical_shape]), pa.array([dtype_str])],
+            schema=CHUNK_WIRE_SCHEMA,
         )
 
         entry, is_owner = cache_manager.start_compute(

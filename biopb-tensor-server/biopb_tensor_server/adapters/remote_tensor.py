@@ -40,7 +40,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.base import SourceAdapter, TensorAdapter, unpack_chunk_array
 from biopb_tensor_server.chunk import (
     cache_key_for_chunk_id,
     decode_chunk_id,
@@ -565,9 +565,7 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
             self._to_upstream_array_id(self.array_id), bounds
         )
         batch = self._upstream_record_batch(upstream_chunk_id)
-        arr = batch.column("data").to_numpy(zero_copy_only=False)[0]
-        shape = tuple(batch.column("shape").to_pylist()[0])
-        return arr.reshape(shape)
+        return unpack_chunk_array(batch)
 
     def resolve_chunk_data(self, chunk_id: bytes, cache_manager=None) -> pa.RecordBatch:
         """Serve a chunk by forwarding the (rewritten) chunk_id to the upstream.

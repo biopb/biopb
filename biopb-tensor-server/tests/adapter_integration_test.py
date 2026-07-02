@@ -91,6 +91,51 @@ class TestZarrIntegration:
             server.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_big_endian_source_roundtrip(self):
+        """A big-endian source must serve and reconstruct with correct values.
+
+        Arrow cannot hold byte-swapped buffers, so pa.array() on a '>i2' chunk
+        used to raise ArrowNotImplementedError ("Byte-swapped arrays not
+        supported") -- breaking every read of a big-endian source (FITS is
+        big-endian by spec). The server now normalizes to native order at
+        serialization; the client must still get identical values.
+        """
+        import zarr
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zarr_path = str(Path(tmpdir) / "be.zarr")
+            # Big-endian int16 array with distinctive values.
+            src = (np.arange(64 * 64, dtype="<i2").reshape(64, 64) - 5000).astype(">i2")
+            za = zarr.open_array(
+                zarr_path, mode="w", shape=(64, 64), chunks=(32, 32), dtype=">i2"
+            )
+            za[:] = src
+            assert za.dtype.byteorder == ">"  # genuinely non-native on this host
+
+            from biopb_tensor_server import ZarrAdapter
+
+            adapter = ZarrAdapter(
+                zarr.open_array(zarr_path, mode="r"), "be", ["y", "x"]
+            )
+            server = TensorFlightServer("grpc://localhost:0")
+            server.register_source("be", adapter)
+            server_thread = threading.Thread(target=server.serve, daemon=True)
+            server_thread.start()
+            time.sleep(1)
+
+            try:
+                client = TensorFlightClient(
+                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+                )
+                darr = client.get_tensor("be")
+                data = darr.compute()  # raised ArrowNotImplementedError before the fix
+                # Values are preserved exactly (compared in native order).
+                np.testing.assert_array_equal(data.astype("<i2"), src.astype("<i2"))
+                client.close()
+            finally:
+                server.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_scaled_read_integration(self, simple_zarr_array):
         """Test scaled reads through server/client."""
         import zarr

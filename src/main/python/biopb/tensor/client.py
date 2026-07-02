@@ -10,7 +10,6 @@ Features:
 """
 
 import atexit
-import importlib.metadata
 import json
 import logging
 import os
@@ -670,12 +669,10 @@ def _fetch_chunk_distributed(
         reader = client.do_get(
             flight.Ticket(ticket.SerializeToString()), options=call_options
         )
-        table = reader.read_all()
-        arr = table.column("data").to_numpy()[0]  # First row's data list
-
-        # Get shape from shape column (list<int64>)
-        shape = tuple(table.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
+        # do_get returns a single-row unified binary batch [data, shape, dtype];
+        # decode it exactly like the cache-file fast path (raw bytes reinterpreted
+        # via the dtype string, so endianness round-trips -- biopb/biopb#293).
+        arr = _array_from_unified_batch(reader.read_all().to_batches()[0])
 
     # Cache the result (skipped when caching is disabled)
     if cache is not None:
@@ -885,7 +882,7 @@ def _fetch_endpoints_via_get_flight_info(
     info = client.get_flight_info(flight_desc, options=call_options)
 
     # Check schema version compatibility
-    _check_schema_version(info.schema)
+    _check_wire_protocol(info.schema)
 
     # Parse endpoints into chunk info
     chunks = []
@@ -931,28 +928,37 @@ def _parse_version(version_str: str) -> Tuple[int, int, int]:
     return (major, minor, patch)
 
 
-def _check_schema_version(schema: pa.Schema) -> None:
-    """Check schema metadata version and warn if client version is older."""
-    if schema.metadata is None:
-        return
+def _check_wire_protocol(schema: pa.Schema) -> None:
+    """Fail fast if the server's chunk wire-protocol version is incompatible.
 
-    server_version_bytes = schema.metadata.get(b"tensor_schema_version")
-    if server_version_bytes is None:
-        return
+    The chunk ``RecordBatch`` encoding is a hard contract (biopb/biopb#293): a
+    version mismatch means the client would misread every chunk (e.g. decode the
+    v2 binary blob as a v1 typed list). We reject at ``GetFlightInfo`` -- before
+    any ``do_get`` -- with an actionable message rather than let a cryptic decode
+    error surface deep in the read path. The version constant lives in ``biopb``
+    core, which both the client and the server import, so there is one source of
+    truth (see ``biopb.tensor._wire_version``).
+    """
+    from biopb.tensor._wire_version import (
+        TENSOR_WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_METADATA_KEY,
+    )
 
-    server_version = server_version_bytes.decode("utf-8")
+    meta = schema.metadata or {}
+    raw = meta.get(WIRE_PROTOCOL_METADATA_KEY.encode("utf-8"))
+    # An unstamped schema is a pre-#293 server, which speaks the v1 typed-list
+    # encoding this client can no longer read.
     try:
-        client_version = importlib.metadata.version("biopb")
-    except importlib.metadata.PackageNotFoundError:
-        return
+        server_ver = int(raw.decode("utf-8")) if raw is not None else 1
+    except (ValueError, AttributeError):
+        server_ver = 1
 
-    server_parsed = _parse_version(server_version)
-    client_parsed = _parse_version(client_version)
-
-    if client_parsed < server_parsed:
-        logger.warning(
-            f"Client version {client_version} is older than server schema version {server_version}. "
-            f"Consider upgrading biopb client for compatibility."
+    if server_ver != TENSOR_WIRE_PROTOCOL_VERSION:
+        stale = "server" if server_ver < TENSOR_WIRE_PROTOCOL_VERSION else "client"
+        raise RuntimeError(
+            f"Incompatible biopb tensor wire protocol: the server speaks v{server_ver}, "
+            f"this client speaks v{TENSOR_WIRE_PROTOCOL_VERSION}. The chunk encoding is a "
+            f"breaking contract (biopb/biopb#293); upgrade the {stale} so both sides match."
         )
 
 
@@ -1806,7 +1812,7 @@ class TensorFlightClient:
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         # Check schema version compatibility
-        _check_schema_version(info.schema)
+        _check_wire_protocol(info.schema)
 
         # Extract schema metadata for SHM transfer feature detection
         schema_metadata = _extract_schema_metadata(info.schema)

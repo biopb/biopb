@@ -455,46 +455,37 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                 new org.apache.arrow.flight.Ticket(tensorTicket.toByteArray()), authOption)) {
             double[] values = new double[0];
             while (stream.next()) {
-                java.util.List<org.apache.arrow.vector.FieldVector> vectors = stream.getRoot().getFieldVectors();
-                if (vectors.isEmpty()) {
-                    throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
-                }
-
-                // Read "data" column - it's a ListArray with 1 row per chunk
+                // Unified binary chunk schema (biopb/biopb#293): the "data" column
+                // holds one opaque byte[] per row and the "dtype" column names how
+                // to reinterpret it (element type + endianness). This replaces the
+                // former typed list<T>, which Arrow could not carry for big-endian
+                // sources (e.g. FITS '>i2').
                 org.apache.arrow.vector.FieldVector dataVector = stream.getRoot().getVector("data");
-                if (dataVector == null) {
-                    throw new IllegalStateException("Chunk payload missing 'data' column");
+                org.apache.arrow.vector.FieldVector dtypeVector = stream.getRoot().getVector("dtype");
+                if (dataVector == null || dtypeVector == null) {
+                    throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
                 }
 
-                // Each row is one chunk's data as a list
                 int rowCount = stream.getRoot().getRowCount();
                 for (int row = 0; row < rowCount; row++) {
                     Object rowObj = dataVector.getObject(row);
-                    if (!(rowObj instanceof java.util.List)) {
-                        throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                    if (!(rowObj instanceof byte[])) {
+                        throw new IllegalStateException("Data column value is not binary: "
+                                + (rowObj == null ? "null" : rowObj.getClass()));
                     }
-                    java.util.List<?> dataList = (java.util.List<?>) rowObj;
+                    byte[] raw = (byte[]) rowObj;
+                    Object dtypeObj = dtypeVector.getObject(row);
+                    String dtypeStr = dtypeObj == null ? "" : dtypeObj.toString();
+                    double[] decoded = ChunkDecoder.decodeChunkBytes(raw, dtypeStr);
                     int offset = values.length;
-                    values = java.util.Arrays.copyOf(values, offset + dataList.size());
-                    for (int i = 0; i < dataList.size(); i++) {
-                        values[offset + i] = asDouble(dataList.get(i));
-                    }
+                    values = java.util.Arrays.copyOf(values, offset + decoded.length);
+                    System.arraycopy(decoded, 0, values, offset, decoded.length);
                 }
             }
             return values;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
         }
-    }
-
-    private static double asDouble(Object value) {
-        if (value == null) {
-            throw new IllegalStateException("Chunk payload contains null values");
-        }
-        if (!(value instanceof Number)) {
-            throw new IllegalStateException("Chunk payload is not numeric: " + value.getClass().getName());
-        }
-        return ((Number) value).doubleValue();
     }
 
     private static <T extends NativeType<T> & RealType<T>> void writeChunk(

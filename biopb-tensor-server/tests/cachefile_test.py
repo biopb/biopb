@@ -22,12 +22,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from biopb_tensor_server.base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
-    _cast_from_unified_schema,
 )
 from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.server import TensorFlightServer
@@ -48,14 +48,9 @@ def _zarr_available() -> bool:
 
 
 def _make_typed_batch(arr: np.ndarray) -> pa.RecordBatch:
-    """Build a batch in the [data: list<dtype>, shape, dtype] schema the cache
-    expects from a compute_fn (mirrors BackendAdapter.resolve_chunk_data)."""
-    data = pa.array(
-        [arr.ravel().tolist()], type=pa.list_(pa.from_numpy_dtype(arr.dtype))
-    )
-    shape = pa.array([list(arr.shape)], type=pa.list_(pa.int64()))
-    dtype = pa.array([str(arr.dtype)], type=pa.string())
-    return pa.RecordBatch.from_arrays([data, shape, dtype], ["data", "shape", "dtype"])
+    """Build a chunk batch in the unified binary [data: binary, shape, dtype]
+    schema a compute_fn now produces (mirrors BackendAdapter.resolve_chunk_data)."""
+    return pack_chunk_batch(arr)
 
 
 def _read_via_location(loc: ChunkLocation) -> np.ndarray:
@@ -65,9 +60,7 @@ def _read_via_location(loc: ChunkLocation) -> np.ndarray:
         schema = pa.ipc.open_stream(mm).schema
         mm.seek(loc.byte_offset)
         batch = pa.ipc.read_record_batch(pa.ipc.read_message(mm), schema)
-        typed = _cast_from_unified_schema(batch)
-        data = np.asarray(typed.column("data").to_numpy(zero_copy_only=False)[0])
-        return data.reshape(tuple(typed.column("shape").to_pylist()[0]))
+        return unpack_chunk_array(batch)
     finally:
         mm.close()
 
@@ -331,10 +324,9 @@ class TestShouldTryCachefile:
 class TestArrayFromUnifiedBatch:
     def test_decode_matches_source(self):
         from biopb.tensor.client import _array_from_unified_batch
-        from biopb_tensor_server.cache.file_backend import _cast_to_unified_schema
 
         a = (np.arange(120, dtype=np.uint16).reshape(8, 15) % 97).astype(np.uint16)
-        unified = _cast_to_unified_schema(_make_typed_batch(a))
+        unified = _make_typed_batch(a)  # already the unified binary schema
         got = _array_from_unified_batch(unified)
         assert got.dtype == np.uint16 and got.shape == (8, 15)
         assert np.array_equal(got, a)

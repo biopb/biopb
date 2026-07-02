@@ -65,6 +65,63 @@ if TYPE_CHECKING:
     from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 
+# --- unified chunk wire schema (biopb/biopb#293) ----------------------------
+# Every chunk crosses the wire as an opaque binary blob plus its numpy dtype
+# string, NOT a typed Arrow ``list<T>``. Arrow arrays are always native-endian,
+# so a typed encoding cannot carry a big-endian source (FITS is ``>i2``) --
+# ``pa.array()`` raises "Byte-swapped arrays not supported". Serializing the raw
+# bytes and reconstructing them client-side with ``np.frombuffer(buf, dtype_str)``
+# preserves the exact dtype (endianness included) and is zero-copy on both ends:
+# the server wraps the numpy buffer with no per-element copy, and the cache
+# stores/serves this same schema with no typed<->binary conversion. It is the ONE
+# schema for the do_get wire, the file cache (``UNIFIED_SCHEMA``), and the memory
+# cache. (Cross-language clients decode the binary column per the dtype string;
+# see the Java client's ``SerializableTensorImg``.)
+CHUNK_WIRE_SCHEMA = pa.schema(
+    [
+        pa.field("data", pa.binary()),
+        pa.field("shape", pa.list_(pa.int64())),
+        pa.field("dtype", pa.string()),
+    ]
+)
+
+
+def pack_chunk_batch(arr: np.ndarray) -> pa.RecordBatch:
+    """Pack a chunk's numpy array into the unified binary RecordBatch (one row).
+
+    Zero-copy: the array's bytes are wrapped as an Arrow buffer without a copy
+    (made C-contiguous first, which copies only a non-contiguous view). The dtype
+    string carries endianness, so byte-swapped sources round-trip losslessly.
+    See ``CHUNK_WIRE_SCHEMA`` / biopb/biopb#293.
+    """
+    arr = np.ascontiguousarray(arr)
+    data_buf = pa.py_buffer(arr)  # keeps ``arr`` alive; no element copy
+    offsets = pa.py_buffer(np.array([0, data_buf.size], dtype=np.int32))
+    data_col = pa.Array.from_buffers(pa.binary(), 1, [None, offsets, data_buf])
+    return pa.RecordBatch.from_arrays(
+        [data_col, pa.array([list(arr.shape)]), pa.array([arr.dtype.str])],
+        schema=CHUNK_WIRE_SCHEMA,
+    )
+
+
+def unpack_chunk_array(batch: pa.RecordBatch) -> np.ndarray:
+    """Reconstruct a chunk's numpy array from a unified binary RecordBatch.
+
+    Inverse of :func:`pack_chunk_batch`: reads the raw bytes and reinterprets them
+    with the per-chunk dtype string, so numpy applies the correct (possibly
+    non-native) byte order. Returns an owned copy so it stays valid after any
+    backing mmap is released. (The Python Flight client has its own copy of this
+    logic, ``_array_from_unified_batch``, since the core ``biopb`` package cannot
+    import server code.)
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    data_buf = batch.column("data").buffers()[2]
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
+    return arr.reshape(shape).copy()
+
+
 # A real URL scheme is 2+ chars followed by "://" (so a bare Windows drive
 # "C:\..." — one char then ":" then "\" — never matches).
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]+://")
@@ -366,11 +423,37 @@ class TensorAdapter(ABC):
     def get_chunk_size(self) -> Tuple[int, ...]:
         """Return the chunk size for this tensor adapter.
 
+        A descriptor may legitimately carry an empty ``chunk_shape`` -- it is
+        documented as "can be empty [] if not readily available"
+        (:meth:`get_tensor_descriptor`), and the lean ListFlights form omits it,
+        so a descriptor sourced from the catalog (e.g. the bulk-seeded remote
+        proxy, biopb/biopb#266) may have none. Rather than hand the read planner
+        a too-short tuple -- which indexes out of range against the full-rank
+        shape (biopb/biopb#292, IndexError in ``_get_read_plan``) -- derive the
+        default transfer grid from the full shape: one chunk covering the whole
+        tensor, then split under ``MAX_ARROW_BATCH_BYTES`` (non-spatial axes
+        first, Y-X plane kept whole). This is the same sizing policy the server
+        applies everywhere else, so an empty/partial ``chunk_shape`` reads
+        identically to one that was advertised.
+
+        An *unresolved* descriptor (empty shape/dtype -- e.g. a not-yet-hydrated
+        cloud/remote source) is rejected up front: the fallback would otherwise
+        reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
+        illegible ``TypeError``. ``require_resolved`` converts it to a clean
+        ``SourceUnresolvedError`` at this read-planning boundary, exactly as
+        ``get_arrow_schema`` and ``_get_read_plan`` already do.
+
         Returns:
             Tuple of chunk dimensions (e.g., (64, 64, 64) for 3D chunks)
         """
         desc = self.get_tensor_descriptor()
-        return tuple(int(dim) for dim in desc.chunk_shape)
+        require_resolved(desc)
+        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
+        shape = tuple(int(dim) for dim in desc.shape)
+        if len(chunk_shape) == len(shape):
+            return chunk_shape
+        # Empty or rank-mismatched chunk_shape: fall back to the default grid.
+        return compute_safe_chunk_size(shape, desc.dtype, list(desc.dim_labels))
 
     @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -415,32 +498,37 @@ class TensorAdapter(ABC):
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
 
-        Schema format:
-        - data: list<dtype> - flattened tensor elements per chunk
+        Schema format (the unified binary wire schema, biopb/biopb#293):
+        - data: binary - the chunk's raw C-contiguous bytes per row
         - shape: list<int64> - shape tuple per chunk
-        - dtype: string - numpy dtype string per chunk
+        - dtype: string - numpy dtype string (carries endianness) per chunk
 
-        Each RecordBatch has 1 row per chunk, making data self-describing.
+        Each RecordBatch has 1 row per chunk, making data self-describing. The
+        client reconstructs the array with ``np.frombuffer(data, dtype)``; see
+        ``CHUNK_WIRE_SCHEMA``.
 
         Returns:
             Arrow Schema with data, shape, and dtype fields
         """
         import importlib.metadata
 
+        from biopb.tensor._wire_version import (
+            TENSOR_WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_METADATA_KEY,
+        )
+
         desc = desc or self.get_tensor_descriptor()
         require_resolved(desc)
 
-        dtype = np.dtype(desc.dtype)
-        data_field = pa.field("data", pa.list_(pa.from_numpy_dtype(dtype)))
-        shape_field = pa.field("shape", pa.list_(pa.int64()))
-        dtype_field = pa.field("dtype", pa.string())
-
-        # Schema metadata: server version for compatibility tracking and feature detection
+        # Schema metadata: the wire-protocol version is the hard compatibility
+        # gate the client enforces (biopb/biopb#293); tensor_schema_version is
+        # kept as an informational package-version tag.
         metadata = {
             "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
+            WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
 
-        return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)
+        return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
     def resolve_chunk_data(
         self,
@@ -477,17 +565,11 @@ class TensorAdapter(ABC):
                 # Crop and downsample (no padding needed - bounds aligned via floor_div)
                 result_arr = downsample_block(result_arr, scale_hint, reduction_method)
 
-            logical_shape = list(result_arr.shape)
-            dtype_str = str(result_arr.dtype)
-
-            result = pa.RecordBatch.from_arrays(
-                [
-                    pa.array([result_arr.ravel()]),
-                    pa.array([logical_shape]),
-                    pa.array([dtype_str]),
-                ],
-                ["data", "shape", "dtype"],
-            )
+            # Serialize into the unified binary wire schema: raw bytes + dtype
+            # string, wrapped zero-copy. This preserves the exact dtype including
+            # endianness (big-endian FITS '>i2' round-trips without conversion)
+            # and avoids the per-element typed-list encoding (biopb/biopb#293).
+            result = pack_chunk_batch(result_arr)
             return result, result_arr.nbytes
 
         if should_cache:

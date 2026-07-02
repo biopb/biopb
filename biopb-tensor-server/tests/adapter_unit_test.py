@@ -304,6 +304,89 @@ class TestGetScaledReadPlan:
             assert list(plan.descriptor.shape) == [25, 25]
 
 
+class TestEmptyChunkShapeFallback:
+    """get_chunk_size() must tolerate an empty/partial chunk_shape.
+
+    A descriptor may legitimately omit chunk_shape (documented as "can be empty
+    []"; the lean ListFlights form drops it, and the bulk-seeded remote proxy
+    mirrors that lean catalog -- biopb/biopb#266). Before the fix, get_chunk_size
+    returned a too-short tuple and _get_read_plan indexed it out of range against
+    the full-rank shape, so every read of such a source raised IndexError.
+    """
+
+    from biopb_tensor_server.base import TensorAdapter
+
+    class _StubTensorAdapter(TensorAdapter):
+        """Minimal tensor adapter whose descriptor carries no chunk_shape."""
+
+        def __init__(self, shape, dtype, dim_labels, chunk_shape=None):
+            self._desc = TensorDescriptor(
+                array_id="stub",
+                shape=list(shape),
+                chunk_shape=list(chunk_shape or []),
+                dtype=dtype,
+                dim_labels=list(dim_labels),
+            )
+
+        def get_tensor_descriptor(self):
+            return self._desc
+
+        def get_data(self, bounds):  # pragma: no cover - not exercised here
+            raise NotImplementedError
+
+    def test_empty_chunk_shape_derives_default_grid(self):
+        # The reproducer: a 5-D FITS-like tensor (>i2) with no chunk_shape, as a
+        # remote-proxy source seeded from the lean upstream catalog.
+        shape = [1, 1, 1000, 512, 512]
+        adapter = self._StubTensorAdapter(shape, ">i2", ["T", "C", "Z", "Y", "X"])
+
+        from biopb_tensor_server.chunk import compute_safe_chunk_size
+
+        chunk = adapter.get_chunk_size()
+        # A full-rank grid (no longer a 0-length tuple).
+        assert len(chunk) == len(shape)
+        # Matches the server's default transfer-grid policy exactly.
+        assert chunk == compute_safe_chunk_size(
+            tuple(shape), ">i2", ["T", "C", "Z", "Y", "X"]
+        )
+        # Y-X plane kept whole; a non-spatial axis was split to fit the cap.
+        assert chunk[-2:] == (512, 512)
+        assert chunk[2] < 1000
+
+    def test_read_plan_no_longer_raises_on_empty_chunk_shape(self):
+        shape = [1, 1, 1000, 512, 512]
+        adapter = self._StubTensorAdapter(shape, ">i2", ["T", "C", "Z", "Y", "X"])
+        request_desc = TensorDescriptor(array_id="stub", shape=shape, dtype=">i2")
+        plan = adapter.get_read_plan(request_desc)  # was IndexError
+        assert plan.chunk_endpoints
+        assert list(plan.descriptor.shape) == shape
+
+    def test_normal_chunk_shape_is_untouched(self):
+        adapter = self._StubTensorAdapter(
+            [100, 100], "uint8", ["y", "x"], chunk_shape=[50, 50]
+        )
+        assert adapter.get_chunk_size() == (50, 50)
+
+    def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
+        # An unresolved descriptor (shape known, dtype still empty) must fail the
+        # read-planning boundary cleanly, not blow up on np.dtype("") in the
+        # default-grid fallback (biopb/biopb#292 follow-up).
+        from biopb_tensor_server.errors import SourceUnresolvedError
+
+        adapter = self._StubTensorAdapter(
+            [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
+        )
+        with pytest.raises(SourceUnresolvedError):
+            adapter.get_chunk_size()
+
+    def test_unresolved_empty_shape_raises_source_unresolved(self):
+        from biopb_tensor_server.errors import SourceUnresolvedError
+
+        adapter = self._StubTensorAdapter([], "", [])
+        with pytest.raises(SourceUnresolvedError):
+            adapter.get_chunk_size()
+
+
 class TestGetPhysicalScale:
     """Per-dim physical-scale summary folded onto the descriptor (issue #31)."""
 
