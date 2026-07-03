@@ -304,15 +304,16 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_read_plan_forwards_upstream_native_grid(self):
-        """The proxy forwards GetFlightInfo to the upstream and returns ITS
-        endpoints on the native grid -- it re-derives no grid locally, so the
-        advisory (empty) catalog seed never drives planning (biopb/biopb#295).
+    def test_forward_flight_info_returns_upstream_native_grid(self):
+        """forward_flight_info forwards a whole GetFlightInfo to the upstream and
+        returns ITS endpoints on the native grid + server-advertised pyramid --
+        the proxy re-derives no grid or pyramid locally, so the advisory (empty)
+        catalog seed never drives planning (biopb/biopb#295).
         """
         import tempfile
 
         import zarr
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
         from biopb_tensor_server.chunk import decode_chunk_id
@@ -349,18 +350,18 @@ class TestRemoteTensorProxy:
                     metadata={},
                     data_resident=True,
                 )
-                req = TensorDescriptor(
-                    array_id="hpc__aics",
-                    dim_labels=["z", "y", "x"],
-                    shape=[3, 40, 50],
-                    dtype="<i2",
+                plan = adapter.forward_flight_info(
+                    TensorReadOption(tensor_id="hpc__aics")
                 )
-                plan = adapter.get_read_plan(req)
 
+                assert plan is not None
                 # Native upstream grid (one z-plane per chunk), NOT the whole-volume
                 # (3,40,50) default grid an empty seed would otherwise produce.
                 assert list(plan.descriptor.chunk_shape) == [1, 40, 50]
                 assert len(plan.chunk_endpoints) == 3  # one endpoint per plane
+                # The upstream's server-advertised pyramid rode through the forward
+                # (the lean catalog localizer would have stripped it).
+                assert len(plan.descriptor.pyramid) >= 1
                 # Endpoints carry LOCAL chunk_ids (upstream 'aics' rewritten).
                 for ce in plan.chunk_endpoints:
                     aid, _ = decode_chunk_id(ce.chunk_id)
@@ -369,10 +370,71 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_read_plan_falls_back_when_upstream_unreachable(self):
-        """A failed upstream GetFlightInfo must not raise: fall back to the local
-        planner so the RPC still returns a (best-effort) plan."""
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+    def test_forward_flight_info_surfaces_upstream_native_pyramid(self):
+        """A pyramidal OME-Zarr upstream's NATIVE precompute levels are surfaced
+        through the proxy -- the whole-call forward carries them (the proxy itself
+        computes none: get_native_pyramid_levels is None on it, so the local
+        planner would advertise a *computed* pyramid instead). biopb/biopb#295.
+        """
+        import tempfile
+
+        import zarr
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath, _, _ = create_multiresolution_ome_zarr(
+                tmp, n_levels=4, base_shape=(256, 256), chunk_size=(64, 64)
+            )
+            root = zarr.open_group(zpath, mode="r")
+
+            upstream = TensorFlightServer("grpc://localhost:0")
+            upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+            _serve(upstream)
+            try:
+                adapter = RemoteTensorAdapter(
+                    source_id="hpc__ome",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="ome",
+                )
+                adapter.seed_catalog(
+                    upstream_tensors=[
+                        {
+                            "array_id": "ome",
+                            "dim_labels": ["y", "x"],
+                            "shape": [256, 256],
+                            "chunk_shape": [64, 64],
+                            "dtype": "uint8",
+                        }
+                    ],
+                    metadata={},
+                    data_resident=True,
+                )
+                plan = adapter.forward_flight_info(
+                    TensorReadOption(tensor_id="hpc__ome")
+                )
+
+                assert plan is not None
+                # Multiple native levels, each a precomputed on-disk dataset.
+                assert len(plan.descriptor.pyramid) >= 2
+                assert all(lvl.native for lvl in plan.descriptor.pyramid)
+                assert all(
+                    lvl.reduction_method == "precompute"
+                    for lvl in plan.descriptor.pyramid
+                )
+            finally:
+                upstream.shutdown()
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_forward_flight_info_returns_none_when_upstream_unreachable(self, caplog):
+        """A **transport** failure (upstream unreachable) returns None so the
+        *server* falls back to its local planner. Categorized as an expected
+        operational condition: logged at DEBUG, never escalated to WARNING."""
+        import logging
+
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
         adapter = RemoteTensorAdapter(
@@ -386,29 +448,35 @@ class TestRemoteTensorProxy:
                     "array_id": "aics",
                     "dim_labels": ["z", "y", "x"],
                     "shape": [3, 40, 50],
-                    "chunk_shape": [1, 40, 50],  # seed present -> base planner uses it
+                    "chunk_shape": [1, 40, 50],
                     "dtype": "<i2",
                 }
             ],
             metadata={},
             data_resident=True,
         )
-        req = TensorDescriptor(
-            array_id="hpc__aics",
-            dim_labels=["z", "y", "x"],
-            shape=[3, 40, 50],
-            dtype="<i2",
-        )
-        plan = adapter.get_read_plan(req)  # must not raise
-        assert len(plan.chunk_endpoints) >= 1
+        with caplog.at_level(
+            logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
+        ):
+            plan = adapter.forward_flight_info(TensorReadOption(tensor_id="hpc__aics"))
+        assert plan is None
+        recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
+        assert any("RPC failed" in r.getMessage() for r in recs)
+        # a transport error is expected -- it must NOT be raised to WARNING
+        assert not any(r.levelno >= logging.WARNING for r in recs)
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_read_plan_falls_back_on_unparseable_upstream_endpoint(self):
-        """A malformed upstream endpoint must not blow up the whole plan: the
-        parse loop is guarded, so it falls back to the local planner."""
+    def test_forward_flight_info_returns_none_on_unparseable_upstream_endpoint(
+        self, caplog
+    ):
+        """A **logic** failure (a response received but not localizable) returns
+        None so the server falls back -- but, unlike a transport error, it is
+        unexpected and logged at WARNING so the fallback never silently masks a
+        protocol mismatch or a proxy bug."""
+        import logging
         from types import SimpleNamespace
 
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
         adapter = RemoteTensorAdapter(
@@ -430,22 +498,24 @@ class TestRemoteTensorProxy:
             data_resident=True,
         )
         # A valid descriptor but a junk endpoint (no .ticket) -> the parse loop
-        # raises inside the guarded block.
+        # raises inside the guarded LOGIC block (not the transport block).
         valid_cmd = adapter.get_tensor_descriptor().SerializeToString()
         fake_info = SimpleNamespace(
             descriptor=SimpleNamespace(command=valid_cmd),
             endpoints=[SimpleNamespace()],  # missing .ticket
         )
-        adapter._upstream_flight_info = lambda req: fake_info
+        adapter._upstream_flight_info = lambda read_opt: fake_info
 
-        req = TensorDescriptor(
-            array_id="hpc__aics",
-            dim_labels=["z", "y", "x"],
-            shape=[3, 40, 50],
-            dtype="<i2",
+        with caplog.at_level(
+            logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
+        ):
+            plan = adapter.forward_flight_info(TensorReadOption(tensor_id="hpc__aics"))
+        assert plan is None
+        recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
+        assert any(
+            r.levelno == logging.WARNING and "could not be localized" in r.getMessage()
+            for r in recs
         )
-        plan = adapter.get_read_plan(req)  # must not raise -> local planner
-        assert len(plan.chunk_endpoints) >= 1
 
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
@@ -706,10 +776,12 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
-    """The caching proxy does not implement physical_scale yet (biopb/biopb#266):
-    reading it would be a per-open upstream get_descriptor RPC on every serve --
-    the wrong layer; it should ride the bulk mirror seed. So get_physical_scale
-    returns None even when the upstream advertises a scale."""
+    """The proxy's get_physical_scale() *method* returns None even when the
+    upstream advertises a scale: physical scale is surfaced at a different layer
+    -- it rides the whole-call forward (forward_flight_info -> the upstream
+    descriptor's physical_scale), not a per-open get_descriptor RPC from this
+    method (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for
+    the end-to-end path."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -731,10 +803,12 @@ def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_physical_scale_not_advertised_through_proxy(simple_zarr_array):
-    """End-to-end: even when the upstream carries physical_scale, a client
-    GetFlightInfo through the proxy advertises none -- the proxy leaves the
-    descriptor's physical_scale/physical_unit empty (unimplemented, #266)."""
+def test_physical_scale_surfaced_through_proxy(simple_zarr_array):
+    """End-to-end: the upstream's physical_scale/physical_unit are surfaced to a
+    client GetFlightInfo through the proxy. The whole-call forward
+    (forward_flight_info) rides the upstream descriptor's physical scale straight
+    through -- no per-open get_descriptor RPC of its own, since the same forwarded
+    GetFlightInfo already carries the grid (biopb/biopb#295, closing #266's gap)."""
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
@@ -759,9 +833,127 @@ def test_physical_scale_not_advertised_through_proxy(simple_zarr_array):
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
             desc = client.get_descriptor("lab__img")
-            assert not desc.physical_scale
-            assert not desc.physical_unit
+            assert list(desc.physical_scale) == list(_PHYS_SCALE)
+            assert list(desc.physical_unit) == list(_PHYS_UNIT)
             client.close()
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_server_get_flight_info_uses_proxy_forward():
+    """server.get_flight_info special-cases a proxy: it forwards to the upstream
+    and returns ITS native pyramid, rather than running the local planner (which
+    would advertise a *computed*, non-native pyramid). Calls the server method
+    directly to exercise the isinstance(RemoteTensorAdapter) branch (biopb/biopb#295).
+    """
+    import tempfile
+
+    import zarr
+    from biopb.tensor.descriptor_pb2 import (
+        FlightCmd,
+        TensorDescriptor,
+        TensorReadOption,
+    )
+    from biopb_tensor_server import OmeZarrAdapter, TensorFlightServer
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+    from pyarrow import flight
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zpath, _, _ = create_multiresolution_ome_zarr(
+            tmp, n_levels=4, base_shape=(256, 256), chunk_size=(64, 64)
+        )
+        root = zarr.open_group(zpath, mode="r")
+
+        upstream = TensorFlightServer("grpc://localhost:0")
+        upstream.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
+        _serve(upstream)
+        try:
+            proxy = TensorFlightServer("grpc://localhost:0")
+            proxy.register_source(
+                "hpc__ome",
+                RemoteTensorAdapter(
+                    source_id="hpc__ome",
+                    upstream_location=f"grpc://localhost:{upstream.port}",
+                    upstream_source_id="ome",
+                ),
+            )
+            _serve(proxy)
+            try:
+                cmd = FlightCmd(
+                    source_id="hpc__ome",
+                    tensor_read=TensorReadOption(tensor_id="hpc__ome"),
+                )
+                fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+                # Direct server-method call (no client): the proxy source carries no
+                # token, so _authorize_source is a no-op and context can be None.
+                info = proxy.get_flight_info(None, fd)
+
+                out = TensorDescriptor.FromString(info.descriptor.command)
+                # The upstream's NATIVE pyramid rode through the forward -- the local
+                # planner would have produced a computed (native=False) pyramid.
+                assert len(out.pyramid) >= 2
+                assert all(lvl.native for lvl in out.pyramid)
+                assert all(lvl.reduction_method == "precompute" for lvl in out.pyramid)
+                assert len(info.endpoints) >= 1
+            finally:
+                proxy.shutdown()
+        finally:
+            upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_array):
+    """When a proxy's forward_flight_info returns None (upstream unreachable /
+    unparseable), server.get_flight_info falls through to the local planner and
+    still returns a best-effort plan -- the branch degrades, it does not raise."""
+    import zarr
+    from biopb.tensor.descriptor_pb2 import FlightCmd, TensorReadOption
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from pyarrow import flight
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    upstream = TensorFlightServer("grpc://localhost:0")
+    upstream.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    _serve(upstream)
+    try:
+        adapter = RemoteTensorAdapter(
+            source_id="lab__img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
+        )
+        adapter.seed_catalog(
+            upstream_tensors=[
+                {
+                    "array_id": "img",
+                    "dim_labels": ["y", "x"],
+                    "shape": [128, 128],
+                    "chunk_shape": [64, 64],
+                    "dtype": "uint8",
+                }
+            ],
+            metadata={},
+            data_resident=True,
+        )
+        # Force the forward to yield nothing -> the server must use the local planner.
+        adapter.forward_flight_info = lambda read_opt: None
+
+        proxy = TensorFlightServer("grpc://localhost:0")
+        proxy.register_source("lab__img", adapter)
+        _serve(proxy)
+        try:
+            cmd = FlightCmd(
+                source_id="lab__img",
+                tensor_read=TensorReadOption(tensor_id="lab__img"),
+            )
+            fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+            info = proxy.get_flight_info(None, fd)  # must not raise
+            assert len(info.endpoints) >= 1  # local planner produced a plan
         finally:
             proxy.shutdown()
     finally:

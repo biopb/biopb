@@ -328,6 +328,27 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         out.ClearField("pyramid")
         return out
 
+    def _localize_forwarded_descriptor(
+        self, desc: TensorDescriptor
+    ) -> TensorDescriptor:
+        """Localize an upstream *GetFlightInfo* descriptor, keeping pyramid + scale.
+
+        The serve-path counterpart to ``_localize_descriptor`` (which strips the
+        pyramid so the LOCAL server advertises its own). A forwarded
+        ``GetFlightInfo`` descriptor is **authoritative**: the upstream already
+        computed the server-advertised pyramid (its native precompute levels for
+        a pyramidal OME-Zarr) and the physical scale for this exact tensor, and
+        the proxy mirrors it 1:1, so those are kept verbatim rather than
+        recomputed against a locally-guessed grid. Only ``metadata_json`` is
+        cleared -- the local server fills it from the mirror catalog row
+        (biopb/biopb#253), not from this forwarded call.
+        """
+        out = TensorDescriptor()
+        out.CopyFrom(desc)
+        out.array_id = self._to_local_array_id(desc.array_id)
+        out.metadata_json = ""
+        return out
+
     def _mark_unreachable(self, exc: Exception) -> None:
         """Record an upstream connectivity failure (catalog-surface degradation)."""
         self._reachable = False
@@ -596,30 +617,54 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         desc = self.client.get_descriptor(upstream_array_id)
         return self._localize_descriptor(desc)
 
-    def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
-        """Forward the read plan to the upstream and rewrite it local-ward.
+    def forward_flight_info(
+        self, read_opt: TensorReadOption
+    ) -> Optional[TensorReadPlan]:
+        """Forward a whole ``GetFlightInfo`` to the upstream and localize it.
 
-        A caching proxy re-derives **no** chunk grid (see the module docstring).
-        The default ``get_read_plan`` would plan against a locally-guessed grid
-        via ``get_chunk_size()`` -- but the bulk seed's ``chunk_shape`` is
-        advisory and often empty for the aicsimageio/OME-TIFF family, so that
-        guess falls through to the 64 MB default grid and over-amplifies a
-        single-plane read ~125x (biopb/biopb#295). Instead, forward one
-        ``GetFlightInfo`` to the upstream with the *same* slice/scale hints and
-        return **its** endpoints, with each ``chunk_id``'s ``array_id`` rewritten
-        upstream->local. That yields the upstream's authoritative native grid,
-        its scaled ``chunk_id``s for a downsampled read, and its slice bounding --
-        nothing re-implemented. The rewritten ``chunk_id``s round-trip: a
-        ``do_get`` on one forwards straight back to the upstream via
+        The server's ``get_flight_info`` calls this for a proxy tensor *instead*
+        of running its local read planner (biopb/biopb#295). A caching proxy
+        re-derives **no** chunk grid, pyramid, or physical scale of its own (see
+        the module docstring); the default planner would guess a grid from the
+        seed's ``chunk_shape`` (advisory, and often empty for the aicsimageio/
+        OME-TIFF family), fall through to the 64 MB default grid, and
+        over-amplify a single-plane read ~125x. Instead, consult the upstream
+        once for its **authoritative** ``GetFlightInfo`` -- carrying the native
+        grid, the server-advertised pyramid (a pyramidal OME-Zarr upstream's
+        precompute levels included), the physical scale, and scaled ``chunk_id``s
+        for a downsampled read -- and return it localized, with each
+        ``chunk_id``'s ``array_id`` rewritten upstream->local. Nothing is
+        re-implemented, and the rewritten ``chunk_id``s round-trip: a later
+        ``do_get`` on one forwards straight back upstream via
         ``resolve_chunk_data`` (the same array_id swap).
 
-        Falls back to the default local planner when the upstream call fails OR
-        its response can't be parsed (unreachable / too-old / unexpected upstream)
-        so ``GetFlightInfo`` still returns a (best-effort) plan -- never worse than
-        a non-proxy adapter.
+        Returns ``None`` in either failure mode, so the caller falls back to the
+        local planner -- never worse than a non-proxy adapter. The two modes are
+        caught separately: a **transport** failure of the upstream RPC (unreachable
+        / UNAVAILABLE / timeout / auth / upstream-side error) is an expected
+        operational condition, logged at DEBUG; a **logic** failure localizing a
+        response we *did* receive (a too-old / unexpected upstream, a corrupt
+        payload, or a proxy bug) is unexpected and logged at WARNING, so the
+        fallback never silently masks it.
         """
+        # Transport step -- the upstream GetFlightInfo RPC. flight.FlightError
+        # covers every upstream/gRPC failure (unavailable, timeout, auth, and an
+        # upstream-side internal error); OSError covers a socket-level fault.
         try:
-            info = self._upstream_flight_info(request_desc)
+            info = self._upstream_flight_info(read_opt)
+        except (flight.FlightError, OSError) as exc:
+            logger.debug(
+                "upstream flight-info RPC failed for %s (%r); falling back to the "
+                "local read planner",
+                self.array_id,
+                exc,
+            )
+            return None
+
+        # Logic step -- localize the response. A failure here is not a transport
+        # problem, so surface it (WARNING) rather than letting the fallback hide a
+        # protocol mismatch or a proxy bug.
+        try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
             endpoints = []
             for ep in info.endpoints:
@@ -637,40 +682,44 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
                 )
                 endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
             return TensorReadPlan(
-                descriptor=self._localize_descriptor(up_desc),
+                descriptor=self._localize_forwarded_descriptor(up_desc),
                 chunk_endpoints=endpoints,
             )
         except Exception as exc:
-            logger.debug(
-                "upstream read-plan forwarding failed for %s (%r); falling back to "
-                "the local read planner",
+            logger.warning(
+                "upstream flight-info response for %s could not be localized (%r); "
+                "falling back to the local read planner",
                 self.array_id,
                 exc,
                 exc_info=True,
             )
-            return super().get_read_plan(request_desc)
+            return None
 
-    def _upstream_flight_info(self, request_desc: TensorDescriptor):
+    def _upstream_flight_info(self, read_opt: TensorReadOption):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
 
-        ``with_metadata`` is left False: the local server fills the response
-        ``metadata_json``/``pyramid``/``physical_scale`` itself, so the forwarded
-        call needs only the descriptor + endpoints.
+        Re-targets the incoming ``read_opt`` at the upstream array_id and forwards
+        its slice/scale/reduction hints verbatim. ``with_metadata`` is forced
+        False: the local server fills the response ``metadata_json`` itself from
+        the mirror catalog (biopb/biopb#253), and ``pyramid``/``physical_scale``
+        ride the upstream descriptor unconditionally (the upstream fills them at
+        open time regardless of ``with_metadata``), so the forwarded call needs
+        only the descriptor + endpoints.
         """
         upstream_array_id = self._to_upstream_array_id(self.array_id)
-        read_opt = TensorReadOption(tensor_id=upstream_array_id, with_metadata=False)
-        if request_desc.HasField("slice_hint"):
-            read_opt.slice_hint.CopyFrom(request_desc.slice_hint)
-        if request_desc.scale_hint:
-            read_opt.scale_hint[:] = list(request_desc.scale_hint)
-        if request_desc.reduction_method:
-            read_opt.reduction_method = request_desc.reduction_method
+        up_read_opt = TensorReadOption(tensor_id=upstream_array_id, with_metadata=False)
+        if read_opt.HasField("slice_hint"):
+            up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
+        if read_opt.scale_hint:
+            up_read_opt.scale_hint[:] = list(read_opt.scale_hint)
+        if read_opt.reduction_method:
+            up_read_opt.reduction_method = read_opt.reduction_method
         # FlightCmd.source_id is the slash-free array_id prefix (identity policy);
         # tensor_id carries the full array_id, which the upstream reduces to the
         # within-source field -- so this works for a multi-tensor source too.
         cmd = FlightCmd(
             source_id=upstream_array_id.split("/", 1)[0],
-            tensor_read=read_opt,
+            tensor_read=up_read_opt,
         )
         flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
         return self.client._client.get_flight_info(
