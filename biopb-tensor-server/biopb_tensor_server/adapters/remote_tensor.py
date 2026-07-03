@@ -638,12 +638,33 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         ``do_get`` on one forwards straight back upstream via
         ``resolve_chunk_data`` (the same array_id swap).
 
-        Returns ``None`` when the upstream call fails OR its response can't be
-        parsed (unreachable / too-old / unexpected upstream), so the caller falls
-        back to the local planner -- never worse than a non-proxy adapter.
+        Returns ``None`` in either failure mode, so the caller falls back to the
+        local planner -- never worse than a non-proxy adapter. The two modes are
+        caught separately: a **transport** failure of the upstream RPC (unreachable
+        / UNAVAILABLE / timeout / auth / upstream-side error) is an expected
+        operational condition, logged at DEBUG; a **logic** failure localizing a
+        response we *did* receive (a too-old / unexpected upstream, a corrupt
+        payload, or a proxy bug) is unexpected and logged at WARNING, so the
+        fallback never silently masks it.
         """
+        # Transport step -- the upstream GetFlightInfo RPC. flight.FlightError
+        # covers every upstream/gRPC failure (unavailable, timeout, auth, and an
+        # upstream-side internal error); OSError covers a socket-level fault.
         try:
             info = self._upstream_flight_info(read_opt)
+        except (flight.FlightError, OSError) as exc:
+            logger.debug(
+                "upstream flight-info RPC failed for %s (%r); falling back to the "
+                "local read planner",
+                self.array_id,
+                exc,
+            )
+            return None
+
+        # Logic step -- localize the response. A failure here is not a transport
+        # problem, so surface it (WARNING) rather than letting the fallback hide a
+        # protocol mismatch or a proxy bug.
+        try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
             endpoints = []
             for ep in info.endpoints:
@@ -665,9 +686,9 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
                 chunk_endpoints=endpoints,
             )
         except Exception as exc:
-            logger.debug(
-                "upstream flight-info forwarding failed for %s (%r); falling back "
-                "to the local read planner",
+            logger.warning(
+                "upstream flight-info response for %s could not be localized (%r); "
+                "falling back to the local read planner",
                 self.array_id,
                 exc,
                 exc_info=True,
