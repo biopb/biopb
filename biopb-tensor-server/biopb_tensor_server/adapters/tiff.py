@@ -486,8 +486,31 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         # Coherence gate at resolve too (mirrors claim()): the stacked members
         # must look like a related set, not an incidental grab-bag. Filename-only;
         # this is the one mismatch normalization can't fix, so unlike dtype/shape
-        # it raises rather than stacking nonsense.
+        # it raises rather than stacking nonsense. Split the message: if the
+        # directory fragmented by page count (or an unreadable file), members is
+        # only the dominant subset -- the names may cohere while the subset is too
+        # small to stack, so blame the page-count split, not the filenames.
         if not _looks_like_tiff_sequence([p.name for p in members]):
+            if len(buckets) > 1 or unreadable:
+                bucket_summary = ", ".join(
+                    f"{len(v)} file(s)x{k}pg"
+                    for k, v in sorted(
+                        buckets.items(), key=lambda kv: (-len(kv[1]), kv[0])
+                    )
+                )
+                unreadable_note = (
+                    f", plus {len(unreadable)} unreadable" if unreadable else ""
+                )
+                raise ValueError(
+                    f"Cannot stack the TIFFs in {directory} into one sequence: "
+                    f"they split into {len(buckets)} page-count group(s) "
+                    f"[{bucket_summary}]{unreadable_note}, and the largest group "
+                    f"({len(members)} file(s) with {n_pages_per_file} page(s) "
+                    f"each) is too small to form a sequence on its own. Files in "
+                    f"a sequence must share a page count (the directory's "
+                    f"filenames do cohere; it is the page-count split that "
+                    f"prevents stacking)."
+                )
             raise ValueError(
                 f"TIFF files in {directory} do not look like one sequence "
                 f"(no shared filename template or stem across the stacked files)"

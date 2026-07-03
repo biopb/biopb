@@ -346,6 +346,32 @@ class TestTiffSequenceStackAll:
             with pytest.raises(ValueError, match="do not look like one sequence"):
                 TiffSequenceAdapter(str(tmpdir), "sid")
 
+    def test_init_page_count_split_reports_pages_not_names(self):
+        """Regression (biopb/biopb): when coherent filenames fragment by page
+        count, the resolve error must name the page-count split -- not blame the
+        filenames. The real VivaView case: sp11_07032020_DIC.tif etc. cohere as a
+        set (claim passes) yet each is a different-length stack, so the dominant
+        page-count bucket collapses to one file and cannot stack. The old message
+        said 'do not look like one sequence', hiding the actual cause."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Names share the 'sp11_070' stem -> the directory coheres and claim()
+            # accepts it; only the per-page-count subsets are too small to stack.
+            for date, pages in (("07032020", 1), ("07052020", 2), ("07092020", 3)):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / f"sp11_{date}_DIC.tif"),
+                    np.zeros((pages, 8, 8), np.uint16),
+                    photometric="minisblack",
+                )
+
+            claim, _ = _claim(tmpdir)
+            assert claim is not None  # the directory cohered at claim time
+
+            with pytest.raises(ValueError) as excinfo:
+                TiffSequenceAdapter(str(tmpdir), "sid")
+            msg = str(excinfo.value)
+            assert "page-count group" in msg  # names the real cause
+            assert "do not look like one sequence" not in msg  # not a name complaint
+
     def test_same_shape_sibling_is_stacked_and_listed(self):
         """A same-shape digit-less sibling (e.g. readme.tif) is physically
         stackable, so it IS stacked -- and visible in metadata for the agent to
