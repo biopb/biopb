@@ -276,8 +276,8 @@ class TestReaderDeferBranches:
 
         d = tmp_path / "seq"
         d.mkdir()
-        for i in range(3):
-            (d / f"frame{i}.tif").write_bytes(b"II*\x00not-a-real-tiff")
+        for i in range(30):  # clears the claim floor (_MIN_TIFF_FILES)
+            (d / f"frame{i:03d}.tif").write_bytes(b"II*\x00not-a-real-tiff")
         claim = TiffSequenceAdapter.claim(
             _RaisingReadCtx(d, cloud_root=True), DiscoveryState()
         )
@@ -292,8 +292,8 @@ class TestReaderDeferBranches:
 
         d = tmp_path / "seq"
         d.mkdir()
-        for i in range(3):
-            (d / f"frame{i}.tif").write_bytes(b"II*\x00not-a-real-tiff")
+        for i in range(30):  # clears the claim floor (_MIN_TIFF_FILES)
+            (d / f"frame{i:03d}.tif").write_bytes(b"II*\x00not-a-real-tiff")
         claim = TiffSequenceAdapter.claim(ClaimContext(d), DiscoveryState())
         assert claim is not None
         assert claim.unresolved is False
@@ -1286,8 +1286,8 @@ class TestDirClaimingMembership:
         from biopb_tensor_server.adapters.tiff import TiffSequenceAdapter
 
         # Plain numbered sequence (img_*/OME/MicroManager names are excluded by
-        # _group_tiff_sequence on purpose).
-        for i in range(3):
+        # _group_tiff_sequence on purpose). 30 frames clears the claim floor.
+        for i in range(30):
             tifffile.imwrite(
                 tmp_path / f"frame_{i:03d}.tif", np.zeros((4, 4), dtype="uint8")
             )

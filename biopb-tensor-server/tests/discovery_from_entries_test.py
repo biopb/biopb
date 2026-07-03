@@ -320,9 +320,9 @@ class TestCachedGlobNoReaddir:
 
         seq = tmp_path / "seq"
         seq.mkdir()
-        # Naming that _group_tiff_sequence treats as one ordered sequence (one
-        # varying numeric field); see tiff_sequence_test.py.
-        for i in range(1, 6):
+        # A coherent numbered sequence; 30 frames clears the claim floor
+        # (_MIN_TIFF_FILES). See tiff_sequence_test.py.
+        for i in range(1, 31):
             tifffile.imwrite(
                 str(seq / f"s1-{i:04d}_bf.tif"), np.zeros((4, 4), dtype="uint8")
             )

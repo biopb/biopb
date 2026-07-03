@@ -12,6 +12,7 @@ downstream agent to interpret. Covered here:
 - the retained _group_tiff_sequence helper (single-field ordering reference)
 """
 
+import math
 import tempfile
 from pathlib import Path
 
@@ -20,8 +21,11 @@ import pytest
 import tifffile
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.tiff import (
+    _COHERENT_FRACTION,
+    _MIN_TIFF_FILES,
     TiffSequenceAdapter,
     _group_tiff_sequence,
+    _looks_like_tiff_sequence,
 )
 from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
@@ -42,6 +46,21 @@ def _write_tiff(path: Path, shape=(8, 8), *, seed: int = 0, compression=None):
     tifffile.imwrite(str(path), data, compression=compression)
 
 
+# Enough coherent TIFFs to clear the claim floor (_MIN_TIFF_FILES). Small dirs
+# now fall back to per-file sources, so claim tests write a full-size sequence.
+_N = _MIN_TIFF_FILES
+
+
+def _write_seq(dirpath, n=_N, template="s1-{i:04d}_bf.tif", *, start=1, **kw):
+    """Write ``n`` coherent single-page TIFFs named by ``template``; return paths."""
+    paths = []
+    for i in range(start, start + n):
+        p = Path(dirpath) / template.format(i=i)
+        _write_tiff(p, seed=i, **kw)
+        paths.append(p)
+    return paths
+
+
 def _claim(tmpdir):
     ctx = ClaimContext(Path(tmpdir))
     state = DiscoveryState()
@@ -53,9 +72,7 @@ class TestTiffSequenceClaim:
     def test_claim_single_field_sequence(self):
         """`s1-NNNN_bf.tif`: a plain sequence is claimed (dir is the boundary)."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            files = [Path(tmpdir) / f"s1-{i:04d}_bf.tif" for i in range(1, 6)]
-            for j, f in enumerate(files):
-                _write_tiff(f, seed=j)
+            _write_seq(tmpdir)
 
             claim, state = _claim(tmpdir)
 
@@ -68,9 +85,7 @@ class TestTiffSequenceClaim:
     def test_claim_with_differing_file_sizes(self):
         """Compressed sequence with all-distinct file sizes is still claimed."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            files = [Path(tmpdir) / f"s1-{i:04d}_bf.tif" for i in range(1, 6)]
-            for j, f in enumerate(files):
-                _write_tiff(f, seed=j, compression="zlib")
+            files = _write_seq(tmpdir, compression="zlib")
 
             sizes = {f.stat().st_size for f in files}
             assert len(sizes) > 1, "fixture should produce differing sizes"
@@ -79,16 +94,14 @@ class TestTiffSequenceClaim:
             assert claim is not None
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert len(adapter._tiff_files) == 5
+            assert len(adapter._tiff_files) == _N
 
     def test_claim_multi_field_filenames(self):
         """Stack-all (#215): two numeric fields varying together no longer block
         the claim -- the directory is claimed and the files stacked, with the
         agent left to interpret the axis from the names."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            names = ["r1-c1_x.tif", "r2-c2_x.tif", "r3-c3_x.tif"]
-            for j, n in enumerate(names):
-                _write_tiff(Path(tmpdir) / n, seed=j)
+            _write_seq(tmpdir, template="r{i}-c{i}_x.tif")
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
@@ -101,86 +114,74 @@ class TestTiffSequenceClaim:
         per-file names reach the agent via get_metadata for reshape/relabel.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
+            n = 0
             for ch in ("w1DIC", "w2GFP"):
                 for s in (1, 2):
-                    for t in (1, 2, 10):
+                    for t in range(1, 9):  # 2*2*8 = 32 frames, clears the floor
                         _write_tiff(
                             Path(tmpdir) / f"07122017_Sample2_{ch}_s{s}_t{t}.TIF",
                             seed=t,
                         )
+                        n += 1
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
             assert claim.source_type == "tiff-sequence"
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter.full_shape == [12, 8, 8]
+            assert adapter.full_shape == [n, 8, 8]
             assert adapter.dim_labels == ["i", "y", "x"]
-            files = adapter.get_metadata()["files"]
-            assert len(files) == 12
-            # Natural order: t1, t2, t10 within a (channel, site) group.
-            assert files[:3] == [
-                "07122017_Sample2_w1DIC_s1_t1.TIF",
-                "07122017_Sample2_w1DIC_s1_t2.TIF",
-                "07122017_Sample2_w1DIC_s1_t10.TIF",
-            ]
+            assert len(adapter.get_metadata()["files"]) == n
 
     def test_uppercase_tif_extension_claimed(self):
         """Case-insensitive extension match: a folder of `.TIF` is claimed."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(3):
-                _write_tiff(Path(tmpdir) / f"frame_{i}.TIF", seed=i)
+            _write_seq(tmpdir, template="frame_{i}.TIF", start=0)
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter.full_shape[0] == 3
+            assert adapter.full_shape[0] == _N
 
-    def test_no_claim_fewer_than_three(self):
+    def test_no_claim_below_min_files(self):
+        """The claim floor: a handful of TIFFs (below _MIN_TIFF_FILES) is left to
+        per-file fallback rather than welded into a sequence -- even when the
+        names cohere perfectly."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 3):
-                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
+            _write_seq(tmpdir, n=_MIN_TIFF_FILES - 1)  # one short of the floor
 
             claim, _ = _claim(tmpdir)
             assert claim is None
 
-    def test_no_claim_incoherent_grab_bag(self):
-        """Coherence gate: unrelated filenames (no shared template or stem) are
-        not welded into one tensor -- left to per-file fallback."""
+    def test_no_claim_pattern_below_threshold(self):
+        """Coherence gate: enough files to clear the floor, but fewer than the
+        required fraction share one pattern -- a real sequence with too many
+        unrelated strays reads as a grab-bag and is left to per-file fallback."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for n in ("logo.tif", "figure3.tif", "scalebar.tif"):
-                _write_tiff(Path(tmpdir) / n, seed=1)
-
-            claim, _ = _claim(tmpdir)
-            assert claim is None
-
-    def test_no_claim_bare_channel_tokens(self):
-        """Accepted limitation: a no-number, no-stem channel set (bare
-        red/green/blue.tif) is indistinguishable from a grab-bag by filename
-        alone, so it is not claimed (graceful miss, never a wrong tensor)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for c in ("red", "green", "blue"):
-                _write_tiff(Path(tmpdir) / f"{c}.tif", seed=1)
+            # 26 coherent frames + 4 unrelated strays = 30 files; 26/30 = 87% < 90%
+            _write_seq(tmpdir, n=26, template="frame_{i:04d}.tif")
+            for stray in ("alpha.tif", "beta.tif", "gamma.tif", "delta.tif"):
+                _write_tiff(Path(tmpdir) / stray, seed=1)
 
             claim, _ = _claim(tmpdir)
             assert claim is None
 
     def test_claim_short_stem_numbered_sequence(self):
-        """A numbered sequence with a tiny stem (a1/a2/a3) coheres via its shared
-        digit-template even though the common prefix is only one char."""
+        """A numbered sequence with a tiny stem (a1/a2/a3...) coheres via its
+        shared digit-template even though the common prefix is only one char."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 4):
-                _write_tiff(Path(tmpdir) / f"a{i}.tif", seed=i)
+            _write_seq(tmpdir, template="a{i}.tif")
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
 
     def test_claim_indexed_channel_tokens(self):
-        """An indexed channel set (sp_0001_{red,green,blue}) coheres via its
-        shared stem even though no single digit-template is a majority."""
+        """An indexed channel set (sp_NNNN_{red,green,blue}) coheres via its
+        shared stem even though no single digit-template reaches the threshold."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for c in ("red", "green", "blue"):
-                _write_tiff(Path(tmpdir) / f"sp_0001_{c}.tif", seed=1)
+            for i in range(1, 11):  # 10 indices x 3 channels = 30 files
+                for c in ("red", "green", "blue"):
+                    _write_tiff(Path(tmpdir) / f"sp_{i:04d}_{c}.tif", seed=i)
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
@@ -193,8 +194,7 @@ class TestTiffSequenceClaim:
         one MM could not parse (e.g. truncated from an aborted acquisition).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
+            _write_seq(tmpdir)
             (Path(tmpdir) / "metadata.txt").write_text("{ truncated")
 
             claim, _ = _claim(tmpdir)
@@ -204,8 +204,7 @@ class TestTiffSequenceClaim:
     def test_claim_micromanager_img_frames_without_metadata(self):
         """img_* single-frame sequences (no metadata) are claimed as one source."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(4):
-                _write_tiff(Path(tmpdir) / f"img_{i:09d}__000.tif", seed=i)
+            _write_seq(tmpdir, template="img_{i:09d}__000.tif", start=0)
 
             claim, _ = _claim(tmpdir)
             assert claim is not None
@@ -214,8 +213,7 @@ class TestTiffSequenceClaim:
     def test_no_claim_when_ome_companion_present(self):
         """*.companion.ome still defers to the file-level OmeTiffAdapter."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"s1-{i:04d}_bf.tif", seed=i)
+            _write_seq(tmpdir)
             (Path(tmpdir) / "set.companion.ome").write_text("<OME/>")
 
             claim, _ = _claim(tmpdir)
@@ -224,8 +222,7 @@ class TestTiffSequenceClaim:
     def test_no_claim_for_ome_tiff_directory(self):
         """A folder of .ome.tif files is left to the file-level OmeTiffAdapter."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+            _write_seq(tmpdir, template="img_{i:03d}.ome.tif")
 
             claim, _ = _claim(tmpdir)
             assert claim is None
@@ -235,8 +232,7 @@ class TestTiffSequenceClaim:
         and a folder of .ome.tif is claimed (unresolved) instead of degrading to
         one per-file source per frame."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+            _write_seq(tmpdir, template="img_{i:03d}.ome.tif")
 
             ctx = ClaimContext(Path(tmpdir), cloud_root=True)
             claim = TiffSequenceAdapter.claim(ctx, DiscoveryState())
@@ -247,8 +243,7 @@ class TestTiffSequenceClaim:
     def test_claim_ome_companion_under_cloud(self):
         """The *.companion.ome guard also lifts under a cloud root."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(1, 5):
-                _write_tiff(Path(tmpdir) / f"img_{i:03d}.ome.tif", seed=i)
+            _write_seq(tmpdir, template="img_{i:03d}.ome.tif")
             (Path(tmpdir) / "set.companion.ome").write_text("<OME/>")
 
             ctx = ClaimContext(Path(tmpdir), cloud_root=True)
@@ -349,22 +344,20 @@ class TestTiffSequenceStackAll:
     def test_init_page_count_split_reports_pages_not_names(self):
         """Regression (biopb/biopb): when coherent filenames fragment by page
         count, the resolve error must name the page-count split -- not blame the
-        filenames. The real VivaView case: sp11_07032020_DIC.tif etc. cohere as a
-        set (claim passes) yet each is a different-length stack, so the dominant
-        page-count bucket collapses to one file and cannot stack. The old message
-        said 'do not look like one sequence', hiding the actual cause."""
+        filenames. The VivaView case: sp11_07032020_DIC.tif etc. cohere as a set
+        yet each is a different-length stack, so the dominant page-count bucket
+        collapses to one file and cannot stack. The old message said 'do not look
+        like one sequence', hiding the actual cause. (Resolve imposes no claim
+        floor, so an explicitly-pointed small set still reaches this path.)"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Names share the 'sp11_070' stem -> the directory coheres and claim()
-            # accepts it; only the per-page-count subsets are too small to stack.
+            # Names share the 'sp11_070' stem -> coherent; only the per-page-count
+            # subsets are too small to stack.
             for date, pages in (("07032020", 1), ("07052020", 2), ("07092020", 3)):
                 tifffile.imwrite(
                     str(Path(tmpdir) / f"sp11_{date}_DIC.tif"),
                     np.zeros((pages, 8, 8), np.uint16),
                     photometric="minisblack",
                 )
-
-            claim, _ = _claim(tmpdir)
-            assert claim is not None  # the directory cohered at claim time
 
             with pytest.raises(ValueError) as excinfo:
                 TiffSequenceAdapter(str(tmpdir), "sid")
@@ -375,14 +368,17 @@ class TestTiffSequenceStackAll:
     def test_same_shape_sibling_is_stacked_and_listed(self):
         """A same-shape digit-less sibling (e.g. readme.tif) is physically
         stackable, so it IS stacked -- and visible in metadata for the agent to
-        disregard. (Contrast the old behavior, which silently ignored it.)"""
+        disregard. (Contrast the old behavior, which silently ignored it.) The
+        sequence stays a large super-majority so the lone sibling doesn't trip the
+        coherence gate."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i in range(4):
+            n = 30
+            for i in range(n):
                 _write_tiff(Path(tmpdir) / f"ND{i:03d}_aligned.tiff", seed=i)
             _write_tiff(Path(tmpdir) / "readme.tif", seed=42)
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter.full_shape[0] == 5
+            assert adapter.full_shape[0] == n + 1
             assert "readme.tif" in adapter.get_metadata()["files"]
 
     def test_unreadable_tiff_listed_as_unstacked(self):
@@ -528,6 +524,63 @@ class TestTiffSequenceStackAll:
             assert adapter.is_tiled is True
             assert adapter._spatial_chunk == [16, 16]
             assert adapter.chunk_shape == [1, 16, 16]
+
+
+class TestCoherenceGate:
+    """_looks_like_tiff_sequence: the filename-only coherence check. Pure, no I/O,
+    so the >=90% fraction and the small-sample floor are tested directly on name
+    lists rather than by fabricating dozens of files per case."""
+
+    def test_mask_shared_by_exactly_the_threshold_coheres(self):
+        # 27 of 30 share the mask -> exactly 90% -> coheres.
+        names = [f"frame_{i:03d}.tif" for i in range(27)]
+        names += ["aaa.tif", "bbb.tif", "ccc.tif"]
+        assert len(names) == 30
+        assert _looks_like_tiff_sequence(names) is True
+
+    def test_mask_below_threshold_does_not_cohere(self):
+        # 26 of 30 share the mask; the 4 strays share no stem -> < 90% -> grab-bag.
+        names = [f"frame_{i:03d}.tif" for i in range(26)]
+        names += ["aardvark.tif", "bison.tif", "cheetah.tif", "dingo.tif"]
+        assert len(names) == 30
+        assert _looks_like_tiff_sequence(names) is False
+
+    def test_stem_shared_by_threshold_coheres_without_mask_majority(self):
+        # 27 files share the stem 'exp_000' across three rotating channel masks
+        # (each mask only 9 of 30, so it is the stem -- not a mask -- that carries
+        # coherence); 3 strays make up the balance.
+        names = [
+            f"exp_{i:04d}_{tok}.tif"
+            for i in range(9)
+            for tok in ("red", "green", "blue")
+        ]
+        names += ["aaa.tif", "bbb.tif", "ccc.tif"]
+        assert len(names) == 30
+        assert _looks_like_tiff_sequence(names) is True
+
+    def test_below_pattern_floor_never_coheres(self):
+        # Under _MIN_PATTERN_FILES a shared mask/stem is trivially met and means
+        # nothing, so it is rejected regardless.
+        assert _looks_like_tiff_sequence(["a.tif", "b.tif"]) is False
+
+    def test_small_but_coherent_set_passes_the_pattern_check(self):
+        # The pattern check itself has only the small-sample floor (the 30-file
+        # bar is the separate claim floor), so a tiny coherent set still reads as
+        # a sequence -- this is the resolve path for an explicit small source.
+        assert _looks_like_tiff_sequence(["s1.tif", "s2.tif", "s3.tif"]) is True
+
+    def test_threshold_matches_the_configured_fraction(self):
+        # Guard the boundary against drift if _COHERENT_FRACTION changes.
+        n = 30
+        need = math.ceil(_COHERENT_FRACTION * n)
+        at = [f"f_{i}.tif" for i in range(need)] + [
+            f"x{j}_.tif" for j in range(n - need)
+        ]
+        below = [f"f_{i}.tif" for i in range(need - 1)] + [
+            f"x{j}_.tif" for j in range(n - need + 1)
+        ]
+        assert _looks_like_tiff_sequence(at) is True
+        assert _looks_like_tiff_sequence(below) is False
 
 
 class TestGroupHelper:

@@ -5,6 +5,7 @@ OME-TIFF files are handled by the aicsimageio adapter.
 """
 
 import json
+import math
 import re
 import threading
 from pathlib import Path
@@ -60,11 +61,15 @@ def _filter_tiff_candidates(files: List[Path], exclude_ome: bool = True) -> List
     return [f for f in files if not any(f.match(p) for p in _TIFF_EXCLUDE_PATTERNS)]
 
 
-# Minimum number of TIFFs for a directory to be claimed as a stacked sequence.
-# Below this a directory is left to per-file fallback. The stack-all policy
-# (#215) no longer requires a single varying numeric field -- any several plain
-# TIFFs are claimed and stacked, with per-file provenance exposed for the agent.
-_MIN_TIFF_FILES = 3
+# Minimum number of TIFFs for a directory to be *claimed* as a stacked sequence.
+# Below this the directory is left to per-file fallback (each TIFF a source of its
+# own): a handful of TIFFs in a folder is far more often a few unrelated images
+# than a genuine sequence, and welding them costs more than it helps. A real
+# sequence -- a time-lapse, a channel/site sweep, a page-split stack -- runs to
+# dozens of frames, so the floor is set well above "a few". Claim-time only; the
+# resolve path (__init__) imposes no such floor, so an explicitly-configured
+# small sequence still opens (see _MIN_PATTERN_FILES).
+_MIN_TIFF_FILES = 30
 
 
 def _mask_and_digits(name: str) -> Tuple[str, List[int]]:
@@ -102,16 +107,27 @@ def _natural_key(name: str) -> List[Tuple[int, Any]]:
 # shape-bucketing, a pixel size). Stack-all (#215) stopped parsing what the
 # filename fields *mean* -- that is the agent's job -- but "is this a dataset at
 # all?" is still the adapter's call, so we keep a cheap, filename-only coherence
-# gate at claim time. Two signals, either sufficient:
-#   (a) a majority share one digit-template (mask) -- catches numbered sequences
-#       including short stems like ``a1/a2/a3`` whose common prefix is tiny;
-#   (b) a majority share a non-trivial common stem (prefix) -- catches sets that
+# gate. Two signals, either sufficient:
+#   (a) one digit-template (mask) shared by >=90% of the names -- catches numbered
+#       sequences including short stems like ``a1/a2/a3`` whose common prefix is
+#       tiny;
+#   (b) a non-trivial common stem (prefix) shared by >=90% -- catches sets that
 #       vary by a token rather than a number, e.g. ``sp_0001_{red,green,blue}``
 #       or MetaMorph ``..._w1DIC_.. / .._w2GFP_..``.
-# A bare, no-number, no-stem set (``red/green/blue.tif``) is indistinguishable
+# The bar is a large super-majority, not a bare 50%+1: a real sequence is almost
+# entirely one pattern, and requiring near-uniformity keeps a few stray TIFFs
+# dropped alongside a true sequence from dragging an unrelated grab-bag in with
+# it. A bare, no-number, no-stem set (``red/green/blue.tif``) is indistinguishable
 # from a grab-bag by filename alone, so it is left to per-file fallback -- a
 # graceful miss, never a wrong tensor.
 _MIN_STEM = 3  # chars; a shorter shared prefix is too weak to imply coherence
+_COHERENT_FRACTION = 0.9  # share of names that must fit one mask/stem to cohere
+
+# Floor for the pattern check itself, distinct from the claim floor
+# (_MIN_TIFF_FILES): below a few names a shared mask/stem is trivially satisfied
+# and says nothing. This governs the resolve-time gate on the stacked subset,
+# where an explicitly-configured small sequence must still be allowed to open.
+_MIN_PATTERN_FILES = 3
 
 
 def _common_prefix_len(a: str, b: str) -> int:
@@ -126,24 +142,24 @@ def _common_prefix_len(a: str, b: str) -> int:
 def _looks_like_tiff_sequence(names: List[str]) -> bool:
     """Filename-only coherence gate (see the comment above). Pure, no I/O."""
     n = len(names)
-    if n < _MIN_TIFF_FILES:
+    if n < _MIN_PATTERN_FILES:
         return False
-    majority = n // 2 + 1
+    threshold = math.ceil(_COHERENT_FRACTION * n)
 
-    # (a) a digit-template (mask) shared by a majority of the names.
+    # (a) a digit-template (mask) shared by >=90% of the names.
     mask_counts: Dict[str, int] = {}
     for nm in names:
         mask, _ = _mask_and_digits(nm)
         mask_counts[mask] = mask_counts.get(mask, 0) + 1
-    if max(mask_counts.values()) >= majority:
+    if max(mask_counts.values()) >= threshold:
         return True
 
-    # (b) a non-trivial common stem shared by a majority. A majority-shared prefix
-    # is contiguous once the names are sorted, so the LCP of the first and last
-    # entry of each majority-sized window covers every candidate prefix.
+    # (b) a non-trivial common stem shared by >=90%. A prefix shared by that many
+    # names is contiguous once the names are sorted, so the LCP of the first and
+    # last entry of each threshold-sized window covers every candidate prefix.
     ordered = sorted(nm.lower() for nm in names)
-    for i in range(n - majority + 1):
-        if _common_prefix_len(ordered[i], ordered[i + majority - 1]) >= _MIN_STEM:
+    for i in range(n - threshold + 1):
+        if _common_prefix_len(ordered[i], ordered[i + threshold - 1]) >= _MIN_STEM:
             return True
     return False
 
