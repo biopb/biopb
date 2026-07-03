@@ -37,6 +37,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import (
@@ -1148,66 +1149,84 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Build request descriptor for the specific tensor
         try:
-            base_desc = tensor_adapter.get_tensor_descriptor()
-            tensor_desc = TensorDescriptor(
-                array_id=tensor_id,
-                dim_labels=base_desc.dim_labels,
-                shape=base_desc.shape,
-                chunk_shape=base_desc.chunk_shape,
-                dtype=base_desc.dtype,
-            )
-            if read_opt.HasField("slice_hint"):
-                tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-                logger.debug(
-                    f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
+            # A remote-proxy tensor mirrors an upstream source 1:1 and re-derives
+            # no chunk grid, pyramid, or physical scale of its own. Consult the
+            # upstream once for its authoritative GetFlightInfo and use it as-is
+            # rather than planning against a locally-guessed 64 MB grid and a
+            # locally-computed pyramid (biopb/biopb#295): the forwarded descriptor
+            # already carries the upstream's native grid, its server-advertised
+            # pyramid (a pyramidal OME-Zarr upstream's precompute levels
+            # included), and its physical scale -- so the pyramid/physical
+            # overwrite below is skipped for it (they are already authoritative).
+            # metadata_json still comes from the local mirror catalog (the #253
+            # no-extra-RPC path). A None return (upstream unreachable/unparseable)
+            # falls through to the local planner -- never worse than before.
+            read_plan = None
+            if isinstance(tensor_adapter, RemoteTensorAdapter):
+                read_plan = tensor_adapter.forward_flight_info(read_opt)
+
+            if read_plan is None:
+                base_desc = tensor_adapter.get_tensor_descriptor()
+                tensor_desc = TensorDescriptor(
+                    array_id=tensor_id,
+                    dim_labels=base_desc.dim_labels,
+                    shape=base_desc.shape,
+                    chunk_shape=base_desc.chunk_shape,
+                    dtype=base_desc.dtype,
                 )
-            # Apply scale_hint and reduction_method directly to TensorDescriptor
-            if read_opt.scale_hint:
-                tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
-            if read_opt.reduction_method:
-                tensor_desc.reduction_method = read_opt.reduction_method
+                if read_opt.HasField("slice_hint"):
+                    tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
+                    logger.debug(
+                        f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
+                    )
+                # Apply scale_hint and reduction_method directly to TensorDescriptor
+                if read_opt.scale_hint:
+                    tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
+                if read_opt.reduction_method:
+                    tensor_desc.reduction_method = read_opt.reduction_method
 
-            read_plan = tensor_adapter.get_read_plan(tensor_desc)
+                read_plan = tensor_adapter.get_read_plan(tensor_desc)
 
-            # The response descriptor's array_id is the adapter's own
-            # source-unique array_id (source_id or source_id/field), carried
-            # through get_read_plan from get_tensor_descriptor(). Under the
-            # identity policy this same qualified array_id is what list_flights
-            # advertises, the chunk_ids encode, and the client caches -- one form
-            # everywhere, so there is nothing to strip here (cf. the removed #45
-            # bare-form normalization; the bare/qualified split it papered over
-            # no longer exists).
+                # The response descriptor's array_id is the adapter's own
+                # source-unique array_id (source_id or source_id/field), carried
+                # through get_read_plan from get_tensor_descriptor(). Under the
+                # identity policy this same qualified array_id is what list_flights
+                # advertises, the chunk_ids encode, and the client caches -- one
+                # form everywhere, so there is nothing to strip here (cf. the
+                # removed #45 bare-form normalization; the bare/qualified split it
+                # papered over no longer exists).
+
+                # Advertise the server-decided resolution pyramid. Filled here
+                # (open time), never in list_flights -- like metadata_json -- so
+                # discovery stays lean. The client reads each advertised level via
+                # the normal scale_hint path; native sources get their precomputed
+                # levels.
+                read_plan.descriptor.ClearField("pyramid")
+                read_plan.descriptor.pyramid.extend(
+                    self._advertised_pyramid(tensor_adapter, base_desc)
+                )
+
+                # Compact per-dim physical scale summary. Filled here at open time
+                # (always, like pyramid -- NOT gated on with_metadata), never in
+                # list_flights, so the common tensor-load path gets physical sizes
+                # without fetching the full OME tree (issue #31). Full-res values:
+                # do not scale by scale_hint (napari multiscale scale is level-0).
+                read_plan.descriptor.ClearField("physical_scale")
+                read_plan.descriptor.ClearField("physical_unit")
+                try:
+                    phys = tensor_adapter.get_physical_scale()
+                except Exception:
+                    phys = None
+                if phys is not None:
+                    scale_vec, unit_vec = phys
+                    ndim = len(read_plan.descriptor.dim_labels)
+                    if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
+                        read_plan.descriptor.physical_scale[:] = scale_vec
+                        read_plan.descriptor.physical_unit[:] = unit_vec
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
             source_adapter = self._get_source_adapter(source_id)
-
-            # Advertise the server-decided resolution pyramid. Filled here (open
-            # time), never in list_flights -- like metadata_json -- so discovery
-            # stays lean. The client reads each advertised level via the normal
-            # scale_hint path; native sources get their precomputed levels.
-            read_plan.descriptor.ClearField("pyramid")
-            read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(tensor_adapter, base_desc)
-            )
-
-            # Compact per-dim physical scale summary. Filled here at open time
-            # (always, like pyramid -- NOT gated on with_metadata), never in
-            # list_flights, so the common tensor-load path gets physical sizes
-            # without fetching the full OME tree (issue #31). Full-res values:
-            # do not scale by scale_hint (napari multiscale scale is level-0).
-            read_plan.descriptor.ClearField("physical_scale")
-            read_plan.descriptor.ClearField("physical_unit")
-            try:
-                phys = tensor_adapter.get_physical_scale()
-            except Exception:
-                phys = None
-            if phys is not None:
-                scale_vec, unit_vec = phys
-                ndim = len(read_plan.descriptor.dim_labels)
-                if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
-                    read_plan.descriptor.physical_scale[:] = scale_vec
-                    read_plan.descriptor.physical_unit[:] = unit_vec
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
