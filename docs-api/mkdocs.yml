@@ -1,0 +1,80 @@
+# API-reference build for the biopb Python SDK.
+#
+# This is a SEPARATE mkdocs project from biopb-site: it renders only the
+# auto-generated API reference (mkdocstrings) and is published by the release
+# workflow to https://biopb.org/docs/api/python/ — a namespace the main site's
+# deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml).
+#
+# Build locally (from repo root):
+#   uv sync --extra doc
+#   uv run mkdocs build -f docs-api/mkdocs.yml      # -> docs-api/site/
+#   uv run mkdocs serve  -f docs-api/mkdocs.yml     # live preview
+
+site_name: biopb Python SDK
+site_description: API reference for the biopb Python SDK (biopb.image, biopb.tensor).
+site_url: https://biopb.org/docs/api/python/
+repo_url: https://github.com/biopb/biopb
+repo_name: biopb/biopb
+edit_uri: blob/main/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  palette:
+    scheme: default
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+
+plugins:
+  - search
+  # gen-files + literate-nav build one reference page per public module at build
+  # time (see gen_ref_pages.py); nothing under docs/reference/ is checked in.
+  - gen-files:
+      scripts:
+        - gen_ref_pages.py
+  - literate-nav:
+      nav_file: SUMMARY.md
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          # Source roots (relative to this config). mkdocstrings/griffe analyze
+          # statically from here, so the package's runtime deps (pyarrow, dask,
+          # …) need not be importable to build the docs.
+          paths:
+            - ../src/main/python
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            show_root_heading: true
+            show_source: true
+            show_signature_annotations: true
+            separate_signature: true
+            members_order: source
+            merge_init_into_class: true
+            # Hide private/dunder members; modules are pre-filtered in the gen
+            # script, this drops leading-underscore names within each module.
+            filters:
+              - "!^_"
+
+nav:
+  - Overview: index.md
+  - API reference: reference/

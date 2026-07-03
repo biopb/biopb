@@ -155,3 +155,6 @@ packages/*/coverage/
 packages/tensor-flight-client/src/gen/
 *.sif
 .benchmarks/
+
+# Generated SDK API-reference site (docs-api/, see api-docs.yaml)
+docs-api/site/

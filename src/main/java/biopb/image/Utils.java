@@ -756,7 +756,7 @@ public final class Utils {
                 serializedTensor.getAuthToken().isEmpty() ? null : serializedTensor.getAuthToken(),
                 100_000_000L,  // Default cache size 100MB
                 serializedTensor.getTensorDescriptor().getArrayId(),
-                null,  // tensorId is embedded in descriptor
+                serializedTensor.getTensorDescriptor().getArrayId(),  // tensorId == arrayId; server reduces to field
                 serializedTensor.hasOriginalSliceHint() ? serializedTensor.getOriginalSliceHint() : null,
                 serializedTensor.getTensorDescriptor().getScaleHintList().isEmpty() ? null
                         : toLongArray(serializedTensor.getTensorDescriptor().getScaleHintList()),

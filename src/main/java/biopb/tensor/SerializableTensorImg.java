@@ -315,10 +315,10 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
                 arr[i] = dis.readLong();
             }
             dis.close();
+            return arr;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to deserialize long array", e);
         }
-        return null; // unreachable
     }
 
     // Helper methods (adapted from TensorFlightClient)
