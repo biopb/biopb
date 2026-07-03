@@ -108,7 +108,7 @@ class UnresolvedSourceAdapter(SourceAdapter):
             return self._resolved.get_source_descriptor()
         return DataSourceDescriptor(
             source_id=self.source_id,
-            source_url=to_catalog_url(self._source_url),
+            source_url=self._catalog_url or to_catalog_url(self._source_url),
             source_type=self._source_type,
             tensors=[],
             metadata_json="",
@@ -181,6 +181,11 @@ class UnresolvedSourceAdapter(SourceAdapter):
             if self._resolved is not None:  # lost the race; someone resolved it
                 return self._resolved
             adapter = self._build_resolved_adapter()
+            # Carry the drag-drop catalog-url override onto the real adapter so
+            # the resolved descriptor keeps rendering under its drop root (the
+            # proxy delegates get_source_descriptor to it after resolution).
+            if self._catalog_url:
+                adapter._catalog_url = self._catalog_url
             self._resolved = adapter
             if self._on_resolved is not None:
                 try:

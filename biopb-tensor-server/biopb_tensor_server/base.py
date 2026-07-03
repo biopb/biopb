@@ -200,6 +200,16 @@ class SourceAdapter(ABC):
     _source_type: str  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
+    # Display-only override for the catalog ``source_url`` (the descriptor field
+    # the tensor-browser / web viewer group the tree by). Normally None, so the
+    # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
+    # The drag-drop runtime-add path sets it to a re-rooted url so each drop
+    # renders as its own top-level root instead of nesting deep under the shared
+    # absolute-path tree (see SourceManager._drop_catalog_url). It never touches
+    # ``_source_url`` (filesystem ops) or ``source_id`` (path hash), so it is
+    # purely cosmetic and needs no re-index.
+    _catalog_url: Optional[str] = None
+
     @property
     def array_id(self) -> str:
         """Tensor identifier used in chunk encoding.
@@ -307,7 +317,7 @@ class SourceAdapter(ABC):
         """
         return DataSourceDescriptor(
             source_id=self.source_id,
-            source_url=to_catalog_url(self._source_url),
+            source_url=self._catalog_url or to_catalog_url(self._source_url),
             source_type=self._source_type,
             tensors=self.list_tensor_descriptors(),
             metadata_json="",  # filled by GetFlightInfo()

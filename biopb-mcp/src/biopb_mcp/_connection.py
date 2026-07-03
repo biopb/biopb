@@ -349,6 +349,54 @@ class TensorConnection:
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
+    def is_localhost(self) -> bool:
+        """True if the connected server runs on this machine.
+
+        The tensor-browser drag-drop gate: a dropped path is a *client-side*
+        filesystem path, meaningful to the server only when they share a
+        filesystem, so the drop affordance is enabled only for a localhost
+        server. Cheap and GUI-free so the widget can call it on every drag.
+        """
+        return is_local_url(self.url)
+
+    def add_source(
+        self,
+        path: str,
+        *,
+        monitor: bool = False,
+        confirm_large: bool = False,
+        on_progress=None,
+        should_cancel=None,
+    ):
+        """Register a local path on the server as a source, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.add_source` — the wire
+        entrypoint behind the tensor-browser drag-drop. The server interprets
+        ``path`` on *its own* filesystem (a localhost server shares ours), routes
+        it through the discovery pipeline, and streams progress as each source
+        registers; a dropped directory may add several. The local catalog
+        snapshot (:attr:`sources`) is then refreshed so the browser shows the new
+        rows. Slow for a large directory, so call off the GUI thread.
+
+        ``on_progress`` (an ``AddSourceProgress`` per registered source) and
+        ``should_cancel`` (polled per message; a cancel stops the walk but keeps
+        what is already registered) are forwarded verbatim. ``confirm_large``
+        acknowledges the server's large-directory guard on a retry. Returns the
+        terminal ``AddSourceResult`` (added / already_present / failed /
+        needs_confirm_large).
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        result = self.client.add_source(
+            path,
+            monitor=monitor,
+            confirm_large=confirm_large,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+        )
+        self.refresh()
+        return result
+
     def start_source_watch(
         self,
         min_interval: float | None = None,

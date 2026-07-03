@@ -230,6 +230,58 @@ class TestConnect:
         )
         assert out is terminal
 
+    def test_add_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.add_source("/data/x.zarr")
+
+    def test_add_source_delegates_and_refreshes(self, monkeypatch):
+        # add_source() streams the registration and returns the terminal tally;
+        # the connection then re-lists so the new source is in its snapshot.
+        result = MagicMock(name="add-result")
+        client = _fake_client({})
+        client.add_source.return_value = result
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        after = {"x": MagicMock()}
+        client.list_sources.return_value = after
+
+        out = conn.add_source("/data/x.zarr")
+
+        client.add_source.assert_called_once_with(
+            "/data/x.zarr",
+            monitor=False,
+            confirm_large=False,
+            on_progress=None,
+            should_cancel=None,
+        )
+        assert out is result
+        assert conn.sources == after  # snapshot refreshed via list_sources()
+
+
+class TestIsLocalhost:
+    """The drag-drop gate: only a localhost server shares the client's disk."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("grpc://localhost:8815", True),
+            ("grpc://127.0.0.1:8815", True),
+            ("grpc://[::1]:8815", True),
+            ("grpc://10.0.0.5:8815", False),
+            ("grpc://data.lab.example:8815", False),
+        ],
+    )
+    def test_is_localhost(self, url, expected):
+        conn = TensorConnection(config={})
+        conn.url = url
+        assert conn.is_localhost() is expected
+
 
 # ---------------------------------------------------------------------------
 # readiness gating (issue #12): STARTING vs SERVING vs down

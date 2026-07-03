@@ -77,6 +77,50 @@ which may expose multiple tensors (e.g., multi-field).
 | `GetFlightInfo` | Returns chunk endpoints for a specific tensor, respecting `SliceHint` and `TensorReadOptions` in the descriptor. Also fills `TensorDescriptor.pyramid` — the **server-advertised** resolution levels (see below) — and `metadata_json` when requested |
 | `DoGet` | Fetches a single chunk identified by a `TensorTicket`; reads from the adapter and returns a `RecordBatch` stream |
 
+Custom `do_action` verbs extend these: `health`, `create_source`,
+`upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`, and
+`add_source` (below).
+
+#### Runtime source registration (`add_source`)
+
+The `add_source` Flight action registers an existing path on the **server's**
+filesystem as a served source at runtime, without editing config or restarting —
+the wire entrypoint behind the napari tensor-browser's drag-and-drop. It routes
+the dropped path through the same claim → adapter → catalog pipeline the
+directory watcher uses (`SourceManager.add_local_source`), so a dropped file or
+dataset-dir registers one source and a plain folder is walked recursively and may
+register several. The `TensorFlightServer` holds no `SourceManager` reference, so
+the launcher injects the entrypoint via `set_add_source_handler(...)`.
+
+- **Streaming.** A directory walk has no known size up front, so the action
+  streams `AddSourceStreamMessage` (zero or more `AddSourceProgress` heartbeats —
+  a running *count* of sources registered, not a percentage — then one terminal
+  `AddSourceResult` carrying `added` / `already_present` / `failed(path, reason)`
+  / `needs_confirm_large`). The client can cancel by closing the stream; the walk
+  stops but everything already registered stays (non-destructive).
+- **Single-writer safety.** `add_local_source` runs inline on the Flight handler
+  thread but under `SourceManager._catalog_lock`, which the periodic rescan also
+  holds — so the two never mutate the confirmed catalog at once. Discovery runs
+  into a scratch `DiscoveryState`; only committed claims touch the confirmed
+  catalog.
+- **Dedup & containment.** Re-dropping the exact same path is an upsert reported
+  as `already_present` (deterministic `source_id`). Dropping a path **inside** an
+  existing source is rejected (`_find_containing_source`, "already part of …") —
+  the exact-member dedup in `DiscoveryState.add_claim` does not catch nesting
+  because dir sources record only the directory as a member. Dropping a **parent**
+  of existing sources re-discovers them (same id → `already_present`) and adds new
+  siblings. A plain-directory drop above `_ADD_SOURCE_LARGE_DIR_THRESHOLD` entries
+  is declined with `needs_confirm_large` until the client retries with
+  `confirm_large=True`.
+- **Locality.** Runtime add is local-path only (a remote URL raises); the client
+  gate additionally enables the drop UI only against a localhost server, since a
+  dropped path is a client-side filesystem path.
+- **Security.** The action is token-gated by the Flight auth middleware and, being
+  a catalog mutation that exposes any server-readable path, is guarded by
+  `TensorFlightServer._allow_runtime_source_add` (defaults **on**; a hardened
+  read-only deployment can turn it off). It is *not* gated on write mode
+  (`_writable`) — a normal read-only server still registers dropped local files.
+
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 
 The server decides the resolution pyramid, rather than the client computing one

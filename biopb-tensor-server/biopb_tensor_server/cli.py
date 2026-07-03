@@ -423,6 +423,11 @@ def _setup_flight_server(
         console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
+    # Wire the runtime add_source handler (tensor-browser drag-drop): the server
+    # holds no SourceManager reference, so inject the entrypoint that routes a
+    # dropped path into the same claim -> adapter -> catalog pipeline.
+    server.set_add_source_handler(source_manager.add_local_source)
+
     # Note: the metadata DB is already populated at this point. Static sources
     # are seeded via SourceManager._commit_add_claim -> _register_source_claim
     # (which syncs each), and monitored sources stream in through the background

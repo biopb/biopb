@@ -20,11 +20,15 @@ import threading
 import time
 from math import ceil
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
+    AddSourceProgress,
+    AddSourceRequest,
+    AddSourceResult,
+    AddSourceStreamMessage,
     FlightCmd,
     PyramidLevel,
     ResolveProgress,
@@ -242,6 +246,18 @@ class TensorFlightServer(flight.FlightServerBase):
         self._full_scan_in_progress = False
         self._last_full_scan_at: Optional[float] = None
 
+        # Runtime source registration (the "add_source" Flight action / tensor-
+        # browser drag-drop). The SourceManager injects its ``add_local_source``
+        # generator via ``set_add_source_handler`` at launch (the server holds no
+        # SourceManager reference otherwise). ``None`` means the feature is
+        # unavailable (e.g. a server with no source manager); the action then
+        # reports a clear error. Distinct from ``_writable`` (upload mode): a
+        # normal read-only server still registers dropped local files, so this
+        # gates on its own flag defaulting on -- a hardened deployment can set it
+        # off to refuse runtime path registration.
+        self._add_source_handler: Optional[Callable[..., Any]] = None
+        self._allow_runtime_source_add = True
+
     @contextlib.contextmanager
     def _serving_request(self):
         """Mark a heavy read in flight for its duration (precache idle signal)."""
@@ -295,6 +311,16 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         with self._scan_status_lock:
             self._last_full_scan_at = float(timestamp)
+
+    def set_add_source_handler(self, handler: Optional[Callable[..., Any]]) -> None:
+        """Wire the SourceManager's ``add_local_source`` for the add_source action.
+
+        The server holds no SourceManager reference; the launcher injects the
+        handler here so the ``add_source`` Flight action can route a dropped path
+        into the claim -> adapter -> catalog pipeline. ``None`` leaves the action
+        reporting "not enabled".
+        """
+        self._add_source_handler = handler
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -586,6 +612,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "warm",
                 "Hydrate-ahead: recall a resolved cloud source's member files server-side",
             ),
+            flight.ActionType(
+                "add_source",
+                "Register a local path/dir as a served source at runtime (streams progress)",
+            ),
         ]
 
     def do_action(
@@ -653,6 +683,9 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id = action.body.to_pybytes().decode("utf-8")
             self._authorize_source(context, source_id)
             yield from self._handle_warm(source_id, context)
+        elif action.type == "add_source":
+            req = AddSourceRequest.FromString(action.body.to_pybytes())
+            yield from self._handle_add_source(req, context)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -906,6 +939,63 @@ class TensorFlightServer(flight.FlightServerBase):
         finally:
             with self._activity_lock:
                 self._warming.discard(source_id)
+
+    def _handle_add_source(
+        self, req: AddSourceRequest, context: flight.ServerCallContext
+    ) -> Iterator[bytes]:
+        """Stream registration of a runtime-added local path (drag-drop).
+
+        Wraps the SourceManager's ``add_local_source`` generator: each event
+        tuple it yields is mapped onto an ``AddSourceStreamMessage`` (zero or
+        more ``progress`` heartbeats, then one terminal ``result``). A dropped
+        directory can register several sources, so this streams -- a client shows
+        rows appearing and can cancel (the stream closing sets is_cancelled(),
+        which stops discovery while keeping what is already registered).
+
+        Whole-request failures (path not found / unreadable, or a remote URL)
+        raise from the generator on first iteration and are mapped to a
+        FlightServerError so the client surfaces a clean message.
+        """
+        if not self._allow_runtime_source_add or self._add_source_handler is None:
+            raise flight.FlightServerError(
+                "Runtime source registration is not enabled on this server."
+            )
+
+        def _should_cancel() -> bool:
+            return context.is_cancelled()
+
+        try:
+            events = self._add_source_handler(
+                req.url,
+                source_type=req.source_type,
+                dim_labels=list(req.dim_labels),
+                monitor=req.monitor,
+                confirm_large=req.confirm_large,
+                should_cancel=_should_cancel,
+            )
+            for event in events:
+                kind = event[0]
+                if kind == "progress":
+                    _, added_count, current_path, descriptor = event
+                    progress = AddSourceProgress(
+                        added_count=added_count,
+                        current_path=current_path or "",
+                    )
+                    if descriptor is not None:
+                        progress.last_added.CopyFrom(descriptor)
+                    yield AddSourceStreamMessage(progress=progress).SerializeToString()
+                else:  # "result"
+                    _, added, already_present, failed, needs_confirm_large = event
+                    result = AddSourceResult(
+                        already_present=already_present,
+                        needs_confirm_large=needs_confirm_large,
+                    )
+                    result.added.extend(d for d in added if d is not None)
+                    for path, reason in failed:
+                        result.failed.add(path=path, reason=reason)
+                    yield AddSourceStreamMessage(result=result).SerializeToString()
+        except (FileNotFoundError, PermissionError, ValueError) as exc:
+            raise flight.FlightServerError(str(exc)) from exc
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes

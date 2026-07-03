@@ -19,10 +19,13 @@ from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 from biopb_tensor_server.config import SourceConfig
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
+    ClaimContext,
     DiscoveryState,
     SourceClaim,
     _is_offline_placeholder,
+    discover_sources,
     discover_sources_from_entries,
+    generate_source_id,
     get_file_identity,
     is_remote_url,
     should_skip_walk_entry,
@@ -46,6 +49,18 @@ logger = logging.getLogger(__name__)
 # 30s rescan tick (instead of querying it every 30s forever).
 _UPSTREAM_RELIST_MAX_TICKS = 120
 
+# Runtime source add (the "add_source" Flight action / tensor-browser drag-drop).
+# A plain-directory drop with more than this many entries is declined until the
+# client re-requests with confirm_large=True, so a user who drops a huge or
+# high-level folder gets a chance to reconsider before the recursive walk. The
+# count short-circuits at the threshold, so it is cheap even for enormous trees.
+_ADD_SOURCE_LARGE_DIR_THRESHOLD = 2000
+
+# While add_local_source waits for the catalog lock (a rescan is mid-flight), it
+# emits a heartbeat this often so the streamed action does not sit silent long
+# enough to trip a proxy idle read timeout.
+_ADD_SOURCE_ACQUIRE_HEARTBEAT = 5.0
+
 # Hard backstop against unbounded recursion in the rescan walk. visited_identities
 # breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
 # identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
@@ -54,6 +69,40 @@ _UPSTREAM_RELIST_MAX_TICKS = 120
 # cap turns any such loop into a bounded, logged skip. Real microscopy trees are far
 # shallower (rarely past ~10 levels), so this only ever fires on a pathological loop.
 _MAX_WALK_DEPTH = 64
+
+
+def _drop_catalog_url(dropped_root: str, primary_path: str) -> str:
+    """Catalog ``source_url`` that re-roots a drag-dropped source under the
+    dropped item's basename.
+
+    The tensor-browser (and the web viewer) build their tree by splitting each
+    source's ``source_url`` on ``/`` — so a source's first path component is its
+    top-level root. A dropped file's real path (``/home/u/data/exp/a.tif``) would
+    otherwise nest it deep inside the shared absolute-path tree; re-rooting it at
+    the dropped item's basename makes each drop its own root instead:
+
+        drop /home/u/data/exp.zarr           -> "exp.zarr"          (own root)
+        drop /home/u/data/exp/ (a folder) with
+             .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
+
+    Display-only: this feeds the descriptor's ``source_url`` (never ``source_id``,
+    which hashes the raw path, nor the raw ``_source_url`` the filesystem uses), so
+    it is safe to be a bare virtual path with no scheme. Not durable against a
+    later rescan for a drop under a *monitored* root — the watcher re-discovers it
+    with its native absolute url and it re-merges into the shared tree (accepted;
+    see the design note / issue for the durable-flag alternative).
+    """
+    dropped_root = str(dropped_root).rstrip("/\\")
+    base = os.path.basename(dropped_root) or dropped_root
+    try:
+        rel = os.path.relpath(str(primary_path), dropped_root).replace("\\", "/")
+    except ValueError:  # different drive on Windows, etc. -- can't relativize
+        rel = "."
+    if rel in (".", "") or rel.startswith("../"):
+        # The dropped item is itself the source (single file / dataset dir), or
+        # (defensively) the source is not under it -- keep the drop as one root.
+        return base
+    return f"{base}/{rel}"
 
 
 @dataclass
@@ -159,6 +208,14 @@ class SourceManager:
         # Rescan/reconcile helpers may re-enter other state-mutating helpers.
         # Use an RLock so nested calls on the same thread do not deadlock.
         self._lock = threading.RLock()
+
+        # Coarse mutex serializing a *whole* catalog-mutation pass. The periodic
+        # rescan (event-loop thread) and a runtime ``add_local_source`` (a Flight
+        # handler thread) are the only two flows that discover + commit sources;
+        # holding this across each keeps the confirmed catalog single-writer
+        # without threading add_source through the event loop. Distinct from
+        # ``self._lock`` (the fine-grained state RLock ``_commit_add_claim`` takes).
+        self._catalog_lock = threading.Lock()
 
         # Path tracking for move handling
         # Maps resolved path -> source_id (str keys for URL support)
@@ -312,20 +369,23 @@ class SourceManager:
         mirror it registers is startup set and must route to the slow backlog. We
         suppress the live enqueue across just that re-list.
         """
-        startup_tick = not self._initial_scan_done
-        self._rescan_monitored_dirs()
-        # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
-        # cadence -- fast (every tick) while changing/failing, backing off toward
-        # full_rescan_interval while a source set stays stable. Runs AFTER the
-        # local walk (see docstring).
-        if startup_tick:
-            self._suppress_live_precache = True
-            try:
+        # Serialize the whole pass against a concurrent runtime add_local_source
+        # (Flight thread) so the two never mutate the confirmed catalog at once.
+        with self._catalog_lock:
+            startup_tick = not self._initial_scan_done
+            self._rescan_monitored_dirs()
+            # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
+            # cadence -- fast (every tick) while changing/failing, backing off toward
+            # full_rescan_interval while a source set stays stable. Runs AFTER the
+            # local walk (see docstring).
+            if startup_tick:
+                self._suppress_live_precache = True
+                try:
+                    self._reconcile_due_upstreams()
+                finally:
+                    self._suppress_live_precache = False
+            else:
                 self._reconcile_due_upstreams()
-            finally:
-                self._suppress_live_precache = False
-        else:
-            self._reconcile_due_upstreams()
 
     def _rescan_monitored_dirs(self) -> None:
         """Walk the monitored directories and reconcile the discovered catalog.
@@ -1237,14 +1297,21 @@ class SourceManager:
         self._commit_add_claim(claim)
 
     def _commit_add_claim(
-        self, claim: SourceClaim, catalog_seed: Optional[tuple] = None
+        self,
+        claim: SourceClaim,
+        catalog_seed: Optional[tuple] = None,
+        catalog_url: Optional[str] = None,
     ) -> bool:
         """Register a discovered source, then commit it into confirmed state.
 
         ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
-        remote bulk-seed); ``None`` for local sources.
+        remote bulk-seed); ``None`` for local sources. ``catalog_url`` overrides the
+        descriptor's display ``source_url`` (drag-drop re-rooting, see
+        ``_drop_catalog_url``); ``None`` for the discovery/watcher path.
         """
-        if not self._register_source_claim(claim, catalog_seed=catalog_seed):
+        if not self._register_source_claim(
+            claim, catalog_seed=catalog_seed, catalog_url=catalog_url
+        ):
             self._record_failed_source_attempt(claim.source_id)
             return False
 
@@ -1690,8 +1757,208 @@ class SourceManager:
                     "metadata-DB backfill failed for resolved source %s", source_id
                 )
 
+    def add_local_source(
+        self,
+        url: str,
+        source_type: str = "",
+        dim_labels: Optional[List[str]] = None,
+        monitor: bool = False,
+        confirm_large: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ):
+        """Register ``url`` (a path on the server) as source(s) at runtime.
+
+        Generator, driving the "add_source" Flight action / tensor-browser
+        drag-drop. It yields event tuples the caller maps onto the wire:
+
+        - ``("progress", added_count, current_path, descriptor)`` -- one per
+          source as it registers (``descriptor`` is a ``DataSourceDescriptor``),
+        - ``("result", added, already_present, failed, needs_confirm_large)`` --
+          exactly one terminal tally (``added`` is a list of descriptors,
+          ``already_present`` a list of source_ids, ``failed`` a list of
+          ``(path, reason)``).
+
+        The walk + commit run inline on the CALLING (Flight handler) thread, but
+        under ``self._catalog_lock`` -- so they are mutually exclusive with the
+        periodic rescan and the confirmed catalog stays single-writer. A dropped
+        directory that is not itself a dataset is walked recursively and may
+        register several sources; discovery runs into a scratch state so it never
+        mutates the confirmed ``self._state`` until a claim is committed.
+
+        ``should_cancel()`` is polled between sources: a cancel stops discovery
+        but KEEPS everything already committed (registration is not rolled back).
+
+        Whole-request problems raise before the first yield:
+        ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
+        ``ValueError`` (remote URL -- runtime add is local-only for now).
+        """
+        if is_remote_url(url):
+            raise ValueError(
+                "Runtime source add supports local filesystem paths only; "
+                f"got remote URL: {url}"
+            )
+
+        # Server-side locality/existence check (belt-and-suspenders; the client
+        # already gated on a localhost server, which shares this filesystem).
+        real = os.path.realpath(url)
+        if not os.path.exists(real):
+            raise FileNotFoundError(f"Path not found on server: {url}")
+        if not os.access(real, os.R_OK):
+            raise PermissionError(f"Path not readable by the server: {url}")
+        url = real
+        is_dir = os.path.isdir(url)
+
+        added: List[Any] = []
+        already_present: List[str] = []
+        failed: List[Tuple[str, str]] = []
+
+        # Acquire the catalog lock, heart-beating while a rescan holds it so a
+        # long wait does not sit silent long enough to trip a proxy timeout.
+        while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
+            yield ("progress", 0, "waiting for catalog scan to finish", None)
+        try:
+            # Containment check (case 4): if a STRICT ancestor of the drop is
+            # already owned by a source, the drop is *inside* that source. The
+            # exact-path member dedup in DiscoveryState.add_claim does not catch
+            # this (dir sources record only the dir as a member), so reject here.
+            owner = self._find_containing_source(url)
+            if owner is not None:
+                failed.append((url, f"already part of source '{owner}'"))
+                yield ("result", added, already_present, failed, False)
+                return
+
+            # Is the dropped path itself a dataset (single claim), or a plain
+            # folder to recurse into? Probe the root once against a scratch state.
+            scratch = DiscoveryState()
+            root_claims = self._registry.get_claims_for_path(
+                ClaimContext(Path(url)), scratch
+            )
+            if root_claims:
+                claims: List[SourceClaim] = [root_claims[0]]
+            elif is_dir:
+                # Large-scan guard (case 5) before the recursive walk.
+                if not confirm_large and self._dir_exceeds_scan_threshold(url):
+                    yield ("result", [], [], [], True)
+                    return
+                discover_sources(
+                    Path(url),
+                    self._registry,
+                    scratch,
+                    dim_labels=dim_labels,
+                )
+                claims = list(scratch.claims.values())
+            else:
+                claims = []
+
+            if not claims:
+                reason = (
+                    "no supported datasets found under directory"
+                    if is_dir
+                    else "not a recognized image format"
+                )
+                failed.append((url, reason))
+                yield ("result", added, already_present, failed, False)
+                return
+
+            # Assign identity to every claim up front so the overlap check below
+            # can see the whole drop before any of it is committed.
+            for claim in claims:
+                if source_type:
+                    claim.source_type = source_type
+                if dim_labels:
+                    claim.dim_labels = list(dim_labels)
+                if not claim.source_id:
+                    claim.source_id = generate_source_id(
+                        str(claim.primary_path), claim.source_type
+                    )
+
+            # Re-root the drop into its own browser tree root only when it is
+            # ENTIRELY NEW. If any claim is already registered, this drop is a
+            # rescan of a location already represented in the tree -- e.g. a
+            # monitor=false config dir dropped to pick up new files -- so keep the
+            # native source_url on the new siblings. Re-rooting them instead would
+            # split that one dir's old and new contents across two roots with
+            # nothing to reconcile them (a monitor=false dir never rescans).
+            with self._lock:
+                reroot = not any(
+                    claim.source_id in self._state.claims for claim in claims
+                )
+
+            for claim in claims:
+                with self._lock:
+                    already = claim.source_id in self._state.claims
+                if already:
+                    already_present.append(claim.source_id)
+                else:
+                    catalog_url = (
+                        _drop_catalog_url(url, claim.primary_path) if reroot else None
+                    )
+                    if self._commit_add_claim(claim, catalog_url=catalog_url):
+                        desc = self._descriptor_for(claim.source_id)
+                        added.append(desc)
+                        yield (
+                            "progress",
+                            len(added),
+                            str(claim.primary_path),
+                            desc,
+                        )
+                    else:
+                        failed.append(
+                            (
+                                str(claim.primary_path),
+                                "could not open or register (see server log)",
+                            )
+                        )
+
+                if should_cancel is not None and should_cancel():
+                    break
+
+            # Track a dropped directory root for live monitoring if requested, so
+            # later changes under it are picked up by the periodic rescan.
+            if monitor and is_dir:
+                self._monitored_dirs.add(Path(url))
+
+            yield ("result", added, already_present, failed, False)
+        finally:
+            self._catalog_lock.release()
+
+    def _find_containing_source(self, path: str) -> Optional[str]:
+        """Return the source_id owning a strict ancestor of ``path``, else None.
+
+        Used by ``add_local_source`` to reject a drop that lands inside an
+        already-registered source (case 4). Only strict ancestors count -- an
+        exact re-drop of a source's own path is handled as ``already_present``.
+        """
+        p = Path(os.path.realpath(path))
+        with self._lock:
+            for ancestor in p.parents:
+                owner = self._state.path_to_source.get(str(ancestor))
+                if owner is not None:
+                    return owner
+        return None
+
+    def _dir_exceeds_scan_threshold(self, path: str) -> bool:
+        """True if ``path`` holds more than the large-drop entry threshold.
+
+        Short-circuits at the threshold, so it stays cheap on an enormous tree.
+        """
+        count = 0
+        for _root, dirs, files in os.walk(path):
+            count += len(dirs) + len(files)
+            if count > _ADD_SOURCE_LARGE_DIR_THRESHOLD:
+                return True
+        return False
+
+    def _descriptor_for(self, source_id: str):
+        """Fetch the registered source's DataSourceDescriptor (None if missing)."""
+        adapter = self._server._get_source_adapter(source_id)
+        return adapter.get_source_descriptor() if adapter is not None else None
+
     def _register_source_claim(
-        self, claim: SourceClaim, catalog_seed: Optional[tuple] = None
+        self,
+        claim: SourceClaim,
+        catalog_seed: Optional[tuple] = None,
+        catalog_url: Optional[str] = None,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
 
@@ -1699,7 +1966,9 @@ class SourceManager:
         ``(tensors, metadata, data_resident)`` tuple from a bulk upstream
         ``query_sources``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
-        upstream RPC.
+        upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
+        ``source_url`` on the adapter *before* register/sync so both ListFlights
+        and the metadata DB record the re-rooted url.
         """
         try:
             source_config = SourceConfig(
@@ -1754,6 +2023,11 @@ class SourceManager:
                 exc_info=True,
             )
             return False
+
+        # Drag-drop re-rooting: stamp the display-only source_url override before
+        # register/sync so ListFlights and the metadata-DB row both carry it.
+        if catalog_url:
+            adapter._catalog_url = catalog_url
 
         registered = False
         try:
