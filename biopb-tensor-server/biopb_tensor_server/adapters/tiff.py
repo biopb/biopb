@@ -61,14 +61,12 @@ def _filter_tiff_candidates(files: List[Path], exclude_ome: bool = True) -> List
     return [f for f in files if not any(f.match(p) for p in _TIFF_EXCLUDE_PATTERNS)]
 
 
-# Minimum number of TIFFs for a directory to be *claimed* as a stacked sequence.
-# Below this the directory is left to per-file fallback (each TIFF a source of its
-# own): a handful of TIFFs in a folder is far more often a few unrelated images
-# than a genuine sequence, and welding them costs more than it helps. A real
-# sequence -- a time-lapse, a channel/site sweep, a page-split stack -- runs to
-# dozens of frames, so the floor is set well above "a few". Claim-time only; the
-# resolve path (__init__) imposes no such floor, so an explicitly-configured
-# small sequence still opens (see _MIN_PATTERN_FILES).
+# Minimum TIFFs for a directory to be *claimed* as a stacked sequence; below it
+# each TIFF falls back to its own source. Set purposefully high to avoid
+# false-positives: a wrong claim prunes the subtree and can leave the data
+# unreadable, whereas a false-negative degrades gracefully to per-file sources.
+# Claim-time only -- an explicitly-configured small sequence still opens at
+# resolve (see _MIN_PATTERN_FILES).
 _MIN_TIFF_FILES = 30
 
 
@@ -102,31 +100,26 @@ def _natural_key(name: str) -> List[Tuple[int, Any]]:
     ]
 
 
-# A claimed directory should look like a *coherent* set of related files, not an
-# incidental grab-bag of unrelated TIFFs that merely share a directory (and, after
-# shape-bucketing, a pixel size). Stack-all (#215) stopped parsing what the
-# filename fields *mean* -- that is the agent's job -- but "is this a dataset at
-# all?" is still the adapter's call, so we keep a cheap, filename-only coherence
-# gate. Two signals, either sufficient:
-#   (a) one digit-template (mask) shared by >=90% of the names -- catches numbered
-#       sequences including short stems like ``a1/a2/a3`` whose common prefix is
-#       tiny;
-#   (b) a non-trivial common stem (prefix) shared by >=90% -- catches sets that
-#       vary by a token rather than a number, e.g. ``sp_0001_{red,green,blue}``
-#       or MetaMorph ``..._w1DIC_.. / .._w2GFP_..``.
-# The bar is a large super-majority, not a bare 50%+1: a real sequence is almost
-# entirely one pattern, and requiring near-uniformity keeps a few stray TIFFs
-# dropped alongside a true sequence from dragging an unrelated grab-bag in with
-# it. A bare, no-number, no-stem set (``red/green/blue.tif``) is indistinguishable
-# from a grab-bag by filename alone, so it is left to per-file fallback -- a
-# graceful miss, never a wrong tensor.
+# Filename-only coherence gate: does a directory hold a *coherent* set of related
+# files, or an incidental grab-bag? It does not parse what the filename fields
+# *mean* (the agent's job) -- only whether the set hangs together. Two signals,
+# either sufficient:
+#   (a) one digit-template (mask) shared by >=_COHERENT_FRACTION of the names --
+#       catches numbered sequences, incl. tiny stems like ``a1/a2/a3``;
+#   (b) a non-trivial common stem shared by >=_COHERENT_FRACTION -- catches sets
+#       varying by a token, e.g. ``sp_0001_{red,green,blue}`` or MetaMorph
+#       ``.._w1DIC_.. / .._w2GFP_..``.
+# The threshold is a near-total super-majority because a real sequence is almost
+# entirely one pattern; this stops a few strays from dragging an unrelated set in.
+# A bare no-number/no-stem set (``red/green/blue.tif``) is indistinguishable from a
+# grab-bag by filename alone, so it is left to per-file fallback.
 _MIN_STEM = 3  # chars; a shorter shared prefix is too weak to imply coherence
 _COHERENT_FRACTION = 0.9  # share of names that must fit one mask/stem to cohere
 
 # Floor for the pattern check itself, distinct from the claim floor
-# (_MIN_TIFF_FILES): below a few names a shared mask/stem is trivially satisfied
-# and says nothing. This governs the resolve-time gate on the stacked subset,
-# where an explicitly-configured small sequence must still be allowed to open.
+# (_MIN_TIFF_FILES): under a few names a shared mask/stem is trivially met and
+# means nothing. Governs the resolve-time gate, so an explicitly-configured small
+# sequence can still open.
 _MIN_PATTERN_FILES = 3
 
 
@@ -499,17 +492,14 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
             buckets.items(), key=lambda kv: (len(kv[1]), kv[0])
         )
 
-        # Coherence gate at resolve too (mirrors claim()): the stacked members
-        # must look like a related set, not an incidental grab-bag. Filename-only;
-        # this is the one mismatch normalization can't fix, so unlike dtype/shape
-        # it raises rather than stacking nonsense. Split the message: when the
-        # directory fragmented by page count (or an unreadable file), members is
-        # only the dominant subset -- so the subset may be too small to stack even
-        # though the *whole directory's* filenames cohere. Blame the page-count
-        # split only in that case; gate on the coherence of ALL files (not the
-        # subset), so the "filenames do cohere" claim is never made about a genuine
-        # grab-bag that merely happens to have mixed page counts (an explicit-config
-        # source skips the claim-time coherence check, so it can reach here).
+        # Coherence gate at resolve too (mirrors claim()): the stacked members must
+        # look like a related set. Filename-only; the one mismatch normalization
+        # can't fix, so it raises rather than stack nonsense. Two messages: if the
+        # whole directory's names cohere but a page-count split (or an unreadable
+        # file) left the dominant subset too small, blame the split; otherwise blame
+        # the names. Gate the page-count message on the coherence of ALL files (not
+        # the subset), so it is never claimed for a grab-bag with mixed page counts
+        # -- reachable because an explicit-config source skips the claim-time gate.
         if not _looks_like_tiff_sequence([p.name for p in members]):
             names_cohere = _looks_like_tiff_sequence([p.name for p in all_tiffs])
             if (len(buckets) > 1 or unreadable) and names_cohere:
