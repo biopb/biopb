@@ -502,12 +502,17 @@ class TiffSequenceAdapter(SourceAdapter, TensorAdapter):
         # Coherence gate at resolve too (mirrors claim()): the stacked members
         # must look like a related set, not an incidental grab-bag. Filename-only;
         # this is the one mismatch normalization can't fix, so unlike dtype/shape
-        # it raises rather than stacking nonsense. Split the message: if the
+        # it raises rather than stacking nonsense. Split the message: when the
         # directory fragmented by page count (or an unreadable file), members is
-        # only the dominant subset -- the names may cohere while the subset is too
-        # small to stack, so blame the page-count split, not the filenames.
+        # only the dominant subset -- so the subset may be too small to stack even
+        # though the *whole directory's* filenames cohere. Blame the page-count
+        # split only in that case; gate on the coherence of ALL files (not the
+        # subset), so the "filenames do cohere" claim is never made about a genuine
+        # grab-bag that merely happens to have mixed page counts (an explicit-config
+        # source skips the claim-time coherence check, so it can reach here).
         if not _looks_like_tiff_sequence([p.name for p in members]):
-            if len(buckets) > 1 or unreadable:
+            names_cohere = _looks_like_tiff_sequence([p.name for p in all_tiffs])
+            if (len(buckets) > 1 or unreadable) and names_cohere:
                 bucket_summary = ", ".join(
                     f"{len(v)} file(s)x{k}pg"
                     for k, v in sorted(

@@ -365,6 +365,35 @@ class TestTiffSequenceStackAll:
             assert "page-count group" in msg  # names the real cause
             assert "do not look like one sequence" not in msg  # not a name complaint
 
+    def test_init_grab_bag_with_page_split_blames_names_not_pages(self):
+        """The page-count message must not be given to a genuine grab-bag that
+        merely happens to have mixed page counts: the '...filenames do cohere...'
+        claim would be false. An explicit-config source skips the claim-time
+        coherence check, so unrelated names can reach resolve; the branch is gated
+        on the coherence of ALL files, so this gets the filename complaint, not the
+        page-count one."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Unrelated names (no shared mask or stem), and mixed page counts so
+            # the directory also fragments into >1 page-count bucket.
+            for name, pages in (
+                ("logo.tif", 1),
+                ("photo.tif", 1),
+                ("banner.tif", 1),
+                ("chart.tif", 2),
+                ("diagram.tif", 3),
+            ):
+                tifffile.imwrite(
+                    str(Path(tmpdir) / name),
+                    np.zeros((pages, 8, 8), np.uint16),
+                    photometric="minisblack",
+                )
+
+            with pytest.raises(ValueError) as excinfo:
+                TiffSequenceAdapter(str(tmpdir), "sid")
+            msg = str(excinfo.value)
+            assert "do not look like one sequence" in msg  # honest name complaint
+            assert "page-count group" not in msg  # no false coherence claim
+
     def test_same_shape_sibling_is_stacked_and_listed(self):
         """A same-shape digit-less sibling (e.g. readme.tif) is physically
         stackable, so it IS stacked -- and visible in metadata for the agent to
