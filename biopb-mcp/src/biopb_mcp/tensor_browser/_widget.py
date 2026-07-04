@@ -308,9 +308,11 @@ def _dir_exceeds_entry_threshold(path: str) -> bool:
     """True if *path* is a directory holding more than the large-drop threshold.
 
     A non-directory (a single file/dataset) is never "large". Short-circuits at
-    the threshold, so it stays cheap even on an enormous tree. Any walk error
-    (permission, race) is treated as "not large" — the server-side walk is the
-    real gate; this is only the confirm prompt.
+    the threshold, so it stays cheap even on an enormous tree. This is the only
+    size gate on a drop — the server does not re-check it (a direct SDK caller
+    passing a path is trusted as explicit intent) — so a walk error (permission,
+    race) is treated as "not large" and the drop proceeds unconfirmed rather
+    than being blocked.
     """
     if not os.path.isdir(path):
         return False

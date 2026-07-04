@@ -28,6 +28,7 @@ from biopb_tensor_server.discovery import (
     generate_source_id,
     get_file_identity,
     is_remote_url,
+    resolve_local_path,
     should_skip_walk_entry,
 )
 from biopb_tensor_server.watcher import (
@@ -1791,7 +1792,7 @@ class SourceManager:
 
         # Server-side locality/existence check (belt-and-suspenders; the client
         # already gated on a localhost server, which shares this filesystem).
-        real = os.path.realpath(url)
+        real = resolve_local_path(url)
         if not os.path.exists(real):
             raise FileNotFoundError(f"Path not found on server: {url}")
         if not os.access(real, os.R_OK):
@@ -1917,7 +1918,7 @@ class SourceManager:
         already-registered source (case 4). Only strict ancestors count -- an
         exact re-drop of a source's own path is handled as ``already_present``.
         """
-        p = Path(os.path.realpath(path))
+        p = Path(resolve_local_path(path))
         with self._lock:
             for ancestor in p.parents:
                 owner = self._state.path_to_source.get(str(ancestor))
@@ -2241,21 +2242,19 @@ def create_source_manager(
         # create_from_config.
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
-        # Store the *resolved* realpath of a local config path so its claim key
-        # matches what the containment guard and discovery dedup compare against
-        # -- both realpath the candidate path. Otherwise a source configured
-        # through a symlink/junction (e.g. /data/current -> /data/2026-07, or a
-        # Windows junction / mapped drive) keeps its raw path, so a drop *inside*
-        # it -- whose realpath differs -- evades the "already part of <source>"
-        # guard and double-registers. realpath is what both sides already use, so
-        # it also folds the Windows case / separator / 8.3 / UNC variants a plain
-        # normcase would not (os.path.realpath resolves reparse points on 3.8+).
-        # Monitored sources are resolved by the walk; this matches them. A remote
-        # URL is left verbatim -- is_remote_url is prefix-based, so a Windows
-        # drive letter (C:\...) is correctly treated as a local path.
+        # Store the canonical resolved form of a local config path (the same
+        # resolve_local_path the source_id hash, the containment guard, and the
+        # drop path all use) so its claim key compares equal to a drop that lands
+        # inside it. Otherwise a source configured through a symlink/junction
+        # (e.g. /data/current -> /data/2026-07, or a Windows junction / mapped
+        # drive) keeps its raw path, so a drop *inside* it -- whose resolved form
+        # differs -- evades the "already part of <source>" guard and double-
+        # registers. Monitored sources reach the same form via the walk's
+        # Path.resolve. A remote URL is left verbatim -- is_remote_url is
+        # prefix-based, so a Windows drive letter (C:\...) stays a local path.
         primary_path = source.url
         if not is_remote_url(source.url):
-            primary_path = os.path.realpath(source.url)
+            primary_path = resolve_local_path(source.url)
         claim = SourceClaim(
             source_type=source.type,
             primary_path=primary_path,  # resolved local path; remote URL verbatim

@@ -836,6 +836,25 @@ class DiscoveryState:
         return set(self.source_to_paths.get(source_id, set()))
 
 
+def resolve_local_path(path: str) -> str:
+    """Canonical absolute form of a LOCAL filesystem path.
+
+    The single canonicalizer for local-path identity across the server: the
+    ``source_id`` hash (``generate_source_id``) and -- in ``source_manager`` --
+    the drag-drop containment guard and the static-config seed all reduce a path
+    to this form, so the same physical location compares equal however it was
+    spelled (symlink / junction / mapped drive / 8.3 / case / trailing sep). The
+    monitored walk reaches the same form via ``Path.resolve`` on its root.
+    ``Path.resolve`` resolves reparse points on Python 3.8+, so it folds those on
+    Windows too.
+
+    Local paths only: a remote URL must NOT be passed here -- ``Path.resolve``
+    mangles the scheme (collapsing ``//`` and prepending the cwd); callers gate
+    on ``is_remote_url`` first.
+    """
+    return str(Path(path).resolve())
+
+
 def generate_source_id(url: str, source_type: str) -> str:
     """Generate deterministic unique source_id from URL.
 
@@ -859,8 +878,9 @@ def generate_source_id(url: str, source_type: str) -> str:
         # Hash the raw URL (trailing slashes stripped so "x.zarr" == "x.zarr/").
         key = url.rstrip("/")
     else:
-        # For local paths, resolve to absolute path for consistency.
-        key = str(Path(url).resolve())
+        # For local paths, resolve to the canonical absolute path so the same
+        # location hashes identically however it was spelled (resolve_local_path).
+        key = resolve_local_path(url)
 
     hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
     return f"{source_type}_{hash_hex}"
