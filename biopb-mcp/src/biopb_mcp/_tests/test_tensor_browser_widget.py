@@ -337,6 +337,24 @@ class TestRefreshFailure:
         assert "lost connection" in w._message_label.text().lower()
         assert "disconnected" in w._status_summary.text()
 
+    def test_render_error_does_not_mark_disconnected(self, widget):
+        w, conn, _workers = widget
+        # The server answered fine (refresh returned sources), but building the
+        # tree blows up -- a client-side bug, not a lost server. The connection
+        # must stay up and the indicator must not flip to disconnected; the
+        # error is reported without dropping the client (mark_disconnected is
+        # scoped to the re-list call, not the render).
+        conn.is_connected = True
+        conn.refresh.return_value = {"a": object()}
+        w._build_and_display_tree.side_effect = RuntimeError("render boom")
+
+        w._refresh()
+
+        conn.mark_disconnected.assert_not_called()
+        assert conn.is_connected
+        assert w._message_level == "error"
+        assert "lost connection" not in w._message_label.text().lower()
+
 
 class TestMessagePane:
     """The unified bottom pane's level + auto-clear lifecycle (biopb/biopb#312)."""

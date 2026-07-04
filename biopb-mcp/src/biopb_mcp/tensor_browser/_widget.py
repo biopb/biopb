@@ -1407,7 +1407,22 @@ class TensorBrowserWidget(QWidget):
 
         try:
             sources = self._conn.refresh()
+        except Exception:
+            # A failed re-list on a previously-"connected" server almost always
+            # means the server is gone. is_connected doesn't self-revalidate, so
+            # without this the status line would stay a stale "connected"; drop
+            # the client to make the indicator honest and steer the user to
+            # reconnect. Scoped to the re-list call itself -- a later tree-render
+            # error is a client-side bug, not a lost server, and must not nuke a
+            # live connection. Stopgap until a live health signal exists (#319).
+            self._conn.mark_disconnected("Lost connection to server")
+            self._show_error("Refresh failed — lost connection to server")
+            self._refresh_button.setEnabled(False)
+            self._update_status_summary()
+            logger.exception("Failed to refresh source list")
+            return
 
+        try:
             if not sources:
                 self._show_empty_state()
                 self._tree_widget.clear()
@@ -1419,18 +1434,12 @@ class TensorBrowserWidget(QWidget):
                 self._filter_input.setPlaceholderText("Search (SQL filter)")
             else:
                 self._filter_input.setPlaceholderText("Search sources...")
-
         except Exception:
-            # A failed re-list on a previously-"connected" server almost always
-            # means the server is gone. is_connected doesn't self-revalidate, so
-            # without this the status line would stay a stale "connected"; drop
-            # the client to make the indicator honest and steer the user to
-            # reconnect. Stopgap until a live health signal exists (#319).
-            self._conn.mark_disconnected("Lost connection to server")
-            self._show_error("Refresh failed — lost connection to server")
-            self._refresh_button.setEnabled(False)
-            self._update_status_summary()
-            logger.exception("Failed to refresh source list")
+            # The server answered; rendering the catalog is a client-side step,
+            # so a failure here is not a lost connection -- report it without
+            # dropping the client (the pre-#318 behavior for a render error).
+            self._show_error("Refresh failed")
+            logger.exception("Failed to display refreshed source list")
 
     def _on_sources_changed(self, sources):
         """Rebuild the tree after the background watcher re-lists (issue #44).
