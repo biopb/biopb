@@ -141,7 +141,9 @@ PY
 # (biopb/biopb#34). JSON generation is stdlib on both ends (json.dump), so the
 # old hand-rolled TOML escaping is gone.
 #
-# Usage: _write_server_config <out-json> <data-dir> [prior-config]
+# Usage: _write_server_config <out-json> <data-dir> <monitor:true|false> [prior-config]
+# <monitor> is the watch flag for the single source: "true" for a user data dir
+# (new files auto-register), "false" for the curated, static sample bundle.
 # When <prior-config> exists, its settings (server/cache/...) are loaded and
 # *preserved*; only the `sources` list is replaced with the chosen data dir, so
 # re-running with a new folder no longer discards the user's tuning. A prior
@@ -150,12 +152,12 @@ PY
 # falls back to fresh defaults. The caller retires the legacy TOML. Writes
 # atomically; returns non-zero on any error.
 _write_server_config() {
-    local out="$1" data_dir="$2" prior="${3:-}"
+    local out="$1" data_dir="$2" monitor="$3" prior="${4:-}"
     mkdir -p "$(dirname "$out")"
-    _py - "$out" "$data_dir" "$prior" <<'PY'
+    _py - "$out" "$data_dir" "$prior" "$monitor" <<'PY'
 import json, os, sys
 
-out, data_dir, prior = sys.argv[1], sys.argv[2], sys.argv[3]
+out, data_dir, prior, monitor = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 data = {}
 if prior and os.path.exists(prior):
@@ -188,15 +190,16 @@ if not isinstance(data, dict):
 data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
                            "aggressive_dir_pruning": True})
 data.setdefault("cache", {"backend": "file", "file_max_segment_mb": 256,
-                          "file_max_total_gb": 128})
+                          "file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):
     if md.get("enabled", True):
         md.pop("enabled", None)
     if md:
         data["metadata_db"] = md
-# Point the server at exactly one watched folder, replacing any prior sources.
-data["sources"] = [{"url": data_dir, "monitor": True}]
+# Point the server at exactly one folder, replacing any prior sources. The
+# sample bundle is static so it is not monitored; a user data dir is.
+data["sources"] = [{"url": data_dir, "monitor": monitor == "true"}]
 
 tmp = out + ".biopb.tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
@@ -1196,6 +1199,9 @@ install_biopb() {
     # and skips the samples. An empty DATA_DIR is the "keep existing" sentinel;
     # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
     local DATA_DIR
+    # Watch a user's own data dir (new files auto-register); leave the static
+    # sample bundle unmonitored.
+    local MONITOR="true"
     if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
         # Existing config, no override: keep it exactly as-is (upgrade fast path).
         DATA_DIR=""
@@ -1210,6 +1216,7 @@ install_biopb() {
     else
         # Fresh install, no override: seed samples and point the config at them.
         DATA_DIR="$SAMPLES_DIR"
+        MONITOR="false"
         _seed_samples "$SAMPLES_DIR"
         _ok "Data directory: $DATA_DIR (sample images)"
     fi
@@ -1224,7 +1231,7 @@ install_biopb() {
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
             exit 1
         fi
-        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$EXISTING_CONFIG"; then
+        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$MONITOR" "$EXISTING_CONFIG"; then
             _err "Failed to write config: $CONFIG_FILE"
             exit 1
         fi
@@ -1446,8 +1453,9 @@ Options:
                 biopb from detected AI agents, and remove the package
                 environment. Keeps config and cached data unless --purge.
   --purge       With --uninstall, also delete config and cached/state data
-                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb).
-                Implies --uninstall. Never touches your image data.
+                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb, and
+                the file cache under the temp dir). Implies --uninstall. Never
+                touches your image data.
   -h, --help    Show this help.
 EOF
 }
@@ -1501,6 +1509,38 @@ uninstall_biopb() {
     # only biopb's own dotfile dirs are removed, never any configured data dir.
     if [ "$purge" = "1" ]; then
         _step "Purging config and cached data..."
+
+        # The file-backend cache lives in the system temp dir (the tensor
+        # server's _default_file_cache_dir), NOT under ~/.local/share, so the
+        # dotfile sweep below misses it. Remove it best-effort: the per-user
+        # default location, plus any custom cache.file_cache_dir read from the
+        # config *before* we delete the config. The server was stopped in step 1,
+        # so its process lock is already released.
+        local cache_dirs=("${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/biopb-cache-$(id -u)")
+        local cfg="$HOME/.config/biopb/biopb.json"
+        if [ -f "$cfg" ]; then
+            local custom
+            custom="$(_py - "$cfg" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        p = (json.load(fh).get("cache") or {}).get("file_cache_dir")
+    if p:
+        print(p)
+except Exception:
+    pass
+PY
+)"
+            [ -n "$custom" ] && cache_dirs+=("$custom")
+        fi
+        local c
+        for c in "${cache_dirs[@]}"; do
+            if [ -e "$c" ]; then
+                rm -rf "$c" 2>/dev/null && _ok "Removed cache $c" \
+                    || _info "Could not remove cache $c (left in place)"
+            fi
+        done
+
         local d
         for d in \
             "$HOME/.config/biopb" \
@@ -1515,6 +1555,7 @@ uninstall_biopb() {
     else
         _info "Config and cached data were kept. Remove them with --purge, or:"
         _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+        _cmd "  rm -rf \"\${TMPDIR:-/tmp}/biopb-cache-\$(id -u)\"   # file cache"
     fi
 
     printf "\n%s%s=== biopb uninstalled ===%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
