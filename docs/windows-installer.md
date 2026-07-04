@@ -152,10 +152,10 @@ the engine's `Get-CloudRoots` does — OneDrive env vars (`%OneDrive%`,
 (`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`), then
 `%USERPROFILE%\iCloudDrive`. The env vars only name one business account, so the
 registry pass is what surfaces *every* signed-in OneDrive; when more than one is
-found the checkbox is paired with a dropdown to pick which root (#188). The
-console front-end gets
-the same cloud folders for free — `Get-DataDirCandidates` (in the engine) now
-offers them alongside the local/drive candidates. Either way the engine
+found the checkbox is paired with a dropdown to pick which root (#188). (The
+console installer no longer prompts for a data directory at all — a fresh install
+seeds samples with no question; only the *re-point* path, the GUI data-dir page
+or `BIOPB_DATA_DIR`, chooses a folder.) Either way the engine
 *auto-detects* cloud-ness from the chosen path (`Test-IsCloudPath`: any dir at or
 under a known cloud root), so browsing/typing a OneDrive path yields `cloud = true`
 even without the checkbox; `-Cloud` is just an explicit override for roots the
