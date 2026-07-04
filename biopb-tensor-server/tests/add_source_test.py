@@ -58,18 +58,13 @@ def _make_manager():
 
 
 def _drain(gen):
-    """Run an add_local_source generator to its terminal result tuple.
-
-    Returns ``(added, already, failed, needs_confirm)`` where ``needs_confirm``
-    is always False -- the large-scan guard is now a plain ``failed`` entry, not
-    a separate flag, but the 4-tuple shape is kept so existing callers/asserts
-    that unpack four values still read cleanly.
-    """
+    """Run an add_local_source generator to its terminal ``(added, already,
+    failed)`` result tuple."""
     added, already, failed = [], [], []
     for event in gen:
         if event[0] == "result":
             _, added, already, failed = event
-    return added, already, failed, False
+    return added, already, failed
 
 
 class TestAddLocalSource:
@@ -79,7 +74,7 @@ class TestAddLocalSource:
         manager, server = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
 
-        added, already, failed, _ = _drain(manager.add_local_source(zpath))
+        added, already, failed = _drain(manager.add_local_source(zpath))
 
         assert len(added) == 1 and not already and not failed
         sid = added[0].source_id
@@ -105,7 +100,7 @@ class TestAddLocalSource:
         _make_zarr(str(root), "a.zarr")
         _make_zarr(str(root), "b.zarr")
 
-        added, _, failed, _ = _drain(manager.add_local_source(str(root)))
+        added, _, failed = _drain(manager.add_local_source(str(root)))
 
         assert not failed
         urls = sorted(d.source_url for d in added)
@@ -125,7 +120,7 @@ class TestAddLocalSource:
         _drain(manager.add_local_source(a))
         # A new dataset lands, then the dir is dropped to force a rescan.
         _make_zarr(str(root), "b.zarr")
-        added, already, failed, _ = _drain(manager.add_local_source(str(root)))
+        added, already, failed = _drain(manager.add_local_source(str(root)))
 
         assert not failed and len(added) == 1  # only b.zarr is new
         assert len(already) == 1  # a.zarr already present
@@ -140,7 +135,7 @@ class TestAddLocalSource:
         added, *_ = _drain(manager.add_local_source(zpath))
         sid = added[0].source_id
 
-        added2, already2, failed2, _ = _drain(manager.add_local_source(zpath))
+        added2, already2, failed2 = _drain(manager.add_local_source(zpath))
 
         assert added2 == [] and already2 == [sid] and failed2 == []
 
@@ -152,7 +147,7 @@ class TestAddLocalSource:
         sub = os.path.join(zpath, "sub")
         os.makedirs(sub, exist_ok=True)
 
-        added, already, failed, _ = _drain(manager.add_local_source(sub))
+        added, already, failed = _drain(manager.add_local_source(sub))
 
         assert added == [] and len(failed) == 1
         assert "already part of" in failed[0][1]
@@ -165,31 +160,11 @@ class TestAddLocalSource:
         added1, *_ = _drain(manager.add_local_source(z1))
         sid1 = added1[0].source_id
 
-        added, already, failed, _ = _drain(manager.add_local_source(str(tmp_path)))
+        added, already, failed = _drain(manager.add_local_source(str(tmp_path)))
 
         assert len(added) == 1  # only b.zarr is new
         assert sid1 in already
         assert not failed
-
-    def test_large_dir_declined_as_failed_not_flagged(self, tmp_path):
-        """A directory over the large-scan threshold is declined outright with a
-        'directory too large' failure (no needs_confirm flag, no walk)."""
-        manager, _ = _make_manager()
-        big = tmp_path / "big"
-        big.mkdir()
-        _make_zarr(str(big), "a.zarr")  # a real dataset lives under it
-        # Force the threshold without materializing thousands of entries.
-        manager._dir_exceeds_scan_threshold = lambda _p: True
-
-        added, already, failed, needs_confirm = _drain(
-            manager.add_local_source(str(big))
-        )
-
-        assert added == [] and already == []
-        assert needs_confirm is False  # no separate confirm flag anymore
-        assert len(failed) == 1
-        assert failed[0][0] == os.path.realpath(str(big))
-        assert "too large" in failed[0][1]
 
     def test_empty_dir_reports_no_datasets(self, tmp_path):
         """Case 6: an empty folder gets a distinct 'no datasets' reason."""
@@ -197,7 +172,7 @@ class TestAddLocalSource:
         empty = tmp_path / "empty"
         empty.mkdir()
 
-        added, _, failed, _ = _drain(manager.add_local_source(str(empty)))
+        added, _, failed = _drain(manager.add_local_source(str(empty)))
 
         assert added == [] and len(failed) == 1
         assert "no supported datasets" in failed[0][1]
@@ -208,7 +183,7 @@ class TestAddLocalSource:
         junk = tmp_path / "notes.txt"
         junk.write_text("hello")
 
-        added, _, failed, _ = _drain(manager.add_local_source(str(junk)))
+        added, _, failed = _drain(manager.add_local_source(str(junk)))
 
         assert added == [] and len(failed) == 1
         assert "not a recognized" in failed[0][1]

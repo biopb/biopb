@@ -49,16 +49,6 @@ logger = logging.getLogger(__name__)
 # 30s rescan tick (instead of querying it every 30s forever).
 _UPSTREAM_RELIST_MAX_TICKS = 120
 
-# Runtime source add (the "add_source" Flight action / tensor-browser drag-drop).
-# A plain-directory drop with more than this many entries is declined outright
-# (a "directory too large" failure), so a user who drops a huge or high-level
-# folder does not kick off a runaway recursive walk that would also bloat the
-# catalog/browser -- they drop a subfolder, or add the root via config instead.
-# The count short-circuits at the threshold, so it is cheap even for enormous
-# trees. Note it counts filesystem *entries*, not resulting *sources*, so it is a
-# coarse footgun-stopper, not a precise cap on the catalog.
-_ADD_SOURCE_LARGE_DIR_THRESHOLD = 2000
-
 # While add_local_source waits for the catalog lock (a rescan is mid-flight), it
 # emits a heartbeat this often so the streamed action does not sit silent long
 # enough to trip a proxy idle read timeout.
@@ -1837,21 +1827,12 @@ class SourceManager:
             if root_claims:
                 claims: List[SourceClaim] = [root_claims[0]]
             elif is_dir:
-                # Large-scan guard (case 5): decline a huge/high-level folder
-                # outright rather than kicking off a runaway recursive walk. A
-                # plain failure (no modal, no retry) keeps the safety brake while
-                # leaving the user in control -- drop a subfolder, or add the root
-                # via config.
-                if self._dir_exceeds_scan_threshold(url):
-                    failed.append(
-                        (
-                            url,
-                            "directory too large to scan on drop -- drop a "
-                            "subfolder, or add it via the server config file",
-                        )
-                    )
-                    yield ("result", added, already_present, failed)
-                    return
+                # A plain folder is walked recursively (case 5). The large-drop
+                # footgun guard lives client-side (the tensor browser confirms
+                # before sending an oversized folder): drag-drop is localhost-only,
+                # so the client shares this filesystem and can size the tree before
+                # any scan is sent. A direct SDK caller passing a path is explicit
+                # intent, so the walk is not gated here.
                 discover_sources(
                     Path(url),
                     self._registry,
@@ -1948,18 +1929,6 @@ class SourceManager:
                 if owner is not None:
                     return owner
         return None
-
-    def _dir_exceeds_scan_threshold(self, path: str) -> bool:
-        """True if ``path`` holds more than the large-drop entry threshold.
-
-        Short-circuits at the threshold, so it stays cheap on an enormous tree.
-        """
-        count = 0
-        for _root, dirs, files in os.walk(path):
-            count += len(dirs) + len(files)
-            if count > _ADD_SOURCE_LARGE_DIR_THRESHOLD:
-                return True
-        return False
 
     def _descriptor_for(self, source_id: str):
         """Fetch the registered source's DataSourceDescriptor (None if missing)."""

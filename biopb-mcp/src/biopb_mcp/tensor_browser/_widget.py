@@ -296,6 +296,35 @@ class _WarmState:
     fraction: float | None = None
 
 
+# A dropped folder with more than this many filesystem entries prompts a
+# confirmation before the recursive scan is sent (a footgun-stopper for dropping
+# a home/root folder by mistake). Counted client-side: drag-drop is gated to a
+# localhost server, so the client shares the server's disk. Coarse on purpose --
+# it counts entries, not resulting sources.
+_LARGE_DROP_ENTRY_THRESHOLD = 2000
+
+
+def _dir_exceeds_entry_threshold(path: str) -> bool:
+    """True if *path* is a directory holding more than the large-drop threshold.
+
+    A non-directory (a single file/dataset) is never "large". Short-circuits at
+    the threshold, so it stays cheap even on an enormous tree. Any walk error
+    (permission, race) is treated as "not large" — the server-side walk is the
+    real gate; this is only the confirm prompt.
+    """
+    if not os.path.isdir(path):
+        return False
+    try:
+        count = 0
+        for _root, dirs, files in os.walk(path):
+            count += len(dirs) + len(files)
+            if count > _LARGE_DROP_ENTRY_THRESHOLD:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 class _AddSourceWorker(QThread):
     """Runs ``TensorConnection.add_source`` for one dropped path off the GUI thread.
 
@@ -309,9 +338,9 @@ class _AddSourceWorker(QThread):
     One drop == one path == one ``add_source`` call == one terminal result
     ``(added, already_present, failed)``. Multi-item drops are refused upstream
     (``_local_paths_from_mime``), so there is no cross-path aggregation here — a
-    single call keeps the progress count monotone. A directory dropped above the
-    server's large-scan threshold comes back as a ``failed`` entry (no modal, no
-    retry): the user drops a subfolder or adds the root via config.
+    single call keeps the progress count monotone. An oversized folder is caught
+    *before* this worker starts, by the widget's client-side confirm prompt
+    (``_confirm_large_drop``), so the walk only runs once the user has agreed.
     """
 
     progress = Signal(object)  # AddSourceProgress
@@ -1082,7 +1111,35 @@ class TensorBrowserWidget(QWidget):
             event.ignore()
             return
         event.acceptProposedAction()
-        self._start_add(paths[0])
+        path = paths[0]
+        if not self._confirm_large_drop(path):
+            return  # user declined scanning an oversized folder; nothing sent
+        self._start_add(path)
+
+    def _confirm_large_drop(self, path: str) -> bool:
+        """Ask before scanning a big folder; return True to proceed.
+
+        Only a directory over the entry threshold prompts — a file or a small
+        folder proceeds silently. The count runs *locally*: the drop UI is
+        enabled only against a localhost server (``_can_accept_drop``), so the
+        client shares the server's filesystem and can size the tree cheaply
+        (short-circuiting at the threshold) before any scan is sent. This is a
+        coarse footgun-stopper for dropping a home/root folder by mistake, kept
+        client-side so the user stays in control instead of the server hard-
+        rejecting; the walk itself still happens server-side once confirmed.
+        """
+        if not _dir_exceeds_entry_threshold(path):
+            return True
+        name = os.path.basename(path.rstrip("/")) or path
+        resp = QMessageBox.question(
+            self,
+            "Add large folder?",
+            f"“{name}” contains many files. Scan it and add all datasets "
+            "found under it?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return resp == QMessageBox.Yes
 
     def _start_add(self, path: str):
         """Spawn the off-GUI-thread add worker for *path* (non-modal)."""

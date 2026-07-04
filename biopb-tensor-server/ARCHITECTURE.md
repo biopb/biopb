@@ -109,10 +109,12 @@ the launcher injects the entrypoint via `set_add_source_handler(...)`.
   the exact-member dedup in `DiscoveryState.add_claim` does not catch nesting
   because dir sources record only the directory as a member. Dropping a **parent**
   of existing sources re-discovers them (same id → `already_present`) and adds new
-  siblings. A plain-directory drop above `_ADD_SOURCE_LARGE_DIR_THRESHOLD` entries
-  is declined outright as a `failed` entry ("directory too large to scan on drop
-  — drop a subfolder, or add it via the server config file") — no modal, no
-  retry; the threshold counts filesystem *entries*, a coarse footgun-stopper.
+  siblings. The server does **not** gate a large directory walk — the
+  large-folder footgun-stopper lives **client-side**: the tensor browser counts
+  a dropped folder's entries (drag-drop is localhost-only, so the client shares
+  this filesystem) and, above a coarse threshold, confirms with the user before
+  sending the add. A direct SDK caller passing a path is explicit intent, so its
+  walk is never gated.
 - **Locality.** Runtime add is local-path only (a remote URL raises); the client
   gate additionally enables the drop UI only against a localhost server, since a
   dropped path is a client-side filesystem path.

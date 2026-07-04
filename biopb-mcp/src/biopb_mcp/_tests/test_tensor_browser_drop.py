@@ -20,7 +20,12 @@ try:
 except Exception:  # pragma: no cover - no Qt platform
     pytest.skip("Qt binding unavailable", allow_module_level=True)
 
-from biopb_mcp.tensor_browser._widget import TensorBrowserWidget, _AddSourceWorker
+from biopb_mcp.tensor_browser import _widget
+from biopb_mcp.tensor_browser._widget import (
+    TensorBrowserWidget,
+    _AddSourceWorker,
+    _dir_exceeds_entry_threshold,
+)
 
 
 @pytest.fixture(scope="module")
@@ -56,27 +61,6 @@ def test_worker_maps_single_result(_qapp):
     assert [d.source_id for d in captured["added"]] == ["a"]
     assert captured["already"] == ["c"]
     assert captured["failed"] == [("/p/bad", "not a recognized image format")]
-
-
-def test_worker_surfaces_large_dir_as_failed(_qapp):
-    # A directory over the server's large-scan threshold now comes back as a
-    # plain failed entry (no modal, no retry) -- the worker just relays it.
-    conn = MagicMock()
-    conn.add_source.return_value = _result(
-        failed=[("/huge", "directory too large to scan on drop -- drop a subfolder")]
-    )
-    worker = _AddSourceWorker(conn, "/huge")
-
-    captured = {}
-    worker.done.connect(
-        lambda payload: captured.update(zip(("added", "already", "failed"), payload))
-    )
-    worker.run()
-
-    assert captured["added"] == [] and captured["already"] == []
-    assert captured["failed"] == [
-        ("/huge", "directory too large to scan on drop -- drop a subfolder")
-    ]
 
 
 def test_worker_surfaces_request_failure(_qapp):
@@ -139,3 +123,54 @@ def test_local_paths_from_mime_accepts_single_local_only(_qapp):
     assert from_mime(remote) == []
 
     assert from_mime(QMimeData()) == []  # no urls at all
+
+
+def test_dir_exceeds_entry_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(_widget, "_LARGE_DROP_ENTRY_THRESHOLD", 3)
+
+    # A single file is never "large".
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    assert _dir_exceeds_entry_threshold(str(f)) is False
+
+    # A small folder (under threshold) does not trip it.
+    small = tmp_path / "small"
+    small.mkdir()
+    (small / "one").write_text("x")
+    (small / "two").write_text("x")
+    assert _dir_exceeds_entry_threshold(str(small)) is False
+
+    # A folder over the threshold does.
+    big = tmp_path / "big"
+    big.mkdir()
+    for i in range(5):
+        (big / f"f{i}").write_text("x")
+    assert _dir_exceeds_entry_threshold(str(big)) is True
+
+    # A nonexistent path is not a directory -> not large (no raise).
+    assert _dir_exceeds_entry_threshold(str(tmp_path / "nope")) is False
+
+
+def test_confirm_large_drop_prompts_only_when_large(monkeypatch):
+    # Small drop: no prompt, proceed silently.
+    monkeypatch.setattr(_widget, "_dir_exceeds_entry_threshold", lambda _p: False)
+    asked = []
+    monkeypatch.setattr(
+        _widget.QMessageBox,
+        "question",
+        lambda *a, **k: asked.append(a) or _widget.QMessageBox.Yes,
+    )
+    assert TensorBrowserWidget._confirm_large_drop(MagicMock(), "/small") is True
+    assert asked == []  # never prompted
+
+    # Large drop: prompt; the user's choice is returned verbatim.
+    monkeypatch.setattr(_widget, "_dir_exceeds_entry_threshold", lambda _p: True)
+    monkeypatch.setattr(
+        _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.No
+    )
+    assert TensorBrowserWidget._confirm_large_drop(MagicMock(), "/huge") is False
+
+    monkeypatch.setattr(
+        _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.Yes
+    )
+    assert TensorBrowserWidget._confirm_large_drop(MagicMock(), "/huge") is True
