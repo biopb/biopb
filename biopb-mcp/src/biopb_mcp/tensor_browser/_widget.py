@@ -304,6 +304,44 @@ class _WarmState:
 _LARGE_DROP_ENTRY_THRESHOLD = 2000
 
 
+def _is_onedrive_dir_name(name: str) -> bool:
+    """True for a OneDrive root directory name (``OneDrive`` / ``OneDrive - <Org>``).
+
+    A deliberate small copy of the server's discovery skip (biopb_tensor_server
+    .discovery._is_skippable_system_dir): the server declines to walk these trees,
+    which is exactly what makes a source added from inside one worth a heads-up.
+    Kept independent rather than imported because the tensor-server package is not
+    a runtime dependency of this widget.
+    """
+    low = name.lower()
+    return (
+        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
+    )
+
+
+def _cloud_drop_warning(path: str) -> str | None:
+    """Warning text if *path* sits in a cloud-synced folder, else ``None``.
+
+    Name-based and best-effort: it inspects the path components only (never opens
+    a file, so it cannot itself trigger a cloud recall). Detects OneDrive -- the
+    common Windows case, and exactly the subtree the server's monitored-tree walk
+    skips. Split on both separators so a Windows path survives whatever the drop
+    delivered.
+    """
+    components = [c for c in re.split(r"[\\/]+", path) if c]
+    if not any(_is_onedrive_dir_name(c) for c in components):
+        return None
+    name = os.path.basename(path.rstrip("/\\")) or path
+    return (
+        f"“{name}” is inside OneDrive, a cloud-synced folder.\n\n"
+        "It will be indexed while its files are downloaded to this PC, but if "
+        "OneDrive Files On-Demand later dehydrates them to free up space, reads "
+        "can become slow or fail until Windows re-downloads them. Marking the "
+        "files “Always keep on this device” avoids that.\n\n"
+        "Add anyway?"
+    )
+
+
 def _dir_exceeds_entry_threshold(path: str) -> bool:
     """True if *path* is a directory holding more than the large-drop threshold.
 
@@ -1116,6 +1154,8 @@ class TensorBrowserWidget(QWidget):
         path = paths[0]
         if not self._confirm_large_drop(path):
             return  # user declined scanning an oversized folder; nothing sent
+        if not self._confirm_cloud_drop(path):
+            return  # user declined adding from a cloud-synced folder
         self._start_add(path)
 
     def _confirm_large_drop(self, path: str) -> bool:
@@ -1140,6 +1180,29 @@ class TensorBrowserWidget(QWidget):
             "found under it?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
+        )
+        return resp == QMessageBox.Yes
+
+    def _confirm_cloud_drop(self, path: str) -> bool:
+        """Warn before adding a source from a cloud-synced (OneDrive) folder.
+
+        OneDrive "Files On-Demand" can evict a file's bytes to the cloud, leaving
+        an offline placeholder: indexed fine while resident, but a later read
+        recalls it -- slow, or failing outright when offline. The server keeps such
+        a source registered across rescans (its walk skips OneDrive; the reconcile
+        preserves already-registered claims there), so this is a heads-up about
+        read behavior, not a block -- the default action is to proceed. Returns
+        True to add, False to cancel.
+        """
+        warning = _cloud_drop_warning(path)
+        if warning is None:
+            return True
+        resp = QMessageBox.question(
+            self,
+            "Add source from a cloud folder?",
+            warning,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
         )
         return resp == QMessageBox.Yes
 

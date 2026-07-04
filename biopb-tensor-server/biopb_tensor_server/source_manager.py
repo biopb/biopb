@@ -759,6 +759,19 @@ class SourceManager:
         if not is_root and should_skip_walk_entry(
             path, is_directory, stat_result, admit_nonresident=cloud
         ):
+            # The entry EXISTS on disk -- discovery is declining to traverse a
+            # system/cloud directory (e.g. OneDrive) or to read an offline
+            # placeholder, NOT observing a deletion. Record it so the reconcile
+            # (via _preserve_skipped_claims) carries forward any already-registered
+            # claim at or under it, exactly as the cloud/stable skips below do.
+            # Without this, a source explicitly registered under such a path is
+            # reaped by the very next reconcile as "disappeared": add_source treats
+            # a drop as a root, which is exempt from this skip (see
+            # _refresh_entry_state's is_root=True), so it happily indexes OneDrive
+            # content -- but the monitored-tree walk that would re-find it refuses
+            # to descend here, so absence from the walk must not be read as
+            # deletion (biopb/biopb#309 drag-drop follow-up).
+            skipped_dirs.add(str(resolved_path))
             return
 
         path_str = str(resolved_path)

@@ -296,3 +296,72 @@ class TestAddSourceRoundtrip:
             client.close()
         finally:
             server.shutdown()
+
+
+class TestAddedSourceSurvivesRescanUnderSkippedDir:
+    """A source added under a name-skipped subtree (e.g. OneDrive) must survive
+    the periodic monitored-tree rescan.
+
+    ``add_source`` treats the drop as a root, which is exempt from the discovery
+    skip policy, so it happily indexes content the monitored-tree walk will not
+    descend into (a server pointed at the Windows home dir, data on the user's
+    OneDrive-backed Desktop). The reconcile must preserve those claims instead of
+    reaping them as "disappeared" (biopb/biopb#309 drag-drop follow-up).
+    """
+
+    def _manager(self, monitored_dirs):
+        server = TensorFlightServer("grpc://localhost:0")
+        manager = SourceManager(
+            server=server,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            watcher=None,
+            monitored_dirs=set(monitored_dirs),
+            metadata_db=None,
+            stability_window=0.0,
+        )
+        return manager, server
+
+    def test_monitor_false_drop_under_onedrive_survives_rescan(self, tmp_path):
+        # Monitored root is an ANCESTOR of a OneDrive dir; the added folder is not
+        # itself monitored (monitor=false, the MCP client's default).
+        home = tmp_path / "home"
+        drop = home / "OneDrive" / "Desktop" / "samples"
+        drop.mkdir(parents=True)
+        _make_zarr(str(drop), "exp.zarr")
+
+        manager, server = self._manager({home})
+
+        added, _already, failed = _drain(manager.add_local_source(str(drop)))
+        assert len(added) == 1 and not failed
+        sid = added[0].source_id
+        assert sid in server._sources
+
+        # First rescan is force_full; the second is the steady-state incremental
+        # that actually reaped the source before the fix (~20 s after the drop).
+        manager._rescan_monitored_dirs()
+        assert sid in server._sources, "reaped by the initial force_full rescan"
+        manager._rescan_monitored_dirs()
+        assert sid in server._sources, "reaped by the steady-state incremental rescan"
+
+    def test_monitor_true_onedrive_root_is_walked_not_skipped(self, tmp_path):
+        # monitor=true makes the OneDrive folder its own monitored root, which is
+        # exempt from the name skip and walked directly -- so its sources are
+        # rediscovered every rescan regardless of the preserve fix.
+        home = tmp_path / "home"
+        drop = home / "OneDrive" / "Desktop" / "samples"
+        drop.mkdir(parents=True)
+        _make_zarr(str(drop), "exp.zarr")
+
+        manager, server = self._manager({home})
+
+        added, _already, failed = _drain(
+            manager.add_local_source(str(drop), monitor=True)
+        )
+        assert len(added) == 1 and not failed
+        sid = added[0].source_id
+        assert drop.resolve() in manager._monitored_dirs
+
+        manager._rescan_monitored_dirs()
+        manager._rescan_monitored_dirs()
+        assert sid in server._sources
