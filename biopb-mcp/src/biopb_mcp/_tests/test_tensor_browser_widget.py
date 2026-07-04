@@ -304,6 +304,30 @@ class TestConnectionSummary:
         assert not w._message_label.isHidden()
 
 
+class TestRefreshFailure:
+    def test_failed_refresh_marks_disconnected_and_updates_indicator(self, widget):
+        w, conn, _workers = widget
+        # Start from a connected state, then make the re-list blow up (server
+        # gone). mark_disconnected is what flips is_connected on the real
+        # connection; emulate that side effect on the mock so the status line
+        # re-render reads the disconnected state.
+        conn.is_connected = True
+
+        def _drop(*_a, **_k):
+            conn.is_connected = False
+
+        conn.mark_disconnected.side_effect = _drop
+        conn.refresh.side_effect = RuntimeError("unreachable")
+
+        w._refresh()
+
+        conn.mark_disconnected.assert_called_once()
+        assert not w._refresh_button.isEnabled()
+        assert w._message_level == "error"
+        assert "lost connection" in w._message_label.text().lower()
+        assert "disconnected" in w._status_summary.text()
+
+
 class TestMessagePane:
     """The unified bottom pane's level + auto-clear lifecycle (biopb/biopb#312)."""
 

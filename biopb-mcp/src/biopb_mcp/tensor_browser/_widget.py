@@ -1418,7 +1418,15 @@ class TensorBrowserWidget(QWidget):
                 self._filter_input.setPlaceholderText("Search sources...")
 
         except Exception:
-            self._show_error("Refresh failed")
+            # A failed re-list on a previously-"connected" server almost always
+            # means the server is gone. is_connected doesn't self-revalidate, so
+            # without this the status line would stay a stale "connected"; drop
+            # the client to make the indicator honest and steer the user to
+            # reconnect. Stopgap until a live health signal exists (#319).
+            self._conn.mark_disconnected("Lost connection to server")
+            self._show_error("Refresh failed — lost connection to server")
+            self._refresh_button.setEnabled(False)
+            self._update_status_summary()
             logger.exception("Failed to refresh source list")
 
     def _on_sources_changed(self, sources):
