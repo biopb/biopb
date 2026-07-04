@@ -289,6 +289,23 @@ class TensorConnection:
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources
 
+    def mark_disconnected(self, message: str = "") -> None:
+        """Drop the client so ``is_connected`` reflects a lost server.
+
+        ``is_connected`` is only ``client is not None`` and nothing re-validates
+        it after ``connect()``, so a server that dies mid-session leaves the flag
+        (and the widget's status line) stale on "connected". Callers that observe
+        a failure against a previously-connected server — e.g. a failed manual
+        ``refresh()`` — call this to reset the state to disconnected, mirroring
+        the reset ``connect()`` already does on its own failure path. This is a
+        stopgap; a live health signal is the real fix (biopb/biopb#319).
+        """
+        self.client = None
+        self.sources = {}
+        self.use_server_query = False
+        self.last_status = "error"
+        self.last_message = message
+
     def resolve_source(
         self,
         source_id: str,

@@ -172,6 +172,26 @@ class TestConnect:
         assert len(result) == 2
         assert conn.sources == result
 
+    def test_mark_disconnected_resets_state(self, monkeypatch):
+        client = _fake_client({"a": MagicMock()})
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        assert conn.is_connected
+
+        conn.mark_disconnected("Lost connection to server")
+
+        assert not conn.is_connected
+        assert conn.client is None
+        assert conn.sources == {}
+        assert conn.use_server_query is False
+        assert conn.last_status == "error"
+        assert conn.last_message == "Lost connection to server"
+
     def test_resolve_source_requires_connection(self):
         conn = TensorConnection(config={})
         with pytest.raises(RuntimeError, match="Not connected"):

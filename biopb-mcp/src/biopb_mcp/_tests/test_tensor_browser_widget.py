@@ -235,6 +235,54 @@ class TestConnect:
         assert conn.token == "secret"
         assert len(workers) == 1  # a connect worker was started
 
+
+class TestConnectionSummary:
+    def test_advanced_panel_collapsed_by_default(self, widget):
+        w, _conn, _workers = widget
+        # The full connection controls start hidden behind the summary line.
+        # (isHidden reflects the explicit visibility flag even when the top-level
+        # widget is never shown, as in these headless tests.)
+        assert w._advanced_panel.isHidden()
+        assert not w._advanced_expanded
+        # The collapsed caret is part of the (clickable) summary line.
+        assert "▸" in w._status_summary.text()
+
+    def test_clicking_summary_reveals_and_hides_panel(self, widget):
+        w, _conn, _workers = widget
+        w._toggle_advanced()  # what the summary line's mousePressEvent calls
+        assert not w._advanced_panel.isHidden()
+        assert w._advanced_expanded
+        assert "▾" in w._status_summary.text()
+        w._toggle_advanced()
+        assert w._advanced_panel.isHidden()
+        assert not w._advanced_expanded
+        assert "▸" in w._status_summary.text()
+
+    def test_summary_shows_url_and_state_across_lifecycle(self, widget):
+        w, conn, workers = widget
+        _connected_with(conn, {"a": object()})
+
+        # Before connecting: disconnected.
+        assert conn.url in w._status_summary.text()
+        assert "disconnected" in w._status_summary.text()
+
+        w._auto_connect()
+        assert "connecting" in w._status_summary.text()  # in flight
+
+        workers.pop(0)()  # run worker -> connected
+        assert "connected" in w._status_summary.text()
+        assert "disconnected" not in w._status_summary.text()
+
+    def test_summary_escapes_url_for_rich_text(self, widget):
+        w, conn, _workers = widget
+        # The summary is a rich-text QLabel; a URL with markup-significant chars
+        # must be escaped, not injected raw.
+        conn.url = "grpc://h?a=1&b=<x>"
+        w._update_status_summary()
+        text = w._status_summary.text()
+        assert "&amp;" in text and "&lt;x&gt;" in text
+        assert "<x>" not in text
+
     def test_stale_generation_is_dropped(self, widget):
         w, conn, workers = widget
         _connected_with(conn, {"a": object()})
@@ -264,6 +312,48 @@ class TestConnect:
         assert w._connect_button.isEnabled()
         assert w._message_level == "error"
         assert not w._message_label.isHidden()
+
+
+class TestRefreshFailure:
+    def test_failed_refresh_marks_disconnected_and_updates_indicator(self, widget):
+        w, conn, _workers = widget
+        # Start from a connected state, then make the re-list blow up (server
+        # gone). mark_disconnected is what flips is_connected on the real
+        # connection; emulate that side effect on the mock so the status line
+        # re-render reads the disconnected state.
+        conn.is_connected = True
+
+        def _drop(*_a, **_k):
+            conn.is_connected = False
+
+        conn.mark_disconnected.side_effect = _drop
+        conn.refresh.side_effect = RuntimeError("unreachable")
+
+        w._refresh()
+
+        conn.mark_disconnected.assert_called_once()
+        assert not w._refresh_button.isEnabled()
+        assert w._message_level == "error"
+        assert "lost connection" in w._message_label.text().lower()
+        assert "disconnected" in w._status_summary.text()
+
+    def test_render_error_does_not_mark_disconnected(self, widget):
+        w, conn, _workers = widget
+        # The server answered fine (refresh returned sources), but building the
+        # tree blows up -- a client-side bug, not a lost server. The connection
+        # must stay up and the indicator must not flip to disconnected; the
+        # error is reported without dropping the client (mark_disconnected is
+        # scoped to the re-list call, not the render).
+        conn.is_connected = True
+        conn.refresh.return_value = {"a": object()}
+        w._build_and_display_tree.side_effect = RuntimeError("render boom")
+
+        w._refresh()
+
+        conn.mark_disconnected.assert_not_called()
+        assert conn.is_connected
+        assert w._message_level == "error"
+        assert "lost connection" not in w._message_label.text().lower()
 
 
 class TestMessagePane:
