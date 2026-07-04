@@ -1410,6 +1410,26 @@ function Invoke-BiopbUninstall {
 
         Report-Step 4 "Cleaning up..."
         if ($Purge) {
+            # The file-backend cache lives in the system temp dir (the tensor
+            # server's _default_file_cache_dir), NOT under .local\share, so the
+            # $dataDirs sweep misses it. Remove it best-effort: the per-user
+            # default location, plus any custom cache.file_cache_dir read from the
+            # config before it is deleted. The server was stopped in step 1.
+            $cacheDirs = @((Join-Path $env:TEMP "biopb-cache-$env:USERNAME"))
+            $cfgFile = Join-Path $BiopbHome ".config\biopb\biopb.json"
+            if (Test-Path -LiteralPath $cfgFile) {
+                try {
+                    $custom = (Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json).cache.file_cache_dir
+                    if ($custom) { $cacheDirs += $custom }
+                } catch { }
+            }
+            foreach ($c in $cacheDirs) {
+                if (Test-Path -LiteralPath $c) {
+                    Remove-Item -LiteralPath $c -Recurse -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $c) { Report-Info "Could not remove cache $c (left in place)" }
+                    else { Report-Ok "Removed cache $c" }
+                }
+            }
             foreach ($d in $dataDirs) {
                 if (Test-Path -LiteralPath $d) {
                     Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue

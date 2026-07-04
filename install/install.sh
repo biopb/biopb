@@ -1453,8 +1453,9 @@ Options:
                 biopb from detected AI agents, and remove the package
                 environment. Keeps config and cached data unless --purge.
   --purge       With --uninstall, also delete config and cached/state data
-                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb).
-                Implies --uninstall. Never touches your image data.
+                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb, and
+                the file cache under the temp dir). Implies --uninstall. Never
+                touches your image data.
   -h, --help    Show this help.
 EOF
 }
@@ -1508,6 +1509,38 @@ uninstall_biopb() {
     # only biopb's own dotfile dirs are removed, never any configured data dir.
     if [ "$purge" = "1" ]; then
         _step "Purging config and cached data..."
+
+        # The file-backend cache lives in the system temp dir (the tensor
+        # server's _default_file_cache_dir), NOT under ~/.local/share, so the
+        # dotfile sweep below misses it. Remove it best-effort: the per-user
+        # default location, plus any custom cache.file_cache_dir read from the
+        # config *before* we delete the config. The server was stopped in step 1,
+        # so its process lock is already released.
+        local cache_dirs=("${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/biopb-cache-$(id -u)")
+        local cfg="$HOME/.config/biopb/biopb.json"
+        if [ -f "$cfg" ]; then
+            local custom
+            custom="$(_py - "$cfg" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        p = (json.load(fh).get("cache") or {}).get("file_cache_dir")
+    if p:
+        print(p)
+except Exception:
+    pass
+PY
+)"
+            [ -n "$custom" ] && cache_dirs+=("$custom")
+        fi
+        local c
+        for c in "${cache_dirs[@]}"; do
+            if [ -e "$c" ]; then
+                rm -rf "$c" 2>/dev/null && _ok "Removed cache $c" \
+                    || _info "Could not remove cache $c (left in place)"
+            fi
+        done
+
         local d
         for d in \
             "$HOME/.config/biopb" \
@@ -1522,6 +1555,7 @@ uninstall_biopb() {
     else
         _info "Config and cached data were kept. Remove them with --purge, or:"
         _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+        _cmd "  rm -rf \"\${TMPDIR:-/tmp}/biopb-cache-\$(id -u)\"   # file cache"
     fi
 
     printf "\n%s%s=== biopb uninstalled ===%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
