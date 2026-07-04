@@ -761,17 +761,30 @@ class SourceManager:
         ):
             # The entry EXISTS on disk -- discovery is declining to traverse a
             # system/cloud directory (e.g. OneDrive) or to read an offline
-            # placeholder, NOT observing a deletion. Record it so the reconcile
-            # (via _preserve_skipped_claims) carries forward any already-registered
-            # claim at or under it, exactly as the cloud/stable skips below do.
-            # Without this, a source explicitly registered under such a path is
-            # reaped by the very next reconcile as "disappeared": add_source treats
-            # a drop as a root, which is exempt from this skip (see
-            # _refresh_entry_state's is_root=True), so it happily indexes OneDrive
-            # content -- but the monitored-tree walk that would re-find it refuses
-            # to descend here, so absence from the walk must not be read as
+            # placeholder, NOT observing a deletion. Record a skipped *directory*
+            # so the reconcile (via _preserve_skipped_claims) carries forward any
+            # already-registered claim at or under it, exactly as the cloud/stable
+            # skips below do. Without this, a source explicitly registered under
+            # such a path is reaped by the very next reconcile as "disappeared":
+            # add_source treats a drop as a root, which is exempt from this skip
+            # (see _refresh_entry_state's is_root=True), so it happily indexes
+            # OneDrive content -- but the monitored-tree walk that would re-find it
+            # refuses to descend here, so absence from the walk must not be read as
             # deletion (biopb/biopb#309 drag-drop follow-up).
-            skipped_dirs.add(str(resolved_path))
+            #
+            # Only directories are recorded. A name-skipped subtree (the #309 case)
+            # is bounded -- the walk returns without descending, so it contributes
+            # one entry. Offline-placeholder FILES, by contrast, are leaves reached
+            # by descending normal directories, so recording them would grow
+            # skipped_dirs O(files) (every zero-block/empty/inline file, since
+            # _is_offline_placeholder flags st_blocks == 0) and feed that set into
+            # _preserve_skipped_claims' per-rescan sort + per-entry Path()/
+            # is_relative_to -- the pathlib hot-path cost _copy_cached_subtree_entries
+            # was rewritten to string-prefix to avoid. The only source this omits is
+            # a single dehydrated placeholder file added directly under a non-cloud
+            # root, whose bytes are non-resident (unreadable) anyway.
+            if is_directory:
+                skipped_dirs.add(str(resolved_path))
             return
 
         path_str = str(resolved_path)
