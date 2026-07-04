@@ -137,7 +137,8 @@ class TestConnect:
         # In flight: status shown, button disabled, worker captured not yet run.
         assert w._connecting is True
         assert not w._connect_button.isEnabled()
-        assert "Connecting" in w._status_label.text()
+        assert w._message_level == "busy"  # "Connecting…" is an ongoing state
+        assert "Connecting" in w._message_label.text()
         assert len(workers) == 1
         w._build_and_display_tree.assert_not_called()
 
@@ -146,7 +147,7 @@ class TestConnect:
         conn.auto_connect.assert_called_once()
         w._build_and_display_tree.assert_called_once()
         assert w._refresh_button.isEnabled()
-        assert w._status_label.isHidden()
+        assert w._message_label.isHidden()  # status cleared once connected
         assert w._connect_button.isEnabled()
         assert w._connecting is False
 
@@ -162,8 +163,9 @@ class TestConnect:
         workers.pop(0)()
 
         conn.auto_connect.assert_called_once()
-        assert not w._error_label.isHidden()
-        assert "Cannot reach" in w._error_label.text()
+        assert w._message_level == "error"
+        assert not w._message_label.isHidden()
+        assert "Cannot reach" in w._message_label.text()
         assert not w._refresh_button.isEnabled()
         assert w._connecting is False
         assert w._connect_button.isEnabled()
@@ -175,7 +177,8 @@ class TestConnect:
         w._auto_connect()
         workers.pop(0)()
 
-        assert "Cannot reach tensor server" in w._error_label.text()
+        assert w._message_level == "error"
+        assert "Cannot reach tensor server" in w._message_label.text()
 
     def test_empty_catalog_shows_error(self, widget):
         w, conn, workers = widget
@@ -184,7 +187,8 @@ class TestConnect:
         w._auto_connect()
         workers.pop(0)()
 
-        assert "No sources found" in w._error_label.text()
+        assert w._message_level == "error"
+        assert "No sources found" in w._message_label.text()
         assert not w._refresh_button.isEnabled()
         w._build_and_display_tree.assert_not_called()
 
@@ -200,10 +204,11 @@ class TestConnect:
         w._auto_connect()
         workers.pop(0)()
 
-        assert w._error_label.isHidden()
-        assert not w._status_label.isHidden()
-        assert "Indexing" in w._status_label.text()
-        assert "7 sources so far" in w._status_label.text()
+        # One pane, showing a sticky "busy" status -- not an error.
+        assert w._message_level == "busy"
+        assert not w._message_label.isHidden()
+        assert "Indexing" in w._message_label.text()
+        assert "7 sources so far" in w._message_label.text()
         assert w._refresh_button.isEnabled()
         w._build_and_display_tree.assert_not_called()
 
@@ -257,7 +262,63 @@ class TestConnect:
 
         assert w._connecting is False
         assert w._connect_button.isEnabled()
-        assert not w._error_label.isHidden()
+        assert w._message_level == "error"
+        assert not w._message_label.isHidden()
+
+
+class TestMessagePane:
+    """The unified bottom pane's level + auto-clear lifecycle (biopb/biopb#312)."""
+
+    def test_info_self_clears_while_busy_and_error_are_sticky(self, widget):
+        w, _conn, _workers = widget
+
+        # A one-shot outcome ("added N") is info and arms the auto-clear timer.
+        w._show_status("added 3 sources")
+        assert w._message_level == "info"
+        assert not w._message_label.isHidden()
+        assert w._message_timer.isActive()
+
+        # An ongoing state is a sticky "busy" status -- no timer.
+        w._show_status("Indexing…", sticky=True)
+        assert w._message_level == "busy"
+        assert not w._message_timer.isActive()
+
+        # An error is sticky (no timer) and replaces the status.
+        w._show_error("boom")
+        assert w._message_level == "error"
+        assert "boom" in w._message_label.text()
+        assert not w._message_timer.isActive()
+
+    def test_clears_are_scoped_to_their_own_level(self, widget):
+        w, _conn, _workers = widget
+
+        # _clear_status must not wipe a live error...
+        w._show_error("boom")
+        w._clear_status()
+        assert w._message_level == "error"
+        assert not w._message_label.isHidden()
+
+        # ...and _clear_error must not wipe a live status.
+        w._show_status("Indexing…", sticky=True)
+        w._clear_error()
+        assert w._message_level == "busy"
+        assert not w._message_label.isHidden()
+
+        # Each clear still works on its own level.
+        w._clear_status()
+        assert w._message_level is None
+        assert w._message_label.isHidden()
+
+    def test_auto_clear_hides_and_resets(self, widget):
+        w, _conn, _workers = widget
+        w._show_status("added 3 sources")  # info -> timer armed
+        assert w._message_timer.isActive()
+
+        w._clear_message()  # what the timer's timeout invokes
+        assert w._message_level is None
+        assert w._message_label.isHidden()
+        assert w._message_label.text() == ""
+        assert not w._message_timer.isActive()
 
 
 class TestSourcesChangedGuard:
