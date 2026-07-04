@@ -131,17 +131,24 @@ def test_constrained_keys_helper_matches_schema(schema):
 
 
 def test_installer_default_config_validates(validator):
-    """The config the installer writes must pass its own schema."""
-    cfg = {
+    """The config the installer writes must pass its own schema.
+
+    Mirrors install.sh / biopb-engine.ps1: a fresh install writes cache
+    file_max_total_gb=32 and a single source that is either monitored (a user
+    data dir) or unmonitored (the static, seeded sample bundle).
+    """
+    base = {
         "server": {"host": "127.0.0.1", "port": 8815, "aggressive_dir_pruning": True},
         "cache": {
             "backend": "file",
             "file_max_segment_mb": 256,
-            "file_max_total_gb": 128,
+            "file_max_total_gb": 32,
         },
-        "sources": [{"url": "/data", "monitor": True}],
     }
-    assert list(validator.iter_errors(cfg)) == []
+    # A user data dir is watched; the static sample bundle is not.
+    for monitor in (True, False):
+        cfg = {**base, "sources": [{"url": "/data", "monitor": monitor}]}
+        assert list(validator.iter_errors(cfg)) == []
 
 
 @pytest.mark.parametrize(
