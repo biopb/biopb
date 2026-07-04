@@ -129,6 +129,37 @@ class TestAddLocalSource:
         assert added[0].source_url.startswith("file://")
         assert added[0].source_url.endswith("/proj/b.zarr")
 
+    def test_static_config_via_symlink_containment(self, tmp_path):
+        """A static-config source configured through a symlinked path still
+        catches a drop that lands inside it. The containment guard keys on
+        os.path.realpath, so the seeded claim must store the resolved path (case
+        4 over a symlinked config path)."""
+        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.source_manager import create_source_manager
+
+        real = tmp_path / "real"
+        real.mkdir()
+        zpath = _make_zarr(str(real), "exp.zarr")
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        manager = create_source_manager(
+            server=server,
+            registry=get_default_registry(),
+            watcher=None,
+            static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
+        )
+        assert manager is not None
+
+        # Drop a subdir inside the source, reached via the real (resolved) path.
+        sub = os.path.join(zpath, "sub")
+        os.makedirs(sub, exist_ok=True)
+        added, already, failed = _drain(manager.add_local_source(sub))
+
+        assert added == [] and len(failed) == 1
+        assert "already part of" in failed[0][1]
+
     def test_readd_same_path_is_already_present(self, tmp_path):
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")

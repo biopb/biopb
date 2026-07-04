@@ -2246,9 +2246,21 @@ def create_source_manager(
         # create_from_config.
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
+        # Resolve a local config path to its realpath so its claim key matches
+        # what the containment guard and discovery dedup compare against -- both
+        # key on os.path.realpath of the candidate path. Without this, a source
+        # configured through a symlink (e.g. /data/current -> /data/2026-07)
+        # stores the raw symlinked path, so dropping a subdir *inside* it (whose
+        # realpath differs) evades the "already part of <source>" guard and
+        # double-registers. Monitored sources are already resolved by the walk;
+        # this brings static sources in line. A remote URL is not a filesystem
+        # path, so it is left verbatim (Path.resolve would mangle the scheme).
+        primary_path = source.url
+        if not is_remote_url(source.url):
+            primary_path = os.path.realpath(source.url)
         claim = SourceClaim(
             source_type=source.type,
-            primary_path=source.url,  # str for URL support
+            primary_path=primary_path,  # resolved local path; remote URL verbatim
             source_id=source.source_id,
             dim_labels=source.dim_labels,
             extra_config=extra_config,
