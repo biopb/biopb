@@ -322,3 +322,71 @@ message WarmStreamMessage {
     WarmProgress done = 2;
   }
 }
+
+// Request body for the "add_source" Flight action: register an existing path
+// (or remote URL) on the SERVER's filesystem as a served source at runtime and
+// start serving it. This is the wire entrypoint into the same claim -> adapter
+// -> catalog pipeline the directory watcher uses; a dropped directory may
+// register several sources. The action streams AddSourceStreamMessage so a slow
+// recursive walk reports progress and can be cancelled.
+message AddSourceRequest {
+  // Absolute path or remote URL, interpreted on the SERVER's filesystem.
+  string url = 1;
+
+  // Explicit adapter type ("zarr", "ome-zarr", ...); empty means auto-detect via
+  // the adapters' claim() protocol.
+  string source_type = 2;
+
+  // Optional dimension labels applied to the registered tensor(s).
+  repeated string dim_labels = 3;
+
+  // Register a directory as a live-monitored root (rescans track later changes).
+  // Ignored for single-file sources.
+  bool monitor = 4;
+}
+
+// Progress heartbeat for an in-flight "add_source" action: one emitted per
+// source as the walk registers it. Informational only -- carries no pixels.
+// There is deliberately NO total: discovery is a walk over a tree of unknown
+// size, so progress is count-up, not a fraction.
+message AddSourceProgress {
+  // Number of sources registered so far in this request.
+  int32 added_count = 1;
+
+  // Path currently being scanned / just registered (for a "Scanning ..." label),
+  // or a short status sentence while the add waits (e.g. for a catalog rescan).
+  string current_path = 2;
+}
+
+// One source that could not be registered, with a user-readable reason (e.g.
+// "already part of <source_id>", "no supported datasets found", "not a
+// recognized image format").
+message AddSourceFailure {
+  string path = 1;
+  string reason = 2;
+}
+
+// Terminal message of the "add_source" stream: the tally of what happened.
+message AddSourceResult {
+  // Sources newly registered by this request.
+  repeated DataSourceDescriptor added = 1;
+
+  // source_ids that were already registered (same deterministic id) -- upsert
+  // no-ops, surfaced so the client can say "already present" rather than
+  // "nothing happened".
+  repeated string already_present = 2;
+
+  // Paths that failed to register, each with its reason. A directory dropped
+  // above the large-scan threshold is declined here too ("directory too large
+  // to scan on drop -- drop a subfolder, or add it via the server config file").
+  repeated AddSourceFailure failed = 3;
+}
+
+// One message in the "add_source" action's result stream: zero or more
+// `progress` heartbeats followed by exactly one terminal `result`.
+message AddSourceStreamMessage {
+  oneof payload {
+    AddSourceProgress progress = 1;
+    AddSourceResult result = 2;
+  }
+}

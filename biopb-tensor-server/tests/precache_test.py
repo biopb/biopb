@@ -419,7 +419,9 @@ class TestRuntimePhaseGating:
         try:
             # Stub the heavy commit collaborators so we exercise only the gate.
             monkeypatch.setattr(
-                sm, "_register_source_claim", lambda claim, catalog_seed=None: True
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
                 sm._state, "add_claim", lambda claim, notify=False: True
@@ -456,7 +458,9 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm, "_register_source_claim", lambda claim, catalog_seed=None: True
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
                 sm._state, "add_claim", lambda claim, notify=False: True
@@ -488,7 +492,9 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm, "_register_source_claim", lambda claim, catalog_seed=None: True
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
                 sm._state, "add_claim", lambda claim, notify=False: True

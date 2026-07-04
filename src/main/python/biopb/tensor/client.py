@@ -29,6 +29,10 @@ from cachey import Cache
 from dask.delayed import delayed
 
 from biopb.tensor.descriptor_pb2 import (
+    AddSourceProgress,
+    AddSourceRequest,
+    AddSourceResult,
+    AddSourceStreamMessage,
     DataSourceDescriptor,
     FlightCmd,
     MetadataQueryOption,
@@ -1484,6 +1488,41 @@ class TensorFlightClient:
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(source_id, array_id)
 
+    def _iter_action_messages(self, action, msg_cls, *, unknown_action_msg=None):
+        """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
+        non-empty message.
+
+        The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
+        the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
+        into ``msg_cls`` (a bad parse yields ``which=None`` so a legacy bare-body
+        caller can fall back on the raw ``body``), and the old-server
+        ``"Unknown action"`` -> :class:`RuntimeError` remap -- applied only when
+        ``unknown_action_msg`` is given; otherwise the ``FlightServerError``
+        propagates unchanged.
+
+        Cancellation is deliberately NOT handled here: its semantics differ per
+        caller (resolve/warm raise, add_source returns what it has), and the poll
+        must run *after* a message is consumed so a terminal already in hand is
+        never discarded by a cancel landing on it (issue #4). Each caller polls
+        ``should_cancel`` around its own dispatch.
+        """
+        try:
+            for result in self._client.do_action(action, options=self._call_options):
+                body = result.body.to_pybytes()
+                if not body:
+                    continue  # legacy empty-body heartbeat (server predating progress)
+                msg = msg_cls()
+                try:
+                    msg.ParseFromString(body)
+                    which = msg.WhichOneof("payload")
+                except Exception:  # noqa: BLE001
+                    which = None
+                yield which, msg, body
+        except flight.FlightServerError as exc:
+            if unknown_action_msg is not None and "Unknown action" in str(exc):
+                raise RuntimeError(unknown_action_msg) from exc
+            raise
+
     def resolve(
         self,
         source_id: str,
@@ -1537,18 +1576,11 @@ class TensorFlightClient:
         # per received message, i.e. roughly once per server heartbeat.
         action = flight.Action("resolve", source_id.encode("utf-8"))
         desc: Optional[DataSourceDescriptor] = None
-        for result in self._client.do_action(action, options=self._call_options):
+        for which, msg, body in self._iter_action_messages(
+            action, ResolveStreamMessage
+        ):
             if should_cancel is not None and should_cancel():
                 raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
-            body = result.body.to_pybytes()
-            if not body:
-                continue  # legacy empty-body heartbeat (server predating progress)
-            msg = ResolveStreamMessage()
-            try:
-                msg.ParseFromString(body)
-                which = msg.WhichOneof("payload")
-            except Exception:  # noqa: BLE001
-                which = None
             if which == "progress":
                 if on_progress is not None:
                     on_progress(msg.progress)
@@ -1612,37 +1644,117 @@ class TensorFlightClient:
         """
         action = flight.Action("warm", source_id.encode("utf-8"))
         done: Optional[WarmProgress] = None
-        try:
-            for result in self._client.do_action(action, options=self._call_options):
-                if should_cancel is not None and should_cancel():
-                    raise ResolveCancelled(f"warm('{source_id}') cancelled by caller")
-                body = result.body.to_pybytes()
-                if not body:
-                    continue
-                msg = WarmStreamMessage()
-                msg.ParseFromString(body)
-                which = msg.WhichOneof("payload")
-                if which == "progress":
-                    if on_progress is not None:
-                        on_progress(msg.progress)
-                elif which == "done":
-                    done = WarmProgress()
-                    done.CopyFrom(msg.done)
-        except flight.FlightServerError as exc:
-            # New-client / old-server: the server has no `warm` action.
-            if "Unknown action" in str(exc):
-                raise RuntimeError(
-                    "Hydrate-ahead is unavailable: the tensor server is too old "
-                    "to support the 'warm' action. Upgrade the server, or just "
-                    "read the data on demand (it will recall lazily)."
-                ) from exc
-            raise
+        unknown = (
+            "Hydrate-ahead is unavailable: the tensor server is too old "
+            "to support the 'warm' action. Upgrade the server, or just "
+            "read the data on demand (it will recall lazily)."
+        )
+        for which, msg, _ in self._iter_action_messages(
+            action, WarmStreamMessage, unknown_action_msg=unknown
+        ):
+            if should_cancel is not None and should_cancel():
+                raise ResolveCancelled(f"warm('{source_id}') cancelled by caller")
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "done":
+                done = WarmProgress()
+                done.CopyFrom(msg.done)
         if done is None:
             raise RuntimeError(
                 f"warm('{source_id}') returned no terminal status "
                 "(server closed the stream without a 'done')"
             )
         return done
+
+    def add_source(
+        self,
+        url: str,
+        *,
+        source_type: str = "",
+        dim_labels: Optional[List[str]] = None,
+        monitor: bool = False,
+        on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "AddSourceResult":
+        """Register a local path on the SERVER as a served source at runtime.
+
+        This is the wire entrypoint behind the tensor-browser's drag-drop: it
+        hands the server a filesystem path (or directory) that it interprets on
+        *its own* filesystem, and the server routes it through the same claim ->
+        adapter -> catalog pipeline the directory watcher uses. A dropped
+        directory that is not itself a dataset is walked recursively and may
+        register several sources, so the action streams progress and a final
+        tally rather than returning a single descriptor.
+
+        The path must exist on the server. Because a dropped directory's walk has
+        no known size up front, there is no percentage -- progress is a running
+        count of sources registered so far.
+
+        Args:
+            url: Absolute path (or directory) on the server's filesystem.
+            source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
+                empty means auto-detect via the adapters' claim protocol.
+            dim_labels: Optional dimension labels for the registered tensor(s).
+            monitor: Register a directory as a live-monitored root (later changes
+                under it are picked up by the periodic rescan). Ignored for files.
+            on_progress: Optional callback invoked with an ``AddSourceProgress``
+                (count + current path + last descriptor) per source as it
+                registers. Called on the calling thread; keep it cheap.
+            should_cancel: Optional predicate polled per message; when it returns
+                True the client closes the stream, which the server observes and
+                stops discovery -- sources already registered stay registered.
+
+        Returns:
+            The terminal ``AddSourceResult`` (``added`` descriptors,
+            ``already_present`` source_ids, ``failed`` ``(path, reason)`` pairs).
+            A directory dropped above the large-scan threshold comes back as a
+            ``failed`` entry, not a special flag.
+
+        Raises:
+            flight.FlightServerError: whole-request failure (path not found /
+                unreadable on the server, or the server declines the request).
+            RuntimeError: the server predates the ``add_source`` action, or
+                closed the stream without a terminal result.
+        """
+        req = AddSourceRequest(
+            url=url,
+            source_type=source_type,
+            dim_labels=dim_labels or [],
+            monitor=monitor,
+        )
+        action = flight.Action("add_source", req.SerializeToString())
+        unknown = (
+            "Runtime source registration is unavailable: the tensor "
+            "server is too old to support the 'add_source' action. "
+            "Upgrade the server, or add the source via its config file."
+        )
+        result: Optional[AddSourceResult] = None
+        for which, msg, _ in self._iter_action_messages(
+            action, AddSourceStreamMessage, unknown_action_msg=unknown
+        ):
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "result":
+                result = AddSourceResult()
+                result.CopyFrom(msg.result)
+            # Poll AFTER consuming this message, not before: a cancel landing
+            # exactly on the terminal ``result`` must not discard a completed
+            # tally already captured above (issue #4). Closing the stream keeps
+            # everything already registered server-side.
+            if should_cancel is not None and should_cancel():
+                break
+        if result is None:
+            # A caller-driven cancel breaks before the terminal result; report an
+            # empty tally rather than an error (the cancel was intentional).
+            if should_cancel is not None and should_cancel():
+                return AddSourceResult()
+            raise RuntimeError(
+                f"add_source('{url}') returned no terminal result "
+                "(server closed the stream without a result)"
+            )
+        return result
 
     def get_source(
         self,

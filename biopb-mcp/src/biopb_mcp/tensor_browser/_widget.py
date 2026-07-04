@@ -9,6 +9,7 @@ Uses pure Qt for complex UI (tree widget, custom layouts).
 
 import json
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -293,6 +294,85 @@ class _WarmState:
 
     worker: _WarmWorker
     fraction: float | None = None
+
+
+# A dropped folder with more than this many filesystem entries prompts a
+# confirmation before the recursive scan is sent (a footgun-stopper for dropping
+# a home/root folder by mistake). Counted client-side: drag-drop is gated to a
+# localhost server, so the client shares the server's disk. Coarse on purpose --
+# it counts entries, not resulting sources.
+_LARGE_DROP_ENTRY_THRESHOLD = 2000
+
+
+def _dir_exceeds_entry_threshold(path: str) -> bool:
+    """True if *path* is a directory holding more than the large-drop threshold.
+
+    A non-directory (a single file/dataset) is never "large". Short-circuits at
+    the threshold, so it stays cheap even on an enormous tree. This is the only
+    size gate on a drop — the server does not re-check it (a direct SDK caller
+    passing a path is trusted as explicit intent) — so a walk error (permission,
+    race) is treated as "not large" and the drop proceeds unconfirmed rather
+    than being blocked.
+    """
+    if not os.path.isdir(path):
+        return False
+    try:
+        count = 0
+        for _root, dirs, files in os.walk(path):
+            count += len(dirs) + len(files)
+            if count > _LARGE_DROP_ENTRY_THRESHOLD:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+class _AddSourceWorker(QThread):
+    """Runs ``TensorConnection.add_source`` for one dropped path off the GUI thread.
+
+    Registering a dropped file/dir asks the server to discover + catalog it,
+    which for a plain folder is a slow recursive walk that may add many sources,
+    so it must not run on the Qt event loop. Presented *non-modally* (like warm):
+    the user keeps using the viewer while sources appear. Per-source progress is
+    relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops the
+    walk (the client closes the stream; sources already registered stay).
+
+    One drop == one path == one ``add_source`` call == one terminal result
+    ``(added, already_present, failed)``. Multi-item drops are refused upstream
+    (``_local_paths_from_mime``), so there is no cross-path aggregation here — a
+    single call keeps the progress count monotone. An oversized folder is caught
+    *before* this worker starts, by the widget's client-side confirm prompt
+    (``_confirm_large_drop``), so the walk only runs once the user has agreed.
+    """
+
+    progress = Signal(object)  # AddSourceProgress
+    done = Signal(object)  # (added, already_present, failed)
+    failed = Signal(str)
+
+    def __init__(self, conn: TensorConnection, path: str):
+        super().__init__()
+        self._conn = conn
+        self._path = path
+        self._cancel = threading.Event()
+
+    def request_cancel(self):
+        """Ask the running add to stop (thread-safe, idempotent)."""
+        self._cancel.set()
+
+    def run(self):
+        try:
+            result = self._conn.add_source(
+                self._path,
+                on_progress=self.progress.emit,
+                should_cancel=self._cancel.is_set,
+            )
+        except Exception as exc:  # surface the SDK/server message to the user
+            self.failed.emit(str(exc))
+            return
+        added = list(result.added)
+        already = list(result.already_present)
+        failed = [(f.path, f.reason) for f in result.failed]
+        self.done.emit((added, already, failed))
 
 
 def _human_bytes(n: int) -> str:
@@ -640,6 +720,10 @@ class TensorBrowserWidget(QWidget):
         # Python ref must live here or a backend that doesn't keep the wrapper
         # alive could GC/destroy the QThread while it is still running.
         self._warm_retain: set = set()
+        # In-flight drag-drop add worker (at most one at a time) plus GC retention
+        # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
+        self._add_worker: _AddSourceWorker | None = None
+        self._add_retain: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -677,6 +761,12 @@ class TensorBrowserWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
+
+        # Accept file/folder drops onto the widget (see dragEnterEvent/dropEvent).
+        # The affordance and its enablement are surfaced by the drop-hint row
+        # below -- a refused drag never reaches dropEvent, so the *reason* must
+        # live in this always-visible label, not in a drop-time message.
+        self.setAcceptDrops(True)
 
         # Server URL input (label and input on same row)
         server_layout = QHBoxLayout()
@@ -742,6 +832,24 @@ class TensorBrowserWidget(QWidget):
         self._tree_widget.setItemDelegate(_WarmProgressDelegate(self._tree_widget))
         layout.addWidget(self._tree_widget, stretch=1)
 
+        # Drag-drop affordance row: an always-visible hint reflecting whether a
+        # drop is possible right now (connected + localhost), plus a Cancel button
+        # shown only while an add is in flight. The hint is the ONLY place a
+        # refused drop's reason can be shown (dragEnterEvent -> ignore never
+        # reaches dropEvent), and it doubles as the non-modal progress line.
+        drop_layout = QHBoxLayout()
+        self._drop_hint_label = QLabel()
+        self._drop_hint_label.setWordWrap(True)
+        self._drop_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        drop_layout.addWidget(self._drop_hint_label, stretch=1)
+        self._add_cancel_btn = QPushButton("Cancel")
+        self._add_cancel_btn.setFixedWidth(60)
+        self._add_cancel_btn.setVisible(False)
+        self._add_cancel_btn.clicked.connect(self._cancel_add)
+        drop_layout.addWidget(self._add_cancel_btn)
+        layout.addLayout(drop_layout)
+        self._update_drop_hint()
+
         # Metadata display
         self._metadata_label = QLabel()
         self._metadata_label.setWordWrap(True)
@@ -749,11 +857,23 @@ class TensorBrowserWidget(QWidget):
         self._metadata_label.setVisible(False)
         layout.addWidget(self._metadata_label)
 
-        # Status/progress display (e.g. "server starting — scanning…"); grey,
-        # distinct from the red error label below.
+        # Status/progress display (e.g. "server starting — scanning…"). Styled
+        # as a blue callout -- an accent color, bold weight, and a tinted
+        # background with a left border -- so transient feedback is visually
+        # distinct from the grey metadata pane above and the red error label
+        # below, rather than blending into another line of grey text.
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet("color: #888;")
+        self._status_label.setStyleSheet(
+            "QLabel {"
+            " color: #93c5fd;"
+            " font-weight: bold;"
+            " background-color: rgba(96, 165, 250, 40);"
+            " border-left: 3px solid #60a5fa;"
+            " border-radius: 2px;"
+            " padding: 4px 8px;"
+            " }"
+        )
         self._status_label.setVisible(False)
         layout.addWidget(self._status_label)
 
@@ -828,6 +948,7 @@ class TensorBrowserWidget(QWidget):
         self._connecting = False
         self._connect_button.setEnabled(True)
         self._clear_status()
+        self._update_drop_hint()
 
         if not self._conn.is_connected:
             # auto_connect recorded the friendly reason (down / still starting).
@@ -923,6 +1044,179 @@ class TensorBrowserWidget(QWidget):
         """Clear the status/progress message."""
         self._status_label.setVisible(False)
         self._status_label.setText("")
+
+    # ------------------------------------------------------------------
+    # Drag-and-drop: add a dropped local file/dir as a source and serve it.
+    # ------------------------------------------------------------------
+
+    def _can_accept_drop(self) -> tuple[bool, str]:
+        """Whether a drop is possible right now, and the reason to display.
+
+        The reason is the ambient affordance text -- a refused drag never reaches
+        ``dropEvent``, so this string (shown in the drop-hint label) is the only
+        place the user learns *why* a drop is unavailable. Drops are enabled only
+        against a connected, **localhost** server: a dropped path is a client-side
+        filesystem path, meaningful to the server only when they share a disk.
+        """
+        if self._connecting or not self._conn.is_connected:
+            return False, "Not connected — connect to add data by drag-drop"
+        if not self._conn.is_localhost():
+            return False, "Connected to a remote server — drag-drop unavailable"
+        if self._add_worker is not None:
+            return False, "Adding data…"
+        return True, "Drop image files or folders here to add them"
+
+    def _update_drop_hint(self):
+        """Refresh the ambient drop-hint text from the current connection state."""
+        if self._add_worker is not None:
+            return  # a live add owns the label (progress line)
+        _, reason = self._can_accept_drop()
+        self._drop_hint_label.setText(reason)
+
+    @staticmethod
+    def _local_paths_from_mime(mime) -> List[str]:
+        """The single local path carried by a drag, wrapped in a list, or [].
+
+        A drop is accepted only when it is *exactly one* local file/folder. A
+        multi-item drag is refused (returns ``[]``, so the cursor shows "no
+        drop") rather than partially accepted — the add pipeline handles one
+        path per drop, and one folder still discovers many datasets in a single
+        call, so the common case is unaffected. A non-file URL (e.g. a web link)
+        is likewise rejected.
+        """
+        if not mime.hasUrls():
+            return []
+        urls = mime.urls()
+        if len(urls) != 1:
+            return []  # exactly one item per drop; multi-select is refused
+        url = urls[0]
+        if not url.isLocalFile():
+            return []
+        return [url.toLocalFile()]
+
+    def dragEnterEvent(self, event):
+        """Accept a drag only if it is all-local files onto a localhost server."""
+        ok, _ = self._can_accept_drop()
+        if ok and self._local_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        """Register the single dropped local path as a source on the server."""
+        ok, _ = self._can_accept_drop()
+        paths = self._local_paths_from_mime(event.mimeData())
+        if not ok or not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        path = paths[0]
+        if not self._confirm_large_drop(path):
+            return  # user declined scanning an oversized folder; nothing sent
+        self._start_add(path)
+
+    def _confirm_large_drop(self, path: str) -> bool:
+        """Ask before scanning a big folder; return True to proceed.
+
+        Only a directory over the entry threshold prompts — a file or a small
+        folder proceeds silently. The count runs *locally*: the drop UI is
+        enabled only against a localhost server (``_can_accept_drop``), so the
+        client shares the server's filesystem and can size the tree cheaply
+        (short-circuiting at the threshold) before any scan is sent. This is a
+        coarse footgun-stopper for dropping a home/root folder by mistake, kept
+        client-side so the user stays in control instead of the server hard-
+        rejecting; the walk itself still happens server-side once confirmed.
+        """
+        if not _dir_exceeds_entry_threshold(path):
+            return True
+        name = os.path.basename(path.rstrip("/")) or path
+        resp = QMessageBox.question(
+            self,
+            "Add large folder?",
+            f"“{name}” contains many files. Scan it and add all datasets "
+            "found under it?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return resp == QMessageBox.Yes
+
+    def _start_add(self, path: str):
+        """Spawn the off-GUI-thread add worker for *path* (non-modal)."""
+        if self._add_worker is not None:
+            return  # one add at a time
+        self._clear_error()
+        worker = _AddSourceWorker(self._conn, path)
+        self._add_worker = worker
+        self._add_retain.add(worker)
+        worker.progress.connect(self._on_add_progress)
+        worker.done.connect(self._on_add_done)
+        worker.failed.connect(self._on_add_failed)
+        worker.finished.connect(lambda w=worker: self._add_retain.discard(w))
+        self._add_cancel_btn.setVisible(True)
+        label = os.path.basename(path.rstrip("/")) or path
+        self._drop_hint_label.setText(f"Adding {label}…")
+        worker.start()
+
+    def _cancel_add(self):
+        """Cancel the in-flight add (keeps sources already registered)."""
+        if self._add_worker is not None:
+            self._add_worker.request_cancel()
+            self._drop_hint_label.setText("Cancelling…")
+
+    def _on_add_progress(self, progress):
+        """Relay per-source add progress to the drop-hint line (count-up)."""
+        count = progress.added_count
+        path = progress.current_path or ""
+        msg = f"Adding… {count} source{'' if count == 1 else 's'} registered"
+        if os.path.isabs(path):
+            # A real filesystem path being scanned -> show its basename.
+            msg += f" (scanning {os.path.basename(path.rstrip('/'))})"
+        elif path:
+            # A status sentence (e.g. the catalog-lock wait heartbeat) -> show it
+            # verbatim, not run through the "scanning {basename}" label.
+            msg += f" ({path})"
+        self._drop_hint_label.setText(msg)
+
+    def _on_add_failed(self, msg: str):
+        """Whole-request add failure (e.g. path not found on the server)."""
+        self._add_worker = None
+        self._add_cancel_btn.setVisible(False)
+        self._update_drop_hint()
+        self._report_failure("Add data failed", msg)
+
+    def _on_add_done(self, payload):
+        """Terminal add tally: refresh, summarize, report failures."""
+        added, already, failed = payload
+        self._add_worker = None
+        self._add_cancel_btn.setVisible(False)
+
+        # Prompt sources appear immediately; the background watcher would also
+        # catch up, but an explicit refresh is prompt.
+        if added or already:
+            try:
+                self._refresh()
+            except Exception:
+                logger.exception("refresh after add_source failed")
+
+        parts = []
+        if added:
+            parts.append(f"added {len(added)}")
+        if already:
+            parts.append(f"{len(already)} already present")
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        self._show_status("Add data: " + (", ".join(parts) if parts else "nothing"))
+        self._update_drop_hint()
+
+        if failed:
+            detail = "\n".join(
+                f"• {os.path.basename(p.rstrip('/')) or p}: {reason}"
+                for p, reason in failed
+            )
+            self._report_failure("Some items were not added", detail)
 
     def _refresh(self):
         """Refresh the source list from server."""
