@@ -273,6 +273,16 @@ class TestConnectionSummary:
         assert "connected" in w._status_summary.text()
         assert "disconnected" not in w._status_summary.text()
 
+    def test_summary_escapes_url_for_rich_text(self, widget):
+        w, conn, _workers = widget
+        # The summary is a rich-text QLabel; a URL with markup-significant chars
+        # must be escaped, not injected raw.
+        conn.url = "grpc://h?a=1&b=<x>"
+        w._update_status_summary()
+        text = w._status_summary.text()
+        assert "&amp;" in text and "&lt;x&gt;" in text
+        assert "<x>" not in text
+
     def test_stale_generation_is_dropped(self, widget):
         w, conn, workers = widget
         _connected_with(conn, {"a": object()})

@@ -7,6 +7,7 @@ tokens and search filtering.
 Uses pure Qt for complex UI (tree widget, custom layouts).
 """
 
+import html
 import json
 import logging
 import os
@@ -1087,7 +1088,9 @@ class TensorBrowserWidget(QWidget):
         connected without expanding the advanced panel. The caret signals that
         the line is clickable to reveal the connection settings.
         """
-        url = self._conn.url or "(no server)"
+        # The URL is user-supplied (Server field / config); it is embedded in a
+        # rich-text QLabel, so escape it or a '&'/'<' would corrupt the markup.
+        url = html.escape(self._conn.url or "(no server)")
         if self._connecting:
             glyph, color, state = "◌", "#888", "connecting…"
         elif self._conn.is_connected:
