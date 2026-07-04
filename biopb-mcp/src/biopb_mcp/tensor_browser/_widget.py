@@ -646,6 +646,40 @@ class MetadataDialog(QDialog):
 # Tensor Browser Widget (Pure Qt)
 # ==============================================================================
 
+# Bottom message pane. One label shows all transient feedback and errors; its
+# lifecycle is driven by a level:
+#   "info"  — a one-shot outcome ("added 3 sources"). Self-clears after
+#             _MESSAGE_AUTO_CLEAR_MS so a stale line does not linger (the d&d
+#             summary was the motivating case).
+#   "busy"  — an ongoing state ("Connecting…", "Indexing…"). Sticky: it reflects
+#             a condition, so the flow that started it clears it when the
+#             condition resolves, not a timer.
+#   "error" — sticky until replaced or explicitly cleared (never times out).
+_MESSAGE_AUTO_CLEAR_MS = 6000
+
+
+def _callout_qss(text_hex: str, accent_hex: str, bg_rgba: str) -> str:
+    """A left-accented callout stylesheet, so the pane reads as one component
+    whose color alone signals severity (blue = status, red = error)."""
+    return (
+        "QLabel {"
+        f" color: {text_hex};"
+        " font-weight: bold;"
+        f" background-color: {bg_rgba};"
+        f" border-left: 3px solid {accent_hex};"
+        " border-radius: 2px;"
+        " padding: 4px 8px;"
+        " }"
+    )
+
+
+# level -> stylesheet. "busy" shares the blue status look with "info".
+_MESSAGE_STYLES = {
+    "info": _callout_qss("#93c5fd", "#60a5fa", "rgba(96, 165, 250, 40)"),
+    "busy": _callout_qss("#93c5fd", "#60a5fa", "rgba(96, 165, 250, 40)"),
+    "error": _callout_qss("#fca5a5", "#ef4444", "rgba(239, 68, 68, 40)"),
+}
+
 
 class TensorBrowserWidget(QWidget):
     """Widget to browse and load tensors from a TensorFlight server."""
@@ -857,32 +891,20 @@ class TensorBrowserWidget(QWidget):
         self._metadata_label.setVisible(False)
         layout.addWidget(self._metadata_label)
 
-        # Status/progress display (e.g. "server starting — scanning…"). Styled
-        # as a blue callout -- an accent color, bold weight, and a tinted
-        # background with a left border -- so transient feedback is visually
-        # distinct from the grey metadata pane above and the red error label
-        # below, rather than blending into another line of grey text.
-        self._status_label = QLabel()
-        self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet(
-            "QLabel {"
-            " color: #93c5fd;"
-            " font-weight: bold;"
-            " background-color: rgba(96, 165, 250, 40);"
-            " border-left: 3px solid #60a5fa;"
-            " border-radius: 2px;"
-            " padding: 4px 8px;"
-            " }"
-        )
-        self._status_label.setVisible(False)
-        layout.addWidget(self._status_label)
-
-        # Error display
-        self._error_label = QLabel()
-        self._error_label.setWordWrap(True)
-        self._error_label.setStyleSheet("color: #d32f2f;")
-        self._error_label.setVisible(False)
-        layout.addWidget(self._error_label)
+        # Bottom message pane: a single callout that carries both transient
+        # status/progress ("Indexing…", "added 3 sources") and inline errors,
+        # colored by level and self-clearing per the rules on _MESSAGE_STYLES /
+        # _MESSAGE_AUTO_CLEAR_MS above. It is styled as a left-accented callout
+        # so it stays visually distinct from the grey metadata pane above.
+        # _show_status / _show_error / _clear_status / _clear_error route here.
+        self._message_level: str | None = None
+        self._message_timer = QTimer(self)
+        self._message_timer.setSingleShot(True)
+        self._message_timer.timeout.connect(self._clear_message)
+        self._message_label = QLabel()
+        self._message_label.setWordWrap(True)
+        self._message_label.setVisible(False)
+        layout.addWidget(self._message_label)
 
     def _on_connect_clicked(self, *args):
         """Connect button handler: retarget to the typed URL/token, connect."""
@@ -919,7 +941,7 @@ class TensorBrowserWidget(QWidget):
         gen = self._connect_gen
         self._connecting = True
         self._connect_button.setEnabled(False)
-        self._show_status(f"Connecting to {self._conn.url}…")
+        self._show_status(f"Connecting to {self._conn.url}…", sticky=True)
 
         def _worker():
             # auto_connect is best-effort: it swallows its own failures and
@@ -1006,22 +1028,49 @@ class TensorBrowserWidget(QWidget):
             self._show_status(
                 f"Indexing data folder… "
                 f"({self._conn.scan_source_count()} sources so far). "
-                "The list updates automatically as sources are found."
+                "The list updates automatically as sources are found.",
+                sticky=True,
             )
             return True
         self._clear_status()
         self._show_error("No sources found on server")
         return False
 
+    def _show_message(self, msg: str, *, level: str, sticky: bool):
+        """Show *msg* in the bottom pane at *level* (see _MESSAGE_STYLES).
+
+        Non-sticky messages self-clear after _MESSAGE_AUTO_CLEAR_MS; sticky ones
+        persist until replaced or explicitly cleared. Each call restarts (or
+        stops) the single-shot timer, so the visible message always owns it.
+        """
+        self._message_level = level
+        self._message_label.setStyleSheet(_MESSAGE_STYLES[level])
+        self._message_label.setText(msg)
+        self._message_label.setVisible(True)
+        self._message_timer.stop()
+        if not sticky:
+            self._message_timer.start(_MESSAGE_AUTO_CLEAR_MS)
+
+    def _clear_message(self):
+        """Clear the bottom pane regardless of level and cancel any timer."""
+        self._message_timer.stop()
+        self._message_level = None
+        self._message_label.setVisible(False)
+        self._message_label.setText("")
+
     def _show_error(self, msg: str):
-        """Display error message."""
-        self._error_label.setText(msg)
-        self._error_label.setVisible(True)
+        """Display an inline error (red, sticky until replaced/cleared)."""
+        self._show_message(msg, level="error", sticky=True)
 
     def _clear_error(self):
-        """Clear error message."""
-        self._error_label.setVisible(False)
-        self._error_label.setText("")
+        """Clear the pane only if it is currently showing an error.
+
+        Callers sprinkle this before a new action to wipe a stale error; it must
+        not knock out a busy/info status set by a concurrent flow (e.g. the
+        background "Indexing…" line), so it is scoped to the error level.
+        """
+        if self._message_level == "error":
+            self._clear_message()
 
     def _report_failure(self, title: str, message: str):
         """Modally report a failed *user-initiated* action (resolve/hydrate/load).
@@ -1035,15 +1084,19 @@ class TensorBrowserWidget(QWidget):
         """
         QMessageBox.critical(self, title, message or "Unknown error")
 
-    def _show_status(self, msg: str):
-        """Display a transient status/progress message (grey, non-error)."""
-        self._status_label.setText(msg)
-        self._status_label.setVisible(True)
+    def _show_status(self, msg: str, *, sticky: bool = False):
+        """Display a transient status/progress message (blue callout).
+
+        Pass ``sticky=True`` for an *ongoing* state ("Connecting…", "Indexing…")
+        whose owning flow clears it when the state resolves; leave it False for a
+        one-shot outcome ("added 3 sources") that should self-clear.
+        """
+        self._show_message(msg, level="busy" if sticky else "info", sticky=sticky)
 
     def _clear_status(self):
-        """Clear the status/progress message."""
-        self._status_label.setVisible(False)
-        self._status_label.setText("")
+        """Clear the pane only if it is currently showing a status (not an error)."""
+        if self._message_level in ("info", "busy"):
+            self._clear_message()
 
     # ------------------------------------------------------------------
     # Drag-and-drop: add a dropped local file/dir as a source and serve it.
