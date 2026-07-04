@@ -141,7 +141,10 @@ class TestAddLocalSource:
         real.mkdir()
         zpath = _make_zarr(str(real), "exp.zarr")
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("cannot create symlinks (e.g. Windows without privilege)")
 
         server = TensorFlightServer("grpc://localhost:0")
         manager = create_source_manager(

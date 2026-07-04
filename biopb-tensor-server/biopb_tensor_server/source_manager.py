@@ -2246,15 +2246,18 @@ def create_source_manager(
         # create_from_config.
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
-        # Resolve a local config path to its realpath so its claim key matches
-        # what the containment guard and discovery dedup compare against -- both
-        # key on os.path.realpath of the candidate path. Without this, a source
-        # configured through a symlink (e.g. /data/current -> /data/2026-07)
-        # stores the raw symlinked path, so dropping a subdir *inside* it (whose
-        # realpath differs) evades the "already part of <source>" guard and
-        # double-registers. Monitored sources are already resolved by the walk;
-        # this brings static sources in line. A remote URL is not a filesystem
-        # path, so it is left verbatim (Path.resolve would mangle the scheme).
+        # Store the *resolved* realpath of a local config path so its claim key
+        # matches what the containment guard and discovery dedup compare against
+        # -- both realpath the candidate path. Otherwise a source configured
+        # through a symlink/junction (e.g. /data/current -> /data/2026-07, or a
+        # Windows junction / mapped drive) keeps its raw path, so a drop *inside*
+        # it -- whose realpath differs -- evades the "already part of <source>"
+        # guard and double-registers. realpath is what both sides already use, so
+        # it also folds the Windows case / separator / 8.3 / UNC variants a plain
+        # normcase would not (os.path.realpath resolves reparse points on 3.8+).
+        # Monitored sources are resolved by the walk; this matches them. A remote
+        # URL is left verbatim -- is_remote_url is prefix-based, so a Windows
+        # drive letter (C:\...) is correctly treated as a local path.
         primary_path = source.url
         if not is_remote_url(source.url):
             primary_path = os.path.realpath(source.url)
