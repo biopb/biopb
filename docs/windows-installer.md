@@ -114,8 +114,8 @@ release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring h
 |---|---|---|
 | Welcome / license | — | — |
 | Options (custom page) | `-Webapp`, `-Bioformats`, `-NoRemotePlugins` | `Select-Components` + remote-plugins consent |
-| Keep-config dialog | `-KeepConfig` (or proceed to data dir) | `Select-DataDir -KeepOption` |
-| Data directory | `-DataDir` (`-Cloud` when the cloud box is ticked) | `Select-DataDir` |
+| Keep-config dialog | `-KeepConfig` (existing config only) | console keep-config note |
+| Data directory *(shown only when re-pointing an existing config)* | `-DataDir` (`-Cloud` when the cloud box is ticked) | (fresh installs skip it) |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
 
@@ -131,8 +131,17 @@ replacing only the `sources` list (a legacy `biopb.toml` is migrated to JSON and
 backed up). We do not pre-read the existing data dir (a config may hold multiple
 `sources` and the engine replaces them with the chosen folder, so "keep" means
 *don't touch the file*).
-The data-dir default is `%USERPROFILE%\Microscopy`, not Documents, matching the
-console's OneDrive-avoiding choice.
+
+**Fresh install seeds sample images (no data-dir prompt).** With no existing
+config, the wizard skips the data-dir page entirely: it passes neither
+`-KeepConfig` nor `-DataDir`, and the engine downloads the release's
+`biopb-samples.tar.gz` (curated CC0 images), extracts it to
+`%USERPROFILE%\.local\share\biopb\samples` — the **local** profile drive, never a
+OneDrive/Dropbox folder — and writes `biopb.json` pointing there with
+`cloud = false`. So a non-CLI user reaches a populated viewer with zero questions
+and adds their own data afterward via the tensor-browser drag-drop or the admin
+page. `BIOPB_INSTALL_SAMPLES=0` seeds nothing; the data-dir page still appears
+only when a user declines to keep an *existing* config (the re-point path).
 
 **Cloud / synced folders.** When a cloud root is present the data-dir page adds a
 *"My images are in a cloud folder"* checkbox: ticking it points the picker at a
@@ -143,10 +152,10 @@ the engine's `Get-CloudRoots` does — OneDrive env vars (`%OneDrive%`,
 (`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`), then
 `%USERPROFILE%\iCloudDrive`. The env vars only name one business account, so the
 registry pass is what surfaces *every* signed-in OneDrive; when more than one is
-found the checkbox is paired with a dropdown to pick which root (#188). The
-console front-end gets
-the same cloud folders for free — `Get-DataDirCandidates` (in the engine) now
-offers them alongside the local/drive candidates. Either way the engine
+found the checkbox is paired with a dropdown to pick which root (#188). (The
+console installer no longer prompts for a data directory at all — a fresh install
+seeds samples with no question; only the *re-point* path, the GUI data-dir page
+or `BIOPB_DATA_DIR`, chooses a folder.) Either way the engine
 *auto-detects* cloud-ness from the chosen path (`Test-IsCloudPath`: any dir at or
 under a known cloud root), so browsing/typing a OneDrive path yields `cloud = true`
 even without the checkbox; `-Cloud` is just an explicit override for roots the

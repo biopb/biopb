@@ -82,6 +82,12 @@ jobs:
     permissions:
       contents: write   # create the GitHub release
       packages: write   # push to ghcr.io
+    env:
+      # Single source of truth for the sample build's skimage pin: used by BOTH
+      # the cache key and the build command below, so they can never drift (a bump
+      # busts the cache and forces a rebuild). Pinning skimage pins its pooch data
+      # registry, so the source images stay reproducible.
+      SAMPLES_SKIMAGE_PIN: 'scikit-image==0.26.0'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -127,6 +133,55 @@ jobs:
           pnpm --filter @biopb/tensor-flight-client build
           VITE_TENSOR_API="" pnpm --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
+
+      # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
+      # install seeds these so the product opens onto real microscopy data instead
+      # of an empty catalog; drag-drop / the admin page are how users add their
+      # own. The bytes are fixed and checksummed into the release -- never fetched
+      # from a third party at install time. Isolated, pinned env: skimage/pooch/
+      # tifffile are build-only. The archive root holds the files directly
+      # (installer extracts with no strip). The default (lite) set omits the
+      # ~250 MB palisades_of_vogt sample.
+      #
+      # The bundle is STATIC -- it only changes when tools/build_samples.py (the
+      # curated set) or the skimage pin change -- so cache it keyed on exactly
+      # those inputs. That keeps skimage's third-party pooch fetch OFF the release
+      # critical path in the common case (unchanged set -> cache hit -> no build,
+      # no network). A cache MISS means the set actually changed, so a build
+      # failure there is a real error that the "Verify sample bundle" step turns
+      # the run red for -- not a silently swallowed warning.
+      - name: Restore cached sample bundle
+        id: samplecache
+        uses: actions/cache@v4
+        with:
+          path: release-wheels/biopb-samples.tar.gz
+          key: samples-${{ hashFiles('tools/build_samples.py') }}-${{ env.SAMPLES_SKIMAGE_PIN }}
+
+      - name: Build sample dataset
+        if: steps.samplecache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          # Retry rides out a transient pooch/skimage blip. On persistent failure
+          # we do NOT abort here -- wheels/webapp/images are the shipped product and
+          # are already built -- we leave the tarball absent and let the
+          # "Verify sample bundle" step below fail the run loudly.
+          ok=0
+          for attempt in 1 2 3; do
+            if uv run --no-project \
+                 --with "$SAMPLES_SKIMAGE_PIN" --with pooch --with tifffile \
+                 python tools/build_samples.py --out samples; then
+              ok=1; break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "sample build attempt $attempt failed; retrying in $((attempt * 20))s"
+              sleep $((attempt * 20))
+            fi
+          done
+          if [ "$ok" = 1 ]; then
+            tar -czf release-wheels/biopb-samples.tar.gz -C samples .
+          else
+            echo "::warning::sample dataset build failed after 3 attempts; the Verify step will fail the run"
+          fi
 
       - name: Compute versions
         id: ver
@@ -315,6 +370,8 @@ jobs:
             - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
               version-paired wheel triple (installer `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
+            - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
+              seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
             - `versions.json` — release manifest (pins `napari`; carries the
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
@@ -328,3 +385,19 @@ jobs:
             - `ghcr.io/${{ github.repository_owner }}/biopb-image-base:${{ steps.ver.outputs.imagebase }}`
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+      # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
+      # third-party fetch never blocks shipping the real product (wheels/webapp/
+      # images), and the release publishes above regardless. But a MISSING bundle
+      # means every fresh install lands on an empty viewer, so make it loud rather
+      # than a swallowed ::warning:: nobody reads on a green run: fail the run here
+      # (GitHub emails the run's actor and the tag shows a red check) AFTER the
+      # release has already published. release.yaml only runs on release-v* tags
+      # and manual dispatch, so this never reddens an unrelated push.
+      - name: Verify sample bundle present
+        run: |
+          if [ ! -f release-wheels/biopb-samples.tar.gz ]; then
+            echo "::error::Release built WITHOUT biopb-samples.tar.gz -- fresh installs will land on an empty folder. If a release published, cut a follow-up once this is green: re-run for a transient skimage/pooch outage, or fix tools/build_samples.py."
+            exit 1
+          fi
+          echo "sample bundle present: $(ls -l release-wheels/biopb-samples.tar.gz)"

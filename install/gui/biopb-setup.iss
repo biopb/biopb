@@ -369,17 +369,24 @@ begin
   Args := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\biopb-engine.ps1') + '"';
   Args := Args + ' -Mode gui';
   Args := Args + ' -LogFile "' + LogPath + '"';
-  { Keep -> leave the existing config untouched (engine honors -KeepConfig);
-    otherwise (re)write biopb.json pointing at the chosen folder. }
+  { Keep    -> leave the existing config untouched (engine honors -KeepConfig).
+    Fresh    -> pass neither -KeepConfig nor -DataDir: the engine seeds the sample
+                image bundle and points the config at it (on the LOCAL profile
+                drive, never a cloud folder). A non-CLI user lands on real data and
+                adds their own later via drag-drop / the admin page.
+    Re-point -> existing config, user chose a new folder on the data-dir page. }
   if KeepConfig then
     Args := Args + ' -KeepConfig'
-  else begin
+  else if ConfigExists then begin
+    { Existing config, user chose a new folder on the (shown) data-dir page. }
     Args := Args + ' -DataDir "' + DataDirPage.Values[0] + '"';
     { Cloud opt-in (only meaningful when (re)writing the config). The engine also
       auto-detects cloud-ness from the path, so this is an explicit override. }
     if (CbCloud <> nil) and CbCloud.Checked then
       Args := Args + ' -Cloud';
   end;
+  { else: fresh install -> pass neither -KeepConfig nor -DataDir; the engine seeds
+    the sample bundle onto the local profile drive and points the config there. }
   { The web interface is always installed now (it carries the server admin page);
     Bio-Formats is no longer a GUI option (opt in via $env:BIOPB_INSTALL_BIOFORMATS
     before launching, or rerun the console installer). }
@@ -558,10 +565,11 @@ begin
       mbConfirmation, MB_YESNO) = IDYES);
 end;
 
-{ Skip the data-directory page when the user chose to keep their current config. }
+{ Skip the data-directory page when keeping an existing config, and on a fresh
+  install (no config) -- a fresh install seeds sample images and asks nothing. }
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = DataDirPage.ID) and KeepConfig;
+  Result := (PageID = DataDirPage.ID) and (KeepConfig or (not ConfigExists));
 end;
 
 procedure CurPageChanged(CurPageID: Integer);

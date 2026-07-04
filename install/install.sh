@@ -5,10 +5,15 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
+# A fresh install asks nothing: it seeds a curated sample-image bundle and points
+# the server at it, so a non-CLI user lands on real data immediately (add your own
+# later via the GUI drag-drop / admin page). Set BIOPB_DATA_DIR=/path to point a
+# fresh install at your own folder instead (skips the samples); BIOPB_INSTALL_SAMPLES=0
+# seeds nothing. An existing config is always kept untouched on rerun.
+#
 # Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
 # an existing config; leaves the remote algorithm plugins off unless
-# BIOPB_REMOTE_PLUGINS=1). It is an upgrade feature — a FRESH unattended install
-# must also pass BIOPB_DATA_DIR or it errors out. Example:
+# BIOPB_REMOTE_PLUGINS=1). Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
 # This installs prebuilt wheels from the latest biopb GitHub release-v*
@@ -47,101 +52,6 @@ _confirm() {
 
     [[ -z "$reply" ]] && reply="y"
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
-}
-
-# Prompt the user to choose a data directory.
-# Usage: _pick_data_dir <varname> [keep]  — writes result into caller's variable
-# (no subshell). All prompts go to /dev/tty. Requires PLATFORM to be set first.
-#
-# When the second arg is non-empty ("keep" mode), an extra "0) Keep my current
-# config file" option is shown as the *default*; choosing it (or Enter, or any
-# invalid input) returns the empty string as a sentinel meaning "don't touch the
-# existing config." Callers pass this when a config (biopb.json or legacy
-# biopb.toml) already exists.
-_pick_data_dir() {
-    # Caller passes the name of a variable to receive the result. We assign into
-    # it with `printf -v` rather than a `local -n` nameref, because namerefs need
-    # bash >= 4.3 and macOS ships bash 3.2.
-    local _retvar_name=$1
-    local keep_mode="${2:-}"
-    local candidates=() seen=()
-
-    for dir in \
-        "$HOME" \
-        "$HOME/data" "$HOME/Data" \
-        "$HOME/microscopy" "$HOME/Microscopy" \
-        "$HOME/Documents" \
-        /mnt/data /data; do
-        [ -d "$dir" ] || continue
-        local real; real=$(realpath "$dir" 2>/dev/null || echo "$dir")
-        local dup=0
-        for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
-        [ "$dup" = "0" ] && candidates+=("$dir") && seen+=("$real")
-    done
-
-    if [ "$PLATFORM" = "WSL" ]; then
-        # On WSL, offer dedicated data subfolders under the Windows profile, but
-        # NEVER the profile root itself. Recursively scanning the profile walks
-        # AppData and, fatally, OneDrive "Files On-Demand" placeholders, which
-        # hydrate-on-read through drvfs and hang discovery before the server can
-        # bind. Data/Microscopy folders aren't OneDrive-redirected
-        # by default the way Documents/Desktop/Pictures are; users who keep data
-        # elsewhere can still type a /mnt/c/... path manually.
-        local win_user; win_user=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
-        if [ -n "$win_user" ]; then
-            for dir in \
-                "/mnt/c/Users/$win_user/Microscopy" \
-                "/mnt/c/Users/$win_user/Data" \
-                "/mnt/c/Users/$win_user/data"; do
-                [ -d "$dir" ] || continue
-                local real; real=$(realpath "$dir" 2>/dev/null || echo "$dir")
-                local dup=0
-                for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
-                [ "$dup" = "0" ] && candidates+=("$dir") && seen+=("$real")
-            done
-        fi
-    fi
-
-    local n=${#candidates[@]}
-    local manual_opt=$((n + 1))
-    local default_dir="${candidates[0]:-$HOME}"
-
-    printf "\n  %sSelect your microscopy data directory:%s\n\n" "$BOLD" "$RESET" >/dev/tty
-    if [ -n "$keep_mode" ]; then
-        printf "    ${CYAN}0)${RESET} Keep my current config file ${DIM}(default)${RESET}\n" >/dev/tty
-    fi
-    local i=1
-    for dir in "${candidates[@]+"${candidates[@]}"}"; do
-        printf "    ${CYAN}%d)${RESET} %s\n" "$i" "$dir" >/dev/tty
-        i=$((i + 1))
-    done
-    printf "    ${CYAN}%d)${RESET} Enter path manually\n\n" "$manual_opt" >/dev/tty
-
-    # Default differs by mode: keep current config (0) vs first candidate (1).
-    local default_choice=1
-    [ -n "$keep_mode" ] && default_choice=0
-    printf "  %sChoice [%s]:%s " "$DIM" "$default_choice" "$RESET" >/dev/tty
-    local choice; read -r choice </dev/tty
-    choice="${choice:-$default_choice}"
-
-    if [ -n "$keep_mode" ] && [ "$choice" = "0" ]; then
-        printf -v "$_retvar_name" '%s' ""   # sentinel: keep the existing config
-    elif [ "$choice" = "$manual_opt" ]; then
-        local manual
-        printf "  Path [%s]: " "$default_dir" >/dev/tty
-        read -r manual </dev/tty
-        manual="${manual%$'\r'}"
-        printf -v "$_retvar_name" '%s' "${manual:-$default_dir}"
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-        printf -v "$_retvar_name" '%s' "${candidates[$((choice - 1))]}"
-    elif [ -n "$keep_mode" ]; then
-        # In keep mode, an unrecognized choice is non-destructive: keep the config.
-        printf "  Invalid choice, keeping current config\n" >/dev/tty
-        printf -v "$_retvar_name" '%s' ""
-    else
-        printf "  Invalid choice, using default\n" >/dev/tty
-        printf -v "$_retvar_name" '%s' "$default_dir"
-    fi
 }
 
 # Run a short inline Python script (reads the program from stdin, forwards args).
@@ -703,6 +613,84 @@ _verify_wheels() {
     _ok "Wheel checksums verified"
 }
 
+# Seed the curated sample-image bundle into $1 so a fresh install opens onto real
+# data. Mirrors the webapp fetch (reuse cached release metadata; skip when the
+# .version marker already matches; download; extract), but with its OWN checksum
+# check that fails SOFT: samples are non-critical, so a missing asset, a download
+# error, or a mismatch warns and leaves the folder as-is rather than aborting the
+# whole install (the config still points here and the user can drag-drop data).
+# Honors BIOPB_INSTALL_SAMPLES=0 to skip entirely. Requires _fetch_latest_release.
+_seed_samples() {
+    local dest="$1"
+    if [ "${BIOPB_INSTALL_SAMPLES:-1}" = "0" ]; then
+        _note "Sample images skipped (BIOPB_INSTALL_SAMPLES=0)"
+        return 0
+    fi
+    if ! _fetch_latest_release; then
+        _warn "Could not fetch release metadata; sample images not installed"
+        return 0
+    fi
+    local installed_tag=""
+    [ -f "$dest/.version" ] && installed_tag=$(cat "$dest/.version" 2>/dev/null)
+    if [ "$installed_tag" = "$RELEASE_TAG" ]; then
+        _ok "Sample images already up to date ($RELEASE_TAG)"
+        return 0
+    fi
+
+    local url
+    url=$(_release_asset_url 'biopb-samples\.tar\.gz')
+    url="${url:-$REPO_URL/releases/download/$RELEASE_TAG/biopb-samples.tar.gz}"
+
+    # Download under the real asset basename so the checksum lookup can match it.
+    local tmpdir arc
+    tmpdir=$(mktemp -d)
+    arc="$tmpdir/biopb-samples.tar.gz"
+    if ! curl -fsSL "$url" -o "$arc" 2>/dev/null; then
+        _warn "No biopb-samples.tar.gz in release $RELEASE_TAG; starting with an empty data folder"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+
+    # Soft integrity check against the release SHA256SUMS: never seed corrupt or
+    # tampered data, but never abort the install over it either.
+    local sums_url sums expected actual
+    sums_url=$(_release_asset_url 'SHA256SUMS')
+    if [ -n "$sums_url" ] && sums=$(curl -fsSL "$sums_url" 2>/dev/null); then
+        expected=$(printf '%s' "$sums" \
+            | awk '{f=$2; sub(/^\*/, "", f)} f == "biopb-samples.tar.gz" {print $1; exit}')
+        actual=$(_sha256 "$arc")
+        if [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
+            _warn "Sample bundle checksum mismatch; skipping sample images"
+            rm -rf "$tmpdir"
+            return 0
+        fi
+    fi
+
+    # Sync the bundle into $dest without a blunt `rm -rf` on the user-facing,
+    # monitored data dir. Extract into a staging dir, delete only the files the
+    # *previous* bundle put here (tracked in .bundle-manifest) so a shrunk bundle
+    # leaves no orphans, then copy the new set in. A user who drag-dropped their
+    # own files into the samples dir keeps them across a re-seed.
+    local stage="$tmpdir/stage"
+    mkdir -p "$stage"
+    if ! tar -xzf "$arc" -C "$stage" 2>/dev/null; then
+        _warn "Could not extract sample images; starting with an empty data folder"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+    mkdir -p "$dest"
+    if [ -f "$dest/.bundle-manifest" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && rm -f "$dest/$f"
+        done < "$dest/.bundle-manifest"
+    fi
+    ( cd "$stage" && find . -type f ) | sed 's|^\./||' > "$dest/.bundle-manifest"
+    cp -a "$stage/." "$dest/"
+    printf '%s' "$RELEASE_TAG" > "$dest/.version"
+    _ok "Sample images installed to: $dest"
+    rm -rf "$tmpdir"
+}
+
 # Print the tail of the server log, indented, for diagnosing a bad startup.
 _tail_log() {
     local log="$1"
@@ -829,6 +817,7 @@ install_biopb() {
     # by this prefix instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
+    SAMPLES_DIR="$HOME/.local/share/biopb/samples"
     CONFIG_DIR="$HOME/.config/biopb"
 
     # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
@@ -923,11 +912,14 @@ install_biopb() {
     # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
     # unattended (cron upgrades, CI, image bakes). It is primarily an UPGRADE
     # feature: with an existing config, that config is kept untouched and nothing
-    # is asked. A fresh unattended install must pass BIOPB_DATA_DIR (we will not
-    # guess a data directory) — without it the run errors out (see step 5) rather
-    # than indexing a default folder. Either way the remote algorithm plugins stay
-    # DISABLED unless BIOPB_REMOTE_PLUGINS=1 — consent can't be asked unattended,
-    # so we never silently enable the off-site IP-logging servers.
+    # is asked. A fresh unattended install with no BIOPB_DATA_DIR now follows the
+    # same zero-question path as an interactive fresh install: it seeds the sample
+    # bundle and points the config there (fail-soft — a fetch/checksum problem
+    # just leaves an empty folder). Set BIOPB_DATA_DIR to index your own folder,
+    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty. Either way the
+    # remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1 —
+    # consent can't be asked unattended, so we never silently enable the off-site
+    # IP-logging servers.
     if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
         NONINTERACTIVE=1
         _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
@@ -1195,43 +1187,31 @@ install_biopb() {
         EXISTING_CONFIG="$LEGACY_CONFIG"
     fi
 
-    # The data-directory prompt is always offered; when a config already exists it
-    # gains a default "0) Keep my current config file" option. Choosing a fresh
-    # data dir no longer rewrites the whole file: we load the existing config,
-    # preserve its settings, and replace only the `sources` list (biopb/biopb#34).
-    # An empty DATA_DIR is the "keep" sentinel.
+    # No data-directory prompt: a fresh install seeds the sample-image bundle and
+    # points the server at it, so a non-CLI user lands on real, populated data
+    # with zero questions (they add their own data afterward via the GUI drag-drop
+    # or the admin page; the config/data-dir workflow for keeping data across
+    # restarts is documented). An existing config is kept UNTOUCHED. BIOPB_DATA_DIR
+    # still overrides on a fresh install (power users / unattended provisioning)
+    # and skips the samples. An empty DATA_DIR is the "keep existing" sentinel;
+    # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
     local DATA_DIR
     if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
-        # Existing config + no override: keep it. Non-interactive skips the prompt
-        # (the unmanned-upgrade fast path); interactive offers "0) keep" as default.
-        if [ "$NONINTERACTIVE" = "1" ]; then
-            DATA_DIR=""
-            _note "Non-interactive: keeping existing config ($EXISTING_CONFIG)."
-        else
-            _pick_data_dir DATA_DIR keep
-            echo ""
-        fi
+        # Existing config, no override: keep it exactly as-is (upgrade fast path).
+        DATA_DIR=""
+        _note "Existing config found; keeping it as-is ($EXISTING_CONFIG)."
     elif [ -n "$EXISTING_CONFIG" ]; then
-        # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
-        # install. With a config already present we keep it (its data dir wins).
+        # BIOPB_DATA_DIR only applies to a fresh install; a present config wins.
         _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $EXISTING_CONFIG to apply BIOPB_DATA_DIR)."
         DATA_DIR=""
     elif [ -n "${BIOPB_DATA_DIR:-}" ]; then
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
-    elif [ "$NONINTERACTIVE" = "1" ]; then
-        # Non-interactive is an UPGRADE feature (no existing config = fresh install).
-        # We won't guess a data directory unattended, so require BIOPB_DATA_DIR and
-        # fail clearly rather than silently indexing some default folder.
-        _err "Non-interactive mode needs an existing install or an explicit data directory."
-        _info "  No config found at $CONFIG_FILE — this looks like a fresh install."
-        _info "  Set BIOPB_DATA_DIR=/path/to/microscopy to provision unattended, or"
-        _info "  rerun without BIOPB_NONINTERACTIVE to choose interactively."
-        exit 1
     else
-        _pick_data_dir DATA_DIR
-        echo ""
-        _ok "Data directory: $DATA_DIR"
+        # Fresh install, no override: seed samples and point the config at them.
+        DATA_DIR="$SAMPLES_DIR"
+        _seed_samples "$SAMPLES_DIR"
+        _ok "Data directory: $DATA_DIR (sample images)"
     fi
 
     # ACTIVE_CONFIG is the file the running server will read -- the JSON we write,

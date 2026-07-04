@@ -37,11 +37,21 @@ docker build \
 echo ""
 echo "Launching — run the installer with:"
 if [ "$SCENARIO" = "bioformats" ]; then
+    # The image bakes a config pointing at /data, so install.sh keeps it and
+    # BIOPB_DATA_DIR would be ignored -- don't set it here.
     echo "  BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh"
     echo "then verify Bio-Formats/ZVI support with:"
     echo "  /verify_bioformats.sh"
 else
-    echo "  bash /install.sh"
+    # A bare fresh install now seeds the sample bundle from the latest release and
+    # points the config there (no data-dir prompt). NOTE: seeding pulls
+    # biopb-samples.tar.gz from the latest *release* (not this branch build), so
+    # the seed path only actually populates once a release shipping that asset
+    # exists -- until then a bare run fails soft to an empty folder (that is not a
+    # seeding failure). To exercise discovery deterministically, point the install
+    # at the TIFFs seeded at /root instead:
+    echo "  BIOPB_DATA_DIR=/root bash /install.sh   # discover the seeded /root TIFFs"
+    echo "  bash /install.sh                        # or: seed + serve the sample bundle (needs a release with the asset)"
 fi
 echo ""
 
