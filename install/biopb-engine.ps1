@@ -212,6 +212,7 @@ function Write-ServerConfig {
         [string]$Path,         # biopb.json to write
         [string]$DataDir,
         [bool]$Cloud,
+        [bool]$Monitor = $true, # watch the source (false for the static sample bundle)
         [string]$Prior = ""    # existing config to preserve (.json) or migrate (.toml)
     )
 
@@ -229,14 +230,15 @@ function Write-ServerConfig {
             cache = [pscustomobject]@{
                 backend             = "file"
                 file_max_segment_mb = 256
-                file_max_total_gb   = 128
+                file_max_total_gb   = 32
             }
         }
     }
 
-    # One watched folder, replacing any prior sources. A cloud/synced root admits
+    # One folder, replacing any prior sources. A user data dir is watched; the
+    # static sample bundle is not (monitor = false). A cloud/synced root admits
     # Files-On-Demand placeholders as unresolved sources (cloud = true).
-    $src = [ordered]@{ url = $DataDir; monitor = $true }
+    $src = [ordered]@{ url = $DataDir; monitor = $Monitor }
     if ($Cloud) { $src["cloud"] = $true }
     $sources = @([pscustomobject]$src)
     if ($data.PSObject.Properties.Name -contains 'sources') {
@@ -1185,6 +1187,9 @@ function Invoke-BiopbInstall {
         # OneDrive/Dropbox Known-Folder), so force cloud off for that path -- the
         # files are resident and must not be treated as Files-On-Demand placeholders.
         $isCloud = if ($seedSamples) { $false } else { [bool]$Cloud -or (Test-IsCloudPath -Path $effectiveDataDir) }
+        # The curated sample bundle is static -- don't watch it. A user data dir is
+        # monitored so newly added files auto-register.
+        $isMonitored = -not $seedSamples
 
         # Fresh install with no chosen dir: populate the sample bundle first so the
         # folder we point at is non-empty. Fails soft -- a missing asset / download
@@ -1285,7 +1290,7 @@ function Invoke-BiopbInstall {
 
         # Load existing settings (json) / migrate from defaults (toml) and replace
         # only the sources block -- a new data dir no longer discards tuning (#34).
-        Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Prior $existingConfig
+        Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Monitor $isMonitored -Prior $existingConfig
         $activeConfig = $configFile
 
         # Retire a legacy TOML we just superseded so the server does not warn about
