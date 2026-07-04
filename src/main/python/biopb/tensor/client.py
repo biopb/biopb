@@ -1532,6 +1532,9 @@ class TensorFlightClient:
     ) -> "DataSourceDescriptor":
         """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
 
+        .. note:: Experimental. Cloud / remote source support (unresolved sources,
+           resolve, and :meth:`warm`) is experimental and its behavior may change.
+
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (it lists with ``data_resident`` False
         and an empty ``list_sources()[source_id].tensors``). The canonical case is
@@ -1607,6 +1610,9 @@ class TensorFlightClient:
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "WarmProgress":
         """Hydrate-ahead: recall a resolved source's member files on the server.
+
+        .. note:: Experimental. Cloud / remote source support (:meth:`resolve` and
+           this hydrate-ahead path) is experimental and its behavior may change.
 
         :meth:`resolve` populates a source's *metadata* but, for a multi-file
         cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),

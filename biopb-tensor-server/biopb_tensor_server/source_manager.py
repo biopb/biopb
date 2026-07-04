@@ -43,6 +43,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Remote/cloud source families are EXPERIMENTAL. Warn once per family per process
+# (registration runs per source) so an operator sees the maturity caveat without
+# per-source log spam. Keyed by family; the set is only ever added to.
+_EXPERIMENTAL_WARNED: set = set()
+_EXPERIMENTAL_SOURCE_MESSAGES = {
+    "cloud": (
+        "Cloud / synced-folder sources (cloud=true, e.g. OneDrive Files "
+        "On-Demand) are EXPERIMENTAL: resolve-on-serve and hydrate-ahead behavior "
+        "may change. See docs/cloud-storage-support.md."
+    ),
+    "tensor-server": (
+        "Remote tensor-server proxy sources (type=tensor-server) are "
+        "EXPERIMENTAL: the caching-passthrough proxy may change. "
+        "See docs/remote-tensor-cache.md."
+    ),
+    "remote-url": (
+        "Remote URL sources (s3://, http(s)://, ...) are EXPERIMENTAL and may change."
+    ),
+}
+
+
+def _warn_experimental_source(family: str) -> None:
+    """Log a one-time EXPERIMENTAL warning for a remote/cloud source *family*."""
+    if family in _EXPERIMENTAL_WARNED:
+        return
+    _EXPERIMENTAL_WARNED.add(family)
+    logger.warning("%s", _EXPERIMENTAL_SOURCE_MESSAGES[family])
+
+
 # Backoff ceiling for the tensor-server upstream re-list, in rescan ticks
 # (biopb/biopb#178). A re-list runs every tick while an upstream is changing or
 # failing; while it stays stable the spacing doubles up to this many ticks, so a
@@ -1957,6 +1986,24 @@ class SourceManager:
         adapter = self._server._get_source_adapter(source_id)
         return adapter.get_source_descriptor() if adapter is not None else None
 
+    def _warn_if_experimental(self, claim: SourceClaim) -> None:
+        """Emit a one-time EXPERIMENTAL warning for remote/cloud source families.
+
+        Cloud/synced-folder, remote tensor-server proxy, and remote-URL sources
+        are experimental; classify the claim and warn once per family (see
+        ``_warn_experimental_source``). Cheap, stat-free classification: it reads
+        ``claim.unresolved`` / the configured cloud roots, never opens a file.
+        """
+        if claim.source_type == "tensor-server":
+            family = "tensor-server"
+        elif claim.unresolved or self._is_under_cloud_root(claim.primary_path):
+            family = "cloud"
+        elif is_remote_url(claim.primary_path):
+            family = "remote-url"
+        else:
+            return
+        _warn_experimental_source(family)
+
     def _register_source_claim(
         self,
         claim: SourceClaim,
@@ -1973,6 +2020,7 @@ class SourceManager:
         ``source_url`` on the adapter *before* register/sync so both ListFlights
         and the metadata DB record the re-rooted url.
         """
+        self._warn_if_experimental(claim)
         try:
             source_config = SourceConfig(
                 type=claim.source_type,

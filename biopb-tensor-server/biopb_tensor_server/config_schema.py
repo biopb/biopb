@@ -166,7 +166,13 @@ def _sources_schema() -> Dict[str, Any]:
         "required": ["url"],
         "additionalProperties": True,
         "properties": {
-            "url": {"type": "string", "description": "Path or URL to the data source."},
+            "url": {
+                "type": "string",
+                "description": (
+                    "Path or URL to the data source. Local paths are stable; "
+                    "remote URLs (s3://, http(s)://, grpc://) are experimental."
+                ),
+            },
             "source_id": {"type": "string"},
             "dataset": {"type": "string", "description": "HDF5 dataset path."},
             "dim_labels": {"type": "array", "items": {"type": "string"}},
@@ -181,7 +187,13 @@ def _sources_schema() -> Dict[str, Any]:
                     "placeholders resolved lazily on first access."
                 ),
             },
-            "credentials_profile": {"type": "string"},
+            "credentials_profile": {
+                "type": "string",
+                "description": (
+                    "(experimental) Credential profile for a remote-URL source "
+                    "(s3://, http(s)://, ...)."
+                ),
+            },
             "alias": {
                 "type": "string",
                 "description": (

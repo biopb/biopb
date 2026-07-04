@@ -209,7 +209,8 @@ meta = client.get_source_metadata("source_id")
 print(meta)
 ```
 
-## Cloud / unresolved sources
+## Cloud / unresolved sources (experimental)
+Cloud / remote source support is **experimental** and may change.
 Some sources (cloud / synced-folder, e.g. OneDrive "Files-On-Demand") are
 catalogued by URL only: their shape/dtype/fields are *unknown* until first read.
 They list with `data_resident == False` and an empty `tensors`, and reading one
