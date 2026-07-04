@@ -975,13 +975,11 @@ class TensorFlightServer(flight.FlightServerBase):
             for event in events:
                 kind = event[0]
                 if kind == "progress":
-                    _, added_count, current_path, descriptor = event
+                    _, added_count, current_path = event
                     progress = AddSourceProgress(
                         added_count=added_count,
                         current_path=current_path or "",
                     )
-                    if descriptor is not None:
-                        progress.last_added.CopyFrom(descriptor)
                     yield AddSourceStreamMessage(progress=progress).SerializeToString()
                 else:  # "result"
                     _, added, already_present, failed = event

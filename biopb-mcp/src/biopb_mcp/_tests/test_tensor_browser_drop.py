@@ -125,6 +125,27 @@ def test_local_paths_from_mime_accepts_single_local_only(_qapp):
     assert from_mime(QMimeData()) == []  # no urls at all
 
 
+def test_add_progress_label_distinguishes_path_from_status():
+    stub = MagicMock()
+
+    def render(count, current_path):
+        TensorBrowserWidget._on_add_progress(
+            stub, MagicMock(added_count=count, current_path=current_path)
+        )
+        return stub._drop_hint_label.setText.call_args.args[0]
+
+    # A real absolute path is shown as "scanning {basename}".
+    assert (
+        render(2, "/data/exp.zarr")
+        == "Adding… 2 sources registered (scanning exp.zarr)"
+    )
+    # The catalog-lock wait heartbeat is a status sentence, not a path: show it
+    # verbatim, never run through the "scanning {name}" label (cosmetic fix).
+    status = render(0, "waiting for catalog scan to finish")
+    assert "scanning" not in status
+    assert "(waiting for catalog scan to finish)" in status
+
+
 def test_dir_exceeds_entry_threshold(tmp_path, monkeypatch):
     monkeypatch.setattr(_widget, "_LARGE_DROP_ENTRY_THRESHOLD", 3)
 

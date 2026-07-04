@@ -353,11 +353,9 @@ message AddSourceProgress {
   // Number of sources registered so far in this request.
   int32 added_count = 1;
 
-  // Path currently being scanned / just registered (for a "Scanning ..." label).
+  // Path currently being scanned / just registered (for a "Scanning ..." label),
+  // or a short status sentence while the add waits (e.g. for a catalog rescan).
   string current_path = 2;
-
-  // The descriptor just registered, when this heartbeat corresponds to an add.
-  DataSourceDescriptor last_added = 3;
 }
 
 // One source that could not be registered, with a user-readable reason (e.g.

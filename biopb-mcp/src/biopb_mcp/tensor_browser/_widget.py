@@ -1167,10 +1167,15 @@ class TensorBrowserWidget(QWidget):
     def _on_add_progress(self, progress):
         """Relay per-source add progress to the drop-hint line (count-up)."""
         count = progress.added_count
-        name = os.path.basename((progress.current_path or "").rstrip("/"))
+        path = progress.current_path or ""
         msg = f"Adding… {count} source{'' if count == 1 else 's'} registered"
-        if name:
-            msg += f" (scanning {name})"
+        if os.path.isabs(path):
+            # A real filesystem path being scanned -> show its basename.
+            msg += f" (scanning {os.path.basename(path.rstrip('/'))})"
+        elif path:
+            # A status sentence (e.g. the catalog-lock wait heartbeat) -> show it
+            # verbatim, not run through the "scanning {basename}" label.
+            msg += f" ({path})"
         self._drop_hint_label.setText(msg)
 
     def _on_add_failed(self, msg: str):

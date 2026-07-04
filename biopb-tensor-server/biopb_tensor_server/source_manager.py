@@ -1763,8 +1763,8 @@ class SourceManager:
         Generator, driving the "add_source" Flight action / tensor-browser
         drag-drop. It yields event tuples the caller maps onto the wire:
 
-        - ``("progress", added_count, current_path, descriptor)`` -- one per
-          source as it registers (``descriptor`` is a ``DataSourceDescriptor``),
+        - ``("progress", added_count, current_path)`` -- one per source as it
+          registers (a running count + the path being scanned),
         - ``("result", added, already_present, failed)`` -- exactly one terminal
           tally (``added`` is a list of descriptors, ``already_present`` a list
           of source_ids, ``failed`` a list of ``(path, reason)``).
@@ -1806,7 +1806,7 @@ class SourceManager:
         # Acquire the catalog lock, heart-beating while a rescan holds it so a
         # long wait does not sit silent long enough to trip a proxy timeout.
         while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
-            yield ("progress", 0, "waiting for catalog scan to finish", None)
+            yield ("progress", 0, "waiting for catalog scan to finish")
         try:
             # Containment check (case 4): if a STRICT ancestor of the drop is
             # already owned by a source, the drop is *inside* that source. The
@@ -1889,12 +1889,7 @@ class SourceManager:
                     if self._commit_add_claim(claim, catalog_url=catalog_url):
                         desc = self._descriptor_for(claim.source_id)
                         added.append(desc)
-                        yield (
-                            "progress",
-                            len(added),
-                            str(claim.primary_path),
-                            desc,
-                        )
+                        yield ("progress", len(added), str(claim.primary_path))
                     else:
                         failed.append(
                             (
