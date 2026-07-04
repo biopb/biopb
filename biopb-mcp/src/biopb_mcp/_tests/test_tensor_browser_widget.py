@@ -235,6 +235,44 @@ class TestConnect:
         assert conn.token == "secret"
         assert len(workers) == 1  # a connect worker was started
 
+
+class TestConnectionSummary:
+    def test_advanced_panel_collapsed_by_default(self, widget):
+        w, _conn, _workers = widget
+        # The full connection controls start hidden behind the summary line.
+        # (isHidden reflects the explicit visibility flag even when the top-level
+        # widget is never shown, as in these headless tests.)
+        assert w._advanced_panel.isHidden()
+        assert not w._advanced_expanded
+        # The collapsed caret is part of the (clickable) summary line.
+        assert "▸" in w._status_summary.text()
+
+    def test_clicking_summary_reveals_and_hides_panel(self, widget):
+        w, _conn, _workers = widget
+        w._toggle_advanced()  # what the summary line's mousePressEvent calls
+        assert not w._advanced_panel.isHidden()
+        assert w._advanced_expanded
+        assert "▾" in w._status_summary.text()
+        w._toggle_advanced()
+        assert w._advanced_panel.isHidden()
+        assert not w._advanced_expanded
+        assert "▸" in w._status_summary.text()
+
+    def test_summary_shows_url_and_state_across_lifecycle(self, widget):
+        w, conn, workers = widget
+        _connected_with(conn, {"a": object()})
+
+        # Before connecting: disconnected.
+        assert conn.url in w._status_summary.text()
+        assert "disconnected" in w._status_summary.text()
+
+        w._auto_connect()
+        assert "connecting" in w._status_summary.text()  # in flight
+
+        workers.pop(0)()  # run worker -> connected
+        assert "connected" in w._status_summary.text()
+        assert "disconnected" not in w._status_summary.text()
+
     def test_stale_generation_is_dropped(self, widget):
         w, conn, workers = widget
         _connected_with(conn, {"a": object()})

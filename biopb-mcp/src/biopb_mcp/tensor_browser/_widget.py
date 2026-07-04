@@ -842,6 +842,29 @@ class TensorBrowserWidget(QWidget):
         # live in this always-visible label, not in a drop-time message.
         self.setAcceptDrops(True)
 
+        # Compact connection summary row: a single clickable line showing the
+        # server + state ("server_url — connected") with a trailing disclosure
+        # caret. Clicking it toggles the advanced connection controls
+        # (URL/token/Connect/Refresh). Those controls are touched once at setup;
+        # day-to-day the user only needs to see *that* they are connected, so
+        # they are collapsed by default. The caret + pointing-hand cursor are the
+        # affordance that the line is expandable (biopb/biopb-mcp).
+        self._advanced_expanded = False
+        self._status_summary = QLabel()
+        self._status_summary.setWordWrap(True)
+        self._status_summary.setCursor(Qt.PointingHandCursor)
+        self._status_summary.setToolTip("Show/hide connection settings")
+        # A QLabel has no clicked signal; route its click straight to the toggle.
+        self._status_summary.mousePressEvent = lambda _event: self._toggle_advanced()
+        layout.addWidget(self._status_summary)
+
+        # Advanced connection panel — hidden until the summary line is clicked.
+        # Holds the server URL, token, and Connect/Refresh controls.
+        self._advanced_panel = QWidget()
+        adv_layout = QVBoxLayout(self._advanced_panel)
+        adv_layout.setContentsMargins(0, 0, 0, 0)
+        adv_layout.setSpacing(4)
+
         # Server URL input (label and input on same row)
         server_layout = QHBoxLayout()
         server_layout.addWidget(QLabel("Server:"))
@@ -849,7 +872,7 @@ class TensorBrowserWidget(QWidget):
         self._server_input.setText(self._conn.url)
         self._server_input.setPlaceholderText("Flight server URL")
         server_layout.addWidget(self._server_input)
-        layout.addLayout(server_layout)
+        adv_layout.addLayout(server_layout)
 
         # Token input (label, input, and toggle on same row)
         token_layout = QHBoxLayout()
@@ -864,7 +887,7 @@ class TensorBrowserWidget(QWidget):
         self._show_token_btn.clicked.connect(self._toggle_token_visibility)
         token_layout.addWidget(self._token_input)
         token_layout.addWidget(self._show_token_btn)
-        layout.addLayout(token_layout)
+        adv_layout.addLayout(token_layout)
 
         # Connect and Refresh buttons
         btn_layout = QHBoxLayout()
@@ -875,7 +898,11 @@ class TensorBrowserWidget(QWidget):
         self._refresh_button.setEnabled(False)
         btn_layout.addWidget(self._connect_button)
         btn_layout.addWidget(self._refresh_button)
-        layout.addLayout(btn_layout)
+        adv_layout.addLayout(btn_layout)
+
+        self._advanced_panel.setVisible(False)
+        layout.addWidget(self._advanced_panel)
+        self._update_status_summary()
 
         # Filter input (label and input on same row)
         filter_layout = QHBoxLayout()
@@ -981,6 +1008,7 @@ class TensorBrowserWidget(QWidget):
         gen = self._connect_gen
         self._connecting = True
         self._connect_button.setEnabled(False)
+        self._update_status_summary()
         self._show_status(f"Connecting to {self._conn.url}…", sticky=True)
 
         def _worker():
@@ -1010,6 +1038,7 @@ class TensorBrowserWidget(QWidget):
         self._connecting = False
         self._connect_button.setEnabled(True)
         self._clear_status()
+        self._update_status_summary()
         self._update_drop_hint()
 
         if not self._conn.is_connected:
@@ -1042,6 +1071,35 @@ class TensorBrowserWidget(QWidget):
 
         self._build_and_display_tree()
         self._refresh_button.setEnabled(True)
+
+    def _toggle_advanced(self):
+        """Show/hide the full connection controls behind the summary line."""
+        self._advanced_expanded = not self._advanced_expanded
+        self._advanced_panel.setVisible(self._advanced_expanded)
+        self._update_status_summary()
+
+    def _update_status_summary(self):
+        """Refresh the compact connection summary line.
+
+        Renders ``<url> — <state> <caret>`` with a leading state glyph and a
+        trailing disclosure caret, mirroring the live connection state
+        (connecting / connected / disconnected) so the user can see they are
+        connected without expanding the advanced panel. The caret signals that
+        the line is clickable to reveal the connection settings.
+        """
+        url = self._conn.url or "(no server)"
+        if self._connecting:
+            glyph, color, state = "◌", "#888", "connecting…"
+        elif self._conn.is_connected:
+            glyph, color, state = "●", "#4ade80", "connected"
+        else:
+            glyph, color, state = "○", "#f87171", "disconnected"
+        caret = "▾" if self._advanced_expanded else "▸"
+        self._status_summary.setText(
+            f"<span style='color:{color}'>{glyph}</span> "
+            f"<b>{url}</b> — <span style='color:{color}'>{state}</span> "
+            f"<span style='color:#888'>{caret}</span>"
+        )
 
     def _toggle_token_visibility(self):
         """Toggle token field visibility between password and normal mode."""
