@@ -297,7 +297,7 @@ class _WarmState:
 
 
 class _AddSourceWorker(QThread):
-    """Runs ``TensorConnection.add_source`` for dropped paths off the GUI thread.
+    """Runs ``TensorConnection.add_source`` for one dropped path off the GUI thread.
 
     Registering a dropped file/dir asks the server to discover + catalog it,
     which for a plain folder is a slow recursive walk that may add many sources,
@@ -306,21 +306,22 @@ class _AddSourceWorker(QThread):
     relayed via :attr:`progress`; :meth:`request_cancel` cooperatively stops the
     walk (the client closes the stream; sources already registered stay).
 
-    Handles a list of dropped paths in one pass, aggregating the per-path tallies
-    into one terminal result: ``(added, already_present, failed, needs_confirm)``
-    where ``needs_confirm`` is the paths the server flagged as large.
+    One drop == one path == one ``add_source`` call == one terminal result
+    ``(added, already_present, failed, needs_confirm)``, where ``needs_confirm``
+    is ``True`` when the server flagged the path as a large folder. Multi-item
+    drops are refused upstream (``_local_paths_from_mime``), so there is no
+    cross-path aggregation here — a single call keeps the progress count monotone
+    and a large-dir "Yes" can't silently drop the rest of a batch's tally.
     """
 
     progress = Signal(object)  # AddSourceProgress
-    done = Signal(object)  # (added, already_present, failed, needs_confirm_paths)
+    done = Signal(object)  # (added, already_present, failed, needs_confirm)
     failed = Signal(str)
 
-    def __init__(
-        self, conn: TensorConnection, paths: List[str], confirm_large: bool = False
-    ):
+    def __init__(self, conn: TensorConnection, path: str, confirm_large: bool = False):
         super().__init__()
         self._conn = conn
-        self._paths = paths
+        self._path = path
         self._confirm_large = confirm_large
         self._cancel = threading.Event()
 
@@ -329,30 +330,20 @@ class _AddSourceWorker(QThread):
         self._cancel.set()
 
     def run(self):
-        added: list = []
-        already: list = []
-        failed: list = []
-        needs_confirm: List[str] = []
         try:
-            for path in self._paths:
-                if self._cancel.is_set():
-                    break
-                result = self._conn.add_source(
-                    path,
-                    confirm_large=self._confirm_large,
-                    on_progress=self.progress.emit,
-                    should_cancel=self._cancel.is_set,
-                )
-                if result.needs_confirm_large:
-                    needs_confirm.append(path)
-                    continue
-                added.extend(result.added)
-                already.extend(result.already_present)
-                failed.extend((f.path, f.reason) for f in result.failed)
+            result = self._conn.add_source(
+                self._path,
+                confirm_large=self._confirm_large,
+                on_progress=self.progress.emit,
+                should_cancel=self._cancel.is_set,
+            )
         except Exception as exc:  # surface the SDK/server message to the user
             self.failed.emit(str(exc))
             return
-        self.done.emit((added, already, failed, needs_confirm))
+        added = list(result.added)
+        already = list(result.already_present)
+        failed = [(f.path, f.reason) for f in result.failed]
+        self.done.emit((added, already, failed, result.needs_confirm_large))
 
 
 def _human_bytes(n: int) -> str:
@@ -703,6 +694,9 @@ class TensorBrowserWidget(QWidget):
         # In-flight drag-drop add worker (at most one at a time) plus GC retention
         # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
         self._add_worker: _AddSourceWorker | None = None
+        self._add_path: str | None = (
+            None  # path of the in-flight add (for retry/confirm)
+        )
         self._add_retain: set = set()
         self._setup_ui()
 
@@ -1055,15 +1049,24 @@ class TensorBrowserWidget(QWidget):
 
     @staticmethod
     def _local_paths_from_mime(mime) -> List[str]:
-        """Local filesystem paths carried by a drag, or [] if any URL is remote."""
+        """The single local path carried by a drag, wrapped in a list, or [].
+
+        A drop is accepted only when it is *exactly one* local file/folder. A
+        multi-item drag is refused (returns ``[]``, so the cursor shows "no
+        drop") rather than partially accepted — the add pipeline handles one
+        path per drop, and one folder still discovers many datasets in a single
+        call, so the common case is unaffected. A non-file URL (e.g. a web link)
+        is likewise rejected.
+        """
         if not mime.hasUrls():
             return []
-        paths = []
-        for url in mime.urls():
-            if not url.isLocalFile():
-                return []  # a non-file URL (e.g. a web link) -> reject the whole drop
-            paths.append(url.toLocalFile())
-        return paths
+        urls = mime.urls()
+        if len(urls) != 1:
+            return []  # exactly one item per drop; multi-select is refused
+        url = urls[0]
+        if not url.isLocalFile():
+            return []
+        return [url.toLocalFile()]
 
     def dragEnterEvent(self, event):
         """Accept a drag only if it is all-local files onto a localhost server."""
@@ -1077,33 +1080,30 @@ class TensorBrowserWidget(QWidget):
         self.dragEnterEvent(event)
 
     def dropEvent(self, event):
-        """Register the dropped local path(s) as source(s) on the server."""
+        """Register the single dropped local path as a source on the server."""
         ok, _ = self._can_accept_drop()
         paths = self._local_paths_from_mime(event.mimeData())
         if not ok or not paths:
             event.ignore()
             return
         event.acceptProposedAction()
-        self._start_add(paths)
+        self._start_add(paths[0])
 
-    def _start_add(self, paths: List[str], confirm_large: bool = False):
-        """Spawn the off-GUI-thread add worker for *paths* (non-modal)."""
+    def _start_add(self, path: str, confirm_large: bool = False):
+        """Spawn the off-GUI-thread add worker for *path* (non-modal)."""
         if self._add_worker is not None:
             return  # one add at a time
         self._clear_error()
-        worker = _AddSourceWorker(self._conn, paths, confirm_large=confirm_large)
+        worker = _AddSourceWorker(self._conn, path, confirm_large=confirm_large)
         self._add_worker = worker
+        self._add_path = path
         self._add_retain.add(worker)
         worker.progress.connect(self._on_add_progress)
         worker.done.connect(self._on_add_done)
         worker.failed.connect(self._on_add_failed)
         worker.finished.connect(lambda w=worker: self._add_retain.discard(w))
         self._add_cancel_btn.setVisible(True)
-        label = (
-            os.path.basename(paths[0].rstrip("/"))
-            if len(paths) == 1
-            else f"{len(paths)} items"
-        )
+        label = os.path.basename(path.rstrip("/")) or path
         self._drop_hint_label.setText(f"Adding {label}…")
         worker.start()
 
@@ -1125,6 +1125,7 @@ class TensorBrowserWidget(QWidget):
     def _on_add_failed(self, msg: str):
         """Whole-request add failure (e.g. path not found on the server)."""
         self._add_worker = None
+        self._add_path = None
         self._add_cancel_btn.setVisible(False)
         self._update_drop_hint()
         self._report_failure("Add data failed", msg)
@@ -1132,7 +1133,9 @@ class TensorBrowserWidget(QWidget):
     def _on_add_done(self, payload):
         """Terminal add tally: refresh, summarize, prompt/large, report failures."""
         added, already, failed, needs_confirm = payload
+        path = self._add_path
         self._add_worker = None
+        self._add_path = None
         self._add_cancel_btn.setVisible(False)
 
         # Prompt sources appear immediately; the background watcher would also
@@ -1143,21 +1146,19 @@ class TensorBrowserWidget(QWidget):
             except Exception:
                 logger.exception("refresh after add_source failed")
 
-        # Large-directory guard: confirm, then retry the flagged paths.
-        if needs_confirm:
-            names = ", ".join(
-                os.path.basename(p.rstrip("/")) or p for p in needs_confirm
-            )
+        # Large-directory guard: confirm, then retry the same path.
+        if needs_confirm and path is not None:
+            name = os.path.basename(path.rstrip("/")) or path
             resp = QMessageBox.question(
                 self,
                 "Add large folder?",
-                f"“{names}” contains many files. Scan it and add all datasets "
+                f"“{name}” contains many files. Scan it and add all datasets "
                 "found under it?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if resp == QMessageBox.Yes:
-                self._start_add(needs_confirm, confirm_large=True)
+                self._start_add(path, confirm_large=True)
                 return
 
         parts = []

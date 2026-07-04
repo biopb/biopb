@@ -1,10 +1,10 @@
 """Drag-and-drop add logic for the tensor-browser widget.
 
 Exercises the pieces that carry real logic without a full widget/napari
-construction: the off-thread ``_AddSourceWorker`` tally aggregation across
-several dropped paths, the ambient drop-gate predicate, and mime-URL filtering.
-A live server round-trip through the ``add_source`` action is covered separately
-in biopb-tensor-server's ``add_source_test.py``.
+construction: the off-thread single-path ``_AddSourceWorker`` result mapping,
+the ambient drop-gate predicate, and mime-URL filtering (which refuses
+multi-item drops). A live server round-trip through the ``add_source`` action is
+covered separately in biopb-tensor-server's ``add_source_test.py``.
 """
 
 from unittest.mock import MagicMock
@@ -37,14 +37,14 @@ def _result(added=(), already=(), failed=(), needs=False):
     return r
 
 
-def test_worker_aggregates_tallies_across_paths(_qapp):
+def test_worker_maps_single_result(_qapp):
     conn = MagicMock()
-    conn.add_source.side_effect = [
-        _result(added=[MagicMock(source_id="a")]),
-        _result(needs=True),  # path B flagged large -> collected for confirm
-        _result(already=["c"], failed=[("/p/bad", "not a recognized image format")]),
-    ]
-    worker = _AddSourceWorker(conn, ["/A", "/B", "/C"])
+    conn.add_source.return_value = _result(
+        added=[MagicMock(source_id="a")],
+        already=["c"],
+        failed=[("/p/bad", "not a recognized image format")],
+    )
+    worker = _AddSourceWorker(conn, "/A")
 
     captured = {}
     worker.done.connect(
@@ -54,16 +54,34 @@ def test_worker_aggregates_tallies_across_paths(_qapp):
     )
     worker.run()  # synchronous; direct-connected slot fires inline
 
+    conn.add_source.assert_called_once()
+    assert conn.add_source.call_args.args[0] == "/A"
     assert [d.source_id for d in captured["added"]] == ["a"]
     assert captured["already"] == ["c"]
     assert captured["failed"] == [("/p/bad", "not a recognized image format")]
-    assert captured["needs"] == ["/B"]
+    assert captured["needs"] is False
+
+
+def test_worker_relays_needs_confirm_large(_qapp):
+    conn = MagicMock()
+    conn.add_source.return_value = _result(needs=True)
+    worker = _AddSourceWorker(conn, "/big")
+
+    captured = {}
+    worker.done.connect(
+        lambda payload: captured.update(
+            zip(("added", "already", "failed", "needs"), payload)
+        )
+    )
+    worker.run()
+
+    assert captured["needs"] is True
 
 
 def test_worker_surfaces_request_failure(_qapp):
     conn = MagicMock()
     conn.add_source.side_effect = RuntimeError("Path not found on server: /nope")
-    worker = _AddSourceWorker(conn, ["/nope"])
+    worker = _AddSourceWorker(conn, "/nope")
     errors = []
     worker.failed.connect(errors.append)
 
@@ -101,16 +119,22 @@ def test_can_accept_drop_gate(connected, local, adding, ok):
     assert reason  # a human-readable reason is always present
 
 
-def test_local_paths_from_mime_rejects_mixed_or_remote(_qapp):
+def test_local_paths_from_mime_accepts_single_local_only(_qapp):
     from_mime = TensorBrowserWidget._local_paths_from_mime
 
-    local = QMimeData()
-    local.setUrls([QUrl.fromLocalFile("/data/a.zarr"), QUrl.fromLocalFile("/data/b")])
-    assert from_mime(local) == ["/data/a.zarr", "/data/b"]
+    single = QMimeData()
+    single.setUrls([QUrl.fromLocalFile("/data/a.zarr")])
+    assert from_mime(single) == ["/data/a.zarr"]
 
-    # A non-file URL anywhere rejects the whole drop (returns []).
-    mixed = QMimeData()
-    mixed.setUrls([QUrl.fromLocalFile("/data/a.zarr"), QUrl("https://example.com")])
-    assert from_mime(mixed) == []
+    # A multi-item drop is refused at the source (returns []): the add pipeline
+    # is one path per drop, so a multi-select drag shows "no drop".
+    multi = QMimeData()
+    multi.setUrls([QUrl.fromLocalFile("/data/a.zarr"), QUrl.fromLocalFile("/data/b")])
+    assert from_mime(multi) == []
+
+    # A single non-file URL (e.g. a web link) is rejected too.
+    remote = QMimeData()
+    remote.setUrls([QUrl("https://example.com")])
+    assert from_mime(remote) == []
 
     assert from_mime(QMimeData()) == []  # no urls at all
