@@ -24,6 +24,7 @@ from biopb_mcp.tensor_browser import _widget
 from biopb_mcp.tensor_browser._widget import (
     TensorBrowserWidget,
     _AddSourceWorker,
+    _cloud_drop_warning,
     _dir_exceeds_entry_threshold,
 )
 
@@ -195,3 +196,47 @@ def test_confirm_large_drop_prompts_only_when_large(monkeypatch):
         _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.Yes
     )
     assert TensorBrowserWidget._confirm_large_drop(MagicMock(), "/huge") is True
+
+
+@pytest.mark.parametrize(
+    "path,expect_warn",
+    [
+        (r"C:\Users\me\OneDrive\Desktop\samples", True),  # under OneDrive
+        (r"C:\Users\me\OneDrive - Acme\data\a.zarr", True),  # OneDrive - <Org>
+        ("/mnt/c/Users/me/OneDrive/data", True),  # forward-slash variant
+        (r"C:\Users\me\Desktop\samples", False),  # not under OneDrive
+        ("/data/microscopy/exp.zarr", False),  # plain local
+        (r"C:\Onedriver\notcloud", False),  # substring, not a OneDrive component
+    ],
+)
+def test_cloud_drop_warning_detects_onedrive(path, expect_warn):
+    warning = _cloud_drop_warning(path)
+    if expect_warn:
+        assert warning is not None and "OneDrive" in warning
+    else:
+        assert warning is None
+
+
+def test_confirm_cloud_drop_prompts_only_under_cloud(monkeypatch):
+    # Non-cloud path: no prompt, proceed silently.
+    monkeypatch.setattr(_widget, "_cloud_drop_warning", lambda _p: None)
+    asked = []
+    monkeypatch.setattr(
+        _widget.QMessageBox,
+        "question",
+        lambda *a, **k: asked.append(a) or _widget.QMessageBox.Yes,
+    )
+    assert TensorBrowserWidget._confirm_cloud_drop(MagicMock(), "/local") is True
+    assert asked == []  # never prompted
+
+    # Cloud path: prompt; the user's choice is returned verbatim.
+    monkeypatch.setattr(_widget, "_cloud_drop_warning", lambda _p: "heads up")
+    monkeypatch.setattr(
+        _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.No
+    )
+    assert TensorBrowserWidget._confirm_cloud_drop(MagicMock(), "/od") is False
+
+    monkeypatch.setattr(
+        _widget.QMessageBox, "question", lambda *a, **k: _widget.QMessageBox.Yes
+    )
+    assert TensorBrowserWidget._confirm_cloud_drop(MagicMock(), "/od") is True
