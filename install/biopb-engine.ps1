@@ -213,7 +213,8 @@ function Write-ServerConfig {
         [string]$DataDir,
         [bool]$Cloud,
         [bool]$Monitor = $true, # watch the source (false for the static sample bundle)
-        [string]$Prior = ""    # existing config to preserve (.json) or migrate (.toml)
+        [string]$Prior = "",   # existing config to preserve (.json) or migrate (.toml)
+        [string]$Alias = ""    # catalog tree-root label ("samples" for the sample bundle)
     )
 
     $data = $null
@@ -237,9 +238,12 @@ function Write-ServerConfig {
 
     # One folder, replacing any prior sources. A user data dir is watched; the
     # static sample bundle is not (monitor = false). A cloud/synced root admits
-    # Files-On-Demand placeholders as unresolved sources (cloud = true).
+    # Files-On-Demand placeholders as unresolved sources (cloud = true). An alias
+    # (set for the sample bundle) makes the source its own catalog tree root in
+    # the browser rather than nesting under the absolute install path.
     $src = [ordered]@{ url = $DataDir; monitor = $Monitor }
     if ($Cloud) { $src["cloud"] = $true }
+    if ($Alias) { $src["alias"] = $Alias }
     $sources = @([pscustomobject]$src)
     if ($data.PSObject.Properties.Name -contains 'sources') {
         $data.sources = $sources
@@ -1290,7 +1294,8 @@ function Invoke-BiopbInstall {
 
         # Load existing settings (json) / migrate from defaults (toml) and replace
         # only the sources block -- a new data dir no longer discards tuning (#34).
-        Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Monitor $isMonitored -Prior $existingConfig
+        $sourceAlias = if ($seedSamples) { "samples" } else { "" }
+        Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Monitor $isMonitored -Prior $existingConfig -Alias $sourceAlias
         $activeConfig = $configFile
 
         # Retire a legacy TOML we just superseded so the server does not warn about

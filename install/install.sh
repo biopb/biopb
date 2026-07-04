@@ -141,9 +141,11 @@ PY
 # (biopb/biopb#34). JSON generation is stdlib on both ends (json.dump), so the
 # old hand-rolled TOML escaping is gone.
 #
-# Usage: _write_server_config <out-json> <data-dir> <monitor:true|false> [prior-config]
+# Usage: _write_server_config <out-json> <data-dir> <monitor:true|false> [prior-config] [alias]
 # <monitor> is the watch flag for the single source: "true" for a user data dir
 # (new files auto-register), "false" for the curated, static sample bundle.
+# <alias>, when set (the sample bundle passes "samples"), makes the source its own
+# catalog tree root in the browser instead of nesting under the absolute path.
 # When <prior-config> exists, its settings (server/cache/...) are loaded and
 # *preserved*; only the `sources` list is replaced with the chosen data dir, so
 # re-running with a new folder no longer discards the user's tuning. A prior
@@ -152,12 +154,13 @@ PY
 # falls back to fresh defaults. The caller retires the legacy TOML. Writes
 # atomically; returns non-zero on any error.
 _write_server_config() {
-    local out="$1" data_dir="$2" monitor="$3" prior="${4:-}"
+    local out="$1" data_dir="$2" monitor="$3" prior="${4:-}" alias="${5:-}"
     mkdir -p "$(dirname "$out")"
-    _py - "$out" "$data_dir" "$prior" "$monitor" <<'PY'
+    _py - "$out" "$data_dir" "$prior" "$monitor" "$alias" <<'PY'
 import json, os, sys
 
 out, data_dir, prior, monitor = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+alias = sys.argv[5] if len(sys.argv) > 5 else ""
 
 data = {}
 if prior and os.path.exists(prior):
@@ -198,8 +201,13 @@ if isinstance(md, dict):
     if md:
         data["metadata_db"] = md
 # Point the server at exactly one folder, replacing any prior sources. The
-# sample bundle is static so it is not monitored; a user data dir is.
-data["sources"] = [{"url": data_dir, "monitor": monitor == "true"}]
+# sample bundle is static so it is not monitored; a user data dir is. An alias
+# (set for the sample bundle) makes the source its own catalog tree root in the
+# browser rather than nesting under the absolute install path.
+src = {"url": data_dir, "monitor": monitor == "true"}
+if alias:
+    src["alias"] = alias
+data["sources"] = [src]
 
 tmp = out + ".biopb.tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
@@ -1200,8 +1208,11 @@ install_biopb() {
     # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
     local DATA_DIR
     # Watch a user's own data dir (new files auto-register); leave the static
-    # sample bundle unmonitored.
+    # sample bundle unmonitored. The sample bundle is also given an alias so it
+    # appears as its own "samples" root in the browser (a user data dir keeps its
+    # native path tree -- no alias).
     local MONITOR="true"
+    local ALIAS=""
     if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
         # Existing config, no override: keep it exactly as-is (upgrade fast path).
         DATA_DIR=""
@@ -1217,6 +1228,7 @@ install_biopb() {
         # Fresh install, no override: seed samples and point the config at them.
         DATA_DIR="$SAMPLES_DIR"
         MONITOR="false"
+        ALIAS="samples"
         _seed_samples "$SAMPLES_DIR"
         _ok "Data directory: $DATA_DIR (sample images)"
     fi
@@ -1231,7 +1243,7 @@ install_biopb() {
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
             exit 1
         fi
-        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$MONITOR" "$EXISTING_CONFIG"; then
+        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$MONITOR" "$EXISTING_CONFIG" "$ALIAS"; then
             _err "Failed to write config: $CONFIG_FILE"
             exit 1
         fi
