@@ -126,7 +126,8 @@ def _tensor_short_name(array_id: str) -> str:
 _RESIDENCY_GLYPH = "☁"
 _REMOTE_TOOLTIP = (
     "Not resident — content is remote or not yet local; "
-    "reading it may be slow or block until it is hydrated"
+    "reading it may be slow or block until it is hydrated. "
+    "(Cloud / remote source support is experimental.)"
 )
 _RESIDENT_TOOLTIP = "Resident — content is local and cheap to read"
 
@@ -334,6 +335,7 @@ def _cloud_drop_warning(path: str) -> str | None:
     name = os.path.basename(path.rstrip("/\\")) or path
     return (
         f"“{name}” is inside OneDrive, a cloud-synced folder.\n\n"
+        "Cloud-synced source support is experimental.\n\n"
         "It will be indexed while its files are downloaded to this PC, but if "
         "OneDrive Files On-Demand later dehydrates them to free up space, reads "
         "can become slow or fail until Windows re-downloads them. Marking the "

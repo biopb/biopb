@@ -348,10 +348,15 @@ class SourceConfig:
     A source may contain multiple tensors (multifield support) - the adapter
     handles tensor enumeration via list_tensor_descriptors() at runtime.
 
+    Remote/cloud source features are EXPERIMENTAL (marked below): remote URLs,
+    ``cloud = true`` synced-folder roots, the ``tensor-server`` proxy type, its
+    ``alias``, and ``credentials_profile``. Local-file sources are stable.
+
     Attributes:
-        url: URL or path to the data source (supports local paths and remote URLs)
+        url: URL or path to the data source. Local paths are stable; remote URLs
+             (s3://, http(s)://, grpc://) are experimental.
         type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs",
-              "aics", or "tensor-server" (an upstream biopb tensor server, fronted as a caching proxy).
+              "aics", or "tensor-server" (experimental; an upstream biopb tensor server, fronted as a caching proxy).
               Optional - auto-detected if None (local files, or a grpc:// endpoint -> "tensor-server").
         source_id: Unique identifier for the data source (auto-generated from URL if None)
         dim_labels: Dimension labels (optional, applies to all tensors in source)
@@ -359,13 +364,13 @@ class SourceConfig:
         monitor: Enable live filesystem monitoring for this source (local directories only)
                  When True, the server will watch for file add/delete events and update
                  the catalog automatically.
-        cloud: Treat this root as cloud/synced-folder storage (OneDrive, Dropbox, ...).
+        cloud: (experimental) Treat this root as cloud/synced-folder storage (OneDrive, Dropbox, ...).
                When True, dehydrated (offline-placeholder) entries under this root are
                admitted as *unresolved* sources instead of being skipped, and their
                shape/dtype is resolved lazily on first access (cloud-storage phase 2).
                Opt-in only -- it does not weaken the global placeholder guard elsewhere.
-        credentials_profile: Name of credential profile for remote URLs (overrides global default)
-        alias: Namespace prefix for an upstream "tensor-server" source. The proxy
+        credentials_profile: (experimental) Name of credential profile for remote URLs (overrides global default)
+        alias: (experimental) Namespace prefix for an upstream "tensor-server" source. The proxy
                mirrors the upstream's sources under "<alias>__<upstream_source_id>"
                so multiple upstreams (and local sources) coexist in one flat,
                source_id-keyed catalog without id collisions. Must be slash-free
