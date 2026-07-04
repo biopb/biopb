@@ -2340,7 +2340,10 @@ def create_source_manager(
             # first access still resolves it cheaply.
             unresolved=bool(source.cloud),
         )
-        manager._commit_add_claim(claim)
+        # source._catalog_url is the alias-derived display tree-root for a local
+        # source (config.resolve_all_sources), or None. Threaded as the descriptor's
+        # source_url override, exactly like the drag-drop re-rooting path.
+        manager._commit_add_claim(claim, catalog_url=source._catalog_url)
 
     # Monitored discovery is NOT run synchronously here: under progressive
     # discovery the launcher starts the manager's event loop and the watcher

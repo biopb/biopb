@@ -163,6 +163,44 @@ class TestAddLocalSource:
         assert added == [] and len(failed) == 1
         assert "already part of" in failed[0][1]
 
+    def test_static_config_alias_reroots_descriptor_source_url(self, tmp_path):
+        """A configured local source with an ``alias`` surfaces that alias as its
+        catalog tree root -- the config-line analogue of a drag-dropped folder
+        getting its own root. End-to-end: resolve_all_sources computes the
+        catalog_url from the alias, create_source_manager threads it as the
+        descriptor's display source_url override (never the source_id)."""
+        from biopb_tensor_server.config import (
+            ServerConfig,
+            SourceConfig,
+            resolve_all_sources,
+        )
+        from biopb_tensor_server.source_manager import create_source_manager
+
+        root = tmp_path / "acquisition"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        _make_zarr(str(root), "b.zarr")
+
+        cfg = ServerConfig(sources=[SourceConfig(url=str(root), alias="exp")])
+        static_sources = resolve_all_sources(cfg)
+
+        server = TensorFlightServer("grpc://localhost:0")
+        manager = create_source_manager(
+            server=server,
+            registry=get_default_registry(),
+            watcher=None,
+            static_sources=static_sources,
+        )
+        assert manager is not None
+
+        urls = sorted(
+            adapter.get_source_descriptor().source_url
+            for adapter in server._sources.values()
+        )
+        assert urls == ["exp/a.zarr", "exp/b.zarr"]
+        # Display-only: source_id still hashes the raw path, not the alias.
+        assert all("exp" not in sid for sid in server._sources)
+
     def test_readd_same_path_is_already_present(self, tmp_path):
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
