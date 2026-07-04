@@ -95,9 +95,9 @@ the launcher injects the entrypoint via `set_add_source_handler(...)`.
 - **Streaming.** A directory walk has no known size up front, so the action
   streams `AddSourceStreamMessage` (zero or more `AddSourceProgress` heartbeats —
   a running *count* of sources registered, not a percentage — then one terminal
-  `AddSourceResult` carrying `added` / `already_present` / `failed(path, reason)`
-  / `needs_confirm_large`). The client can cancel by closing the stream; the walk
-  stops but everything already registered stays (non-destructive).
+  `AddSourceResult` carrying `added` / `already_present` / `failed(path, reason)`).
+  The client can cancel by closing the stream; the walk stops but everything
+  already registered stays (non-destructive).
 - **Single-writer safety.** `add_local_source` runs inline on the Flight handler
   thread but under `SourceManager._catalog_lock`, which the periodic rescan also
   holds — so the two never mutate the confirmed catalog at once. Discovery runs
@@ -110,8 +110,9 @@ the launcher injects the entrypoint via `set_add_source_handler(...)`.
   because dir sources record only the directory as a member. Dropping a **parent**
   of existing sources re-discovers them (same id → `already_present`) and adds new
   siblings. A plain-directory drop above `_ADD_SOURCE_LARGE_DIR_THRESHOLD` entries
-  is declined with `needs_confirm_large` until the client retries with
-  `confirm_large=True`.
+  is declined outright as a `failed` entry ("directory too large to scan on drop
+  — drop a subfolder, or add it via the server config file") — no modal, no
+  retry; the threshold counts filesystem *entries*, a coarse footgun-stopper.
 - **Locality.** Runtime add is local-path only (a remote URL raises); the client
   gate additionally enables the drop UI only against a localhost server, since a
   dropped path is a client-side filesystem path.

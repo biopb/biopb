@@ -28,12 +28,11 @@ def _qapp():
     yield QApplication.instance() or QApplication([])
 
 
-def _result(added=(), already=(), failed=(), needs=False):
+def _result(added=(), already=(), failed=()):
     r = MagicMock()
     r.added = list(added)
     r.already_present = list(already)
     r.failed = [MagicMock(path=p, reason=why) for p, why in failed]
-    r.needs_confirm_large = needs
     return r
 
 
@@ -48,9 +47,7 @@ def test_worker_maps_single_result(_qapp):
 
     captured = {}
     worker.done.connect(
-        lambda payload: captured.update(
-            zip(("added", "already", "failed", "needs"), payload)
-        )
+        lambda payload: captured.update(zip(("added", "already", "failed"), payload))
     )
     worker.run()  # synchronous; direct-connected slot fires inline
 
@@ -59,23 +56,27 @@ def test_worker_maps_single_result(_qapp):
     assert [d.source_id for d in captured["added"]] == ["a"]
     assert captured["already"] == ["c"]
     assert captured["failed"] == [("/p/bad", "not a recognized image format")]
-    assert captured["needs"] is False
 
 
-def test_worker_relays_needs_confirm_large(_qapp):
+def test_worker_surfaces_large_dir_as_failed(_qapp):
+    # A directory over the server's large-scan threshold now comes back as a
+    # plain failed entry (no modal, no retry) -- the worker just relays it.
     conn = MagicMock()
-    conn.add_source.return_value = _result(needs=True)
-    worker = _AddSourceWorker(conn, "/big")
+    conn.add_source.return_value = _result(
+        failed=[("/huge", "directory too large to scan on drop -- drop a subfolder")]
+    )
+    worker = _AddSourceWorker(conn, "/huge")
 
     captured = {}
     worker.done.connect(
-        lambda payload: captured.update(
-            zip(("added", "already", "failed", "needs"), payload)
-        )
+        lambda payload: captured.update(zip(("added", "already", "failed"), payload))
     )
     worker.run()
 
-    assert captured["needs"] is True
+    assert captured["added"] == [] and captured["already"] == []
+    assert captured["failed"] == [
+        ("/huge", "directory too large to scan on drop -- drop a subfolder")
+    ]
 
 
 def test_worker_surfaces_request_failure(_qapp):

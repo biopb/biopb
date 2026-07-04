@@ -50,10 +50,13 @@ logger = logging.getLogger(__name__)
 _UPSTREAM_RELIST_MAX_TICKS = 120
 
 # Runtime source add (the "add_source" Flight action / tensor-browser drag-drop).
-# A plain-directory drop with more than this many entries is declined until the
-# client re-requests with confirm_large=True, so a user who drops a huge or
-# high-level folder gets a chance to reconsider before the recursive walk. The
-# count short-circuits at the threshold, so it is cheap even for enormous trees.
+# A plain-directory drop with more than this many entries is declined outright
+# (a "directory too large" failure), so a user who drops a huge or high-level
+# folder does not kick off a runaway recursive walk that would also bloat the
+# catalog/browser -- they drop a subfolder, or add the root via config instead.
+# The count short-circuits at the threshold, so it is cheap even for enormous
+# trees. Note it counts filesystem *entries*, not resulting *sources*, so it is a
+# coarse footgun-stopper, not a precise cap on the catalog.
 _ADD_SOURCE_LARGE_DIR_THRESHOLD = 2000
 
 # While add_local_source waits for the catalog lock (a rescan is mid-flight), it
@@ -1763,7 +1766,6 @@ class SourceManager:
         source_type: str = "",
         dim_labels: Optional[List[str]] = None,
         monitor: bool = False,
-        confirm_large: bool = False,
         should_cancel: Optional[Callable[[], bool]] = None,
     ):
         """Register ``url`` (a path on the server) as source(s) at runtime.
@@ -1773,10 +1775,9 @@ class SourceManager:
 
         - ``("progress", added_count, current_path, descriptor)`` -- one per
           source as it registers (``descriptor`` is a ``DataSourceDescriptor``),
-        - ``("result", added, already_present, failed, needs_confirm_large)`` --
-          exactly one terminal tally (``added`` is a list of descriptors,
-          ``already_present`` a list of source_ids, ``failed`` a list of
-          ``(path, reason)``).
+        - ``("result", added, already_present, failed)`` -- exactly one terminal
+          tally (``added`` is a list of descriptors, ``already_present`` a list
+          of source_ids, ``failed`` a list of ``(path, reason)``).
 
         The walk + commit run inline on the CALLING (Flight handler) thread, but
         under ``self._catalog_lock`` -- so they are mutually exclusive with the
@@ -1824,7 +1825,7 @@ class SourceManager:
             owner = self._find_containing_source(url)
             if owner is not None:
                 failed.append((url, f"already part of source '{owner}'"))
-                yield ("result", added, already_present, failed, False)
+                yield ("result", added, already_present, failed)
                 return
 
             # Is the dropped path itself a dataset (single claim), or a plain
@@ -1836,9 +1837,20 @@ class SourceManager:
             if root_claims:
                 claims: List[SourceClaim] = [root_claims[0]]
             elif is_dir:
-                # Large-scan guard (case 5) before the recursive walk.
-                if not confirm_large and self._dir_exceeds_scan_threshold(url):
-                    yield ("result", [], [], [], True)
+                # Large-scan guard (case 5): decline a huge/high-level folder
+                # outright rather than kicking off a runaway recursive walk. A
+                # plain failure (no modal, no retry) keeps the safety brake while
+                # leaving the user in control -- drop a subfolder, or add the root
+                # via config.
+                if self._dir_exceeds_scan_threshold(url):
+                    failed.append(
+                        (
+                            url,
+                            "directory too large to scan on drop -- drop a "
+                            "subfolder, or add it via the server config file",
+                        )
+                    )
+                    yield ("result", added, already_present, failed)
                     return
                 discover_sources(
                     Path(url),
@@ -1857,7 +1869,7 @@ class SourceManager:
                     else "not a recognized image format"
                 )
                 failed.append((url, reason))
-                yield ("result", added, already_present, failed, False)
+                yield ("result", added, already_present, failed)
                 return
 
             # Assign identity to every claim up front so the overlap check below
@@ -1918,7 +1930,7 @@ class SourceManager:
             if monitor and is_dir:
                 self._monitored_dirs.add(Path(url))
 
-            yield ("result", added, already_present, failed, False)
+            yield ("result", added, already_present, failed)
         finally:
             self._catalog_lock.release()
 

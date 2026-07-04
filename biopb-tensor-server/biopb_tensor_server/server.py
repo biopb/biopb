@@ -970,7 +970,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 source_type=req.source_type,
                 dim_labels=list(req.dim_labels),
                 monitor=req.monitor,
-                confirm_large=req.confirm_large,
                 should_cancel=_should_cancel,
             )
             for event in events:
@@ -985,10 +984,9 @@ class TensorFlightServer(flight.FlightServerBase):
                         progress.last_added.CopyFrom(descriptor)
                     yield AddSourceStreamMessage(progress=progress).SerializeToString()
                 else:  # "result"
-                    _, added, already_present, failed, needs_confirm_large = event
+                    _, added, already_present, failed = event
                     result = AddSourceResult(
                         already_present=already_present,
-                        needs_confirm_large=needs_confirm_large,
                     )
                     result.added.extend(d for d in added if d is not None)
                     for path, reason in failed:

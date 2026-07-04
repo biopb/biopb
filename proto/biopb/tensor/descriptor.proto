@@ -343,10 +343,6 @@ message AddSourceRequest {
   // Register a directory as a live-monitored root (rescans track later changes).
   // Ignored for single-file sources.
   bool monitor = 4;
-
-  // Client acknowledged the large-scan guard: proceed with a directory walk the
-  // server flagged as large (see AddSourceResult.needs_confirm_large).
-  bool confirm_large = 5;
 }
 
 // Progress heartbeat for an in-flight "add_source" action: one emitted per
@@ -382,14 +378,10 @@ message AddSourceResult {
   // "nothing happened".
   repeated string already_present = 2;
 
-  // Paths that failed to register, each with its reason.
+  // Paths that failed to register, each with its reason. A directory dropped
+  // above the large-scan threshold is declined here too ("directory too large
+  // to scan on drop -- drop a subfolder, or add it via the server config file").
   repeated AddSourceFailure failed = 3;
-
-  // The directory walk was declined because it exceeded the large-scan
-  // threshold and the request did not set confirm_large. The client should
-  // confirm with the user and retry with confirm_large = true. When set, the
-  // other fields are empty.
-  bool needs_confirm_large = 4;
 }
 
 // One message in the "add_source" action's result stream: zero or more

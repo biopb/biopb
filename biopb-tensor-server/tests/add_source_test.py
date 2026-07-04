@@ -58,12 +58,18 @@ def _make_manager():
 
 
 def _drain(gen):
-    """Run an add_local_source generator to its terminal result tuple."""
-    added, already, failed, needs_confirm = [], [], [], False
+    """Run an add_local_source generator to its terminal result tuple.
+
+    Returns ``(added, already, failed, needs_confirm)`` where ``needs_confirm``
+    is always False -- the large-scan guard is now a plain ``failed`` entry, not
+    a separate flag, but the 4-tuple shape is kept so existing callers/asserts
+    that unpack four values still read cleanly.
+    """
+    added, already, failed = [], [], []
     for event in gen:
         if event[0] == "result":
-            _, added, already, failed, needs_confirm = event
-    return added, already, failed, needs_confirm
+            _, added, already, failed = event
+    return added, already, failed, False
 
 
 class TestAddLocalSource:
@@ -165,6 +171,26 @@ class TestAddLocalSource:
         assert sid1 in already
         assert not failed
 
+    def test_large_dir_declined_as_failed_not_flagged(self, tmp_path):
+        """A directory over the large-scan threshold is declined outright with a
+        'directory too large' failure (no needs_confirm flag, no walk)."""
+        manager, _ = _make_manager()
+        big = tmp_path / "big"
+        big.mkdir()
+        _make_zarr(str(big), "a.zarr")  # a real dataset lives under it
+        # Force the threshold without materializing thousands of entries.
+        manager._dir_exceeds_scan_threshold = lambda _p: True
+
+        added, already, failed, needs_confirm = _drain(
+            manager.add_local_source(str(big))
+        )
+
+        assert added == [] and already == []
+        assert needs_confirm is False  # no separate confirm flag anymore
+        assert len(failed) == 1
+        assert failed[0][0] == os.path.realpath(str(big))
+        assert "too large" in failed[0][1]
+
     def test_empty_dir_reports_no_datasets(self, tmp_path):
         """Case 6: an empty folder gets a distinct 'no datasets' reason."""
         manager, _ = _make_manager()
@@ -210,12 +236,12 @@ class TestAddLocalSource:
             return state["n"] >= 1
 
         gen = manager.add_local_source(str(tmp_path), should_cancel=should_cancel)
-        added, already, failed, _ = [], [], [], False
+        added, already, failed = [], [], []
         for event in gen:
             if event[0] == "progress":
                 state["n"] += 1
             else:
-                _, added, already, failed, _ = event
+                _, added, already, failed = event
 
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
         for desc in added:

@@ -256,7 +256,6 @@ class TestConnect:
         client.add_source.assert_called_once_with(
             "/data/x.zarr",
             monitor=False,
-            confirm_large=False,
             on_progress=None,
             should_cancel=None,
         )

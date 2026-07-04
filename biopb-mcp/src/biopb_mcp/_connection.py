@@ -364,7 +364,6 @@ class TensorConnection:
         path: str,
         *,
         monitor: bool = False,
-        confirm_large: bool = False,
         on_progress=None,
         should_cancel=None,
     ):
@@ -380,17 +379,16 @@ class TensorConnection:
 
         ``on_progress`` (an ``AddSourceProgress`` per registered source) and
         ``should_cancel`` (polled per message; a cancel stops the walk but keeps
-        what is already registered) are forwarded verbatim. ``confirm_large``
-        acknowledges the server's large-directory guard on a retry. Returns the
-        terminal ``AddSourceResult`` (added / already_present / failed /
-        needs_confirm_large).
+        what is already registered) are forwarded verbatim. Returns the terminal
+        ``AddSourceResult`` (added / already_present / failed); a directory
+        dropped above the server's large-scan threshold comes back as a
+        ``failed`` entry.
         """
         if self.client is None:
             raise RuntimeError("Not connected")
         result = self.client.add_source(
             path,
             monitor=monitor,
-            confirm_large=confirm_large,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )

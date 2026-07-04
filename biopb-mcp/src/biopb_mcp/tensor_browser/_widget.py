@@ -307,22 +307,21 @@ class _AddSourceWorker(QThread):
     walk (the client closes the stream; sources already registered stay).
 
     One drop == one path == one ``add_source`` call == one terminal result
-    ``(added, already_present, failed, needs_confirm)``, where ``needs_confirm``
-    is ``True`` when the server flagged the path as a large folder. Multi-item
-    drops are refused upstream (``_local_paths_from_mime``), so there is no
-    cross-path aggregation here — a single call keeps the progress count monotone
-    and a large-dir "Yes" can't silently drop the rest of a batch's tally.
+    ``(added, already_present, failed)``. Multi-item drops are refused upstream
+    (``_local_paths_from_mime``), so there is no cross-path aggregation here — a
+    single call keeps the progress count monotone. A directory dropped above the
+    server's large-scan threshold comes back as a ``failed`` entry (no modal, no
+    retry): the user drops a subfolder or adds the root via config.
     """
 
     progress = Signal(object)  # AddSourceProgress
-    done = Signal(object)  # (added, already_present, failed, needs_confirm)
+    done = Signal(object)  # (added, already_present, failed)
     failed = Signal(str)
 
-    def __init__(self, conn: TensorConnection, path: str, confirm_large: bool = False):
+    def __init__(self, conn: TensorConnection, path: str):
         super().__init__()
         self._conn = conn
         self._path = path
-        self._confirm_large = confirm_large
         self._cancel = threading.Event()
 
     def request_cancel(self):
@@ -333,7 +332,6 @@ class _AddSourceWorker(QThread):
         try:
             result = self._conn.add_source(
                 self._path,
-                confirm_large=self._confirm_large,
                 on_progress=self.progress.emit,
                 should_cancel=self._cancel.is_set,
             )
@@ -343,7 +341,7 @@ class _AddSourceWorker(QThread):
         added = list(result.added)
         already = list(result.already_present)
         failed = [(f.path, f.reason) for f in result.failed]
-        self.done.emit((added, already, failed, result.needs_confirm_large))
+        self.done.emit((added, already, failed))
 
 
 def _human_bytes(n: int) -> str:
@@ -694,9 +692,6 @@ class TensorBrowserWidget(QWidget):
         # In-flight drag-drop add worker (at most one at a time) plus GC retention
         # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
         self._add_worker: _AddSourceWorker | None = None
-        self._add_path: str | None = (
-            None  # path of the in-flight add (for retry/confirm)
-        )
         self._add_retain: set = set()
         self._setup_ui()
 
@@ -1089,14 +1084,13 @@ class TensorBrowserWidget(QWidget):
         event.acceptProposedAction()
         self._start_add(paths[0])
 
-    def _start_add(self, path: str, confirm_large: bool = False):
+    def _start_add(self, path: str):
         """Spawn the off-GUI-thread add worker for *path* (non-modal)."""
         if self._add_worker is not None:
             return  # one add at a time
         self._clear_error()
-        worker = _AddSourceWorker(self._conn, path, confirm_large=confirm_large)
+        worker = _AddSourceWorker(self._conn, path)
         self._add_worker = worker
-        self._add_path = path
         self._add_retain.add(worker)
         worker.progress.connect(self._on_add_progress)
         worker.done.connect(self._on_add_done)
@@ -1125,17 +1119,14 @@ class TensorBrowserWidget(QWidget):
     def _on_add_failed(self, msg: str):
         """Whole-request add failure (e.g. path not found on the server)."""
         self._add_worker = None
-        self._add_path = None
         self._add_cancel_btn.setVisible(False)
         self._update_drop_hint()
         self._report_failure("Add data failed", msg)
 
     def _on_add_done(self, payload):
-        """Terminal add tally: refresh, summarize, prompt/large, report failures."""
-        added, already, failed, needs_confirm = payload
-        path = self._add_path
+        """Terminal add tally: refresh, summarize, report failures."""
+        added, already, failed = payload
         self._add_worker = None
-        self._add_path = None
         self._add_cancel_btn.setVisible(False)
 
         # Prompt sources appear immediately; the background watcher would also
@@ -1145,21 +1136,6 @@ class TensorBrowserWidget(QWidget):
                 self._refresh()
             except Exception:
                 logger.exception("refresh after add_source failed")
-
-        # Large-directory guard: confirm, then retry the same path.
-        if needs_confirm and path is not None:
-            name = os.path.basename(path.rstrip("/")) or path
-            resp = QMessageBox.question(
-                self,
-                "Add large folder?",
-                f"“{name}” contains many files. Scan it and add all datasets "
-                "found under it?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if resp == QMessageBox.Yes:
-                self._start_add(path, confirm_large=True)
-                return
 
         parts = []
         if added:
