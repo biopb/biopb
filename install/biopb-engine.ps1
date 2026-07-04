@@ -853,6 +853,7 @@ function Invoke-BiopbInstall {
     $ReleaseTagPrefix = "release-v"
     $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
     $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
+    $SamplesDir  = Join-Path $BiopbHome ".local\share\biopb\samples"
     $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
     $LocalBin    = Join-Path $BiopbHome ".local\bin"
 
@@ -1184,11 +1185,17 @@ function Invoke-BiopbInstall {
     #   -KeepConfig                  -> keep an existing config untouched
     #   -DataDir <path>              -> (re)write config pointing at that dir
     #   neither, config exists       -> keep it (safe default)
-    #   neither, no config           -> default to a dedicated data subfolder
+    #   neither, no config           -> seed the sample bundle and point at it, so
+    #                                   a non-CLI user lands on real data with no
+    #                                   prompt (they add their own via GUI drag-drop
+    #                                   / the admin page). BIOPB_DATA_DIR or a GUI
+    #                                   data-dir page still overrides by passing -DataDir.
     $effectiveKeep = $KeepConfig -or ((-not $DataDir) -and $configExists)
     $effectiveDataDir = $DataDir
+    $seedSamples = $false
     if (-not $effectiveKeep -and -not $effectiveDataDir) {
-        $effectiveDataDir = Join-Path $BiopbHome 'Microscopy'
+        $effectiveDataDir = $SamplesDir
+        $seedSamples = $true
     }
 
     # $activeConfig is the file the running server will read -- the JSON we write,
@@ -1202,7 +1209,70 @@ function Invoke-BiopbInstall {
         # it on for roots the probes miss. A cloud source admits dehydrated
         # Files-On-Demand placeholders as unresolved sources instead of hanging
         # discovery -- see the tensor server's cloud-storage phase 2.
-        $isCloud = [bool]$Cloud -or (Test-IsCloudPath -Path $effectiveDataDir)
+        # The seeded samples live on the LOCAL profile drive (.local\share, never a
+        # OneDrive/Dropbox Known-Folder), so force cloud off for that path -- the
+        # files are resident and must not be treated as Files-On-Demand placeholders.
+        $isCloud = if ($seedSamples) { $false } else { [bool]$Cloud -or (Test-IsCloudPath -Path $effectiveDataDir) }
+
+        # Fresh install with no chosen dir: populate the sample bundle first so the
+        # folder we point at is non-empty. Fails soft -- a missing asset / download
+        # error / checksum mismatch just leaves an empty folder (the user can then
+        # drag-drop their own data). Mirrors the webapp fetch above; honors
+        # BIOPB_INSTALL_SAMPLES=0 to skip.
+        if ($seedSamples -and ($env:BIOPB_INSTALL_SAMPLES -ne '0')) {
+            if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
+            $sTag = if ($release) { $release.tag_name } else { "" }
+            if ($sTag) {
+                $sVersionFile = Join-Path $SamplesDir ".version"
+                $sInstalled = if (Test-Path -LiteralPath $sVersionFile) { (Get-Content -Raw -LiteralPath $sVersionFile).Trim() } else { "" }
+                if ($sInstalled -eq $sTag) {
+                    Report-Ok "Sample images already up to date ($sTag)"
+                } else {
+                    Report-Info "Downloading sample images ($sTag)..."
+                    $sAsset = $release.assets | Where-Object { $_.name -eq 'biopb-samples.tar.gz' } | Select-Object -First 1
+                    $sUrl = if ($sAsset) { $sAsset.browser_download_url } else { "$RepoUrl/releases/download/$sTag/biopb-samples.tar.gz" }
+                    $sTarball = Join-Path $env:TEMP "biopb-samples.tar.gz"
+                    $sOk = $true
+                    try { Invoke-WebRequest -Uri $sUrl -OutFile $sTarball } catch { $sOk = $false }
+                    # Soft checksum check: never seed corrupt/tampered data, but never
+                    # abort the install over it. $expectedSum stays $null on any lookup
+                    # miss (older release, fetch error) -> treated as "not verifiable".
+                    if ($sOk) {
+                        $expectedSum = $null
+                        try {
+                            $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
+                            if ($sumsAsset) {
+                                $sumsText = (Invoke-WebRequest -Uri $sumsAsset.browser_download_url -UseBasicParsing).Content
+                                foreach ($line in ($sumsText -split "`n")) {
+                                    $parts = $line.Trim() -split '\s+', 2
+                                    if ($parts.Count -eq 2 -and ($parts[1] -replace '^\*','') -eq 'biopb-samples.tar.gz') { $expectedSum = $parts[0].ToLower(); break }
+                                }
+                            }
+                        } catch { $expectedSum = $null }
+                        if ($expectedSum) {
+                            $actualSum = (Get-FileHash -LiteralPath $sTarball -Algorithm SHA256).Hash.ToLower()
+                            if ($actualSum -ne $expectedSum) {
+                                Report-Warn "Sample bundle checksum mismatch; skipping sample images"
+                                $sOk = $false
+                            }
+                        }
+                    }
+                    if ($sOk) {
+                        Remove-Item -LiteralPath $SamplesDir -Recurse -Force -ErrorAction SilentlyContinue
+                        New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null
+                        tar -xzf $sTarball -C $SamplesDir
+                        Remove-Item -LiteralPath $sTarball -Force -ErrorAction SilentlyContinue
+                        Set-FileUtf8NoBom -Path $sVersionFile -Content $sTag
+                        Report-Ok "Sample images installed to: $SamplesDir"
+                    } else {
+                        Report-Warn "Sample images not installed; starting with an empty data folder"
+                    }
+                }
+            } else {
+                Report-Warn "Could not fetch release; sample images not installed"
+            }
+            if (-not (Test-Path -LiteralPath $SamplesDir)) { New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null }
+        }
 
         # Load existing settings (json) / migrate from defaults (toml) and replace
         # only the sources block -- a new data dir no longer discards tuning (#34).

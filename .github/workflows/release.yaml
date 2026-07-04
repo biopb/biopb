@@ -128,6 +128,22 @@ jobs:
           VITE_TENSOR_API="" pnpm --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C biopb-tensor-server/packages/web dist
 
+      # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
+      # install seeds these so the product opens onto real microscopy data instead
+      # of an empty catalog; drag-drop / the admin page are how users add their
+      # own. Built ONCE here so the bytes are fixed and checksummed into the
+      # release -- never fetched from a third party at install time. Isolated,
+      # pinned env: skimage/pooch/tifffile are build-only, and pinning skimage
+      # pins its pooch data registry, so the source images are reproducible. The
+      # archive root holds the files directly (installer extracts with no strip).
+      # The default (lite) set omits the ~250 MB palisades_of_vogt sample.
+      - name: Build sample dataset
+        run: |
+          uv run --no-project \
+            --with 'scikit-image==0.26.0' --with pooch --with tifffile \
+            python tools/build_samples.py --out samples
+          tar -czf release-wheels/biopb-samples.tar.gz -C samples .
+
       - name: Compute versions
         id: ver
         run: |
@@ -315,6 +331,8 @@ jobs:
             - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl` — the
               version-paired wheel triple (installer `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
+            - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
+              seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
             - `versions.json` — release manifest (pins `napari`; carries the
               `release` version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies

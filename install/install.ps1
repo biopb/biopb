@@ -87,57 +87,6 @@ function Resolve-EnginePath {
     return $tmp
 }
 
-# Prompt for a data directory; returns the chosen path string. With -KeepOption an
-# extra "0) Keep my current config file" choice is the default; selecting it (or
-# Enter / invalid input) returns $null, the "leave existing config untouched"
-# sentinel. Uses the engine's Get-DataDirCandidates for the candidate list.
-function Select-DataDir {
-    param([string]$BiopbHome, [switch]$KeepOption)
-
-    $candidates = @(Get-DataDirCandidates -BiopbHome $BiopbHome)
-    $n = $candidates.Count
-    $manualOpt = $n + 1
-    # Fall back to a dedicated data subfolder, never the profile root.
-    $defaultDir = if ($n -gt 0) { $candidates[0] } else { (Join-Path $BiopbHome 'Microscopy') }
-
-    Write-Host ""
-    Write-Host "  Select your microscopy data directory:" -ForegroundColor White
-    Write-Host ""
-    if ($KeepOption) {
-        Write-Host "    0) " -ForegroundColor Cyan -NoNewline
-        Write-Host "Keep my current config file (default)"
-    }
-    for ($i = 0; $i -lt $n; $i++) {
-        Write-Host ("    {0}) " -f ($i + 1)) -ForegroundColor Cyan -NoNewline
-        Write-Host $candidates[$i]
-    }
-    Write-Host ("    {0}) " -f $manualOpt) -ForegroundColor Cyan -NoNewline
-    Write-Host "Enter path manually"
-    Write-Host ""
-    $defaultChoice = if ($KeepOption) { "0" } else { "1" }
-    $choice = Read-Host "  Choice [$defaultChoice]"
-    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
-
-    if ($KeepOption -and $choice -eq "0") { return $null }   # sentinel: keep config
-
-    if ($choice -eq "$manualOpt") {
-        $manual = Read-Host "  Path [$defaultDir]"
-        if ([string]::IsNullOrWhiteSpace($manual)) { return $defaultDir }
-        return $manual
-    }
-    elseif ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $n) {
-        return $candidates[[int]$choice - 1]
-    }
-    elseif ($KeepOption) {
-        Write-Host "  Invalid choice, keeping current config"
-        return $null
-    }
-    else {
-        Write-Host "  Invalid choice, using default"
-        return $defaultDir
-    }
-}
-
 function Show-Banner {
     Write-Host ""
     Write-Host "    ____  _       ____  ____  " -ForegroundColor Cyan
@@ -237,7 +186,7 @@ $reportOnFailure = Invoke-Preflight
 
 try {
     # Dot-source at SCRIPT scope (not inside a helper) so the engine's functions --
-    # Invoke-BiopbInstall, Get-DataDirCandidates, Report-* -- persist through Main.
+    # Invoke-BiopbInstall, Report-* -- persist through Main.
     . (Resolve-EnginePath)
 
     $BiopbHome  = $env:USERPROFILE
@@ -259,20 +208,19 @@ try {
     $installWebapp     = ($env:BIOPB_INSTALL_WEBAPP -ne '0')
     $installBioformats = ($env:BIOPB_INSTALL_BIOFORMATS -eq '1')
 
-    # Data directory / keep-config decision, mirroring the original flow.
+    # Data directory / keep-config decision. No prompt: a fresh install lets the
+    # engine seed the sample-image bundle and point the config at it (empty
+    # $dataDir + $keepConfig=$false is the engine's "seed samples" signal), so a
+    # non-CLI user lands on real data with zero questions. An existing config is
+    # kept UNTOUCHED. BIOPB_DATA_DIR still overrides on a fresh install (skips the
+    # samples). Set $env:BIOPB_INSTALL_SAMPLES=0 to seed nothing.
     $dataDir = ""
     $keepConfig = $false
     $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
-        # Existing config + no override: keep it. Non-interactive skips the prompt
-        # (the unmanned-upgrade fast path); interactive offers "0) keep" as default.
-        if ($script:NonInteractive) {
-            $keepConfig = $true
-            Write-Note "Non-interactive: keeping existing config."
-        } else {
-            $picked = Select-DataDir -BiopbHome $BiopbHome -KeepOption
-            if ($null -eq $picked) { $keepConfig = $true } else { $dataDir = $picked }
-        }
+        # Existing config, no override: keep it exactly as-is (upgrade fast path).
+        $keepConfig = $true
+        Write-Note "Existing config found; keeping it as-is."
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
@@ -284,19 +232,9 @@ try {
         $dataDir = $env:BIOPB_DATA_DIR
         Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
     }
-    elseif ($script:NonInteractive) {
-        # Non-interactive is an UPGRADE feature (no existing config = fresh install).
-        # We won't guess a data directory unattended, so require BIOPB_DATA_DIR and
-        # fail clearly rather than silently indexing some default folder.
-        Write-Err2 "Non-interactive mode needs an existing install or an explicit data directory."
-        Write-Inf "  No config found at $configFile -- this looks like a fresh install."
-        Write-Inf "  Set `$env:BIOPB_DATA_DIR to provision unattended, or rerun without"
-        Write-Inf "  `$env:BIOPB_NONINTERACTIVE to choose interactively."
-        exit 1
-    }
     else {
-        $dataDir = Select-DataDir -BiopbHome $BiopbHome
-        Write-Ok "Data directory: $dataDir"
+        # Fresh install, no override: the engine seeds samples and points there.
+        Write-Ok "Fresh install: seeding sample images."
     }
 
     # Remote algorithm plugins consent. The default plugins point at off-site

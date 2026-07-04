@@ -37,11 +37,15 @@ docker build \
 echo ""
 echo "Launching — run the installer with:"
 if [ "$SCENARIO" = "bioformats" ]; then
-    echo "  BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh"
+    echo "  BIOPB_INSTALL_BIOFORMATS=1 BIOPB_DATA_DIR=/data bash /install.sh"
     echo "then verify Bio-Formats/ZVI support with:"
     echo "  /verify_bioformats.sh"
 else
-    echo "  bash /install.sh"
+    # A bare fresh install now seeds the sample bundle from the latest release and
+    # points the config there (no data-dir prompt). To instead exercise discovery
+    # of the TIFFs seeded at /root, point the install at them explicitly:
+    echo "  BIOPB_DATA_DIR=/root bash /install.sh   # discover the seeded /root TIFFs"
+    echo "  bash /install.sh                        # or: seed + serve the sample bundle"
 fi
 echo ""
 

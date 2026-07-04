@@ -7,11 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Seed standalone TIFFs at /root so picking $HOME as the data dir gives the
-# server (install step 7) real sources to discover and pre-cache, mimicking a
-# real start. Distinct names => each is its own dataset (claimed individually by
-# aicsimageio); discovery prunes hidden dirs (~/.local, ~/.config), so scanning
-# /root stays cheap. imagemagick is purged afterward to keep the image clean.
+# Seed standalone TIFFs at /root so a `BIOPB_DATA_DIR=/root bash /install.sh` run
+# gives the server (install step 7) real sources to discover and pre-cache,
+# mimicking a real start. (A bare fresh install instead seeds the sample bundle
+# from the release and serves that.) Distinct names => each is its own dataset
+# (claimed individually by aicsimageio); discovery prunes hidden dirs (~/.local,
+# ~/.config), so scanning /root stays cheap. imagemagick is purged afterward.
 RUN apt-get update && apt-get install -y --no-install-recommends imagemagick \
     && for n in aaa bbb ccc ddd eee; do \
          convert -size 2048x2048 xc:black +noise Gaussian \
