@@ -71,8 +71,14 @@ SAMPLES: list[Sample] = [
     ),
     Sample(
         "kidney",
-        "ZYXS",
-        "Genevieve Buckley, Monash Micro Imaging (2018) — confocal mouse kidney, 3-channel.",
+        "ZCYX",
+        "Genevieve Buckley, Monash Micro Imaging (2018) — confocal mouse kidney, "
+        "3-channel fluorescence (emission 450/515/605 nm).",
+        # skimage returns (Z, Y, X, C); the 3 emission channels are true
+        # fluorescence channels, not interleaved RGB samples -- store them as
+        # separate C planes so each can be contrasted/toggled independently.
+        source_axes="ZYXC",
+        physical_um={"Z": 1.25, "Y": 1.24, "X": 1.24},
     ),
     Sample(
         "lily",
@@ -143,11 +149,9 @@ def build(out_dir: Path, include_large: bool, only: set[str] | None) -> list[dic
     for sample in SAMPLES:
         if only is not None and sample.name not in only:
             continue
-        if (
-            sample.large
-            and not include_large
-            and (only is None or sample.name not in only)
-        ):
+        # A name reaching here is either unfiltered or explicitly selected via
+        # --only; in both cases an explicit request overrides the large skip.
+        if sample.large and not include_large and only is None:
             print(f"  skip {sample.name} (large; use --include-large)")
             continue
 

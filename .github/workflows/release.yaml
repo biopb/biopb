@@ -139,10 +139,31 @@ jobs:
       # The default (lite) set omits the ~250 MB palisades_of_vogt sample.
       - name: Build sample dataset
         run: |
-          uv run --no-project \
-            --with 'scikit-image==0.26.0' --with pooch --with tifffile \
-            python tools/build_samples.py --out samples
-          tar -czf release-wheels/biopb-samples.tar.gz -C samples .
+          set -uo pipefail
+          # Samples are a nice-to-have, not the shipped product (wheels/webapp/
+          # images are). Building them pulls source images from skimage's pooch
+          # data registry -- a third-party host -- so keep that fetch OFF the
+          # release critical path: retry for a transient blip, and if it still
+          # fails, warn and ship the release WITHOUT biopb-samples.tar.gz rather
+          # than aborting an otherwise-good release. This is symmetric with the
+          # deliberately soft install-time fetch (a missing asset just starts the
+          # user on an empty folder). Downstream steps glob *.tar.gz, so a missing
+          # samples asset does not break checksums or the release upload.
+          ok=0
+          for attempt in 1 2 3; do
+            if uv run --no-project \
+                 --with 'scikit-image==0.26.0' --with pooch --with tifffile \
+                 python tools/build_samples.py --out samples; then
+              ok=1; break
+            fi
+            echo "sample build attempt $attempt failed; retrying in $((attempt * 20))s"
+            sleep $((attempt * 20))
+          done
+          if [ "$ok" = 1 ]; then
+            tar -czf release-wheels/biopb-samples.tar.gz -C samples .
+          else
+            echo "::warning::sample dataset build failed after 3 attempts; releasing without biopb-samples.tar.gz"
+          fi
 
       - name: Compute versions
         id: ver

@@ -666,14 +666,28 @@ _seed_samples() {
         fi
     fi
 
-    rm -rf "${dest:?}"
-    mkdir -p "$dest"
-    if tar -xzf "$arc" -C "$dest" 2>/dev/null; then
-        printf '%s' "$RELEASE_TAG" > "$dest/.version"
-        _ok "Sample images installed to: $dest"
-    else
+    # Sync the bundle into $dest without a blunt `rm -rf` on the user-facing,
+    # monitored data dir. Extract into a staging dir, delete only the files the
+    # *previous* bundle put here (tracked in .bundle-manifest) so a shrunk bundle
+    # leaves no orphans, then copy the new set in. A user who drag-dropped their
+    # own files into the samples dir keeps them across a re-seed.
+    local stage="$tmpdir/stage"
+    mkdir -p "$stage"
+    if ! tar -xzf "$arc" -C "$stage" 2>/dev/null; then
         _warn "Could not extract sample images; starting with an empty data folder"
+        rm -rf "$tmpdir"
+        return 0
     fi
+    mkdir -p "$dest"
+    if [ -f "$dest/.bundle-manifest" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && rm -f "$dest/$f"
+        done < "$dest/.bundle-manifest"
+    fi
+    ( cd "$stage" && find . -type f ) | sed 's|^\./||' > "$dest/.bundle-manifest"
+    cp -a "$stage/." "$dest/"
+    printf '%s' "$RELEASE_TAG" > "$dest/.version"
+    _ok "Sample images installed to: $dest"
     rm -rf "$tmpdir"
 }
 
@@ -898,11 +912,14 @@ install_biopb() {
     # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
     # unattended (cron upgrades, CI, image bakes). It is primarily an UPGRADE
     # feature: with an existing config, that config is kept untouched and nothing
-    # is asked. A fresh unattended install must pass BIOPB_DATA_DIR (we will not
-    # guess a data directory) — without it the run errors out (see step 5) rather
-    # than indexing a default folder. Either way the remote algorithm plugins stay
-    # DISABLED unless BIOPB_REMOTE_PLUGINS=1 — consent can't be asked unattended,
-    # so we never silently enable the off-site IP-logging servers.
+    # is asked. A fresh unattended install with no BIOPB_DATA_DIR now follows the
+    # same zero-question path as an interactive fresh install: it seeds the sample
+    # bundle and points the config there (fail-soft — a fetch/checksum problem
+    # just leaves an empty folder). Set BIOPB_DATA_DIR to index your own folder,
+    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty. Either way the
+    # remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1 —
+    # consent can't be asked unattended, so we never silently enable the off-site
+    # IP-logging servers.
     if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
         NONINTERACTIVE=1
         _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"

@@ -403,34 +403,6 @@ function Test-IsCloudPath {
 # because the engine marks any dir under a cloud root `cloud = true`
 # (Test-IsCloudPath), which admits placeholders as unresolved sources instead. A
 # Microscopy subfolder under a cloud root is preferred over the whole synced root.
-function Get-DataDirCandidates {
-    param([string]$BiopbHome)
-    $candidates = New-Object System.Collections.Generic.List[string]
-    $seen = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($d in @(
-        (Join-Path $BiopbHome 'Data'),
-        (Join-Path $BiopbHome 'data'),
-        (Join-Path $BiopbHome 'Microscopy')
-    )) {
-        if ((Test-Path -LiteralPath $d) -and $seen.Add($d.ToLowerInvariant())) {
-            $candidates.Add($d) | Out-Null
-        }
-    }
-    foreach ($drv in Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue) {
-        if ($drv.Name -ne 'C' -and $drv.Root -and (Test-Path -LiteralPath $drv.Root)) {
-            if ($seen.Add($drv.Root.ToLowerInvariant())) { $candidates.Add($drv.Root) | Out-Null }
-        }
-    }
-    foreach ($root in Get-CloudRoots) {
-        $sub = Join-Path $root 'Microscopy'
-        if ((Test-Path -LiteralPath $sub) -and $seen.Add($sub.ToLowerInvariant())) {
-            $candidates.Add($sub) | Out-Null
-        }
-        if ($seen.Add($root.ToLowerInvariant())) { $candidates.Add($root) | Out-Null }
-    }
-    return $candidates.ToArray()
-}
-
 # Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
 # Cursor, ...). biopb-mcp speaks stdio, so the client spawns the command itself --
 # a bare command+args entry (no "type") is the form every mcpServers client
@@ -1242,11 +1214,20 @@ function Invoke-BiopbInstall {
                         try {
                             $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
                             if ($sumsAsset) {
-                                $sumsText = (Invoke-WebRequest -Uri $sumsAsset.browser_download_url -UseBasicParsing).Content
-                                foreach ($line in ($sumsText -split "`n")) {
+                                # Download to a temp file and read it back rather than
+                                # reading .Content directly: on PowerShell 5.1 (the GUI
+                                # installer's shell) GitHub serves SHA256SUMS as
+                                # application/octet-stream, so .Content is a byte[] and
+                                # splitting it on "`n" yields per-byte tokens -- the
+                                # lookup never matches and the check silently no-ops.
+                                # -OutFile + Get-Content -Raw matches the wheel path above.
+                                $sSumsFile = Join-Path $env:TEMP "biopb-samples-SHA256SUMS"
+                                Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sSumsFile -UseBasicParsing
+                                foreach ($line in ((Get-Content -Raw -LiteralPath $sSumsFile) -split "`n")) {
                                     $parts = $line.Trim() -split '\s+', 2
                                     if ($parts.Count -eq 2 -and ($parts[1] -replace '^\*','') -eq 'biopb-samples.tar.gz') { $expectedSum = $parts[0].ToLower(); break }
                                 }
+                                Remove-Item -LiteralPath $sSumsFile -Force -ErrorAction SilentlyContinue
                             }
                         } catch { $expectedSum = $null }
                         if ($expectedSum) {
@@ -1258,9 +1239,27 @@ function Invoke-BiopbInstall {
                         }
                     }
                     if ($sOk) {
-                        Remove-Item -LiteralPath $SamplesDir -Recurse -Force -ErrorAction SilentlyContinue
+                        # Sync the bundle in without a blunt Remove-Item -Recurse on
+                        # the user-facing monitored data dir. Extract to a staging
+                        # dir, delete only the previous bundle's files (tracked in
+                        # .bundle-manifest) so a shrunk bundle leaves no orphans,
+                        # then copy the new set in -- drag-dropped user files in the
+                        # samples dir survive a re-seed.
+                        $sStage = Join-Path $env:TEMP "biopb-samples-stage"
+                        Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
+                        New-Item -ItemType Directory -Force -Path $sStage | Out-Null
+                        tar -xzf $sTarball -C $sStage
                         New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null
-                        tar -xzf $sTarball -C $SamplesDir
+                        $sManifest = Join-Path $SamplesDir ".bundle-manifest"
+                        if (Test-Path -LiteralPath $sManifest) {
+                            foreach ($rel in (Get-Content -LiteralPath $sManifest)) {
+                                if ($rel) { Remove-Item -LiteralPath (Join-Path $SamplesDir $rel) -Force -ErrorAction SilentlyContinue }
+                            }
+                        }
+                        $sFiles = Get-ChildItem -LiteralPath $sStage -Recurse -File | ForEach-Object { $_.FullName.Substring($sStage.Length + 1) }
+                        Set-Content -LiteralPath $sManifest -Value $sFiles
+                        Copy-Item -Path (Join-Path $sStage '*') -Destination $SamplesDir -Recurse -Force
+                        Remove-Item -LiteralPath $sStage -Recurse -Force -ErrorAction SilentlyContinue
                         Remove-Item -LiteralPath $sTarball -Force -ErrorAction SilentlyContinue
                         Set-FileUtf8NoBom -Path $sVersionFile -Content $sTag
                         Report-Ok "Sample images installed to: $SamplesDir"
@@ -1270,6 +1269,16 @@ function Invoke-BiopbInstall {
                 }
             } else {
                 Report-Warn "Could not fetch release; sample images not installed"
+            }
+        }
+        # Whenever the config points at the samples dir (fresh install), ensure it
+        # exists -- even when seeding was skipped via BIOPB_INSTALL_SAMPLES=0 or
+        # failed soft -- so the server never starts pointed at a missing dir. Emit
+        # the skip note so an opted-out user isn't told nothing (the front-end's
+        # "seeding" line is now conditional too).
+        if ($seedSamples) {
+            if ($env:BIOPB_INSTALL_SAMPLES -eq '0') {
+                Report-Info "Sample images skipped (BIOPB_INSTALL_SAMPLES=0); starting with an empty data folder"
             }
             if (-not (Test-Path -LiteralPath $SamplesDir)) { New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null }
         }

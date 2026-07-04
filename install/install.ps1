@@ -70,7 +70,7 @@ function Wait-ForExit {
 # Locate (or download) the headless engine and return the path to dot-source.
 # The caller must dot-source the returned path at SCRIPT scope -- dot-sourcing
 # inside this function would define the engine's functions (Invoke-BiopbInstall,
-# Get-DataDirCandidates, the Report-* renderers) in this function's child scope,
+# the Report-* renderers) in this function's child scope,
 # where they vanish on return and are unavailable to Main. Returning the path and
 # dot-sourcing in Main keeps them alive for the whole session. Dot-sourcing (not
 # running) also skips the engine's auto-run block; we drive it via Invoke-BiopbInstall.
@@ -233,8 +233,15 @@ try {
         Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
     }
     else {
-        # Fresh install, no override: the engine seeds samples and points there.
-        Write-Ok "Fresh install: seeding sample images."
+        # Fresh install, no override: the engine seeds samples and points there
+        # (unless BIOPB_INSTALL_SAMPLES=0 opts out, in which case it points the
+        # config at an empty folder for drag-drop). Don't claim seeding when the
+        # user opted out -- the engine prints the actual outcome either way.
+        if ($env:BIOPB_INSTALL_SAMPLES -eq '0') {
+            Write-Note "Fresh install: sample seeding disabled (BIOPB_INSTALL_SAMPLES=0); starting with an empty data folder."
+        } else {
+            Write-Ok "Fresh install: seeding sample images."
+        }
     }
 
     # Remote algorithm plugins consent. The default plugins point at off-site
