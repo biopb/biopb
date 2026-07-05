@@ -101,11 +101,27 @@ class TestEnsure:
     def test_respins_dead_cluster(self, fake_local_cluster):
         host = DaskClusterHost(_cfg())
         host.ensure()
-        # Simulate the cached cluster dying (all workers gone).
+        # A liveness check that observes the workers, so a later drop to 0 reads
+        # as death rather than the not-yet-started spawn window.
+        assert host.ensure() == "tcp://127.0.0.1:9999"
+        assert len(fake_local_cluster) == 1  # still cached
+        # Now the cached cluster dies (all workers gone) after having had some.
         fake_local_cluster[0].scheduler = _FakeScheduler(0)
         host.ensure()
         assert len(fake_local_cluster) == 2  # re-spun
         assert fake_local_cluster[0].closed is True  # dead one was closed
+
+    def test_no_respin_during_worker_startup_window(self, fake_local_cluster):
+        """A running cluster whose workers have not registered *yet* is coming
+        up, not dead -- ensure() must keep it (else it would re-spin exactly the
+        slow-to-spawn cluster it exists to keep warm, e.g. Windows cold-spawn)."""
+        host = DaskClusterHost(_cfg())
+        host.ensure()
+        # Scheduler is running but no worker has registered so far.
+        fake_local_cluster[0].scheduler = _FakeScheduler(0)
+        host.ensure()
+        assert len(fake_local_cluster) == 1  # kept, not re-spun
+        assert fake_local_cluster[0].closed is False
 
     def test_respins_when_status_not_running(self, fake_local_cluster):
         host = DaskClusterHost(_cfg())

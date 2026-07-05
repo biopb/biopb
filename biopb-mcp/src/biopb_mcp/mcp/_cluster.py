@@ -40,6 +40,11 @@ class DaskClusterHost:
         self._local_dir = local_dir
         self._cluster = None
         self._address = None
+        # Whether the *current* cluster has ever had >=1 worker register, gating
+        # the liveness check: a running scheduler with 0 workers means "dead"
+        # only after we've seen workers, not during the initial spawn window (see
+        # _is_alive). Reset on each spin.
+        self._saw_workers = False
         # ensure() may be reached from the kernel launch path; a lock keeps a
         # spin and a concurrent close() from racing the _cluster/_address pair.
         self._lock = threading.Lock()
@@ -114,6 +119,10 @@ class DaskClusterHost:
             return None
         self._cluster = cluster
         self._address = cluster.scheduler_address
+        # Fresh cluster: workers have not registered *from the liveness check's
+        # standpoint* yet, so a 0-worker reading is startup, not death, until the
+        # first time we observe them (see _is_alive).
+        self._saw_workers = False
         logger.info(
             "Daemon dask cluster: %d worker(s) at %s",
             len(cluster.workers),
@@ -121,20 +130,31 @@ class DaskClusterHost:
         )
         return self._address
 
-    @staticmethod
-    def _is_alive(cluster):
-        """Cheap best-effort liveness: scheduler running with >=1 live worker.
+    def _is_alive(self, cluster):
+        """Cheap best-effort liveness, read off the in-process scheduler.
 
-        Reads the in-process ``LocalCluster`` scheduler's live worker map (no
-        Client needed).  Any error -> treat as dead so ensure() re-spins.
+        A stopped scheduler (``status != "running"``) is always dead. For a
+        running one the live worker count decides — but a 0-worker reading is
+        ambiguous: it is a *dead* cluster (all workers gone) only once we have
+        seen workers register (``_saw_workers``); before that it is the initial
+        spawn window still coming up. Treating that window as dead would re-spin
+        (and close) a cluster that is merely slow to bring workers up — precisely
+        the Windows cold-spawn case this host exists to avoid — so we hold it
+        alive until the first worker appears, then flip to the strict >=1 check
+        (which restores the self-heal a dead cluster needs). Any error -> dead so
+        ensure() re-spins.
         """
         try:
             status = getattr(cluster, "status", None)
             if getattr(status, "name", None) != "running":
                 return False
-            return len(cluster.scheduler.workers) > 0
+            n_workers = len(cluster.scheduler.workers)
         except Exception:
             return False
+        if n_workers > 0:
+            self._saw_workers = True
+            return True
+        return not self._saw_workers
 
     def close(self):
         """Best-effort, idempotent teardown of the owned cluster.
