@@ -243,18 +243,12 @@ DEFAULT_CONFIG = {
             "cache_budget": "1G",
         },
         "tensor": {
-            # Let the data-plane client cache chunks even for a *localhost*
-            # tensor server. Translated into BIOPB_CACHE_LOCAL in the
-            # kernel/worker env by __main__.py. By default the client skips a
-            # localhost cache (the server already caches), but that means an
-            # interactive viewer scrubbing planes re-fetches the whole enclosing
-            # chunk per plane; caching makes repeated/overlapping reads instant.
-            # Memory is bounded by the existing dask.cache_budget plugin (each
-            # worker caps at budget // n_workers), so this does not reintroduce
-            # the per-worker replication that the unbounded cache caused. A
-            # structural fix that removes the underlying read amplification
-            # (client-selectable read granularity) is tracked in biopb/biopb#8.
-            "cache_local": True,
+            # NOTE: the localhost client-cache decision now lives entirely in the
+            # tensor client (biopb.tensor.client._resolve_cache_bytes): localhost
+            # gets no client cache by default (the server caches and the
+            # cache-file mmap fast path makes a re-fetch cheap), with
+            # BIOPB_CACHE_LOCAL=1 as biopb's own opt-out for e.g. a slow loopback
+            # proxy. The MCP kernel no longer overrides that default.
             # Background source-catalog watcher (issue #44). A daemon thread in
             # the kernel periodically health-checks the server and re-lists
             # sources when its source_count changes, so a catalog cached while

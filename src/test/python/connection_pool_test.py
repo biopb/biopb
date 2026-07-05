@@ -258,34 +258,6 @@ class TestConfigureCache:
         assert cache is not None and cache.available_bytes == 500
 
 
-class TestCachePlugin:
-    """Tests for make_cache_plugin() (the worker-init hook, piece 3)."""
-
-    def test_returns_none_without_distributed_or_plugin_with_name(self):
-        plugin = client_module.make_cache_plugin("grpc://remote:8815", None, 1000)
-        try:
-            import distributed  # noqa: F401
-        except Exception:
-            assert plugin is None  # graceful no-op when distributed absent
-            return
-        assert plugin is not None
-        assert plugin.name == "biopb-cache-config"
-
-    def test_setup_pins_cache(self):
-        pytest.importorskip("distributed")
-        client_module._CACHE_POOL.clear()
-        loc = "grpc://remote:8815"
-        plugin = client_module.make_cache_plugin(loc, None, 777)
-        try:
-            with patch.object(
-                client_module, "_is_localhost_location", return_value=False
-            ):
-                plugin.setup(worker=None)  # what dask calls on each worker
-            assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 777
-        finally:
-            client_module._CACHE_POOL.clear()
-
-
 class TestCleanupConnectionPool:
     """Tests for atexit cleanup."""
 

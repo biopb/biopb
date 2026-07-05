@@ -24,7 +24,7 @@ def _fake_dask_client(n_workers):
 class TestRegisterCachePlugin:
     def test_splits_budget_by_planned_workers(self):
         dc = _fake_dask_client(5)  # live count (should be IGNORED)
-        with patch.object(tclient, "make_cache_plugin") as mk:
+        with patch.object(_bootstrap, "_make_cache_plugin") as mk:
             mk.return_value = MagicMock(name="plugin")
             _bootstrap._register_cache_plugin(
                 dc,
@@ -41,7 +41,7 @@ class TestRegisterCachePlugin:
 
     def test_falls_back_to_live_count_without_planned(self):
         dc = _fake_dask_client(4)
-        with patch.object(tclient, "make_cache_plugin") as mk:
+        with patch.object(_bootstrap, "_make_cache_plugin") as mk:
             mk.return_value = MagicMock()
             _bootstrap._register_cache_plugin(
                 dc,
@@ -53,7 +53,7 @@ class TestRegisterCachePlugin:
 
     def test_accepts_int_budget(self):
         dc = _fake_dask_client(2)
-        with patch.object(tclient, "make_cache_plugin") as mk:
+        with patch.object(_bootstrap, "_make_cache_plugin") as mk:
             mk.return_value = MagicMock()
             _bootstrap._register_cache_plugin(
                 dc,
@@ -64,13 +64,13 @@ class TestRegisterCachePlugin:
             )
         assert mk.call_args.args[2] == 400_000_000
 
-    def test_localhost_pins_workers_off(self):
-        # On localhost a worker's per-process cache is redundant: workers consume
-        # whole chunks and share the server's mmap/page-cache path, so the plugin
-        # pins workers to 0 regardless of the configured budget (the main-process
-        # viewer keeps its cache via BIOPB_CACHE_LOCAL, not this plugin).
+    def test_localhost_is_not_special_cased(self):
+        # The plugin no longer special-cases localhost: it splits the budget the
+        # same as for a remote URL. The localhost no-cache rule is applied
+        # authoritatively per worker by the tensor client
+        # (_resolve_cache_bytes), which clamps this budget to 0 on localhost.
         dc = _fake_dask_client(8)
-        with patch.object(tclient, "make_cache_plugin") as mk:
+        with patch.object(_bootstrap, "_make_cache_plugin") as mk:
             mk.return_value = MagicMock()
             _bootstrap._register_cache_plugin(
                 dc,
@@ -79,7 +79,7 @@ class TestRegisterCachePlugin:
                 {"mcp": {"dask": {"cache_budget": "4G"}}},
                 planned_workers=8,
             )
-        assert mk.call_args.args[2] == 0
+        assert mk.call_args.args[2] == 4_000_000_000 // 8
         dc.register_plugin.assert_called_once_with(mk.return_value)
 
     def test_noop_without_dask_client(self):
@@ -88,12 +88,39 @@ class TestRegisterCachePlugin:
 
     def test_noop_when_plugin_unavailable(self):
         dc = _fake_dask_client(3)
-        with patch.object(tclient, "make_cache_plugin", return_value=None) as mk:
+        with patch.object(_bootstrap, "_make_cache_plugin", return_value=None) as mk:
             _bootstrap._register_cache_plugin(
                 dc, "grpc://remote:8815", None, {}, planned_workers=3
             )
         mk.assert_called_once()
         dc.register_plugin.assert_not_called()
+
+
+class TestMakeCachePlugin:
+    """The dask WorkerPlugin factory, moved out of the tensor SDK into MCP."""
+
+    def test_returns_none_or_named_plugin(self):
+        plugin = _bootstrap._make_cache_plugin("grpc://remote:8815", None, 1000)
+        try:
+            import distributed  # noqa: F401
+        except Exception:
+            assert plugin is None  # graceful no-op without distributed
+            return
+        assert plugin is not None
+        assert plugin.name == "biopb-cache-config"
+
+    def test_setup_pins_cache_via_sdk_configure_cache(self):
+        import pytest
+
+        pytest.importorskip("distributed")
+        tclient._CACHE_POOL.clear()
+        loc = "grpc://remote:8815"
+        plugin = _bootstrap._make_cache_plugin(loc, None, 777)
+        try:
+            plugin.setup(worker=None)  # what dask calls on each worker
+            assert tclient._CACHE_POOL[(loc, None)][1].available_bytes == 777
+        finally:
+            tclient._CACHE_POOL.clear()
 
 
 class TestHeadlessViewer:

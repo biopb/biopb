@@ -543,8 +543,8 @@ def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> in
     Sets the per-process chunk cache to ``cache_bytes`` and keeps it there: every
     later fetch honors this budget regardless of the ``cache_bytes`` it requests.
     Idempotent. Call it once per worker process (e.g. from a dask worker-init
-    plugin, see :func:`make_cache_plugin`) to fix the budget deterministically
-    across a dynamically-sized cluster.
+    plugin) to fix the budget deterministically across a dynamically-sized
+    cluster.
 
     A localhost server (the default) or ``cache_bytes <= 0`` pins the cache OFF;
     later fetches then skip caching rather than recreating one of their own.
@@ -581,40 +581,6 @@ def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> in
             _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
 
     return effective
-
-
-def make_cache_plugin(location: str, token: Optional[str], cache_bytes: int):
-    """Build a dask ``WorkerPlugin`` that pins the chunk-cache budget on workers.
-
-    Registering the returned plugin with ``client.register_plugin(...)`` runs
-    :func:`configure_cache` on every worker -- current *and* future -- so the
-    per-process budget stays correct across cluster restarts / autoscaling
-    without re-plumbing. The plugin is ``name``-tagged so re-registration
-    replaces rather than stacks.
-
-    ``cache_bytes`` is the desired *per-worker* size; the caller (which knows the
-    cluster size) is responsible for any total-budget split. Localhost still
-    resolves to 0 via :func:`configure_cache`.
-
-    Returns:
-        A WorkerPlugin instance, or None if ``distributed`` is not importable
-        (so callers can no-op gracefully on non-distributed setups).
-    """
-    try:
-        from distributed.diagnostics.plugin import WorkerPlugin
-    except Exception:
-        return None
-
-    class _CacheConfigPlugin(WorkerPlugin):
-        name = "biopb-cache-config"  # named -> idempotent re-registration
-
-        def __init__(self, location, token, cache_bytes):
-            self._args = (location, token, cache_bytes)
-
-        def setup(self, worker):
-            configure_cache(*self._args)
-
-    return _CacheConfigPlugin(location, token, cache_bytes)
 
 
 def _fetch_chunk_distributed(
