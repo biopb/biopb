@@ -16,7 +16,7 @@ from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-from biopb_tensor_server.config import SourceConfig
+from biopb_tensor_server.config import SourceConfig, _reroot_catalog_url
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
     ClaimContext,
@@ -98,34 +98,24 @@ def _drop_catalog_url(dropped_root: str, primary_path: str) -> str:
     """Catalog ``source_url`` that re-roots a drag-dropped source under the
     dropped item's basename.
 
-    The tensor-browser (and the web viewer) build their tree by splitting each
-    source's ``source_url`` on ``/`` — so a source's first path component is its
-    top-level root. A dropped file's real path (``/home/u/data/exp/a.tif``) would
-    otherwise nest it deep inside the shared absolute-path tree; re-rooting it at
-    the dropped item's basename makes each drop its own root instead:
+    A dropped file's real path (``/home/u/data/exp/a.tif``) would otherwise nest
+    it deep inside the shared absolute-path tree; re-rooting it at the dropped
+    item's basename makes each drop its own root instead (via the shared
+    ``_reroot_catalog_url``):
 
         drop /home/u/data/exp.zarr           -> "exp.zarr"          (own root)
         drop /home/u/data/exp/ (a folder) with
              .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
 
-    Display-only: this feeds the descriptor's ``source_url`` (never ``source_id``,
-    which hashes the raw path, nor the raw ``_source_url`` the filesystem uses), so
-    it is safe to be a bare virtual path with no scheme. Not durable against a
-    later rescan for a drop under a *monitored* root — the watcher re-discovers it
-    with its native absolute url and it re-merges into the shared tree (accepted;
-    see the design note / issue for the durable-flag alternative).
+    Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
+    uses). Not durable against a later rescan for a drop under a *monitored* root
+    — the watcher re-discovers it with its native absolute url and it re-merges
+    into the shared tree (accepted; see the design note / issue for the
+    durable-flag alternative).
     """
     dropped_root = str(dropped_root).rstrip("/\\")
     base = os.path.basename(dropped_root) or dropped_root
-    try:
-        rel = os.path.relpath(str(primary_path), dropped_root).replace("\\", "/")
-    except ValueError:  # different drive on Windows, etc. -- can't relativize
-        rel = "."
-    if rel in (".", "") or rel.startswith("../"):
-        # The dropped item is itself the source (single file / dataset dir), or
-        # (defensively) the source is not under it -- keep the drop as one root.
-        return base
-    return f"{base}/{rel}"
+    return _reroot_catalog_url(base, dropped_root, primary_path)
 
 
 @dataclass
@@ -2340,7 +2330,10 @@ def create_source_manager(
             # first access still resolves it cheaply.
             unresolved=bool(source.cloud),
         )
-        manager._commit_add_claim(claim)
+        # source._catalog_url is the alias-derived display tree-root for a local
+        # source (config.resolve_all_sources), or None. Threaded as the descriptor's
+        # source_url override, exactly like the drag-drop re-rooting path.
+        manager._commit_add_claim(claim, catalog_url=source._catalog_url)
 
     # Monitored discovery is NOT run synchronously here: under progressive
     # discovery the launcher starts the manager's event loop and the watcher

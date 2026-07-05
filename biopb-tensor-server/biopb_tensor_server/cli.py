@@ -190,6 +190,21 @@ def _resolve_serve_sources(
                     "when it appears: %s",
                     s.url,
                 )
+            # A local `alias` sets a catalog tree-root, but that override is
+            # display-only and non-durable: a monitored directory is re-discovered
+            # under its native path on every rescan and re-merges into the shared
+            # tree, so the alias root would flicker away on the first rescan. Ignore
+            # it loudly rather than pretend it holds. (Honored fine for a static /
+            # monitor=false root, and for a monitor=true single *file* -- which is
+            # registered static, above -- neither of which is rescanned.)
+            if s.alias:
+                logger.warning(
+                    "Ignoring 'alias' tree-root %r on monitored directory %s: a "
+                    "monitored root re-merges into the shared path tree on rescan. "
+                    "Drop 'monitor' to keep the alias as its own catalog root.",
+                    s.alias,
+                    s.url,
+                )
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 

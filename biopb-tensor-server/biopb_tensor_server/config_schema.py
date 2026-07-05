@@ -197,8 +197,12 @@ def _sources_schema() -> Dict[str, Any]:
             "alias": {
                 "type": "string",
                 "description": (
-                    "(experimental) Namespace prefix for an upstream 'tensor-server' "
-                    "source (<alias>__<upstream_source_id>); must be slash-free."
+                    "(experimental) The name this source shows up under. For a "
+                    "'tensor-server' upstream: a namespace prefix "
+                    "(<alias>__<upstream_source_id>). For a local file/directory "
+                    "source: its catalog tree root (each source under a configured "
+                    "folder is re-rooted beneath it), ignored with a warning on a "
+                    "monitored directory. Must be slash-free."
                 ),
             },
             "path": {

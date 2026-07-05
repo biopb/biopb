@@ -370,12 +370,23 @@ class SourceConfig:
                shape/dtype is resolved lazily on first access (cloud-storage phase 2).
                Opt-in only -- it does not weaken the global placeholder guard elsewhere.
         credentials_profile: (experimental) Name of credential profile for remote URLs (overrides global default)
-        alias: (experimental) Namespace prefix for an upstream "tensor-server" source. The proxy
-               mirrors the upstream's sources under "<alias>__<upstream_source_id>"
-               so multiple upstreams (and local sources) coexist in one flat,
-               source_id-keyed catalog without id collisions. Must be slash-free
-               (it becomes part of a slash-free source_id). Ignored for non-proxy
-               source types.
+        alias: (experimental) Type-split meaning, unified as "the name this source
+               shows up under":
+               - tensor-server (proxy) upstream: namespace prefix. The proxy mirrors
+                 the upstream's sources under "<alias>__<upstream_source_id>" so
+                 multiple upstreams (and local sources) coexist in one flat,
+                 source_id-keyed catalog without id collisions.
+               - local file/directory source: catalog **tree root**. Each configured
+                 source (and every source discovered under a configured folder) is
+                 re-rooted under ``alias`` in the browser/web tree, the same way a
+                 drag-dropped folder gets its own root -- see ``_alias_catalog_url``
+                 and ``SourceManager._drop_catalog_url``. Display-only (never touches
+                 ``source_id``). Honored on the static / one-shot-expand path only; a
+                 ``monitor = true`` local *directory* re-merges into the shared path
+                 tree on rescan, so its alias tree-root is ignored with a warning
+                 (see ``cli._resolve_serve_sources``).
+               Must be slash-free (it becomes a source_id prefix for a proxy, and the
+               first ``/``-split tree-root component for a local source).
         is_remote: Flag indicating if this is a remote source (set during discovery)
     """
 
@@ -398,7 +409,13 @@ class SourceConfig:
     monitor: bool = False  # Enable live filesystem monitoring
     cloud: bool = False  # Treat as cloud/synced-folder root (admit unresolved sources)
     credentials_profile: Optional[str] = None  # Override global credential profile
-    alias: Optional[str] = None  # Namespace prefix for a "tensor-server" upstream
+    alias: Optional[str] = None  # Proxy namespace prefix / local-source tree root
+    # Display-only catalog tree-root override, derived from `alias` for a local
+    # source during expansion (resolve_all_sources). Threaded to the descriptor's
+    # source_url via _commit_add_claim(catalog_url=...); never affects source_id.
+    # Internal/derived (leading underscore): not a user-facing config key, so it
+    # is excluded from the config-schema drift guard, like `_is_remote`.
+    _catalog_url: Optional[str] = None
     _is_remote: Optional[bool] = field(
         default=None, init=False
     )  # Internal field, computed from URL
@@ -1586,6 +1603,53 @@ def _resolve_tensor_server_id_collisions(
     return result
 
 
+def _reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
+    """Re-root ``primary_path`` under ``label``, preserving its position beneath
+    ``root_path``. Shared core of the two re-rooting entry points -- drag-drop
+    (``SourceManager._drop_catalog_url``, ``label`` = the dropped item's basename)
+    and a configured ``alias`` (``_alias_catalog_url``, ``label`` = the alias).
+
+    The tensor-browser (and web viewer) build their tree by splitting each
+    source's ``source_url`` on ``/``, so ``label`` becomes the top-level root and
+    the sub-structure beneath ``root_path`` is preserved under it:
+
+        root /data/exp, primary /data/exp            -> "<label>"
+        root /data/exp, primary /data/exp/sub/b.tif  -> "<label>/sub/b.tif"
+
+    Display-only: it feeds the descriptor's ``source_url`` and never the
+    ``source_id`` (which hashes the raw path), so a bare virtual path with no
+    scheme is fine.
+    """
+    try:
+        rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
+    except ValueError:  # different drive on Windows, etc. -- can't relativize
+        rel = "."
+    if rel in (".", "") or rel.startswith("../"):
+        # primary IS the root (single file / dataset dir), or (defensively) not
+        # under it -- keep the whole thing as one root, never emit a "../" url.
+        return label
+    return f"{label}/{rel}"
+
+
+def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
+    """Catalog ``source_url`` that re-roots a configured local source under ``alias``.
+
+    The config-line analogue of ``SourceManager._drop_catalog_url``: the root
+    label is the configured ``alias`` (rather than a dropped item's basename), and
+    the sub-structure of a configured folder is preserved relative to it:
+
+        alias "exp", configure /data/exp/            (root_path == primary_path)
+            -> "exp"
+        alias "exp", configure folder /data/exp/ with
+            .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
+
+    Display-only (never touches ``source_id``). Applied on the static / one-shot
+    expand path; a monitored directory's alias is dropped upstream (its rescan
+    re-discovers native paths), so this is never fed a live-monitored source.
+    """
+    return _reroot_catalog_url(alias, root_path, primary_path)
+
+
 def discover_sources(
     source: SourceConfig,
     registry: Optional[AdapterRegistry] = None,
@@ -1806,10 +1870,28 @@ def resolve_all_sources(
                 e,
             )
             continue
+        # A local source's `alias` re-roots it (and everything discovered under a
+        # configured folder) into its own catalog tree root -- the config-line
+        # analogue of a drag-dropped folder becoming its own root. Compute the
+        # display source_url now, while both the configured root and each concrete
+        # child are in hand. Skipped for remote entries: a tensor-server upstream's
+        # alias means the source_id namespace (handled by the proxy adapter's own
+        # display authority), not a tree root. A monitored local *directory* never
+        # reaches here (it is discovered by the rescan, not expanded), so its alias
+        # is correctly never applied -- see _resolve_serve_sources's warning.
+        reroot = bool(source.alias) and not source.is_remote
+        root_path = source.local_path if reroot else None
         for src in discovered:
             # Track HDF5 sources that need dataset config
             if src.type == "hdf5" and src.dataset is None:
                 hdf5_warnings.append(src.url)
+            if reroot and root_path is not None:
+                src = replace(
+                    src,
+                    _catalog_url=_alias_catalog_url(
+                        source.alias, str(root_path), src.url
+                    ),
+                )
             all_sources.append(src)
 
     # source_id collisions involving a tensor-server proxy are a misconfiguration

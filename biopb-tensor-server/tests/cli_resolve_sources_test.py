@@ -286,3 +286,105 @@ class TestResolveAllSourcesOverrides:
 
         with pytest.raises(ValueError):
             resolve_all_sources(cfg, tolerant=False)
+
+
+class TestAliasTreeRoot:
+    """A local source's ``alias`` re-roots it (and everything under a configured
+    folder) into its own catalog tree root -- the config-line analogue of a
+    drag-dropped folder becoming its own root (see add_source_test's drop cases).
+    The override is display-only and honored on the static/expand path only.
+    """
+
+    def test_alias_catalog_url_single_source_is_bare_root(self):
+        from biopb_tensor_server.config import _alias_catalog_url
+
+        # Configured entry IS the source (file / dataset dir): alias is the root.
+        assert _alias_catalog_url("exp", "/data/exp.zarr", "/data/exp.zarr") == "exp"
+
+    def test_alias_catalog_url_preserves_subtree(self):
+        from biopb_tensor_server.config import _alias_catalog_url
+
+        assert _alias_catalog_url("exp", "/data/exp", "/data/exp/a.tif") == "exp/a.tif"
+        assert (
+            _alias_catalog_url("exp", "/data/exp", "/data/exp/sub/b.tif")
+            == "exp/sub/b.tif"
+        )
+
+    def test_alias_catalog_url_non_relativizable_is_bare_root(self):
+        from biopb_tensor_server.config import _alias_catalog_url
+
+        # Primary not under the root (defensive) -> alias-only root, never "../".
+        assert _alias_catalog_url("exp", "/data/exp", "/elsewhere/x.tif") == "exp"
+
+    def test_single_file_alias_sets_catalog_url(self, tmp_path):
+        f = tmp_path / "img.tif"
+        _write_tiff(str(f))
+        cfg = _config(SourceConfig(url=str(f), alias="myroot"))
+
+        resolved = resolve_all_sources(cfg)
+
+        assert len(resolved) == 1
+        assert resolved[0]._catalog_url == "myroot"
+
+    def test_folder_alias_reroots_children_under_alias(self, tmp_path):
+        root = tmp_path / "acquisition"
+        root.mkdir()
+        (root / "sub").mkdir()
+        _write_tiff(str(root / "a.tif"))
+        _write_tiff(str(root / "sub" / "b.tif"))
+        cfg = _config(SourceConfig(url=str(root), alias="exp"))
+
+        resolved = resolve_all_sources(cfg)
+
+        assert sorted(s._catalog_url for s in resolved) == [
+            "exp/a.tif",
+            "exp/sub/b.tif",
+        ]
+
+    def test_no_alias_leaves_catalog_url_none(self, tmp_path):
+        f = tmp_path / "img.tif"
+        _write_tiff(str(f))
+        cfg = _config(SourceConfig(url=str(f)))
+
+        resolved = resolve_all_sources(cfg)
+
+        assert resolved[0]._catalog_url is None
+
+    def test_remote_alias_is_not_a_tree_root(self):
+        """On a remote (non-tensor-server) source the alias keeps its proxy /
+        namespace meaning -- it is NOT turned into a display tree-root override."""
+        cfg = _config(SourceConfig(url="s3://bucket/k.zarr", type="zarr", alias="x"))
+
+        resolved = resolve_all_sources(cfg)
+
+        assert resolved[0]._catalog_url is None
+        assert resolved[0].alias == "x"  # untouched
+
+    def test_monitored_dir_alias_is_ignored_with_warning(self, tmp_path, caplog):
+        """A monitored *directory* re-merges into the shared path tree on rescan,
+        so its alias tree-root cannot hold: it is dropped with a warning and never
+        applied (the monitored entry is not expanded, so catalog_url stays None)."""
+        root = tmp_path / "watched"
+        root.mkdir()
+        _write_tiff(str(root / "image.tif"))
+        cfg = _config(SourceConfig(url=str(root), alias="live", monitor=True))
+
+        with caplog.at_level("WARNING", logger="biopb_tensor_server.cli"):
+            static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert [s.url for s in monitored_sources] == [str(root)]
+        assert all(s._catalog_url is None for s in monitored_sources)
+        assert any("alias" in r.message and "live" in r.message for r in caplog.records)
+
+    def test_monitored_single_file_alias_is_honored(self, tmp_path):
+        """A ``monitor=true`` single *file* cannot be live-monitored, so it is
+        registered static -- and being static, its alias tree-root IS honored (it
+        is never rescanned). No ignore-warning applies to it."""
+        f = tmp_path / "img.tif"
+        _write_tiff(str(f))
+        cfg = _config(SourceConfig(url=str(f), alias="solo", monitor=True))
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert monitored_sources == []
+        assert [s._catalog_url for s in static_sources] == ["solo"]
