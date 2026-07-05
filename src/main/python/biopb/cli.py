@@ -99,6 +99,14 @@ MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
+# Written by the running daemon next to its PID file: the port it bound plus a
+# per-launch random secret. POSTing the secret to the daemon's /shutdown route
+# triggers its graceful teardown in-process -- the stop path `_stop_mcp` prefers,
+# because on Windows os.kill(SIGTERM) is TerminateProcess and the daemon's
+# signal handler never gets to reap its child kernel (#323). Keep in sync with
+# _write_secret_file() in biopb_mcp.mcp.__main__.
+MCP_SECRET_FILE = MCP_PID_FILE.with_suffix(".secret")
+
 
 # The installer records the release-v* deployment version it pulled the wheels
 # from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
@@ -206,9 +214,9 @@ def _write_pid_file(pid_file: Path, pid: int, token: Optional[int] = None):
 
 
 def _remove_pid_file(pid_file: Path):
-    """Remove `pid_file` if present."""
-    if pid_file.exists():
-        pid_file.unlink()
+    """Remove `pid_file` if present. missing_ok because the daemon may remove
+    its own file concurrently (its graceful teardown does)."""
+    pid_file.unlink(missing_ok=True)
 
 
 def _write_pid(pid: int):
@@ -1233,8 +1241,13 @@ def _write_mcp_pid(pid: int):
 
 
 def _remove_mcp_pid():
-    """Remove the MCP daemon PID file."""
+    """Remove the MCP daemon PID file and its shutdown-secret sibling.
+
+    The daemon removes both itself on graceful exit; this covers the force-kill
+    and stale-file paths so a dead daemon's secret can't linger.
+    """
     _remove_pid_file(MCP_PID_FILE)
+    _remove_pid_file(MCP_SECRET_FILE)
 
 
 def _ensure_mcp_dirs():
@@ -1327,24 +1340,83 @@ def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
         time.sleep(0.25)
 
 
-def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
-    """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
-    wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
-    True if it exited gracefully. Assumes `pid` is running.
+def _read_mcp_shutdown_secret() -> Tuple[Optional[int], Optional[str]]:
+    """Read (port, secret) from the daemon's shutdown-secret file.
 
-    Unlike the tensor server there is no Windows shutdown-sentinel handshake: the
-    MCP launcher installs SIGTERM/SIGINT handlers, and on Windows os.kill maps
-    SIGTERM to TerminateProcess (an immediate, ungraceful stop) - acceptable for
-    a localhost dev daemon with no in-flight durability to protect.
+    Written by the daemon next to its PID file at startup (see MCP_SECRET_FILE):
+    the port it bound plus a per-launch random secret its /shutdown route
+    requires. Returns (None, None) when missing or unparseable -- e.g. a
+    pre-secret daemon -- in which case stop falls back to a signal.
+    """
+    try:
+        parts = MCP_SECRET_FILE.read_text().split()
+        return int(parts[0]), parts[1]
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def _http_shutdown_mcp() -> bool:
+    """Ask the daemon to shut down via its POST /shutdown route. Returns True
+    if the request was delivered (not whether the process has exited yet).
+
+    This is the graceful stop path on Windows, where os.kill(pid, SIGTERM) maps
+    to TerminateProcess -- immediate and uncatchable, so the daemon's signal
+    handler never runs and its child Jupyter kernel (napari viewer, dask
+    workers) is orphaned (#323). The route runs the same teardown as the signal
+    handler, inside the daemon, where the kernel can be reaped.
+
+    A connection dropped after the request went out counts as delivered: the
+    daemon acks before exiting, but may tear the socket down before we finish
+    reading. Anything else (nothing listening, timeout, 403 from a secret
+    mismatch) is False and the caller falls back to a signal.
+    """
+    import http.client
+    import urllib.error
+    import urllib.request
+
+    port, secret = _read_mcp_shutdown_secret()
+    if port is None or not secret:
+        return False
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/shutdown",
+        data=b"",
+        method="POST",
+        headers={"X-Biopb-Shutdown-Secret": secret},
+    )
+    dropped = (http.client.RemoteDisconnected, ConnectionResetError)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return 200 <= response.status < 300
+    except dropped:
+        return True
+    except urllib.error.URLError as exc:
+        return isinstance(exc.reason, dropped)
+    except OSError:
+        return False
+
+
+def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
+    """Stop the MCP daemon: request a graceful shutdown, wait up to `timeout`
+    seconds, then force-kill. Removes the PID file. Returns True if it exited
+    gracefully. Assumes `pid` is running.
+
+    The graceful request prefers the daemon's POST /shutdown route over a
+    signal: on Windows os.kill maps SIGTERM to TerminateProcess, which bypasses
+    the daemon's signal handler and orphans its child kernel (#323), while the
+    route triggers the same teardown in-process on every platform. When the
+    route is unavailable (pre-secret daemon, stale/missing secret file) it falls
+    back to SIGTERM -- still graceful on POSIX, ungraceful-but-effective on
+    Windows, i.e. the pre-#323 behavior.
 
     `token` is the recorded create-time identity: the wait loop and force-kill are
     gated on it so a PID reused mid-stop is neither waited on nor TerminateProcess'd.
     """
     if _is_our_daemon(pid, token):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        if not _http_shutdown_mcp():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
     graceful = False
     for _ in range(timeout):

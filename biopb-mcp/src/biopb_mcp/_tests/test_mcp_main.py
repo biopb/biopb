@@ -18,7 +18,9 @@ from biopb_mcp.mcp.__main__ import (
     _remove_pidfile,
     _resolve_headless,
     _setup_observe,
+    _shutdown_route_handler,
     _write_pidfile,
+    _write_secret_file,
     main,
 )
 
@@ -256,3 +258,100 @@ class TestPidfile:
 
     def test_remove_none_is_noop(self):
         _remove_pidfile(None)  # write was skipped/failed; nothing to undo
+
+
+class TestSecretFile:
+    """The daemon records a per-launch shutdown secret (plus its bound port)
+    next to the PID file so `biopb mcp stop` can trigger the graceful
+    /shutdown route -- the only teardown path a Windows signal can't provide
+    (#323)."""
+
+    def test_writes_port_and_secret(self, tmp_path):
+        pidfile = tmp_path / "mcp-server.pid"
+        path = _write_secret_file(pidfile, 8765, "s3cr3t")
+        # port + secret, read back by the CLI's _read_mcp_shutdown_secret.
+        assert path == tmp_path / "mcp-server.secret"
+        assert path.read_text() == "8765\ns3cr3t"
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+    def test_owner_only_on_posix(self, tmp_path):
+        path = _write_secret_file(tmp_path / "mcp-server.pid", 8765, "s3cr3t")
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_skipped_when_pidfile_was(self):
+        # Pidfile write skipped (racing loser) or failed -> no secret either,
+        # so the loser can't clobber the winner's secret.
+        assert _write_secret_file(None, 8765, "s3cr3t") is None
+
+    def test_write_failure_is_swallowed(self, tmp_path, monkeypatch):
+        pidfile = tmp_path / "mcp-server.pid"
+
+        def _boom(*_a, **_k):
+            raise OSError("read-only fs")
+
+        monkeypatch.setattr(type(pidfile), "write_text", _boom)
+        # A write failure only costs the HTTP stop path, never the server.
+        assert _write_secret_file(pidfile, 8765, "s3cr3t") is None
+
+    def test_removed_with_our_pidfile(self, tmp_path):
+        pidfile = tmp_path / "mcp-server.pid"
+        pidfile.write_text(str(os.getpid()))
+        secret = tmp_path / "mcp-server.secret"
+        secret.write_text("8765\ns3cr3t")
+        _remove_pidfile(pidfile)
+        assert not pidfile.exists() and not secret.exists()
+
+    def test_left_when_pidfile_is_not_ours(self, tmp_path):
+        # A losing daemon's exit must not delete the winner's secret either.
+        pidfile = tmp_path / "mcp-server.pid"
+        pidfile.write_text("999999999")
+        secret = tmp_path / "mcp-server.secret"
+        secret.write_text("8765\ns3cr3t")
+        _remove_pidfile(pidfile)
+        assert pidfile.exists() and secret.exists()
+
+
+class TestShutdownRoute:
+    """POST /shutdown runs the daemon's own teardown -- graceful stop where a
+    signal can't be delivered (Windows os.kill is TerminateProcess, #323)."""
+
+    def _client(self, secret, calls):
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        handler = _shutdown_route_handler(secret, calls.append)
+        return TestClient(
+            Starlette(routes=[Route("/shutdown", handler, methods=["POST"])])
+        )
+
+    def test_correct_secret_acks_then_tears_down(self):
+        calls = []
+        client = self._client("s3cr3t", calls)
+        r = client.post("/shutdown", headers={"X-Biopb-Shutdown-Secret": "s3cr3t"})
+        assert r.status_code == 200
+        # The teardown ran as a background task -- after the response was sent,
+        # so `biopb mcp stop` sees the ack before the process exits.
+        assert calls == ["http POST /shutdown"]
+
+    def test_wrong_secret_is_403(self):
+        calls = []
+        client = self._client("s3cr3t", calls)
+        r = client.post("/shutdown", headers={"X-Biopb-Shutdown-Secret": "nope"})
+        assert r.status_code == 403
+        assert calls == []
+
+    def test_missing_header_is_403(self):
+        calls = []
+        client = self._client("s3cr3t", calls)
+        assert client.post("/shutdown").status_code == 403
+        assert calls == []
+
+    def test_empty_secret_fails_closed(self):
+        # A daemon somehow configured with no secret must not be stoppable by
+        # an empty header.
+        calls = []
+        client = self._client("", calls)
+        r = client.post("/shutdown", headers={"X-Biopb-Shutdown-Secret": ""})
+        assert r.status_code == 403
+        assert calls == []

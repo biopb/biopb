@@ -18,6 +18,7 @@ import argparse
 import atexit
 import logging
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -102,15 +103,51 @@ def _remove_pidfile(pidfile):
 
     Pid-safe so a losing daemon's exit never deletes the winner's file. Compares
     only the first whitespace-separated field (the PID), ignoring any trailing
-    create-time token, so the match holds regardless of token presence.
+    create-time token, so the match holds regardless of token presence. The
+    shutdown-secret sibling (see :func:`_write_secret_file`) rides along: it is
+    removed exactly when the PID file it belongs to is.
     """
     if pidfile is None:
         return
     try:
         if pidfile.read_text().split()[0] == str(os.getpid()):
             pidfile.unlink()
+            _secret_file(pidfile).unlink(missing_ok=True)
     except (OSError, ValueError, IndexError):
         pass
+
+
+def _secret_file(pidfile):
+    """The shutdown-secret file that belongs to `pidfile` (its .secret sibling)."""
+    return pidfile.with_suffix(".secret")
+
+
+def _write_secret_file(pidfile, port, secret):
+    """Best-effort: record the bound port and per-launch shutdown secret.
+
+    Read by `biopb mcp stop` to POST /shutdown (see
+    :func:`_register_shutdown_route`) — the graceful stop path on Windows,
+    where os.kill(SIGTERM) is TerminateProcess and the signal handler never
+    runs (#323). The biopb CLI hardcodes the same path
+    (``biopb.cli.MCP_SECRET_FILE``); keep the two in sync.
+
+    Written only when the PID file was (``pidfile`` is None otherwise), so the
+    racing-loser guard in :func:`_write_pidfile` covers both files. Owner-only
+    on POSIX; on Windows the profile dir's ACLs already restrict it. A write
+    failure only costs the HTTP stop path — the CLI falls back to os.kill,
+    the pre-#323 behavior.
+    """
+    if pidfile is None:
+        return None
+    path = _secret_file(pidfile)
+    try:
+        path.write_text(f"{port}\n{secret}")
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+        return path
+    except OSError:
+        logger.warning("Could not write shutdown-secret file %s", path, exc_info=True)
+        return None
 
 
 def _parse_args(argv, default_transport, default_port):
@@ -186,6 +223,51 @@ def _setup_observe(config):
     except Exception:
         logger.exception("observe UI failed to start; continuing without it")
         return False
+
+
+def _shutdown_route_handler(secret, shutdown):
+    """Build the POST /shutdown handler: verify `secret`, ack, then `shutdown`.
+
+    ``shutdown`` (a reason -> never-returns teardown, see ``_serve_http``) runs
+    as a Starlette background task, i.e. strictly after the 200 has been sent —
+    so the caller sees the ack before the process exits. The comparison is
+    constant-time and an empty secret never matches (fail closed).
+    """
+    from starlette.background import BackgroundTask
+    from starlette.responses import PlainTextResponse
+
+    async def _handler(request):
+        provided = request.headers.get("x-biopb-shutdown-secret", "")
+        if not secret or not secrets.compare_digest(provided.encode(), secret.encode()):
+            return PlainTextResponse("forbidden\n", status_code=403)
+        logger.info("Shutdown requested over HTTP.")
+        return PlainTextResponse(
+            "shutting down\n",
+            background=BackgroundTask(shutdown, "http POST /shutdown"),
+        )
+
+    return _handler
+
+
+def _register_shutdown_route(secret, shutdown):
+    """Mount POST /shutdown on the MCP app (the graceful stop path on Windows).
+
+    `biopb mcp stop` prefers this route over a signal because on Windows
+    os.kill(pid, SIGTERM) maps to TerminateProcess — immediate and uncatchable,
+    so the daemon's signal handler never runs and the child Jupyter kernel
+    (napari viewer, dask workers) is orphaned (#323). The route runs the same
+    teardown as the signal handler, in-process, where the kernel can be reaped.
+
+    The app binds loopback-only; `secret` (written next to the PID file, see
+    :func:`_write_secret_file`) additionally keeps other local users on a
+    shared machine from stopping this daemon. Must run before ``_server.run()``
+    — custom routes are read when the streamable-http app is built.
+    """
+    from . import _server
+
+    _server.mcp.custom_route("/shutdown", methods=["POST"])(
+        _shutdown_route_handler(secret, shutdown)
+    )
 
 
 def _config_defaults(config):
@@ -368,12 +450,15 @@ def _serve_http(config, port):
 
     # Register the daemon's PID so `biopb mcp status` can detect it no matter
     # how it was launched (CLI, stdio shim, or manual). Written just before the
-    # bind below; removed pid-safely on every exit path.
+    # bind below; removed pid-safely on every exit path. The shutdown secret
+    # rides along so `biopb mcp stop` can reach the /shutdown route.
     pidfile = _write_pidfile(port)
+    shutdown_secret = secrets.token_hex(16)
+    _write_secret_file(pidfile, port, shutdown_secret)
     atexit.register(_remove_pidfile, pidfile)
 
-    def _handle_signal(signum, frame):
-        logger.info("Received signal %s, shutting down.", signum)
+    def _shutdown(reason):
+        logger.info("Shutting down (%s).", reason)
         host.shutdown()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()
@@ -384,12 +469,18 @@ def _serve_http(config, port):
         # The launcher's only remaining job is to exit, so exit immediately.
         os._exit(0)
 
+    def _handle_signal(signum, frame):
+        _shutdown(f"signal {signum}")
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Opt-in web "observe" UI. Set up before the (blocking) transport run:
-    # custom routes are read when the streamable-http app is built.
+    # Opt-in web "observe" UI, and the /shutdown route `biopb mcp stop` prefers
+    # (on Windows a signal cannot trigger _shutdown; the route always can). Set
+    # up before the (blocking) transport run: custom routes are read when the
+    # streamable-http app is built.
     _setup_observe(config)
+    _register_shutdown_route(shutdown_secret, _shutdown)
 
     _server.run(
         port,
@@ -397,13 +488,10 @@ def _serve_http(config, port):
         allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
     )
 
-    # If the server loop returns on its own, exit the same way: shut down the
-    # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
-    # os._exit, so shut down explicitly here).
-    host.shutdown()
-    _remove_pidfile(pidfile)
-    _cleanup_dask_dir()
-    os._exit(0)
+    # If the server loop returns on its own, exit the same way: reap the kernel
+    # and bypass Py_FinalizeEx (atexit handlers do not run after os._exit, so
+    # shut down explicitly here).
+    _shutdown("server loop exited")
 
 
 if __name__ == "__main__":

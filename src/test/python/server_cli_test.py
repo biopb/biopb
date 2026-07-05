@@ -590,6 +590,149 @@ class TestMcpStop:
         assert "force killed" in res.output
 
 
+class TestMcpHttpShutdown:
+    """_stop_mcp prefers the daemon's POST /shutdown route: on Windows a SIGTERM
+    is TerminateProcess, which skips the daemon's teardown and orphans its child
+    kernel (#323); the route runs the same teardown inside the daemon."""
+
+    @pytest.fixture
+    def secret_file(self, tmp_path, monkeypatch):
+        f = tmp_path / "mcp-server.secret"
+        monkeypatch.setattr(cli, "MCP_SECRET_FILE", f)
+        return f
+
+    def test_reads_port_and_secret(self, secret_file):
+        secret_file.write_text("9123\ns3cr3t")
+        assert cli._read_mcp_shutdown_secret() == (9123, "s3cr3t")
+
+    def test_missing_or_garbage_reads_none(self, secret_file):
+        assert cli._read_mcp_shutdown_secret() == (None, None)
+        secret_file.write_text("not-a-port s3cr3t")
+        assert cli._read_mcp_shutdown_secret() == (None, None)
+
+    def test_no_secret_makes_no_request(self, secret_file, monkeypatch):
+        # Pre-secret daemon: nothing to POST with; caller falls back to signal.
+        import urllib.request
+
+        boom = MagicMock(side_effect=AssertionError("must not request"))
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        assert cli._http_shutdown_mcp() is False
+
+    def test_delivered_on_200(self, secret_file, monkeypatch):
+        import urllib.request
+
+        secret_file.write_text("9123\ns3cr3t")
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["secret"] = request.get_header("X-biopb-shutdown-secret")
+            cm = MagicMock()
+            cm.__enter__.return_value.status = 200
+            return cm
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        assert cli._http_shutdown_mcp() is True
+        assert captured["url"] == "http://127.0.0.1:9123/shutdown"
+        assert captured["secret"] == "s3cr3t"
+
+    def test_dropped_connection_counts_as_delivered(self, secret_file, monkeypatch):
+        # The daemon acks then exits; it may tear the socket down before we
+        # finish reading -- that is a delivered shutdown, not a failure.
+        import http.client
+        import urllib.request
+
+        secret_file.write_text("9123\ns3cr3t")
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            MagicMock(side_effect=http.client.RemoteDisconnected("gone")),
+        )
+        assert cli._http_shutdown_mcp() is True
+
+    def test_wrapped_drop_counts_as_delivered(self, secret_file, monkeypatch):
+        import urllib.error
+        import urllib.request
+
+        secret_file.write_text("9123\ns3cr3t")
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            MagicMock(side_effect=urllib.error.URLError(ConnectionResetError())),
+        )
+        assert cli._http_shutdown_mcp() is True
+
+    def test_nothing_listening_is_not_delivered(self, secret_file, monkeypatch):
+        # Stale secret file, daemon already gone -> fall back to signal path.
+        import urllib.error
+        import urllib.request
+
+        secret_file.write_text("9123\ns3cr3t")
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            MagicMock(side_effect=urllib.error.URLError(ConnectionRefusedError())),
+        )
+        assert cli._http_shutdown_mcp() is False
+
+    def test_forbidden_is_not_delivered(self, secret_file, monkeypatch):
+        # Secret mismatch (daemon restarted since the file was read): 403.
+        import urllib.error
+        import urllib.request
+
+        secret_file.write_text("9123\ns3cr3t")
+        err = urllib.error.HTTPError(
+            "http://127.0.0.1:9123/shutdown", 403, "Forbidden", None, None
+        )
+        monkeypatch.setattr(urllib.request, "urlopen", MagicMock(side_effect=err))
+        assert cli._http_shutdown_mcp() is False
+
+
+class TestStopMcpGraceful:
+    """_stop_mcp escalation: HTTP /shutdown first, SIGTERM fallback, force-kill."""
+
+    def _daemon(self, monkeypatch, alive_polls):
+        alive = iter(alive_polls)
+        monkeypatch.setattr(cli, "_is_our_daemon", lambda _p, _t: next(alive))
+        monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
+
+    def test_http_delivered_skips_signal(self, monkeypatch):
+        # Alive at the pre-request check, gone on the first wait poll.
+        self._daemon(monkeypatch, [True, False])
+        monkeypatch.setattr(cli, "_http_shutdown_mcp", lambda: True)
+        with patch.object(cli.os, "kill") as kill:
+            assert cli._stop_mcp(123, timeout=5) is True
+            kill.assert_not_called()
+
+    def test_falls_back_to_sigterm(self, monkeypatch):
+        # No route (pre-secret daemon): the old signal path still works.
+        self._daemon(monkeypatch, [True, False])
+        monkeypatch.setattr(cli, "_http_shutdown_mcp", lambda: False)
+        with patch.object(cli.os, "kill") as kill:
+            assert cli._stop_mcp(123, timeout=5) is True
+            kill.assert_called_once_with(123, cli.signal.SIGTERM)
+
+    def test_force_kills_when_unresponsive(self, monkeypatch):
+        self._daemon(monkeypatch, [True] * 20)
+        monkeypatch.setattr(cli, "_http_shutdown_mcp", lambda: True)
+        with patch.object(cli.os, "kill") as kill:
+            assert cli._stop_mcp(123, timeout=2) is False
+            expected_sig = getattr(cli.signal, "SIGKILL", cli.signal.SIGTERM)
+            kill.assert_called_with(123, expected_sig)
+
+    def test_remove_mcp_pid_removes_secret_sibling(self, tmp_path, monkeypatch):
+        # After a force-kill the daemon can't clean up; a stale secret must not
+        # linger for the next daemon's stop to trip over.
+        pid_file = tmp_path / "mcp-server.pid"
+        secret_file = tmp_path / "mcp-server.secret"
+        pid_file.write_text("123")
+        secret_file.write_text("8765\ns3cr3t")
+        monkeypatch.setattr(cli, "MCP_PID_FILE", pid_file)
+        monkeypatch.setattr(cli, "MCP_SECRET_FILE", secret_file)
+        cli._remove_mcp_pid()
+        assert not pid_file.exists() and not secret_file.exists()
+
+
 class TestMcpStatus:
     def _json(self, monkeypatch, *, pid, running, listening):
         monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
