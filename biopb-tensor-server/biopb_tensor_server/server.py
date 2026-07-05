@@ -31,6 +31,8 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceStreamMessage,
     FlightCmd,
     PyramidLevel,
+    RemoveSourceRequest,
+    RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
@@ -258,6 +260,13 @@ class TensorFlightServer(flight.FlightServerBase):
         self._add_source_handler: Optional[Callable[..., Any]] = None
         self._allow_runtime_source_add = True
 
+        # Runtime removal of a drag-dropped source branch (the "remove_source"
+        # action / tensor-browser [x] button). Injected via
+        # ``set_remove_source_handler`` alongside the add handler. Gated on the
+        # SAME ``_allow_runtime_source_add`` flag: a server that cannot add has no
+        # dnd:// sources to remove, so removal is a no-op there anyway.
+        self._remove_source_handler: Optional[Callable[..., Any]] = None
+
     @contextlib.contextmanager
     def _serving_request(self):
         """Mark a heavy read in flight for its duration (precache idle signal)."""
@@ -321,6 +330,15 @@ class TensorFlightServer(flight.FlightServerBase):
         reporting "not enabled".
         """
         self._add_source_handler = handler
+
+    def set_remove_source_handler(self, handler: Optional[Callable[..., Any]]) -> None:
+        """Wire the SourceManager's ``remove_dropped_root`` for the remove_source action.
+
+        Injected by the launcher alongside ``set_add_source_handler`` (the server
+        holds no SourceManager reference). ``None`` leaves the action reporting
+        "not enabled".
+        """
+        self._remove_source_handler = handler
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -616,6 +634,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "add_source",
                 "Register a local path/dir as a served source at runtime (streams progress)",
             ),
+            flight.ActionType(
+                "remove_source",
+                "Deregister a drag-dropped (dnd://) source branch at runtime",
+            ),
         ]
 
     def do_action(
@@ -686,6 +708,9 @@ class TensorFlightServer(flight.FlightServerBase):
         elif action.type == "add_source":
             req = AddSourceRequest.FromString(action.body.to_pybytes())
             yield from self._handle_add_source(req, context)
+        elif action.type == "remove_source":
+            req = RemoveSourceRequest.FromString(action.body.to_pybytes())
+            yield self._handle_remove_source(req)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
@@ -991,6 +1016,28 @@ class TensorFlightServer(flight.FlightServerBase):
                     yield AddSourceStreamMessage(result=result).SerializeToString()
         except (FileNotFoundError, PermissionError, ValueError) as exc:
             raise flight.FlightServerError(str(exc)) from exc
+
+    def _handle_remove_source(self, req: RemoveSourceRequest) -> bytes:
+        """Deregister a drag-dropped source branch (single, non-streamed result).
+
+        Delegates to the SourceManager's ``remove_dropped_root``, which removes
+        only sources whose catalog ``source_url`` carries the ``dnd://`` origin
+        scheme -- so a request for anything else is rejected (``ValueError`` ->
+        ``FlightServerError``). Removal is quick (unregister N adapters), so
+        unlike add it does not stream: one ``RemoveSourceResult`` is returned.
+        """
+        if not self._allow_runtime_source_add or self._remove_source_handler is None:
+            raise flight.FlightServerError(
+                "Runtime source removal is not enabled on this server."
+            )
+        try:
+            removed, failed = self._remove_source_handler(req.root_url)
+        except ValueError as exc:
+            raise flight.FlightServerError(str(exc)) from exc
+        result = RemoveSourceResult(removed=removed)
+        for source_id, reason in failed:
+            result.failed.add(path=source_id, reason=reason)
+        return result.SerializeToString()
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes

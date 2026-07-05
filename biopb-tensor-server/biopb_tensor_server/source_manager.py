@@ -1425,6 +1425,61 @@ class SourceManager:
             self._clear_failed_source_attempt(source_id)
         return True
 
+    def remove_dropped_root(
+        self, root_url: str
+    ) -> Tuple[List[str], List[Tuple[str, str]]]:
+        """Deregister every drag-dropped source at or under a ``dnd://`` branch root.
+
+        The narrow counterpart to :meth:`add_local_source`: it removes ONLY
+        drag-dropped sources, identified by the ``dnd://`` scheme their catalog
+        ``source_url`` carries. That scheme is stamped by ``_drop_catalog_url``
+        only for drops that are new and outside every monitored root -- i.e.
+        sources nothing will re-add -- so it is a sound authorization key. A
+        source matches when its ``source_url`` equals ``root_url`` or is under it
+        (the ``root_url + "/"`` prefix), so one dropped folder's sources go as a
+        unit.
+
+        Runs under ``self._catalog_lock`` (like add / rescan) so the confirmed
+        catalog stays single-writer. Returns ``(removed_ids, failed)`` where
+        ``failed`` is a list of ``(source_id, reason)``.
+
+        Raises ``ValueError`` if ``root_url`` does not carry the ``dnd://``
+        scheme -- the authorization boundary: only user-dropped sources are ever
+        removable this way. The bare scheme (``dnd://`` with no branch under it)
+        is refused for the same reason: ``rstrip("/")`` would collapse it to a
+        ``dnd:/`` prefix that matches *every* drop, so it must not resolve to a
+        wildcard "remove all drops".
+        """
+        if not root_url.startswith(DND_URL_PREFIX):
+            raise ValueError(
+                f"remove_source only removes drag-dropped ({DND_URL_PREFIX}) "
+                f"sources; refusing root_url: {root_url!r}"
+            )
+        if not root_url[len(DND_URL_PREFIX) :].strip("/\\"):
+            raise ValueError(
+                f"remove_source needs a branch root under {DND_URL_PREFIX}, "
+                f"not the bare scheme; refusing root_url: {root_url!r}"
+            )
+
+        removed: List[str] = []
+        failed: List[Tuple[str, str]] = []
+        prefix = root_url.rstrip("/") + "/"
+        with self._catalog_lock:
+            with self._lock:
+                source_ids = list(self._state.claims.keys())
+            targets = [
+                source_id
+                for source_id in source_ids
+                if (desc := self._descriptor_for(source_id)) is not None
+                and (desc.source_url == root_url or desc.source_url.startswith(prefix))
+            ]
+            for source_id in targets:
+                if self._commit_remove_source(source_id):
+                    removed.append(source_id)
+                else:
+                    failed.append((source_id, "not present (already removed?)"))
+        return removed, failed
+
     def _reconcile_due_upstreams(self) -> None:
         """Re-list the upstreams that are due this tick (adaptive backoff).
 

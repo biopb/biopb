@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMenu,
@@ -71,6 +72,11 @@ class _TreeNode:
         self.depth = depth
         self.source = source
         self.children: List[_TreeNode] = []
+        # Set on the top-level node of a drag-dropped (``dnd://``) branch: the
+        # tree shows a remove [x] on it, and ``remove_root`` is the ``dnd://``
+        # prefix passed to ``remove_source`` to deregister the whole branch.
+        self.dropped: bool = False
+        self.remove_root: str | None = None
 
 
 # Origin scheme stamped by the tensor server on a drag-dropped source's catalog
@@ -432,6 +438,35 @@ class _AddSourceWorker(QThread):
         self.done.emit((added, already, failed))
 
 
+class _RemoveSourceWorker(QThread):
+    """Runs ``TensorConnection.remove_source`` for one dropped branch off the GUI thread.
+
+    Removal is quick server-side (unregister N adapters), but a rescan may briefly
+    hold the catalog lock, so it runs off the Qt event loop like the add worker.
+    One [x] click == one ``remove_source`` call == one terminal ``(removed,
+    failed)`` tally. Only drag-dropped (``dnd://``) branches are ever removable, so
+    there is nothing to cancel and no path aggregation.
+    """
+
+    done = Signal(object)  # (removed_ids, failed)
+    failed = Signal(str)
+
+    def __init__(self, conn: TensorConnection, root_url: str):
+        super().__init__()
+        self._conn = conn
+        self._root_url = root_url
+
+    def run(self):
+        try:
+            result = self._conn.remove_source(self._root_url)
+        except Exception as exc:  # surface the SDK/server message to the user
+            self.failed.emit(str(exc))
+            return
+        removed = list(result.removed)
+        failed = [(f.path, f.reason) for f in result.failed]
+        self.done.emit((removed, failed))
+
+
 def _human_bytes(n: int) -> str:
     """Compact human-readable byte size (e.g. ``4.2 GB``)."""
     size = float(n)
@@ -461,17 +496,24 @@ def _build_tree(sources: Dict[str, DataSourceDescriptor]) -> _TreeNode:
 
     for src in sources.values():
         parts = _get_path_parts(src.source_url)
+        # A drag-dropped (dnd://) source's top-level node is a removable branch
+        # root; tag it so the tree shows a remove [x], and record the dnd:// prefix
+        # that remove_source() targets (all of one drop's sources share it).
+        is_dropped = src.source_url.startswith(_DND_URL_PREFIX)
+        remove_root = (_DND_URL_PREFIX + parts[0]) if (is_dropped and parts) else None
         if not parts:
             # No path parts, add directly to root
-            root.children.append(
-                _TreeNode(
-                    node_id=src.source_id,
-                    name=src.source_id,
-                    node_type="source",
-                    depth=1,
-                    source=src,
-                )
+            leaf = _TreeNode(
+                node_id=src.source_id,
+                name=src.source_id,
+                node_type="source",
+                depth=1,
+                source=src,
             )
+            if is_dropped:
+                leaf.dropped = True
+                leaf.remove_root = src.source_url
+            root.children.append(leaf)
             continue
 
         # Navigate/create folder path
@@ -494,19 +536,26 @@ def _build_tree(sources: Dict[str, DataSourceDescriptor]) -> _TreeNode:
                     depth=current.depth + 1,
                 )
                 current.children.append(child)
+            # The top-level folder of a dropped folder-branch is its removable root.
+            if i == 0 and is_dropped:
+                child.dropped = True
+                child.remove_root = remove_root
             current = child
 
         # Add source as leaf
         source_name = parts[-1]
-        current.children.append(
-            _TreeNode(
-                node_id=src.source_id,
-                name=source_name,
-                node_type="source",
-                depth=current.depth + 1,
-                source=src,
-            )
+        leaf = _TreeNode(
+            node_id=src.source_id,
+            name=source_name,
+            node_type="source",
+            depth=current.depth + 1,
+            source=src,
         )
+        # A single-part dropped source (one dropped file/dataset) is itself the root.
+        if is_dropped and len(parts) == 1:
+            leaf.dropped = True
+            leaf.remove_root = remove_root
+        current.children.append(leaf)
 
     # Sort children: folders first, then sources, both alphabetically
     def sort_children(node: _TreeNode):
@@ -815,6 +864,10 @@ class TensorBrowserWidget(QWidget):
         # to the ``finished`` signal, mirroring the resolve/warm ownership rule.
         self._add_worker: _AddSourceWorker | None = None
         self._add_retain: set = set()
+        # In-flight dropped-branch remove worker (at most one at a time), same
+        # ownership rule as the add worker.
+        self._remove_worker: _RemoveSourceWorker | None = None
+        self._remove_retain: set = set()
         self._setup_ui()
 
         # Self-heal the tree when the background source watcher re-lists a
@@ -938,6 +991,13 @@ class TensorBrowserWidget(QWidget):
         # Tree widget - give it most of the space
         self._tree_widget = QTreeWidget()
         self._tree_widget.setHeaderHidden(True)
+        # Column 0 holds the name/tree; a narrow column 1 holds the remove [x]
+        # button on drag-dropped root rows only (empty, zero-width otherwise).
+        self._tree_widget.setColumnCount(2)
+        _header = self._tree_widget.header()
+        _header.setStretchLastSection(False)
+        _header.setSectionResizeMode(0, QHeaderView.Stretch)
+        _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1535,6 +1595,13 @@ class TensorBrowserWidget(QWidget):
         item.setData(0, Qt.ItemDataRole.UserRole, node.node_id)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, node.node_type)
 
+        # Drag-dropped branch root: a remove [x] in column 1 (see the two-column
+        # tree in _setup_ui). Re-created on every rebuild -- clear() drops widgets.
+        if node.dropped and node.remove_root:
+            self._tree_widget.setItemWidget(
+                item, 1, self._make_remove_button(node.remove_root, node.name)
+            )
+
         if node.node_type == "folder":
             item.setText(0, node.name)
             for child in node.children:
@@ -1576,6 +1643,69 @@ class TensorBrowserWidget(QWidget):
                     tensor_name = _tensor_short_name(tensor.array_id)
                     shape_str = _format_shape(tensor.shape)
                     tensor_item.setText(0, f"{tensor_name}  [{shape_str}]")
+
+    def _make_remove_button(self, remove_root: str, display_name: str) -> QPushButton:
+        """A small [x] button that removes a drag-dropped branch at its root."""
+        btn = QPushButton("✕")
+        btn.setFlat(True)
+        btn.setFixedSize(18, 18)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Remove dropped source “{display_name}”")
+        btn.clicked.connect(
+            lambda _=False, r=remove_root, n=display_name: self._on_remove_dropped(r, n)
+        )
+        return btn
+
+    def _on_remove_dropped(self, remove_root: str, display_name: str):
+        """Confirm, then deregister a drag-dropped branch (off the GUI thread)."""
+        resp = QMessageBox.question(
+            self,
+            "Remove dropped source?",
+            f"Remove “{display_name}” from the browser?\n\n"
+            "This unregisters the drag-dropped source(s) from the tensor server. "
+            "The underlying files on disk are not deleted.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        self._start_remove(remove_root, display_name)
+
+    def _start_remove(self, root_url: str, display_name: str):
+        """Spawn the off-GUI-thread remove worker (one at a time)."""
+        if self._remove_worker is not None:
+            return  # one removal at a time
+        self._clear_error()
+        worker = _RemoveSourceWorker(self._conn, root_url)
+        self._remove_worker = worker
+        self._remove_retain.add(worker)
+        worker.done.connect(self._on_remove_done)
+        worker.failed.connect(self._on_remove_failed)
+        worker.finished.connect(lambda w=worker: self._remove_retain.discard(w))
+        self._show_status(f"Removing {display_name}…")
+        worker.start()
+
+    def _on_remove_done(self, payload):
+        """Terminal remove tally: refresh so the row disappears, then summarize."""
+        removed, failed = payload
+        self._remove_worker = None
+        if removed:
+            try:
+                self._refresh()
+            except Exception:
+                logger.exception("refresh after remove_source failed")
+        n = len(removed)
+        self._show_status(
+            f"Removed {n} source{'' if n == 1 else 's'}" if n else "Nothing to remove"
+        )
+        if failed:
+            detail = "\n".join(f"• {sid}: {reason}" for sid, reason in failed)
+            self._report_failure("Some sources were not removed", detail)
+
+    def _on_remove_failed(self, msg: str):
+        """Whole-request remove failure (e.g. the server refused a non-dnd root)."""
+        self._remove_worker = None
+        self._report_failure("Remove failed", msg)
 
     def _restore_expanded_state(self):
         """Restore expanded state for folders."""
