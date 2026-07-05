@@ -4,9 +4,15 @@ The MCP launcher holds the *write* end of a pipe whose *read* end is inherited
 by the kernel (the fd number is passed in ``BIOPB_PARENT_DEATH_FD``). When the
 launcher **process** dies for any reason — ``SIGKILL``, OOM, segfault, crash —
 the OS closes its write end, this watcher's blocking ``os.read`` returns EOF,
-and the kernel group-kills itself. That reaps the kernel *and* the dask child
-processes it spawned (same process group) instead of orphaning the whole tree
-(issue #13, failure mode 1).
+and the kernel group-kills itself, so it doesn't outlive the daemon (issue #13,
+failure mode 1). The daemon-owned dask cluster is *not* in the kernel's group
+(it lives in the daemon's); on daemon death its workers self-terminate on
+scheduler loss — the sole reaper on an *uncatchable* daemon death (the daemon's
+own ``_shutdown`` / ``atexit`` close covers the graceful exits), which is why the
+``mcp`` extra floors ``distributed>=2023.9`` (post-``reconnect``, when a worker
+that loses its scheduler shuts down instead of retrying forever). Only under the
+``mcp.dask.owner="kernel"`` escape hatch does the kernel's group also contain
+dask children this reap takes down.
 
 Why a pipe and not ``PR_SET_PDEATHSIG``: the parent-death *signal* is tied to
 the **thread** that forked the kernel, so it fires early when a transient
@@ -62,7 +68,8 @@ def install() -> bool:
 
 
 def _self_terminate():
-    """Hard group-kill: reap this kernel and the dask children it spawned."""
+    """Hard group-kill: reap this kernel and any subprocess it spawned (agent
+    code; and, under owner="kernel", a kernel-local dask cluster)."""
     try:
         os.killpg(os.getpgid(0), signal.SIGKILL)
     except Exception:

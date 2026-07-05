@@ -309,6 +309,7 @@ def _serve_http(config, port):
     """Run the real MCP server (streamable-http) in the foreground."""
     from .._config import get_setting
     from . import _server
+    from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
@@ -368,7 +369,9 @@ def _serve_http(config, port):
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
     # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note).
+    # (issue #13, secondary disk-leak note). Consumed by the daemon-owned
+    # cluster (below) via DaskClusterHost.local_dir, or by a kernel-local cluster
+    # via BIOPB_DASK_LOCAL_DIR under the `owner="kernel"` escape hatch.
     dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
     kernel_env["BIOPB_DASK_LOCAL_DIR"] = dask_local_dir
 
@@ -379,6 +382,16 @@ def _serve_http(config, port):
     # interpreter exit if start() raises. rmtree(ignore_errors) makes this and
     # the explicit calls on the os._exit paths harmless if they both run.
     atexit.register(_cleanup_dask_dir)
+
+    # Daemon-owned dask cluster: spun lazily on the first kernel launch (from
+    # KernelHost._launch, which injects its address), kept warm across kernel
+    # restarts, and closed only on real daemon exit (the _shutdown chokepoint +
+    # atexit backstop). Detaching the cluster from the kernel is what avoids
+    # re-spinning N cold workers on every restart_kernel — the dominant restart
+    # cost on Windows (no fork). Construction is cheap (no dask import until
+    # ensure()); atexit is a backstop for exits that skip _shutdown.
+    cluster_host = DaskClusterHost(config, local_dir=dask_local_dir)
+    atexit.register(cluster_host.close)
 
     host = KernelHost(
         extra_arguments=extra_arguments,
@@ -396,6 +409,9 @@ def _serve_http(config, port):
         # The window-close pipe only matters with a viewer; a headless kernel
         # has no window to close, so don't wire it up.
         window_close_pipe=not headless,
+        # Daemon-owned dask cluster; _launch calls ensure() and injects its
+        # scheduler address so the kernel attaches instead of spinning its own.
+        cluster_host=cluster_host,
     )
     _server.set_kernel_host(host)
     _server.set_promote_after(get_setting(config, "mcp.kernel.promote_after"))
@@ -432,8 +448,8 @@ def _serve_http(config, port):
 
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
-        Windows stop sentinel, the server loop returning: reap the kernel,
-        remove our files, exit.
+        Windows stop sentinel, the server loop returning: reap the kernel, close
+        the daemon-owned dask cluster, remove our files, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -443,6 +459,10 @@ def _serve_http(config, port):
         """
         logger.info("Shutting down (%s).", reason)
         host.shutdown()
+        # After the kernel is reaped (no clients left attached): stop the
+        # daemon-owned cluster, then rmtree its now-idle spill dir. This is the
+        # only path that closes the cluster — kernel restart/reap leaves it warm.
+        cluster_host.close()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()
         os._exit(0)

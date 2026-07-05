@@ -540,7 +540,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "distributed", marker = "extra == 'mcp'" },
+    { name = "distributed", marker = "extra == 'mcp'", specifier = ">=2023.9.0" },
     { name = "grpcio-health-checking" },
     { name = "ipykernel", marker = "extra == 'mcp'" },
     { name = "jupyter-client", marker = "extra == 'mcp'" },

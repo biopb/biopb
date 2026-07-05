@@ -369,10 +369,15 @@ The `mcp` section is grouped by concern:
   job handle), `parent_death_pipe`, and the `watchdog_*` orphan-hardening knobs
   (issue #13).
 - **`mcp.dask`** — `scheduler` defaults to `distributed`, which with an empty
-  `address` auto-spins a kernel-local multi-process `LocalCluster` (the only mode
-  where `cancel_job` can stop an in-flight `.compute()`); set a non-empty
-  `address` to attach to an external scheduler, or `threads`/`synchronous` for a
-  low-overhead in-process scheduler with no mid-compute cancel.
+  `address` auto-spins a multi-process `LocalCluster`; any distributed mode lets
+  `cancel_job` stop an in-flight `.compute()`. Set a non-empty `address` to
+  attach to an external scheduler, or `threads`/`synchronous` for a low-overhead
+  in-process scheduler with no mid-compute cancel. `owner` (default `daemon`)
+  decides who owns the auto-spun cluster: `daemon` — the MCP daemon owns it and
+  it survives kernel restart/respawn/window-close (the kernel attaches via an
+  injected scheduler address; no cold worker re-spawn per restart, which is the
+  dominant restart cost on Windows), so worker/memory changes need a *daemon*
+  restart, not just `restart_kernel`; `kernel` — the legacy per-kernel cluster.
   `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
   auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
   cluster-wide chunk cache (split across workers).
