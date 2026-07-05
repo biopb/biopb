@@ -297,7 +297,7 @@ editing the code.
   *multi-process distributed* dask a per-process cache is replicated per worker.
   `biopb-mcp` bounds it with a cluster-wide `dask_cache_budget` (split
   `budget // n_workers` by a worker-init plugin; localhost still resolves to 0
-  unless `mcp.tensor_cache_local` sets `BIOPB_CACHE_LOCAL=1`). **Caveat measured:**
+  unless `BIOPB_CACHE_LOCAL=1` is set). **Caveat measured:**
   even with the cache on, the viewer's *serial* plane reads scatter across workers
   — dask's locality scheduler keys on tracked task *dependencies*, not the opaque
   per-worker cache side-effect, so repeated reads of the same chunk round-robin

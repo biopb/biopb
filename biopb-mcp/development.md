@@ -7,7 +7,7 @@ Always run tooling through that interpreter — e.g. `.venv/bin/python -m pytest
 `.venv/bin/python -m black …` — **not** the bare `python`/`pytest` on `PATH`. A
 system or user-site Python can shadow the project env with a *different* (often
 older) `biopb`, which silently breaks tests that depend on newer client APIs
-(e.g. `make_cache_plugin`, added in `biopb >= 0.5.8`).
+(e.g. `configure_cache`, added in `biopb >= 0.5.8`).
 
 biopb-mcp now lives in the **biopb monorepo** (`biopb/biopb-mcp/`) as a uv
 workspace member; see `docs/monorepo-migration.md`. `biopb` and
