@@ -65,8 +65,8 @@ _DEATHWATCH_ARG = (
     "--IPKernelApp.exec_lines=import biopb_mcp.mcp._deathwatch as _dw; _dw.install()"
 )
 
-# Best-effort snippet run before a restart so dask releases child processes /
-# cluster keys cleanly.  ``_dask_client`` / ``_dask_cluster`` are set by the
+# Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
+# standalone caller).  ``_dask_client`` / ``_dask_cluster`` are set by the
 # bootstrap (both None for the in-process scheduler; for an auto-spun
 # LocalCluster the cluster is closed after the client so workers don't orphan).
 _DASK_RELEASE_SNIPPET = (
@@ -84,14 +84,16 @@ _DASK_RELEASE_SNIPPET = (
     "    pass\n"
 )
 
-# Best-effort snippet run *before* the group-SIGKILL on shutdown so the tensor
-# server sees a clean Flight GOAWAY (and cancels any in-flight do_get) instead of
-# discovering the dropped connection only via async socket teardown after the
-# kill. That teardown lag is what lets a `biopb server stop` issued right after
-# Ctrl-C block on its graceful drain (pyarrow FlightServerBase.shutdown waits for
-# in-flight requests to finish). Closes the tensor client, then releases dask.
-# Bounded + best-effort: a busy/wedged kernel just falls through to the SIGKILL,
-# so this never holds up Ctrl-C beyond the short timeout in shutdown().
+# Best-effort snippet run *before* the group-kill on shutdown AND restart so the
+# tensor server sees a clean Flight GOAWAY (and cancels any in-flight do_get)
+# instead of discovering the dropped connection only via async socket teardown
+# after the kill. That teardown lag is what lets a `biopb server stop` issued
+# right after Ctrl-C block on its graceful drain (pyarrow FlightServerBase.
+# shutdown waits for in-flight requests to finish) — and a restart drops the
+# connection just as abruptly, so both teardown paths share this snippet.
+# Closes the tensor client, then releases dask. Bounded + best-effort: a
+# busy/wedged kernel just falls through to the kill, so this never holds up
+# Ctrl-C beyond the short timeout in shutdown().
 _GRACEFUL_CLOSE_SNIPPET = (
     "try:\n"
     "    _c = globals().get('_conn')\n"
@@ -620,7 +622,15 @@ class KernelHost:
                 logger.debug("interrupt_kernel failed", exc_info=True)
 
     def restart(self):
-        """Hard-restart: release dask, group-kill the kernel, respawn."""
+        """Hard-restart: graceful-close tensor/dask, group-kill, respawn.
+
+        Deliberately NOT ``shutdown()`` + ``start()``: shutdown() must join
+        the watchdog *outside* the lock (the watchdog may hold the lock
+        mid-respawn, so joining under the lock deadlocks), while restart
+        keeps the watchdog alive and needs the whole dead->alive transition
+        under one lock hold so concurrent tools/the watchdog never observe —
+        or race into — the gap between kill and relaunch.
+        """
         with self._lock:
             # Tell the watchdog this alive->dead transition is intentional.
             self._stopping = True
@@ -632,9 +642,9 @@ class KernelHost:
             self._teardown_reason = None
             try:
                 try:
-                    self._execute_locked(_DASK_RELEASE_SNIPPET, timeout=5.0)
+                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
                 except Exception:
-                    logger.debug("dask release failed on restart", exc_info=True)
+                    logger.debug("graceful close failed on restart", exc_info=True)
 
                 self._shutdown_current()
                 try:
