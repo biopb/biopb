@@ -272,6 +272,8 @@ class TestSecretFile:
         # port + secret, read back by the CLI's _read_mcp_shutdown_secret.
         assert path == tmp_path / "mcp-server.secret"
         assert path.read_text() == "8765\ns3cr3t"
+        # Atomic write: the temp file was replaced away, not left behind.
+        assert list(tmp_path.glob("*.tmp")) == []
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
     def test_owner_only_on_posix(self, tmp_path):
@@ -283,15 +285,15 @@ class TestSecretFile:
         # so the loser can't clobber the winner's secret.
         assert _write_secret_file(None, 8765, "s3cr3t") is None
 
-    def test_write_failure_is_swallowed(self, tmp_path, monkeypatch):
+    def test_write_failure_is_swallowed(self, tmp_path):
         pidfile = tmp_path / "mcp-server.pid"
-
-        def _boom(*_a, **_k):
-            raise OSError("read-only fs")
-
-        monkeypatch.setattr(type(pidfile), "write_text", _boom)
+        # Occupy the secret path with a directory so the atomic os.replace
+        # fails (OSError on both platforms).
+        (tmp_path / "mcp-server.secret").mkdir()
         # A write failure only costs the HTTP stop path, never the server.
         assert _write_secret_file(pidfile, 8765, "s3cr3t") is None
+        # The temp file is cleaned up on the failure path too.
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_removed_with_our_pidfile(self, tmp_path):
         pidfile = tmp_path / "mcp-server.pid"

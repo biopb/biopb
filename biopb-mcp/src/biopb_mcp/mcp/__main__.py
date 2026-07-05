@@ -132,21 +132,33 @@ def _write_secret_file(pidfile, port, secret):
     (``biopb.cli.MCP_SECRET_FILE``); keep the two in sync.
 
     Written only when the PID file was (``pidfile`` is None otherwise), so the
-    racing-loser guard in :func:`_write_pidfile` covers both files. Owner-only
-    on POSIX; on Windows the profile dir's ACLs already restrict it. A write
-    failure only costs the HTTP stop path — the CLI falls back to os.kill,
-    the pre-#323 behavior.
+    racing-loser guard in :func:`_write_pidfile` covers both files. Written
+    atomically — an owner-only temp file, then os.replace — so a `biopb mcp
+    stop` racing the write never reads a torn half-file, and the secret never
+    exists on disk looser than 0600 (POSIX; on Windows the mode is a no-op and
+    the profile dir's ACLs already restrict it). A write failure only costs
+    the HTTP stop path — the CLI falls back to os.kill, the pre-#323 behavior.
     """
     if pidfile is None:
         return None
     path = _secret_file(pidfile)
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        path.write_text(f"{port}\n{secret}")
+        # 0o600 at creation caps the mode (umask can only narrow it); the
+        # chmod then pins it to exactly 0600 under a restrictive umask.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{port}\n{secret}")
         if os.name == "posix":
-            os.chmod(path, 0o600)
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
         return path
     except OSError:
         logger.warning("Could not write shutdown-secret file %s", path, exc_info=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
 
