@@ -381,12 +381,12 @@ The `mcp` section is grouped by concern:
   `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
   auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
   cluster-wide chunk cache (split across workers).
-- **`mcp.tensor`** — `cache_local` (let the data-plane client cache chunks even
-  for a localhost server; translated to `BIOPB_CACHE_LOCAL` in the kernel env)
-  and `health_poll_min_interval`/`health_poll_max_interval` (the background
-  source watcher's backoff bounds; the kernel re-lists when `source_count`
-  changes so a catalog cached mid-index self-heals — issue #44; min `<= 0`
-  disables it).
+- **`mcp.tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
+  background source watcher's backoff bounds; the kernel re-lists when
+  `source_count` changes so a catalog cached mid-index self-heals — issue #44;
+  min `<= 0` disables it). (The localhost client-cache decision lives in the
+  tensor client itself — `_resolve_cache_bytes`, off by default with
+  `BIOPB_CACHE_LOCAL=1` as the opt-out — the MCP kernel no longer overrides it.)
 - **`mcp.viewer`** — `compute_scheduler` (default `threads`; pins the napari
   viewer's *serial* slice reads to a single-process scheduler via
   `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`

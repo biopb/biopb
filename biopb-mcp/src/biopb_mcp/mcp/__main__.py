@@ -352,15 +352,6 @@ def _serve_http(config, port):
     if headless:
         kernel_env["BIOPB_HEADLESS"] = "1"
 
-    # Let the data-plane client cache chunks for a localhost tensor server
-    # (otherwise skipped as redundant with the server's own cache). Bridges
-    # interactive viewer responsiveness: repeated/overlapping plane reads
-    # within a chunk hit the cache instead of re-fetching the whole chunk.
-    # Inherited by the LocalCluster workers, where the bootstrap's cache plugin
-    # bounds each worker at mcp.dask.cache_budget // n_workers.
-    if get_setting(config, "mcp.tensor.cache_local"):
-        kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
-
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
     # the launcher's stdout/stderr — which, when the daemon was spawned by the

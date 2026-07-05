@@ -279,11 +279,16 @@ class TestDefaultConfig:
         for key in required:
             assert key in DEFAULT_CONFIG["timeout"]
 
-    def test_no_dead_tensor_disable_shm_key(self):
-        """tensor_disable_shm was removed (issue #10, no-op after biopb#9)."""
+    def test_no_dead_tensor_cache_keys(self):
+        """Removed tensor cache keys stay removed.
+
+        tensor_disable_shm (issue #10, no-op after biopb#9) and cache_local (the
+        localhost client-cache decision now lives entirely in the tensor client,
+        not overridden by the MCP kernel).
+        """
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]["tensor"]
-        assert DEFAULT_CONFIG["mcp"]["tensor"]["cache_local"] is True
+        assert "cache_local" not in DEFAULT_CONFIG["mcp"]["tensor"]
 
     def test_mcp_sub_sections_present(self):
         """The mcp section is grouped into its concern sub-sections."""
