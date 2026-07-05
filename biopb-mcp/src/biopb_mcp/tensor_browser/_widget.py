@@ -73,6 +73,14 @@ class _TreeNode:
         self.children: List[_TreeNode] = []
 
 
+# Origin scheme stamped by the tensor server on a drag-dropped source's catalog
+# ``source_url`` (server-side ``DND_URL_PREFIX`` in ``source_manager.py``). It is a
+# display-only marker of drop provenance; the tree strips it so a dropped source
+# renders under a clean root, identical to a scheme-less re-root. Keep in sync
+# with the server constant and the web viewer's ``getPathParts``.
+_DND_URL_PREFIX = "dnd://"
+
+
 def _get_path_parts(url: str) -> List[str]:
     """Extract tree path parts from source_url.
 
@@ -91,12 +99,20 @@ def _get_path_parts(url: str) -> List[str]:
     flat ``grpc:`` node (biopb/biopb#297). A local ``file://`` url has an empty
     netloc, so it is unchanged (still just its path).
 
+    A ``dnd://`` drop-origin url is stripped of its scheme and split as a plain
+    path, so a dropped source renders under a clean top-level root just like a
+    scheme-less re-root. Stripping it as a string (rather than via ``urlparse``)
+    also avoids netloc/port misparsing of a basename like ``exp:2.zarr``.
+
     Mirror of the web viewer's ``getPathParts`` in
     ``biopb-tensor-server/packages/web/src/components/SourceTree.tsx`` — keep the
     two behaviorally in lockstep.
     """
     if not url:
         return []
+    if url.startswith(_DND_URL_PREFIX):
+        raw = url[len(_DND_URL_PREFIX) :]
+        return [p for p in re.split(r"[\\/]+", raw) if p]
     try:
         parsed = urlparse(url)
     except Exception:

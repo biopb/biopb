@@ -93,29 +93,49 @@ _ADD_SOURCE_ACQUIRE_HEARTBEAT = 5.0
 # shallower (rarely past ~10 levels), so this only ever fires on a pathological loop.
 _MAX_WALK_DEPTH = 64
 
+# Virtual scheme stamped on the catalog ``source_url`` of a drag-dropped source.
+# It marks the source's *origin* (a runtime drop, not config/discovery) and is the
+# key a future "remove dropped source" feature authorizes on: the drop re-root
+# guard below only stamps it when the drop is entirely new AND outside every
+# monitored root, so its presence means "user-added and nothing will re-add it."
+# It is a display-only scheme (like ``cache://``) — never touches ``source_id`` or
+# the raw ``_source_url`` used for I/O. Keep in sync with the client tree builders
+# that strip it: ``_get_path_parts`` (biopb-mcp ``tensor_browser/_widget.py``) and
+# ``getPathParts`` (web ``SourceTree.tsx``).
+DND_URL_PREFIX = "dnd://"
 
-def _drop_catalog_url(dropped_root: str, primary_path: str) -> str:
+
+def _drop_catalog_url(
+    dropped_root: str, primary_path: str, *, mark_dnd: bool = True
+) -> str:
     """Catalog ``source_url`` that re-roots a drag-dropped source under the
-    dropped item's basename.
+    dropped item's basename, optionally prefixed with the ``dnd://`` origin scheme.
 
     A dropped file's real path (``/home/u/data/exp/a.tif``) would otherwise nest
     it deep inside the shared absolute-path tree; re-rooting it at the dropped
     item's basename makes each drop its own root instead (via the shared
-    ``_reroot_catalog_url``):
+    ``_reroot_catalog_url``). When ``mark_dnd`` is set, the ``dnd://`` prefix also
+    marks it as removable drop-origin:
 
-        drop /home/u/data/exp.zarr           -> "exp.zarr"          (own root)
+        drop /home/u/data/exp.zarr           -> "dnd://exp.zarr"        (own root)
         drop /home/u/data/exp/ (a folder) with
-             .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
+             .../exp/a.tif, .../exp/sub/b.tif -> "dnd://exp/a.tif",
+                                                 "dnd://exp/sub/b.tif"
+
+    ``mark_dnd`` is False for a drop that lands under a monitored root: it still
+    gets a tidy display root, but no marker, because the periodic rescan will
+    re-discover it (with its native url) — so it is not safely removable. The
+    marker therefore means exactly "user-added and nothing will re-add it."
 
     Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
-    uses). Not durable against a later rescan for a drop under a *monitored* root
-    — the watcher re-discovers it with its native absolute url and it re-merges
-    into the shared tree (accepted; see the design note / issue for the
-    durable-flag alternative).
+    uses); the client tree builders strip the scheme for display. The
+    configured-``alias`` re-root shares ``_reroot_catalog_url`` but is always
+    scheme-less, so the two re-root paths stay distinguishable.
     """
     dropped_root = str(dropped_root).rstrip("/\\")
     base = os.path.basename(dropped_root) or dropped_root
-    return _reroot_catalog_url(base, dropped_root, primary_path)
+    rerooted = _reroot_catalog_url(base, dropped_root, primary_path)
+    return DND_URL_PREFIX + rerooted if mark_dnd else rerooted
 
 
 @dataclass
@@ -1801,7 +1821,6 @@ class SourceManager:
         url: str,
         source_type: str = "",
         dim_labels: Optional[List[str]] = None,
-        monitor: bool = False,
         should_cancel: Optional[Callable[[], bool]] = None,
     ):
         """Register ``url`` (a path on the server) as source(s) at runtime.
@@ -1929,8 +1948,21 @@ class SourceManager:
                 if already:
                     already_present.append(claim.source_id)
                 else:
+                    # Re-rooting (own display root) and the ``dnd://`` origin
+                    # marker are decoupled: a drop under a monitored root still
+                    # gets a tidy display root, but NOT the marker -- the periodic
+                    # rescan re-discovers it, so it is not safely removable. Only a
+                    # drop outside every monitored root is stamped ``dnd://``, so
+                    # the marker stays equivalent to "user-added and nothing will
+                    # re-add it" (what Phase 2 removal authorizes on).
                     catalog_url = (
-                        _drop_catalog_url(url, claim.primary_path) if reroot else None
+                        _drop_catalog_url(
+                            url,
+                            claim.primary_path,
+                            mark_dnd=not self._is_monitored_claim(claim),
+                        )
+                        if reroot
+                        else None
                     )
                     if self._commit_add_claim(claim, catalog_url=catalog_url):
                         desc = self._descriptor_for(claim.source_id)
@@ -1946,11 +1978,6 @@ class SourceManager:
 
                 if should_cancel is not None and should_cancel():
                     break
-
-            # Track a dropped directory root for live monitoring if requested, so
-            # later changes under it are picked up by the periodic rescan.
-            if monitor and is_dir:
-                self._monitored_dirs.add(Path(url))
 
             yield ("result", added, already_present, failed)
         finally:

@@ -380,7 +380,6 @@ class TensorConnection:
         self,
         path: str,
         *,
-        monitor: bool = False,
         on_progress=None,
         should_cancel=None,
     ):
@@ -405,7 +404,6 @@ class TensorConnection:
             raise RuntimeError("Not connected")
         result = self.client.add_source(
             path,
-            monitor=monitor,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )

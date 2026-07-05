@@ -7,6 +7,13 @@ import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 // Threshold for switching to server-side SQL query
 const SERVER_QUERY_THRESHOLD = 1000;
 
+// Origin scheme the tensor server stamps on a drag-dropped source's source_url
+// (server-side DND_URL_PREFIX). Display-only marker of drop provenance; the tree
+// strips it so a dropped source renders under a clean root, identical to a
+// scheme-less re-root. Keep in sync with the server constant and the napari
+// plugin's _get_path_parts.
+const DND_URL_PREFIX = "dnd://";
+
 interface TreeNode {
   id: string;           // unique id (path for folders, source_id for sources)
   name: string;         // display name
@@ -18,6 +25,12 @@ interface TreeNode {
 
 function getPathParts(url: string): string[] {
   if (!url) return [];
+  if (url.startsWith(DND_URL_PREFIX)) {
+    // Drag-dropped source: strip the origin scheme and split the re-rooted
+    // remainder as a plain path. String-strip (not URL parse) avoids host/port
+    // misparsing of a basename like "exp:2.zarr".
+    return url.slice(DND_URL_PREFIX.length).split(/[\\/]+/).filter(Boolean);
+  }
   try {
     const parsed = new URL(url);
     const path = parsed.pathname.split("/").filter(Boolean);
