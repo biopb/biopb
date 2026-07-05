@@ -340,9 +340,12 @@ message AddSourceRequest {
   // Optional dimension labels applied to the registered tensor(s).
   repeated string dim_labels = 3;
 
-  // Register a directory as a live-monitored root (rescans track later changes).
-  // Ignored for single-file sources.
-  bool monitor = 4;
+  // Field 4 was `bool monitor` — a drag-drop could register a live-monitored
+  // root that existed in no config (invisible, unpersisted, self-re-adding after
+  // removal). Removed as a footgun; never exercised by any client. Reserved so
+  // the tag is not reused.
+  reserved 4;
+  reserved "monitor";
 }
 
 // Progress heartbeat for an in-flight "add_source" action: one emitted per

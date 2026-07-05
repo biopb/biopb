@@ -70,6 +70,24 @@ class TestGetPathParts:
     def test_empty_url(self):
         assert self._parts("") == []
 
+    def test_dnd_single_source_strips_scheme_to_own_root(self):
+        # A drag-dropped source's "dnd://" origin scheme is stripped for display,
+        # so it renders under a clean top-level root (same as a scheme-less
+        # re-root), not a literal "dnd://exp.zarr" node.
+        assert self._parts("dnd://exp.zarr") == ["exp.zarr"]
+
+    def test_dnd_folder_children_nest_under_stripped_root(self):
+        assert self._parts("dnd://my_experiment/sub/b.tif") == [
+            "my_experiment",
+            "sub",
+            "b.tif",
+        ]
+
+    def test_dnd_basename_with_colon_not_misparsed_as_port(self):
+        # String-strip (not urlparse) so a basename with a colon can't misparse
+        # as a netloc/port.
+        assert self._parts("dnd://exp:2.zarr") == ["exp:2.zarr"]
+
 
 @pytest.fixture
 def widget(make_napari_viewer, monkeypatch):

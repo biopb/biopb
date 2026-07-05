@@ -1645,7 +1645,6 @@ class TensorFlightClient:
         *,
         source_type: str = "",
         dim_labels: Optional[List[str]] = None,
-        monitor: bool = False,
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
@@ -1668,8 +1667,6 @@ class TensorFlightClient:
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
             dim_labels: Optional dimension labels for the registered tensor(s).
-            monitor: Register a directory as a live-monitored root (later changes
-                under it are picked up by the periodic rescan). Ignored for files.
             on_progress: Optional callback invoked with an ``AddSourceProgress``
                 (count + current path + last descriptor) per source as it
                 registers. Called on the calling thread; keep it cheap.
@@ -1693,7 +1690,6 @@ class TensorFlightClient:
             url=url,
             source_type=source_type,
             dim_labels=dim_labels or [],
-            monitor=monitor,
         )
         action = flight.Action("add_source", req.SerializeToString())
         unknown = (

@@ -18,7 +18,11 @@ import pytest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.discovery import DiscoveryState
-from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.source_manager import (
+    DND_URL_PREFIX,
+    SourceManager,
+    _drop_catalog_url,
+)
 
 
 def _zarr_available() -> bool:
@@ -67,6 +71,28 @@ def _drain(gen):
     return added, already, failed
 
 
+class TestDropCatalogUrl:
+    """Unit coverage for the ``dnd://`` origin scheme on a drop's catalog url."""
+
+    def test_single_file_drop_marked_dnd(self):
+        url = _drop_catalog_url("/data/exp.zarr", "/data/exp.zarr")
+        assert url == "dnd://exp.zarr"
+        assert url.startswith(DND_URL_PREFIX)
+
+    def test_folder_drop_children_marked_dnd_under_one_root(self):
+        assert (
+            _drop_catalog_url("/data/exp", "/data/exp/sub/b.tif")
+            == "dnd://exp/sub/b.tif"
+        )
+
+    def test_mark_dnd_false_reroots_without_scheme(self):
+        # A drop under a monitored root: tidy display root, but no removable
+        # marker (the periodic rescan governs it).
+        url = _drop_catalog_url("/data/exp.zarr", "/data/exp.zarr", mark_dnd=False)
+        assert url == "exp.zarr"
+        assert not url.startswith(DND_URL_PREFIX)
+
+
 class TestAddLocalSource:
     """In-process coverage of SourceManager.add_local_source."""
 
@@ -82,18 +108,20 @@ class TestAddLocalSource:
 
     def test_dropped_single_source_reroots_to_basename(self, tmp_path):
         """A dropped dataset's catalog source_url is re-rooted at its own
-        basename, so the browser renders it as its own top-level root instead of
-        nesting it under the shared absolute-path tree."""
+        basename under the ``dnd://`` origin scheme, so the browser renders it as
+        its own top-level root instead of nesting it under the shared
+        absolute-path tree, and can tell it is a removable drop."""
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
 
         added, *_ = _drain(manager.add_local_source(zpath))
 
-        assert added[0].source_url == "exp.zarr"
+        assert added[0].source_url == "dnd://exp.zarr"
 
     def test_dropped_folder_reroots_children_under_folder(self, tmp_path):
         """Dropping a plain folder re-roots every discovered source under the
-        folder's basename (one drop == one root, sources as children)."""
+        folder's basename (one drop == one root, sources as children), all under
+        the ``dnd://`` origin scheme."""
         manager, _ = _make_manager()
         root = tmp_path / "my_experiment"
         root.mkdir()
@@ -104,7 +132,7 @@ class TestAddLocalSource:
 
         assert not failed
         urls = sorted(d.source_url for d in added)
-        assert urls == ["my_experiment/a.zarr", "my_experiment/b.zarr"]
+        assert urls == ["dnd://my_experiment/a.zarr", "dnd://my_experiment/b.zarr"]
 
     def test_overlapping_drop_keeps_native_url_no_reroot(self, tmp_path):
         """A drop that overlaps an already-registered source (e.g. re-dropping a
@@ -374,6 +402,10 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         assert len(added) == 1 and not failed
         sid = added[0].source_id
         assert sid in server._sources
+        # Re-rooted for a tidy display root, but NOT stamped ``dnd://``: it sits
+        # under a monitored root, so the rescan re-discovers it -- it is not
+        # safely removable, so it must not carry the removable marker.
+        assert added[0].source_url == "samples/exp.zarr"
 
         # First rescan is force_full; the second is the steady-state incremental
         # that actually reaped the source before the fix (~20 s after the drop).
@@ -381,25 +413,3 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         assert sid in server._sources, "reaped by the initial force_full rescan"
         manager._rescan_monitored_dirs()
         assert sid in server._sources, "reaped by the steady-state incremental rescan"
-
-    def test_monitor_true_onedrive_root_is_walked_not_skipped(self, tmp_path):
-        # monitor=true makes the OneDrive folder its own monitored root, which is
-        # exempt from the name skip and walked directly -- so its sources are
-        # rediscovered every rescan regardless of the preserve fix.
-        home = tmp_path / "home"
-        drop = home / "OneDrive" / "Desktop" / "samples"
-        drop.mkdir(parents=True)
-        _make_zarr(str(drop), "exp.zarr")
-
-        manager, server = self._manager({home})
-
-        added, _already, failed = _drain(
-            manager.add_local_source(str(drop), monitor=True)
-        )
-        assert len(added) == 1 and not failed
-        sid = added[0].source_id
-        assert drop.resolve() in manager._monitored_dirs
-
-        manager._rescan_monitored_dirs()
-        manager._rescan_monitored_dirs()
-        assert sid in server._sources

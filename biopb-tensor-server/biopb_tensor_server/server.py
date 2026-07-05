@@ -969,7 +969,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 req.url,
                 source_type=req.source_type,
                 dim_labels=list(req.dim_labels),
-                monitor=req.monitor,
                 should_cancel=_should_cancel,
             )
             for event in events:

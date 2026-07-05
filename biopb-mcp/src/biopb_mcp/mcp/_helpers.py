@@ -9,11 +9,27 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Origin scheme the tensor server stamps on a drag-dropped source's source_url
+# (server-side DND_URL_PREFIX). Display-only; stripped here so a derived layer
+# name matches what the tensor browser shows. Keep in sync with the server
+# constant and the tree builders' strip (_widget.py, web SourceTree.tsx).
+_DND_URL_PREFIX = "dnd://"
+
 
 def _get_url_stem(url: str) -> str:
-    """Extract last path component from a URL."""
+    """Extract last path component from a URL.
+
+    A drag-dropped source's ``dnd://`` origin scheme is stripped first -- it puts
+    the re-rooted basename in the netloc rather than the path, so ``urlparse``
+    would otherwise yield an empty path and fall back to the raw ``dnd://...``
+    string as the "stem."
+    """
     try:
-        parts = [p for p in urlparse(url).path.split("/") if p]
+        if url.startswith(_DND_URL_PREFIX):
+            path = url[len(_DND_URL_PREFIX) :].replace("\\", "/")
+        else:
+            path = urlparse(url).path
+        parts = [p for p in path.split("/") if p]
         return parts[-1] if parts else url
     except Exception:
         return url
