@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from biopb_mcp.mcp._helpers import (
+    _get_url_stem,
     patch_viewer_add_tensor,
     resync_view_for_capture,
     viewer_window_alive,
@@ -39,6 +40,27 @@ def _make_tensor(array_id, shape, dtype="float32"):
     t.dtype = dtype
     t.dim_labels = []
     return t
+
+
+class TestGetUrlStem:
+    """source_url -> last path component (used to name the added viewer layer)."""
+
+    def test_file_url(self):
+        assert _get_url_stem("file:///home/me/data/img.tif") == "img.tif"
+
+    def test_bare_path(self):
+        assert _get_url_stem("/data/cells/exp.zarr") == "exp.zarr"
+
+    def test_dnd_single_source_strips_scheme(self):
+        # dnd:// puts the basename in the netloc, so a naive urlparse().path
+        # yields "" and falls back to the raw url. Must return the basename.
+        assert _get_url_stem("dnd://exp.zarr") == "exp.zarr"
+
+    def test_dnd_folder_child_returns_leaf(self):
+        assert _get_url_stem("dnd://my_experiment/sub/b.tif") == "b.tif"
+
+    def test_empty_url(self):
+        assert _get_url_stem("") == ""
 
 
 class TestPatchViewerAddTensor:
