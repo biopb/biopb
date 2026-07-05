@@ -393,3 +393,26 @@ message AddSourceStreamMessage {
     AddSourceResult result = 2;
   }
 }
+
+// Request body for the "remove_source" Flight action: deregister a drag-dropped
+// source branch at runtime. This is a deliberately narrow counterpart to
+// "add_source" -- it only removes drag-dropped sources, never a configured or
+// discovered one, so the server authorizes purely on the `dnd://` origin scheme
+// stamped on a drop's catalog source_url. A non-`dnd://` root_url is rejected.
+message RemoveSourceRequest {
+  // The dnd:// branch root to remove. Every source whose catalog source_url is
+  // this value, or is under it (has the `root_url + "/"` prefix), is removed --
+  // so one dropped folder's sources go as a unit. MUST carry the dnd:// scheme.
+  string root_url = 1;
+}
+
+// Terminal (single, non-streamed) result of the "remove_source" action.
+message RemoveSourceResult {
+  // source_ids actually deregistered.
+  repeated string removed = 1;
+
+  // Sources that matched the branch but could not be removed (e.g. already gone
+  // from a concurrent rescan). Reuses AddSourceFailure: its `path` field carries
+  // the source_id here, `reason` the explanation.
+  repeated AddSourceFailure failed = 2;
+}

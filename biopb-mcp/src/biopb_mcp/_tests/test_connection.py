@@ -281,6 +281,33 @@ class TestConnect:
         assert out is result
         assert conn.sources == after  # snapshot refreshed via list_sources()
 
+    def test_remove_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.remove_source("dnd://exp.zarr")
+
+    def test_remove_source_delegates_and_refreshes(self, monkeypatch):
+        # remove_source() deregisters a dropped branch and returns the tally; the
+        # connection then re-lists so the removed rows leave its snapshot.
+        result = MagicMock(name="remove-result")
+        client = _fake_client({"x": MagicMock()})
+        client.remove_source.return_value = result
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        after = {}
+        client.list_sources.return_value = after
+
+        out = conn.remove_source("dnd://exp.zarr")
+
+        client.remove_source.assert_called_once_with("dnd://exp.zarr")
+        assert out is result
+        assert conn.sources == after  # snapshot refreshed via list_sources()
+
 
 class TestIsLocalhost:
     """The drag-drop gate: only a localhost server shares the client's disk."""

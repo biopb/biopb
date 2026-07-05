@@ -364,6 +364,104 @@ class TestAddSourceRoundtrip:
             server.shutdown()
 
 
+class TestRemoveDroppedRoot:
+    """SourceManager.remove_dropped_root: deregister a dnd:// drop branch."""
+
+    def test_remove_single_dropped_source(self, tmp_path):
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0].source_id
+        assert added[0].source_url == "dnd://exp.zarr"
+        assert sid in server._sources
+
+        removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
+        assert removed == [sid] and not failed
+        assert sid not in server._sources
+
+    def test_remove_dropped_folder_removes_all_siblings_as_a_unit(self, tmp_path):
+        manager, server = _make_manager()
+        root = tmp_path / "my_experiment"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        _make_zarr(str(root), "b.zarr")
+        added, _, failed = _drain(manager.add_local_source(str(root)))
+        assert not failed and len(added) == 2
+        sids = {d.source_id for d in added}
+
+        removed, failed = manager.remove_dropped_root("dnd://my_experiment")
+        assert set(removed) == sids and not failed
+        for sid in sids:
+            assert sid not in server._sources
+
+    def test_remove_root_matches_only_its_own_branch(self, tmp_path):
+        # A sibling drop sharing a name prefix must NOT be swept up.
+        manager, server = _make_manager()
+        added_a, *_ = _drain(
+            manager.add_local_source(_make_zarr(str(tmp_path), "exp.zarr"))
+        )
+        added_b, *_ = _drain(
+            manager.add_local_source(_make_zarr(str(tmp_path), "exp2.zarr"))
+        )
+        sid_a, sid_b = added_a[0].source_id, added_b[0].source_id
+
+        removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
+        assert removed == [sid_a] and not failed
+        assert sid_b in server._sources  # exp2.zarr untouched
+
+    def test_remove_non_dnd_root_rejected(self):
+        # Authorization boundary: only drag-dropped (dnd://) sources are removable.
+        manager, _ = _make_manager()
+        with pytest.raises(ValueError, match="dnd://"):
+            manager.remove_dropped_root("file:///data/x.zarr")
+
+    def test_remove_unknown_root_removes_nothing(self):
+        manager, _ = _make_manager()
+        removed, failed = manager.remove_dropped_root("dnd://never_dropped")
+        assert removed == [] and failed == []
+
+
+class TestRemoveSourceRoundtrip:
+    """Full server -> client gRPC round-trip through the remove_source action."""
+
+    def test_client_remove_source_over_grpc(self, tmp_path):
+        from biopb.tensor import TensorFlightClient
+
+        manager, server = _make_manager()
+        server.set_add_source_handler(manager.add_local_source)
+        server.set_remove_source_handler(manager.remove_dropped_root)
+        server.mark_ready()
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        _make_zarr(str(root), "b.zarr")
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+
+            added = client.add_source(str(root))
+            assert len(added.added) == 2
+            sids = {d.source_id for d in added.added}
+            assert sids <= set(client.list_sources())
+
+            # Remove the whole dropped branch by its dnd:// root.
+            result = client.remove_source("dnd://exp")
+            assert set(result.removed) == sids and not result.failed
+            assert not (sids & set(client.list_sources()))
+
+            # A non-dnd root is refused server-side.
+            import pyarrow.flight as flight
+
+            with pytest.raises(flight.FlightServerError):
+                client.remove_source("file:///data/x.zarr")
+
+            client.close()
+        finally:
+            server.shutdown()
+
+
 class TestAddedSourceSurvivesRescanUnderSkippedDir:
     """A source added under a name-skipped subtree (e.g. OneDrive) must survive
     the periodic monitored-tree rescan.

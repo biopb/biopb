@@ -410,6 +410,24 @@ class TensorConnection:
         self.refresh()
         return result
 
+    def remove_source(self, root_url: str):
+        """Deregister a drag-dropped source branch on the server, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.remove_source` — the
+        wire entrypoint behind the tensor-browser's dropped-root [x] button.
+        ``root_url`` is a ``dnd://`` branch root; the server removes every source
+        at or under it (a dropped folder's sources go as a unit) and refuses
+        anything that is not a drag-dropped (``dnd://``) source. The local catalog
+        snapshot (:attr:`sources`) is then refreshed so the row disappears. Quick,
+        but still call off the GUI thread (a rescan may briefly hold the catalog
+        lock). Returns the ``RemoveSourceResult`` (removed / failed).
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        result = self.client.remove_source(root_url)
+        self.refresh()
+        return result
+
     def start_source_watch(
         self,
         min_interval: float | None = None,

@@ -36,6 +36,8 @@ from biopb.tensor.descriptor_pb2 import (
     DataSourceDescriptor,
     FlightCmd,
     MetadataQueryOption,
+    RemoveSourceRequest,
+    RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
     SliceHint,
@@ -1723,6 +1725,47 @@ class TensorFlightClient:
                 "(server closed the stream without a result)"
             )
         return result
+
+    def remove_source(self, root_url: str) -> "RemoveSourceResult":
+        """Deregister a drag-dropped source branch on the SERVER at runtime.
+
+        The narrow counterpart to :meth:`add_source`: it removes ONLY
+        drag-dropped sources, which the server identifies by the ``dnd://``
+        origin scheme on their catalog ``source_url``. ``root_url`` is such a
+        branch root (a ``dnd://...`` value); every source at or under it is
+        removed as a unit. A non-``dnd://`` ``root_url`` is refused by the server.
+
+        Args:
+            root_url: The ``dnd://`` branch root to remove (from the browser's
+                dropped-root node).
+
+        Returns:
+            A ``RemoveSourceResult`` with ``removed`` (source_ids) and ``failed``
+            (``AddSourceFailure`` whose ``path`` carries the source_id).
+
+        Raises:
+            flight.FlightServerError: the server refused the request (e.g. a
+                non-``dnd://`` root, or removal not enabled).
+            RuntimeError: the server predates the ``remove_source`` action, or
+                returned no result.
+        """
+        req = RemoveSourceRequest(root_url=root_url)
+        action = flight.Action("remove_source", req.SerializeToString())
+        try:
+            results = self._client.do_action(action, options=self._call_options)
+            result_bytes = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    "Source removal is unavailable: the tensor server is too old "
+                    "to support the 'remove_source' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"remove_source('{root_url}') returned no result"
+            ) from exc
+        return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
 
     def get_source(
         self,

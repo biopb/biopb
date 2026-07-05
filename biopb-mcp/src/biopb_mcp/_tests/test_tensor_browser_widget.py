@@ -89,6 +89,71 @@ class TestGetPathParts:
         assert self._parts("dnd://exp:2.zarr") == ["exp:2.zarr"]
 
 
+class TestBuildTreeDroppedTagging:
+    """_build_tree tags a drag-dropped branch's root node so the UI shows [x]."""
+
+    @staticmethod
+    def _src(source_id, source_url):
+        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+
+        return DataSourceDescriptor(
+            source_id=source_id,
+            source_url=source_url,
+            tensors=[TensorDescriptor(array_id=source_id, shape=[8, 8], dtype="uint8")],
+        )
+
+    @staticmethod
+    def _tree(sources):
+        from biopb_mcp.tensor_browser._widget import _build_tree
+
+        return _build_tree({s.source_id: s for s in sources})
+
+    def test_single_file_drop_leaf_is_tagged(self):
+        root = self._tree([self._src("s1", "dnd://exp.zarr")])
+        (leaf,) = root.children
+        assert leaf.node_type == "source"
+        assert leaf.dropped is True
+        assert leaf.remove_root == "dnd://exp.zarr"
+
+    def test_folder_drop_top_folder_is_tagged(self):
+        root = self._tree(
+            [
+                self._src("a", "dnd://my_experiment/a.zarr"),
+                self._src("b", "dnd://my_experiment/sub/b.zarr"),
+            ]
+        )
+        (folder,) = root.children
+        assert folder.node_type == "folder"
+        assert folder.dropped is True
+        assert folder.remove_root == "dnd://my_experiment"
+        # Children (the actual sources) are NOT individually tagged.
+        assert all(not _leaf_dropped(c) for c in folder.children)
+
+    def test_dropped_root_survives_path_flattening(self):
+        # A drop whose only content is nested gets its single-child folders
+        # flattened; the dropped tag + remove_root must ride along on the merged
+        # node (flatten mutates the node in place, preserving the attributes).
+        root = self._tree([self._src("x", "dnd://exp/sub/deep/img.zarr")])
+        (node,) = root.children
+        assert node.dropped is True
+        assert node.remove_root == "dnd://exp"
+        assert node.name.startswith("exp")  # flattened, e.g. "exp/sub/deep"
+
+    def test_configured_source_is_not_tagged(self):
+        root = self._tree([self._src("c", "file:///data/cells/img.zarr")])
+        assert all(not n.dropped for n in _walk(root))
+
+
+def _leaf_dropped(node):
+    return getattr(node, "dropped", False)
+
+
+def _walk(node):
+    for child in node.children:
+        yield child
+        yield from _walk(child)
+
+
 @pytest.fixture
 def widget(make_napari_viewer, monkeypatch):
     from qtpy.QtCore import QTimer
@@ -513,6 +578,81 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
         assert item.toolTip(0) == ""
+
+
+class TestRemoveButton:
+    """`_add_tree_node` puts a remove [x] in column 1 for dropped roots only."""
+
+    def _node(self, *, dropped, source_url="dnd://exp.zarr", name="exp.zarr"):
+        from biopb.tensor.descriptor_pb2 import (
+            DataSourceDescriptor,
+            TensorDescriptor,
+        )
+
+        from biopb_mcp.tensor_browser._widget import _TreeNode
+
+        src = DataSourceDescriptor(
+            source_id="s",
+            source_url=source_url,
+            tensors=[TensorDescriptor(array_id="s", shape=[10, 10], dtype="uint8")],
+        )
+        node = _TreeNode(
+            node_id="s", name=name, node_type="source", depth=0, source=src
+        )
+        if dropped:
+            node.dropped = True
+            node.remove_root = source_url
+        return node
+
+    def test_dropped_root_gets_remove_button(self, widget):
+        from qtpy.QtWidgets import QPushButton
+
+        w, _, _ = widget
+        w._add_tree_node(w._tree_widget, self._node(dropped=True))
+        item = w._tree_widget.topLevelItem(0)
+        assert isinstance(w._tree_widget.itemWidget(item, 1), QPushButton)
+
+    def test_non_dropped_row_has_no_button(self, widget):
+        w, _, _ = widget
+        w._add_tree_node(
+            w._tree_widget, self._node(dropped=False, source_url="/data/c.zarr")
+        )
+        item = w._tree_widget.topLevelItem(0)
+        assert w._tree_widget.itemWidget(item, 1) is None
+
+    def test_button_click_routes_to_remove_with_branch_root(self, widget, monkeypatch):
+        w, _, _ = widget
+        called = {}
+        monkeypatch.setattr(
+            w, "_on_remove_dropped", lambda r, n: called.update(root=r, name=n)
+        )
+        w._add_tree_node(w._tree_widget, self._node(dropped=True))
+        item = w._tree_widget.topLevelItem(0)
+        w._tree_widget.itemWidget(item, 1).click()
+        assert called == {"root": "dnd://exp.zarr", "name": "exp.zarr"}
+
+    def test_confirm_yes_starts_remove(self, widget, monkeypatch):
+        from biopb_mcp.tensor_browser import _widget as m
+
+        w, _, _ = widget
+        monkeypatch.setattr(
+            m.QMessageBox, "question", lambda *a, **k: m.QMessageBox.Yes
+        )
+        started = {}
+        monkeypatch.setattr(
+            w, "_start_remove", lambda r, n: started.update(root=r, name=n)
+        )
+        w._on_remove_dropped("dnd://exp", "exp")
+        assert started == {"root": "dnd://exp", "name": "exp"}
+
+    def test_confirm_no_does_not_remove(self, widget, monkeypatch):
+        from biopb_mcp.tensor_browser import _widget as m
+
+        w, _, _ = widget
+        monkeypatch.setattr(m.QMessageBox, "question", lambda *a, **k: m.QMessageBox.No)
+        w._start_remove = MagicMock()
+        w._on_remove_dropped("dnd://exp", "exp")
+        w._start_remove.assert_not_called()
 
 
 class TestRestoreSelection:

@@ -440,8 +440,10 @@ def _setup_flight_server(
 
     # Wire the runtime add_source handler (tensor-browser drag-drop): the server
     # holds no SourceManager reference, so inject the entrypoint that routes a
-    # dropped path into the same claim -> adapter -> catalog pipeline.
+    # dropped path into the same claim -> adapter -> catalog pipeline. Its
+    # counterpart removes a dropped (dnd://) branch.
     server.set_add_source_handler(source_manager.add_local_source)
+    server.set_remove_source_handler(source_manager.remove_dropped_root)
 
     # Note: the metadata DB is already populated at this point. Static sources
     # are seeded via SourceManager._commit_add_claim -> _register_source_claim
