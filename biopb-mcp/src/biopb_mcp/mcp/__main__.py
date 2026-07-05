@@ -23,6 +23,8 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,62 @@ def _remove_pidfile(pidfile):
             pidfile.unlink()
     except (OSError, ValueError, IndexError):
         pass
+
+
+def _shutdown_sentinel_path():
+    """Path of the stop-sentinel file `biopb mcp stop` writes on Windows.
+
+    A sibling of the PID file with a single fixed name — NOT keyed by PID: on
+    Windows the PID the CLI recorded can differ from this daemon's os.getpid()
+    (Store-Python/uv launcher shims), so a pid-keyed name would make stop and
+    the daemon disagree. There is only ever one daemon (the PID file is
+    singular too), so a fixed name is unambiguous. The biopb CLI hardcodes the
+    same name next to its hardcoded MCP_PID_FILE (biopb.cli._mcp_shutdown_sentinel);
+    keep the two in sync.
+    """
+    from .._config import get_pid_file
+
+    return get_pid_file().with_name("mcp-server.stop")
+
+
+def _install_shutdown_sentinel_watcher(sentinel, shutdown, poll=0.2):
+    """Let `biopb mcp stop` shut this daemon down gracefully on Windows.
+
+    There, ``os.kill(pid, SIGTERM)`` is an unconditional TerminateProcess —
+    immediate and uncatchable, so the SIGTERM handler installed in _serve_http
+    never runs and the kernel is left to ipykernel's in-kernel parent poller,
+    which reaps abruptly (``os._exit(1)``: no dask/Qt close, no spill-dir
+    cleanup) and not at all when the kernel is GIL-wedged (issue #323). So on
+    Windows `stop` instead drops a sentinel *file*; this watcher thread polls
+    for it and runs the same shared shutdown as the POSIX signal handler,
+    reaping the kernel from *outside* regardless of the kernel's internal
+    state. Same mechanism as the tensor server's `biopb server stop`
+    (http_server._install_windows_shutdown_listener), minus the uvicorn nudge:
+    ``shutdown`` here ``os._exit``\\ s and never returns, so the sentinel is
+    consumed *before* calling it.
+
+    A leftover sentinel from a previous run is ignored via an mtime guard
+    (only files touched at/after this watcher started count), so no startup
+    delete is needed. The *caller* gates installation on Windows (POSIX uses
+    real signals and needs no watcher); the function itself is
+    platform-agnostic so tests exercise it on every OS.
+    """
+    installed_at = time.time()
+
+    def _watch():
+        while True:
+            try:
+                if sentinel.exists() and sentinel.stat().st_mtime >= installed_at:
+                    logger.info("Stop sentinel found; shutting down.")
+                    sentinel.unlink(missing_ok=True)
+                    shutdown("stop sentinel")
+                    return
+            except OSError:
+                pass
+            time.sleep(poll)
+
+    threading.Thread(target=_watch, name="mcp-stop-sentinel", daemon=True).start()
+    logger.info("Stop-sentinel watcher installed (%s).", sentinel)
 
 
 def _parse_args(argv, default_transport, default_port):
@@ -372,20 +430,34 @@ def _serve_http(config, port):
     pidfile = _write_pidfile(port)
     atexit.register(_remove_pidfile, pidfile)
 
-    def _handle_signal(signum, frame):
-        logger.info("Received signal %s, shutting down.", signum)
+    def _shutdown(reason):
+        """One teardown for every deliberate-exit path — POSIX signals, the
+        Windows stop sentinel, the server loop returning: reap the kernel,
+        remove our files, exit.
+
+        Skips Python finalization: this process still has a live asyncio/epoll
+        event-loop thread and the numpy OpenBLAS worker pool running, and
+        tearing down the interpreter on top of them segfaults inside
+        Py_FinalizeEx (refcount write into a read-only static-type page).
+        The launcher's only remaining job is to exit, so exit immediately.
+        """
+        logger.info("Shutting down (%s).", reason)
         host.shutdown()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()
-        # Skip Python finalization: this process still has a live asyncio/epoll
-        # event-loop thread and the numpy OpenBLAS worker pool running, and
-        # tearing down the interpreter on top of them segfaults inside
-        # Py_FinalizeEx (refcount write into a read-only static-type page).
-        # The launcher's only remaining job is to exit, so exit immediately.
         os._exit(0)
+
+    def _handle_signal(signum, frame):
+        _shutdown(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # On Windows those handlers are unreachable from `biopb mcp stop` —
+    # os.kill(SIGTERM) is TerminateProcess, uncatchable — so stop drops a
+    # sentinel file instead and a watcher thread runs the same _shutdown.
+    if os.name == "nt":
+        _install_shutdown_sentinel_watcher(_shutdown_sentinel_path(), _shutdown)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.
@@ -397,13 +469,9 @@ def _serve_http(config, port):
         allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
     )
 
-    # If the server loop returns on its own, exit the same way: shut down the
-    # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
-    # os._exit, so shut down explicitly here).
-    host.shutdown()
-    _remove_pidfile(pidfile)
-    _cleanup_dask_dir()
-    os._exit(0)
+    # If the server loop returns on its own, exit the same way (atexit
+    # handlers do not run after os._exit, so tear down explicitly here).
+    _shutdown("server loop exited")
 
 
 if __name__ == "__main__":

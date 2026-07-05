@@ -7,6 +7,8 @@ daemon.
 
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -14,10 +16,12 @@ from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _has_display,
+    _install_shutdown_sentinel_watcher,
     _parse_args,
     _remove_pidfile,
     _resolve_headless,
     _setup_observe,
+    _shutdown_sentinel_path,
     _write_pidfile,
     main,
 )
@@ -256,3 +260,55 @@ class TestPidfile:
 
     def test_remove_none_is_noop(self):
         _remove_pidfile(None)  # write was skipped/failed; nothing to undo
+
+
+class TestShutdownSentinelWatcher:
+    """The Windows stop path (issue #323): `biopb mcp stop` cannot deliver a
+    catchable signal there (os.kill is TerminateProcess), so it drops a
+    sentinel file and this daemon-side watcher runs the shared shutdown. The
+    watcher itself is platform-agnostic — only its installation in _serve_http
+    is Windows-gated — so these tests run on every OS."""
+
+    def test_sentinel_triggers_shutdown_and_is_consumed(self, tmp_path):
+        sentinel = tmp_path / "mcp-server.stop"
+        fired = threading.Event()
+        reasons = []
+
+        def _shutdown(reason):
+            reasons.append(reason)
+            fired.set()
+
+        _install_shutdown_sentinel_watcher(sentinel, _shutdown, poll=0.01)
+        sentinel.write_text("stop")
+        assert fired.wait(5), "watcher never fired on a fresh sentinel"
+        assert reasons == ["stop sentinel"]
+        # Consumed before shutdown, so a daemon started later can't trip on it
+        # (belt and braces on top of the mtime guard).
+        assert not sentinel.exists()
+
+    def test_stale_sentinel_is_ignored(self, tmp_path):
+        # A leftover from a previous run — mtime before this watcher started —
+        # must not stop a freshly started daemon.
+        sentinel = tmp_path / "mcp-server.stop"
+        sentinel.write_text("stop")
+        past = time.time() - 60
+        os.utime(sentinel, (past, past))
+        fired = threading.Event()
+        _install_shutdown_sentinel_watcher(sentinel, lambda _r: fired.set(), poll=0.01)
+        assert not fired.wait(0.3)
+        assert sentinel.exists()  # ignored via the mtime guard, not deleted
+
+    def test_missing_sentinel_never_fires(self, tmp_path):
+        fired = threading.Event()
+        _install_shutdown_sentinel_watcher(
+            tmp_path / "mcp-server.stop", lambda _r: fired.set(), poll=0.01
+        )
+        assert not fired.wait(0.2)
+
+    def test_sentinel_path_is_fixed_pidfile_sibling(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "biopb_mcp._config.get_pid_file", lambda: tmp_path / "mcp-server.pid"
+        )
+        # Fixed name (not pid-keyed: uv/Store-Python shims make PIDs ambiguous
+        # on Windows) in the PID file's dir; biopb.cli hardcodes the same.
+        assert _shutdown_sentinel_path() == tmp_path / "mcp-server.stop"

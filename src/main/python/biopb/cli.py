@@ -259,41 +259,44 @@ def _win_shutdown_sentinel() -> Path:
     return PID_FILE.parent / "tensor-server.stop"
 
 
-def _win_request_shutdown() -> bool:
-    """Windows: ask the daemon to shut down gracefully. Returns True if the
-    request was delivered (not whether the process has exited yet).
+def _win_request_shutdown(sentinel: Path) -> bool:
+    """Windows: ask a daemon to shut down gracefully by dropping its stop
+    sentinel. Returns True if the request was delivered (not whether the
+    process has exited yet).
 
-    The daemon is a windowless background process in its own process group, so it
-    has no console to receive a CTRL_BREAK, and Win32 named events are brittle
-    across sessions/elevation. We instead drop a sentinel *file* the daemon polls
-    for (see _install_windows_shutdown_listener in biopb_tensor_server.http_server);
-    a file under the user's biopb dir is unambiguous regardless of how either
-    process was launched.
+    The daemons are windowless background processes in their own process groups,
+    so they have no console to receive a CTRL_BREAK, and Win32 named events are
+    brittle across sessions/elevation. We instead drop a sentinel *file* the
+    daemon polls for (tensor server: _install_windows_shutdown_listener in
+    biopb_tensor_server.http_server; MCP daemon: _install_shutdown_sentinel_watcher
+    in biopb_mcp.mcp.__main__); a file under the user's biopb dir is unambiguous
+    regardless of how either process was launched.
     """
     global _LAST_WIN_SHUTDOWN_DIAG
     try:
-        _ensure_dirs()
-        _win_shutdown_sentinel().write_text("stop")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("stop")
         return True
     except OSError as e:
         _LAST_WIN_SHUTDOWN_DIAG = f"could not write shutdown sentinel: {e}"
         return False
 
 
-def _win_remove_sentinel() -> None:
-    """Remove the shutdown sentinel (best effort), so it doesn't linger after a
+def _win_remove_sentinel(sentinel: Path) -> None:
+    """Remove a shutdown sentinel (best effort), so it doesn't linger after a
     force-kill where the daemon never consumed it."""
     try:
-        _win_shutdown_sentinel().unlink()
+        sentinel.unlink()
     except OSError:
         pass
 
 
-def _request_graceful_stop(pid: int) -> bool:
-    """Ask the daemon to shut down gracefully. Returns whether the request was
-    delivered (not whether the process has exited yet)."""
+def _request_graceful_stop(pid: int, sentinel: Path) -> bool:
+    """Ask a daemon to shut down gracefully. Returns whether the request was
+    delivered (not whether the process has exited yet). `sentinel` is that
+    daemon's Windows stop-sentinel path (unused on POSIX, which signals)."""
     if sys.platform == "win32":
-        return _win_request_shutdown()
+        return _win_request_shutdown(sentinel)
     try:
         os.kill(pid, signal.SIGTERM)
         return True
@@ -311,7 +314,7 @@ def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
     its PID is reused mid-stop, we neither keep waiting on nor TerminateProcess
     the innocent new owner.
     """
-    delivered = _request_graceful_stop(pid)
+    delivered = _request_graceful_stop(pid, _win_shutdown_sentinel())
     if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
         console.print(
             f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
@@ -338,7 +341,8 @@ def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
 
     _remove_pid()
     if sys.platform == "win32":
-        _win_remove_sentinel()  # tidy up if the daemon never consumed it
+        # tidy up if the daemon never consumed it
+        _win_remove_sentinel(_win_shutdown_sentinel())
     return graceful
 
 
@@ -1327,24 +1331,40 @@ def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
         time.sleep(0.25)
 
 
-def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
-    """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
-    wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
-    True if it exited gracefully. Assumes `pid` is running.
+def _mcp_shutdown_sentinel() -> Path:
+    """Path of the MCP daemon's shutdown sentinel (Windows graceful stop).
 
-    Unlike the tensor server there is no Windows shutdown-sentinel handshake: the
-    MCP launcher installs SIGTERM/SIGINT handlers, and on Windows os.kill maps
-    SIGTERM to TerminateProcess (an immediate, ungraceful stop) - acceptable for
-    a localhost dev daemon with no in-flight durability to protect.
+    Must match _shutdown_sentinel_path() in biopb_mcp.mcp.__main__ (kept as a
+    literal here, like MCP_PID_FILE itself, to avoid importing biopb_mcp just
+    to stop). A single fixed name, not pid-keyed, for the same shim-PID-mismatch
+    reason as _win_shutdown_sentinel().
+    """
+    return MCP_PID_FILE.parent / "mcp-server.stop"
+
+
+def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
+    """Stop the MCP daemon: request graceful shutdown, wait up to `timeout`
+    seconds, then force-kill. Removes the PID file. Returns True if it exited
+    gracefully. Assumes `pid` is running.
+
+    POSIX: SIGTERM - the launcher's handler reaps the kernel and exits cleanly.
+    Windows: os.kill maps SIGTERM to TerminateProcess, immediate and uncatchable,
+    so the handler never runs and the napari kernel is left to ipykernel's
+    best-effort in-process backstop - abrupt at best, and inert exactly when the
+    kernel is wedged (issue #323). So, like the tensor server, stop instead drops
+    a sentinel file the daemon watches for; the daemon then reaps the kernel
+    itself before exiting.
 
     `token` is the recorded create-time identity: the wait loop and force-kill are
     gated on it so a PID reused mid-stop is neither waited on nor TerminateProcess'd.
     """
     if _is_our_daemon(pid, token):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        delivered = _request_graceful_stop(pid, _mcp_shutdown_sentinel())
+        if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
+            console.print(
+                f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
+                f"force killing.[/yellow]"
+            )
 
     graceful = False
     for _ in range(timeout):
@@ -1362,6 +1382,9 @@ def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
             time.sleep(0.5)
 
     _remove_mcp_pid()
+    if sys.platform == "win32":
+        # tidy up if the daemon never consumed it
+        _win_remove_sentinel(_mcp_shutdown_sentinel())
     return graceful
 
 
