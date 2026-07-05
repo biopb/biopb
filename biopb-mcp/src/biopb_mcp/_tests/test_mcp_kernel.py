@@ -34,6 +34,7 @@ class TestConfigureDask:
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
         created = {}
 
         class _FakeClient:
@@ -58,10 +59,104 @@ class TestConfigureDask:
         assert created["address"] == "tcp://1.2.3.4:8786"
         assert cluster is None
 
-    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
-        """A LocalCluster spawn failure degrades to in-process, not a crash."""
+    def test_injected_address_takes_precedence(self, monkeypatch):
+        """BIOPB_DASK_ADDRESS (daemon-injected) wins over the config address."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
+
+        monkeypatch.setenv("BIOPB_DASK_ADDRESS", "tcp://daemon:8786")
+        created = {}
+
+        class _FakeClient:
+            def __init__(self, address):
+                created["address"] = address
+
+        monkeypatch.setattr(dd, "Client", _FakeClient)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {"mcp": {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}}
+        )
+        assert created["address"] == "tcp://daemon:8786"
+        assert cluster is None
+
+    def test_daemon_owner_no_address_falls_back_to_threads(self, monkeypatch):
+        """owner='daemon' with no injected address -> threads, not a competing
+        kernel-local cluster (LocalCluster must never be constructed)."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+
+        def _must_not_spin(*args, **kwargs):
+            raise AssertionError("owner=daemon must not spin a kernel-local cluster")
+
+        monkeypatch.setattr(dd, "LocalCluster", _must_not_spin)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "daemon",
+                    }
+                }
+            }
+        )
+        assert client is None
+        assert cluster is None
+
+    def test_kernel_owner_spins_local_cluster(self, monkeypatch):
+        """owner='kernel' (escape hatch) spins a kernel-local LocalCluster."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+        spun = {}
+
+        class _FakeCluster:
+            def __init__(self, **kwargs):
+                spun["kwargs"] = kwargs
+                self.scheduler_address = "tcp://local:1"
+                self.workers = {"w0": object()}
+
+        class _FakeClient:
+            def __init__(self, target):
+                spun["client_target"] = target
+
+        monkeypatch.setattr(dd, "LocalCluster", _FakeCluster)
+        monkeypatch.setattr(dd, "Client", _FakeClient)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "kernel",
+                    }
+                }
+            }
+        )
+        assert isinstance(cluster, _FakeCluster)
+        assert isinstance(client, _FakeClient)
+        assert spun["client_target"] is cluster
+
+    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
+        """A LocalCluster spawn failure degrades to in-process, not a crash.
+
+        Uses owner='kernel' so the LocalCluster branch is actually reached.
+        """
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
 
         def _boom(*args, **kwargs):
             raise RuntimeError("no cluster for you")
@@ -71,10 +166,63 @@ class TestConfigureDask:
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
         client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "distributed", "address": ""}}}
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "kernel",
+                    }
+                }
+            }
         )
         assert client is None
         assert cluster is None
+
+
+class TestClusterAddressInjection:
+    """_launch injects BIOPB_DASK_ADDRESS from cluster_host.ensure().
+
+    Uses a real bare kernel and reads its inherited env back out, so it covers
+    the full injection path.
+    """
+
+    class _FakeClusterHost:
+        def __init__(self, address):
+            self._address = address
+            self.calls = 0
+
+        def ensure(self):
+            self.calls += 1
+            return self._address
+
+    def test_injects_address_when_ensure_returns_one(self):
+        fake = self._FakeClusterHost("tcp://127.0.0.1:12345")
+        host = KernelHost(
+            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
+        )
+        host.start()
+        try:
+            res = host.execute("import os; print(os.environ.get('BIOPB_DASK_ADDRESS'))")
+            assert "tcp://127.0.0.1:12345" in res["stdout"]
+            assert fake.calls >= 1
+        finally:
+            host.shutdown()
+
+    def test_omits_address_when_ensure_returns_none(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+        fake = self._FakeClusterHost(None)
+        host = KernelHost(
+            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
+        )
+        host.start()
+        try:
+            res = host.execute(
+                "import os; print(repr(os.environ.get('BIOPB_DASK_ADDRESS')))"
+            )
+            assert "None" in res["stdout"]
+        finally:
+            host.shutdown()
 
 
 class TestTokenReportParsing:

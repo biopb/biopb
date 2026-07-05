@@ -185,12 +185,13 @@ DEFAULT_CONFIG = {
             "promote_after": 10.0,
             # Orphan hardening (issue #13). The kernel runs in its own session,
             # so an abnormal launcher/kernel death would otherwise orphan the
-            # kernel + its dask LocalCluster.
+            # kernel (and, under mcp.dask.owner="kernel", the cluster it spawned;
+            # the default daemon-owned cluster is reaped separately by the daemon).
             #   parent_death_pipe: kernel inherits a pipe read-end and group-kills
             #     itself when the launcher *process* dies (POSIX only; mode 1).
             #   watchdog_interval: seconds between liveness polls; on an
-            #     unexpected kernel death the host reaps the orphaned dask group
-            #     and respawns (0 disables the watchdog; mode 2).
+            #     unexpected kernel death the host reaps the orphaned process
+            #     group and respawns (0 disables the watchdog; mode 2).
             #   watchdog_max_respawns / watchdog_respawn_window: bound respawns to
             #     avoid a crash-respawn thrash loop; once exceeded the host is
             #     marked dead until restart_kernel.
@@ -200,14 +201,22 @@ DEFAULT_CONFIG = {
             "watchdog_respawn_window": 60.0,
         },
         "dask": {
-            # Dask defaults to a kernel-local multi-process distributed cluster
-            # (LocalCluster). This is the only configuration where cancel_job can
-            # stop an in-flight .compute() mid-execution, and it gives real
-            # (non-GIL) CPU parallelism. Set scheduler to "threads" /
-            # "synchronous" for a low-overhead in-process scheduler (no
-            # mid-compute cancel), or set address to attach to an external
+            # Dask defaults to a multi-process distributed cluster (LocalCluster)
+            # owned by the MCP *daemon* (owner="daemon"); the kernel attaches to
+            # it via an injected scheduler address, so the cluster survives kernel
+            # restarts (no cold worker re-spawn -- the dominant restart cost on
+            # Windows). Any distributed mode lets cancel_job stop an in-flight
+            # .compute() and gives real (non-GIL) CPU parallelism. Set scheduler
+            # to "threads"/"synchronous" for a low-overhead in-process scheduler
+            # (no mid-compute cancel), or set address to attach to an external
             # scheduler instead of spinning a local one.
             "scheduler": "distributed",
+            # Who owns the auto-spun LocalCluster. "daemon" (default): the MCP
+            # daemon owns it, so it outlives kernel restart/respawn/window-close.
+            # "kernel": the legacy behavior where each kernel spins (and tears
+            # down) its own cluster. Ignored when scheduler is not "distributed"
+            # or an external address is set (the kernel attaches to that).
+            "owner": "daemon",
             # n_workers for the auto-spun LocalCluster (0 -> let dask pick,
             # ~n_cores). When connecting to an external scheduler this is ignored.
             # 0 on POSIX (fork makes ~n_cores workers cheap); capped at 4 on

@@ -130,6 +130,7 @@ class KernelHost:
         parent_death_pipe: bool = True,
         window_close_pipe: bool = True,
         window_poll_interval: float = 2.0,
+        cluster_host=None,
     ):
         self._extra_arguments = list(extra_arguments or [])
         self._kernel_name = kernel_name
@@ -217,7 +218,7 @@ class KernelHost:
         self._tensor_url = None
         self._tensor_token = None
         # Liveness watchdog (failure mode 2): respawn an unexpectedly-dead
-        # kernel after reaping its orphaned dask group, bounded to avoid a
+        # kernel after reaping its orphaned process group, bounded to avoid a
         # crash-respawn thrash loop.
         self._watchdog_interval = watchdog_interval
         self._watchdog_max_respawns = watchdog_max_respawns
@@ -227,6 +228,12 @@ class KernelHost:
         self._respawn_times = []  # monotonic timestamps of recent respawns
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
+
+        # Daemon-owned dask cluster (or None). _launch calls ensure() and injects
+        # the scheduler address so the kernel attaches to it instead of spinning
+        # its own; the daemon owns its lifetime, so a kernel restart/reap here
+        # leaves the cluster (and its warm workers) untouched. See _cluster.py.
+        self._cluster_host = cluster_host
 
     # -- lifecycle ------------------------------------------------------
 
@@ -307,6 +314,20 @@ class KernelHost:
             if self._tensor_url:
                 env[_TENSOR_URL_ENV] = self._tensor_url
 
+        # Attach this kernel to the daemon-owned dask cluster. ensure() spins it
+        # on the first launch (returning as soon as the scheduler is bound, so
+        # workers register while the kernel imports napari) and returns the cached
+        # address on later launches. None -> the daemon owns no cluster (owner
+        # "kernel", a non-distributed scheduler, an external address, or a spin
+        # failure); the kernel then resolves dask from its own config.
+        if self._cluster_host is not None:
+            from ._cluster import DASK_ADDRESS_ENV
+
+            address = self._cluster_host.ensure()
+            if address:
+                env = dict(env)
+                env[DASK_ADDRESS_ENV] = address
+
         # Redirect the kernel subprocess' native stdout/stderr fds. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher
         # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
@@ -361,7 +382,10 @@ class KernelHost:
                     cwd=self._cwd,
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
-                    # dask children it spawned.
+                    # kernel and any subprocess it spawned (arbitrary agent code;
+                    # and, under the `owner="kernel"` escape hatch, a kernel-local
+                    # dask cluster). The daemon-owned cluster lives in the
+                    # *daemon's* group, so this group-kill never touches it.
                     start_new_session=True,
                     **popen_kwargs,
                 )
@@ -953,7 +977,7 @@ class KernelHost:
     def _handle_unexpected_death(self):
         """Reap the orphaned process group and respawn, bounded. Held lock."""
         logger.warning("Kernel died unexpectedly; reaping orphans and respawning.")
-        self._shutdown_current()  # killpg the captured pgid -> reap dask group
+        self._shutdown_current()  # killpg the captured pgid -> reap kernel group
 
         now = time.monotonic()
         window = self._watchdog_respawn_window

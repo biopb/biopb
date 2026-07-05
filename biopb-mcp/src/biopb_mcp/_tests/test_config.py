@@ -301,12 +301,13 @@ class TestDefaultConfig:
         assert mcp["transport"]["port"] == 8765
 
     def test_mcp_dask_defaults(self):
-        """MCP dask defaults to a kernel-local distributed cluster."""
+        """MCP dask defaults to a daemon-owned distributed cluster."""
         dask = DEFAULT_CONFIG["mcp"]["dask"]
-        # "distributed" + empty address -> auto-spun LocalCluster, the only
-        # mode where cancel_job can stop an in-flight compute().
+        # "distributed" + empty address -> auto-spun LocalCluster, owned by the
+        # daemon by default so it survives kernel restart.
         assert dask["scheduler"] == "distributed"
         assert dask["address"] == ""
+        assert dask["owner"] == "daemon"
         # LocalCluster sizing knobs are present so they can be tuned.
         for key in (
             "num_workers",

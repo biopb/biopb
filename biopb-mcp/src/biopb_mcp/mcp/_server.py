@@ -229,6 +229,8 @@ try:
         _info = _dask_client.scheduler_info()
         print("  distributed_workers: " + str(len(_info.get("workers", {}))))
         print("  dashboard: " + str(_dask_client.dashboard_link))
+    elif not globals().get("_dask_attach_done", True):
+        print("  distributed: starting (attaching to cluster)")
     else:
         print("  distributed: not active")
 except Exception:
