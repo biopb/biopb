@@ -270,6 +270,43 @@ class TestKernelLifecycle:
         assert calls.index(("shutdown_current",)) > 0
         assert not host.is_alive()
 
+    def test_restart_attempts_graceful_close_before_kill(self, monkeypatch):
+        # restart() drops the tensor connection just as abruptly as shutdown(),
+        # so it must send the same graceful-close snippet (not just the dask
+        # release) before _shutdown_current() group-kills the old kernel --
+        # only the timeout budget differs (restart is not on the Ctrl-C path).
+        from biopb_mcp.mcp import _kernel
+
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        host.start()
+
+        calls = []
+        real_execute_locked = host._execute_locked
+        real_shutdown_current = host._shutdown_current
+
+        def _spy_execute(code, timeout):
+            calls.append(("execute", code, timeout))
+            return real_execute_locked(code, timeout)
+
+        def _spy_shutdown_current():
+            calls.append(("shutdown_current",))
+            return real_shutdown_current()
+
+        monkeypatch.setattr(host, "_execute_locked", _spy_execute)
+        monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
+
+        try:
+            host.restart()
+
+            assert calls[0][0] == "execute"
+            assert calls[0][1] is _kernel._GRACEFUL_CLOSE_SNIPPET
+            assert calls[0][2] == 5.0
+            assert ("shutdown_current",) in calls
+            # Unlike shutdown, a restart respawns: the host comes back alive.
+            assert host.is_alive()
+        finally:
+            host.shutdown()
+
     def test_health_probe_failure_raises(self):
         # Probe expects a name that does not exist in a bare kernel.
         host = KernelHost(
