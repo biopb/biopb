@@ -1445,12 +1445,20 @@ class SourceManager:
 
         Raises ``ValueError`` if ``root_url`` does not carry the ``dnd://``
         scheme -- the authorization boundary: only user-dropped sources are ever
-        removable this way.
+        removable this way. The bare scheme (``dnd://`` with no branch under it)
+        is refused for the same reason: ``rstrip("/")`` would collapse it to a
+        ``dnd:/`` prefix that matches *every* drop, so it must not resolve to a
+        wildcard "remove all drops".
         """
         if not root_url.startswith(DND_URL_PREFIX):
             raise ValueError(
                 f"remove_source only removes drag-dropped ({DND_URL_PREFIX}) "
                 f"sources; refusing root_url: {root_url!r}"
+            )
+        if not root_url[len(DND_URL_PREFIX) :].strip("/\\"):
+            raise ValueError(
+                f"remove_source needs a branch root under {DND_URL_PREFIX}, "
+                f"not the bare scheme; refusing root_url: {root_url!r}"
             )
 
         removed: List[str] = []

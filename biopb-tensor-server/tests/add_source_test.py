@@ -415,6 +415,15 @@ class TestRemoveDroppedRoot:
         with pytest.raises(ValueError, match="dnd://"):
             manager.remove_dropped_root("file:///data/x.zarr")
 
+    def test_remove_bare_scheme_rejected(self):
+        # The bare scheme would rstrip("/") to a "dnd:/" prefix that matches every
+        # drop -- it must be refused, not resolve to a wildcard "remove all drops".
+        # (Rejected up front, before any catalog access, like the non-dnd case.)
+        manager, _ = _make_manager()
+        for bare in ("dnd://", "dnd:///", "dnd://\\"):
+            with pytest.raises(ValueError, match="bare scheme"):
+                manager.remove_dropped_root(bare)
+
     def test_remove_unknown_root_removes_nothing(self):
         manager, _ = _make_manager()
         removed, failed = manager.remove_dropped_root("dnd://never_dropped")
