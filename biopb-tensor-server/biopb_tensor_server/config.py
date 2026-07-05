@@ -1603,35 +1603,51 @@ def _resolve_tensor_server_id_collisions(
     return result
 
 
-def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
-    """Catalog ``source_url`` that re-roots a configured local source under ``alias``.
+def _reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
+    """Re-root ``primary_path`` under ``label``, preserving its position beneath
+    ``root_path``. Shared core of the two re-rooting entry points -- drag-drop
+    (``SourceManager._drop_catalog_url``, ``label`` = the dropped item's basename)
+    and a configured ``alias`` (``_alias_catalog_url``, ``label`` = the alias).
 
     The tensor-browser (and web viewer) build their tree by splitting each
-    source's ``source_url`` on ``/``, so its first component is the top-level
-    root. This mirrors ``SourceManager._drop_catalog_url`` (drag-drop re-rooting),
-    but the root label is the configured ``alias`` rather than a dropped item's
-    basename, and the sub-structure of a configured folder is preserved relative
-    to the configured root:
+    source's ``source_url`` on ``/``, so ``label`` becomes the top-level root and
+    the sub-structure beneath ``root_path`` is preserved under it:
 
-        alias "exp", configure /data/exp/            (root_path == primary_path)
-            -> "exp"
-        alias "exp", configure folder /data/exp/ with
-            .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
+        root /data/exp, primary /data/exp            -> "<label>"
+        root /data/exp, primary /data/exp/sub/b.tif  -> "<label>/sub/b.tif"
 
     Display-only: it feeds the descriptor's ``source_url`` and never the
-    ``source_id`` (which hashes the raw path). Applied on the static / one-shot
-    expand path; a monitored directory's alias is dropped upstream (its rescan
-    re-discovers native paths), so this is never fed a live-monitored source.
+    ``source_id`` (which hashes the raw path), so a bare virtual path with no
+    scheme is fine.
     """
     try:
         rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
     except ValueError:  # different drive on Windows, etc. -- can't relativize
         rel = "."
     if rel in (".", "") or rel.startswith("../"):
-        # The configured entry is itself the source (single file / dataset dir),
-        # or (defensively) the source is not under it -- alias is the whole root.
-        return alias
-    return f"{alias}/{rel}"
+        # primary IS the root (single file / dataset dir), or (defensively) not
+        # under it -- keep the whole thing as one root, never emit a "../" url.
+        return label
+    return f"{label}/{rel}"
+
+
+def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
+    """Catalog ``source_url`` that re-roots a configured local source under ``alias``.
+
+    The config-line analogue of ``SourceManager._drop_catalog_url``: the root
+    label is the configured ``alias`` (rather than a dropped item's basename), and
+    the sub-structure of a configured folder is preserved relative to it:
+
+        alias "exp", configure /data/exp/            (root_path == primary_path)
+            -> "exp"
+        alias "exp", configure folder /data/exp/ with
+            .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
+
+    Display-only (never touches ``source_id``). Applied on the static / one-shot
+    expand path; a monitored directory's alias is dropped upstream (its rescan
+    re-discovers native paths), so this is never fed a live-monitored source.
+    """
+    return _reroot_catalog_url(alias, root_path, primary_path)
 
 
 def discover_sources(
