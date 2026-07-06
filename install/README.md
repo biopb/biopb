@@ -27,6 +27,14 @@ Requirements: `curl`/`tar` (POSIX) or built-in PowerShell tooling (Windows), plu
 `uv` (installed automatically). **No git, buf, or compiler needed** — the release
 wheels ship the generated protobuf/Flight stubs.
 
+**Minimum macOS:** Apple Silicon (arm64) needs **macOS 12 Monterey or newer**;
+Intel (x86_64) needs **macOS 10.15 Catalina or newer**. napari's optional `numba`
+accelerator pulls `llvmlite`, and the current prebuilt `llvmlite` wheels target
+those OS floors (arm64 → `macosx_12_0`, x86_64 → `macosx_10_15`). On an older
+macOS there is no matching wheel, so the install falls back to building `llvmlite`
+from source — which needs an LLVM toolchain and fails on a stock machine. If you
+hit that, upgrade macOS (there is no build workaround the installer can apply).
+
 ### Stable (default)
 
 Tracks the latest **stable** release — a clean `release-vX.Y.Z` tag. Prerelease
