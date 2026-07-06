@@ -991,27 +991,47 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 self._aics_image.set_scene(scene_ids[0])
                 dtype = self._aics_image.dask_data.dtype.str
 
-                # Get shapes from OME metadata (no scene switching)
-                # OME images are in same order as img.scenes
-                for i, im in enumerate(ome_meta.images):
-                    px = im.pixels
-                    shape = [px.size_t, px.size_c, px.size_z, px.size_y, px.size_x]
+                labels = (
+                    list(self.dim_labels)
+                    if self.dim_labels
+                    else list(self._aics_image.dims.order)
+                )
+                # The OME-pixels shape below is canonical 5-D TCZYX. It only
+                # agrees with `labels` when the image really is plain TCZYX. An
+                # RGB/samples source reports dims.order "TCZYXS" (aicsimageio
+                # folds the interleaved samples into a trailing S axis, and its
+                # dask shape carries C=1,S=3 where OME reports C=3,no-S), so the
+                # 5-D shape would disagree with the 6 labels and yield a
+                # malformed descriptor -- get_flight_info then rejects every
+                # slice as a dimensionality mismatch, so an RGB OME-TIFF fails to
+                # open. Defer those to the authoritative scene-switching fallback
+                # below, mirroring `_tczyx_shape`'s rejection of the S axis.
+                if labels == list(_CANONICAL_DIMS):
+                    # Get shapes from OME metadata (no scene switching)
+                    # OME images are in same order as img.scenes
+                    for i, im in enumerate(ome_meta.images):
+                        px = im.pixels
+                        shape = [
+                            px.size_t,
+                            px.size_c,
+                            px.size_z,
+                            px.size_y,
+                            px.size_x,
+                        ]
 
-                    descriptors.append(
-                        TensorDescriptor(
-                            # Globally-unique array_id = source_id/field (the
-                            # scene id is the within-source field). Identity
-                            # policy: list_flights, get_flight_info, and the
-                            # chunk_id all carry this one qualified form.
-                            array_id=f"{self.source_id}/{scene_ids[i]}",
-                            dim_labels=self.dim_labels
-                            if self.dim_labels
-                            else list(self._aics_image.dims.order),
-                            shape=shape,
-                            chunk_shape=[],  # Not populated - call get_flight_info for chunk info
-                            dtype=dtype,
+                        descriptors.append(
+                            TensorDescriptor(
+                                # Globally-unique array_id = source_id/field (the
+                                # scene id is the within-source field). Identity
+                                # policy: list_flights, get_flight_info, and the
+                                # chunk_id all carry this one qualified form.
+                                array_id=f"{self.source_id}/{scene_ids[i]}",
+                                dim_labels=list(labels),
+                                shape=shape,
+                                chunk_shape=[],  # Not populated - call get_flight_info for chunk info
+                                dtype=dtype,
+                            )
                         )
-                    )
         except NotImplementedError:
             # Some formats don't support ome_metadata - fall through to scene switching
             pass
