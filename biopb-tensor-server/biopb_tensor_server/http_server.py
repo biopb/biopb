@@ -1068,8 +1068,14 @@ async def _ws_render_one(
         if not dim_labels:
             dim_labels = [f"d{i}" for i in range(dask_arr.ndim)]
 
-        y_idx = dim_labels.index("y") if "y" in dim_labels else len(dim_labels) - 2
-        x_idx = dim_labels.index("x") if "x" in dim_labels else len(dim_labels) - 1
+        # Case-insensitive Y/X lookup (descriptor labels are uppercase "TCZYXS").
+        # A raw dim_labels.index("y") misses "Y" and, for a 6-D RGB TCZYXS
+        # layout, its positional fallback would pick X/S as Y/X.
+        from .renderer import build_axis_map
+
+        _axis_map = build_axis_map(dim_labels)
+        y_idx = _axis_map["y"] if _axis_map["y"] is not None else len(dim_labels) - 2
+        x_idx = _axis_map["x"] if _axis_map["x"] is not None else len(dim_labels) - 1
 
         # Slice to the originally requested bounds (except y/x) before computing.
         dask_arr = _ws_crop_to_request(dask_arr, cctx, y_idx, x_idx)
