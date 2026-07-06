@@ -49,10 +49,13 @@ jobs:
         id: decide
         run: |
           set -euo pipefail
-          # Dry run (manual dispatch): nothing is pushed, always proceed.
+          # Not a release-v* tag ref -- the usual case is a manual
+          # workflow_dispatch from a branch. The downstream deploy steps are
+          # themselves `is_tag`-gated (also keyed on this ref), so a non-tag ref
+          # never pushes: there is nothing to guard, so proceed.
           if [[ "${GITHUB_REF:-}" != refs/tags/release-v* ]]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
-            echo "manual dispatch / dry run -> proceed"
+            echo "non-release-tag ref (dry run) -> proceed"
             exit 0
           fi
           REL="${GITHUB_REF#refs/tags/release-v}"
