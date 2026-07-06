@@ -2293,11 +2293,36 @@ def create_source_manager(
     if not monitored_sources and not static_sources:
         return None
 
-    # Extract monitored directories (skip remote URLs)
+    # A bare-host tensor-server upstream ("mirror everything") IS monitored -- its
+    # catalog is re-listed/reconciled in the background (biopb/biopb#178) -- it just
+    # is not *filesystem*-watched. Distinguished here so the log line below is not
+    # misleading, and reused for the monitored_upstreams filter.
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    def _is_bare_host_upstream_url(url: str) -> bool:
+        return (
+            url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+            and _split_grpc_url(url)[1] is None
+        )
+
+    # Extract monitored directories. Remote sources are never filesystem-watched;
+    # a bare-host upstream is still monitored via the background re-list, whereas
+    # any other remote source (a single-source grpc://host/<id>, or an s3://...
+    # entry) is registered statically.
     monitored_dirs: Set[Path] = set()
     for source in monitored_sources:
         if source.is_remote:
-            logger.info(f"Remote URL will not be monitored: {source.url}")
+            if _is_bare_host_upstream_url(source.url):
+                logger.info(
+                    "Tensor-server upstream %s: catalog re-listed in the background, "
+                    "not filesystem-watched",
+                    source.url,
+                )
+            else:
+                logger.info(
+                    "Remote source %s is registered statically, not monitored",
+                    source.url,
+                )
             continue
 
         local_path = source.local_path
@@ -2319,14 +2344,10 @@ def create_source_manager(
     # the adaptive cadence back off after the boot-tick reconcile. A single-source
     # grpc://host/<id> entry has nothing to re-list, so it is excluded -- only the
     # bare-host "mirror everything" form qualifies.
-    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
-
     monitored_upstreams = [
         ms
         for ms in monitored_sources
-        if ms.is_remote
-        and ms.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
-        and _split_grpc_url(ms.url)[1] is None
+        if ms.is_remote and _is_bare_host_upstream_url(ms.url)
     ]
 
     # An unreachable monitored upstream contributes no static sources at startup
