@@ -282,7 +282,7 @@ class TestShutdownSentinelWatcher:
         assert fired.wait(5), "watcher never fired on a fresh sentinel"
         assert reasons == ["stop sentinel"]
         # Consumed before shutdown, so a daemon started later can't trip on it
-        # (belt and braces on top of the mtime guard).
+        # (belt and braces on top of the delete-at-install clear).
         assert not sentinel.exists()
 
     def test_stale_sentinel_is_ignored(self, tmp_path):

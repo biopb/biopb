@@ -1560,24 +1560,31 @@ def _install_windows_shutdown_listener(server) -> None:
     can't stall shutdown). uvicorn then returns from run(), so launch()'s
     ``finally -> _graceful_shutdown`` runs and the file-cache lock is released.
 
-    A leftover sentinel from a previous run is ignored via an mtime guard (only
-    files modified at/after this watcher started count), so no startup delete is
-    needed. No-op off Windows (POSIX uses SIGTERM). Best-effort: on any error
-    `stop` force-kills after its timeout.
+    A leftover sentinel from a previous run is cleared once, up front, so the
+    watch loop can treat any existing sentinel as a live stop request with no
+    clock comparison. (The former mtime guard compared the filesystem's mtime
+    against a process-clock ``time.time()``; on a filesystem whose mtime
+    granularity is coarser than ``time.time()`` a freshly written sentinel could
+    round to just below install time and be misread as stale, dropping a real
+    stop -- biopb/biopb#345.) No-op off Windows (POSIX uses SIGTERM).
+    Best-effort: on any error `stop` force-kills after its timeout.
     """
     if sys.platform != "win32":
         return
 
     sentinel = shutdown_sentinel_path()
-    installed_at = time.time()
+    # Clear a stale leftover exactly once at install, so "fresh vs. leftover"
+    # needs no mtime/clock comparison: after this, any sentinel that appears was
+    # written by a `stop` racing or following this watcher.
+    try:
+        os.remove(sentinel)
+    except OSError:
+        pass
 
     def _watch() -> None:
         while True:
             try:
-                if (
-                    os.path.exists(sentinel)
-                    and os.path.getmtime(sentinel) >= installed_at
-                ):
+                if os.path.exists(sentinel):
                     logger.info("Shutdown sentinel found; requesting graceful exit.")
                     server.should_exit = True
                     server.force_exit = True
