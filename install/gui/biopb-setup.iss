@@ -79,24 +79,16 @@ Source: "..\biopb-engine.ps1"; DestDir: "{app}"; Flags: ignoreversion
 var
   OptionsPage:  TWizardPage;
   CbRemote:     TNewCheckBox;
-  DataDirPage:  TInputDirWizardPage;
   ProgressPage: TOutputMarqueeProgressWizardPage;
   LogMemo:      TNewMemo;
 
-  { Cloud / synced-folder support. When one or more cloud roots (OneDrive,
-    iCloud) are found we add a checkbox to the data-dir page; ticking it points
-    the picker at a Microscopy folder under a cloud root and passes -Cloud so the
-    engine writes `cloud = true`. The engine ALSO auto-detects cloud-ness from the
-    path, so the flag is belt-and-suspenders -- browsing to a OneDrive folder
-    works regardless. With more than one signed-in OneDrive a dropdown
-    (CbCloudCombo) lets the user pick which one (#188). }
-  CbCloud:      TNewCheckBox;
-  CbCloudDesc:  TNewStaticText;
-  CbCloudCombo: TNewComboBox;
-  CloudRoots:   TArrayOfString;
-  LocalDataDir: String;
-
-  { Existing-config detection (mirrors the console "keep current config" path) }
+  { Existing-config detection (mirrors the console "keep current config" path).
+    When a config is present the wizard offers to keep it; declining RESETS the
+    server to the curated sample bundle (engine -Reset) rather than prompting for
+    a data folder. This matches the console front-end, which never asks for a
+    data directory -- a fresh install seeds samples and an existing config is
+    kept or reset, never re-pointed at a hand-picked folder from the installer.
+    (Users add their own images later via GUI drag-drop / the web admin page.) }
   ConfigPath:   String;
   ConfigExists: Boolean;
   KeepConfig:   Boolean;
@@ -158,103 +150,9 @@ begin
   Result := cb;
 end;
 
-{ Append P to Roots if it exists on disk and is not already present
-  (case-insensitive). Trailing backslash is stripped so comparisons are stable. }
-procedure AddCloudRoot(const P: String);
-var
-  q: String;
-  i, n: Integer;
-begin
-  if P = '' then Exit;
-  q := RemoveBackslashUnlessRoot(P);
-  if not DirExists(q) then Exit;
-  for i := 0 to GetArrayLength(CloudRoots) - 1 do
-    if CompareText(CloudRoots[i], q) = 0 then Exit;   { dedupe }
-  n := GetArrayLength(CloudRoots);
-  SetArrayLength(CloudRoots, n + 1);
-  CloudRoots[n] := q;
-end;
-
-{ Fill CloudRoots with every existing cloud / synced-folder root. Mirrors the
-  engine's Get-CloudRoots probe order: OneDrive env vars, then the OneDrive
-  registry accounts, then iCloud. The env vars only ever name ONE business
-  account (the most recently active one), so the registry pass --
-  HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder, which lists every
-  signed-in account (personal + each business) -- is the multi-OneDrive fix
-  (#188). The engine additionally reads Dropbox's JSON sidecar, but OneDrive
-  covers the lab norm and the engine still auto-detects a hand-picked Dropbox
-  path by prefix. }
-procedure DiscoverCloudRoots;
-var
-  accounts: TArrayOfString;
-  i: Integer;
-  uf, prof: String;
-begin
-  SetArrayLength(CloudRoots, 0);
-  AddCloudRoot(GetEnv('OneDrive'));
-  AddCloudRoot(GetEnv('OneDriveConsumer'));
-  AddCloudRoot(GetEnv('OneDriveCommercial'));
-  if RegGetSubkeyNames(HKEY_CURRENT_USER, 'Software\Microsoft\OneDrive\Accounts', accounts) then
-    for i := 0 to GetArrayLength(accounts) - 1 do
-      if RegQueryStringValue(HKEY_CURRENT_USER,
-           'Software\Microsoft\OneDrive\Accounts\' + accounts[i], 'UserFolder', uf) then
-        AddCloudRoot(uf);
-  prof := GetEnv('USERPROFILE');
-  if prof <> '' then AddCloudRoot(AddBackslash(prof) + 'iCloudDrive');
-end;
-
-{ The Microscopy folder under the Idx-th detected cloud root. }
-function CloudDirFor(Idx: Integer): String;
-begin
-  Result := AddBackslash(CloudRoots[Idx]) + 'Microscopy';
-end;
-
-{ Index of the cloud root whose Microscopy folder equals P, or -1. Used to tell a
-  still-default cloud suggestion apart from a hand-typed/browsed path. }
-function IndexOfCloudDir(const P: String): Integer;
-var
-  i: Integer;
-begin
-  Result := -1;
-  for i := 0 to GetArrayLength(CloudRoots) - 1 do
-    if CompareText(P, CloudDirFor(i)) = 0 then begin Result := i; Exit; end;
-end;
-
-{ Currently selected cloud root (the dropdown choice, or the only root). }
-function CurrentCloudIdx: Integer;
-begin
-  if CbCloudCombo <> nil then Result := CbCloudCombo.ItemIndex else Result := 0;
-  if Result < 0 then Result := 0;
-end;
-
-{ Re-point the suggestion at the newly selected cloud root -- but only when the
-  field still holds one of our cloud defaults, so a hand-typed path is kept. }
-procedure CloudComboChange(Sender: TObject);
-begin
-  if CbCloud.Checked and (IndexOfCloudDir(DataDirPage.Values[0]) >= 0) then
-    DataDirPage.Values[0] := CloudDirFor(CurrentCloudIdx);
-end;
-
-{ Toggle the suggested folder between the local default and a Microscopy folder
-  under the chosen cloud root. Only swaps when the box still holds a KNOWN
-  default (local on the way in, any cloud default on the way out), so a
-  hand-typed/browsed path is never clobbered. }
-procedure CloudCheckboxClick(Sender: TObject);
-begin
-  if CbCloudCombo <> nil then CbCloudCombo.Enabled := CbCloud.Checked;
-  if CbCloud.Checked then begin
-    if CompareText(DataDirPage.Values[0], LocalDataDir) = 0 then
-      DataDirPage.Values[0] := CloudDirFor(CurrentCloudIdx);
-  end else begin
-    if IndexOfCloudDir(DataDirPage.Values[0]) >= 0 then
-      DataDirPage.Values[0] := LocalDataDir;
-  end;
-end;
-
 procedure InitializeWizard;
 var
   T: Integer;
-  i: Integer;
 begin
   { Component selection is no longer offered (biopb/biopb#237): biopb-mcp, the
     data server, and the web interface (image viewer + server admin page) are
@@ -270,10 +168,12 @@ begin
     'Use off-site servers (hosted at UConn Health) for tasks like cell segmentation. Those servers log your IP address; uncheck to keep them disabled.',
     True, ScaleY(50));
 
-  { Data-directory page -> engine -DataDir, placed right after the options page. }
   { Detect a previous install the same way the engine/console do: the config is
     at a fixed home-relative path (covers both GUI and `irm|iex` console
-    installs). If present, we offer to keep it (see NextButtonClick). }
+    installs). If present, we offer to keep it on the way out of this page (see
+    NextButtonClick); declining passes the engine -Reset, which re-wires the
+    server to the sample bundle. No data-directory page is created -- like the
+    console, the installer never asks for a microscopy folder. }
   { Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
     pre-#34 install still counts. Prefer the JSON path for display when present. }
   ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.json';
@@ -281,63 +181,6 @@ begin
     ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.toml';
   ConfigExists := FileExists(ConfigPath);
   KeepConfig   := False;
-
-  DataDirPage := CreateInputDirPage(OptionsPage.ID,
-    'Microscopy data directory',
-    'Where are the images biopb should serve?',
-    'biopb will index this folder. You can change it later in biopb.json.',
-    False, '');
-  DataDirPage.Add('');
-  { Default under the profile root, NOT the Documents folder: Documents is
-    frequently OneDrive-redirected, and OneDrive "Files On-Demand" placeholders
-    hang the server's directory scan. Matches the console installer's fallback. }
-  LocalDataDir := AddBackslash(GetEnv('USERPROFILE')) + 'Microscopy';
-  DataDirPage.Values[0] := LocalDataDir;
-
-  { If a cloud root exists, offer it: a checkbox under the dir input that points
-    the picker at a Microscopy folder there and flags the source `cloud = true`.
-    Cloud sources are now safe to index -- the server admits Files-On-Demand
-    placeholders as unresolved sources (resolved lazily on read) instead of
-    hanging the scan, which is exactly why we once steered AWAY from OneDrive. }
-  DiscoverCloudRoots;
-  if GetArrayLength(CloudRoots) > 0 then begin
-    CbCloud := TNewCheckBox.Create(DataDirPage);
-    CbCloud.Parent  := DataDirPage.Surface;
-    CbCloud.Left    := 0;
-    CbCloud.Top     := DataDirPage.Edits[0].Top + DataDirPage.Edits[0].Height + ScaleY(16);
-    CbCloud.Width   := DataDirPage.SurfaceWidth;
-    CbCloud.Height  := ScaleY(17);
-    CbCloud.Caption := 'My images are in a cloud folder (OneDrive / iCloud / Dropbox)';
-    CbCloud.OnClick := @CloudCheckboxClick;
-
-    CbCloudDesc := TNewStaticText.Create(DataDirPage);
-    CbCloudDesc.Parent   := DataDirPage.Surface;
-    CbCloudDesc.Left     := ScaleX(18);
-    CbCloudDesc.Top      := CbCloud.Top + CbCloud.Height + ScaleY(2);
-    CbCloudDesc.Width    := DataDirPage.SurfaceWidth - ScaleX(18);
-    CbCloudDesc.AutoSize := False;
-    CbCloudDesc.WordWrap := True;
-    CbCloudDesc.Height   := ScaleY(34);
-    CbCloudDesc.Caption  := 'biopb indexes these without downloading every file -- images are ' +
-                            'pulled on demand the first time you open them.';
-
-    { Multiple signed-in OneDrives: a dropdown picks which one (env vars name
-      only one business account -- #188). A single root needs no dropdown, so the
-      common case keeps the bare-checkbox UX. Disabled until cloud is ticked. }
-    if GetArrayLength(CloudRoots) > 1 then begin
-      CbCloudCombo := TNewComboBox.Create(DataDirPage);
-      CbCloudCombo.Parent  := DataDirPage.Surface;
-      CbCloudCombo.Style    := csDropDownList;
-      CbCloudCombo.Left     := ScaleX(18);
-      CbCloudCombo.Top      := CbCloudDesc.Top + CbCloudDesc.Height + ScaleY(6);
-      CbCloudCombo.Width    := DataDirPage.SurfaceWidth - ScaleX(18);
-      for i := 0 to GetArrayLength(CloudRoots) - 1 do
-        CbCloudCombo.Items.Add(CloudRoots[i]);
-      CbCloudCombo.ItemIndex := 0;
-      CbCloudCombo.Enabled   := False;
-      CbCloudCombo.OnChange  := @CloudComboChange;
-    end;
-  end;
 
   { Progress page. We deliberately DROP the step-counting determinate gauge -- its
     n/total updates proved finicky and could skip a step -- in favor of an
@@ -369,23 +212,19 @@ begin
   Args := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\biopb-engine.ps1') + '"';
   Args := Args + ' -Mode gui';
   Args := Args + ' -LogFile "' + LogPath + '"';
-  { Keep    -> leave the existing config untouched (engine honors -KeepConfig).
-    Fresh    -> pass neither -KeepConfig nor -DataDir: the engine seeds the sample
-                image bundle and points the config at it (on the LOCAL profile
-                drive, never a cloud folder). A non-CLI user lands on real data and
-                adds their own later via drag-drop / the admin page.
-    Re-point -> existing config, user chose a new folder on the data-dir page. }
+  { Keep  -> leave the existing config untouched (engine honors -KeepConfig).
+    Reset -> existing config, user declined to keep it: -Reset re-wires the
+             server's sources to the sample bundle (other settings preserved),
+             the same end state as a fresh install -- no data folder is asked.
+    Fresh -> no config at all: pass neither flag; the engine seeds the sample
+             bundle and points the config at it (on the LOCAL profile drive). A
+             non-CLI user lands on real data and adds their own later via
+             drag-drop / the admin page. }
   if KeepConfig then
     Args := Args + ' -KeepConfig'
-  else if ConfigExists then begin
-    { Existing config, user chose a new folder on the (shown) data-dir page. }
-    Args := Args + ' -DataDir "' + DataDirPage.Values[0] + '"';
-    { Cloud opt-in (only meaningful when (re)writing the config). The engine also
-      auto-detects cloud-ness from the path, so this is an explicit override. }
-    if (CbCloud <> nil) and CbCloud.Checked then
-      Args := Args + ' -Cloud';
-  end;
-  { else: fresh install -> pass neither -KeepConfig nor -DataDir; the engine seeds
+  else if ConfigExists then
+    Args := Args + ' -Reset';
+  { else: fresh install -> pass neither -KeepConfig nor -Reset; the engine seeds
     the sample bundle onto the local profile drive and points the config there. }
   { The web interface is always installed now (it carries the server admin page);
     Bio-Formats is no longer a GUI option (opt in via $env:BIOPB_INSTALL_BIOFORMATS
@@ -552,24 +391,17 @@ begin
   Result := True;
   { Leaving the options page with an existing config present: ask whether to keep
     it -- the GUI equivalent of the console/Linux "Keep my current config file
-    (default)" choice. Yes -> keep untouched and skip the data-dir page; No ->
-    pick a new data folder (the engine preserves your other settings and replaces
-    only the data folder). }
+    (default)" choice. Yes -> keep untouched; No -> reset to the sample images
+    (the engine's -Reset re-wires the sources to the sample bundle and preserves
+    your other settings). Either way we never prompt for a data folder. }
   if (CurPageID = OptionsPage.ID) and ConfigExists then
     KeepConfig := (MsgBox(
       'An existing biopb configuration was found:' + #13#10 +
       ConfigPath + #13#10#13#10 +
       'Keep your current configuration (data folder and settings)?' + #13#10#13#10 +
       'Yes  -  keep it unchanged' + #13#10 +
-      'No   -  choose a new microscopy data folder (your other settings are kept)',
+      'No   -  reset to the sample images (your other settings are kept)',
       mbConfirmation, MB_YESNO) = IDYES);
-end;
-
-{ Skip the data-directory page when keeping an existing config, and on a fresh
-  install (no config) -- a fresh install seeds sample images and asks nothing. }
-function ShouldSkipPage(PageID: Integer): Boolean;
-begin
-  Result := (PageID = DataDirPage.ID) and (KeepConfig or (not ConfigExists));
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
