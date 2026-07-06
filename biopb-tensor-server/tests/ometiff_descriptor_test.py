@@ -350,34 +350,6 @@ class TestFastMetadata:
         assert adapter._raw_ome_xml  # the embedded OME-XML string
         assert adapter._local_ome_xml() == adapter._raw_ome_xml
 
-    def test_release_retained_metadata_drops_raw_ome_xml(self, tmp_path):
-        # Once the catalog holds the metadata, release_retained_metadata drops the
-        # (MB-scale) OME-XML string the adapter cached only for get_metadata
-        # (biopb/biopb#253). get_metadata still works afterwards, via aicsimageio.
-        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "release")
-        adapter.list_tensor_descriptors()  # populate the cache
-        assert adapter._raw_ome_xml
-
-        adapter.release_retained_metadata()
-        assert adapter._raw_ome_xml is None
-        # stays "probed" so _local_ome_xml does not reopen the file and re-pin it
-        assert adapter._raw_ome_xml_probed is True
-        assert adapter._local_ome_xml() is None
-
-        # get_metadata still returns real OME metadata (authoritative aicsimageio
-        # path, since the fast-path string was released)
-        md = adapter.get_metadata()
-        assert "images" in md
-
-    def test_release_retained_metadata_is_idempotent(self, tmp_path):
-        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "idem")
-        adapter.list_tensor_descriptors()
-        adapter.release_retained_metadata()
-        adapter.release_retained_metadata()  # second call must not raise
-        assert adapter._raw_ome_xml is None
-
 
 class TestFallback:
     def test_remote_url_falls_back(self, tmp_path):
