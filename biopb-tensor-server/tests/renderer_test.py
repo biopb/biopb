@@ -110,6 +110,29 @@ class TestRenderRgb:
         assert (w, h) == (24, 20)
         assert len(img) == 24 * 20 * 3  # RGB, alpha dropped
 
+    def test_rgba_alpha_excluded_from_percentile_stretch(self):
+        # An opaque alpha=255 must not inflate the high cutoff: the RGB stretch
+        # must be identical whether or not an alpha sample is present. RGB values
+        # span 0..200 (max well below the constant 255 alpha), so including alpha
+        # in the stats would raise hi and darken the output.
+        h, w = 32, 40
+        rgb = np.zeros((1, 1, 1, h, w, 3), np.uint8)
+        rgb[..., 0] = np.linspace(0, 200, w, dtype=np.uint8)[None, :]
+        rgb[..., 1] = 80
+        rgb[..., 2] = 40
+        rgba = np.concatenate(
+            [rgb, np.full((1, 1, 1, h, w, 1), 255, np.uint8)], axis=-1
+        )
+
+        out_rgb, _, _, lo_rgb, hi_rgb = render_array_to_image_bytes(
+            arr=rgb, dim_labels=RGB_LABELS, output_format="raw"
+        )
+        out_rgba, _, _, lo_rgba, hi_rgba = render_array_to_image_bytes(
+            arr=rgba, dim_labels=RGB_LABELS, output_format="raw"
+        )
+        assert (lo_rgba, hi_rgba) == (lo_rgb, hi_rgb)
+        assert out_rgba == out_rgb
+
     def test_grayscale_still_pseudocolors(self):
         # Non-RGB single plane keeps the pseudo-color path (green here).
         arr = np.full((1, 1, 1, 16, 20), 128, np.uint8)

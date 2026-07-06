@@ -428,14 +428,21 @@ def render_array_to_image_bytes(
     yx_slice = extract_yx_slice(arr, dim_labels)
     extract_ms = (time.monotonic() - t1) * 1000
 
-    # Compute percentile cutoffs (shared across samples for a true-color plane,
-    # so the RGB balance is preserved).
+    is_rgb = yx_slice.ndim == 3
+
+    # Compute percentile cutoffs. For an interleaved RGB(A) plane a *shared*
+    # stretch across the color samples preserves the color balance -- but the
+    # alpha sample (RGBA) is excluded from the statistics, else a constant opaque
+    # alpha=255 inflates the high cutoff and washes out the RGB.
     t2 = time.monotonic()
-    lo_val, hi_val = compute_percentile_cutoffs(yx_slice, percentile_lo, percentile_hi)
+    stat_source = yx_slice[..., :3] if is_rgb else yx_slice
+    lo_val, hi_val = compute_percentile_cutoffs(
+        stat_source, percentile_lo, percentile_hi
+    )
     percentile_ms = (time.monotonic() - t2) * 1000
 
     t3 = time.monotonic()
-    if yx_slice.ndim == 3:
+    if is_rgb:
         # Interleaved RGB(A) samples: composite directly, no pseudo-color.
         rgb = normalize_rgb_samples(yx_slice, lo_val, hi_val)
     else:
