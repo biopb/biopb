@@ -731,8 +731,25 @@ _start_data_server() {
     fi
 
     # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise.
-    biopb server restart >/dev/null 2>&1 || true
+    # and is a plain start otherwise. Don't swallow a failure (biopb/biopb#324):
+    # on a start that can never succeed -- e.g. gRPC port 8815 held by a process
+    # biopb is not tracking -- the CLI prints the real cause, and the status poll
+    # below would bury it under a generic "may not have started".
+    local restart_out
+    if ! restart_out=$(biopb server restart 2>&1); then
+        _warn "Data server failed to (re)start:"
+        # A plain `if` (not `[ -n "$line" ] && _info`): an empty $restart_out
+        # still yields one loop pass whose trailing false test would make the
+        # while's exit status 1, and `set -o pipefail` + `set -e` would then
+        # abort the installer here -- before the log tail / recovery hint below.
+        printf '%s\n' "$restart_out" | while IFS= read -r line; do
+            if [ -n "$line" ]; then _info "  $line"; fi
+        done
+        _tail_log "$log_file"
+        _info "  full log: ${CYAN}$log_file${RESET}"
+        _info "  after fixing the cause, run: ${CYAN}biopb server start${RESET}"
+        return 0
+    fi
 
     # Ask the daemon for its health, polling until it reaches SERVING (or 60s).
     # stderr carries live progress ("data server starting - N found so far...")
