@@ -64,6 +64,14 @@ param(
     # Explicitly keep an existing config untouched (do not rewrite it).
     [switch]$KeepConfig,
 
+    # Reset an existing config to the sample bundle: re-wire the sources block to
+    # the curated samples (exactly as a fresh install would) while preserving the
+    # user's other settings, instead of keeping the config. No-op when no config
+    # exists (a fresh install already seeds samples) and overridden by -DataDir.
+    # This is the GUI's "don't keep my configuration" choice -- it re-points the
+    # server at the samples without ever prompting for a data folder.
+    [switch]$Reset,
+
     # Mark the written source as cloud/synced storage (OneDrive, Dropbox, iCloud):
     # the server admits dehydrated "Files On-Demand" placeholders as *unresolved*
     # sources (resolved lazily on first read) instead of skipping them. Absent =
@@ -765,6 +773,7 @@ function Invoke-BiopbInstall {
         [switch]$Rc,
         [switch]$NoServerStart,
         [switch]$KeepConfig,
+        [switch]$Reset,
         [switch]$DryRun,
         [switch]$NoRemotePlugins,
         [string]$LogFile = "",
@@ -1161,14 +1170,20 @@ function Invoke-BiopbInstall {
     # Decide keep-vs-write. The interactive prompt now lives in the front-end; the
     # engine just honors the resolved choice:
     #   -KeepConfig                  -> keep an existing config untouched
+    #   -Reset                       -> re-wire an existing config's sources to the
+    #                                   sample bundle (other settings preserved),
+    #                                   the same end state as a fresh install; the
+    #                                   GUI's "don't keep my config" choice
     #   -DataDir <path>              -> (re)write config pointing at that dir
     #   neither, config exists       -> keep it (safe default)
     #   neither, no config           -> seed the sample bundle and point at it, so
     #                                   a non-CLI user lands on real data with no
     #                                   prompt (they add their own via GUI drag-drop
-    #                                   / the admin page). BIOPB_DATA_DIR or a GUI
-    #                                   data-dir page still overrides by passing -DataDir.
-    $effectiveKeep = $KeepConfig -or ((-not $DataDir) -and $configExists)
+    #                                   / the admin page). BIOPB_DATA_DIR still
+    #                                   overrides by passing -DataDir.
+    # -Reset forces the fresh sample-seed path below even when a config exists (an
+    # explicit -DataDir still wins); it is a no-op without a config.
+    $effectiveKeep = (-not $Reset) -and ($KeepConfig -or ((-not $DataDir) -and $configExists))
     $effectiveDataDir = $DataDir
     $seedSamples = $false
     if (-not $effectiveKeep -and -not $effectiveDataDir) {
@@ -1479,6 +1494,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             Rc              = $Rc
             NoServerStart   = $NoServerStart
             KeepConfig      = $KeepConfig
+            Reset           = $Reset
             DryRun          = $DryRun
             NoRemotePlugins = $NoRemotePlugins
             LogFile         = $LogFile

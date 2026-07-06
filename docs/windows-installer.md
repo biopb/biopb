@@ -43,12 +43,12 @@ Per-machine / GPO mass-deployment for managed lab fleets (WiX/MSI) is explicitly
 ## Architecture: one engine, two front-ends
 
 ```
-                 choices (components, data dir)
+                 choices (plugins consent; keep-or-reset config)
                           │
    ┌──────────────────────┴───────────────────────┐
    │                                               │
 install.ps1 (console front-end)        biopb-setup.iss (Inno GUI front-end)
-   │  banner, preflight, prompts            │  welcome, components page, dir page
+   │  banner, preflight, prompts            │  welcome, options page, keep/reset dialog
    │  dot-sources engine, -Mode console     │  runs engine as child, -Mode gui
    └──────────────────────┬────────────────┘
                           │  calls Invoke-BiopbInstall / runs the .ps1
@@ -67,8 +67,8 @@ Both front-ends go through the same `Report-*` calls, so they can never drift on
 | File | Role |
 |---|---|
 | `install/biopb-engine.ps1` | Headless engine. Dual-use: **dot-sourced** (defines functions only — guarded by `$MyInvocation.InvocationName`) or **run directly** (executes in `-Mode gui`). |
-| `install/install.ps1` | Console front-end. Banner, preflight, `Select-Components`, `Select-DataDir`, then drives the engine `-Mode console` in-process and renders the summary. |
-| `install/gui/biopb-setup.iss` | Inno Setup wizard skeleton. Components page → `-Webapp`/`-Bioformats`; dir page → `-DataDir`; runs the engine and parses its tagged stream. |
+| `install/install.ps1` | Console front-end. Banner, preflight, remote-plugins consent, then drives the engine `-Mode console` in-process and renders the summary. Never prompts for a data directory — a fresh install seeds samples; an existing config is kept untouched. |
+| `install/gui/biopb-setup.iss` | Inno Setup wizard. Options page → `-Webapp`/`-NoRemotePlugins`; keep/reset dialog → `-KeepConfig` (Yes) / `-Reset` (No); runs the engine and parses its tagged stream. No data-directory page. |
 
 ## The progress protocol (the integration seam)
 
@@ -126,9 +126,8 @@ policies still require a *signed* engine — signing is the sole fix there.
 | Wizard page | Feeds | Replaces |
 |---|---|---|
 | Welcome / license | — | — |
-| Options (custom page) | `-Webapp`, `-Bioformats`, `-NoRemotePlugins` | `Select-Components` + remote-plugins consent |
-| Keep-config dialog | `-KeepConfig` (existing config only) | console keep-config note |
-| Data directory *(shown only when re-pointing an existing config)* | `-DataDir` (`-Cloud` when the cloud box is ticked) | (fresh installs skip it) |
+| Options (custom page) | `-Webapp`, `-NoRemotePlugins` | components + remote-plugins consent |
+| Keep-config dialog *(existing config only)* | `-KeepConfig` (Yes) / `-Reset` (No) | console keep-config note |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
 
@@ -138,46 +137,41 @@ falling back to a legacy `biopb.toml` (fixed paths, so it catches both prior GUI
 *and* `irm|iex` console installs). If present, a Yes/No dialog offers to keep the
 current configuration — the GUI equivalent of the console/Linux "Keep my current
 config file (default)". **Yes** passes `-KeepConfig` (engine leaves the existing
-config untouched) and skips the data-dir page; **No** shows the data-dir page and
-the engine writes `biopb.json`, preserving the prior server/cache settings and
-replacing only the `sources` list (a legacy `biopb.toml` is migrated to JSON and
-backed up). We do not pre-read the existing data dir (a config may hold multiple
-`sources` and the engine replaces them with the chosen folder, so "keep" means
-*don't touch the file*).
+config untouched). **No** passes `-Reset`: the engine re-wires the `sources` list
+to the curated sample bundle — the same end state as a fresh install — while
+preserving the prior server/cache settings (a legacy `biopb.toml` is migrated to
+JSON and backed up). Neither branch prompts for a data folder, matching the
+console, which has no re-point path at all. We do not pre-read the existing data
+dir (a config may hold multiple `sources`, so "keep" means *don't touch the
+file*, and "reset" means *replace only the `sources`*).
 
 **Fresh install seeds sample images (no data-dir prompt).** With no existing
-config, the wizard skips the data-dir page entirely: it passes neither
-`-KeepConfig` nor `-DataDir`, and the engine downloads the release's
-`biopb-samples.tar.gz` (curated CC0 images), extracts it to
-`%USERPROFILE%\.local\share\biopb\samples` — the **local** profile drive, never a
-OneDrive/Dropbox folder — and writes `biopb.json` pointing there with
+config, the wizard passes neither `-KeepConfig` nor `-Reset`, and the engine
+downloads the release's `biopb-samples.tar.gz` (curated CC0 images), extracts it
+to `%USERPROFILE%\.local\share\biopb\samples` — the **local** profile drive,
+never a OneDrive/Dropbox folder — and writes `biopb.json` pointing there with
 `cloud = false`. So a non-CLI user reaches a populated viewer with zero questions
 and adds their own data afterward via the tensor-browser drag-drop or the admin
-page. `BIOPB_INSTALL_SAMPLES=0` seeds nothing; the data-dir page still appears
-only when a user declines to keep an *existing* config (the re-point path).
+page. `BIOPB_INSTALL_SAMPLES=0` seeds nothing (the config then points at an empty
+folder). The **reset** path (existing config, "No") reaches the identical
+sample-seeded end state; the installer never asks for a microscopy folder.
 
-**Cloud / synced folders.** When a cloud root is present the data-dir page adds a
-*"My images are in a cloud folder"* checkbox: ticking it points the picker at a
-`Microscopy` folder under the cloud root and passes `-Cloud`, which makes the
-engine write `cloud = true` on the source. The GUI discovers roots the same way
-the engine's `Get-CloudRoots` does — OneDrive env vars (`%OneDrive%`,
-`%OneDriveConsumer/Commercial%`), **plus the OneDrive account registry**
-(`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder`), then
-`%USERPROFILE%\iCloudDrive`. The env vars only name one business account, so the
-registry pass is what surfaces *every* signed-in OneDrive; when more than one is
-found the checkbox is paired with a dropdown to pick which root (#188). (The
-console installer no longer prompts for a data directory at all — a fresh install
-seeds samples with no question; only the *re-point* path, the GUI data-dir page
-or `BIOPB_DATA_DIR`, chooses a folder.) Either way the engine
-*auto-detects* cloud-ness from the chosen path (`Test-IsCloudPath`: any dir at or
-under a known cloud root), so browsing/typing a OneDrive path yields `cloud = true`
-even without the checkbox; `-Cloud` is just an explicit override for roots the
-probes miss (e.g. a Dropbox path the GUI didn't enumerate). A `cloud = true`
-source admits OneDrive/Dropbox/iCloud "Files-On-Demand" placeholders as
-*unresolved* sources (resolved lazily on first read) instead of letting the
-directory scan hang on hydrate-on-read placeholders — the reason the installer
-historically steered *away* from OneDrive. See the tensor server's cloud-storage
-phase 2 (`SourceConfig.cloud`).
+**Cloud / synced folders.** The GUI no longer offers a data-dir picker or a cloud
+checkbox — a fresh install and a reset both land on the local sample bundle
+(`cloud = false`), and there is no in-wizard way to point at your own folder
+(that's the tensor-browser drag-drop / admin page, post-install). Cloud handling
+now lives entirely in the engine for the `-DataDir` / `BIOPB_DATA_DIR` paths (the
+console override, or an advanced direct `biopb-engine.ps1 -DataDir` run): the
+engine *auto-detects* cloud-ness from the path (`Test-IsCloudPath`: any dir at or
+under a known cloud root — OneDrive env vars + the
+`HKCU\Software\Microsoft\OneDrive\Accounts\*\UserFolder` registry, iCloud,
+Dropbox), so a OneDrive path yields `cloud = true` without any flag; `-Cloud` is
+an explicit override for roots the probes miss. A `cloud = true` source admits
+OneDrive/Dropbox/iCloud "Files-On-Demand" placeholders as *unresolved* sources
+(resolved lazily on first read) instead of letting the directory scan hang on
+hydrate-on-read placeholders — the reason the installer historically steered
+*away* from OneDrive. See the tensor server's cloud-storage phase 2
+(`SourceConfig.cloud`).
 
 Inno gives the **uninstaller + Add/Remove Programs entry for free** — something
 the CLI install can't offer today.
@@ -210,9 +204,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install\biopb-engine.ps1 -Mo
 ```
 
 A `/DDryRun` build passes `-DryRun` to the engine (via an `#ifdef` in
-`biopb-setup.iss`); a normal build never does. Watch for: the data-dir page
-default, the gauge advancing 0→7, the log memo scrolling, and the finish page
-picking up the `RESULT` records.
+`biopb-setup.iss`); a normal build never does. Watch for: the options page
+(remote-plugins checkbox), the keep/reset dialog when a config already exists (Yes
+→ `-KeepConfig`, No → `-Reset`), the marquee bar animating, the log memo
+scrolling, and the finish page picking up the `RESULT` records.
 
 **Full end-to-end test** (real install — downloads uv/Python/napari/wheels and
 writes config): build without `/DDryRun` and run the `.exe`. The per-user/no-admin
