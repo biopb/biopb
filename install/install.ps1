@@ -67,24 +67,31 @@ function Wait-ForExit {
     }
 }
 
-# Locate (or download) the headless engine and return the path to dot-source.
-# The caller must dot-source the returned path at SCRIPT scope -- dot-sourcing
-# inside this function would define the engine's functions (Invoke-BiopbInstall,
-# the Report-* renderers) in this function's child scope,
-# where they vanish on return and are unavailable to Main. Returning the path and
+# Locate (or download) the headless engine and return its SOURCE TEXT (not a
+# path). The caller dot-sources it as an in-memory scriptblock at SCRIPT scope --
+# dot-sourcing inside this function would define the engine's functions
+# (Invoke-BiopbInstall, the Report-* renderers) in this function's child scope,
+# where they vanish on return and are unavailable to Main. Returning the text and
 # dot-sourcing in Main keeps them alive for the whole session. Dot-sourcing (not
 # running) also skips the engine's auto-run block; we drive it via Invoke-BiopbInstall.
-function Resolve-EnginePath {
+#
+# We return TEXT rather than a .ps1 path on purpose: a factory-default Windows
+# client ships ExecutionPolicy=Restricted, which blocks dot-sourcing a script
+# *file* -- so writing the downloaded engine to %TEMP% and dot-sourcing it fails
+# mid-install with a cryptic PSSecurityException, even though the `irm | iex`
+# entry ran fine (in-memory expressions are never policy-gated). An in-memory
+# scriptblock is the same in-memory path: it runs under Restricted, needs no
+# temp file, and keeps $MyInvocation.InvocationName '.' so the auto-run guard
+# still skips. (AllSigned / GPO-locked machines still need a signed engine --
+# nothing short of signing helps there.)
+function Resolve-EngineSource {
     # $PSScriptRoot is empty under `irm | iex` (no file on disk) -> download.
     $local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { $null }
     if ($local -and (Test-Path -LiteralPath $local)) {
-        return $local
+        return (Get-Content -Raw -LiteralPath $local)
     }
     Write-Inf "Fetching install engine..."
-    $engineSrc = Invoke-RestMethod -Uri $EngineUrl
-    $tmp = Join-Path $env:TEMP "biopb-engine.ps1"
-    Set-Content -LiteralPath $tmp -Value $engineSrc -Encoding UTF8
-    return $tmp
+    return (Invoke-RestMethod -Uri $EngineUrl)
 }
 
 function Show-Banner {
@@ -186,8 +193,9 @@ $reportOnFailure = Invoke-Preflight
 
 try {
     # Dot-source at SCRIPT scope (not inside a helper) so the engine's functions --
-    # Invoke-BiopbInstall, Report-* -- persist through Main.
-    . (Resolve-EnginePath)
+    # Invoke-BiopbInstall, Report-* -- persist through Main. An in-memory
+    # scriptblock (not a .ps1 file) so it runs under a Restricted ExecutionPolicy.
+    . ([scriptblock]::Create((Resolve-EngineSource)))
 
     $BiopbHome  = $env:USERPROFILE
     # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
