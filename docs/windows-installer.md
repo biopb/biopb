@@ -98,11 +98,24 @@ colored `Write-Host` styling, so existing `irm | iex` users see no regression.
 ## `irm | iex` is preserved
 
 The console front-end stays a single self-contained entry point. When run from a
-local checkout/unpacked installer it dot-sources the sibling `biopb-engine.ps1`;
-when run via `irm | iex` (no file on disk, `$PSScriptRoot` empty) it downloads the
+local checkout/unpacked installer it reads the sibling `biopb-engine.ps1`; when
+run via `irm | iex` (no file on disk, `$PSScriptRoot` empty) it downloads the
 engine from `https://biopb.org/biopb-engine.ps1`. CI publishes the engine as a
 release asset alongside `install.ps1`, and `biopb.org` serves it — mirroring how
 `install.ps1`/`install.sh` are already hosted (see `release-model.md`).
+
+**ExecutionPolicy: the engine is dot-sourced in-memory, never from a temp file.**
+`Resolve-EngineSource` returns the engine's *text* (local `Get-Content` or the
+download), and Main dot-sources it as `. ([scriptblock]::Create($src))`. This
+matters because a factory-default Windows client ships
+`ExecutionPolicy=Restricted`, which blocks dot-sourcing a script *file* — writing
+the engine to `%TEMP%\biopb-engine.ps1` and dot-sourcing that path fails
+mid-install with a `PSSecurityException`, even though the `irm | iex` entry itself
+ran fine (in-memory expressions are never policy-gated). A scriptblock stays on
+that same in-memory path: it loads under `Restricted`, needs no temp file, and
+keeps `$MyInvocation.InvocationName` `.` so the engine's auto-run guard still
+skips (Main drives it via `Invoke-BiopbInstall`). Only `AllSigned` / GPO-locked
+policies still require a *signed* engine — signing is the sole fix there.
 
 > Alternative if the extra fetch is unwanted: a build step concatenates engine +
 > front-end into one self-contained published `install.ps1`, with the engine also
