@@ -3,15 +3,13 @@
 Tests utility functions that don't require a live Flight server.
 """
 
-import pytest
-import warnings
-import logging
-import importlib.metadata
-from unittest.mock import MagicMock, patch
-
 import pyarrow as pa
-
-from biopb.tensor.client import _parse_version, _check_schema_version
+import pytest
+from biopb.tensor._wire_version import (
+    TENSOR_WIRE_PROTOCOL_VERSION,
+    WIRE_PROTOCOL_METADATA_KEY,
+)
+from biopb.tensor.client import _check_wire_protocol, _parse_version
 
 
 class TestParseVersion:
@@ -46,106 +44,57 @@ class TestParseVersion:
             _parse_version("")
 
 
-class TestCheckSchemaVersion:
-    """Tests for _check_schema_version version compatibility warnings."""
+def _schema_with_protocol(version):
+    """A chunk schema stamped with the given wire-protocol version (None = unstamped)."""
+    md = {} if version is None else {WIRE_PROTOCOL_METADATA_KEY: str(version)}
+    return pa.schema([pa.field("data", pa.binary())], metadata=md)
 
-    def test_no_warning_when_no_metadata(self):
-        """Test no warning when schema has no metadata."""
-        schema = pa.schema([pa.field("data", pa.float32())])
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
-            _check_schema_version(schema)
-            # No warnings should be emitted
 
-    def test_no_warning_when_no_version_in_metadata(self):
-        """Test no warning when metadata doesn't contain version."""
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"other_key": "some_value"}
-        )
-        with warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
-            _check_schema_version(schema)
-            # No warnings should be emitted
+class TestCheckWireProtocol:
+    """The hard chunk wire-protocol guard (biopb/biopb#293).
 
-    def test_warning_when_client_older_than_server(self):
-        """Test warning when client version is older than server schema version."""
-        # Create schema with server version metadata
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
-        )
+    A version mismatch means the client would misread every chunk, so the guard
+    raises at GetFlightInfo instead of warning and proceeding.
+    """
 
-        # Mock client version to be older
-        with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
-            mock_version.return_value = "1.0.0"
+    def test_matching_version_passes(self):
+        _check_wire_protocol(_schema_with_protocol(TENSOR_WIRE_PROTOCOL_VERSION))
 
-            # Capture logger warnings
-            with patch("biopb.tensor.client.logger.warning") as mock_logger:
-                _check_schema_version(schema)
-                mock_logger.assert_called_once()
-                assert "older than server schema version" in mock_logger.call_args[0][0]
+    def test_older_server_raises(self):
+        with pytest.raises(RuntimeError, match="wire protocol"):
+            _check_wire_protocol(
+                _schema_with_protocol(TENSOR_WIRE_PROTOCOL_VERSION - 1)
+            )
 
-    def test_no_warning_when_client_same_version(self):
-        """Test no warning when client version equals server version."""
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "1.0.0"}
-        )
+    def test_newer_server_raises(self):
+        with pytest.raises(RuntimeError, match="wire protocol"):
+            _check_wire_protocol(
+                _schema_with_protocol(TENSOR_WIRE_PROTOCOL_VERSION + 1)
+            )
 
-        with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
-            mock_version.return_value = "1.0.0"
+    def test_unstamped_schema_is_v1_and_raises(self):
+        # A pre-#293 server sends no protocol tag; it speaks the v1 typed schema
+        # this client can't read, so reject rather than fail cryptically.
+        with pytest.raises(RuntimeError, match="wire protocol"):
+            _check_wire_protocol(_schema_with_protocol(None))
 
-            with patch("biopb.tensor.client.logger.warning") as mock_logger:
-                _check_schema_version(schema)
-                # No warning should be logged
-                mock_logger.assert_not_called()
+    def test_no_metadata_at_all_raises(self):
+        with pytest.raises(RuntimeError, match="wire protocol"):
+            _check_wire_protocol(pa.schema([pa.field("data", pa.binary())]))
 
-    def test_no_warning_when_client_newer_than_server(self):
-        """Test no warning when client version is newer than server."""
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "1.0.0"}
-        )
+    def test_malformed_version_raises(self):
+        with pytest.raises(RuntimeError, match="wire protocol"):
+            _check_wire_protocol(_schema_with_protocol("not-an-int"))
 
-        with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
-            mock_version.return_value = "2.0.0"
-
-            with patch("biopb.tensor.client.logger.warning") as mock_logger:
-                _check_schema_version(schema)
-                # No warning should be logged
-                mock_logger.assert_not_called()
-
-    def test_no_warning_when_package_not_found(self):
-        """Test no warning when biopb package not found."""
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
-        )
-
-        with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
-            mock_version.side_effect = importlib.metadata.PackageNotFoundError("biopb")
-
-            with patch("biopb.tensor.client.logger.warning") as mock_logger:
-                _check_schema_version(schema)
-                # No warning should be logged
-                mock_logger.assert_not_called()
-
-    def test_warning_logged_not_warning_module(self):
-        """Test that older client logs a warning via logger."""
-        schema = pa.schema(
-            [pa.field("data", pa.float32())],
-            metadata={"tensor_schema_version": "2.0.0"}
-        )
-
-        with patch("biopb.tensor.client.importlib.metadata.version") as mock_version:
-            mock_version.return_value = "1.0.0"
-
-            # Capture logger warnings
-            with patch("biopb.tensor.client.logger.warning") as mock_logger:
-                _check_schema_version(schema)
-                mock_logger.assert_called_once()
-                assert "older than server schema version" in mock_logger.call_args[0][0]
+    def test_error_names_the_stale_side(self):
+        with pytest.raises(RuntimeError, match="upgrade the server"):
+            _check_wire_protocol(
+                _schema_with_protocol(TENSOR_WIRE_PROTOCOL_VERSION - 1)
+            )
+        with pytest.raises(RuntimeError, match="upgrade the client"):
+            _check_wire_protocol(
+                _schema_with_protocol(TENSOR_WIRE_PROTOCOL_VERSION + 1)
+            )
 
 
 class TestVersionComparison:
@@ -185,9 +134,11 @@ class TestImport:
     def test_import_client(self):
         """Test that client module can be imported."""
         import biopb.tensor.client as client
-        assert hasattr(client, 'TensorFlightClient')
+
+        assert hasattr(client, "TensorFlightClient")
 
     def test_import_serialized_pb2(self):
         """Test that serialized_pb2 can be imported."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
+
         assert SerializedTensor is not None

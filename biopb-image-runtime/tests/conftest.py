@@ -1,10 +1,10 @@
 """Pytest configuration for biopb-image-runtime tests."""
 
-import subprocess
-import time
 import os
-import tempfile
 import shutil
+import subprocess
+import tempfile
+import time
 from typing import Generator
 
 import grpc
@@ -22,7 +22,7 @@ def mock_server() -> Generator[str, None, None]:
 
     # Check if mock_servicer module is available
     try:
-        import biopb_image_base.mock_servicer
+        import biopb_image_base.mock_servicer  # noqa: F401  # availability probe
     except ImportError:
         pytest.skip("biopb_image_base.mock_servicer not available")
 
@@ -57,6 +57,7 @@ def mock_server() -> Generator[str, None, None]:
         try:
             channel = grpc.insecure_channel(server_addr)
             from grpc_health.v1 import health_pb2, health_pb2_grpc
+
             stub = health_pb2_grpc.HealthStub(channel)
             request = health_pb2.HealthCheckRequest()
             stub.Check(request, timeout=2)
@@ -75,7 +76,6 @@ def mock_server() -> Generator[str, None, None]:
         proc.kill()
 
     # Clean cache directory
-    import shutil
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 

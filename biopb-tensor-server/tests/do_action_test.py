@@ -3,7 +3,6 @@
 import json
 
 import pyarrow.flight as flight
-
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.server import TensorFlightServer

@@ -91,9 +91,11 @@ message TensorDescriptor {
   repeated int64 scale_hint = 7;
 
   // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",
-  // "linear", or "precompute" (serve a native on-disk pyramid level).
+  // or "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
-  // "precomputed" -> "precompute".
+  // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
+  // Advisory for caching: the server may serve an existing cached chunk
+  // computed under a different method at the same bounds/scale.
   string reduction_method = 8;
 
   // Opaque JSON metadata compatible with OME-NGFF (.zattrs schema).
@@ -132,7 +134,7 @@ message PyramidLevel {
   // Level 0 is [1, 1, ...]; matches TensorDescriptor.scale_hint semantics.
   repeated int64 scale_hint = 1;
 
-  // Method to request this level: "area" | "nearest" | "linear" | "precompute".
+  // Method to request this level: "area" | "nearest" | "precompute".
   // "precompute" means the server serves a native on-disk level (see `native`).
   string reduction_method = 2;
 
@@ -191,10 +193,10 @@ message TensorReadOption {
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   repeated int64 scale_hint = 3;
 
-  // Dynamic reduction/downsampling method: "nearest", "area", "linear", or
+  // Dynamic reduction/downsampling method: "nearest", "area", or
   // "precompute" (serve a native on-disk pyramid level).
   // Compatibility aliases accepted: "stride" -> "nearest", "mean" -> "area",
-  // "precomputed" -> "precompute".
+  // "precomputed" -> "precompute", "linear" (deprecated) -> "area".
   string reduction_method = 4;
 
   // If true, server populates metadata_json with wrapped metadata.
@@ -239,4 +241,178 @@ message DataSourceDescriptor {
 
   // Source-level OME/vendor metadata (JSON format)
   string metadata_json = 5;
+
+  // Advisory, point-in-time hint: this source's content is local and cheap to
+  // read right now. VOLATILE -- a synced-folder source can re-dehydrate under
+  // storage pressure, so the authoritative residency gate is a fresh stat
+  // (adapter.is_resident()), not this stored value. `optional` so absence is
+  // distinguishable from false: servers predating this field leave it unset
+  // (residency unknown); a resident local source sets it true, a remote
+  // (fsspec) source false until its pixels are materialized locally.
+  optional bool data_resident = 6;
+}
+
+// Progress heartbeat for an in-flight "resolve" Flight action. Resolving a
+// dehydrated cloud / synced-folder source is a whole-file recall that can take
+// minutes; the action streams these periodically so a client can show progress
+// and decide whether to cancel, and so the empty-looking response does not trip
+// proxy idle read timeouts. Informational only -- carries no pixels.
+message ResolveProgress {
+  // Seconds elapsed since resolution began on the server.
+  double elapsed_seconds = 1;
+
+  // Human-readable name of the recall target (file / directory basename), or
+  // empty when the server cannot name it.
+  string target_name = 2;
+
+  // Size in bytes of the recall target, or 0 when unknown (e.g. a directory, a
+  // remote URL, or a stat failure).
+  int64 target_bytes = 3;
+}
+
+// One message in the "resolve" action's result stream. The server emits zero or
+// more `progress` heartbeats followed by exactly one terminal `result` carrying
+// the resolved DataSourceDescriptor. (Replaces the older convention of an empty
+// body for a heartbeat and a bare serialized descriptor for the result, so a
+// heartbeat can now carry progress -- clients must read this envelope.)
+message ResolveStreamMessage {
+  oneof payload {
+    ResolveProgress progress = 1;
+    DataSourceDescriptor result = 2;
+  }
+}
+
+// Progress for an in-flight "warm" (hydrate-ahead) Flight action. After a
+// source is resolved, a multi-file cloud source's member data files are still
+// dehydrated and recall one-at-a-time onto the lazy read path. "warm" opts into
+// pulling them all resident on the server up front: it walks the source
+// directory and reads each file to force the sync engine's recall, streaming
+// these so a client can show progress (files / bytes) and cancel. The recall
+// happens server-side -- no pixels cross the wire, only this progress.
+// Informational only.
+message WarmProgress {
+  // Total regular files discovered under the source (the recall-free stat
+  // pass). 0 while still enumerating.
+  int32 files_total = 1;
+
+  // Files fully read (made resident) so far.
+  int32 files_done = 2;
+
+  // Sum of file sizes in bytes (stat is recall-free), or 0 while enumerating.
+  int64 bytes_total = 3;
+
+  // Bytes read (recalled) so far.
+  int64 bytes_done = 4;
+
+  // Basename of the file currently being recalled, or empty.
+  string current_name = 5;
+
+  // Seconds elapsed since warming began on the server.
+  double elapsed_seconds = 6;
+}
+
+// One message in the "warm" action's result stream. The server emits zero or
+// more `progress` updates followed by exactly one terminal `done` snapshot. On
+// normal completion `done.files_done == done.files_total`; on cancellation (the
+// client closing the stream) the `done` reflects partial progress. A
+// single-file or non-directory source yields one `done` with files_total == 0.
+message WarmStreamMessage {
+  oneof payload {
+    WarmProgress progress = 1;
+    WarmProgress done = 2;
+  }
+}
+
+// Request body for the "add_source" Flight action: register an existing path
+// (or remote URL) on the SERVER's filesystem as a served source at runtime and
+// start serving it. This is the wire entrypoint into the same claim -> adapter
+// -> catalog pipeline the directory watcher uses; a dropped directory may
+// register several sources. The action streams AddSourceStreamMessage so a slow
+// recursive walk reports progress and can be cancelled.
+message AddSourceRequest {
+  // Absolute path or remote URL, interpreted on the SERVER's filesystem.
+  string url = 1;
+
+  // Explicit adapter type ("zarr", "ome-zarr", ...); empty means auto-detect via
+  // the adapters' claim() protocol.
+  string source_type = 2;
+
+  // Optional dimension labels applied to the registered tensor(s).
+  repeated string dim_labels = 3;
+
+  // Field 4 was `bool monitor` — a drag-drop could register a live-monitored
+  // root that existed in no config (invisible, unpersisted, self-re-adding after
+  // removal). Removed as a footgun; never exercised by any client. Reserved so
+  // the tag is not reused.
+  reserved 4;
+  reserved "monitor";
+}
+
+// Progress heartbeat for an in-flight "add_source" action: one emitted per
+// source as the walk registers it. Informational only -- carries no pixels.
+// There is deliberately NO total: discovery is a walk over a tree of unknown
+// size, so progress is count-up, not a fraction.
+message AddSourceProgress {
+  // Number of sources registered so far in this request.
+  int32 added_count = 1;
+
+  // Path currently being scanned / just registered (for a "Scanning ..." label),
+  // or a short status sentence while the add waits (e.g. for a catalog rescan).
+  string current_path = 2;
+}
+
+// One source that could not be registered, with a user-readable reason (e.g.
+// "already part of <source_id>", "no supported datasets found", "not a
+// recognized image format").
+message AddSourceFailure {
+  string path = 1;
+  string reason = 2;
+}
+
+// Terminal message of the "add_source" stream: the tally of what happened.
+message AddSourceResult {
+  // Sources newly registered by this request.
+  repeated DataSourceDescriptor added = 1;
+
+  // source_ids that were already registered (same deterministic id) -- upsert
+  // no-ops, surfaced so the client can say "already present" rather than
+  // "nothing happened".
+  repeated string already_present = 2;
+
+  // Paths that failed to register, each with its reason. A directory dropped
+  // above the large-scan threshold is declined here too ("directory too large
+  // to scan on drop -- drop a subfolder, or add it via the server config file").
+  repeated AddSourceFailure failed = 3;
+}
+
+// One message in the "add_source" action's result stream: zero or more
+// `progress` heartbeats followed by exactly one terminal `result`.
+message AddSourceStreamMessage {
+  oneof payload {
+    AddSourceProgress progress = 1;
+    AddSourceResult result = 2;
+  }
+}
+
+// Request body for the "remove_source" Flight action: deregister a drag-dropped
+// source branch at runtime. This is a deliberately narrow counterpart to
+// "add_source" -- it only removes drag-dropped sources, never a configured or
+// discovered one, so the server authorizes purely on the `dnd://` origin scheme
+// stamped on a drop's catalog source_url. A non-`dnd://` root_url is rejected.
+message RemoveSourceRequest {
+  // The dnd:// branch root to remove. Every source whose catalog source_url is
+  // this value, or is under it (has the `root_url + "/"` prefix), is removed --
+  // so one dropped folder's sources go as a unit. MUST carry the dnd:// scheme.
+  string root_url = 1;
+}
+
+// Terminal (single, non-streamed) result of the "remove_source" action.
+message RemoveSourceResult {
+  // source_ids actually deregistered.
+  repeated string removed = 1;
+
+  // Sources that matched the branch but could not be removed (e.g. already gone
+  // from a concurrent rescan). Reuses AddSourceFailure: its `path` field carries
+  // the source_id here, `reason` the explanation.
+  repeated AddSourceFailure failed = 2;
 }

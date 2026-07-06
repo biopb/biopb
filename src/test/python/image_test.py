@@ -1,42 +1,52 @@
-import pytest
-import numpy as np
-import dask.array as da
 import warnings
 from unittest.mock import MagicMock, patch
 
-import biopb.tensor.ticket_pb2
-
-from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy, _canonicalize_dtype, deserialize_image_data, serialize_from_numpy_to_image_data, _pb_from_np, _np_from_pb, get_image_data_dim_labels, get_image_data_shape, normalize_array_dims
-from biopb.image import BinData, Pixels, ImageData, Tensor
+import dask.array as da
+import numpy as np
+import pytest
+from biopb.image import BinData, ImageData, Pixels
+from biopb.image.utils import (
+    _canonicalize_dtype,
+    _np_from_pb,
+    _pb_from_np,
+    _serialize_from_numpy,
+    deserialize_image_data,
+    deserialize_to_numpy,
+    get_image_data_dim_labels,
+    get_image_data_shape,
+    normalize_array_dims,
+    serialize_from_numpy_to_image_data,
+)
 
 
 def test_import():
     import biopb.image as proto
+
     assert proto.__version__
 
 
 def test_canonicalize_dtype():
     """Test that dtype canonicalization strips byteorder prefixes."""
     # Test various dtype strings with different prefixes
-    assert _canonicalize_dtype('|u1') == 'u1'
-    assert _canonicalize_dtype('<u1') == 'u1'
-    assert _canonicalize_dtype('>u1') == 'u1'
-    assert _canonicalize_dtype('=u1') == 'u1'
-    assert _canonicalize_dtype('u1') == 'u1'
+    assert _canonicalize_dtype("|u1") == "u1"
+    assert _canonicalize_dtype("<u1") == "u1"
+    assert _canonicalize_dtype(">u1") == "u1"
+    assert _canonicalize_dtype("=u1") == "u1"
+    assert _canonicalize_dtype("u1") == "u1"
 
-    assert _canonicalize_dtype('<f4') == 'f4'
-    assert _canonicalize_dtype('>f4') == 'f4'
-    assert _canonicalize_dtype('=f4') == 'f4'
-    assert _canonicalize_dtype('f4') == 'f4'
+    assert _canonicalize_dtype("<f4") == "f4"
+    assert _canonicalize_dtype(">f4") == "f4"
+    assert _canonicalize_dtype("=f4") == "f4"
+    assert _canonicalize_dtype("f4") == "f4"
 
-    assert _canonicalize_dtype('<i2') == 'i2'
-    assert _canonicalize_dtype('>i2') == 'i2'
-    assert _canonicalize_dtype('i2') == 'i2'
+    assert _canonicalize_dtype("<i2") == "i2"
+    assert _canonicalize_dtype(">i2") == "i2"
+    assert _canonicalize_dtype("i2") == "i2"
 
     # Larger types
-    assert _canonicalize_dtype('<u4') == 'u4'
-    assert _canonicalize_dtype('<f8') == 'f8'
-    assert _canonicalize_dtype('<i4') == 'i4'
+    assert _canonicalize_dtype("<u4") == "u4"
+    assert _canonicalize_dtype("<f8") == "f8"
+    assert _canonicalize_dtype("<i4") == "i4"
 
 
 def test_serialize_produces_canonical_dtype():
@@ -44,27 +54,27 @@ def test_serialize_produces_canonical_dtype():
     # uint8 on little-endian systems normally produces '|u1' dtype.str
     img = np.array([[1, 2], [3, 4]], dtype=np.uint8)
     pixels = _serialize_from_numpy(img)
-    assert pixels.dtype == 'u1', f"Expected 'u1' but got '{pixels.dtype}'"
+    assert pixels.dtype == "u1", f"Expected 'u1' but got '{pixels.dtype}'"
 
     # uint16 produces '<u2' on little-endian
     img = np.array([[1, 2], [3, 4]], dtype=np.uint16)
     pixels = _serialize_from_numpy(img)
-    assert pixels.dtype == 'u2', f"Expected 'u2' but got '{pixels.dtype}'"
+    assert pixels.dtype == "u2", f"Expected 'u2' but got '{pixels.dtype}'"
 
     # float32
     img = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     pixels = _serialize_from_numpy(img)
-    assert pixels.dtype == 'f4', f"Expected 'f4' but got '{pixels.dtype}'"
+    assert pixels.dtype == "f4", f"Expected 'f4' but got '{pixels.dtype}'"
 
     # float64
     img = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
     pixels = _serialize_from_numpy(img)
-    assert pixels.dtype == 'f8', f"Expected 'f8' but got '{pixels.dtype}'"
+    assert pixels.dtype == "f8", f"Expected 'f8' but got '{pixels.dtype}'"
 
     # int16
     img = np.array([[1, 2], [3, 4]], dtype=np.int16)
     pixels = _serialize_from_numpy(img)
-    assert pixels.dtype == 'i2', f"Expected 'i2' but got '{pixels.dtype}'"
+    assert pixels.dtype == "i2", f"Expected 'i2' but got '{pixels.dtype}'"
 
 
 def test_roundtrip_uint8():
@@ -122,19 +132,17 @@ def test_endianness_conflict_warning():
     # Create a Pixels message with conflicting endianness
     # dtype has '<' (little-endian) but BinData says BIG
     img = np.array([[1, 2], [3, 4]], dtype=np.uint8)
-    pixels = _serialize_from_numpy(img)
 
     # Manually override to create conflict
     # We'll create a Pixels with dtype '<u1' but endianness BIG
-    from biopb.image import Pixels
     conflicting_pixels = Pixels(
         bindata=BinData(data=img.tobytes(), endianness=BinData.Endianness.BIG),
-        dtype='<u1',  # Little-endian prefix but BinData says BIG
+        dtype="<u1",  # Little-endian prefix but BinData says BIG
         size_x=2,
         size_y=2,
         size_z=1,
         size_c=1,
-        dimension_order='CXYZT',
+        dimension_order="CXYZT",
     )
 
     with warnings.catch_warnings(record=True) as w:
@@ -148,7 +156,7 @@ def test_utils():
     import numpy as np
     from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy
 
-    img = np.random.random(size=[64,64,3])
+    img = np.random.random(size=[64, 64, 3])
     img = (img * 65536).astype("<u2")
 
     pixels = _serialize_from_numpy(img)
@@ -266,7 +274,7 @@ def test_serialize_transpose_dimension_order():
     pixels = _serialize_from_numpy(
         img,
         dimension_order="XYZCT",  # Output F-order: X first varies fastest
-        np_index_order="ZYX"  # Input C-order: axis 0=Z (slowest), axis -1=X (fastest)
+        np_index_order="ZYX",  # Input C-order: axis 0=Z (slowest), axis -1=X (fastest)
     )
 
     # Verify sizes
@@ -291,8 +299,9 @@ def test_serialize_transpose_dimension_order():
         for y in range(y_size):
             for x in range(x_size):
                 expected = z * 10000 + y * 100 + x
-                assert img_back_xyz[x, y, z] == expected, \
-                    f"Mismatch at ({x},{y},{z}): expected {expected}, got {img_back_xyz[x,y,z]}"
+                assert img_back_xyz[x, y, z] == expected, (
+                    f"Mismatch at ({x},{y},{z}): expected {expected}, got {img_back_xyz[x, y, z]}"
+                )
 
 
 def test_serialize_transpose_with_channel():
@@ -310,9 +319,7 @@ def test_serialize_transpose_with_channel():
     # Test different dimension_order combinations
     for out_order in ["XYZCT", "CXYZT", "ZYXCT"]:
         pixels = _serialize_from_numpy(
-            img,
-            dimension_order=out_order,
-            np_index_order="ZYXC"
+            img, dimension_order=out_order, np_index_order="ZYXC"
         )
 
         assert pixels.size_z == z_size
@@ -322,8 +329,9 @@ def test_serialize_transpose_with_channel():
 
         # Round-trip
         img_back = deserialize_to_numpy(pixels, np_index_order="ZYXC")
-        np.testing.assert_array_equal(img_back, img,
-            err_msg=f"Round-trip failed for dimension_order={out_order}")
+        np.testing.assert_array_equal(
+            img_back, img, err_msg=f"Round-trip failed for dimension_order={out_order}"
+        )
 
 
 def test_singleton_t_deprecation_warning():
@@ -347,8 +355,8 @@ def test_serialize_non_contiguous_array():
     img_c = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
     img_f = img_c.T  # Now F-order, shape (4, 3, 2)
 
-    assert not img_f.flags['C_CONTIGUOUS'], "img_f should not be C-contiguous"
-    assert img_f.flags['F_CONTIGUOUS'], "img_f should be F-contiguous"
+    assert not img_f.flags["C_CONTIGUOUS"], "img_f should not be C-contiguous"
+    assert img_f.flags["F_CONTIGUOUS"], "img_f should be F-contiguous"
 
     # Serialize with np_index_order matching the transposed shape
     # img_f has shape (4, 3, 2) which is (X, Y, Z) in our notation
@@ -368,7 +376,7 @@ def test_serialize_f_order_input():
     """Test serialization with explicitly F-order array."""
     # Create F-order array directly (4D to match np_index_order)
     img = np.asfortranarray(np.arange(24, dtype=np.uint8).reshape(2, 3, 4, 1))
-    assert img.flags['F_CONTIGUOUS']
+    assert img.flags["F_CONTIGUOUS"]
 
     # Serialize with np_index_order matching shape (Z=2, Y=3, X=4, C=1)
     pixels = _serialize_from_numpy(img, np_index_order="ZYXC")
@@ -388,15 +396,14 @@ def test_serialize_f_order_input():
 # deserialize_image_data Tests
 # ============================================================================
 
+
 def test_deserialize_image_data_eager_data():
     """Test deserialize_image_data with eager_data (Tensor)."""
-    from biopb.image.utils import deserialize_image_data
-    from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
     # Use the new Tensor-based serialization
-    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=["Y", "X", "C"])
     result = deserialize_image_data(image_data)
 
     assert isinstance(result, np.ndarray)
@@ -406,12 +413,10 @@ def test_deserialize_image_data_eager_data():
 
 def test_deserialize_image_data_lazy_data():
     """Test deserialize_image_data with lazy_data (SerializedTensor)."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
-    from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds
-    from unittest.mock import patch
+    from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+    from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
     # Create a mock SerializedTensor
     descriptor = TensorDescriptor(
@@ -440,7 +445,10 @@ def test_deserialize_image_data_lazy_data():
     mock_dask_arr.shape = (64, 64)
     mock_dask_arr.dtype = np.uint8
 
-    with patch("biopb.tensor.client.TensorFlightClient.tensor_from_pb", return_value=mock_dask_arr):
+    with patch(
+        "biopb.tensor.client.TensorFlightClient.tensor_from_pb",
+        return_value=mock_dask_arr,
+    ):
         result = deserialize_image_data(image_data)
 
         # Should return the mocked dask array
@@ -449,7 +457,6 @@ def test_deserialize_image_data_lazy_data():
 
 def test_deserialize_image_data_legacy_pixels():
     """Test deserialize_image_data with legacy pixels field."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
@@ -470,7 +477,6 @@ def test_deserialize_image_data_legacy_pixels():
 
 def test_deserialize_image_data_no_data_raises():
     """Test that deserialize_image_data raises when no data field is set."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
 
     # Create ImageData with no data fields set
@@ -483,18 +489,17 @@ def test_deserialize_image_data_no_data_raises():
 def test_serialize_from_numpy_to_image_data():
     """Test serialize_from_numpy_to_image_data."""
     from biopb.image.utils import serialize_from_numpy_to_image_data
-    from biopb.image import ImageData
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
     image_data = serialize_from_numpy_to_image_data(img)
 
     assert isinstance(image_data, ImageData)
-    assert image_data.HasField('eager_data')
+    assert image_data.HasField("eager_data")
 
     # Verify dimensions - Tensor uses dims list
     assert list(image_data.eager_data.dims) == [32, 32, 3]
-    assert image_data.eager_data.dtype == 'u1'
+    assert image_data.eager_data.dtype == "u1"
 
 
 def test_serialize_from_numpy_to_image_data_with_dim_labels():
@@ -503,9 +508,9 @@ def test_serialize_from_numpy_to_image_data_with_dim_labels():
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
-    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=["Y", "X", "C"])
 
-    assert list(image_data.eager_data.dim_labels) == ['Y', 'X', 'C']
+    assert list(image_data.eager_data.dim_labels) == ["Y", "X", "C"]
 
 
 def test_get_image_data_dim_labels():
@@ -513,9 +518,9 @@ def test_get_image_data_dim_labels():
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
     # With dim_labels
-    image_data = serialize_from_numpy_to_image_data(img, dim_labels=['Y', 'X', 'C'])
+    image_data = serialize_from_numpy_to_image_data(img, dim_labels=["Y", "X", "C"])
     labels = get_image_data_dim_labels(image_data)
-    assert labels == ['Y', 'X', 'C']
+    assert labels == ["Y", "X", "C"]
 
     # Without dim_labels - returns None when not set
     image_data2 = serialize_from_numpy_to_image_data(img)
@@ -529,25 +534,25 @@ def test_get_image_data_dim_labels_implicit():
     img_2d = np.random.randint(0, 256, size=(32, 64), dtype=np.uint8)
     image_data_2d = serialize_from_numpy_to_image_data(img_2d)
     labels_2d = get_image_data_dim_labels(image_data_2d, implicit=True)
-    assert labels_2d == ['y', 'x']
+    assert labels_2d == ["y", "x"]
 
     # 3D with dim[0] <= 4 -> ['c', 'y', 'x'] (channel-first)
     img_3d_c_first = np.random.randint(0, 256, size=(3, 32, 64), dtype=np.uint8)
     image_data_3d_c_first = serialize_from_numpy_to_image_data(img_3d_c_first)
     labels_3d_c_first = get_image_data_dim_labels(image_data_3d_c_first, implicit=True)
-    assert labels_3d_c_first == ['c', 'y', 'x']
+    assert labels_3d_c_first == ["c", "y", "x"]
 
     # 3D with dim[-1] <= 4 -> ['y', 'x', 'c'] (channel-last)
     img_3d_c_last = np.random.randint(0, 256, size=(32, 64, 3), dtype=np.uint8)
     image_data_3d_c_last = serialize_from_numpy_to_image_data(img_3d_c_last)
     labels_3d_c_last = get_image_data_dim_labels(image_data_3d_c_last, implicit=True)
-    assert labels_3d_c_last == ['y', 'x', 'c']
+    assert labels_3d_c_last == ["y", "x", "c"]
 
     # 3D with both dim[0] <= 4 and dim[-1] <= 4 -> prefers dim[0] (channel-first)
     img_3d_both = np.random.randint(0, 256, size=(3, 32, 3), dtype=np.uint8)
     image_data_3d_both = serialize_from_numpy_to_image_data(img_3d_both)
     labels_3d_both = get_image_data_dim_labels(image_data_3d_both, implicit=True)
-    assert labels_3d_both == ['c', 'y', 'x']
+    assert labels_3d_both == ["c", "y", "x"]
 
     # 3D with neither dim[0] nor dim[-1] <= 4 -> None
     img_3d_none = np.random.randint(0, 256, size=(32, 64, 32), dtype=np.uint8)
@@ -563,9 +568,11 @@ def test_get_image_data_dim_labels_implicit():
 
     # With explicit dim_labels, implicit=True should return explicit labels
     img_explicit = np.random.randint(0, 256, size=(32, 64, 3), dtype=np.uint8)
-    image_data_explicit = serialize_from_numpy_to_image_data(img_explicit, dim_labels=['Z', 'Y', 'X'])
+    image_data_explicit = serialize_from_numpy_to_image_data(
+        img_explicit, dim_labels=["Z", "Y", "X"]
+    )
     labels_explicit = get_image_data_dim_labels(image_data_explicit, implicit=True)
-    assert labels_explicit == ['Z', 'Y', 'X']  # explicit labels take precedence
+    assert labels_explicit == ["Z", "Y", "X"]  # explicit labels take precedence
 
 
 def test_get_image_data_shape():
@@ -581,10 +588,10 @@ def test_pb_from_np_and_np_from_pb():
     """Test _pb_from_np and _np_from_pb helpers."""
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
-    tensor = _pb_from_np(img, dim_labels=['Y', 'X', 'C'])
+    tensor = _pb_from_np(img, dim_labels=["Y", "X", "C"])
     assert list(tensor.dims) == [32, 32, 3]
-    assert tensor.dtype == 'u1'
-    assert list(tensor.dim_labels) == ['Y', 'X', 'C']
+    assert tensor.dtype == "u1"
+    assert list(tensor.dim_labels) == ["Y", "X", "C"]
 
     img_back = _np_from_pb(tensor)
     assert img_back.shape == img.shape
@@ -593,11 +600,9 @@ def test_pb_from_np_and_np_from_pb():
 
 def test_deserialize_image_data_cache_bytes_parameter():
     """Test deserialize_image_data with cache_bytes parameter for lazy_data."""
-    from biopb.image.utils import deserialize_image_data
     from biopb.image import ImageData
-    from biopb.tensor.serialized_pb2 import SerializedTensor
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from unittest.mock import patch
+    from biopb.tensor.serialized_pb2 import SerializedTensor
 
     descriptor = TensorDescriptor(
         array_id="test-tensor",
@@ -614,7 +619,9 @@ def test_deserialize_image_data_cache_bytes_parameter():
 
     mock_dask_arr = MagicMock()
 
-    with patch("biopb.tensor.client.TensorFlightClient.tensor_from_pb") as mock_tensor_from_pb:
+    with patch(
+        "biopb.tensor.client.TensorFlightClient.tensor_from_pb"
+    ) as mock_tensor_from_pb:
         mock_tensor_from_pb.return_value = mock_dask_arr
 
         # Call with custom cache_bytes
@@ -623,12 +630,13 @@ def test_deserialize_image_data_cache_bytes_parameter():
         # Verify cache_bytes was passed
         mock_tensor_from_pb.assert_called_once()
         call_args = mock_tensor_from_pb.call_args
-        assert call_args[1]['cache_bytes'] == 500_000_000
+        assert call_args[1]["cache_bytes"] == 500_000_000
 
 
 # ============================================================================
 # normalize_array_dims Tests
 # ============================================================================
+
 
 def test_normalize_array_dims_transpose():
     """Test that normalize_array_dims correctly transposes dimensions."""
@@ -636,7 +644,7 @@ def test_normalize_array_dims_transpose():
     arr = np.arange(72, dtype=np.uint8).reshape(2, 3, 4, 3)
 
     # Transpose to (C, Z, Y, X)
-    result = normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['C', 'Z', 'Y', 'X'])
+    result = normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["C", "Z", "Y", "X"])
 
     assert result.shape == (3, 2, 3, 4)
     # Verify data is correctly transposed
@@ -649,7 +657,7 @@ def test_normalize_array_dims_squeeze():
     arr = np.arange(96, dtype=np.uint8).reshape(1, 3, 4, 8)  # (Z=1, Y=3, X=4, C=8)
 
     # Remove Z dimension
-    result = normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['Y', 'X', 'C'])
+    result = normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["Y", "X", "C"])
 
     assert result.shape == (3, 4, 8)
     np.testing.assert_array_equal(result, arr.squeeze(0))
@@ -661,7 +669,7 @@ def test_normalize_array_dims_expand():
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)  # (Y=3, X=4, C=2)
 
     # Add Z and T dimensions
-    result = normalize_array_dims(arr, ['Y', 'X', 'C'], ['T', 'Z', 'Y', 'X', 'C'])
+    result = normalize_array_dims(arr, ["Y", "X", "C"], ["T", "Z", "Y", "X", "C"])
 
     assert result.shape == (1, 1, 3, 4, 2)
     np.testing.assert_array_equal(result.squeeze(), arr)
@@ -672,7 +680,7 @@ def test_normalize_array_dims_combined_operations():
     # Array: (Z=1, Y=3, X=4, C=2) -> target: (C, Y, X, T=1)
     arr = np.arange(24, dtype=np.uint8).reshape(1, 3, 4, 2)
 
-    result = normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['C', 'Y', 'X', 'T'])
+    result = normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["C", "Y", "X", "T"])
 
     assert result.shape == (2, 3, 4, 1)
     # Verify by computing expected shape manually
@@ -685,7 +693,7 @@ def test_normalize_array_dims_case_insensitive():
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
     # Mix case in labels
-    result = normalize_array_dims(arr, ['y', 'X', 'c'], ['C', 'Y', 'X'])
+    result = normalize_array_dims(arr, ["y", "X", "c"], ["C", "Y", "X"])
 
     assert result.shape == (2, 3, 4)
     np.testing.assert_array_equal(result, arr.transpose(2, 0, 1))
@@ -697,7 +705,7 @@ def test_normalize_array_dims_preserves_case():
 
     # Try to squeeze non-singleton dimension - original case preserved
     with pytest.raises(ValueError, match="'y'"):
-        normalize_array_dims(arr, ['y', 'x', 'c'], ['x', 'c'])
+        normalize_array_dims(arr, ["y", "x", "c"], ["x", "c"])
 
 
 def test_normalize_array_dims_dask_array():
@@ -705,7 +713,7 @@ def test_normalize_array_dims_dask_array():
     # Create dask array
     arr = da.arange(72, dtype=np.uint8).reshape(2, 3, 4, 3)
 
-    result = normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['C', 'Z', 'Y', 'X'])
+    result = normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["C", "Z", "Y", "X"])
 
     assert isinstance(result, da.Array)
     assert result.shape == (3, 2, 3, 4)
@@ -717,7 +725,7 @@ def test_normalize_array_dims_dask_squeeze_expand():
     """Test squeeze and expand with dask arrays."""
     arr = da.arange(24, dtype=np.uint8).reshape(1, 3, 4, 2)
 
-    result = normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['C', 'Y', 'X', 'T'])
+    result = normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["C", "Y", "X", "T"])
 
     assert isinstance(result, da.Array)
     assert result.shape == (2, 3, 4, 1)
@@ -728,7 +736,7 @@ def test_normalize_array_dims_none_raises():
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
     with pytest.raises(ValueError, match="no dim_labels"):
-        normalize_array_dims(arr, None, ['Y', 'X', 'C'])
+        normalize_array_dims(arr, None, ["Y", "X", "C"])
 
 
 def test_normalize_array_dims_length_mismatch():
@@ -736,7 +744,7 @@ def test_normalize_array_dims_length_mismatch():
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
     with pytest.raises(ValueError, match="dim_labels length"):
-        normalize_array_dims(arr, ['Y', 'X'], ['Y', 'X', 'C'])
+        normalize_array_dims(arr, ["Y", "X"], ["Y", "X", "C"])
 
 
 def test_normalize_array_dims_duplicate_labels():
@@ -744,10 +752,10 @@ def test_normalize_array_dims_duplicate_labels():
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
     with pytest.raises(ValueError, match="dim_labels has duplicate"):
-        normalize_array_dims(arr, ['Y', 'Y', 'C'], ['Y', 'X', 'C'])
+        normalize_array_dims(arr, ["Y", "Y", "C"], ["Y", "X", "C"])
 
     with pytest.raises(ValueError, match="target_dim_labels has duplicate"):
-        normalize_array_dims(arr, ['Y', 'X', 'C'], ['Y', 'Y', 'C'])
+        normalize_array_dims(arr, ["Y", "X", "C"], ["Y", "Y", "C"])
 
 
 def test_normalize_array_dims_cannot_squeeze_non_singleton():
@@ -755,14 +763,14 @@ def test_normalize_array_dims_cannot_squeeze_non_singleton():
     arr = np.arange(72, dtype=np.uint8).reshape(2, 3, 4, 3)  # Z=2 (not singleton)
 
     with pytest.raises(ValueError, match="Cannot squeeze non-singleton"):
-        normalize_array_dims(arr, ['Z', 'Y', 'X', 'C'], ['Y', 'X', 'C'])
+        normalize_array_dims(arr, ["Z", "Y", "X", "C"], ["Y", "X", "C"])
 
 
 def test_normalize_array_dims_no_change_needed():
     """Test that identical source and target returns same array."""
     arr = np.arange(24, dtype=np.uint8).reshape(3, 4, 2)
 
-    result = normalize_array_dims(arr, ['Y', 'X', 'C'], ['Y', 'X', 'C'])
+    result = normalize_array_dims(arr, ["Y", "X", "C"], ["Y", "X", "C"])
 
     assert result.shape == arr.shape
     np.testing.assert_array_equal(result, arr)
@@ -771,11 +779,14 @@ def test_normalize_array_dims_no_change_needed():
 def test_normalize_array_dims_complex_reorder():
     """Test complex dimension reorder with all 5 dims."""
     # Create 5D array
-    arr = np.arange(480, dtype=np.uint8).reshape(2, 3, 4, 5, 4)  # (T=2, Z=3, Y=4, X=5, C=4)
+    arr = np.arange(480, dtype=np.uint8).reshape(
+        2, 3, 4, 5, 4
+    )  # (T=2, Z=3, Y=4, X=5, C=4)
 
     # Reorder from TZYXC to ZYXCT
-    result = normalize_array_dims(arr, ['T', 'Z', 'Y', 'X', 'C'], ['Z', 'Y', 'X', 'C', 'T'])
+    result = normalize_array_dims(
+        arr, ["T", "Z", "Y", "X", "C"], ["Z", "Y", "X", "C", "T"]
+    )
 
     assert result.shape == (3, 4, 5, 4, 2)
     np.testing.assert_array_equal(result, arr.transpose(1, 2, 3, 4, 0))
-

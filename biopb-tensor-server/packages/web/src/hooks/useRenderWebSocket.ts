@@ -85,7 +85,6 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
   const pendingLoadedRegionRef = useRef<LoadedRegionInfo | null>(null);  // Store region from render_start
   const renderGenerationRef = useRef(0);  // Incremented on each render request, used to discard stale responses
   const pendingRenderGenerationRef = useRef<number | null>(null);  // Generation at time of render_start
-  const currentSourceTensorRef = useRef<{ source_id: string; tensor_id: string } | null>(null);  // Current source/tensor being displayed
   const enabledRef = useRef(enabled);
   const tokenRef = useRef(token);
   const apiBaseRef = useRef(apiBase);
@@ -304,6 +303,9 @@ export function useRenderWebSocket(options: UseRenderWebSocketOptions): UseRende
         wsRef.current = null;
       }
     };
+    // connect/cleanupUrl are stable useCallbacks (ref-based); fire on mount and
+    // enabled-toggle only, not on their identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]); // Only depend on enabled - connect is stable
 
   return {

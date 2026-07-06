@@ -6,14 +6,13 @@ Imports fixture factory functions from fixtures module and wraps them as pytest 
 import tempfile
 
 import pytest
-
 from biopb_tensor_server.fixtures import (
-    create_companion_ome_dataset,
     create_5d_6d_micromanager_dataset,
+    create_companion_ome_dataset,
     create_hdf5_dataset,
+    create_multi_series_ome_tiff,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
-    create_multi_series_ome_tiff,
     create_multiresolution_ome_zarr,
     create_tiled_ome_tiff,
     create_zarr_array,
@@ -22,6 +21,22 @@ from biopb_tensor_server.fixtures import (
 # =============================================================================
 # pytest fixtures using the factory functions
 # =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _reset_upstream_client_pool():
+    """Isolate the process-wide upstream client pool (biopb/biopb#266 B1).
+
+    Pooled clients are keyed by ``(endpoint, token)`` and live until eviction or
+    process exit, so a client dialed at a random port in one test could be
+    handed back in a later test that happens to reuse the port. Clear the pool
+    around every test to keep them independent (and to close leaked clients)."""
+    from biopb_tensor_server.adapters.remote_tensor import _clear_client_pool
+
+    _clear_client_pool()
+    yield
+    _clear_client_pool()
+
 
 @pytest.fixture
 def temp_dir():

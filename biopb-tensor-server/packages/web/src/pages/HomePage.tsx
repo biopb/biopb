@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useAppStore } from "../store";
 import { ImageViewer } from "../components/ImageViewer";
 import { MetaPanel } from "../components/MetaPanel";
@@ -14,6 +15,7 @@ export function HomePage() {
   return (
     <div className="app-shell">
       <header className="app-topbar">
+        <img className="topbar-logo" src="/biopb-logo.png" alt="" aria-hidden="true" />
         <h1>BioPB Tensor Viewer</h1>
         <span className={`status-pill ${connectionState}`}>
           {connectionState === "connected"
@@ -24,6 +26,10 @@ export function HomePage() {
                 ? "Error"
                 : "Idle"}
         </span>
+        <div className="topbar-spacer" />
+        <Link className="icon-btn" to="/admin" title="Server admin">
+          ⚙ Admin
+        </Link>
         <button className="icon-btn" onClick={clearSession} title="Lock session">
           Lock
         </button>

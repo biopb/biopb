@@ -5,8 +5,8 @@ import time
 
 import numpy as np
 import pytest
-
 from biopb_tensor_server.chunk import (
+    cache_key_for_chunk_id,
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
@@ -118,9 +118,7 @@ class TestComputePrecacheScaleHint:
 
     def test_custom_knobs(self):
         # Tighter threshold downsamples further.
-        scale = compute_precache_scale_hint(
-            [20000, 20000], ["y", "x"], threshold=1024
-        )
+        scale = compute_precache_scale_hint([20000, 20000], ["y", "x"], threshold=1024)
         ly = (20000 + scale[0] - 1) // scale[0]
         assert ly <= 1024
 
@@ -214,7 +212,6 @@ class TestFlightIdleProbe:
 class TestWarming:
     def _make_server_with_zarr(self, tmp_path, shape):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -257,9 +254,7 @@ class TestWarming:
             adapter = server._get_source_adapter("warm-src")
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
-            scale = compute_precache_scale_hint(
-                list(td.shape), list(td.dim_labels)
-            )
+            scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
             assert scale == [4, 4]
             from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -276,7 +271,90 @@ class TestWarming:
             assert len(plan.chunk_endpoints) > 0
             for ce in plan.chunk_endpoints:
                 assert is_scaled_chunk(ce.chunk_id)
-                assert cache_manager.locate_entry(ce.chunk_id) is not None
+                # Entries are keyed by the method-stripped canonical key, the
+                # same locate the server's chunk-locate handoff performs (#76).
+                assert (
+                    cache_manager.locate_entry(cache_key_for_chunk_id(ce.chunk_id))
+                    is not None
+                )
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_should_warm_gate_skips_non_resident_source(self, tmp_path):
+        # #174: a should_warm callback returning False (source re-dehydrated under
+        # a cloud root) must short-circuit before any chunk is read, so OneDrive
+        # is never asked to recall the bytes.
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            server = self._make_server_with_zarr(tmp_path, (8192, 8192))
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+            worker.should_warm = lambda source_id: False
+
+            # Pin the ordering contract of #174: the gate must fire *before* any
+            # adapter access, so a denied warm never touches the source at all.
+            # A spy on _get_source_adapter (and the cache stats) catches a future
+            # re-ordering of the gate below adapter/list/compute.
+            adapter_calls = []
+            real_get = server._get_source_adapter
+            server._get_source_adapter = lambda sid: (
+                adapter_calls.append(sid) or real_get(sid)
+            )
+
+            worker._process_source("warm-src")
+
+            assert adapter_calls == []  # gate fired before any adapter access
+            # ... and consequently nothing was computed/cached.
+            stats = CacheManager.get_instance().stats()
+            assert stats.misses == 0
+            assert stats.total_entries == 0
+        finally:
+            server.shutdown()
+            CacheManager.get_instance().close()
+            CacheManager.reset()
+
+    def test_skips_remote_source(self, tmp_path):
+        # #299: a non-local (remote-tensor proxy) source must be skipped before
+        # any tensor is read -- warming it would speculatively pull every chunk
+        # across the network from the upstream, and the proxy does not implement
+        # has_native_pyramid() so it would mis-warm a pyramidal upstream.
+        from biopb_tensor_server.cache import CacheManager
+        from biopb_tensor_server.config import CacheConfig
+
+        CacheManager.reset()
+        CacheManager.initialize(
+            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
+        )
+        try:
+            server = self._make_server_with_zarr(tmp_path, (8192, 8192))
+            worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
+
+            listed = []
+
+            class _RemoteAdapter:
+                # A caching-proxy source advertises a grpc:// source_url.
+                _source_url = "grpc://upstream:8815/img"
+
+                def list_tensor_descriptors(self):
+                    listed.append(True)  # must NOT be reached
+                    return []
+
+            server._get_source_adapter = lambda sid: _RemoteAdapter()
+
+            preempted = worker._process_source("remote-src")
+
+            assert preempted is False
+            assert listed == []  # skipped before enumerating the source's tensors
+            stats = CacheManager.get_instance().stats()
+            assert stats.misses == 0
+            assert stats.total_entries == 0
         finally:
             server.shutdown()
             CacheManager.get_instance().close()
@@ -322,24 +400,32 @@ class TestRuntimePhaseGating:
         )
         return server, sm
 
-    def test_runtime_phase_default_false_then_start_flips(self):
+    def test_initial_scan_done_default_false_and_start_does_not_flip(self):
         server, sm = self._bare_source_manager()
         try:
-            assert sm._runtime_phase is False
-            # Static-only (watcher=None) start() is a no-op and does NOT flip.
+            assert sm._initial_scan_done is False
+            # start() no longer flips the precache gate -- only the first full
+            # scan completing does. A static-only (watcher=None) start() is a
+            # no-op and leaves it False.
             sm.start()
-            assert sm._runtime_phase is False
+            assert sm._initial_scan_done is False
         finally:
             server.shutdown()
 
-    def test_commit_hook_fires_only_in_runtime_phase(self, monkeypatch):
+    def test_commit_hook_fires_only_after_initial_scan(self, monkeypatch):
         from types import SimpleNamespace
 
         server, sm = self._bare_source_manager()
         try:
             # Stub the heavy commit collaborators so we exercise only the gate.
-            monkeypatch.setattr(sm, "_register_source_claim", lambda claim: True)
-            monkeypatch.setattr(sm._state, "add_claim", lambda claim, notify=False: True)
+            monkeypatch.setattr(
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
+            )
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
             monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
@@ -347,15 +433,56 @@ class TestRuntimePhaseGating:
             sm._on_source_committed = fired.append
             claim = SimpleNamespace(source_id="s1", primary_path="/x")
 
-            # Startup phase: hook must NOT fire.
-            sm._runtime_phase = False
+            # During the initial scan: startup sources go to the backlog, not the
+            # prompt enqueue -- the hook must NOT fire.
+            sm._initial_scan_done = False
             assert sm._commit_add_claim(claim) is True
             assert fired == []
 
-            # Runtime phase: hook fires with the source_id.
-            sm._runtime_phase = True
+            # After the initial scan: live additions fire the hook.
+            sm._initial_scan_done = True
             assert sm._commit_add_claim(claim) is True
             assert fired == ["s1"]
+        finally:
+            server.shutdown()
+
+    def test_suppress_live_precache_overrides_the_gate(self, monkeypatch):
+        """A commit during the boot-tick upstream re-list stays off the prompt
+        enqueue even though the initial scan is already done.
+
+        On the both-present boot tick the local walk flips _initial_scan_done
+        True before the upstream re-list runs; _suppress_live_precache keeps that
+        startup upstream mirror routed to the slow backlog (see _handle_rescan)."""
+        from types import SimpleNamespace
+
+        server, sm = self._bare_source_manager()
+        try:
+            monkeypatch.setattr(
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
+            )
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
+            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
+            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+
+            fired = []
+            sm._on_source_committed = fired.append
+            sm._initial_scan_done = True
+            claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
+
+            # Suppressed: initial scan done, but this is the boot-tick upstream
+            # re-list -> backlog, not prompt enqueue.
+            sm._suppress_live_precache = True
+            assert sm._commit_add_claim(claim) is True
+            assert fired == []
+
+            # Not suppressed (a later live delta): the hook fires as usual.
+            sm._suppress_live_precache = False
+            assert sm._commit_add_claim(claim) is True
+            assert fired == ["up1"]
         finally:
             server.shutdown()
 
@@ -364,8 +491,14 @@ class TestRuntimePhaseGating:
 
         server, sm = self._bare_source_manager()
         try:
-            monkeypatch.setattr(sm, "_register_source_claim", lambda claim: True)
-            monkeypatch.setattr(sm._state, "add_claim", lambda claim, notify=False: True)
+            monkeypatch.setattr(
+                sm,
+                "_register_source_claim",
+                lambda claim, catalog_seed=None, catalog_url=None: True,
+            )
+            monkeypatch.setattr(
+                sm._state, "add_claim", lambda claim, notify=False: True
+            )
             monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
@@ -373,7 +506,7 @@ class TestRuntimePhaseGating:
                 raise RuntimeError("hook failure")
 
             sm._on_source_committed = boom
-            sm._runtime_phase = True
+            sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="s2", primary_path="/y")
             # Commit still succeeds despite the hook raising.
             assert sm._commit_add_claim(claim) is True
@@ -390,7 +523,6 @@ class TestRuntimePhaseGating:
 class TestPreemptionAndLifecycle:
     def test_no_warming_while_in_flight(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
@@ -472,7 +604,6 @@ from types import SimpleNamespace  # noqa: E402
 
 def _register_zarr(server, tmp_path, source_id, shape=(8192, 8192)):
     import zarr
-
     from biopb_tensor_server import ZarrAdapter
 
     arr = zarr.open_array(
@@ -510,7 +641,7 @@ def _located_all(server, cache_manager, source_ids):
         if not plan.chunk_endpoints:
             return False
         for ce in plan.chunk_endpoints:
-            if cache_manager.locate_entry(ce.chunk_id) is None:
+            if cache_manager.locate_entry(cache_key_for_chunk_id(ce.chunk_id)) is None:
                 return False
     return True
 
@@ -827,7 +958,6 @@ class TestBacklogWarming:
 class TestSkipNativePyramid:
     def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _level_paths, _zattrs = multires_ome_zarr
@@ -840,7 +970,6 @@ class TestSkipNativePyramid:
 
     def test_plain_zarr_has_no_native_pyramid(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -853,9 +982,7 @@ class TestSkipNativePyramid:
         adapter = ZarrAdapter(arr, "plain", ["y", "x"])
         assert adapter.has_native_pyramid() is False
 
-    def test_precache_skips_native_multiscale_source(
-        self, multires_ome_zarr, tmp_path
-    ):
+    def test_precache_skips_native_multiscale_source(self, multires_ome_zarr, tmp_path):
         from biopb_tensor_server.cache import CacheManager
         from biopb_tensor_server.config import CacheConfig
 
@@ -916,9 +1043,7 @@ class TestBuildPyramidPlan:
         shape = [1000, 8000, 8000]
         levels = build_pyramid_plan(shape, ["z", "y", "x"])
         for level in levels:
-            expected = [
-                ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)
-            ]
+            expected = [ceil_div(dim, s) for dim, s in zip(shape, level.scale_hint)]
             assert list(level.shape) == expected
 
     def test_levels_strictly_coarsen(self):
@@ -939,9 +1064,9 @@ class TestBuildPyramidPlan:
     @pytest.mark.parametrize(
         "shape,labels",
         [
-            ([100000], ["x"]),       # 1-D with a label
-            ([100000], None),        # 1-D, no labels (no X/Y to resolve)
-            ([], []),                # 0-D scalar
+            ([100000], ["x"]),  # 1-D with a label
+            ([100000], None),  # 1-D, no labels (no X/Y to resolve)
+            ([], []),  # 0-D scalar
         ],
     )
     def test_sub_2d_is_single_unscaled_level(self, shape, labels):
@@ -971,7 +1096,6 @@ class TestNativePyramidLevels:
 
     def _ome_adapter(self, multires_ome_zarr, source_id="ome-native"):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _level_paths, _zattrs = multires_ome_zarr
@@ -984,12 +1108,18 @@ class TestNativePyramidLevels:
         # The fixture builds 4 levels at scale 1,2,4,8 (shape 256..32).
         assert levels is not None
         assert [list(lv.scale_hint) for lv in levels] == [
-            [1, 1], [2, 2], [4, 4], [8, 8],
+            [1, 1],
+            [2, 2],
+            [4, 4],
+            [8, 8],
         ]
         assert all(lv.native is True for lv in levels)
         assert all(lv.reduction_method == "precompute" for lv in levels)
         assert [list(lv.shape) for lv in levels] == [
-            [256, 256], [128, 128], [64, 64], [32, 32],
+            [256, 256],
+            [128, 128],
+            [64, 64],
+            [32, 32],
         ]
 
     def test_each_advertised_level_round_trips(self, multires_ome_zarr):
@@ -1013,7 +1143,6 @@ class TestNativePyramidLevels:
 
     def test_plain_zarr_has_no_native_levels(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1049,7 +1178,6 @@ class TestAdvertisedPyramidDescriptor:
 
     def _big_zarr_adapter(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1077,16 +1205,13 @@ class TestAdvertisedPyramidDescriptor:
 
     def test_get_flight_info_advertises_native_pyramid(self, multires_ome_zarr):
         import zarr
-
         from biopb_tensor_server import OmeZarrAdapter
 
         zarr_path, _lp, _z = multires_ome_zarr
         root = zarr.open_group(zarr_path, mode="r")
         server = TensorFlightServer("grpc://localhost:0")
         try:
-            server.register_source(
-                "ome", OmeZarrAdapter(root["0"], "ome")
-            )
+            server.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
             desc = self._descriptor(self._flight_info(server, "ome", "ome"))
             assert len(desc.pyramid) == 4
             assert all(lv.native for lv in desc.pyramid)
@@ -1098,7 +1223,6 @@ class TestAdvertisedPyramidDescriptor:
         # A 1-D tensor has no Y/X plane; GetFlightInfo must advertise one full-res
         # level rather than raise (regression for the <2-D guard).
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
 
         arr = zarr.open_array(
@@ -1138,7 +1262,6 @@ class TestPrecacheAdvertisedAlignment:
 
     def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.chunk import build_pyramid_plan
 
@@ -1154,14 +1277,12 @@ class TestPrecacheAdvertisedAlignment:
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()
-            advertised = server._advertised_pyramid(adapter, "big", base_desc)
+            advertised = server._advertised_pyramid(adapter, base_desc)
             # The worker warms build_pyramid_plan(...)[-1]; the server advertises
             # the same plan -- so their coarsest scales are identical.
             worker_coarsest = build_pyramid_plan(
                 list(base_desc.shape), list(base_desc.dim_labels)
             )[-1]
-            assert list(advertised[-1].scale_hint) == list(
-                worker_coarsest.scale_hint
-            )
+            assert list(advertised[-1].scale_hint) == list(worker_coarsest.scale_hint)
         finally:
             server.shutdown()

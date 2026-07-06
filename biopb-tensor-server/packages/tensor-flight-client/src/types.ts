@@ -29,7 +29,7 @@ export interface SliceRequest {
   slice_stop?: number[];
   /** Per-dimension integer downsampling factors, e.g. [1, 8, 8]. */
   scale_hint?: number[];
-  /** "nearest" | "area" | "linear" (server also accepts "stride", "decimate", "mean"). */
+  /** "nearest" | "area" | "precompute" (server also accepts "stride", "decimate", "mean"). */
   reduction_method?: string;
   /** Informational: current viewport pixel budget (stored in diagnostics). */
   pixel_budget?: number;
@@ -69,6 +69,19 @@ export interface DiagnosticsSnapshot {
   metrics_ready: boolean;
 }
 
+/** The tensor server's `health` action payload, forwarded verbatim by /readyz. */
+export interface BackendHealth {
+  status?: string;
+  source_count?: number;
+  metadata_db_enabled?: boolean;
+  writable?: boolean;
+  uptime_seconds?: number;
+  /** Progressive discovery: whether a full catalog scan is running right now. */
+  full_scan_in_progress?: boolean;
+  /** Epoch seconds of the last successful full scan, or null until the first. */
+  last_full_scan_finished_at?: number | null;
+}
+
 export interface ReadyzSnapshot {
   status: string;
   timestamp: string;
@@ -76,6 +89,10 @@ export interface ReadyzSnapshot {
   dev_mode: boolean;
   service: string;
   version: string;
+  /** source_count from the backend health (0/absent on older servers). */
+  source_count?: number;
+  /** Full backend health dict, including the freshness fields above. */
+  backend_health?: BackendHealth | null;
 }
 
 export interface QuerySourcesResult {
@@ -83,6 +100,54 @@ export interface QuerySourcesResult {
   totalSources: number;
   returnedSources: number;
   truncated: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Admin endpoint (GET/PUT /api/config, /api/admin/status, /api/admin/restart)
+// ---------------------------------------------------------------------------
+
+/** Response of `GET /api/config`: the on-disk config plus its path and schema. */
+export interface AdminConfigResponse {
+  /** Absolute path of the config file on the server. */
+  path: string;
+  /** The raw config dict, exactly as it sits on disk (round-trippable). */
+  config: Record<string, unknown>;
+  /** The JSON Schema (build_config_schema output) describing the config. */
+  schema: Record<string, unknown>;
+}
+
+/** One schema-validation failure from a rejected `PUT /api/config` (422 body). */
+export interface AdminConfigError {
+  /** JSON path to the offending field, e.g. ["sources", 0, "url"]. */
+  path: (string | number)[];
+  message: string;
+}
+
+/** Body of a `422` from `PUT /api/config`. Carried on `TensorApiError.detail`. */
+export interface AdminConfigValidationBody {
+  detail: string;
+  errors: AdminConfigError[];
+}
+
+/** Response of `PUT /api/config` on success (200). */
+export interface AdminConfigSaveResult {
+  saved: boolean;
+  restart_required: boolean;
+  path: string;
+}
+
+/** Response of `GET /api/admin/status`: backend health merged with process facts. */
+export interface AdminStatus {
+  running: boolean;
+  pid: number;
+  version: string;
+  config_path: string | null;
+  health: string | null;
+  source_count: number | null;
+  writable: boolean | null;
+  uptime_seconds: number | null;
+  full_scan_in_progress: boolean | null;
+  last_full_scan_finished_at: number | null;
 }
 
 /** Parameters for backend rendering request. */

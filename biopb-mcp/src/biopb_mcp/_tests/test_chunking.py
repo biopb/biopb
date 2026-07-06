@@ -143,9 +143,7 @@ class TestGetIterSpec:
         hint.required_multivalue = []
 
         spec = _get_iter_spec("YXC", hint)
-        assert spec.iter_dims == {
-            "C"
-        }  # C removed from submission, becomes iter_dim
+        assert spec.iter_dims == {"C"}  # C removed from submission, becomes iter_dim
         assert spec.axis_order == "YXC"
 
     def test_required_multivalue(self):
@@ -188,9 +186,7 @@ class TestDataIterator:
     def test_multi_iter_dims(self):
         """Multiple iter_dims iterates over all combinations."""
         data = np.random.rand(2, 3, 100, 100)  # T, Z, Y, X
-        results = list(
-            _data_iterator(data, {"T", "Z"}, "TZYX")
-        )  # Iterate over T and Z
+        results = list(_data_iterator(data, {"T", "Z"}, "TZYX"))  # Iterate over T and Z
         assert len(results) == 6  # 2 * 3
 
         # Each result should have singleton T and Z

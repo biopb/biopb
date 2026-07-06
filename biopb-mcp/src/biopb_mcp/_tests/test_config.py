@@ -22,9 +22,7 @@ def mock_config_dir(monkeypatch, tmp_path):
     """Redirect the home-relative config dir (~/.config/biopb-mcp) to a tmp path."""
     import pathlib
 
-    monkeypatch.setattr(
-        pathlib.Path, "home", classmethod(lambda cls: tmp_path)
-    )
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path / ".config" / "biopb-mcp"
 
 
@@ -106,14 +104,10 @@ class TestLoadConfig:
         assert "grpc" in config
         assert "mcp" in config
 
-    def test_migrates_installer_flat_process_image_servers(
-        self, mock_config_dir
-    ):
+    def test_migrates_installer_flat_process_image_servers(self, mock_config_dir):
         """The installer's flat mcp.process_image_servers is relocated."""
         # The shape the biopb installer writes (pre-nesting).
-        installer_config = {
-            "mcp": {"process_image_servers": ["grpcs://cellpose:443"]}
-        }
+        installer_config = {"mcp": {"process_image_servers": ["grpcs://cellpose:443"]}}
         config_path = mock_config_dir / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
@@ -127,9 +121,7 @@ class TestLoadConfig:
         # The legacy flat key is removed, not left as a dead duplicate.
         assert "process_image_servers" not in config["mcp"]
 
-    def test_nested_process_image_servers_wins_over_legacy(
-        self, mock_config_dir
-    ):
+    def test_nested_process_image_servers_wins_over_legacy(self, mock_config_dir):
         """An explicit nested value takes precedence over the legacy key."""
         both = {
             "mcp": {
@@ -144,9 +136,7 @@ class TestLoadConfig:
 
         config = load_config()
 
-        assert config["mcp"]["services"]["process_image_servers"] == [
-            "grpcs://new:443"
-        ]
+        assert config["mcp"]["services"]["process_image_servers"] == ["grpcs://new:443"]
         assert "process_image_servers" not in config["mcp"]
 
     def test_mcp_has_server_start_timeout(self):
@@ -289,11 +279,16 @@ class TestDefaultConfig:
         for key in required:
             assert key in DEFAULT_CONFIG["timeout"]
 
-    def test_no_dead_tensor_disable_shm_key(self):
-        """tensor_disable_shm was removed (issue #10, no-op after biopb#9)."""
+    def test_no_dead_tensor_cache_keys(self):
+        """Removed tensor cache keys stay removed.
+
+        tensor_disable_shm (issue #10, no-op after biopb#9) and cache_local (the
+        localhost client-cache decision now lives entirely in the tensor client,
+        not overridden by the MCP kernel).
+        """
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]
         assert "tensor_disable_shm" not in DEFAULT_CONFIG["mcp"]["tensor"]
-        assert DEFAULT_CONFIG["mcp"]["tensor"]["cache_local"] is True
+        assert "cache_local" not in DEFAULT_CONFIG["mcp"]["tensor"]
 
     def test_mcp_sub_sections_present(self):
         """The mcp section is grouped into its concern sub-sections."""
@@ -311,12 +306,13 @@ class TestDefaultConfig:
         assert mcp["transport"]["port"] == 8765
 
     def test_mcp_dask_defaults(self):
-        """MCP dask defaults to a kernel-local distributed cluster."""
+        """MCP dask defaults to a daemon-owned distributed cluster."""
         dask = DEFAULT_CONFIG["mcp"]["dask"]
-        # "distributed" + empty address -> auto-spun LocalCluster, the only
-        # mode where cancel_job can stop an in-flight compute().
+        # "distributed" + empty address -> auto-spun LocalCluster, owned by the
+        # daemon by default so it survives kernel restart.
         assert dask["scheduler"] == "distributed"
         assert dask["address"] == ""
+        assert dask["owner"] == "daemon"
         # LocalCluster sizing knobs are present so they can be tuned.
         for key in (
             "num_workers",
@@ -328,16 +324,40 @@ class TestDefaultConfig:
         # Dashboard binds loopback only, matching the server security model.
         assert dask["dashboard_address"].startswith("127.0.0.1")
 
+    def test_platform_dependent_bringup_defaults(self):
+        """startup_timeout / num_workers defaults track the platform.
+
+        Windows has no fork(), so dask LocalCluster workers cold-spawn (a full
+        stack re-import each); the defaults widen the startup budget and cap the
+        worker count there, while POSIX keeps the lean values. Asserted against
+        the module's own platform constants so the test is correct on whichever
+        OS runs it, and guards that DEFAULT_CONFIG is actually wired to them.
+        """
+        import os
+
+        from biopb_mcp import _config
+
+        kernel = DEFAULT_CONFIG["mcp"]["kernel"]
+        dask = DEFAULT_CONFIG["mcp"]["dask"]
+        if os.name == "nt":
+            assert _config._IS_WINDOWS is True
+            assert kernel["startup_timeout"] == 120.0
+            assert dask["num_workers"] == 4
+        else:
+            assert _config._IS_WINDOWS is False
+            assert kernel["startup_timeout"] == 60.0
+            assert dask["num_workers"] == 0
+        # Either way DEFAULT_CONFIG uses the computed constants, not literals.
+        assert kernel["startup_timeout"] == _config._DEFAULT_STARTUP_TIMEOUT
+        assert dask["num_workers"] == _config._DEFAULT_DASK_NUM_WORKERS
+
     def test_mcp_tensor_health_poll_defaults(self):
         """The background source watcher's backoff bounds (issue #44)."""
         tensor = DEFAULT_CONFIG["mcp"]["tensor"]
         assert tensor["health_poll_min_interval"] == 2.0
         assert tensor["health_poll_max_interval"] == 60.0
         # A sane backoff window: min below max so the interval can grow.
-        assert (
-            tensor["health_poll_min_interval"]
-            < tensor["health_poll_max_interval"]
-        )
+        assert tensor["health_poll_min_interval"] < tensor["health_poll_max_interval"]
 
 
 class TestGetSetting:
@@ -437,18 +457,14 @@ class TestConfigSingleton:
     def test_reload_picks_up_external_edit(self):
         """After reload(), an externally-edited file is observed."""
         # Prime the cache with defaults.
-        assert (
-            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
-        )
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
 
         # Edit the file out-of-band; the cache is stale until reload().
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
             json.dump({"tensor_browser": {"server_url": "grpc://ext:9"}}, f)
-        assert (
-            CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
-        )
+        assert CONFIG.get("tensor_browser.server_url") == "grpc://localhost:8815"
 
         CONFIG.reload()
         assert CONFIG.get("tensor_browser.server_url") == "grpc://ext:9"

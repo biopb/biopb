@@ -69,7 +69,14 @@ tables = [
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed", "napari[all]==0.7.0", "pyqt6"]
+# distributed floor: the daemon owns the LocalCluster (DaskClusterHost), so its
+# worker processes live in the *daemon's* process group, not the kernel's. On an
+# abnormal daemon death (SIGKILL/OOM) neither _shutdown nor the atexit close runs
+# to reap them — the sole remaining cleanup is dask's own "worker shuts down when
+# it loses the scheduler" behavior, which only holds since the `reconnect` era
+# ended (>=2023.9). Pin a floor so orphan-hardening (issue #13) can't silently
+# regress on an older distributed. See mcp/_deathwatch and mcp/_cluster.
+mcp = ["mcp>=1.20", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6"]
 3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
@@ -161,57 +168,6 @@ addopts = "--ignore-glob='*_vendor*'"
 [tool.pytest_env]
 QT_QPA_PLATFORM = "offscreen"
 
-[tool.black]
-line-length = 79
-target-version = ['py310', 'py311', 'py312']
-
-[tool.ruff]
-line-length = 79
-lint.select = [
-    "E", "F", "W", #flake8
-    "UP", # pyupgrade
-    "I", # isort
-    "BLE", # flake8-blind-exception
-    "B", # flake8-bugbear
-    "A", # flake8-builtins
-    "C4", # flake8-comprehensions
-    "ISC", # flake8-implicit-str-concat
-    "G", # flake8-logging-format
-    "PIE", # flake8-pie
-    "SIM", # flake8-simplify
-]
-lint.ignore = [
-    "E501", # line too long. let black handle this
-    "UP006", "UP007", # type annotation. As using magicgui require runtime type annotation then we disable this.
-    "SIM117", # flake8-simplify - some merged with statements don't look great with black; revisit later
-    "BLE001", # blind-except - intentional best-effort cleanup paths (e.g. _kernel.py, _config.py, connect/autostart) that must never propagate.
-    "UP035", # deprecated-import - keep typing.List/Dict for magicgui runtime annotations, consistent with the UP006/UP007 ignores.
-    "G004", # logging-f-string - stylistic; the codebase mixes f-string and lazy %-style logs.
-    "SIM105", # suppressible-exception - keep explicit try/except/pass over contextlib.suppress in death-pipe / cleanup paths.
-    "B904", # raise-without-from-inside-except - one deliberate re-raise in image_processing/_grpc.py.
-]
-
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".mypy_cache",
-    ".pants.d",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "venv",
-    "*vendored*",
-    "*_vendor*",
-]
-
-target-version = "py310"
-fix = true
+# Lint/format config lives at the monorepo root [tool.ruff] (issue #82). The
+# magicgui-driven ignores (UP006/UP007/UP035 runtime annotations) were promoted
+# there and now apply repo-wide.

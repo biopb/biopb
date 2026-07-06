@@ -27,6 +27,14 @@ Requirements: `curl`/`tar` (POSIX) or built-in PowerShell tooling (Windows), plu
 `uv` (installed automatically). **No git, buf, or compiler needed** — the release
 wheels ship the generated protobuf/Flight stubs.
 
+**Minimum macOS:** Apple Silicon (arm64) needs **macOS 12 Monterey or newer**;
+Intel (x86_64) needs **macOS 10.15 Catalina or newer**. napari's optional `numba`
+accelerator pulls `llvmlite`, and the current prebuilt `llvmlite` wheels target
+those OS floors (arm64 → `macosx_12_0`, x86_64 → `macosx_10_15`). On an older
+macOS there is no matching wheel, so the install falls back to building `llvmlite`
+from source — which needs an LLVM toolchain and fails on a stock machine. If you
+hit that, upgrade macOS (there is no build workaround the installer can apply).
+
 ### Stable (default)
 
 Tracks the latest **stable** release — a clean `release-vX.Y.Z` tag. Prerelease
@@ -60,8 +68,9 @@ are produced.
   biopb-mcp release, into a single `uv` tool environment so the components can
   import and drive each other (`biopb server start`, the napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
-- **Data browser** (optional) — `webapp.tar.gz` from the same biopb-mcp release,
-  unpacked to `~/.local/share/biopb/webapp`.
+- **Web interface** — `webapp.tar.gz` from the same biopb-mcp release, unpacked to
+  `~/.local/share/biopb/webapp`. Carries the image viewer and the server admin
+  page; installed by default (set `BIOPB_INSTALL_WEBAPP=0` to skip).
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Cursor, opencode, Hermes) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
@@ -70,12 +79,49 @@ are produced.
 
 ## Config & data locations
 
-- Data-server config: `~/.config/biopb/biopb.toml` (preserved on rerun)
+- Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun; a
+  legacy `biopb.toml` still loads and is migrated to JSON when you pick a new
+  data folder)
 - biopb-mcp config: `~/.config/biopb-mcp/config.json`
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Webapp: `~/.local/share/biopb/webapp`
 
 Set `BIOPB_DATA_DIR` to skip the interactive data-directory prompt.
+
+### Unattended / unmanned upgrades
+
+Set `BIOPB_NONINTERACTIVE=1` to suppress **every** prompt, so the installer can
+run from cron / Task Scheduler / CI to upgrade in place. The common case — a
+rerun with an existing config — keeps that config untouched and asks nothing.
+
+It is an **upgrade** feature, not a fresh-install one: with no existing config
+the installer won't guess a data directory, so a *fresh* unattended install
+**errors out unless `BIOPB_DATA_DIR` is set** (which lets you provision a new box
+unattended on purpose). The remote algorithm plugins stay **off** unless
+`BIOPB_REMOTE_PLUGINS=1` (consent can't be asked unattended, so the off-site
+IP-logging servers are never enabled silently). Both console front-ends
+(`install.sh`, `install.ps1`) honor these; the env vars apply to the `curl|bash`
+and `irm|iex` paths alike.
+
+## Uninstall
+
+`install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
+Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
+from any detected agent (Claude Code/Desktop, Cursor, opencode), and removes the
+shared `uv` tool environment. Add `--purge` to also delete config and cached
+data — your **image data is never touched**.
+
+```sh
+# Remove the stack, keep config + cached data
+curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall
+
+# Remove everything biopb owns, including config and cache
+curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
+```
+
+`--purge` deletes `~/.config/biopb`, `~/.config/biopb-mcp`, and
+`~/.local/share/biopb`. `uv` and any AI agent (e.g. opencode) are left installed.
+On Windows, uninstall through Add/Remove Programs instead.
 
 ## Notes
 

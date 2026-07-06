@@ -14,9 +14,10 @@ from biopb_tensor_server.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
 from .ome_zarr import OmeZarrAdapter
+from .remote_tensor import RemoteTensorAdapter
 from .tiff import (
-    TiffSequenceAdapter,
     MicroManagerLegacyAdapter,
+    TiffSequenceAdapter,
 )
 from .zarr import ZarrAdapter
 
@@ -29,14 +30,14 @@ except ImportError:
 # Optional aicsimageio adapters (format-specific subclasses)
 try:
     from .aicsimageio import (
-        OmeTiffAdapter,
-        ZeissAdapter,
+        AicsImageIoAdapter,
+        BioformatsAdapter,
+        DvAdapter,
         LeicaAdapter,
         NikonAdapter,
-        DvAdapter,
         OlympusAdapter,
-        BioformatsAdapter,
-        AicsImageIoAdapter,
+        OmeTiffAdapter,
+        ZeissAdapter,
     )
 except ImportError:
     OmeTiffAdapter = None  # type: ignore
@@ -71,6 +72,7 @@ __all__ = [
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
     "OmeZarrAdapter",
+    "RemoteTensorAdapter",
     "NdTiffAdapter",
     "OmeTiffAdapter",
     "ZeissAdapter",
@@ -132,11 +134,17 @@ def get_default_registry() -> AdapterRegistry:
     if AicsImageIoAdapter is not None:
         registry.register_with_type("aics", AicsImageIoAdapter)
 
-    # OME-Zarr
+    # OME-Zarr (specific) before plain Zarr (generic fallback). Order is
+    # load-bearing: get_claims_for_path returns claims in registration order and
+    # callers take claims[0], so for a .zarr both adapters could claim/defer and
+    # OmeZarrAdapter must win. OmeZarrAdapter declines a real plain zarr (no
+    # multiscales) and ZarrAdapter declines a real OME-Zarr, so claims[0] lands on
+    # the right adapter once the store is resident (e.g. at cloud resolve).
     registry.register_with_type("ome-zarr", OmeZarrAdapter)
     registry.register_with_type(
         "ome-zarr-hcs", OmeZarrAdapter
     )  # HCS plates use same adapter
+    registry.register_with_type("zarr", ZarrAdapter)
 
     # TIFF/MicroManager - NDTiff before Legacy (newer format)
     if NdTiffAdapter is not None:
@@ -153,5 +161,10 @@ def get_default_registry() -> AdapterRegistry:
         registry.register_with_type("nifti", NiftiAdapter)
 
     registry.register_with_type("hdf5", Hdf5Adapter)
+
+    # Remote tensor server -- a caching passthrough proxy (biopb/biopb#178).
+    # Config-only (grpc:// url, like hdf5 it never claims a filesystem path), so
+    # its claim() default returns None and it only registers by explicit type.
+    registry.register_with_type("tensor-server", RemoteTensorAdapter)
 
     return registry

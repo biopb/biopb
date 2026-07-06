@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
-import { type ColorValue, guessDefaultColor, extractChannelNames } from "./utils/colorUtils";
+import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
@@ -25,6 +25,10 @@ export interface AppState {
   // Data sources
   sources: DataSourceDescriptor[];
   sourcesLoading: boolean;
+  // Progressive discovery: the server is SERVING but its catalog scan is still
+  // running. Lets the source list show "Indexing…" instead of "No sources" when
+  // the catalog is briefly empty at startup. Refreshed from /readyz.
+  scanning: boolean;
 
   // Active selection
   activeSourceId: string | null;
@@ -94,6 +98,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   sources: [],
   sourcesLoading: false,
+  scanning: false,
 
   activeSourceId: null,
   activeTensorId: null,
@@ -102,7 +107,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     t: 0,
     z: 0,
     c: 0,
-    reductionMethod: "nearest",
+    reductionMethod: "area",
     percentileScale: 1,  // Default 1-99 percentile
     useMinMax: false,
   },
@@ -172,7 +177,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   getChannelColor(sourceId, channelIdx) {
-    const { channelColors, channelNames } = get();
+    const { channelColors } = get();
     const sourceColors = channelColors[sourceId];
     if (sourceColors && sourceColors[channelIdx]) {
       return sourceColors[channelIdx];
@@ -221,6 +226,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       try {
         const newSources = await client.listSources();
         const sorted = newSources.sort((a, b) => a.source_url.localeCompare(b.source_url));
+
+        // Refresh the scan-in-progress flag so the "Indexing…" hint clears once
+        // the background catalog scan finishes (best-effort; a readyz blip just
+        // leaves the previous value).
+        try {
+          const readyz = await client.http.readyz();
+          set({ scanning: !!readyz.backend_health?.full_scan_in_progress });
+        } catch {
+          // ignore transient readyz errors
+        }
 
         // Compare source_urls to detect changes
         const oldUrls = sources.map((s) => s.source_url).join(",");

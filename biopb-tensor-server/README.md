@@ -52,36 +52,37 @@ See [deploy.md](deploy.md) for a complete list of deployment options, including 
 
 You can create custom config file to fine-tune server behavior, e.g.,specifying multiple data sources.
 
-```toml
-[server]
-host = "127.0.0.1"
-port = 8815
-log_level = "INFO"
-
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 4096      # increase flight storage limit
-
-# directories will be recursively scanned for data discovery
-[[sources]]
-url = "/data"
-
-# specific data sources allow metadata override
-[[sources]]
-source_id  = "my-zarr"
-type       = "zarr"
-url        = "/experiment.zarr"
-dim_labels = ["z", "y", "x"]
+```json
+{
+  "server": { "host": "127.0.0.1", "port": 8815, "log_level": "INFO" },
+  "cache": {
+    "backend": "file",
+    "file_max_segment_mb": 256,
+    "file_max_total_gb": 4096
+  },
+  "sources": [
+    { "url": "/data" },
+    {
+      "source_id": "my-zarr",
+      "type": "zarr",
+      "url": "/experiment.zarr",
+      "dim_labels": ["z", "y", "x"]
+    }
+  ]
+}
 ```
+
+Directories (the `/data` source above) are recursively scanned for data
+discovery; a specific source like `my-zarr` lets you override its metadata.
+
 To use your custom configuration:
 
 ```bash
 docker run -d -p 8814:8814 -p 8815:8815 \
-    -v ~/my-config.toml:/custom.toml \
+    -v ~/biopb.json:/custom.json \
     -v ~/data:/data \
     -v ~/experiment.zarr:/experiment.zarr \
-    -e CONFIG_FILE=/custom.toml \
+    -e CONFIG_FILE=/custom.json \
     -e BIOPB_TENSOR_TOKEN=mytoken \
     jiyuuchc/biopb-tensor-server:latest
 ```
@@ -90,10 +91,12 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 
 Directory monitoring uses a claim-based discovery protocol with periodic rescans:
 
-```toml
-[[sources]]
-url = "/data/acquisition/"
-monitor = true   # enable live filesystem monitoring
+```json
+{
+  "sources": [
+    { "url": "/data/acquisition/", "monitor": true }
+  ]
+}
 ```
 
 ## Development
@@ -120,13 +123,13 @@ pip install -e "biopb-tensor-server/[web,aics,ome-zarr,medical]"
 
 ```bash
 # Interactive launch with auto-generated token
-biopb-tensor-server launch --config biopb-tensor.toml
+biopb-tensor-server launch --config biopb.json
 
 # Dev mode (localhost, no token required)
-biopb-tensor-server launch --config biopb-tensor.toml --dev
+biopb-tensor-server launch --config biopb.json --dev
 
 # gRPC only (no web sidecar)
-biopb-tensor-server serve --config biopb-tensor.toml
+biopb-tensor-server serve --config biopb.json
 ```
 
 ### Web App
@@ -150,7 +153,7 @@ pnpm --filter @biopb/web dev   # runs on :5173
 ```
 biopb-tensor-server serve    Start the gRPC Flight server only
 biopb-tensor-server launch   Start Flight server + HTTP sidecar for web
-biopb-tensor-server validate Check a TOML config file
+biopb-tensor-server validate Check a config file (JSON; legacy TOML)
 biopb-tensor-server list     List all data sources and tensors in a config
 biopb-tensor-server version  Show version information
 ```
@@ -159,7 +162,7 @@ biopb-tensor-server version  Show version information
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config, -c` | (required) | Path to TOML config |
+| `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--web-port` | 8814 | HTTP server port |
 | `--web-host` | 127.0.0.1 | HTTP server bind address |
 | `--static-dir` | (none) | Directory with static webapp files (API-only if unset) |
@@ -174,10 +177,9 @@ biopb-tensor-server version  Show version information
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config, -c` | (required) | Path to TOML config |
+| `--config, -c` | (required) | Path to config file (JSON; legacy TOML) |
 | `--host, -h` | (from config) | gRPC server host |
 | `--port, -p` | (from config) | gRPC server port |
-| `--compute-backend` | auto | auto, cpu, or gpu |
 | `--writable` | false | Enable write mode for data upload |
 
 ### Python Client

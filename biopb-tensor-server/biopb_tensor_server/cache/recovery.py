@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 @dataclass
 class SegmentEntryInfo:
     """Metadata for an entry stored in a segment."""
+
     segment_id: int
     offset: int  # Entry index within segment (used by the sequential reader)
     size_bytes: int
@@ -39,6 +40,7 @@ class SegmentEntryInfo:
 @dataclass
 class SegmentInfo:
     """Metadata for a segment file."""
+
     size_bytes: int
     created_at: float
     last_access_time: float  # Updated on each read from segment
@@ -58,6 +60,7 @@ class SieveKSegmentInfo:
         frequency: Saturating counter (0 to K=2) for Sieve-K algorithm
         mmap_released: True if mmap handle was released for cold segment
     """
+
     segment_id: int
     size_bytes: int
     created_at: float
@@ -83,10 +86,13 @@ class PoolQueueInfo:
         hits: Number of cache hits in this pool
         misses: Number of cache misses in this pool
     """
+
     pool_key: Tuple[str, str]  # (schema_key, size_class)
     hand: int = 0  # Current hand offset from tail (0 = tail position)
     queue: deque = field(default_factory=deque)  # segment_ids ordered (newest at left)
-    segments: Dict[int, SieveKSegmentInfo] = field(default_factory=dict)  # segment_id -> info
+    segments: Dict[int, SieveKSegmentInfo] = field(
+        default_factory=dict
+    )  # segment_id -> info
     hits: int = 0
     misses: int = 0
 
@@ -94,6 +100,7 @@ class PoolQueueInfo:
 @dataclass
 class RecoveryStatus:
     """Result of crash recovery."""
+
     recovered_entries: int
     lost_entries: int
     recovered_bytes: int
@@ -117,17 +124,17 @@ class WriteAheadLog:
         """Load existing WAL state from disk."""
         if self._path.exists():
             try:
-                with open(self._path, 'r') as f:
+                with open(self._path) as f:
                     data = json.load(f)
-                self._pending = data.get('pending', {})
-            except (json.JSONDecodeError, IOError):
+                self._pending = data.get("pending", {})
+            except (OSError, json.JSONDecodeError):
                 # Corrupted WAL - start fresh
                 self._pending = {}
 
     def _save(self) -> None:
         """Save WAL state to disk."""
-        data = {'pending': self._pending}
-        with open(self._path, 'w') as f:
+        data = {"pending": self._pending}
+        with open(self._path, "w") as f:
             json.dump(data, f)
 
     def log_pending(self, key: bytes) -> None:
@@ -181,9 +188,9 @@ class ProcessLock:
         # Check for existing lock
         if self._path.exists():
             try:
-                with open(self._path, 'r') as f:
+                with open(self._path) as f:
                     data = json.load(f)
-                existing_pid = data.get('pid')
+                existing_pid = data.get("pid")
 
                 if existing_pid and self._is_process_running(existing_pid):
                     # Lock held by another running process
@@ -191,7 +198,7 @@ class ProcessLock:
 
                 # Stale lock - process is dead, remove it
                 self._path.unlink()
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 # Corrupted lock file - remove it
                 self._path.unlink()
 
@@ -199,10 +206,10 @@ class ProcessLock:
         self._pid = os.getpid()
         self._acquired = True
         data = {
-            'pid': self._pid,
-            'acquired_at': time.time(),
+            "pid": self._pid,
+            "acquired_at": time.time(),
         }
-        with open(self._path, 'w') as f:
+        with open(self._path, "w") as f:
             json.dump(data, f)
 
         return True
@@ -224,12 +231,12 @@ class ProcessLock:
             return False
 
         try:
-            with open(self._path, 'r') as f:
+            with open(self._path) as f:
                 data = json.load(f)
-            existing_pid = data.get('pid')
+            existing_pid = data.get("pid")
             if existing_pid and not self._is_process_running(existing_pid):
                 return True
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             return True  # Corrupted lock is stale
 
         return False

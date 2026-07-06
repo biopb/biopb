@@ -1,4 +1,3 @@
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,6 +68,46 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
             mgr.close()
 
 
+def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
+    """The cache lock must be released BEFORE the (up-to-5s) source-manager join,
+    so a mid-teardown SIGKILL still finds it released (biopb/biopb#300). A slow or
+    raising source_manager.stop() must not keep the lock from being released.
+    """
+    cache_dir = tmp_path / "cache"
+    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    lock_path = cache_dir / "lock"
+    assert lock_path.exists()
+
+    order = []
+    state = {}
+
+    class _Flight:
+        def shutdown(self):
+            order.append("flight")
+
+    class _SourceManager:
+        def stop(self):
+            order.append("source_manager")
+            # The cache lock must already be gone by the time this slow step runs.
+            state["lock_at_stop"] = lock_path.exists()
+            raise RuntimeError("boom")  # a failure here must not matter
+
+    try:
+        cli._graceful_shutdown(
+            source_manager=_SourceManager(),
+            watcher=None,
+            flight_server=_Flight(),
+        )
+        # Cache closed (lock released) between the flight drain and the join.
+        assert order == ["flight", "source_manager"]
+        assert state["lock_at_stop"] is False  # released before the join ran
+        assert not lock_path.exists()  # released despite source_manager raising
+    finally:
+        mgr = CacheManager.get_instance()
+        if mgr is not None:
+            mgr.close()
+
+
 def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     """End-to-end: serve()'s shutdown path releases the cache lock."""
     cache_dir = tmp_path / "cache"
@@ -90,3 +129,56 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     cli.serve(config=Path("unused.toml"))
 
     assert not lock_path.exists()
+
+
+def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
+    """A static-only config reaches SERVING and reports a freshness timestamp.
+
+    Progressive discovery: _setup_flight_server no longer blocks on a scan. With
+    no monitored dirs there is nothing to background, so the launcher drives the
+    first-scan-complete path directly -- the server is SERVING, not scanning, and
+    last_full_scan_finished_at is stamped so a client sees an established catalog.
+    """
+    import json
+
+    from biopb_tensor_server.fixtures import create_zarr_array
+    from pyarrow import flight
+
+    zarr_path, _, _ = create_zarr_array(str(tmp_path))
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 0},
+                "cache": {"backend": "memory"},
+                "sources": [
+                    {
+                        "type": "zarr",
+                        "url": zarr_path,
+                        "source_id": "z",
+                        "dim_labels": ["y", "x"],
+                    }
+                ],
+            }
+        )
+    )
+
+    config = cli.load_config(config_path)
+    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
+        config, port=0
+    )
+    try:
+        assert server.is_ready is True
+
+        (raw,) = list(server.do_action(None, flight.Action("health", b"")))
+        health = json.loads(bytes(raw))
+        assert health["status"] == "SERVING"
+        assert health["full_scan_in_progress"] is False
+        assert health["last_full_scan_finished_at"] is not None
+        assert health["source_count"] == 1
+    finally:
+        if watcher is not None:
+            watcher.stop()
+        if precache_worker is not None:
+            precache_worker.stop()
+        server.shutdown()

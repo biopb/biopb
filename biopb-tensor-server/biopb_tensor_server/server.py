@@ -20,25 +20,60 @@ import threading
 import time
 from math import ceil
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import (
+    AddSourceProgress,
+    AddSourceRequest,
+    AddSourceResult,
+    AddSourceStreamMessage,
     FlightCmd,
+    PyramidLevel,
+    RemoveSourceRequest,
+    RemoveSourceResult,
+    ResolveProgress,
+    ResolveStreamMessage,
     TensorDescriptor,
+    WarmProgress,
+    WarmStreamMessage,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.chunk import build_pyramid_plan, encode_chunk_id
+from biopb_tensor_server.chunk import (
+    build_pyramid_plan,
+    cache_key_for_chunk_id,
+    encode_chunk_id,
+)
 from biopb_tensor_server.config import PyramidConfig
+from biopb_tensor_server.errors import (
+    SourceResolveRetriableError,
+    SourceUnresolvedError,
+)
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
 logger = logging.getLogger(__name__)
+
+# How often the ``resolve`` action emits an (empty-body) heartbeat Result while a
+# resolution is in flight. Kept well under common proxy idle read timeouts
+# (nginx ``grpc_read_timeout`` defaults to 60s) so a minutes-long recall doesn't
+# get its stream reset.
+_RESOLVE_HEARTBEAT_SECONDS = 15.0
+
+# Block size for the ``warm`` action's recall reads, and the minimum interval
+# between its progress messages. The min interval throttles the stream to a
+# smooth UI cadence (rather than one message per file) while staying well under
+# the proxy idle timeout, so it doubles as the heartbeat during a single large
+# file's read. Enumeration (a long recall-free stat walk) falls back to the
+# resolve heartbeat cadence.
+_WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
+_WARM_PROGRESS_MIN_INTERVAL = 0.5
 
 
 def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
@@ -160,7 +195,7 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:
-            separator = '&' if '?' in location else '?'
+            separator = "&" if "?" in location else "?"
             location = f"{location}{separator}grpc.max_send_message_size={grpc_max_message_size}&grpc.max_receive_message_size={grpc_max_message_size}"
 
         middleware = kwargs.pop("middleware", {})
@@ -197,6 +232,41 @@ class TensorFlightServer(flight.FlightServerBase):
         self._inflight = 0
         self._last_active = 0.0  # time.monotonic() of last do_get completion
 
+        # Source ids with a "warm" (hydrate-ahead) recall in flight, so a second
+        # concurrent warm of the same source is rejected rather than doubling the
+        # disk/recall pressure. Guarded by the activity lock (cheap, uncontended).
+        self._warming: set = set()
+
+        # Catalog-freshness signals for the ``health`` action (progressive
+        # discovery, biopb/biopb#212). ``SERVING`` only means "up and serving the
+        # possibly-still-populating catalog"; these two fields carry *how fresh*
+        # the catalog is. Written by the SourceManager's single event-loop thread
+        # via the setters below, read from gRPC handler threads -- guarded by a
+        # dedicated lock so a health read never contends with catalog/activity
+        # locks. ``None`` until the first full scan succeeds.
+        self._scan_status_lock = threading.Lock()
+        self._full_scan_in_progress = False
+        self._last_full_scan_at: Optional[float] = None
+
+        # Runtime source registration (the "add_source" Flight action / tensor-
+        # browser drag-drop). The SourceManager injects its ``add_local_source``
+        # generator via ``set_add_source_handler`` at launch (the server holds no
+        # SourceManager reference otherwise). ``None`` means the feature is
+        # unavailable (e.g. a server with no source manager); the action then
+        # reports a clear error. Distinct from ``_writable`` (upload mode): a
+        # normal read-only server still registers dropped local files, so this
+        # gates on its own flag defaulting on -- a hardened deployment can set it
+        # off to refuse runtime path registration.
+        self._add_source_handler: Optional[Callable[..., Any]] = None
+        self._allow_runtime_source_add = True
+
+        # Runtime removal of a drag-dropped source branch (the "remove_source"
+        # action / tensor-browser [x] button). Injected via
+        # ``set_remove_source_handler`` alongside the add handler. Gated on the
+        # SAME ``_allow_runtime_source_add`` flag: a server that cannot add has no
+        # dnd:// sources to remove, so removal is a no-op there anyway.
+        self._remove_source_handler: Optional[Callable[..., Any]] = None
+
     @contextlib.contextmanager
     def _serving_request(self):
         """Mark a heavy read in flight for its duration (precache idle signal)."""
@@ -232,6 +302,43 @@ class TensorFlightServer(flight.FlightServerBase):
     def is_ready(self) -> bool:
         """Whether initial source registration has completed."""
         return self._ready.is_set()
+
+    def set_full_scan_in_progress(self, in_progress: bool) -> None:
+        """Record whether a full catalog rescan is running right now.
+
+        Called by the SourceManager around a force-full rescan; surfaced on the
+        ``health`` action so a client can tell "a scan is running" from "idle".
+        """
+        with self._scan_status_lock:
+            self._full_scan_in_progress = bool(in_progress)
+
+    def set_last_full_scan(self, timestamp: float) -> None:
+        """Record the epoch-seconds time a full catalog rescan last succeeded.
+
+        Surfaced on ``health`` as ``last_full_scan_finished_at`` -- the catalog
+        freshness signal that unifies boot with steady-state periodic rescans.
+        """
+        with self._scan_status_lock:
+            self._last_full_scan_at = float(timestamp)
+
+    def set_add_source_handler(self, handler: Optional[Callable[..., Any]]) -> None:
+        """Wire the SourceManager's ``add_local_source`` for the add_source action.
+
+        The server holds no SourceManager reference; the launcher injects the
+        handler here so the ``add_source`` Flight action can route a dropped path
+        into the claim -> adapter -> catalog pipeline. ``None`` leaves the action
+        reporting "not enabled".
+        """
+        self._add_source_handler = handler
+
+    def set_remove_source_handler(self, handler: Optional[Callable[..., Any]]) -> None:
+        """Wire the SourceManager's ``remove_dropped_root`` for the remove_source action.
+
+        Injected by the launcher alongside ``set_add_source_handler`` (the server
+        holds no SourceManager reference). ``None`` leaves the action reporting
+        "not enabled".
+        """
+        self._remove_source_handler = handler
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
         """Register a data source with the server.
@@ -347,27 +454,25 @@ class TensorFlightServer(flight.FlightServerBase):
 
     def _advertised_pyramid(
         self,
-        source_adapter: Optional[SourceAdapter],
-        tensor_id: Optional[str],
+        tensor_adapter: Optional[TensorAdapter],
         base_desc: TensorDescriptor,
     ) -> List["PyramidLevel"]:
         """The pyramid levels to advertise for a tensor.
 
-        Native (precomputed on-disk) levels when the source ships them, else a
+        Native (precomputed on-disk) levels when the tensor ships them, else a
         computed pyramid from the authoritative ``[pyramid]`` knobs. Filled only
         by ``get_flight_info`` -- ``list_flights`` leaves ``pyramid`` empty, like
         ``metadata_json``. Cheap (arithmetic + already-memoized level adapters),
         so it is recomputed per open rather than separately cached.
         """
         levels = None
-        if source_adapter is not None:
+        if tensor_adapter is not None:
             try:
-                levels = source_adapter.get_native_pyramid_levels(tensor_id)
+                levels = tensor_adapter.get_native_pyramid_levels()
             except Exception:
                 logger.exception(
-                    "pyramid: native enumeration failed for %s/%s",
-                    source_adapter.source_id,
-                    tensor_id,
+                    "pyramid: native enumeration failed for %s",
+                    base_desc.array_id,
                 )
                 levels = None
         if levels is None:
@@ -408,9 +513,7 @@ class TensorFlightServer(flight.FlightServerBase):
         mw = context.get_middleware("auth")
         provided = getattr(mw, "token", None) if mw is not None else None
         if provided != expected:
-            raise flight.FlightUnauthenticatedError(
-                "Invalid or missing source token"
-            )
+            raise flight.FlightUnauthenticatedError("Invalid or missing source token")
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
         """Parse a TensorTicket from a Flight Ticket.
@@ -452,7 +555,7 @@ class TensorFlightServer(flight.FlightServerBase):
             return None
         prefix = f"{source_id}/"
         if tensor_id.startswith(prefix):
-            return tensor_id[len(prefix):]
+            return tensor_id[len(prefix) :]
         if tensor_id == source_id:
             return None
         return tensor_id
@@ -512,10 +615,29 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
-            flight.ActionType("create_source", "Create a writable source from a TensorDescriptor request"),
+            flight.ActionType(
+                "create_source",
+                "Create a writable source from a TensorDescriptor request",
+            ),
             flight.ActionType("upload_status", "Upload status for a writable source"),
-            flight.ActionType("chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"),
-            flight.ActionType("cache_stats", "Cache statistics - returns backend CacheStats JSON"),
+            flight.ActionType(
+                "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
+            ),
+            flight.ActionType(
+                "cache_stats", "Cache statistics - returns backend CacheStats JSON"
+            ),
+            flight.ActionType(
+                "warm",
+                "Hydrate-ahead: recall a resolved cloud source's member files server-side",
+            ),
+            flight.ActionType(
+                "add_source",
+                "Register a local path/dir as a served source at runtime (streams progress)",
+            ),
+            flight.ActionType(
+                "remove_source",
+                "Deregister a drag-dropped (dnd://) source branch at runtime",
+            ),
         ]
 
     def do_action(
@@ -534,12 +656,21 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         if action.type == "health":
             uptime_seconds = int(time.time() - self._start_time)
+            with self._scan_status_lock:
+                full_scan_in_progress = self._full_scan_in_progress
+                last_full_scan_at = self._last_full_scan_at
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
                 "source_count": len(self._get_sources_snapshot()),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
+                # Catalog-freshness signals (progressive discovery). ``SERVING``
+                # no longer implies a complete catalog; these say whether a full
+                # scan is running and when one last finished (epoch seconds, or
+                # null until the first full scan succeeds). See biopb/biopb#212.
+                "full_scan_in_progress": full_scan_in_progress,
+                "last_full_scan_finished_at": last_full_scan_at,
             }
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "create_source":
@@ -566,8 +697,347 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError("Cache not initialized")
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
+        elif action.type == "resolve":
+            source_id = action.body.to_pybytes().decode("utf-8")
+            self._authorize_source(context, source_id)
+            yield from self._handle_resolve(source_id)
+        elif action.type == "warm":
+            source_id = action.body.to_pybytes().decode("utf-8")
+            self._authorize_source(context, source_id)
+            yield from self._handle_warm(source_id, context)
+        elif action.type == "add_source":
+            req = AddSourceRequest.FromString(action.body.to_pybytes())
+            yield from self._handle_add_source(req, context)
+        elif action.type == "remove_source":
+            req = RemoveSourceRequest.FromString(action.body.to_pybytes())
+            yield self._handle_remove_source(req)
         else:
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
+        """Stream the result of resolving a source.
+
+        Resolution is the ONE consented, possibly minutes-long recall (it may
+        download a whole cloud / synced-folder file). It runs on a daemon thread
+        so this handler can emit ``ResolveStreamMessage`` progress heartbeats
+        while it blocks -- a silent multi-minute response would otherwise trip
+        proxy idle read timeouts (e.g. nginx ``grpc_read_timeout``, default 60s)
+        and reset the stream, and the elapsed/size fields let a client show
+        progress and decide whether to cancel. The single terminal message
+        carries the now-resolved ``DataSourceDescriptor`` in its ``result`` arm.
+
+        Resolving an already-resident source is a cheap no-op (returns its
+        descriptor). If the client disconnects mid-resolve the daemon thread runs
+        to completion and caches the result on the adapter, so a retry coalesces
+        onto the finished work rather than downloading again.
+        """
+        adapter = self._get_source_adapter(source_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
+
+        # Name/size of what is being recalled, computed once (stat is recall-free).
+        # Best-effort: an unresolved adapter exposes its URL; a directory or a
+        # remote URL has no single file size, so target_bytes stays 0 (unknown).
+        source_url = getattr(adapter, "_source_url", None) or source_id
+        target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
+        target_bytes = 0
+        try:
+            if os.path.isfile(source_url):
+                target_bytes = os.path.getsize(source_url)
+        except OSError:
+            pass
+
+        started = time.monotonic()
+
+        def _progress() -> bytes:
+            return ResolveStreamMessage(
+                progress=ResolveProgress(
+                    elapsed_seconds=time.monotonic() - started,
+                    target_name=target_name,
+                    target_bytes=target_bytes,
+                )
+            ).SerializeToString()
+
+        result: dict = {}
+
+        def _run() -> None:
+            try:
+                result["desc"] = adapter.resolve()
+            except BaseException as exc:  # surfaced on the stream below
+                result["err"] = exc
+
+        worker = threading.Thread(target=_run, name=f"resolve-{source_id}", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(timeout=_RESOLVE_HEARTBEAT_SECONDS)
+            if worker.is_alive():
+                yield _progress()  # heartbeat: warm + progress, carries no pixels
+
+        if "err" in result:
+            exc = result["err"]
+            # Retriable subclass first (it IS a SourceUnresolvedError): a transient
+            # recall/IO failure -> UNAVAILABLE so the client may retry the resolve.
+            if isinstance(exc, SourceResolveRetriableError):
+                raise flight.FlightUnavailableError(
+                    f"Source resolve failed transiently (retry): {exc}"
+                ) from exc
+            # A bare SourceUnresolvedError here is a permanent resolution failure
+            # (unsupported type / parse error) -> INTERNAL so the client does not
+            # retry forever. (Contrast: an *unresolved-but-resolvable* source is
+            # caught in get_flight_info and mapped to UNAVAILABLE "open to resolve".)
+            if isinstance(exc, SourceUnresolvedError):
+                raise flight.FlightInternalError(
+                    f"Source could not be resolved: {exc}"
+                ) from exc
+            raise flight.FlightServerError(
+                f"resolve failed for {source_id!r}: {exc}"
+            ) from exc
+        yield ResolveStreamMessage(result=result["desc"]).SerializeToString()
+
+    def _handle_warm(
+        self, source_id: str, context: flight.ServerCallContext
+    ) -> Iterator[bytes]:
+        """Stream the progress of *warming* (hydrate-ahead) a resolved source.
+
+        After ``resolve`` populates a multi-file cloud source's metadata, its
+        member data files are still dehydrated and recall one-at-a-time onto the
+        lazy ``do_get`` read path (the canonical case is zarr/ome-zarr: resolve
+        reads only ``.zattrs``/``.zarray``, so every chunk file recalls the first
+        time the viewer scrubs to it). ``warm`` opts into pulling them all
+        resident up front: it walks the source directory and reads every file to
+        force the sync engine's recall -- entirely server-side, so no pixels
+        cross the wire, only the ``WarmStreamMessage`` progress.
+
+        Unlike ``resolve`` (one opaque blocking call wrapped on a daemon thread),
+        warming is our own loop, so it runs inline in this generator: progress is
+        yielded between files (throttled to ``_WARM_PROGRESS_MIN_INTERVAL``) and
+        ``context.is_cancelled()`` is polled between files and read blocks, so a
+        client closing the stream halts the recall promptly. Warming is a pure
+        side-effect (residency), so a cancel genuinely stops -- there is no result
+        to preserve.
+
+        Properties:
+        - **No-op for non-directory sources** -- a single-file source's one file
+          was already recalled by resolve, so this emits one terminal ``done``
+          with ``files_total == 0`` and returns.
+        - **Read every file unconditionally** -- residency is volatile (eviction /
+          re-dehydration can flip it underneath us), so a "skip already-resident"
+          check would be a TOCTOU trap; an unconditional read is idempotent
+          (already-warm files are cheap local reads, cold files recall).
+        - **Counts as Flight activity** (wrapped in ``_serving_request``) so the
+          background precache worker yields to it for the duration.
+        - Does **not** hold the adapter's per-source IO lock -- these are plain
+          filesystem reads, concurrency-safe with real reads, so warming never
+          blocks a live viewer read.
+        """
+        adapter = self._get_source_adapter(source_id)
+        if adapter is None:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
+
+        root = getattr(adapter, "_source_url", None)
+        # Single-file / remote / non-directory source: nothing to warm beyond what
+        # resolve already recalled. One terminal `done`, files_total == 0.
+        if not root or not os.path.isdir(root):
+            yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
+            return
+
+        # Reject a second concurrent warm of the same source (avoid doubling the
+        # disk/recall pressure); the browser also disables re-trigger while running.
+        with self._activity_lock:
+            if source_id in self._warming:
+                raise flight.FlightServerError(
+                    f"warm already in progress for {source_id!r}"
+                )
+            self._warming.add(source_id)
+
+        started = time.monotonic()
+        last_yield = 0.0
+        buf = bytearray(_WARM_READ_BLOCK_BYTES)
+
+        def _progress(
+            files_total: int,
+            files_done: int,
+            bytes_total: int,
+            bytes_done: int,
+            current_name: str,
+        ) -> bytes:
+            return WarmStreamMessage(
+                progress=WarmProgress(
+                    files_total=files_total,
+                    files_done=files_done,
+                    bytes_total=bytes_total,
+                    bytes_done=bytes_done,
+                    current_name=current_name,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+            ).SerializeToString()
+
+        try:
+            # Warming registers as in-flight activity so the precache worker parks.
+            with self._serving_request():
+                # 1. Enumerate + stat (recursive, recall-free). os.walk separates
+                #    directories from `names`, so `names` are the data files we
+                #    want; stat does not recall a placeholder.
+                entries: List[Tuple[int, str]] = []
+                bytes_total = 0
+                for dirpath, _dirs, names in os.walk(root):
+                    if context.is_cancelled():
+                        yield WarmStreamMessage(
+                            done=WarmProgress(
+                                elapsed_seconds=time.monotonic() - started
+                            )
+                        ).SerializeToString()
+                        return
+                    for name in names:
+                        fpath = os.path.join(dirpath, name)
+                        try:
+                            size = os.stat(fpath).st_size
+                        except OSError:
+                            continue  # vanished/unreadable between walk and stat
+                        entries.append((size, fpath))
+                        bytes_total += size
+                    now = time.monotonic()
+                    if now - last_yield >= _RESOLVE_HEARTBEAT_SECONDS:
+                        last_yield = now
+                        yield _progress(0, 0, 0, 0, "")  # still enumerating
+
+                # 2. Ascending size: for pyramidal data this approximates
+                #    coarsest-level-first (coarse levels are the small files) so the
+                #    viewer becomes responsive earliest; otherwise a harmless tie.
+                entries.sort(key=lambda e: e[0])
+                files_total = len(entries)
+                files_done = 0
+                bytes_done = 0
+
+                # Immediately surface the total before the first (possibly long) read.
+                last_yield = time.monotonic()
+                yield _progress(files_total, files_done, bytes_total, bytes_done, "")
+
+                # 3. Recall loop: read every file to completion (forces residency).
+                for _size, fpath in entries:
+                    if context.is_cancelled():
+                        break
+                    name = os.path.basename(fpath)
+                    try:
+                        with open(fpath, "rb", buffering=0) as fh:
+                            while True:
+                                if context.is_cancelled():
+                                    break
+                                n = fh.readinto(buf)
+                                if not n:
+                                    break
+                                bytes_done += n
+                                now = time.monotonic()
+                                if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                                    last_yield = now
+                                    yield _progress(
+                                        files_total,
+                                        files_done,
+                                        bytes_total,
+                                        bytes_done,
+                                        name,
+                                    )
+                    except OSError as exc:
+                        logger.warning("warm: skipping %s: %s", fpath, exc)
+                    files_done += 1
+                    now = time.monotonic()
+                    if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                        last_yield = now
+                        yield _progress(
+                            files_total,
+                            files_done,
+                            bytes_total,
+                            bytes_done,
+                            name,
+                        )
+
+                # 4. Terminal done (partial counts if cancelled mid-loop).
+                yield WarmStreamMessage(
+                    done=WarmProgress(
+                        files_total=files_total,
+                        files_done=files_done,
+                        bytes_total=bytes_total,
+                        bytes_done=bytes_done,
+                        elapsed_seconds=time.monotonic() - started,
+                    )
+                ).SerializeToString()
+        finally:
+            with self._activity_lock:
+                self._warming.discard(source_id)
+
+    def _handle_add_source(
+        self, req: AddSourceRequest, context: flight.ServerCallContext
+    ) -> Iterator[bytes]:
+        """Stream registration of a runtime-added local path (drag-drop).
+
+        Wraps the SourceManager's ``add_local_source`` generator: each event
+        tuple it yields is mapped onto an ``AddSourceStreamMessage`` (zero or
+        more ``progress`` heartbeats, then one terminal ``result``). A dropped
+        directory can register several sources, so this streams -- a client shows
+        rows appearing and can cancel (the stream closing sets is_cancelled(),
+        which stops discovery while keeping what is already registered).
+
+        Whole-request failures (path not found / unreadable, or a remote URL)
+        raise from the generator on first iteration and are mapped to a
+        FlightServerError so the client surfaces a clean message.
+        """
+        if not self._allow_runtime_source_add or self._add_source_handler is None:
+            raise flight.FlightServerError(
+                "Runtime source registration is not enabled on this server."
+            )
+
+        def _should_cancel() -> bool:
+            return context.is_cancelled()
+
+        try:
+            events = self._add_source_handler(
+                req.url,
+                source_type=req.source_type,
+                dim_labels=list(req.dim_labels),
+                should_cancel=_should_cancel,
+            )
+            for event in events:
+                kind = event[0]
+                if kind == "progress":
+                    _, added_count, current_path = event
+                    progress = AddSourceProgress(
+                        added_count=added_count,
+                        current_path=current_path or "",
+                    )
+                    yield AddSourceStreamMessage(progress=progress).SerializeToString()
+                else:  # "result"
+                    _, added, already_present, failed = event
+                    result = AddSourceResult(
+                        already_present=already_present,
+                    )
+                    result.added.extend(d for d in added if d is not None)
+                    for path, reason in failed:
+                        result.failed.add(path=path, reason=reason)
+                    yield AddSourceStreamMessage(result=result).SerializeToString()
+        except (FileNotFoundError, PermissionError, ValueError) as exc:
+            raise flight.FlightServerError(str(exc)) from exc
+
+    def _handle_remove_source(self, req: RemoveSourceRequest) -> bytes:
+        """Deregister a drag-dropped source branch (single, non-streamed result).
+
+        Delegates to the SourceManager's ``remove_dropped_root``, which removes
+        only sources whose catalog ``source_url`` carries the ``dnd://`` origin
+        scheme -- so a request for anything else is rejected (``ValueError`` ->
+        ``FlightServerError``). Removal is quick (unregister N adapters), so
+        unlike add it does not stream: one ``RemoveSourceResult`` is returned.
+        """
+        if not self._allow_runtime_source_add or self._remove_source_handler is None:
+            raise flight.FlightServerError(
+                "Runtime source removal is not enabled on this server."
+            )
+        try:
+            removed, failed = self._remove_source_handler(req.root_url)
+        except ValueError as exc:
+            raise flight.FlightServerError(str(exc)) from exc
+        result = RemoveSourceResult(removed=removed)
+        for source_id, reason in failed:
+            result.failed.add(path=source_id, reason=reason)
+        return result.SerializeToString()
 
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes
@@ -579,12 +1049,74 @@ class TensorFlightServer(flight.FlightServerBase):
         Results are capped at `max_list_flights_results` for safety. Truncation
         is signaled via schema metadata on all returned FlightInfos.
 
+        Served from the DuckDB catalog when a metadata DB is present, so the
+        browse surface cannot drift from ``query_sources`` (biopb/biopb#265); an
+        embedded/test server built without a DB (``metadata_db=None``) falls back
+        to iterating adapters.
+
         Args:
             context: Server call context
             criteria: Unused criteria bytes
 
         Yields:
             FlightInfo for each registered data source (up to max_list_flights_results)
+        """
+        if self._metadata_db is not None:
+            yield from self._list_flights_from_catalog()
+        else:
+            yield from self._list_flights_from_adapters()
+
+    def _list_flights_from_catalog(self) -> Iterator[flight.FlightInfo]:
+        """Build ListFlights results from the DuckDB catalog (the default path).
+
+        One SQL read replaces the per-adapter ``get_source_descriptor()`` calls.
+        Token-protected sources never appear here: the only ones that exist live
+        in the embedded image-base server, which runs with ``metadata_db=None``
+        and therefore takes the adapter fallback instead -- so the DuckDB path
+        has no tokened source to leak (biopb/biopb#265).
+        """
+        max_sources = self._max_list_flights_results
+        descriptors, total_sources = self._metadata_db.list_source_descriptors(
+            limit=max_sources
+        )
+        returned_count = len(descriptors)
+        truncated = total_sources > returned_count
+
+        if truncated:
+            logger.warning(
+                f"list_flights truncated: returning {returned_count} of {total_sources} sources"
+            )
+
+        base_metadata = {
+            b"total_sources": str(total_sources).encode(),
+            b"max_sources": str(max_sources).encode(),
+            b"returned_sources": str(returned_count).encode(),
+            b"truncated": str(truncated).encode(),
+        }
+
+        for source_desc in descriptors:
+            schema = pa.schema([], metadata=base_metadata)
+            flight_descriptor = flight.FlightDescriptor.for_command(
+                source_desc.SerializeToString()
+            )
+            endpoint = flight.FlightEndpoint(
+                ticket=flight.Ticket(b""),  # Empty ticket for listing
+                locations=[],
+            )
+            yield flight.FlightInfo(
+                schema=schema,
+                descriptor=flight_descriptor,
+                endpoints=[endpoint],
+                total_records=-1,
+                total_bytes=-1,
+            )
+
+    def _list_flights_from_adapters(self) -> Iterator[flight.FlightInfo]:
+        """List sources by iterating adapters (fallback when no metadata DB).
+
+        Used by embedded/test servers built with ``metadata_db=None`` (e.g. the
+        image-base result-cache server). Honors per-source capability tokens by
+        skipping token-protected sources from enumeration.
         """
         source_items = self._get_sources_snapshot()
         total_sources = len(source_items)
@@ -683,18 +1215,22 @@ class TensorFlightServer(flight.FlightServerBase):
             # Metadata SQL query branch
             if cmd.HasField("metadata_query"):
                 sql = cmd.metadata_query.sql
-                logger.debug(
-                    f"get_flight_info: metadata_query sql={sql[:100]}..."
-                )
+                logger.debug(f"get_flight_info: metadata_query sql={sql[:100]}...")
                 if self._metadata_db is None:
+                    # The CLI always attaches a metadata DB (mandatory,
+                    # biopb/biopb#225); reaching here means this server was
+                    # constructed without one (an embedded/test instance).
                     raise flight.FlightServerError(
-                        "Metadata database not enabled. Set metadata_db config to enable SQL queries."
+                        "This server has no metadata database attached, so SQL "
+                        "queries are unavailable."
                     )
                 try:
                     return self._metadata_db.handle_query(sql)
                 except ValueError as e:
                     # Query validation or execution failure
-                    raise flight.FlightInternalError(f"Metadata query failed: {e}") from e
+                    raise flight.FlightInternalError(
+                        f"Metadata query failed: {e}"
+                    ) from e
             else:
                 raise flight.FlightServerError(
                     "Metadata query source_id but no MetadataQueryOption"
@@ -738,83 +1274,118 @@ class TensorFlightServer(flight.FlightServerBase):
         )
 
         # Get tensor adapter for the specified source and tensor
-        tensor_adapter = self._get_adapter_for_tensor(
-            source_id, field
-        )
+        tensor_adapter = self._get_adapter_for_tensor(source_id, field)
         if tensor_adapter is None:
-            logger.warning(
-                f"Tensor not found: {source_id}/{tensor_id}"
-            )
-            raise flight.FlightServerError(
-                f"Tensor not found: {source_id}/{tensor_id}"
-            )
+            logger.warning(f"Tensor not found: {source_id}/{tensor_id}")
+            raise flight.FlightServerError(f"Tensor not found: {source_id}/{tensor_id}")
 
         # Build request descriptor for the specific tensor
         try:
-            base_desc = tensor_adapter.get_tensor_descriptor()
-            tensor_desc = TensorDescriptor(
-                array_id=tensor_id,
-                dim_labels=base_desc.dim_labels,
-                shape=base_desc.shape,
-                chunk_shape=base_desc.chunk_shape,
-                dtype=base_desc.dtype,
-            )
-            if read_opt.HasField("slice_hint"):
-                tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-                logger.debug(
-                    f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
+            # A remote-proxy tensor mirrors an upstream source 1:1 and re-derives
+            # no chunk grid, pyramid, or physical scale of its own. Consult the
+            # upstream once for its authoritative GetFlightInfo and use it as-is
+            # rather than planning against a locally-guessed 64 MB grid and a
+            # locally-computed pyramid (biopb/biopb#295): the forwarded descriptor
+            # already carries the upstream's native grid, its server-advertised
+            # pyramid (a pyramidal OME-Zarr upstream's precompute levels
+            # included), and its physical scale -- so the pyramid/physical
+            # overwrite below is skipped for it (they are already authoritative).
+            # metadata_json still comes from the local mirror catalog (the #253
+            # no-extra-RPC path). A None return (upstream unreachable/unparseable)
+            # falls through to the local planner -- never worse than before.
+            read_plan = None
+            if isinstance(tensor_adapter, RemoteTensorAdapter):
+                read_plan = tensor_adapter.forward_flight_info(read_opt)
+
+            if read_plan is None:
+                base_desc = tensor_adapter.get_tensor_descriptor()
+                tensor_desc = TensorDescriptor(
+                    array_id=tensor_id,
+                    dim_labels=base_desc.dim_labels,
+                    shape=base_desc.shape,
+                    chunk_shape=base_desc.chunk_shape,
+                    dtype=base_desc.dtype,
                 )
-            # Apply scale_hint and reduction_method directly to TensorDescriptor
-            if read_opt.scale_hint:
-                tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
-            if read_opt.reduction_method:
-                tensor_desc.reduction_method = read_opt.reduction_method
+                if read_opt.HasField("slice_hint"):
+                    tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
+                    logger.debug(
+                        f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
+                    )
+                # Apply scale_hint and reduction_method directly to TensorDescriptor
+                if read_opt.scale_hint:
+                    tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
+                if read_opt.reduction_method:
+                    tensor_desc.reduction_method = read_opt.reduction_method
 
-            read_plan = tensor_adapter.get_read_plan(tensor_desc)
+                read_plan = tensor_adapter.get_read_plan(tensor_desc)
 
-            # The response descriptor's array_id is the adapter's own
-            # source-unique array_id (source_id or source_id/field), carried
-            # through get_read_plan from get_tensor_descriptor(). Under the
-            # identity policy this same qualified array_id is what list_flights
-            # advertises, the chunk_ids encode, and the client caches -- one form
-            # everywhere, so there is nothing to strip here (cf. the removed #45
-            # bare-form normalization; the bare/qualified split it papered over
-            # no longer exists).
+                # The response descriptor's array_id is the adapter's own
+                # source-unique array_id (source_id or source_id/field), carried
+                # through get_read_plan from get_tensor_descriptor(). Under the
+                # identity policy this same qualified array_id is what list_flights
+                # advertises, the chunk_ids encode, and the client caches -- one
+                # form everywhere, so there is nothing to strip here (cf. the
+                # removed #45 bare-form normalization; the bare/qualified split it
+                # papered over no longer exists).
+
+                # Advertise the server-decided resolution pyramid. Filled here
+                # (open time), never in list_flights -- like metadata_json -- so
+                # discovery stays lean. The client reads each advertised level via
+                # the normal scale_hint path; native sources get their precomputed
+                # levels.
+                read_plan.descriptor.ClearField("pyramid")
+                read_plan.descriptor.pyramid.extend(
+                    self._advertised_pyramid(tensor_adapter, base_desc)
+                )
+
+                # Compact per-dim physical scale summary. Filled here at open time
+                # (always, like pyramid -- NOT gated on with_metadata), never in
+                # list_flights, so the common tensor-load path gets physical sizes
+                # without fetching the full OME tree (issue #31). Full-res values:
+                # do not scale by scale_hint (napari multiscale scale is level-0).
+                read_plan.descriptor.ClearField("physical_scale")
+                read_plan.descriptor.ClearField("physical_unit")
+                try:
+                    phys = tensor_adapter.get_physical_scale()
+                except Exception:
+                    phys = None
+                if phys is not None:
+                    scale_vec, unit_vec = phys
+                    ndim = len(read_plan.descriptor.dim_labels)
+                    if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
+                        read_plan.descriptor.physical_scale[:] = scale_vec
+                        read_plan.descriptor.physical_unit[:] = unit_vec
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
             source_adapter = self._get_source_adapter(source_id)
 
-            # Advertise the server-decided resolution pyramid. Filled here (open
-            # time), never in list_flights -- like metadata_json -- so discovery
-            # stays lean. The client reads each advertised level via the normal
-            # scale_hint path; native sources get their precomputed levels.
-            read_plan.descriptor.ClearField("pyramid")
-            read_plan.descriptor.pyramid.extend(
-                self._advertised_pyramid(source_adapter, field, base_desc)
-            )
-
-            # Compact per-dim physical scale summary. Filled here at open time
-            # (always, like pyramid -- NOT gated on with_metadata), never in
-            # list_flights, so the common tensor-load path gets physical sizes
-            # without fetching the full OME tree (issue #31). Full-res values:
-            # do not scale by scale_hint (napari multiscale scale is level-0).
-            read_plan.descriptor.ClearField("physical_scale")
-            read_plan.descriptor.ClearField("physical_unit")
-            try:
-                phys = tensor_adapter.get_physical_scale(field)
-            except Exception:
-                phys = None
-            if phys is not None:
-                scale_vec, unit_vec = phys
-                ndim = len(read_plan.descriptor.dim_labels)
-                if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
-                    read_plan.descriptor.physical_scale[:] = scale_vec
-                    read_plan.descriptor.physical_unit[:] = unit_vec
-
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
-                raw_metadata = tensor_adapter.get_metadata()
+                # Prefer the catalog's stored metadata_json (biopb/biopb#253):
+                # computed once at registration, read back with a cheap local
+                # SELECT -- no adapter recompute, and for a remote proxy no
+                # upstream RPC (read the local mirror row directly, never
+                # adapter.get_metadata()). Fall back to the adapter only when
+                # there is no DB, or get_metadata_json returns None -- an absent/
+                # NULL row (empty metadata, or an unresolved source whose real row
+                # isn't written yet), unparseable JSON, or a catalog read error
+                # (it parses and degrades internally, never raising).
+                #
+                # Escape hatch: the catalog row is source-level, so read it only
+                # when the source's metadata covers every tensor. HCS plates hold
+                # per-field metadata (the row is the plate .zattrs, not a field's
+                # OME metadata), so they fall through to the per-tensor adapter --
+                # preserving the field-level answer (biopb/biopb#253).
+                raw_metadata = None
+                if (
+                    self._metadata_db is not None
+                    and source_adapter is not None
+                    and source_adapter.metadata_covers_all_tensors()
+                ):
+                    raw_metadata = self._metadata_db.get_metadata_json(source_id)
+                if raw_metadata is None:
+                    raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter._source_type,
@@ -824,7 +1395,16 @@ class TensorFlightServer(flight.FlightServerBase):
                     read_plan.descriptor.metadata_json = json.dumps(
                         wrapped_metadata, cls=NumpyEncoder
                     )
-        except (OSError, IOError, ValueError, json.JSONDecodeError) as e:
+        except SourceUnresolvedError as e:
+            # Expected for a not-yet-hydrated source: surface a legible
+            # "open to resolve" message rather than burying it in "Metadata
+            # error". Unavailable (not Internal) -- it is not ready yet, not
+            # broken. Must precede the ValueError clause (SourceUnresolvedError
+            # subclasses ValueError).
+            raise flight.FlightUnavailableError(
+                f"Source unresolved (open to resolve): {e}"
+            ) from e
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
             ) from e
@@ -902,7 +1482,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch = adapter.resolve_chunk_data(
                     tensor_ticket.chunk_id, cache_manager
                 )
-            except (OSError, IOError, ValueError) as e:
+            except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
                 raise flight.FlightInternalError(
                     f"I/O error reading chunk data: {e}"
@@ -912,7 +1492,9 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.debug(f"do_get: returning {batch_size} bytes")
 
             # zero-copy wrapper - do _not_ convert to pa.Table!
-            reader = pa.RecordBatchReader.from_batches(record_batch.schema, [record_batch])
+            reader = pa.RecordBatchReader.from_batches(
+                record_batch.schema, [record_batch]
+            )
             return flight.RecordBatchStream(reader)
 
     def _handle_chunk_locate(self, chunk_id: bytes) -> str:
@@ -936,16 +1518,20 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"Adapter not found for chunk_id: {chunk_id[:16]}..."
             )
 
+        # Entries are stored under the method-stripped canonical key
+        # (biopb/biopb#76); locate with the same key or a warm chunk cached
+        # under a different reduction_method is never found.
+        cache_key = cache_key_for_chunk_id(chunk_id)
         try:
             # If the chunk is already cached, just locate it. Resolving first
             # would, on a chunk whose in-RAM entry has been trimmed, re-read the
             # whole chunk from its segment server-side for nothing. Only
             # materialize (same path as do_get) on a genuine cold miss.
-            location = cache_manager.locate_entry(chunk_id)
+            location = cache_manager.locate_entry(cache_key)
             if location is None:
                 adapter.resolve_chunk_data(chunk_id, cache_manager)
-                location = cache_manager.locate_entry(chunk_id)
-        except (OSError, IOError, ValueError) as e:
+                location = cache_manager.locate_entry(cache_key)
+        except (OSError, ValueError) as e:
             raise flight.FlightInternalError(
                 f"I/O error locating chunk data: {e}"
             ) from e
@@ -953,14 +1539,16 @@ class TensorFlightServer(flight.FlightServerBase):
         if location is None:
             return json.dumps({"available": False})
 
-        return json.dumps({
-            "available": True,
-            "format_version": CACHE_FILE_FORMAT_VERSION,
-            "segment_path": location.segment_path,
-            "byte_offset": location.byte_offset,
-            "byte_length": location.byte_length,
-            "generation_id": location.generation_id,
-        })
+        return json.dumps(
+            {
+                "available": True,
+                "format_version": CACHE_FILE_FORMAT_VERSION,
+                "segment_path": location.segment_path,
+                "byte_offset": location.byte_offset,
+                "byte_length": location.byte_length,
+                "generation_id": location.generation_id,
+            }
+        )
 
     def do_put(
         self,
@@ -1090,6 +1678,21 @@ class TensorFlightServer(flight.FlightServerBase):
             )
 
             self.register_source(source_id, adapter)
+            # File-backed uploads are durable (a real .zarr on disk), so add them
+            # to the catalog to be discoverable via list_sources/query_sources.
+            # Cache-backed uploads (the `cache:` branch above) are intentionally
+            # NOT synced: they are volatile and have no removal hook, so a row
+            # would dangle after eviction -- they stay readable by their returned
+            # id but are not enumerable (biopb/biopb#265). Best-effort: a catalog
+            # write must not fail the upload (the source is already usable by id).
+            if self._metadata_db is not None:
+                try:
+                    self._metadata_db.sync_source_added(source_id, adapter)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to sync uploaded source {source_id} to catalog "
+                        f"(readable by id, not listed): {e}"
+                    )
             self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
@@ -1163,7 +1766,7 @@ class TensorFlightServer(flight.FlightServerBase):
             if hasattr(adapter, "write_chunk"):
                 adapter.write_chunk(chunk_idx, data)
             else:
-                raise flight.FlightServerError(f"Source does not support writes")
+                raise flight.FlightServerError("Source does not support writes")
 
         elif isinstance(adapter, CachedSourceAdapter):
             # Cache-backed sources accept arbitrary bounds
@@ -1171,7 +1774,7 @@ class TensorFlightServer(flight.FlightServerBase):
             adapter.write_chunk_arrow(bounds, data_column, expected_shape, dtype)
 
         else:
-            raise flight.FlightServerError(f"Source type does not support writes")
+            raise flight.FlightServerError("Source type does not support writes")
 
         self.mark_upload_chunk(upload.source_id, bounds)
 

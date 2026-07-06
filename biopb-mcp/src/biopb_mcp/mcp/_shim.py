@@ -116,13 +116,26 @@ def ensure_daemon(config, port, timeout=DAEMON_START_TIMEOUT):
     daemon_log_name = getattr(log, "name", "stderr")
     cmd = _daemon_command(port)
     logger.info("No daemon on 127.0.0.1:%d; spawning: %s", port, cmd)
-    # Detach fully: new session/process group, no inherited stdio. The daemon
-    # must outlive this shim (and its client), which is the point of the
-    # daemon model.
+    # Detach into its own session/process group with no inherited stdio, so the
+    # daemon reliably outlives this shim and its client (orphaned to init, the
+    # port stays bound across shim restarts) even if the client tears down the
+    # shim's *process group* on exit -- the point of the daemon model. setsid
+    # detaches it within the login session only: it is still session-bound and
+    # dies on logout. A daemon meant to survive logout must be made persistent
+    # at the wrapper level (see cli._detach_kwargs).
+    #
+    # Windows: CREATE_NO_WINDOW, NOT DETACHED_PROCESS. Both keep the shim from
+    # pinning a console, but DETACHED_PROCESS leaves the daemon with *no* console
+    # at all -- so when it later spawns the console-subsystem Jupyter kernel
+    # (python.exe, no creation flags of its own) Windows is forced to allocate a
+    # fresh *visible* console for it, and an empty shell window pops on the user's
+    # desktop. CREATE_NO_WINDOW instead gives the daemon a hidden console the
+    # kernel inherits silently. This mirrors cli._detach_kwargs, the convention
+    # for every other daemon spawn in the project ("so none pops").
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
     else:
         popen_kwargs["start_new_session"] = True
@@ -210,9 +223,7 @@ def build_proxy(remote):
     async def _list_resource_templates(_):
         return types.ServerResult(await remote.list_resource_templates())
 
-    app.request_handlers[types.ListResourceTemplatesRequest] = (
-        _list_resource_templates
-    )
+    app.request_handlers[types.ListResourceTemplatesRequest] = _list_resource_templates
 
     async def _read_resource(req):
         return types.ServerResult(await remote.read_resource(req.params.uri))
@@ -233,9 +244,7 @@ def build_proxy(remote):
 
     async def _complete(req):
         return types.ServerResult(
-            await remote.complete(
-                req.params.ref, req.params.argument.model_dump()
-            )
+            await remote.complete(req.params.ref, req.params.argument.model_dump())
         )
 
     app.request_handlers[types.CompleteRequest] = _complete

@@ -8,11 +8,14 @@ unlike the viewer-dependent ``test_tensor_browser_widget.py``.
 
 from types import SimpleNamespace
 
+from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+
 from biopb_mcp.tensor_browser._widget import (
     _build_tree,
     _filter_empty_metadata,
     _get_path_parts,
     _is_empty_for_display,
+    _residency_state,
 )
 
 
@@ -104,9 +107,13 @@ class TestGetPathParts:
     def test_windows_path_splits_on_backslash(self):
         # The regression: urlparse reads "C:" as a scheme and leaves the path
         # backslash-separated; splitting on "/" alone yielded one giant leaf.
-        assert _get_path_parts(
-            r"C:\Users\me\Pictures\Screenshots 1\shot.png"
-        ) == ["Users", "me", "Pictures", "Screenshots 1", "shot.png"]
+        assert _get_path_parts(r"C:\Users\me\Pictures\Screenshots 1\shot.png") == [
+            "Users",
+            "me",
+            "Pictures",
+            "Screenshots 1",
+            "shot.png",
+        ]
 
     def test_windows_drive_root_file(self):
         assert _get_path_parts(r"C:\img.tif") == ["img.tif"]
@@ -149,3 +156,23 @@ class TestBuildTreeWindowsPaths:
         leaf_names = sorted(c.name for c in folder.children)
         assert leaf_names == ["one.png", "two.png"]
         assert all(c.node_type == "source" for c in folder.children)
+
+
+class TestResidencyState:
+    """Tri-state residency indicator: resident / remote / unknown (unset)."""
+
+    def test_unset_is_unknown(self):
+        # Old server (field absent) -> None, so the UI shows no indicator.
+        src = DataSourceDescriptor(source_id="s")
+        assert src.HasField("data_resident") is False
+        assert _residency_state(src) is None
+
+    def test_true_is_resident(self):
+        src = DataSourceDescriptor(source_id="s", data_resident=True)
+        assert _residency_state(src) == "resident"
+
+    def test_false_is_remote(self):
+        src = DataSourceDescriptor(source_id="s", data_resident=False)
+        # Explicitly set false (present) -> remote, not unknown.
+        assert src.HasField("data_resident") is True
+        assert _residency_state(src) == "remote"

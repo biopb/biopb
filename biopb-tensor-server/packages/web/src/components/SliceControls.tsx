@@ -89,6 +89,9 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Get current color for the channel
   const currentColor = useMemo(() => {
     return getChannelColor(sourceId, slice.c);
+    // getChannelColor is a stable store method that reads channelColors via get();
+    // list channelColors so the memo recomputes when a color is edited.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getChannelColor, sourceId, slice.c, channelColors]);
 
   // Determine if current color is a custom hex color

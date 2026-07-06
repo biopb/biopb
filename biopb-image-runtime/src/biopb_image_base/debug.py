@@ -5,12 +5,13 @@ import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
-import threading
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ServiceStats:
@@ -70,7 +71,11 @@ def get_gpu_memory_info() -> Optional[dict]:
     try:
         # Query nvidia-smi for GPU info
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -98,7 +103,7 @@ def get_gpu_memory_info() -> Optional[dict]:
             "device": name,
             "total_mb": round(total_mb, 2),
             "allocated_mb": round(used_mb, 2),  # used = allocated in nvidia-smi terms
-            "reserved_mb": round(used_mb, 2),   # approximate
+            "reserved_mb": round(used_mb, 2),  # approximate
             "free_mb": round(free_mb, 2),
         }
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
@@ -121,7 +126,7 @@ def get_system_info() -> dict:
 
     # Try to get memory info
     try:
-        with open("/proc/meminfo", "r") as f:
+        with open("/proc/meminfo") as f:
             meminfo = {}
             for line in f:
                 parts = line.split(":")

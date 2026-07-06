@@ -25,9 +25,7 @@ class TestConfigureDask:
         """threads/synchronous schedulers yield no client and no cluster."""
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
-        client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "threads"}}}
-        )
+        client, cluster = _configure_dask({"mcp": {"dask": {"scheduler": "threads"}}})
         assert client is None
         assert cluster is None
 
@@ -36,6 +34,7 @@ class TestConfigureDask:
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
 
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
         created = {}
 
         class _FakeClient:
@@ -60,10 +59,104 @@ class TestConfigureDask:
         assert created["address"] == "tcp://1.2.3.4:8786"
         assert cluster is None
 
-    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
-        """A LocalCluster spawn failure degrades to in-process, not a crash."""
+    def test_injected_address_takes_precedence(self, monkeypatch):
+        """BIOPB_DASK_ADDRESS (daemon-injected) wins over the config address."""
         pytest.importorskip("dask.distributed")
         import dask.distributed as dd
+
+        monkeypatch.setenv("BIOPB_DASK_ADDRESS", "tcp://daemon:8786")
+        created = {}
+
+        class _FakeClient:
+            def __init__(self, address):
+                created["address"] = address
+
+        monkeypatch.setattr(dd, "Client", _FakeClient)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {"mcp": {"dask": {"scheduler": "distributed", "address": "tcp://cfg:1"}}}
+        )
+        assert created["address"] == "tcp://daemon:8786"
+        assert cluster is None
+
+    def test_daemon_owner_no_address_falls_back_to_threads(self, monkeypatch):
+        """owner='daemon' with no injected address -> threads, not a competing
+        kernel-local cluster (LocalCluster must never be constructed)."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+
+        def _must_not_spin(*args, **kwargs):
+            raise AssertionError("owner=daemon must not spin a kernel-local cluster")
+
+        monkeypatch.setattr(dd, "LocalCluster", _must_not_spin)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "daemon",
+                    }
+                }
+            }
+        )
+        assert client is None
+        assert cluster is None
+
+    def test_kernel_owner_spins_local_cluster(self, monkeypatch):
+        """owner='kernel' (escape hatch) spins a kernel-local LocalCluster."""
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+        spun = {}
+
+        class _FakeCluster:
+            def __init__(self, **kwargs):
+                spun["kwargs"] = kwargs
+                self.scheduler_address = "tcp://local:1"
+                self.workers = {"w0": object()}
+
+        class _FakeClient:
+            def __init__(self, target):
+                spun["client_target"] = target
+
+        monkeypatch.setattr(dd, "LocalCluster", _FakeCluster)
+        monkeypatch.setattr(dd, "Client", _FakeClient)
+
+        from biopb_mcp.mcp._bootstrap import _configure_dask
+
+        client, cluster = _configure_dask(
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "kernel",
+                    }
+                }
+            }
+        )
+        assert isinstance(cluster, _FakeCluster)
+        assert isinstance(client, _FakeClient)
+        assert spun["client_target"] is cluster
+
+    def test_local_cluster_failure_falls_back_to_threads(self, monkeypatch):
+        """A LocalCluster spawn failure degrades to in-process, not a crash.
+
+        Uses owner='kernel' so the LocalCluster branch is actually reached.
+        """
+        pytest.importorskip("dask.distributed")
+        import dask.distributed as dd
+
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
 
         def _boom(*args, **kwargs):
             raise RuntimeError("no cluster for you")
@@ -73,10 +166,107 @@ class TestConfigureDask:
         from biopb_mcp.mcp._bootstrap import _configure_dask
 
         client, cluster = _configure_dask(
-            {"mcp": {"dask": {"scheduler": "distributed", "address": ""}}}
+            {
+                "mcp": {
+                    "dask": {
+                        "scheduler": "distributed",
+                        "address": "",
+                        "owner": "kernel",
+                    }
+                }
+            }
         )
         assert client is None
         assert cluster is None
+
+
+class TestClusterAddressInjection:
+    """_launch injects BIOPB_DASK_ADDRESS from cluster_host.ensure().
+
+    Uses a real bare kernel and reads its inherited env back out, so it covers
+    the full injection path.
+    """
+
+    class _FakeClusterHost:
+        def __init__(self, address):
+            self._address = address
+            self.calls = 0
+
+        def ensure(self):
+            self.calls += 1
+            return self._address
+
+    def test_injects_address_when_ensure_returns_one(self):
+        fake = self._FakeClusterHost("tcp://127.0.0.1:12345")
+        host = KernelHost(
+            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
+        )
+        host.start()
+        try:
+            res = host.execute("import os; print(os.environ.get('BIOPB_DASK_ADDRESS'))")
+            assert "tcp://127.0.0.1:12345" in res["stdout"]
+            assert fake.calls >= 1
+        finally:
+            host.shutdown()
+
+    def test_omits_address_when_ensure_returns_none(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_DASK_ADDRESS", raising=False)
+        fake = self._FakeClusterHost(None)
+        host = KernelHost(
+            health_probe_code=None, startup_timeout=60.0, cluster_host=fake
+        )
+        host.start()
+        try:
+            res = host.execute(
+                "import os; print(repr(os.environ.get('BIOPB_DASK_ADDRESS')))"
+            )
+            assert "None" in res["stdout"]
+        finally:
+            host.shutdown()
+
+
+class TestTokenReportParsing:
+    """Pure-unit tests for the token-report cache (issue #86), no kernel needed."""
+
+    def test_record_updates_remembered_token(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok-123")
+        assert host._tensor_url == "grpc://host:9"
+        assert host._tensor_token == "tok-123"
+
+    def test_empty_token_field_clears(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok-123")
+        # User switched to a no-auth server: the report carries an empty token.
+        host._record_token_line(b"grpc://other:1\t")
+        assert host._tensor_url == "grpc://other:1"
+        assert host._tensor_token is None
+
+    def test_malformed_line_ignored(self):
+        host = KernelHost(health_probe_code=None)
+        host._record_token_line(b"grpc://host:9\ttok")
+        host._record_token_line(b"no-tab-here")  # not a token-report line
+        assert host._tensor_token == "tok"
+
+    def test_watch_loop_caches_from_pipe(self):
+        """The reader thread caches lines written to the pipe and exits on EOF."""
+        host = KernelHost(health_probe_code=None)
+        r, w = os.pipe()
+        host._token_r = r
+        host._start_token_watch()
+        try:
+            os.write(w, b"grpc://h:9\ttok-A\n")
+            # Two messages in one write are both processed (line-framed).
+            os.write(w, b"grpc://h:9\ttok-B\ngrpc://h:9\ttok-")
+            deadline = time.time() + 5.0
+            while host._tensor_token != "tok-B" and time.time() < deadline:
+                time.sleep(0.02)
+            assert host._tensor_token == "tok-B"  # partial trailing line buffered
+        finally:
+            os.close(w)  # EOF -> reader thread returns
+        host._token_thread.join(timeout=5.0)
+        assert not host._token_thread.is_alive()
+        os.close(r)
 
 
 @pytest.fixture
@@ -228,6 +418,43 @@ class TestKernelLifecycle:
         assert calls.index(("shutdown_current",)) > 0
         assert not host.is_alive()
 
+    def test_restart_attempts_graceful_close_before_kill(self, monkeypatch):
+        # restart() drops the tensor connection just as abruptly as shutdown(),
+        # so it must send the same graceful-close snippet (not just the dask
+        # release) before _shutdown_current() group-kills the old kernel --
+        # only the timeout budget differs (restart is not on the Ctrl-C path).
+        from biopb_mcp.mcp import _kernel
+
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        host.start()
+
+        calls = []
+        real_execute_locked = host._execute_locked
+        real_shutdown_current = host._shutdown_current
+
+        def _spy_execute(code, timeout):
+            calls.append(("execute", code, timeout))
+            return real_execute_locked(code, timeout)
+
+        def _spy_shutdown_current():
+            calls.append(("shutdown_current",))
+            return real_shutdown_current()
+
+        monkeypatch.setattr(host, "_execute_locked", _spy_execute)
+        monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
+
+        try:
+            host.restart()
+
+            assert calls[0][0] == "execute"
+            assert calls[0][1] is _kernel._GRACEFUL_CLOSE_SNIPPET
+            assert calls[0][2] == 5.0
+            assert ("shutdown_current",) in calls
+            # Unlike shutdown, a restart respawns: the host comes back alive.
+            assert host.is_alive()
+        finally:
+            host.shutdown()
+
     def test_health_probe_failure_raises(self):
         # Probe expects a name that does not exist in a bare kernel.
         host = KernelHost(
@@ -345,9 +572,7 @@ class TestWatchdog:
         try:
             pid1 = host._kernel_pid()
             os.kill(pid1, signal.SIGKILL)
-            assert _wait_until(
-                lambda: host.is_alive() and host._kernel_pid() != pid1
-            )
+            assert _wait_until(lambda: host.is_alive() and host._kernel_pid() != pid1)
             assert host.is_alive()
             assert host._kernel_pid() != pid1
             assert not host._dead
@@ -386,9 +611,7 @@ class TestWatchdog:
             # kernel is alive, not marked dead, and the namespace is cleared.
             assert host.is_alive()
             assert not host._dead
-            assert (
-                "False" in host.execute("print('survivor' in dir())")["stdout"]
-            )
+            assert "False" in host.execute("print('survivor' in dir())")["stdout"]
         finally:
             host.shutdown()
 
@@ -521,9 +744,7 @@ class TestParentDeathPipe:
         r, w = os.pipe()
         monkeypatch.setenv(_deathwatch.ENV_FD, str(r))
         killed = []
-        monkeypatch.setattr(
-            os, "killpg", lambda pg, sig: killed.append((pg, sig))
-        )
+        monkeypatch.setattr(os, "killpg", lambda pg, sig: killed.append((pg, sig)))
 
         assert _deathwatch.install() is True
         os.close(w)  # launcher "dies" -> read end sees EOF
@@ -685,8 +906,7 @@ class TestWindowClosePipe:
             # Simulate the in-kernel close hook: the kernel writes a byte to its
             # inherited write end of the window-close pipe.
             host.execute(
-                "import os; "
-                "os.write(int(os.environ['BIOPB_WINDOW_CLOSE_FD']), b'x')"
+                "import os; os.write(int(os.environ['BIOPB_WINDOW_CLOSE_FD']), b'x')"
             )
             deadline = time.time() + 10
             while host.is_alive() and time.time() < deadline:
@@ -722,5 +942,177 @@ class TestWindowClosePipe:
         try:
             host.start()
             assert host._window_r is None
+        finally:
+            host.shutdown()
+
+
+class TestWindowClosePoll:
+    """Windows fallback for the POSIX pipe: poll the in-kernel window-alive
+    probe and reap the kernel when the user closes the napari window. The tick
+    logic is unit-tested (no kernel/display) by forcing the poll path on and
+    stubbing the probe; one integration test drives the real poll loop against a
+    plain kernel with the probe symbol injected."""
+
+    def _host(self):
+        host = KernelHost(
+            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
+        )
+        # Force the Windows poll path regardless of the test platform.
+        host._window_close_poll = True
+        return host
+
+    def test_tick_tears_down_when_window_gone(self, monkeypatch):
+        host = self._host()
+        host._ready.set()
+        calls = {}
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "ok", "stdout": "False\n"},
+        )
+        monkeypatch.setattr(host, "shutdown", lambda: calls.setdefault("down", True))
+        assert host._window_close_tick() is True
+        assert calls.get("down")
+        assert host._teardown_reason and "window" in host._teardown_reason
+
+    def test_tick_noop_when_window_alive(self, monkeypatch):
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "ok", "stdout": "True\n"},
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down a live window")
+        )
+        assert host._window_close_tick() is False
+        assert host._teardown_reason is None
+
+    def test_tick_skips_busy_kernel(self, monkeypatch):
+        # A running job holds the lock: never probe or tear down mid-job.
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: True)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: pytest.fail("probed a busy kernel"),
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down a busy kernel")
+        )
+        assert host._window_close_tick() is False
+
+    def test_tick_inconclusive_probe_is_noop(self, monkeypatch):
+        # A busy/timeout/error probe must not be read as "window gone".
+        host = self._host()
+        host._ready.set()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: {"status": "busy", "stdout": ""},
+        )
+        monkeypatch.setattr(
+            host, "shutdown", lambda: pytest.fail("tore down on inconclusive probe")
+        )
+        assert host._window_close_tick() is False
+
+    def test_tick_skips_until_ready(self, monkeypatch):
+        # _ready unset (mid (re)spawn): don't probe a half-built kernel.
+        host = self._host()
+        monkeypatch.setattr(host, "is_busy", lambda: False)
+        monkeypatch.setattr(
+            host,
+            "_execute_internal",
+            lambda *a, **k: pytest.fail("probed before ready"),
+        )
+        assert host._window_close_tick() is False
+
+    def test_poll_loop_reaps_on_real_probe(self):
+        # End-to-end against a plain kernel: the bootstrap normally injects
+        # _viewer_window_alive; here we inject it returning False and let the
+        # real poll thread (started by start()) detect the close and reap.
+        host = self._host()
+        host._window_poll_interval = 0.05
+        try:
+            host.start()
+            assert host._window_thread is not None and host._window_thread.is_alive()
+            host.execute("_viewer_window_alive = lambda: False")
+            deadline = time.time() + 10
+            while host.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
+            assert not host.is_alive()
+            assert host._teardown_reason and "window" in host._teardown_reason
+            res = host.execute("1 + 1")
+            assert res["status"] == "not_started"
+            assert "window" in res["error_text"]
+        finally:
+            host.shutdown()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="token-report pipe is POSIX-only")
+class TestTokenReportPipe:
+    """End-to-end token persistence across a kernel restart (issue #86)."""
+
+    def test_kernel_reports_token_to_launcher(self):
+        """A token the kernel writes to its report fd is cached in the host."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            host.start()
+            assert host._token_r is not None
+            # Simulate the in-kernel on_connect hook reporting (url, token).
+            host.execute(
+                "import os; os.write(int(os.environ['BIOPB_TOKEN_REPORT_FD']),"
+                " b'grpc://srv:8815\\tsecret-tok\\n')"
+            )
+            deadline = time.time() + 10
+            while host._tensor_token != "secret-tok" and time.time() < deadline:
+                time.sleep(0.05)
+            assert host._tensor_url == "grpc://srv:8815"
+            assert host._tensor_token == "secret-tok"
+        finally:
+            host.shutdown()
+
+    def test_remembered_token_is_reinjected_on_launch(self):
+        """A token remembered in the host reaches the (re)launched kernel's env —
+        the mechanism that lets a GUI-entered token survive restart_kernel."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        # Pre-seed as if a prior kernel had reported it before dying.
+        host._tensor_url = "grpc://srv:8815"
+        host._tensor_token = "remembered-tok"
+        try:
+            host.start()
+            res = host.execute(
+                "import os; print(os.environ.get('BIOPB_TENSOR_TOKEN'),"
+                " os.environ.get('BIOPB_TENSOR_URL'))"
+            )
+            assert "remembered-tok" in res["stdout"]
+            assert "grpc://srv:8815" in res["stdout"]
+        finally:
+            host.shutdown()
+
+    def test_token_survives_across_restart(self):
+        """The full loop: kernel reports a token, restart_kernel rebuilds the
+        kernel, and the new kernel's env carries the remembered token."""
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
+        try:
+            host.start()
+            host.execute(
+                "import os; os.write(int(os.environ['BIOPB_TOKEN_REPORT_FD']),"
+                " b'grpc://srv:8815\\tround-trip-tok\\n')"
+            )
+            deadline = time.time() + 10
+            while host._tensor_token != "round-trip-tok" and time.time() < deadline:
+                time.sleep(0.05)
+            assert host._tensor_token == "round-trip-tok"
+
+            host.restart()  # the #86 repro: kernel process is replaced
+
+            res = host.execute("import os; print(os.environ.get('BIOPB_TENSOR_TOKEN'))")
+            assert "round-trip-tok" in res["stdout"]
         finally:
             host.shutdown()

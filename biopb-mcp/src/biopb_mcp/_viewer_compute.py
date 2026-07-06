@@ -58,9 +58,7 @@ class _ViewerArray(NDArrayOperatorsMixin):
         # NumPy dispatch to dask's own __array_ufunc__. The result is a plain
         # lazy dask array on the default (distributed) scheduler -- not re-wrapped
         # -- so derived agent expressions are not pinned to the viewer scheduler.
-        inputs = tuple(
-            x._arr if isinstance(x, _ViewerArray) else x for x in inputs
-        )
+        inputs = tuple(x._arr if isinstance(x, _ViewerArray) else x for x in inputs)
         out = kwargs.get("out")
         if out is not None:
             kwargs["out"] = tuple(

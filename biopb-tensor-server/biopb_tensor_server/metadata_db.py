@@ -31,12 +31,13 @@ import re
 import threading
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
 if TYPE_CHECKING:
     from biopb_tensor_server.base import BackendAdapter
@@ -60,6 +61,7 @@ class NumpyEncoder(json.JSONEncoder):
                 return obj.decode("utf-8")
             except UnicodeDecodeError:
                 import base64
+
                 return base64.b64encode(obj).decode("ascii")
         # Catch-all: indicate unserializable type
         return f"Unserializable {type(obj).__qualname__}"
@@ -71,8 +73,11 @@ class MetadataDatabase:
     Thread-safe: All operations are protected by a lock.
     Lazy initialization: Database created on first access.
 
+    The metadata DB is mandatory (biopb/biopb#225): it is the canonical
+    source-browsing surface (``client.query_sources``), so there is no
+    off switch -- constructing this object means the catalog is live.
+
     Args:
-        enabled: If False, all operations are no-ops (for disabling feature)
         max_query_results: Safety cap on returned rows (truncation signaled via schema metadata)
         query_timeout_ms: Query execution timeout in milliseconds
 
@@ -100,6 +105,15 @@ class MetadataDatabase:
         "LOAD",
     }
 
+    # Match forbidden keywords only as whole words. A plain substring test
+    # rejects legitimate queries where the keyword appears inside an identifier
+    # or string literal (e.g. `LIKE '%/uploads/%'` contains LOAD, `%update%`
+    # contains UPDATE). The real defense against file/network access is
+    # enable_external_access=False on the connection; this is defense in depth.
+    FORBIDDEN_KEYWORD_PATTERN = re.compile(
+        r"\b(" + "|".join(sorted(FORBIDDEN_KEYWORDS)) + r")\b"
+    )
+
     # Only these tables can be referenced in queries
     ALLOWED_TABLES: Set[str] = {"sources"}
 
@@ -114,11 +128,9 @@ class MetadataDatabase:
 
     def __init__(
         self,
-        enabled: bool = True,
         max_query_results: int = 100000,
         query_timeout_ms: int = 30000,
     ):
-        self._enabled = enabled
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
 
@@ -126,12 +138,9 @@ class MetadataDatabase:
         self._write_lock = threading.Lock()  # Lock for write operations only
         self._initialized = False
 
-        if self._enabled:
-            logger.info(
-                "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
-            )
-        else:
-            logger.info("MetadataDatabase disabled")
+        logger.info(
+            "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
+        )
 
         # Pending query results for DoGet (stored by ticket)
         self._pending_results: Dict[str, pa.Table] = {}
@@ -185,7 +194,34 @@ class MetadataDatabase:
                 dtype TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
-                shape_summary TEXT
+                shape_summary TEXT,
+                -- NOT NULL DEFAULT FALSE: every source has a residency value
+                -- (both insert sites write the descriptor's data_resident bit),
+                -- and a non-null column lets `WHERE data_resident` /
+                -- `WHERE NOT data_resident` partition ALL rows cleanly -- no
+                -- three-valued-logic gap where a NULL row silently drops from
+                -- both. FALSE is the conservative default (unknown -> treat as
+                -- non-resident; still discoverable via `WHERE NOT data_resident`).
+                data_resident BOOLEAN NOT NULL DEFAULT FALSE,
+                -- Full per-tensor structural info (biopb/biopb#224): one struct
+                -- per tensor, so multi-field / HCS sources are queryable per
+                -- tensor instead of via the first-tensor projection only. Only
+                -- cheap/structural fields (already in the lean ListFlights
+                -- descriptor) are stored here -- the expensive/lazy fields
+                -- (metadata_json, pyramid, physical_scale) are deliberately left
+                -- out, filled only by GetFlightInfo. A single nested column (not a
+                -- child table) keeps the whole row a single-statement upsert, so
+                -- shrinking a source's tensor set can't leave ghost rows and a
+                -- read never straddles a torn sources-tensors join. Unresolved
+                -- cloud sources carry an empty list. Query per tensor with
+                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
+                tensors STRUCT(
+                    array_id VARCHAR,
+                    dim_labels VARCHAR[],
+                    shape BIGINT[],
+                    chunk_shape BIGINT[],
+                    dtype VARCHAR
+                )[]
             )
         """)
         # Index on source_url for path filtering
@@ -198,19 +234,22 @@ class MetadataDatabase:
         Raises:
             ValueError: If query contains forbidden keywords or references disallowed tables
         """
-        # Normalize SQL for checking
-        normalized = sql.upper()
+        # Strip single-quoted string literals before scanning so keywords that
+        # appear *inside* a literal (e.g. `LIKE '%update%'`) aren't mistaken for
+        # SQL keywords or table names. '' is DuckDB's escaped single quote.
+        literal_free = re.sub(r"'(?:''|[^'])*'", "''", sql)
+        normalized = literal_free.upper()
 
-        # Check for forbidden keywords
-        for keyword in self.FORBIDDEN_KEYWORDS:
-            if keyword in normalized:
-                raise ValueError(
-                    f"SQL query contains forbidden keyword: {keyword}. "
-                    f"Only SELECT queries are allowed."
-                )
+        # Check for forbidden keywords (whole-word match, see pattern above)
+        match = self.FORBIDDEN_KEYWORD_PATTERN.search(normalized)
+        if match:
+            raise ValueError(
+                f"SQL query contains forbidden keyword: {match.group(1)}. "
+                f"Only SELECT queries are allowed."
+            )
 
         # Check for table references
-        table_refs = self.TABLE_REFERENCE_PATTERN.findall(sql)
+        table_refs = self.TABLE_REFERENCE_PATTERN.findall(literal_free)
         referenced_tables = set()
         for match in table_refs:
             for table_name in match:
@@ -224,14 +263,6 @@ class MetadataDatabase:
                     f"SQL query references disallowed table: {table}. "
                     f"Only the 'sources' table is accessible."
                 )
-
-        # Check for subqueries that might reference external resources
-        # (DuckDB can't actually access external resources without explicit config,
-        # but we validate anyway for clarity)
-        if "SELECT" in normalized and "(" in normalized:
-            # Has subquery - ensure it only references sources
-            # This is a simplified check; DuckDB's SQL parser would be more thorough
-            pass  # DuckDB won't allow external table references without explicit config
 
     def handle_query(self, sql: str) -> flight.FlightInfo:
         """Execute a safe SQL query and return FlightInfo.
@@ -250,9 +281,6 @@ class MetadataDatabase:
         Raises:
             ValueError: If query is invalid or violates security rules
         """
-        if not self._enabled:
-            raise ValueError("Metadata database is disabled")
-
         self._validate_query(sql)
 
         # Use cursor for thread-safe read (no lock needed for SELECT)
@@ -331,145 +359,213 @@ class MetadataDatabase:
         return result
 
     def sync_source_added(self, source_id: str, adapter: BackendAdapter) -> None:
-        """Sync a source to the metadata database.
+        """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
-        Called by SourceManager._on_source_added callback.
+        Called by ``SourceManager`` when a source is registered and, for a
+        previously-unresolved cloud source, again when it resolves (the upsert
+        overwrites the placeholder row with the concrete descriptor).
+
+        Raises on failure (descriptor read, JSON encode, or DB write) rather
+        than swallowing, so the caller can react -- the registration path rolls
+        back the matching ``register_source`` so the catalog and ``ListFlights``
+        never silently disagree. Logging is the caller's responsibility.
 
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
         """
-        if not self._enabled:
-            return
+        conn = self._get_connection()
+
+        # Get source descriptor and metadata
+        source_desc = adapter.get_source_descriptor()
+        metadata = adapter.get_metadata()
+
+        # Scalar first-tensor projection, kept for back-compat: the MCP guide's
+        # `WHERE dtype='uint16'` / `shape_summary` predicates keep working, and
+        # since they are written in the SAME upsert as the tensors struct below
+        # they can never desync from it.
+        shape_summary = None
+        dtype = None
+        if source_desc.tensors:
+            first_tensor = source_desc.tensors[0]
+            shape_summary = json.dumps(list(first_tensor.shape))
+            dtype = first_tensor.dtype
+
+        # Full per-tensor structural info (biopb/biopb#224): one struct per tensor,
+        # not just tensors[0]. Every field here is already populated in the lean
+        # ListFlights descriptor (source_desc.tensors), so this adds no adapter
+        # call and no recall. Expensive/lazy fields (metadata_json, pyramid,
+        # physical_scale) are intentionally omitted -- they are filled only by
+        # GetFlightInfo. Unresolved cloud sources have no tensors -> empty list.
+        tensors = [
+            {
+                "array_id": t.array_id,
+                "dim_labels": list(t.dim_labels),
+                "shape": [int(s) for s in t.shape],
+                "chunk_shape": [int(c) for c in t.chunk_shape],
+                "dtype": t.dtype,
+            }
+            for t in source_desc.tensors
+        ]
+
+        # Build row data
+        indexed_at = datetime.now()
+        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
+
+        # Insert or replace (upsert) - serialize writes with lock
+        with self._write_lock:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sources
+                (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary, data_resident, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                [
+                    source_id,
+                    source_desc.source_url,
+                    source_desc.source_type,
+                    dtype,
+                    indexed_at,
+                    metadata_json,
+                    shape_summary,
+                    source_desc.data_resident,
+                    tensors,
+                ],
+            )
+
+        logger.debug(f"Synced source to metadata database: {source_id}")
+
+    def get_metadata_json(self, source_id: str) -> Optional[dict]:
+        """Return a source's stored metadata as a dict, or ``None`` to fall back.
+
+        The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
+        dict, no envelope -- so the serve path can read metadata back with a
+        cheap local ``SELECT`` instead of recomputing it on the adapter
+        (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
+        the local mirror row directly, never ``adapter.get_metadata()``). The
+        stored JSON is parsed here so callers get a ready dict.
+
+        Returns ``None`` in every "no usable catalog metadata" case -- so the
+        caller uniformly falls back to ``adapter.get_metadata()``:
+        - the source is absent, or its metadata is SQL NULL (empty is stored as
+          NULL),
+        - the stored value is not valid JSON / not a JSON object,
+        - the DuckDB read itself fails.
+
+        Never raises: a catalog read error degrades to the adapter path rather
+        than failing the serve. Uses ``cursor()`` for a thread-safe read.
+        """
+        try:
+            cursor = self._get_cursor()
+            row = cursor.execute(
+                "SELECT metadata_json FROM sources WHERE source_id = ?", [source_id]
+            ).fetchone()
+        except Exception as exc:
+            logger.warning(
+                "metadata_json read failed for source %s: %s", source_id, exc
+            )
+            return None
+
+        if row is None or not row[0]:
+            return None
 
         try:
-            conn = self._get_connection()
+            parsed = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "stored metadata_json for source %s is not valid JSON", source_id
+            )
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
-            # Get source descriptor
-            source_desc = adapter.get_source_descriptor()
+    def list_source_descriptors(
+        self, limit: Optional[int] = None
+    ) -> Tuple[List[DataSourceDescriptor], int]:
+        """Rebuild the lean ListFlights descriptors from the catalog.
 
-            # Get metadata
-            metadata = adapter.get_metadata()
+        The DuckDB-backed equivalent of iterating adapters and calling
+        ``get_source_descriptor()``. Serving ``ListFlights`` from here makes the
+        catalog the single source of truth for browsing, so ``list_sources`` and
+        ``query_sources`` cannot drift (biopb/biopb#265).
 
-            # Build shape_summary from first tensor
-            shape_summary = None
-            dtype = None
-            if source_desc.tensors:
-                first_tensor = source_desc.tensors[0]
-                shape_summary = json.dumps(list(first_tensor.shape))
-                dtype = first_tensor.dtype
+        Only the cheap/structural fields the lean descriptor carries are
+        reconstructed: per-tensor ``array_id``/``dim_labels``/``shape``/
+        ``chunk_shape``/``dtype`` from the ``tensors`` STRUCT[] (biopb/biopb#224).
+        ``metadata_json`` is left empty (filled by ``GetFlightInfo``), exactly
+        like the adapter path. ``data_resident`` is the stored snapshot -- the
+        field is advisory/volatile by contract (the authoritative gate is a fresh
+        ``adapter.is_resident()``), so a point-in-time value is acceptable here.
 
-            # Build row data
-            indexed_at = datetime.now()
-            metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
+        Uses ``cursor()`` for a thread-safe read (no lock). The full count is
+        carried by a ``COUNT(*) OVER ()`` window in the SAME statement as the
+        rows (window functions run before ``LIMIT``), so ``total`` and the
+        clipped rows come from one consistent snapshot -- a separate
+        ``SELECT COUNT(*)`` could race a concurrent upload and report
+        ``returned > total``.
 
-            # Insert or replace (upsert) - serialize writes with lock
-            with self._write_lock:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                    [
-                        source_id,
-                        source_desc.source_url,
-                        source_desc.source_type,
-                        dtype,
-                        indexed_at,
-                        metadata_json,
-                        shape_summary,
-                    ],
+        Args:
+            limit: Max rows to return (the ListFlights safety cap). ``None`` =
+                no cap.
+
+        Returns:
+            ``(descriptors, total)`` where ``total`` is the full catalog row
+            count (so the caller can signal truncation when ``limit`` clips it).
+        """
+        cursor = self._get_cursor()
+
+        sql = (
+            "SELECT source_id, source_url, source_type, data_resident, tensors, "
+            "COUNT(*) OVER () AS total_count "
+            "FROM sources ORDER BY source_id"
+        )
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = cursor.execute(sql, params).fetchall()
+
+        # COUNT(*) OVER () is identical on every row; no rows -> empty catalog.
+        total = rows[0][-1] if rows else 0
+
+        descriptors: List[DataSourceDescriptor] = []
+        for source_id, source_url, source_type, data_resident, tensors, _ in rows:
+            tensor_descs = [
+                TensorDescriptor(
+                    array_id=t["array_id"],
+                    dim_labels=t["dim_labels"] or [],
+                    shape=t["shape"] or [],
+                    chunk_shape=t["chunk_shape"] or [],
+                    dtype=t["dtype"] or "",
                 )
-
-            logger.debug(f"Synced source to metadata database: {source_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to sync source {source_id}: {e}", exc_info=True)
+                for t in (tensors or [])
+            ]
+            descriptors.append(
+                DataSourceDescriptor(
+                    source_id=source_id,
+                    source_url=source_url or "",
+                    source_type=source_type or "",
+                    tensors=tensor_descs,
+                    metadata_json="",  # lean; filled by GetFlightInfo
+                    data_resident=bool(data_resident),
+                )
+            )
+        return descriptors, total
 
     def sync_source_removed(self, source_id: str) -> None:
         """Remove a source from the metadata database.
 
-        Called by SourceManager._on_source_removed callback.
+        Called by ``SourceManager`` when a source is unregistered or rolled back.
+
+        Raises on DB failure rather than swallowing, so the caller can react;
+        logging is the caller's responsibility.
 
         Args:
             source_id: Unique source identifier
         """
-        if not self._enabled:
-            return
-
-        try:
-            conn = self._get_connection()
-            with self._write_lock:
-                conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
-            logger.debug(f"Removed source from metadata database: {source_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to remove source {source_id}: {e}", exc_info=True)
-
-    def initial_sync(self, server_sources: Dict[str, BackendAdapter]) -> None:
-        """Batch insert all existing sources on startup.
-
-        Called once after SourceManager is created to sync sources
-        that were discovered during initial discovery (before callbacks
-        were registered).
-
-        Args:
-            server_sources: Dict of source_id to BackendAdapter from server._sources
-        """
-        if not self._enabled:
-            return
-
-        if not server_sources:
-            return
-
         conn = self._get_connection()
-
-        # Build batch of rows (skip sources that fail to sync)
-        batch = []
-        failed_count = 0
-        for source_id, adapter in server_sources.items():
-            try:
-                source_desc = adapter.get_source_descriptor()
-                metadata = adapter.get_metadata()
-
-                shape_summary = None
-                dtype = None
-                if source_desc.tensors:
-                    first_tensor = source_desc.tensors[0]
-                    shape_summary = json.dumps(list(first_tensor.shape))
-                    dtype = first_tensor.dtype
-
-                batch.append(
-                    [
-                        source_id,
-                        source_desc.source_url,
-                        source_desc.source_type,
-                        dtype,
-                        datetime.now(),
-                        json.dumps(metadata, cls=NumpyEncoder) if metadata else None,
-                        shape_summary,
-                    ]
-                )
-            except Exception as e:
-                logger.error(f"Failed to sync source {source_id}: {e}", exc_info=True)
-                failed_count += 1
-
-        # Batch insert - serialize writes with lock
-        if batch:
-            with self._write_lock:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO sources
-                    (source_id, source_url, source_type, dtype, indexed_at, metadata_json, shape_summary)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                    batch,
-                )
-
-        logger.info(
-            f"Initial sync: inserted {len(batch)} sources into metadata database"
-        )
+        with self._write_lock:
+            conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+        logger.debug(f"Removed source from metadata database: {source_id}")
 
     def close(self) -> None:
         """Close the DuckDB connection."""

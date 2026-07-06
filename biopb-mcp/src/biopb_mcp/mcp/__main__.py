@@ -23,6 +23,8 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,34 @@ def _port_listening(port, timeout=0.5):
         return False
 
 
+def _self_create_time():
+    """This process's creation-time token, or None if it can't be determined.
+
+    Delegates to biopb._proc.process_create_time (the single source of truth
+    shared with biopb.cli, so the token this daemon writes is computed exactly
+    the way the CLI reads it) for os.getpid(): a per-process identity that lets
+    `biopb mcp stop`/`status` tell our daemon apart from an unrelated process
+    that later inherits a reused PID (Windows never cleans the PID file at logout
+    and recycles PIDs aggressively). None -> the CLI falls back to a liveness-only
+    check, the pre-fix behavior. Best-effort: any failure degrades to None.
+    """
+    try:
+        from biopb._proc import process_create_time
+
+        return process_create_time(os.getpid())
+    except Exception:
+        return None
+
+
+def _pidfile_contents():
+    """The text to write into the PID file: `pid` plus, when known, a `pid\\ntoken`
+    create-time identity. Read back by biopb.cli._read_pid_record (two whitespace-
+    separated ints, tolerant of the legacy bare-pid form)."""
+    pid = os.getpid()
+    token = _self_create_time()
+    return f"{pid}\n{token}" if token is not None else str(pid)
+
+
 def _write_pidfile(port):
     """Best-effort: record this daemon's PID so `biopb mcp status` finds it.
 
@@ -43,6 +73,10 @@ def _write_pidfile(port):
     the daemon detached without writing it — so the daemon registers itself
     here, covering every launch path uniformly. Best-effort: a write failure
     only costs `status` visibility, never the server.
+
+    Records a create-time identity token alongside the PID (see
+    :func:`_self_create_time`) so the CLI can distinguish this daemon from an
+    unrelated process that later inherits a reused PID.
 
     Concurrent first-run shims can each spawn a daemon; only the one that binds
     the port survives (the rest die on EADDRINUSE). Re-checking the port
@@ -58,7 +92,7 @@ def _write_pidfile(port):
             # Someone already owns the port; we are about to lose the bind.
             return None
         pidfile.parent.mkdir(parents=True, exist_ok=True)
-        pidfile.write_text(str(os.getpid()))
+        pidfile.write_text(_pidfile_contents())
         return pidfile
     except OSError:
         logger.warning("Could not write PID file %s", pidfile, exc_info=True)
@@ -68,15 +102,73 @@ def _write_pidfile(port):
 def _remove_pidfile(pidfile):
     """Remove our PID file, but only if it still names this process.
 
-    Pid-safe so a losing daemon's exit never deletes the winner's file.
+    Pid-safe so a losing daemon's exit never deletes the winner's file. Compares
+    only the first whitespace-separated field (the PID), ignoring any trailing
+    create-time token, so the match holds regardless of token presence.
     """
     if pidfile is None:
         return
     try:
-        if pidfile.read_text().strip() == str(os.getpid()):
+        if pidfile.read_text().split()[0] == str(os.getpid()):
             pidfile.unlink()
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
+
+
+def _shutdown_sentinel_path():
+    """Path of the stop-sentinel file `biopb mcp stop` writes on Windows.
+
+    A sibling of the PID file with a single fixed name — NOT keyed by PID: on
+    Windows the PID the CLI recorded can differ from this daemon's os.getpid()
+    (Store-Python/uv launcher shims), so a pid-keyed name would make stop and
+    the daemon disagree. There is only ever one daemon (the PID file is
+    singular too), so a fixed name is unambiguous. The biopb CLI hardcodes the
+    same name next to its hardcoded MCP_PID_FILE (biopb.cli._mcp_shutdown_sentinel);
+    keep the two in sync.
+    """
+    from .._config import get_pid_file
+
+    return get_pid_file().with_name("mcp-server.stop")
+
+
+def _install_shutdown_sentinel_watcher(sentinel, shutdown, poll=0.2):
+    """Let `biopb mcp stop` shut this daemon down gracefully on Windows.
+
+    There, ``os.kill(pid, SIGTERM)`` is an unconditional TerminateProcess —
+    immediate and uncatchable, so the SIGTERM handler installed in _serve_http
+    never runs and the kernel is left to ipykernel's in-kernel parent poller,
+    which reaps abruptly (``os._exit(1)``: no dask/Qt close, no spill-dir
+    cleanup) and not at all when the kernel is GIL-wedged (issue #323). So on
+    Windows `stop` instead drops a sentinel *file*; this watcher thread polls
+    for it and runs the same shared shutdown as the POSIX signal handler,
+    reaping the kernel from *outside* regardless of the kernel's internal
+    state. Same mechanism as the tensor server's `biopb server stop`
+    (http_server._install_windows_shutdown_listener), minus the uvicorn nudge:
+    ``shutdown`` here ``os._exit``\\ s and never returns, so the sentinel is
+    consumed *before* calling it.
+
+    A leftover sentinel from a previous run is ignored via an mtime guard
+    (only files touched at/after this watcher started count), so no startup
+    delete is needed. The *caller* gates installation on Windows (POSIX uses
+    real signals and needs no watcher); the function itself is
+    platform-agnostic so tests exercise it on every OS.
+    """
+    installed_at = time.time()
+
+    def _watch():
+        while True:
+            try:
+                if sentinel.exists() and sentinel.stat().st_mtime >= installed_at:
+                    logger.info("Stop sentinel found; shutting down.")
+                    sentinel.unlink(missing_ok=True)
+                    shutdown("stop sentinel")
+                    return
+            except OSError:
+                pass
+            time.sleep(poll)
+
+    threading.Thread(target=_watch, name="mcp-stop-sentinel", daemon=True).start()
+    logger.info("Stop-sentinel watcher installed (%s).", sentinel)
 
 
 def _parse_args(argv, default_transport, default_port):
@@ -142,15 +234,9 @@ def _setup_observe(config):
         from . import _observe
 
         _observe.configure(
-            max_output_chars=get_setting(
-                config, "mcp.observe.max_output_chars"
-            ),
-            poll_interval_ms=get_setting(
-                config, "mcp.observe.poll_interval_ms"
-            ),
-            allowed_origins=get_setting(
-                config, "mcp.transport.allowed_origins"
-            ),
+            max_output_chars=get_setting(config, "mcp.observe.max_output_chars"),
+            poll_interval_ms=get_setting(config, "mcp.observe.poll_interval_ms"),
+            allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
             allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
         )
         _observe.register_http_routes()
@@ -223,6 +309,7 @@ def _serve_http(config, port):
     """Run the real MCP server (streamable-http) in the foreground."""
     from .._config import get_setting
     from . import _server
+    from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
@@ -265,15 +352,6 @@ def _serve_http(config, port):
     if headless:
         kernel_env["BIOPB_HEADLESS"] = "1"
 
-    # Let the data-plane client cache chunks for a localhost tensor server
-    # (otherwise skipped as redundant with the server's own cache). Bridges
-    # interactive viewer responsiveness: repeated/overlapping plane reads
-    # within a chunk hit the cache instead of re-fetching the whole chunk.
-    # Inherited by the LocalCluster workers, where the bootstrap's cache plugin
-    # bounds each worker at mcp.dask.cache_budget // n_workers.
-    if get_setting(config, "mcp.tensor.cache_local"):
-        kernel_env.setdefault("BIOPB_CACHE_LOCAL", "1")
-
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
     # the launcher's stdout/stderr — which, when the daemon was spawned by the
@@ -282,7 +360,9 @@ def _serve_http(config, port):
     # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
     # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
     # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note).
+    # (issue #13, secondary disk-leak note). Consumed by the daemon-owned
+    # cluster (below) via DaskClusterHost.local_dir, or by a kernel-local cluster
+    # via BIOPB_DASK_LOCAL_DIR under the `owner="kernel"` escape hatch.
     dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
     kernel_env["BIOPB_DASK_LOCAL_DIR"] = dask_local_dir
 
@@ -294,6 +374,16 @@ def _serve_http(config, port):
     # the explicit calls on the os._exit paths harmless if they both run.
     atexit.register(_cleanup_dask_dir)
 
+    # Daemon-owned dask cluster: spun lazily on the first kernel launch (from
+    # KernelHost._launch, which injects its address), kept warm across kernel
+    # restarts, and closed only on real daemon exit (the _shutdown chokepoint +
+    # atexit backstop). Detaching the cluster from the kernel is what avoids
+    # re-spinning N cold workers on every restart_kernel — the dominant restart
+    # cost on Windows (no fork). Construction is cheap (no dask import until
+    # ensure()); atexit is a backstop for exits that skip _shutdown.
+    cluster_host = DaskClusterHost(config, local_dir=dask_local_dir)
+    atexit.register(cluster_host.close)
+
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=get_setting(config, "mcp.kernel.name"),
@@ -302,9 +392,7 @@ def _serve_http(config, port):
         busy_lock_timeout=get_setting(config, "mcp.kernel.busy_lock_timeout"),
         env=kernel_env,
         watchdog_interval=get_setting(config, "mcp.kernel.watchdog_interval"),
-        watchdog_max_respawns=get_setting(
-            config, "mcp.kernel.watchdog_max_respawns"
-        ),
+        watchdog_max_respawns=get_setting(config, "mcp.kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(
             config, "mcp.kernel.watchdog_respawn_window"
         ),
@@ -312,6 +400,9 @@ def _serve_http(config, port):
         # The window-close pipe only matters with a viewer; a headless kernel
         # has no window to close, so don't wire it up.
         window_close_pipe=not headless,
+        # Daemon-owned dask cluster; _launch calls ensure() and injects its
+        # scheduler address so the kernel attaches instead of spinning its own.
+        cluster_host=cluster_host,
     )
     _server.set_kernel_host(host)
     _server.set_promote_after(get_setting(config, "mcp.kernel.promote_after"))
@@ -346,20 +437,38 @@ def _serve_http(config, port):
     pidfile = _write_pidfile(port)
     atexit.register(_remove_pidfile, pidfile)
 
-    def _handle_signal(signum, frame):
-        logger.info("Received signal %s, shutting down.", signum)
+    def _shutdown(reason):
+        """One teardown for every deliberate-exit path — POSIX signals, the
+        Windows stop sentinel, the server loop returning: reap the kernel, close
+        the daemon-owned dask cluster, remove our files, exit.
+
+        Skips Python finalization: this process still has a live asyncio/epoll
+        event-loop thread and the numpy OpenBLAS worker pool running, and
+        tearing down the interpreter on top of them segfaults inside
+        Py_FinalizeEx (refcount write into a read-only static-type page).
+        The launcher's only remaining job is to exit, so exit immediately.
+        """
+        logger.info("Shutting down (%s).", reason)
         host.shutdown()
+        # After the kernel is reaped (no clients left attached): stop the
+        # daemon-owned cluster, then rmtree its now-idle spill dir. This is the
+        # only path that closes the cluster — kernel restart/reap leaves it warm.
+        cluster_host.close()
         _remove_pidfile(pidfile)
         _cleanup_dask_dir()
-        # Skip Python finalization: this process still has a live asyncio/epoll
-        # event-loop thread and the numpy OpenBLAS worker pool running, and
-        # tearing down the interpreter on top of them segfaults inside
-        # Py_FinalizeEx (refcount write into a read-only static-type page).
-        # The launcher's only remaining job is to exit, so exit immediately.
         os._exit(0)
+
+    def _handle_signal(signum, frame):
+        _shutdown(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # On Windows those handlers are unreachable from `biopb mcp stop` —
+    # os.kill(SIGTERM) is TerminateProcess, uncatchable — so stop drops a
+    # sentinel file instead and a watcher thread runs the same _shutdown.
+    if os.name == "nt":
+        _install_shutdown_sentinel_watcher(_shutdown_sentinel_path(), _shutdown)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.
@@ -371,13 +480,9 @@ def _serve_http(config, port):
         allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
     )
 
-    # If the server loop returns on its own, exit the same way: shut down the
-    # kernel and bypass Py_FinalizeEx (atexit handlers do not run after
-    # os._exit, so shut down explicitly here).
-    host.shutdown()
-    _remove_pidfile(pidfile)
-    _cleanup_dask_dir()
-    os._exit(0)
+    # If the server loop returns on its own, exit the same way (atexit
+    # handlers do not run after os._exit, so tear down explicitly here).
+    _shutdown("server loop exited")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,32 @@ public class TensorFlightClientUtilTest {
         assertEquals("plate_x", TensorFlightClient.sourceIdFromArrayId("plate_x/A01/0"));
     }
 
+    @Test
+    public void testResolveArrayIdBareSource() {
+        // bare source_id -> {source_id, null}: tensorId unset so getTensor
+        // resolves the source's sole/default tensor
+        String[] route = TensorFlightClient.resolveArrayId("zarr_a3f2");
+        assertEquals("zarr_a3f2", route[0]);
+        assertNull(route[1]);
+    }
+
+    @Test
+    public void testResolveArrayIdQualified() {
+        // qualified source_id/field -> {source_id, full-array_id}
+        String[] route = TensorFlightClient.resolveArrayId("aics_7f3/Image:0");
+        assertEquals("aics_7f3", route[0]);
+        assertEquals("aics_7f3/Image:0", route[1]);
+    }
+
+    @Test
+    public void testResolveArrayIdHierarchicalField() {
+        // HCS field carries its own '/': source boundary is the FIRST '/', and
+        // the full array_id is preserved as the tensorId
+        String[] route = TensorFlightClient.resolveArrayId("plate_x/A01/0");
+        assertEquals("plate_x", route[0]);
+        assertEquals("plate_x/A01/0", route[1]);
+    }
+
     // We can test bytesPerElement and createType by examining the types they create
 
     @Test
@@ -187,6 +213,28 @@ public class TensorFlightClientUtilTest {
         assertEquals(1, version[0]);
         assertEquals(2, version[1]);
         assertEquals(3, version[2]);
+    }
+
+    @Test
+    public void testRealParseVersionHandlesBuildMetadataSuffix() throws Exception {
+        // Regression: the real (private) parseVersion used split("+") -- an
+        // invalid regex that throws PatternSyntaxException on dev versions with
+        // a "+gHASH" build-metadata suffix. The local mirror above uses the
+        // correct split("\\+"), so it never covered the real method. Invoke the
+        // real one via reflection.
+        java.lang.reflect.Method m =
+                TensorFlightClient.class.getDeclaredMethod("parseVersion", String.class);
+        m.setAccessible(true);
+
+        int[] dev = (int[]) m.invoke(null, "0.3.1.dev43+gabc123");
+        assertEquals(0, dev[0]);
+        assertEquals(3, dev[1]);
+        assertEquals(1, dev[2]);
+
+        int[] plus = (int[]) m.invoke(null, "1.2.3+gabc");
+        assertEquals(1, plus[0]);
+        assertEquals(2, plus[1]);
+        assertEquals(3, plus[2]);
     }
 
     @Test

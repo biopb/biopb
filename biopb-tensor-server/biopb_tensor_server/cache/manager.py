@@ -42,17 +42,21 @@ class CacheManager:
 
     def __init__(self, config: CacheConfig):
         """Initialize with CacheConfig, selecting backend based on config.backend."""
-        if config.backend == 'memory':
-            self._backend = MemoryCacheBackend(MemoryCacheConfig(
-                max_entries=config.memory_max_entries,
-                max_bytes=config.memory_max_bytes,
-            ))
-        elif config.backend == 'file':
-            self._backend = ArrowFileBackend(ArrowFileConfig(
-                cache_dir=config.file_cache_dir,
-                max_segment_bytes=config.file_max_segment_bytes,
-                max_total_bytes=config.file_max_total_bytes,
-            ))
+        if config.backend == "memory":
+            self._backend = MemoryCacheBackend(
+                MemoryCacheConfig(
+                    max_entries=config.memory_max_entries,
+                    max_bytes=config.memory_max_bytes,
+                )
+            )
+        elif config.backend == "file":
+            self._backend = ArrowFileBackend(
+                ArrowFileConfig(
+                    cache_dir=config.file_cache_dir,
+                    max_segment_bytes=config.file_max_segment_bytes,
+                    max_total_bytes=config.file_max_total_bytes,
+                )
+            )
         else:
             raise ValueError(f"Unknown cache backend: {config.backend}")
 

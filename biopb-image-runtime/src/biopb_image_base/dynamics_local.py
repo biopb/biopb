@@ -99,9 +99,7 @@ def compute_destinations(
     return inds, p
 
 
-def _detect_seeds(
-    h: np.ndarray, min_count: int
-) -> np.ndarray:
+def _detect_seeds(h: np.ndarray, min_count: int) -> np.ndarray:
     """Peak coordinates of the destination histogram, sorted by ascending count.
 
     A voxel is a seed if it is a local maximum within a 5-window and collects
@@ -172,7 +170,7 @@ def cluster_destinations(
     # Build the combined, deduped seed list. Injected seeds are forced in and
     # carry an inherited id; own peaks near an injected seed are dropped so the
     # cell keeps the inherited id rather than a fresh one.
-    seed_coords: list = []   # each ndim tuple in padded coords
+    seed_coords: list = []  # each ndim tuple in padded coords
     seed_inherit: list = []  # inherited id or None
     injected_seeds = injected_seeds or []
     for coord, gid in injected_seeds:
@@ -181,7 +179,9 @@ def cluster_destinations(
         seed_coords.append(pc)
         seed_inherit.append(gid)
 
-    inj_arr = np.array([c for c in seed_coords], dtype=np.float64) if seed_coords else None
+    inj_arr = (
+        np.array([c for c in seed_coords], dtype=np.float64) if seed_coords else None
+    )
     for k in range(own_seeds.shape[1]):
         c = own_seeds[:, k]
         if inj_arr is not None and len(inj_arr):

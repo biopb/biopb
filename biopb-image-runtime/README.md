@@ -38,19 +38,17 @@ class MyServicer(BiopbServicerBase):
             )
 
     def Run(self, request, context):
-        """Define the logic of your algorithm"""
-        with self._server_context(context):
-            img = decode_image_data(request.image_data)
-            result = ...  # your result (numpy array)
-            return proto.ProcessResponse(
-                image_data=encode_image(result)
-            )
-
+        img = decode_image_data(request.image_data)
+        result = ...  # your result (numpy or dask array)
+        return proto.ProcessResponse(
+            image_data=return_lazy_or_eager(result, self._tensor_cache)
+        )
 
 # Run the service
 run_server(MyServicer(), port=50051)
 ```
-See [biopb-server](https://github.com/biopb/biopb-server) project for examples of fully fleshed-out servicer implementations.
+
+See [biopb-server](https://github.com/biopb/biopb-server) project for fully functional implementation examples.
 
 ### Run the new servicer
 ```bash

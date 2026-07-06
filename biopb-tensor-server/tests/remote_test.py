@@ -2,12 +2,9 @@
 
 import json
 import os
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import fsspec
-
+import pytest
 from biopb_tensor_server.discovery import generate_source_id
 from biopb_tensor_server.remote import (
     CredentialProfile,
@@ -19,10 +16,10 @@ from biopb_tensor_server.remote import (
     is_remote_url,
 )
 
-
 # =============================================================================
 # CredentialProfile Tests
 # =============================================================================
+
 
 class TestCredentialProfile:
     """Tests for CredentialProfile.to_storage_options()."""
@@ -127,12 +124,16 @@ class TestCredentialProfile:
             token="DefaultEndpointsProtocol=https;AccountName=...",
         )
         opts = profile.to_storage_options()
-        assert opts["connection_string"] == "DefaultEndpointsProtocol=https;AccountName=..."
+        assert (
+            opts["connection_string"]
+            == "DefaultEndpointsProtocol=https;AccountName=..."
+        )
 
 
 # =============================================================================
 # CredentialsConfig Tests
 # =============================================================================
+
 
 class TestCredentialsConfig:
     """Tests for CredentialsConfig profile lookup."""
@@ -180,6 +181,7 @@ class TestCredentialsConfig:
 # =============================================================================
 # URL Detection Tests
 # =============================================================================
+
 
 class TestDetectStorageType:
     """Tests for _detect_storage_type()."""
@@ -283,6 +285,7 @@ class TestGenerateSourceIdRemote:
 # Signed URL Tests
 # =============================================================================
 
+
 class TestExtractSignedUrlParams:
     """Tests for _extract_signed_url_params()."""
 
@@ -322,6 +325,7 @@ class TestExtractSignedUrlParams:
 # Environment Credentials Tests
 # =============================================================================
 
+
 class TestGetEnvCredentials:
     """Tests for _get_env_credentials()."""
 
@@ -355,9 +359,15 @@ class TestGetEnvCredentials:
     def test_no_env_credentials(self, monkeypatch):
         """No credentials in environment returns empty dict."""
         # Clear all relevant env vars
-        for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-                    "AWS_DEFAULT_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
-                    "AZURE_STORAGE_ACCOUNT_NAME", "AZURE_STORAGE_ACCOUNT_KEY"]:
+        for var in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_DEFAULT_REGION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AZURE_STORAGE_ACCOUNT_NAME",
+            "AZURE_STORAGE_ACCOUNT_KEY",
+        ]:
             monkeypatch.delenv(var, raising=False)
 
         opts = _get_env_credentials("s3")
@@ -368,11 +378,12 @@ class TestGetEnvCredentials:
 # RemoteStore Tests (Memory Filesystem)
 # =============================================================================
 
+
 @pytest.fixture
 def memory_fs():
     """Create in-memory filesystem with test data (module-level fixture)."""
-    fs = fsspec.filesystem('memory')
-    fs.mkdir('/test.zarr')
+    fs = fsspec.filesystem("memory")
+    fs.mkdir("/test.zarr")
     zarray_meta = {
         "zarr_format": 2,
         "shape": [10, 10],
@@ -382,11 +393,11 @@ def memory_fs():
         "fill_value": 0,
         "order": "C",
     }
-    fs.pipe('/test.zarr/.zarray', json.dumps(zarray_meta).encode())
+    fs.pipe("/test.zarr/.zarray", json.dumps(zarray_meta).encode())
     yield fs
     # Cleanup
     try:
-        fs.rm('/', recursive=True)
+        fs.rm("/", recursive=True)
     except Exception:
         pass
 
@@ -399,12 +410,12 @@ class TestRemoteStoreMemoryFS:
         store = RemoteStore("memory:///test.zarr")
         assert store.exists() == True
         assert store.isdir() == True
-        assert store.exists('.zarray') == True
+        assert store.exists(".zarray") == True
 
     def test_remote_store_read_text(self, memory_fs):
         """Read file contents from memory filesystem."""
         store = RemoteStore("memory:///test.zarr")
-        content = store.read_text('.zarray')
+        content = store.read_text(".zarray")
         meta = json.loads(content)
         assert meta["zarr_format"] == 2
         assert meta["shape"] == [10, 10]
@@ -412,41 +423,41 @@ class TestRemoteStoreMemoryFS:
     def test_remote_store_listdir(self):
         """List directory contents."""
         # Create fresh filesystem for this test
-        fs = fsspec.filesystem('memory')
-        fs.mkdir('/listdir_test.zarr')
-        fs.touch('/listdir_test.zarr/.zarray')
-        fs.touch('/listdir_test.zarr/.zattrs')
-        fs.mkdir('/listdir_test.zarr/0')
+        fs = fsspec.filesystem("memory")
+        fs.mkdir("/listdir_test.zarr")
+        fs.touch("/listdir_test.zarr/.zarray")
+        fs.touch("/listdir_test.zarr/.zattrs")
+        fs.mkdir("/listdir_test.zarr/0")
 
         store = RemoteStore("memory:///listdir_test.zarr")
         listing = store.listdir()
         # Memory filesystem returns full paths or just names depending on version
         # Check for the presence of key elements
-        listing_str = ' '.join(listing)
-        assert '.zarray' in listing_str
-        assert '.zattrs' in listing_str or 'zattrs' in listing_str
+        listing_str = " ".join(listing)
+        assert ".zarray" in listing_str
+        assert ".zattrs" in listing_str or "zattrs" in listing_str
 
     def test_remote_store_get_identity(self, memory_fs):
         """Get unique identity for deduplication."""
-        memory_fs.pipe('/test.zarr/.zarray', b'{"test": "data"}', set_type='file')
+        memory_fs.pipe("/test.zarr/.zarray", b'{"test": "data"}', set_type="file")
         store = RemoteStore("memory:///test.zarr")
-        identity = store.get_identity('.zarray')
+        identity = store.get_identity(".zarray")
         # Memory filesystem identity includes path and size
-        assert 'test.zarr/.zarray' in identity
+        assert "test.zarr/.zarray" in identity
 
     def test_remote_store_walk(self, memory_fs):
         """Walk directory tree."""
-        memory_fs.mkdir('/test.zarr/0')
-        memory_fs.mkdir('/test.zarr/1')
-        memory_fs.touch('/test.zarr/0/data')
-        memory_fs.touch('/test.zarr/1/data')
+        memory_fs.mkdir("/test.zarr/0")
+        memory_fs.mkdir("/test.zarr/1")
+        memory_fs.touch("/test.zarr/0/data")
+        memory_fs.touch("/test.zarr/1/data")
 
         store = RemoteStore("memory:///test.zarr")
         walked = list(store.walk())
         assert len(walked) >= 1
         # Check that we got the subdirectories
         dirpaths = [w[0] for w in walked]
-        assert '/test.zarr' in dirpaths or 'test.zarr' in dirpaths
+        assert "/test.zarr" in dirpaths or "test.zarr" in dirpaths
 
     def test_remote_store_with_profile(self, memory_fs):
         """RemoteStore with explicit credential profile."""
@@ -459,7 +470,7 @@ class TestRemoteStoreMemoryFS:
         """Create RemoteStore via from_config factory."""
         config = CredentialsConfig(
             default_profile="test-profile",
-            profiles=[CredentialProfile(name="test-profile", storage_type="memory")]
+            profiles=[CredentialProfile(name="test-profile", storage_type="memory")],
         )
         store = RemoteStore.from_config(
             "memory:///test.zarr",
@@ -471,6 +482,7 @@ class TestRemoteStoreMemoryFS:
 # =============================================================================
 # RemoteStore Tests (Local fsspec)
 # =============================================================================
+
 
 class TestRemoteStoreLocalFsspec:
     """Tests for RemoteStore using local filesystem via fsspec."""
@@ -503,7 +515,7 @@ class TestRemoteStoreLocalFsspec:
         """Read file from local filesystem via fsspec."""
         url = f"file://{local_zarr}"
         store = RemoteStore(url)
-        content = store.read_text('.zarray')
+        content = store.read_text(".zarray")
         meta = json.loads(content)
         assert meta["zarr_format"] == 2
 
@@ -511,7 +523,7 @@ class TestRemoteStoreLocalFsspec:
         """Open file as file-like object."""
         url = f"file://{local_zarr}"
         store = RemoteStore(url)
-        with store.open('.zarray', mode='rb') as f:
+        with store.open(".zarray", mode="rb") as f:
             content = f.read()
         meta = json.loads(content.decode())
         assert meta["shape"] == [10, 10]
@@ -521,28 +533,30 @@ class TestRemoteStoreLocalFsspec:
 # ZarrAdapter Remote Tests
 # =============================================================================
 
+
 class TestZarrAdapterRemote:
     """Tests for ZarrAdapter with remote storage."""
 
     @pytest.fixture
     def memory_zarr(self):
         """Create in-memory zarr dataset."""
+        import numpy as np
         import zarr
         from zarr.storage import FSStore
-        import numpy as np
 
-        fs = fsspec.filesystem('memory')
-        store = FSStore('test.zarr', fs=fs)
-        arr = zarr.open_array(store, mode='w', shape=(10, 10), chunks=(5, 5), dtype='i4')
+        fs = fsspec.filesystem("memory")
+        store = FSStore("test.zarr", fs=fs)
+        arr = zarr.open_array(
+            store, mode="w", shape=(10, 10), chunks=(5, 5), dtype="i4"
+        )
         arr[:] = np.arange(100).reshape(10, 10)
-        yield fs, 'test.zarr'
+        yield fs, "test.zarr"
 
     def test_zarr_adapter_memory_fs(self, memory_zarr):
         """ZarrAdapter works with memory filesystem."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.remote import RemoteStore
         import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+        from biopb_tensor_server.remote import RemoteStore
         from zarr.storage import FSStore
 
         fs, path = memory_zarr
@@ -550,7 +564,7 @@ class TestZarrAdapterRemote:
         # Create adapter using RemoteStore
         store = RemoteStore("memory:///test.zarr")
         zarr_store = FSStore(store.path, fs=store.fs)
-        arr = zarr.open_array(zarr_store, mode='r')
+        arr = zarr.open_array(zarr_store, mode="r")
 
         adapter = ZarrAdapter(arr, "test-zarr")
 
@@ -560,16 +574,16 @@ class TestZarrAdapterRemote:
 
     def test_zarr_adapter_read_data(self, memory_zarr):
         """Read data from remote zarr via adapter."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        import zarr
-        from zarr.storage import FSStore
         import numpy as np
+        import zarr
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+        from zarr.storage import FSStore
 
         fs, path = memory_zarr
 
         store = FSStore(path, fs=fs)
-        arr = zarr.open_array(store, mode='r')
+        arr = zarr.open_array(store, mode="r")
         adapter = ZarrAdapter(arr, "test-zarr")
 
         bounds = ChunkBounds(start=[0, 0], stop=[5, 5])
@@ -585,21 +599,22 @@ class TestZarrAdapterRemote:
 # Integration Tests (Public S3)
 # =============================================================================
 
+
 def check_s3_available():
     """Check if S3 network access is available."""
     try:
         import fsspec
-        fs = fsspec.filesystem('s3', anon=True)
+
+        fs = fsspec.filesystem("s3", anon=True)
         # Quick check on a known public bucket
-        fs.exists('allencell')
+        fs.exists("allencell")
         return True
     except Exception:
         return False
 
 
 requires_network = pytest.mark.skipif(
-    not check_s3_available(),
-    reason="requires network access to S3"
+    not check_s3_available(), reason="requires network access to S3"
 )
 
 
@@ -617,7 +632,7 @@ class TestPublicS3Integration:
         assert store.isfile() == True
 
         info = store.info()
-        assert info.get('size', 0) > 0
+        assert info.get("size", 0) > 0
 
     def test_allen_cell_s3_open(self):
         """Open file from Allen Cell S3."""
@@ -628,7 +643,7 @@ class TestPublicS3Integration:
             # Read first few bytes (TIFF header)
             header = f.read(4)
             # TIFF files start with II or MM
-            assert header[:2] in (b'II', b'MM')
+            assert header[:2] in (b"II", b"MM")
 
     def test_allen_cell_s3_read_bytes(self):
         """Read bytes from Allen Cell S3."""
@@ -638,7 +653,7 @@ class TestPublicS3Integration:
         # Read entire file (it's small ~380KB)
         data = store.read_bytes()
         assert len(data) > 0
-        assert data[:2] in (b'II', b'MM')  # TIFF header
+        assert data[:2] in (b"II", b"MM")  # TIFF header
 
     @pytest.mark.skip(reason="IDR bucket currently unavailable")
     def test_idr_s3_with_endpoint(self):
@@ -664,8 +679,6 @@ class TestZarrAdapterS3Integration:
 
     def test_zarr_adapter_allen_cell_s3(self):
         """Test ZarrAdapter with Allen Cell S3 (as remote store)."""
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb_tensor_server.config import SourceConfig
 
         # Allen Cell has TIFF files, not zarr, but we can test RemoteStore creation
         url = "s3://allencell/aics/data_handoff_4dn/crop_seg/"
@@ -678,12 +691,13 @@ class TestZarrAdapterS3Integration:
         files = store.listdir()
         assert len(files) > 0
         # Should have some tiff files
-        assert any('.tif' in f for f in files)
+        assert any(".tif" in f for f in files)
 
 
 # =============================================================================
 # Credential Resolution Tests
 # =============================================================================
+
 
 class TestCredentialResolution:
     """Tests for credential resolution priority."""
@@ -691,9 +705,9 @@ class TestCredentialResolution:
     def test_resolution_order_env_then_profile(self, monkeypatch):
         """Environment vars are base layer, profile overrides."""
         # Create test filesystem
-        fs = fsspec.filesystem('memory')
-        fs.mkdir('/cred_test.zarr')
-        fs.touch('/cred_test.zarr/.zarray')
+        fs = fsspec.filesystem("memory")
+        fs.mkdir("/cred_test.zarr")
+        fs.touch("/cred_test.zarr/.zarray")
 
         # Set env var
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "env-key")
@@ -715,12 +729,16 @@ class TestCredentialResolution:
     def test_resolution_source_profile_overrides_default(self):
         """Source-level profile overrides global default."""
         # Create test filesystem
-        fs = fsspec.filesystem('memory')
-        fs.mkdir('/cred_test2.zarr')
-        fs.touch('/cred_test2.zarr/.zarray')
+        fs = fsspec.filesystem("memory")
+        fs.mkdir("/cred_test2.zarr")
+        fs.touch("/cred_test2.zarr/.zarray")
 
-        default_profile = CredentialProfile(name="default", storage_type="s3", key="default-key")
-        source_profile = CredentialProfile(name="source", storage_type="s3", key="source-key")
+        default_profile = CredentialProfile(
+            name="default", storage_type="s3", key="default-key"
+        )
+        source_profile = CredentialProfile(
+            name="source", storage_type="s3", key="source-key"
+        )
         config = CredentialsConfig(
             default_profile="default",
             profiles=[default_profile, source_profile],
@@ -739,6 +757,7 @@ class TestCredentialResolution:
 # Edge Cases and Error Handling
 # =============================================================================
 
+
 class TestRemoteStoreEdgeCases:
     """Tests for edge cases and error handling."""
 
@@ -750,10 +769,10 @@ class TestRemoteStoreEdgeCases:
 
     def test_empty_subpath(self):
         """Operations with empty subpath (root)."""
-        fs = fsspec.filesystem('memory')
+        fs = fsspec.filesystem("memory")
         # Use unique path to avoid conflicts with other tests
-        fs.mkdir('/empty_test.zarr')
-        fs.touch('/empty_test.zarr/.zarray')
+        fs.mkdir("/empty_test.zarr")
+        fs.touch("/empty_test.zarr/.zarray")
 
         store = RemoteStore("memory:///empty_test.zarr")
         # Empty subpath means root
@@ -764,6 +783,7 @@ class TestRemoteStoreEdgeCases:
         """Error when fsspec is not installed."""
         # Mock import error
         import builtins
+
         real_import = builtins.__import__
 
         def mock_import(name, *args, **kwargs):
@@ -778,8 +798,8 @@ class TestRemoteStoreEdgeCases:
 
     def test_path_join(self):
         """Path joining with various subpath formats."""
-        fs = fsspec.filesystem('memory')
-        fs.mkdir('/root')
+        fs = fsspec.filesystem("memory")
+        fs.mkdir("/root")
 
         store = RemoteStore("memory:///root")
 

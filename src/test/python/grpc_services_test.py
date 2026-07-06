@@ -1,16 +1,15 @@
 import os
-import pytest
-
-import grpc
-import numpy as np
 
 import biopb.image as proto
-from biopb.image.utils import serialize_from_numpy, deserialize_to_numpy
-
+import grpc
+import numpy as np
+import pytest
+from biopb.image.utils import deserialize_to_numpy, serialize_from_numpy
 
 # ---------------------------------------------------------------------------
 # shared channel fixture
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def service_channel():
@@ -30,6 +29,7 @@ def service_channel():
     # interpret URL-like values
     if "://" in raw:
         from urllib.parse import urlparse
+
         parts = urlparse(raw)
         scheme = parts.scheme.lower()
         hostport = parts.netloc
@@ -63,6 +63,7 @@ def service_channel():
 
 try:
     from grpc_health.v1 import health_pb2, health_pb2_grpc
+
     _health_available = True
 except ImportError:
     _health_available = False
@@ -84,6 +85,7 @@ def test_grpc_health(service_channel):
 # ---------------------------------------------------------------------------
 # functional tests for each protocol
 # ---------------------------------------------------------------------------
+
 
 def _make_small_image(shape=(1, 8, 8, 1)):
     arr = (np.random.rand(*shape) * 255).astype("uint8")

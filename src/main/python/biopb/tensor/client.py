@@ -10,39 +10,56 @@ Features:
 """
 
 import atexit
-import logging
-import importlib.metadata
 import json
+import logging
 import os
-import sys
+import threading
 import time
 import warnings
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-import threading
-
 from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import dask.array as da
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-import dask.array as da
-from dask.delayed import delayed
 from cachey import Cache
+from dask.delayed import delayed
 
-from biopb.tensor.ticket_pb2 import TensorTicket, ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import (
-    TensorDescriptor,
-    SliceHint,
-    FlightCmd,
-    TensorReadOption,
-    MetadataQueryOption,
+    AddSourceProgress,
+    AddSourceRequest,
+    AddSourceResult,
+    AddSourceStreamMessage,
     DataSourceDescriptor,
+    FlightCmd,
+    MetadataQueryOption,
+    RemoveSourceRequest,
+    RemoveSourceResult,
+    ResolveProgress,
+    ResolveStreamMessage,
+    SliceHint,
+    TensorDescriptor,
+    TensorReadOption,
+    WarmProgress,
+    WarmStreamMessage,
 )
-from biopb.tensor.serialized_pb2 import SerializedTensor, SerializedEndpoint
+from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 logger = logging.getLogger(__name__)
+
+
+class ResolveCancelled(Exception):
+    """Raised by :meth:`TensorFlightClient.resolve` when its ``should_cancel``
+    callback asks it to stop.
+
+    The client stops consuming the resolve stream and unwinds; the server's
+    recall daemon thread runs to completion and caches its result, so a later
+    :meth:`resolve` coalesces onto the finished work rather than re-downloading.
+    """
 
 
 # ==============================================================================
@@ -74,7 +91,11 @@ _cachefile_support_lock = threading.Lock()
 
 def _is_cachefile_disabled_by_env() -> bool:
     """Whether the cache-file fast path is explicitly disabled via env var."""
-    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in ("1", "true", "yes")
+    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _cachefile_supported(location: str) -> Optional[bool]:
@@ -113,7 +134,7 @@ def _resolve_cache_bytes(location: str, requested: int) -> int:
     return requested
 
 
-@lru_cache(maxsize=None)
+@cache
 def _is_localhost_location(location: str) -> bool:
     """Check if location points to localhost.
 
@@ -130,13 +151,15 @@ def _is_localhost_location(location: str) -> bool:
     Returns:
         True if location resolves to loopback address
     """
-    import socket
     import re
+    import socket
 
     # Parse location URI - handle various formats
     # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
     # IPv6 format: grpc://[::1]:port
-    match = re.match(r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location)
+    match = re.match(
+        r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location
+    )
     if not match:
         return False
 
@@ -245,7 +268,8 @@ def _try_cachefile_transfer(
     if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
         logger.debug(
             "chunk_locate reports segment format %s > supported %s; using do_get",
-            info.get("format_version"), _CACHEFILE_SUPPORTED_FORMAT,
+            info.get("format_version"),
+            _CACHEFILE_SUPPORTED_FORMAT,
         )
         _set_cachefile_supported(location, False)
         return None
@@ -277,6 +301,7 @@ def _try_cachefile_transfer(
 # Internal context for tensor flight info
 # ==============================================================================
 
+
 @dataclass
 class _TensorContext:
     """Internal context returned by _get_tensor_context().
@@ -284,11 +309,14 @@ class _TensorContext:
     Contains all parsed flight info needed to build either a dask array
     or a SerializedTensor protobuf.
     """
+
     descriptor: TensorDescriptor
     endpoints: List[Tuple[bytes, ChunkBounds]]  # (chunk_id, bounds) pairs
     read_opt: TensorReadOption
     original_slice_hint: Optional[SliceHint]
-    schema_metadata: Optional[Dict[str, str]] = None  # For SHM transfer feature detection
+    schema_metadata: Optional[Dict[str, str]] = (
+        None  # For SHM transfer feature detection
+    )
 
 
 # ==============================================================================
@@ -307,7 +335,9 @@ class _TensorContext:
 _THREAD_LOCAL = threading.local()
 
 # Global registry for cleanup: thread_id -> {(location, token): FlightClient}
-_CONNECTION_REGISTRY: Dict[int, Dict[Tuple[str, Optional[str]], flight.FlightClient]] = {}
+_CONNECTION_REGISTRY: Dict[
+    int, Dict[Tuple[str, Optional[str]], flight.FlightClient]
+] = {}
 _REGISTRY_LOCK = threading.Lock()
 
 # Shared pools for cache and call options (cross-thread cache hits enabled)
@@ -371,7 +401,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
     current_pid = os.getpid()
 
     # Fast path: thread already has client for this location (no lock)
-    local_pool = getattr(_THREAD_LOCAL, 'clients', None)
+    local_pool = getattr(_THREAD_LOCAL, "clients", None)
     if local_pool is None:
         local_pool = {}
         _THREAD_LOCAL.clients = local_pool
@@ -398,7 +428,7 @@ def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClie
         generic_options=[
             ("grpc.max_send_message_size", 80 * 1024 * 1024),
             ("grpc.max_receive_message_size", 80 * 1024 * 1024),
-        ]
+        ],
     )
     local_pool[key] = (current_pid, client)
 
@@ -456,7 +486,9 @@ def _get_shared_cache(
         return _CACHE_POOL[key][1]
 
 
-def _get_shared_call_options(location: str, token: Optional[str]) -> flight.FlightCallOptions:
+def _get_shared_call_options(
+    location: str, token: Optional[str]
+) -> flight.FlightCallOptions:
     """Get shared FlightCallOptions.
 
     Args:
@@ -507,22 +539,17 @@ def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int)
     return (client, cache, call_options)
 
 
-def configure_cache(
-    location: str, token: Optional[str], cache_bytes: int
-) -> int:
-    """Pin this process's chunk-cache budget for a connection namespace.
+def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> int:
+    """Pin this process's chunk-cache budget for a connection, authoritatively.
 
-    Authoritative and idempotent, unlike the lazy first-touch creation in
-    ``_get_shared_cache``: it (re)sizes the pooled cache to the *resolved*
-    ``cache_bytes`` and is honored by every later fetch, regardless of what
-    those fetch calls request. Call it once per worker process (e.g. from a
-    dask worker-init plugin, see :func:`make_cache_plugin`) to fix the budget
-    deterministically across a dynamically-sized cluster.
+    Sets the per-process chunk cache to ``cache_bytes`` and keeps it there: every
+    later fetch honors this budget regardless of the ``cache_bytes`` it requests.
+    Idempotent. Call it once per worker process (e.g. from a dask worker-init
+    plugin) to fix the budget deterministically across a dynamically-sized
+    cluster.
 
-    The size is run through :func:`_resolve_cache_bytes`, so a localhost server
-    (default) or ``cache_bytes <= 0`` pins the cache OFF: it records a sentinel
-    so later fetches skip caching instead of recreating one from their own
-    ``cache_bytes``.
+    A localhost server (the default) or ``cache_bytes <= 0`` pins the cache OFF;
+    later fetches then skip caching rather than recreating one of their own.
 
     Args:
         location: Flight server location string
@@ -532,6 +559,9 @@ def configure_cache(
     Returns:
         The effective (resolved) cache size that was pinned, in bytes.
     """
+    # Unlike the lazy first-touch creation in _get_shared_cache, this (re)sizes
+    # the pooled cache now and records a None sentinel for the disabled case, so
+    # a later fetch can't undo the decision from its own cache_bytes.
     effective = _resolve_cache_bytes(location, cache_bytes)
     key = (location, token)
     current_pid = os.getpid()
@@ -553,40 +583,6 @@ def configure_cache(
             _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
 
     return effective
-
-
-def make_cache_plugin(location: str, token: Optional[str], cache_bytes: int):
-    """Build a dask ``WorkerPlugin`` that pins the chunk-cache budget on workers.
-
-    Registering the returned plugin with ``client.register_plugin(...)`` runs
-    :func:`configure_cache` on every worker -- current *and* future -- so the
-    per-process budget stays correct across cluster restarts / autoscaling
-    without re-plumbing. The plugin is ``name``-tagged so re-registration
-    replaces rather than stacks.
-
-    ``cache_bytes`` is the desired *per-worker* size; the caller (which knows the
-    cluster size) is responsible for any total-budget split. Localhost still
-    resolves to 0 via :func:`configure_cache`.
-
-    Returns:
-        A WorkerPlugin instance, or None if ``distributed`` is not importable
-        (so callers can no-op gracefully on non-distributed setups).
-    """
-    try:
-        from distributed.diagnostics.plugin import WorkerPlugin
-    except Exception:
-        return None
-
-    class _CacheConfigPlugin(WorkerPlugin):
-        name = "biopb-cache-config"  # named -> idempotent re-registration
-
-        def __init__(self, location, token, cache_bytes):
-            self._args = (location, token, cache_bytes)
-
-        def setup(self, worker):
-            configure_cache(*self._args)
-
-    return _CacheConfigPlugin(location, token, cache_bytes)
 
 
 def _fetch_chunk_distributed(
@@ -645,12 +641,10 @@ def _fetch_chunk_distributed(
         reader = client.do_get(
             flight.Ticket(ticket.SerializeToString()), options=call_options
         )
-        table = reader.read_all()
-        arr = table.column("data").to_numpy()[0]  # First row's data list
-
-        # Get shape from shape column (list<int64>)
-        shape = tuple(table.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
+        # do_get returns a single-row unified binary batch [data, shape, dtype];
+        # decode it exactly like the cache-file fast path (raw bytes reinterpreted
+        # via the dtype string, so endianness round-trips -- biopb/biopb#293).
+        arr = _array_from_unified_batch(reader.read_all().to_batches()[0])
 
     # Cache the result (skipped when caching is disabled)
     if cache is not None:
@@ -770,7 +764,9 @@ def _build_dask_array_from_chunk_map(
 
     chunks = _regular_grid_chunks(chunk_map, grid_shape, shape)
     if chunks is not None:
-        id_map = {chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()}
+        id_map = {
+            chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()
+        }
         return da.map_blocks(
             _fetch_chunk_block,
             id_map,
@@ -805,7 +801,9 @@ def _build_dask_array_from_chunk_map(
     return da.block(blocks.tolist())
 
 
-def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[bytes], List[ChunkBounds]]:
+def _fetch_endpoints_via_get_flight_info(
+    pb: SerializedTensor,
+) -> Tuple[List[bytes], List[ChunkBounds]]:
     """Fetch endpoints from server via GetFlightInfo when not provided in SerializedTensor.
 
     This is used when the endpoints field in SerializedTensor is empty.
@@ -856,7 +854,7 @@ def _fetch_endpoints_via_get_flight_info(pb: SerializedTensor) -> Tuple[List[byt
     info = client.get_flight_info(flight_desc, options=call_options)
 
     # Check schema version compatibility
-    _check_schema_version(info.schema)
+    _check_wire_protocol(info.schema)
 
     # Parse endpoints into chunk info
     chunks = []
@@ -902,28 +900,37 @@ def _parse_version(version_str: str) -> Tuple[int, int, int]:
     return (major, minor, patch)
 
 
-def _check_schema_version(schema: pa.Schema) -> None:
-    """Check schema metadata version and warn if client version is older."""
-    if schema.metadata is None:
-        return
+def _check_wire_protocol(schema: pa.Schema) -> None:
+    """Fail fast if the server's chunk wire-protocol version is incompatible.
 
-    server_version_bytes = schema.metadata.get(b"tensor_schema_version")
-    if server_version_bytes is None:
-        return
+    The chunk ``RecordBatch`` encoding is a hard contract (biopb/biopb#293): a
+    version mismatch means the client would misread every chunk (e.g. decode the
+    v2 binary blob as a v1 typed list). We reject at ``GetFlightInfo`` -- before
+    any ``do_get`` -- with an actionable message rather than let a cryptic decode
+    error surface deep in the read path. The version constant lives in ``biopb``
+    core, which both the client and the server import, so there is one source of
+    truth (see ``biopb.tensor._wire_version``).
+    """
+    from biopb.tensor._wire_version import (
+        TENSOR_WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_METADATA_KEY,
+    )
 
-    server_version = server_version_bytes.decode("utf-8")
+    meta = schema.metadata or {}
+    raw = meta.get(WIRE_PROTOCOL_METADATA_KEY.encode("utf-8"))
+    # An unstamped schema is a pre-#293 server, which speaks the v1 typed-list
+    # encoding this client can no longer read.
     try:
-        client_version = importlib.metadata.version("biopb")
-    except importlib.metadata.PackageNotFoundError:
-        return
+        server_ver = int(raw.decode("utf-8")) if raw is not None else 1
+    except (ValueError, AttributeError):
+        server_ver = 1
 
-    server_parsed = _parse_version(server_version)
-    client_parsed = _parse_version(client_version)
-
-    if client_parsed < server_parsed:
-        logger.warning(
-            f"Client version {client_version} is older than server schema version {server_version}. "
-            f"Consider upgrading biopb client for compatibility."
+    if server_ver != TENSOR_WIRE_PROTOCOL_VERSION:
+        stale = "server" if server_ver < TENSOR_WIRE_PROTOCOL_VERSION else "client"
+        raise RuntimeError(
+            f"Incompatible biopb tensor wire protocol: the server speaks v{server_ver}, "
+            f"this client speaks v{TENSOR_WIRE_PROTOCOL_VERSION}. The chunk encoding is a "
+            f"breaking contract (biopb/biopb#293); upgrade the {stale} so both sides match."
         )
 
 
@@ -937,7 +944,9 @@ def _normalize_location(location: str) -> str:
     return location
 
 
-def make_debug_serialized_tensor(arr: da.Array, array_id: str = "debug") -> SerializedTensor:
+def make_debug_serialized_tensor(
+    arr: da.Array, array_id: str = "debug"
+) -> SerializedTensor:
     """Create a SerializedTensor with debug_pickled_array for testing.
 
     Eagerly computes the array and pickles it, bypassing Flight server.
@@ -980,6 +989,22 @@ def _upload_source_id_from_pb(pb: SerializedTensor) -> str:
     return source_id
 
 
+def _unresolved_source_error(source_id: str) -> ValueError:
+    """Directive error for reading an *unresolved* (cloud / synced-folder) source.
+
+    Shared by every read entry point so the guidance is uniform: name the cure
+    (``client.resolve``) instead of leaking a bare internal "no tensors", and --
+    critically for methods like ``get_physical_scale`` -- raise this rather than
+    silently recalling (downloading) the whole file just to answer a metadata
+    query. Resolving is the heavyweight, *consenting* act; reads must not trigger
+    it implicitly."""
+    return ValueError(
+        f"Source '{source_id}' is unresolved (no tensors listed yet). If this "
+        f"is a cloud / synced-folder source, call client.resolve('{source_id}') "
+        f"first to download and resolve it, then read it."
+    )
+
+
 class TensorFlightClient:
     """Client for accessing tensors from a TensorFlightServer.
 
@@ -1003,12 +1028,14 @@ class TensorFlightClient:
         data = arr[0:100, 0:100].compute()   # Load slice
 
     Note:
-        This client IS compatible with dask.distributed. The dask arrays
-        returned by get_tensor() use a pickle-safe design where FlightClient
-        connections are created lazily in each worker from stored connection
-        parameters. Each worker maintains its own connection pool and LRU
-        cache keyed by (location, token).
+        The dask arrays returned by get_tensor() are picklable and work with
+        dask.distributed: each worker fetches chunks over its own connection,
+        so you can scatter an array across a cluster and compute on it.
     """
+
+    # The arrays are pickle-safe because the fetch functions hold no FlightClient
+    # in their closure -- connections, caches, and call options are recreated
+    # lazily per worker process from module-level pools keyed by (location, token).
 
     def __init__(
         self,
@@ -1060,7 +1087,7 @@ class TensorFlightClient:
         """
         prefix = f"{source_id}/"
         if array_id.startswith(prefix):
-            array_id = array_id[len(prefix):]
+            array_id = array_id[len(prefix) :]
         return (source_id, array_id)
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
@@ -1112,7 +1139,9 @@ class TensorFlightClient:
     def query_sources(self, sql: str, *, format: str = "arrow") -> Any:
         """Execute SQL query against server's source metadata database.
 
-        Requires server to have metadata_db.enabled=True in config.
+        The server-side metadata database is mandatory (biopb/biopb#225), so any
+        standard tensor-server supports this. Only an embedded server explicitly
+        constructed without a metadata database rejects the query.
 
         Args:
             sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
@@ -1227,27 +1256,24 @@ class TensorFlightClient:
         # Go through object dtype: pandas' str dtype re-coerces a None put back
         # in via .where() to NaN, but an object column preserves None.
         for field in table.schema:
-            if pa.types.is_string(field.type) or pa.types.is_large_string(
-                field.type
-            ):
+            if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
                 col = df[field.name].astype(object)
                 df[field.name] = col.where(col.notna(), None)
         return df
 
     def get_source_metadata(self, source_id: str) -> dict:
-        """Get source-level OME/vendor metadata.
-
-        Fetches metadata via GetFlightInfo for the first tensor in the source,
-        since metadata_json is populated in the response TensorDescriptor.
+        """Get source-level OME/vendor metadata as a dict.
 
         Args:
             source_id: Source identifier
 
         Returns:
-            Parsed metadata from GetFlightInfo response.
-            The server wraps metadata in {"type": ..., "dim_label": [...], "metadata": {...}},
-            this method returns the inner "metadata" dict,
-            or empty dict if no metadata.
+            The source's metadata dict (the format-specific OME/vendor metadata),
+            or an empty dict if the source carries none.
+
+        Raises:
+            ValueError: If the source is unknown, or unresolved (cloud /
+                synced-folder) -- call :meth:`resolve` first.
         """
         import json
 
@@ -1259,9 +1285,17 @@ class TensorFlightClient:
             raise ValueError(f"Source not found: {source_id}")
 
         if not source_desc.tensors:
-            return {}
+            # Unresolved (cloud / synced-folder) source: tensors are unknown
+            # until resolve. Don't silently return {} -- that conflates
+            # "unresolved" with "resolved, no metadata" (the line below). Steer
+            # the caller to the explicit, consented resolve() instead, matching
+            # get_physical_scale / get_tensor (#108). Crucially this stays a
+            # cheap read: it must NOT silently recall the whole file the way a
+            # resolve-on-serve probe (get_descriptor) would.
+            raise _unresolved_source_error(source_id)
 
-        # Get metadata from first tensor via GetFlightInfo
+        # metadata_json is populated on the descriptor GetFlightInfo returns, so
+        # we fetch it via the source's first tensor.
         first_tensor = source_desc.tensors[0]
         cmd = FlightCmd(
             source_id=source_id,
@@ -1275,8 +1309,9 @@ class TensorFlightClient:
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         if response_desc.metadata_json:
+            # The server wraps it as {"type": ..., "dim_label": [...],
+            # "metadata": {...}}; return just the inner metadata dict.
             wrapped = json.loads(response_desc.metadata_json)
-            # Unwrap to return just the metadata dict
             return wrapped.get("metadata", {})
         return {}
 
@@ -1290,20 +1325,22 @@ class TensorFlightClient:
         """Per-dimension physical pixel size + unit for a tensor.
 
         Returns ``(scale, unit)``: two lists aligned with the tensor's
-        ``dim_labels`` (source axis order), or ``None`` when the server
-        advertised no physical sizes (an older server, or a format that carries
-        none). This is the compact summary the server folds onto the descriptor
-        ``GetFlightInfo`` already returns (issue #31), so the common case avoids
-        the much larger ``get_source_metadata`` round trip.
+        ``dim_labels`` (source axis order), or ``None`` when no physical sizes
+        are known (an older server, or a format that carries none).
 
-        Reads the descriptor cached by a prior ``get_tensor()`` when available
-        (no extra RPC); otherwise issues one cheap ``GetFlightInfo``.
+        ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
+        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
+        descriptor a prior :meth:`get_tensor` already cached -- no extra RPC when
+        it is cached, and it never requests the opt-in ``metadata_json`` field on
+        that same descriptor. (Contrast :meth:`get_source_metadata`, which forces
+        ``with_metadata`` to ship the whole OME tree; do not dig physical sizes
+        out of that -- this is the compact projection meant for display scale.)
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
                 ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``. A bare single-tensor
                 source id resolves to its sole tensor. A bare *multi*-tensor
-                source id anchors on the source's default (first) tensor (#44) --
+                source id anchors on the source's default (first) tensor --
                 unlike ``get_tensor``, which requires the field be named; pass the
                 qualified ``source_id/field`` to target a specific scene.
             tensor_id: DEPRECATED. The legacy ``(source_id, tensor_id)`` form;
@@ -1321,6 +1358,16 @@ class TensorFlightClient:
             else None
         )
         if desc is None:
+            # Don't silently recall (download) a whole cloud file just to read its
+            # pixel size: if the source is known-unresolved, steer the caller to
+            # resolve() explicitly -- consistent with get_tensor, and faithful to
+            # resolution being a consented act, not a side effect of a metadata
+            # probe. (Only catches sources already in the catalog cache; a
+            # never-listed id still falls through to the fetch below, same as
+            # every other entry point.)
+            cached = self._sources.get(source_id)
+            if cached is not None and not cached.tensors:
+                raise _unresolved_source_error(source_id)
             # tensor_id None -> the source's default (first) tensor. A real fetch
             # error (server unreachable, source not found) propagates to the
             # caller -- it must stay distinguishable from "no physical scale
@@ -1340,9 +1387,12 @@ class TensorFlightClient:
 
         Backs the public ``get_descriptor`` (the array_id-keyed primitive) and
         the deprecated ``get_source``. Uses the per-tensor ``GetFlightInfo`` RPC,
-        so it resolves a source even when it is beyond the (truncatable)
+        which works even when the source is beyond the (truncatable)
         ``list_sources()`` cap. ``tensor_id`` unset/empty -> the source's default
-        (first) tensor, resolved server-side (#44).
+        (first) tensor (#44). This is a CHEAP probe: it does NOT resolve. An
+        unresolved (cloud / synced-folder) source raises the directive
+        ``_unresolved_source_error`` steering the caller to :meth:`resolve`,
+        rather than triggering a download.
 
         The descriptor is cached in ``self._descriptors`` (keyed by the
         echoed-back array_id). ``self._sources`` is intentionally NOT touched, so
@@ -1360,28 +1410,40 @@ class TensorFlightClient:
             read_opt.tensor_id = tensor_id
         cmd = FlightCmd(source_id=source_id, tensor_read=read_opt)
         fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-        info = self._client.get_flight_info(fd, options=self._call_options)
+        try:
+            info = self._client.get_flight_info(fd, options=self._call_options)
+        except flight.FlightUnavailableError as exc:
+            # GetFlightInfo no longer resolves on serve: an unresolved (cloud /
+            # synced-folder) source now refuses with FlightUnavailableError
+            # ("Source unresolved ...") instead of silently downloading. Make this
+            # a cheap steering probe -- restate it as the shared directive so
+            # get_descriptor / get_source point the caller at the explicit,
+            # consented resolve(), consistent with get_tensor / get_physical_scale.
+            if "unresolved" in str(exc).lower():
+                raise _unresolved_source_error(source_id) from exc
+            raise
         tensor_desc = TensorDescriptor.FromString(info.descriptor.command)
-        self._descriptors[
-            self._descriptor_key(source_id, tensor_desc.array_id)
-        ] = tensor_desc
+        self._descriptors[self._descriptor_key(source_id, tensor_desc.array_id)] = (
+            tensor_desc
+        )
         return tensor_desc
 
     def get_descriptor(self, array_id: str) -> "TensorDescriptor":
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
-        This is the policy-conformant single-tensor probe: a tensor is identified
-        by its ``array_id`` ALONE (see the tensor identity policy at the top of
-        ``proto/biopb/tensor/descriptor.proto``), so this takes that one
-        identifier rather than a ``(source_id, tensor_id)`` pair. The source is
-        derived as the slash-free prefix ``array_id.split('/', 1)[0]`` and the
-        full ``array_id`` is sent as the request ``tensor_id``.
-
+        A tensor is identified by its ``array_id`` alone (see the tensor identity
+        policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
+        takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
         Works even when the source is beyond the (truncatable) ``list_sources()``
         cap, and the result is cached. Passing a bare ``source_id`` (single-tensor
         source, or to anchor on a multi-tensor source's default/first tensor) is
-        accepted and resolves server-side. To enumerate ALL tensors/scenes of a
-        source, use ``list_sources()[source_id].tensors`` -- NOT this method.
+        accepted. To enumerate ALL tensors/scenes of a source, use
+        ``list_sources()[source_id].tensors`` -- NOT this method.
+
+        This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
+        synced-folder) source it raises an error pointing at :meth:`resolve`,
+        never triggering a download. Call :meth:`resolve` first to read such a
+        source.
 
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
@@ -1390,8 +1452,320 @@ class TensorFlightClient:
         Returns:
             The ``TensorDescriptor`` for that tensor.
         """
+        # source_id is the slash-free prefix; the full array_id is the tensor_id.
         source_id = array_id.split("/", 1)[0]
         return self._fetch_tensor_descriptor(source_id, array_id)
+
+    def _iter_action_messages(self, action, msg_cls, *, unknown_action_msg=None):
+        """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
+        non-empty message.
+
+        The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
+        the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
+        into ``msg_cls`` (a bad parse yields ``which=None`` so a legacy bare-body
+        caller can fall back on the raw ``body``), and the old-server
+        ``"Unknown action"`` -> :class:`RuntimeError` remap -- applied only when
+        ``unknown_action_msg`` is given; otherwise the ``FlightServerError``
+        propagates unchanged.
+
+        Cancellation is deliberately NOT handled here: its semantics differ per
+        caller (resolve/warm raise, add_source returns what it has), and the poll
+        must run *after* a message is consumed so a terminal already in hand is
+        never discarded by a cancel landing on it (issue #4). Each caller polls
+        ``should_cancel`` around its own dispatch.
+        """
+        try:
+            for result in self._client.do_action(action, options=self._call_options):
+                body = result.body.to_pybytes()
+                if not body:
+                    continue  # legacy empty-body heartbeat (server predating progress)
+                msg = msg_cls()
+                try:
+                    msg.ParseFromString(body)
+                    which = msg.WhichOneof("payload")
+                except Exception:  # noqa: BLE001
+                    which = None
+                yield which, msg, body
+        except flight.FlightServerError as exc:
+            if unknown_action_msg is not None and "Unknown action" in str(exc):
+                raise RuntimeError(unknown_action_msg) from exc
+            raise
+
+    def resolve(
+        self,
+        source_id: str,
+        *,
+        on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "DataSourceDescriptor":
+        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
+
+        .. note:: Experimental. Cloud / remote source support (unresolved sources,
+           resolve, and :meth:`warm`) is experimental and its behavior may change.
+
+        An *unresolved* source is catalogued by URL only -- its shape/dtype/field
+        list are unknown until first access (it lists with ``data_resident`` False
+        and an empty ``list_sources()[source_id].tensors``). The canonical case is
+        a cloud / synced-folder ("Files-On-Demand") source.
+
+        Resolving asks the server to hydrate it. For a dehydrated placeholder this
+        **downloads the whole file** -- a recall that can take minutes, consume
+        local disk, and fail when offline -- then reads its real shape, dtype, and
+        field list. This is the heavyweight, *consenting* operation that catalog
+        browsing (:meth:`list_sources` / :meth:`query_sources`) deliberately
+        avoids; call it only when you intend to read the data. After it returns,
+        :meth:`get_tensor` and friends work normally.
+
+        Idempotent: resolving an already-resolved source just re-fetches it.
+
+        Args:
+            source_id: The source to resolve (e.g. ``"onedrive_a3f2"``).
+            on_progress: Optional callback invoked with a ``ResolveProgress``
+                (elapsed seconds, target name, target size in bytes) on each
+                server heartbeat, so a caller can display progress. Called on the
+                calling thread; keep it cheap and non-blocking.
+            should_cancel: Optional predicate polled on each heartbeat; when it
+                returns True the client stops consuming the stream and raises
+                :class:`ResolveCancelled`. The server-side recall continues to
+                completion and is cached, so a later ``resolve`` reuses it.
+
+        Returns:
+            The full ``DataSourceDescriptor`` with every tensor/field enumerated
+            -- the complete field set in one call, regardless of catalog size.
+
+        Raises:
+            ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
+        """
+        # One dedicated, streaming ``resolve`` action: it is the SINGLE server
+        # entry point that performs the (possibly minutes-long) recall, and it
+        # returns the full DataSourceDescriptor directly -- no GetFlightInfo +
+        # list_sources two-step, so no truncation hole for multi-field sources
+        # beyond the list cap. The action streams ``ResolveStreamMessage``
+        # heartbeats (a ``progress`` arm) to keep the connection warm under proxy
+        # idle timeouts; the single terminal message carries the descriptor in
+        # its ``result`` arm. ``should_cancel`` / ``on_progress`` are polled once
+        # per received message, i.e. roughly once per server heartbeat.
+        action = flight.Action("resolve", source_id.encode("utf-8"))
+        desc: Optional[DataSourceDescriptor] = None
+        for which, msg, body in self._iter_action_messages(
+            action, ResolveStreamMessage
+        ):
+            if should_cancel is not None and should_cancel():
+                raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "result":
+                desc = DataSourceDescriptor()
+                desc.CopyFrom(msg.result)
+            else:
+                # Legacy server: a non-empty body IS a bare serialized
+                # DataSourceDescriptor (pre-envelope protocol).
+                desc = DataSourceDescriptor.FromString(body)
+        if desc is None:
+            raise RuntimeError(
+                f"resolve('{source_id}') returned no descriptor "
+                "(server closed the stream without a result)"
+            )
+        self._sources[source_id] = desc
+        return desc
+
+    def warm(
+        self,
+        source_id: str,
+        *,
+        on_progress: Optional[Callable[["WarmProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "WarmProgress":
+        """Hydrate-ahead: recall a resolved source's member files on the server.
+
+        .. note:: Experimental. Cloud / remote source support (:meth:`resolve` and
+           this hydrate-ahead path) is experimental and its behavior may change.
+
+        :meth:`resolve` populates a source's *metadata* but, for a multi-file
+        cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
+        leaves the bulk pixel data dehydrated -- each member file then recalls
+        one-at-a-time, slowly, the first time a read touches it (the viewer
+        scrubbing planes is the worst case). ``warm`` opts into pulling them all
+        resident up front so later reads never stall.
+
+        The recall happens **entirely server-side** (the server walks the source
+        directory and reads each file to force the sync engine's recall); no
+        pixels cross the wire, only progress. It is idempotent -- already-resident
+        files are cheap local reads -- so a ``warm`` re-run after a cancel simply
+        finishes the remainder. Only meaningful for multi-file sources; a
+        single-file source returns immediately (resolve already recalled it).
+
+        Args:
+            source_id: The (already-resolved) source to warm.
+            on_progress: Optional callback invoked with a ``WarmProgress``
+                (files/bytes done vs total, current file name, elapsed) on each
+                progress message. Called on the calling thread; keep it cheap.
+            should_cancel: Optional predicate polled per message; when it returns
+                True the client closes the stream -- which the server observes and
+                stops the recall promptly -- and this raises
+                :class:`ResolveCancelled`. Files already recalled stay resident.
+
+        Returns:
+            The terminal ``WarmProgress`` snapshot (``files_done`` /
+            ``bytes_done`` reflect what was made resident; on a no-op source
+            ``files_total == 0``).
+
+        Raises:
+            ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
+            RuntimeError: if the server predates the ``warm`` action (too old for
+                hydrate-ahead), or closes the stream without a terminal status.
+        """
+        action = flight.Action("warm", source_id.encode("utf-8"))
+        done: Optional[WarmProgress] = None
+        unknown = (
+            "Hydrate-ahead is unavailable: the tensor server is too old "
+            "to support the 'warm' action. Upgrade the server, or just "
+            "read the data on demand (it will recall lazily)."
+        )
+        for which, msg, _ in self._iter_action_messages(
+            action, WarmStreamMessage, unknown_action_msg=unknown
+        ):
+            if should_cancel is not None and should_cancel():
+                raise ResolveCancelled(f"warm('{source_id}') cancelled by caller")
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "done":
+                done = WarmProgress()
+                done.CopyFrom(msg.done)
+        if done is None:
+            raise RuntimeError(
+                f"warm('{source_id}') returned no terminal status "
+                "(server closed the stream without a 'done')"
+            )
+        return done
+
+    def add_source(
+        self,
+        url: str,
+        *,
+        source_type: str = "",
+        dim_labels: Optional[List[str]] = None,
+        on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> "AddSourceResult":
+        """Register a local path on the SERVER as a served source at runtime.
+
+        This is the wire entrypoint behind the tensor-browser's drag-drop: it
+        hands the server a filesystem path (or directory) that it interprets on
+        *its own* filesystem, and the server routes it through the same claim ->
+        adapter -> catalog pipeline the directory watcher uses. A dropped
+        directory that is not itself a dataset is walked recursively and may
+        register several sources, so the action streams progress and a final
+        tally rather than returning a single descriptor.
+
+        The path must exist on the server. Because a dropped directory's walk has
+        no known size up front, there is no percentage -- progress is a running
+        count of sources registered so far.
+
+        Args:
+            url: Absolute path (or directory) on the server's filesystem.
+            source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
+                empty means auto-detect via the adapters' claim protocol.
+            dim_labels: Optional dimension labels for the registered tensor(s).
+            on_progress: Optional callback invoked with an ``AddSourceProgress``
+                (count + current path + last descriptor) per source as it
+                registers. Called on the calling thread; keep it cheap.
+            should_cancel: Optional predicate polled per message; when it returns
+                True the client closes the stream, which the server observes and
+                stops discovery -- sources already registered stay registered.
+
+        Returns:
+            The terminal ``AddSourceResult`` (``added`` descriptors,
+            ``already_present`` source_ids, ``failed`` ``(path, reason)`` pairs).
+            A directory dropped above the large-scan threshold comes back as a
+            ``failed`` entry, not a special flag.
+
+        Raises:
+            flight.FlightServerError: whole-request failure (path not found /
+                unreadable on the server, or the server declines the request).
+            RuntimeError: the server predates the ``add_source`` action, or
+                closed the stream without a terminal result.
+        """
+        req = AddSourceRequest(
+            url=url,
+            source_type=source_type,
+            dim_labels=dim_labels or [],
+        )
+        action = flight.Action("add_source", req.SerializeToString())
+        unknown = (
+            "Runtime source registration is unavailable: the tensor "
+            "server is too old to support the 'add_source' action. "
+            "Upgrade the server, or add the source via its config file."
+        )
+        result: Optional[AddSourceResult] = None
+        for which, msg, _ in self._iter_action_messages(
+            action, AddSourceStreamMessage, unknown_action_msg=unknown
+        ):
+            if which == "progress":
+                if on_progress is not None:
+                    on_progress(msg.progress)
+            elif which == "result":
+                result = AddSourceResult()
+                result.CopyFrom(msg.result)
+            # Poll AFTER consuming this message, not before: a cancel landing
+            # exactly on the terminal ``result`` must not discard a completed
+            # tally already captured above (issue #4). Closing the stream keeps
+            # everything already registered server-side.
+            if should_cancel is not None and should_cancel():
+                break
+        if result is None:
+            # A caller-driven cancel breaks before the terminal result; report an
+            # empty tally rather than an error (the cancel was intentional).
+            if should_cancel is not None and should_cancel():
+                return AddSourceResult()
+            raise RuntimeError(
+                f"add_source('{url}') returned no terminal result "
+                "(server closed the stream without a result)"
+            )
+        return result
+
+    def remove_source(self, root_url: str) -> "RemoveSourceResult":
+        """Deregister a drag-dropped source branch on the SERVER at runtime.
+
+        The narrow counterpart to :meth:`add_source`: it removes ONLY
+        drag-dropped sources, which the server identifies by the ``dnd://``
+        origin scheme on their catalog ``source_url``. ``root_url`` is such a
+        branch root (a ``dnd://...`` value); every source at or under it is
+        removed as a unit. A non-``dnd://`` ``root_url`` is refused by the server.
+
+        Args:
+            root_url: The ``dnd://`` branch root to remove (from the browser's
+                dropped-root node).
+
+        Returns:
+            A ``RemoveSourceResult`` with ``removed`` (source_ids) and ``failed``
+            (``AddSourceFailure`` whose ``path`` carries the source_id).
+
+        Raises:
+            flight.FlightServerError: the server refused the request (e.g. a
+                non-``dnd://`` root, or removal not enabled).
+            RuntimeError: the server predates the ``remove_source`` action, or
+                returned no result.
+        """
+        req = RemoveSourceRequest(root_url=root_url)
+        action = flight.Action("remove_source", req.SerializeToString())
+        try:
+            results = self._client.do_action(action, options=self._call_options)
+            result_bytes = next(results)
+        except flight.FlightError as exc:
+            if "Unknown action" in str(exc):
+                raise RuntimeError(
+                    "Source removal is unavailable: the tensor server is too old "
+                    "to support the 'remove_source' action. Upgrade the server."
+                ) from exc
+            raise
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"remove_source('{root_url}') returned no result"
+            ) from exc
+        return RemoveSourceResult.FromString(result_bytes.body.to_pybytes())
 
     def get_source(
         self,
@@ -1409,7 +1783,7 @@ class TensorFlightClient:
         returned ``.tensors`` holds ONLY the resolved tensor (or the source's
         default/first tensor when ``tensor_id`` is None), never the full scene
         list. For a multi-scene source, ``get_source(id).tensors`` is length-1
-        and scenes 2..N are NOT enumerated here -- that was issue #75. Use
+        and scenes 2..N are NOT enumerated here. Use
         ``list_sources()[id].tensors`` for the complete enumeration.
 
         Args:
@@ -1465,7 +1839,9 @@ class TensorFlightClient:
         Returns:
             _TensorContext with descriptor, endpoints, read_opt, and original_slice_hint
         """
-        logger.debug(f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}")
+        logger.debug(
+            f"_get_tensor_context: source_id={source_id}, tensor_id={tensor_id}"
+        )
 
         # Ensure sources are loaded; fall back to direct server fetch if list_sources
         # didn't return this source (e.g. truncated result set).
@@ -1492,7 +1868,7 @@ class TensorFlightClient:
             if len(source_desc.tensors) == 1:
                 tensor_id = source_desc.tensors[0].array_id
             elif len(source_desc.tensors) == 0:
-                raise ValueError(f"Source '{source_id}' has no tensors")
+                raise _unresolved_source_error(source_id)
             else:
                 raise ValueError(
                     f"Source '{source_id}' has multiple tensors ({len(source_desc.tensors)}), "
@@ -1559,15 +1935,15 @@ class TensorFlightClient:
         response_desc = TensorDescriptor.FromString(info.descriptor.command)
 
         # Check schema version compatibility
-        _check_schema_version(info.schema)
+        _check_wire_protocol(info.schema)
 
         # Extract schema metadata for SHM transfer feature detection
         schema_metadata = _extract_schema_metadata(info.schema)
 
         # Cache the response descriptor
-        self._descriptors[
-            self._descriptor_key(source_id, response_desc.array_id)
-        ] = response_desc
+        self._descriptors[self._descriptor_key(source_id, response_desc.array_id)] = (
+            response_desc
+        )
 
         # Parse endpoints into (chunk_id, bounds) pairs
         endpoints = []
@@ -1705,7 +2081,9 @@ class TensorFlightClient:
         # The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         # the returned descriptor.shape may be larger than what was requested.
         # We crop the dask array back to the exact requested region here.
-        if ctx.original_slice_hint is not None and ctx.descriptor.HasField("slice_hint"):
+        if ctx.original_slice_hint is not None and ctx.descriptor.HasField(
+            "slice_hint"
+        ):
             realized = ctx.descriptor.slice_hint
             ndim = len(ctx.descriptor.shape)
             scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
@@ -1862,9 +2240,7 @@ class TensorFlightClient:
 
         # Build dask array with lazy chunk fetching
         ndim = len(shape)
-        grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
-        )
+        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
 
         # Extract schema_metadata from pb for SHM transfer
         schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
@@ -1945,9 +2321,7 @@ class TensorFlightClient:
         # Blockwise (map_blocks) layer for a regular grid, falling back to
         # da.block-of-from_delayed for ragged/sparse grids.
         ndim = len(shape)
-        grid_shape = tuple(
-            max(idx[d] + 1 for idx in chunk_map.keys()) for d in range(ndim)
-        )
+        grid_shape = tuple(max(idx[d] + 1 for idx in chunk_map) for d in range(ndim))
 
         return _build_dask_array_from_chunk_map(
             chunk_map,
@@ -2182,11 +2556,19 @@ class TensorFlightClient:
 
         Returns:
             Dictionary with health status information:
-            - status: "SERVING" or other status string
+            - status: "SERVING" or other status string. Note: with progressive
+              discovery, SERVING means "up and serving the possibly-still-
+              populating catalog," not "catalog complete" -- use the freshness
+              fields below to tell whether indexing is still in progress.
             - source_count: Number of registered sources
             - metadata_db_enabled: Whether metadata database is enabled
             - writable: Whether server accepts uploads
             - uptime_seconds: Server uptime in seconds
+            - full_scan_in_progress: Whether a full catalog rescan is running now
+              (absent on older servers)
+            - last_full_scan_finished_at: Epoch seconds when a full scan last
+              succeeded, or None until the first one does (absent on older
+              servers)
 
         Raises:
             FlightError: If server is unreachable or action fails

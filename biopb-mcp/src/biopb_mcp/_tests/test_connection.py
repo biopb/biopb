@@ -15,6 +15,7 @@ from biopb_mcp._config import DEFAULT_CONFIG
 from biopb_mcp._connection import (
     SERVER_QUERY_THRESHOLD,
     TensorConnection,
+    connect_error_message,
 )
 
 
@@ -146,6 +147,11 @@ class TestConnect:
         assert conn.sources == {}
         assert conn.use_server_query is False
         assert conn.is_connected is False
+        # issue #86 secondary: the failure now records a non-empty reason (no
+        # longer a blank error that server_status/the widget can't explain).
+        assert conn.last_status == "error"
+        assert conn.last_message
+        assert "grpc://host:9" in conn.last_message
 
     def test_refresh_requires_connection(self):
         conn = TensorConnection(config={})
@@ -165,6 +171,161 @@ class TestConnect:
         result = conn.refresh()
         assert len(result) == 2
         assert conn.sources == result
+
+    def test_mark_disconnected_resets_state(self, monkeypatch):
+        client = _fake_client({"a": MagicMock()})
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        assert conn.is_connected
+
+        conn.mark_disconnected("Lost connection to server")
+
+        assert not conn.is_connected
+        assert conn.client is None
+        assert conn.sources == {}
+        assert conn.use_server_query is False
+        assert conn.last_status == "error"
+        assert conn.last_message == "Lost connection to server"
+
+    def test_resolve_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.resolve_source("cloud_x")
+
+    def test_resolve_source_delegates_and_refreshes(self, monkeypatch):
+        # resolve() returns the resolved descriptor; the connection then re-lists
+        # so its snapshot carries the now-populated field set.
+        resolved = MagicMock(name="resolved-descriptor")
+        client = _fake_client({"cloud_x": MagicMock()})
+        client.resolve.return_value = resolved
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        full = {"cloud_x": MagicMock(), "other": MagicMock()}
+        client.list_sources.return_value = full
+
+        out = conn.resolve_source("cloud_x")
+
+        # progress/cancel hooks are forwarded verbatim (None when the caller,
+        # e.g. the headless agent, supplies neither).
+        client.resolve.assert_called_once_with(
+            "cloud_x", on_progress=None, should_cancel=None
+        )
+        assert out is resolved  # the resolved descriptor is returned verbatim
+        assert conn.sources == full  # snapshot refreshed via list_sources()
+
+    def test_warm_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.warm_source("cloud_x")
+
+    def test_warm_source_delegates(self, monkeypatch):
+        # warm() returns the terminal WarmProgress; the connection forwards the
+        # progress/cancel hooks verbatim and does NOT refresh (warm changes
+        # residency, not the descriptor).
+        terminal = MagicMock(name="warm-done")
+        client = _fake_client({"cloud_x": MagicMock()})
+        client.warm.return_value = terminal
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+
+        out = conn.warm_source("cloud_x")
+
+        client.warm.assert_called_once_with(
+            "cloud_x", on_progress=None, should_cancel=None
+        )
+        assert out is terminal
+
+    def test_add_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.add_source("/data/x.zarr")
+
+    def test_add_source_delegates_and_refreshes(self, monkeypatch):
+        # add_source() streams the registration and returns the terminal tally;
+        # the connection then re-lists so the new source is in its snapshot.
+        result = MagicMock(name="add-result")
+        client = _fake_client({})
+        client.add_source.return_value = result
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        after = {"x": MagicMock()}
+        client.list_sources.return_value = after
+
+        out = conn.add_source("/data/x.zarr")
+
+        client.add_source.assert_called_once_with(
+            "/data/x.zarr",
+            on_progress=None,
+            should_cancel=None,
+        )
+        assert out is result
+        assert conn.sources == after  # snapshot refreshed via list_sources()
+
+    def test_remove_source_requires_connection(self):
+        conn = TensorConnection(config={})
+        with pytest.raises(RuntimeError, match="Not connected"):
+            conn.remove_source("dnd://exp.zarr")
+
+    def test_remove_source_delegates_and_refreshes(self, monkeypatch):
+        # remove_source() deregisters a dropped branch and returns the tally; the
+        # connection then re-lists so the removed rows leave its snapshot.
+        result = MagicMock(name="remove-result")
+        client = _fake_client({"x": MagicMock()})
+        client.remove_source.return_value = result
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        after = {}
+        client.list_sources.return_value = after
+
+        out = conn.remove_source("dnd://exp.zarr")
+
+        client.remove_source.assert_called_once_with("dnd://exp.zarr")
+        assert out is result
+        assert conn.sources == after  # snapshot refreshed via list_sources()
+
+
+class TestIsLocalhost:
+    """The drag-drop gate: only a localhost server shares the client's disk."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("grpc://localhost:8815", True),
+            ("grpc://127.0.0.1:8815", True),
+            ("grpc://[::1]:8815", True),
+            ("grpc://10.0.0.5:8815", False),
+            ("grpc://data.lab.example:8815", False),
+        ],
+    )
+    def test_is_localhost(self, url, expected):
+        conn = TensorConnection(config={})
+        conn.url = url
+        assert conn.is_localhost() is expected
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +388,11 @@ class TestConnectReadiness:
             conn.connect("grpc://host:9")
         assert conn.is_connected is False
         assert conn.last_status == "error"
-        assert conn.last_message == ""
+        # The stale "starting" message is replaced by the error reason (#86):
+        # an unreachable server gets a friendly, actionable hint.
+        assert "scanning" not in conn.last_message
+        assert "Cannot reach" in conn.last_message
+        assert "grpc://host:9" in conn.last_message
 
     def test_starting_message_includes_zero_counts(self):
         # source_count=0 is meaningful (just started) and must not be dropped.
@@ -236,6 +401,64 @@ class TestConnectReadiness:
         )
         assert "0 sources registered so far" in msg
         assert "up 0s" in msg
+
+
+class TestScanFreshness:
+    """Cached health freshness fields (progressive discovery #212)."""
+
+    def _connect(self, monkeypatch, health):
+        client = _fake_client({})
+        client.health_check.return_value = health
+        monkeypatch.setattr(
+            _connection, "TensorFlightClient", lambda url, token=None: client
+        )
+        monkeypatch.setattr(TensorConnection, "persist_url", lambda self: None)
+        conn = TensorConnection(config={})
+        conn.connect("grpc://host:9")
+        return conn
+
+    def test_connect_caches_health_and_reports_scan(self, monkeypatch):
+        conn = self._connect(
+            monkeypatch,
+            {"status": "SERVING", "source_count": 4, "full_scan_in_progress": True},
+        )
+        assert conn.last_health["full_scan_in_progress"] is True
+        assert conn.scan_in_progress() is True
+        assert conn.scan_source_count() == 4
+
+    def test_not_scanning_when_field_false(self, monkeypatch):
+        conn = self._connect(
+            monkeypatch,
+            {"status": "SERVING", "source_count": 9, "full_scan_in_progress": False},
+        )
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 9
+
+    def test_older_server_without_field_is_not_scanning(self, monkeypatch):
+        # No freshness field -> absence is treated as "not scanning" (old UX).
+        conn = self._connect(monkeypatch, {"status": "SERVING", "source_count": 2})
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 2
+
+    def test_defaults_before_any_health(self):
+        conn = TensorConnection(config={})
+        assert conn.last_health is None
+        assert conn.scan_in_progress() is False
+        assert conn.scan_source_count() == 0
+
+    def test_watch_loop_refreshes_cached_health(self, monkeypatch):
+        conn, client = _connected_conn(
+            monkeypatch,
+            {"a": MagicMock()},
+            [{"source_count": 1, "full_scan_in_progress": False}],
+        )
+        conn._watch_stop = _FakeStop(allow=1)
+        conn._source_watch_loop(0.0, 0.0)
+
+        assert conn.last_health == {
+            "source_count": 1,
+            "full_scan_in_progress": False,
+        }
 
 
 class TestConnectWhenBooted:
@@ -473,15 +696,11 @@ class TestPersistUrl:
         conn.persist_url()
 
         assert CONFIG.get("tensor_browser.server_url") == "grpc://new:2"
-        assert CONFIG.get("mcp.services.process_image_servers") == [
-            "grpc://ops:5"
-        ]
+        assert CONFIG.get("mcp.services.process_image_servers") == ["grpc://ops:5"]
         with get_config_path().open() as f:
             saved = json.load(f)
         assert saved["tensor_browser"]["server_url"] == "grpc://new:2"
-        assert saved["mcp"]["services"]["process_image_servers"] == [
-            "grpc://ops:5"
-        ]
+        assert saved["mcp"]["services"]["process_image_servers"] == ["grpc://ops:5"]
 
 
 # ---------------------------------------------------------------------------
@@ -779,3 +998,43 @@ class TestAutoConnect:
         )
         # A failed autostart must not propagate out of the best-effort policy.
         conn.auto_connect()
+
+
+# ---------------------------------------------------------------------------
+# connect_error_message (issue #86 secondary)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectErrorMessage:
+    URL = "grpc://host:9"
+
+    def test_auth_required_when_no_token(self):
+        exc = RuntimeError("FlightUnauthenticatedError: token required")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "Authentication required" in msg
+        assert self.URL in msg
+        # Names the fix so the user knows what to do.
+        assert "token" in msg.lower()
+
+    def test_auth_failed_when_token_present(self):
+        exc = RuntimeError("PermissionDenied: invalid token")
+        msg = connect_error_message(exc, self.URL, token="bad")
+        assert "Authentication failed" in msg
+        assert "rejected" in msg
+        assert self.URL in msg
+
+    def test_unreachable_gets_friendly_hint(self):
+        exc = RuntimeError("FlightUnavailableError: failed to connect to all addresses")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "Cannot reach" in msg
+        assert self.URL in msg
+
+    def test_other_error_echoes_underlying(self):
+        exc = ValueError("something odd")
+        msg = connect_error_message(exc, self.URL, token=None)
+        assert "something odd" in msg
+
+    def test_never_blank(self):
+        # Even an exception with an empty str() yields an actionable message.
+        msg = connect_error_message(RuntimeError(), self.URL, token=None)
+        assert msg.strip()

@@ -4,6 +4,7 @@ Unit tests use FastAPI TestClient with a mocked TensorFlightClient.
 Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 """
 
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -11,9 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from biopb_tensor_server.http_server import _request_array_id, create_app
 from fastapi.testclient import TestClient
-
-from biopb_tensor_server.http_server import create_app, _request_array_id
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -424,6 +424,7 @@ class TestChunkEndpoint:
     def _make_ticket_hex(self, chunk_id: bytes = b"test-chunk") -> str:
         """Create a hex-encoded TensorTicket string."""
         from biopb.tensor.ticket_pb2 import TensorTicket
+
         ticket = TensorTicket(chunk_id=chunk_id)
         return ticket.SerializeToString().hex()
 
@@ -432,12 +433,13 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         # Mock do_get to return a table
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()
@@ -453,12 +455,13 @@ class TestChunkEndpoint:
         tc, mock_fc = auth_client
         ticket_hex = self._make_ticket_hex()
 
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()
@@ -475,12 +478,13 @@ class TestChunkEndpoint:
         tc, mock_fc = auth_client
         ticket_hex = self._make_ticket_hex()
 
+        import pyarrow as pa
+        from biopb_tensor_server.base import pack_chunk_batch
+
+        # do_get returns the unified binary chunk batch (biopb/biopb#293).
+        batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
         mock_reader = MagicMock()
-        mock_table = MagicMock()
-        mock_column = MagicMock()
-        mock_column.to_numpy.return_value = np.zeros((16, 16), dtype="uint16")
-        mock_table.column.return_value = mock_column
-        mock_reader.read_all.return_value = mock_table
+        mock_reader.read_all.return_value = pa.Table.from_batches([batch])
 
         mock_fc._client.do_get.return_value = mock_reader
         mock_fc._call_options = MagicMock()
@@ -512,6 +516,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow.flight as flight
+
         mock_fc._client.do_get.side_effect = flight.FlightServerError("Chunk not found")
         mock_fc._call_options = MagicMock()
 
@@ -625,6 +630,7 @@ class TestRequestArrayId:
 def _zarr_available() -> bool:
     try:
         import zarr  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -637,7 +643,6 @@ class TestIntegration:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         import zarr
-
         from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
         # Create a small Zarr array
@@ -646,7 +651,9 @@ class TestIntegration:
         chunks = (1, 16, 16)
         rng = np.random.default_rng(0)
         data = rng.integers(0, 1000, shape, dtype="uint16")
-        z = zarr.open_array(zarr_path, mode="w", shape=shape, chunks=chunks, dtype="uint16")
+        z = zarr.open_array(
+            zarr_path, mode="w", shape=shape, chunks=chunks, dtype="uint16"
+        )
         z[:] = data
 
         adapter = ZarrAdapter(z, "int-tensor", ["z", "y", "x"])
@@ -754,14 +761,19 @@ class TestQuerySourcesEndpoint:
 
         # Mock query_sources to return an Arrow table
         import pyarrow as pa
-        mock_table = pa.table({
-            "source_id": ["src0", "src1"],
-            "source_type": ["zarr", "zarr"],
-        })
-        mock_table = mock_table.replace_schema_metadata({
-            b"total_sources": "2",
-            b"returned_sources": "2",
-        })
+
+        mock_table = pa.table(
+            {
+                "source_id": ["src0", "src1"],
+                "source_type": ["zarr", "zarr"],
+            }
+        )
+        mock_table = mock_table.replace_schema_metadata(
+            {
+                b"total_sources": "2",
+                b"returned_sources": "2",
+            }
+        )
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(
@@ -779,13 +791,18 @@ class TestQuerySourcesEndpoint:
         tc, mock_fc = auth_client
 
         import pyarrow as pa
-        mock_table = pa.table({
-            "source_id": ["src0", "src1"],
-        })
-        mock_table = mock_table.replace_schema_metadata({
-            b"total_sources": "100",
-            b"returned_sources": "2",
-        })
+
+        mock_table = pa.table(
+            {
+                "source_id": ["src0", "src1"],
+            }
+        )
+        mock_table = mock_table.replace_schema_metadata(
+            {
+                b"total_sources": "100",
+                b"returned_sources": "2",
+            }
+        )
         mock_fc.query_sources.return_value = mock_table
 
         r = tc.post(
@@ -827,6 +844,7 @@ class TestWindowsShutdownListener:
 
     def test_sentinel_path_matches_stop_side_contract(self):
         from pathlib import Path
+
         from biopb_tensor_server.http_server import shutdown_sentinel_path
 
         # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).
@@ -844,3 +862,342 @@ class TestWindowsShutdownListener:
             _install_windows_shutdown_listener(server)  # must not raise
         assert threading.active_count() == before  # no watcher thread started
         assert server.should_exit is False
+
+
+# ===========================================================================
+# Admin routes — config read/write, status, restart (biopb/biopb#237)
+# ===========================================================================
+
+
+@pytest.fixture()
+def admin_client(tmp_path):
+    """Dev-mode TestClient wired with a config path and a health-reporting mock."""
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        '{"server": {"host": "127.0.0.1", "port": 8815}, "keep_me": {"x": 1}}'
+    )
+    mock_fc = _build_mock_client()
+    mock_fc.health_check.return_value = {
+        "status": "SERVING",
+        "source_count": 7,
+        "writable": True,
+        "uptime_seconds": 42,
+        "full_scan_in_progress": True,
+        "last_full_scan_finished_at": None,
+    }
+    with patch(
+        "biopb_tensor_server.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(
+            token=None,
+            dev_mode=True,
+            config_path=str(config_path),
+            web_host="127.0.0.1",
+            web_port=8814,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, config_path
+
+
+class TestAdminConfigRoutes:
+    def test_get_config_returns_path_config_and_schema(self, admin_client):
+        tc, config_path = admin_client
+        r = tc.get("/api/config")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["path"] == str(config_path)
+        assert body["config"]["server"]["port"] == 8815
+        assert "properties" in body["schema"]
+
+    def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        # downscale_factor of 1 is out of range (#34) -> schema rejects it.
+        r = tc.put(
+            "/api/config",
+            json={"pyramid": {"downscale_factor": 1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["errors"]
+        assert any("downscale_factor" in err["path"] for err in body["errors"])
+        # Nothing written: disk untouched.
+        assert config_path.read_text() == before
+
+    def test_put_rejects_bad_case_insensitive_enum_the_schema_cannot_express(
+        self, admin_client
+    ):
+        # log_level is a case-insensitive enum, so the published JSON Schema
+        # emits no hard `enum` (it would reject valid differently-cased values).
+        # The endpoint's semantic pass (validate_config_dict) must still reject a
+        # value the server would refuse at load, so "the form accepted it" always
+        # implies "the server will load it" (biopb/biopb#34).
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": {"log_level": "VERBOSE"}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert any(err["path"] == ["server", "log_level"] for err in body["errors"])
+        assert config_path.read_text() == before  # nothing written
+
+    def test_put_malformed_section_returns_422_not_500(self, admin_client):
+        # A wrong-typed section (a string where an object is expected) makes the
+        # server's semantic validator's parse step raise while walking a non-dict.
+        # The endpoint must degrade to a clean 422 (the JSON Schema's precise type
+        # error), never a 500, and write nothing. Regression guard: the semantic
+        # pass used to let that exception escape.
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": "not-a-dict"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["errors"]
+        # Schema's per-field error only -- no redundant root-level ([]) duplicate
+        # from the semantic pass's structural fallback.
+        assert not any(err["path"] == [] for err in body["errors"])
+        assert config_path.read_text() == before  # nothing written
+
+    def test_put_valid_saves_and_preserves_unsurfaced_keys(self, admin_client):
+        import json
+
+        tc, config_path = admin_client
+        r = tc.put(
+            "/api/config",
+            json={"server": {"host": "127.0.0.1", "port": 9000}, "keep_me": {"x": 1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["saved"] is True and body["restart_required"] is True
+        on_disk = json.loads(config_path.read_text())
+        assert on_disk["server"]["port"] == 9000
+        assert on_disk["keep_me"] == {"x": 1}  # unsurfaced key survived
+        assert on_disk["$schema"] == "./biopb.schema.json"
+
+    def test_put_blocks_cross_origin_without_token_header(self, admin_client):
+        tc, config_path = admin_client
+        before = config_path.read_text()
+        r = tc.put(
+            "/api/config",
+            json={"server": {"port": 9000}},
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        assert r.status_code == 403
+        assert config_path.read_text() == before  # guarded before any write
+
+    def test_put_cross_origin_allowed_with_xbiopb_token_header(self, admin_client):
+        # A custom header a cross-origin browser fetch cannot set without a
+        # (failing) CORS preflight is the same-origin proof, so it bypasses the
+        # Sec-Fetch-Site check even on a cross-site request.
+        tc, config_path = admin_client
+        r = tc.put(
+            "/api/config",
+            json={"server": {"host": "127.0.0.1", "port": 9000}},
+            headers={"Sec-Fetch-Site": "cross-site", "X-Biopb-Token": "anything"},
+        )
+        assert r.status_code == 200
+
+    def test_put_cross_origin_allowed_with_authorization_header(self, admin_client):
+        tc, config_path = admin_client
+        r = tc.put(
+            "/api/config",
+            json={"server": {"host": "127.0.0.1", "port": 9000}},
+            headers={"Sec-Fetch-Site": "cross-site", "Authorization": "Bearer x"},
+        )
+        assert r.status_code == 200
+
+
+@pytest.fixture()
+def admin_client_with_creds(tmp_path):
+    """Admin TestClient whose config carries a credentials profile with secrets."""
+    config_path = tmp_path / "biopb.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server": {"host": "127.0.0.1", "port": 8815},
+                "credentials": {
+                    "profiles": [
+                        {
+                            "name": "aws-prod",
+                            "storage_type": "s3",
+                            "key": "AKIA-REAL",
+                            "secret": "REAL-SECRET",
+                            "region": "us-east-1",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    mock_fc = _build_mock_client()
+    with patch(
+        "biopb_tensor_server.http_server.TensorFlightClient",
+        return_value=mock_fc,
+    ):
+        app = create_app(
+            token=None,
+            dev_mode=True,
+            config_path=str(config_path),
+            web_host="127.0.0.1",
+            web_port=8814,
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            yield tc, config_path
+
+
+class TestAdminConfigSecretRedaction:
+    def test_get_masks_credential_secrets(self, admin_client_with_creds):
+        from biopb_tensor_server.config import REDACTED_SENTINEL
+
+        tc, _ = admin_client_with_creds
+        prof = tc.get("/api/config").json()["config"]["credentials"]["profiles"][0]
+        assert prof["key"] == REDACTED_SENTINEL
+        assert prof["secret"] == REDACTED_SENTINEL
+        assert prof["region"] == "us-east-1"  # non-secret passes through
+
+    def test_put_with_redacted_sentinels_preserves_real_secret_on_disk(
+        self, admin_client_with_creds
+    ):
+        import json as _json
+
+        from biopb_tensor_server.config import REDACTED_SENTINEL
+
+        tc, config_path = admin_client_with_creds
+        # Round-trip the masked GET body back, editing only a non-secret field.
+        body = tc.get("/api/config").json()["config"]
+        body["credentials"]["profiles"][0]["region"] = "eu-west-1"
+        r = tc.put("/api/config", json=body, headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        prof = _json.loads(config_path.read_text())["credentials"]["profiles"][0]
+        assert prof["secret"] == "REAL-SECRET"  # not clobbered by the sentinel
+        assert prof["key"] == "AKIA-REAL"
+        assert prof["region"] == "eu-west-1"  # the genuine edit landed
+        assert REDACTED_SENTINEL not in _json.dumps(prof)
+
+
+class TestAdminStatusRoute:
+    def test_status_merges_health_and_process_facts(self, admin_client):
+        tc, config_path = admin_client
+        r = tc.get("/api/admin/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["running"] is True
+        assert body["health"] == "SERVING"
+        assert body["source_count"] == 7
+        assert body["full_scan_in_progress"] is True
+        assert body["last_full_scan_finished_at"] is None
+        assert body["config_path"] == str(config_path)
+        assert isinstance(body["pid"], int)
+        assert body["version"]
+
+
+class TestAdminRestartRoute:
+    def test_restart_spawns_detached_child_and_returns_202(self, admin_client):
+        tc, _ = admin_client
+        with patch("subprocess.Popen") as popen:
+            r = tc.post(
+                "/api/admin/restart",
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+        assert r.status_code == 202
+        assert r.json() == {"restarting": True}
+        popen.assert_called_once()
+        cmd = popen.call_args.args[0]
+        assert cmd[1:5] == ["-m", "biopb.cli", "server", "restart"]
+        # The daemon echoes its own launch args so restart comes back identically.
+        assert cmd[cmd.index("--web-port") + 1] == "8814"
+        assert cmd[cmd.index("--web-host") + 1] == "127.0.0.1"
+        assert "--config" in cmd
+        # dev-bypass token rides the child env (never the command line).
+        assert popen.call_args.kwargs["env"].get("BIOPB_WEB_DEV_BYPASS") == "1"
+        assert not any(str(arg).startswith("BIOPB") for arg in cmd)
+
+    def test_restart_blocks_cross_origin(self, admin_client):
+        tc, _ = admin_client
+        with patch("subprocess.Popen") as popen:
+            r = tc.post(
+                "/api/admin/restart",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+        assert r.status_code == 403
+        popen.assert_not_called()
+
+    def test_second_restart_while_one_in_progress_returns_409(self, admin_client):
+        tc, _ = admin_client
+        hdr = {"Sec-Fetch-Site": "same-origin"}
+        with patch("subprocess.Popen") as popen:
+            first = tc.post("/api/admin/restart", headers=hdr)
+            second = tc.post("/api/admin/restart", headers=hdr)
+        assert first.status_code == 202
+        assert second.status_code == 409
+        # The latch stops the second from spawning a competing restart child.
+        popen.assert_called_once()
+
+    def test_latch_resets_when_spawn_fails_so_retry_is_possible(self, admin_client):
+        tc, _ = admin_client
+        hdr = {"Sec-Fetch-Site": "same-origin"}
+        with patch("subprocess.Popen", side_effect=OSError("boom")):
+            failed = tc.post("/api/admin/restart", headers=hdr)
+        assert failed.status_code == 500
+        # Latch was cleared on failure, so a later successful spawn returns 202.
+        with patch("subprocess.Popen") as popen:
+            retry = tc.post("/api/admin/restart", headers=hdr)
+        assert retry.status_code == 202
+        popen.assert_called_once()
+
+
+# ===========================================================================
+# WebSocket render endpoint (/ws/render)
+#
+# The render pipeline itself is exercised by the HTTP /api/render path; these
+# lock in the auth + message-dispatch behaviour that the refactor split out of
+# the monolithic websocket handler (biopb/biopb#181).
+# ===========================================================================
+
+
+class TestWebSocketRender:
+    def test_unknown_action_returns_error(self, dev_client):
+        tc, _ = dev_client
+        with tc.websocket_connect("/ws/render") as ws:
+            ws.send_json({"action": "nope"})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"] == "Unknown action: nope"
+
+    def test_invalid_params_returns_error(self, dev_client):
+        tc, _ = dev_client
+        with tc.websocket_connect("/ws/render") as ws:
+            # RenderRequest requires source_id/tensor_id → validation error
+            ws.send_json({"action": "render", "params": {}})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"].startswith("Invalid params")
+
+    def test_missing_token_rejected(self, auth_client):
+        from fastapi import WebSocketDisconnect
+
+        tc, _ = auth_client
+        # Token enforced (auth_client) and none supplied → server closes 4001.
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with tc.websocket_connect("/ws/render") as ws:
+                ws.receive_json()
+        assert excinfo.value.code == 4001
+
+    def test_valid_query_token_accepts(self, auth_client):
+        tc, _ = auth_client
+        # Token via query param (browsers can't set WS headers).
+        with tc.websocket_connect(f"/ws/render?token={_TOKEN}") as ws:
+            ws.send_json({"action": "nope"})
+            msg = ws.receive_json()
+        assert msg["action"] == "error"
+        assert msg["message"] == "Unknown action: nope"

@@ -37,6 +37,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Platform-dependent defaults for the two kernel-bring-up knobs that Windows
+# pays a structural penalty on. Windows has no fork(): dask's multi-process
+# LocalCluster must *spawn* every worker -- a fresh interpreter that re-imports
+# the whole numpy/dask/distributed stack cold -- where Linux/macOS fork near-
+# free via copy-on-write. With num_workers=0 (dask picks ~n_cores) that
+# spawn+reimport storm both lengthens kernel bring-up (risking startup_timeout)
+# and multiplies memory. So on Windows we cap the worker count and widen the
+# startup budget; POSIX keeps the lean defaults. A user config.json still
+# overrides either leaf on any platform (deep-merge), so this only sets the
+# floor for an unconfigured install.
+_IS_WINDOWS = os.name == "nt"
+_DEFAULT_STARTUP_TIMEOUT = 120.0 if _IS_WINDOWS else 60.0
+_DEFAULT_DASK_NUM_WORKERS = 4 if _IS_WINDOWS else 0
+
 # Default configuration values
 DEFAULT_CONFIG = {
     # Experimental napari demo widgets (image_processing/). Only those widgets
@@ -154,7 +168,10 @@ DEFAULT_CONFIG = {
         },
         "kernel": {
             "name": "python3",
-            "startup_timeout": 60.0,
+            # 60.0 on POSIX; 120.0 on Windows, where the cold spawn+reimport of
+            # dask workers makes bring-up legitimately slower (see
+            # _DEFAULT_STARTUP_TIMEOUT).
+            "startup_timeout": _DEFAULT_STARTUP_TIMEOUT,
             # execute_timeout now bounds only the *quick* in-band kernel snippets
             # (screenshot / status / inspect / job submit+poll), not long jobs:
             # execute_code runs agent code in a background thread that may run
@@ -168,12 +185,13 @@ DEFAULT_CONFIG = {
             "promote_after": 10.0,
             # Orphan hardening (issue #13). The kernel runs in its own session,
             # so an abnormal launcher/kernel death would otherwise orphan the
-            # kernel + its dask LocalCluster.
+            # kernel (and, under mcp.dask.owner="kernel", the cluster it spawned;
+            # the default daemon-owned cluster is reaped separately by the daemon).
             #   parent_death_pipe: kernel inherits a pipe read-end and group-kills
             #     itself when the launcher *process* dies (POSIX only; mode 1).
             #   watchdog_interval: seconds between liveness polls; on an
-            #     unexpected kernel death the host reaps the orphaned dask group
-            #     and respawns (0 disables the watchdog; mode 2).
+            #     unexpected kernel death the host reaps the orphaned process
+            #     group and respawns (0 disables the watchdog; mode 2).
             #   watchdog_max_respawns / watchdog_respawn_window: bound respawns to
             #     avoid a crash-respawn thrash loop; once exceeded the host is
             #     marked dead until restart_kernel.
@@ -183,17 +201,28 @@ DEFAULT_CONFIG = {
             "watchdog_respawn_window": 60.0,
         },
         "dask": {
-            # Dask defaults to a kernel-local multi-process distributed cluster
-            # (LocalCluster). This is the only configuration where cancel_job can
-            # stop an in-flight .compute() mid-execution, and it gives real
-            # (non-GIL) CPU parallelism. Set scheduler to "threads" /
-            # "synchronous" for a low-overhead in-process scheduler (no
-            # mid-compute cancel), or set address to attach to an external
+            # Dask defaults to a multi-process distributed cluster (LocalCluster)
+            # owned by the MCP *daemon* (owner="daemon"); the kernel attaches to
+            # it via an injected scheduler address, so the cluster survives kernel
+            # restarts (no cold worker re-spawn -- the dominant restart cost on
+            # Windows). Any distributed mode lets cancel_job stop an in-flight
+            # .compute() and gives real (non-GIL) CPU parallelism. Set scheduler
+            # to "threads"/"synchronous" for a low-overhead in-process scheduler
+            # (no mid-compute cancel), or set address to attach to an external
             # scheduler instead of spinning a local one.
             "scheduler": "distributed",
+            # Who owns the auto-spun LocalCluster. "daemon" (default): the MCP
+            # daemon owns it, so it outlives kernel restart/respawn/window-close.
+            # "kernel": the legacy behavior where each kernel spins (and tears
+            # down) its own cluster. Ignored when scheduler is not "distributed"
+            # or an external address is set (the kernel attaches to that).
+            "owner": "daemon",
             # n_workers for the auto-spun LocalCluster (0 -> let dask pick,
             # ~n_cores). When connecting to an external scheduler this is ignored.
-            "num_workers": 0,
+            # 0 on POSIX (fork makes ~n_cores workers cheap); capped at 4 on
+            # Windows, where each worker is a cold spawn (see
+            # _DEFAULT_DASK_NUM_WORKERS).
+            "num_workers": _DEFAULT_DASK_NUM_WORKERS,
             # Non-empty -> connect to this external scheduler address; empty ->
             # spin a kernel-local LocalCluster.
             "address": "",
@@ -214,18 +243,12 @@ DEFAULT_CONFIG = {
             "cache_budget": "1G",
         },
         "tensor": {
-            # Let the data-plane client cache chunks even for a *localhost*
-            # tensor server. Translated into BIOPB_CACHE_LOCAL in the
-            # kernel/worker env by __main__.py. By default the client skips a
-            # localhost cache (the server already caches), but that means an
-            # interactive viewer scrubbing planes re-fetches the whole enclosing
-            # chunk per plane; caching makes repeated/overlapping reads instant.
-            # Memory is bounded by the existing dask.cache_budget plugin (each
-            # worker caps at budget // n_workers), so this does not reintroduce
-            # the per-worker replication that the unbounded cache caused. A
-            # structural fix that removes the underlying read amplification
-            # (client-selectable read granularity) is tracked in biopb/biopb#8.
-            "cache_local": True,
+            # NOTE: the localhost client-cache decision now lives entirely in the
+            # tensor client (biopb.tensor.client._resolve_cache_bytes): localhost
+            # gets no client cache by default (the server caches and the
+            # cache-file mmap fast path makes a re-fetch cheap), with
+            # BIOPB_CACHE_LOCAL=1 as biopb's own opt-out for e.g. a slow loopback
+            # proxy. The MCP kernel no longer overrides that default.
             # Background source-catalog watcher (issue #44). A daemon thread in
             # the kernel periodically health-checks the server and re-lists
             # sources when its source_count changes, so a catalog cached while
@@ -289,6 +312,28 @@ DEFAULT_CONFIG = {
             # How often (ms) the page polls the job list / status. Deliberately
             # slow: each poll is a kernel round-trip competing with agent calls.
             "poll_interval_ms": 3000,
+        },
+        "update": {
+            # Kernel-start auto-updater (issue #87). When a napari window exists,
+            # the kernel checks once — in the background, fail-open — whether a
+            # newer biopb release-v* *deployment* is available than the one the
+            # installer recorded (~/.config/biopb/release.version), and offers to
+            # re-run the installer. The check never blocks or crashes the viewer.
+            "enabled": True,
+            # owner/name of the deployment repo whose release-v* line is the
+            # product. Overridable for forks / testing; the release line prefix
+            # ("release-v") is fixed (see docs/release-model.md).
+            "repo": "biopb/biopb",
+            # "stable"     -> newest clean release-vX.Y.Z (prereleases skipped,
+            #                 matching the installer's default).
+            # "prerelease" -> also consider release candidates (…a/b/rc).
+            "channel": "stable",
+            # A version the user chose to skip ("Skip vX.Y.Z"): suppresses the
+            # prompt for exactly that version. Empty -> nothing skipped.
+            "skipped_version": "",
+            # Per-request network timeout (seconds) for the GitHub API fetch.
+            # Short on purpose — the check must never delay viewer start.
+            "timeout": 5.0,
         },
         # Give-up budget (seconds) for start_local_server's just-launched boot
         # wait, where connection-refused is tolerated while the server binds and
@@ -423,11 +468,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     mismatches) replace wholesale.
     """
     for key, value in override.items():
-        if (
-            key in base
-            and isinstance(base[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _deep_merge(base[key], value)
         else:
             base[key] = value
@@ -497,9 +538,7 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     # Unique per process *and* thread so two concurrent writers never collide on
     # the temp file (CONFIG._save serializes them under the lock, but this keeps
     # the helper safe if called directly, e.g. via save_config).
-    tmp = path.with_name(
-        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with tmp.open("w") as f:
             json.dump(data, f, indent=2)
@@ -635,9 +674,7 @@ def save_config(config: dict) -> None:
     CONFIG.reload()
 
 
-def get_grid_params(
-    is_3d: bool, config: dict
-) -> Tuple[np.ndarray, np.ndarray]:
+def get_grid_params(is_3d: bool, config: dict) -> Tuple[np.ndarray, np.ndarray]:
     """Get grid size and stride from config.
 
     Args:
@@ -648,10 +685,6 @@ def get_grid_params(
         Tuple of (grid_size, stride) as numpy arrays.
     """
     prefix = "3d" if is_3d else "2d"
-    grid_size = np.array(
-        get_setting(config, f"widget.grid.{prefix}_size"), dtype=int
-    )
-    stride = np.array(
-        get_setting(config, f"widget.grid.{prefix}_stride"), dtype=int
-    )
+    grid_size = np.array(get_setting(config, f"widget.grid.{prefix}_size"), dtype=int)
+    stride = np.array(get_setting(config, f"widget.grid.{prefix}_stride"), dtype=int)
     return grid_size, stride

@@ -15,14 +15,20 @@ from pathlib import Path
 from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.config import SourceConfig
+from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+from biopb_tensor_server.config import SourceConfig, _reroot_catalog_url
 from biopb_tensor_server.discovery import (
     AdapterRegistry,
+    ClaimContext,
     DiscoveryState,
     SourceClaim,
+    _is_offline_placeholder,
+    discover_sources,
     discover_sources_from_entries,
+    generate_source_id,
     get_file_identity,
     is_remote_url,
+    resolve_local_path,
     should_skip_walk_entry,
 )
 from biopb_tensor_server.watcher import (
@@ -32,9 +38,104 @@ from biopb_tensor_server.watcher import (
 )
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.metadata_db import MetadataDatabase
     from biopb_tensor_server.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
+
+# Remote/cloud source families are EXPERIMENTAL. Warn once per family per process
+# (registration runs per source) so an operator sees the maturity caveat without
+# per-source log spam. Keyed by family; the set is only ever added to.
+_EXPERIMENTAL_WARNED: set = set()
+_EXPERIMENTAL_SOURCE_MESSAGES = {
+    "cloud": (
+        "Cloud / synced-folder sources (cloud=true, e.g. OneDrive Files "
+        "On-Demand) are EXPERIMENTAL: resolve-on-serve and hydrate-ahead behavior "
+        "may change. See docs/cloud-storage-support.md."
+    ),
+    "tensor-server": (
+        "Remote tensor-server proxy sources (type=tensor-server) are "
+        "EXPERIMENTAL: the caching-passthrough proxy may change. "
+        "See docs/remote-tensor-cache.md."
+    ),
+    "remote-url": (
+        "Remote URL sources (s3://, http(s)://, ...) are EXPERIMENTAL and may change."
+    ),
+}
+
+
+def _warn_experimental_source(family: str) -> None:
+    """Log a one-time EXPERIMENTAL warning for a remote/cloud source *family*."""
+    if family in _EXPERIMENTAL_WARNED:
+        return
+    _EXPERIMENTAL_WARNED.add(family)
+    logger.warning("%s", _EXPERIMENTAL_SOURCE_MESSAGES[family])
+
+
+# Backoff ceiling for the tensor-server upstream re-list, in rescan ticks
+# (biopb/biopb#178). A re-list runs every tick while an upstream is changing or
+# failing; while it stays stable the spacing doubles up to this many ticks, so a
+# fully-stable upstream settles to re-listing about once an hour at the default
+# 30s rescan tick (instead of querying it every 30s forever).
+_UPSTREAM_RELIST_MAX_TICKS = 120
+
+# While add_local_source waits for the catalog lock (a rescan is mid-flight), it
+# emits a heartbeat this often so the streamed action does not sit silent long
+# enough to trip a proxy idle read timeout.
+_ADD_SOURCE_ACQUIRE_HEARTBEAT = 5.0
+
+# Hard backstop against unbounded recursion in the rescan walk. visited_identities
+# breaks real directory loops (symlink/junction/hardlink/bind mount) by filesystem
+# identity, but under a cloud root the inode is zeroed (biopb/biopb#207) so identity
+# degrades to a path hash that never repeats inside a junction loop -> RecursionError,
+# which the os.scandir `except OSError` does not catch (biopb/biopb#207 review). This
+# cap turns any such loop into a bounded, logged skip. Real microscopy trees are far
+# shallower (rarely past ~10 levels), so this only ever fires on a pathological loop.
+_MAX_WALK_DEPTH = 64
+
+# Virtual scheme stamped on the catalog ``source_url`` of a drag-dropped source.
+# It marks the source's *origin* (a runtime drop, not config/discovery) and is the
+# key a future "remove dropped source" feature authorizes on: the drop re-root
+# guard below only stamps it when the drop is entirely new AND outside every
+# monitored root, so its presence means "user-added and nothing will re-add it."
+# It is a display-only scheme (like ``cache://``) — never touches ``source_id`` or
+# the raw ``_source_url`` used for I/O. Keep in sync with the client tree builders
+# that strip it: ``_get_path_parts`` (biopb-mcp ``tensor_browser/_widget.py``) and
+# ``getPathParts`` (web ``SourceTree.tsx``).
+DND_URL_PREFIX = "dnd://"
+
+
+def _drop_catalog_url(
+    dropped_root: str, primary_path: str, *, mark_dnd: bool = True
+) -> str:
+    """Catalog ``source_url`` that re-roots a drag-dropped source under the
+    dropped item's basename, optionally prefixed with the ``dnd://`` origin scheme.
+
+    A dropped file's real path (``/home/u/data/exp/a.tif``) would otherwise nest
+    it deep inside the shared absolute-path tree; re-rooting it at the dropped
+    item's basename makes each drop its own root instead (via the shared
+    ``_reroot_catalog_url``). When ``mark_dnd`` is set, the ``dnd://`` prefix also
+    marks it as removable drop-origin:
+
+        drop /home/u/data/exp.zarr           -> "dnd://exp.zarr"        (own root)
+        drop /home/u/data/exp/ (a folder) with
+             .../exp/a.tif, .../exp/sub/b.tif -> "dnd://exp/a.tif",
+                                                 "dnd://exp/sub/b.tif"
+
+    ``mark_dnd`` is False for a drop that lands under a monitored root: it still
+    gets a tidy display root, but no marker, because the periodic rescan will
+    re-discover it (with its native url) — so it is not safely removable. The
+    marker therefore means exactly "user-added and nothing will re-add it."
+
+    Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
+    uses); the client tree builders strip the scheme for display. The
+    configured-``alias`` re-root shares ``_reroot_catalog_url`` but is always
+    scheme-less, so the two re-root paths stay distinguishable.
+    """
+    dropped_root = str(dropped_root).rstrip("/\\")
+    base = os.path.basename(dropped_root) or dropped_root
+    rerooted = _reroot_catalog_url(base, dropped_root, primary_path)
+    return DND_URL_PREFIX + rerooted if mark_dnd else rerooted
 
 
 @dataclass
@@ -58,6 +159,7 @@ class SourceManager:
         discovery_state: DiscoveryState,
         watcher: Optional[DirectoryWatcher],
         monitored_dirs: Set[Path],
+        metadata_db: Optional[MetadataDatabase] = None,
         dim_labels: Optional[List[str]] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -65,12 +167,41 @@ class SourceManager:
         full_rescan_interval: float = 3600.0,
         stable_rescans_required: int = 0,
         aggressive_dir_pruning: bool = False,
+        cloud_roots: Optional[Set[Path]] = None,
+        monitored_upstreams: Optional[List[SourceConfig]] = None,
     ):
         self._server = server
+        # First-class catalog dependency: injected by create_source_manager so
+        # all DB sync routes through self._metadata_db instead of poking through
+        # the server. None when the metadata DB feature is disabled.
+        self._metadata_db = metadata_db
         self._registry = registry
         self._state = discovery_state
         self._watcher = watcher
         self._monitored_dirs = monitored_dirs
+        # Resolved roots opted into cloud/synced-folder handling (config cloud=true).
+        # Under these, dehydrated entries are admitted and registered as unresolved
+        # sources that resolve lazily on first access (cloud-storage phase 2).
+        self._cloud_roots: Set[Path] = cloud_roots or set()
+        # Monitored tensor-server (bare-host grpc://) upstreams: their catalog is
+        # periodically re-listed and reconciled like a directory walk
+        # (biopb/biopb#178). Single-source grpc://host/<id> entries are not here --
+        # there is nothing to re-list for one fixed source.
+        self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
+        # Per-upstream re-list cadence (keyed by url), counted in rescan ticks (no
+        # wall-clock interval -- the rescan tick is the unit). A re-list runs every
+        # tick by default; when it finds the source set UNCHANGED the spacing
+        # doubles (a stable upstream is skipped for more ticks, up to
+        # _UPSTREAM_RELIST_MAX_TICKS, so we are not querying it every tick forever),
+        # and any change OR failure resets it to every tick -- so a new source / a
+        # recovering upstream is picked up within ~one tick, not after the full
+        # backoff. `countdown` ticks down to 0 (re-list due); `period` is the
+        # current spacing in ticks.
+        self._upstream_relist: Dict[str, Dict[str, int]] = {}
+        self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
+        # Upstreams (by url) whose last re-list failed -- a status signal (the fast
+        # retry itself is driven by the period reset above).
+        self._failed_upstreams: Set[str] = set()
         self._dim_labels = dim_labels
         self._credentials_config = credentials_config
         self._stability_window = stability_window
@@ -83,14 +214,41 @@ class SourceManager:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         # Background precache hook: called with a source_id when a source is
-        # committed *after* start() (the runtime phase). Left None for the
-        # initial startup scan -- which is committed before start() -- so the
-        # precache worker only warms sources that arrive live. See start().
+        # committed *after* the initial scan completes. Gated on
+        # ``_initial_scan_done`` so the (possibly large) startup set is routed to
+        # the slow precache *backlog* instead of the prompt enqueue -- only
+        # sources discovered live (later rescans) warm promptly. See
+        # ``_commit_add_claim``.
         self._on_source_committed: Optional[Callable[[str], None]] = None
-        self._runtime_phase = False
+        # Flipped True at the end of the first successful full rescan. Under
+        # progressive discovery that scan runs in the event loop *after* start(),
+        # so this -- not "are we past start()" -- is the correct startup/runtime
+        # boundary for the precache gate.
+        self._initial_scan_done = False
+        # Set only for the duration of the boot-tick upstream re-list, when the
+        # local walk earlier in the *same* rescan already flipped
+        # ``_initial_scan_done`` True (see ``_handle_rescan``). It keeps the
+        # startup upstream mirror -- committed after that flip -- routed to the
+        # slow backlog instead of the prompt enqueue, exactly as the startup set
+        # is meant to be (the mirror is part of the startup catalog regardless of
+        # which half of the tick registers it). Event-loop thread only, so a plain
+        # flag is safe.
+        self._suppress_live_precache = False
+        # Best-effort callback fired once, when the first full scan completes
+        # (from the event-loop thread). The launcher uses it to seed the precache
+        # backlog with the startup set at the moment the catalog is established.
+        self._on_initial_scan_complete: Optional[Callable[[], None]] = None
         # Rescan/reconcile helpers may re-enter other state-mutating helpers.
         # Use an RLock so nested calls on the same thread do not deadlock.
         self._lock = threading.RLock()
+
+        # Coarse mutex serializing a *whole* catalog-mutation pass. The periodic
+        # rescan (event-loop thread) and a runtime ``add_local_source`` (a Flight
+        # handler thread) are the only two flows that discover + commit sources;
+        # holding this across each keeps the confirmed catalog single-writer
+        # without threading add_source through the event loop. Distinct from
+        # ``self._lock`` (the fine-grained state RLock ``_commit_add_claim`` takes).
+        self._catalog_lock = threading.Lock()
 
         # Path tracking for move handling
         # Maps resolved path -> source_id (str keys for URL support)
@@ -109,6 +267,20 @@ class SourceManager:
         # Rescan bookkeeping for low-overhead subtree pruning.
         self._skipped_stable_dirs: Set[str] = set()
         self._last_full_rescan_at: float = float("-inf")
+        # Cloud-subtree entry partition. Cloud (synced-folder) subtrees are walked
+        # only on the hourly force_full pass; on the frequent incremental rescans
+        # they are skipped entirely. To keep that O(non-cloud), cloud entries live
+        # here -- rebuilt only at the end of a successful force_full -- instead of
+        # being re-materialized into ``_entry_state``/``next_state`` every cycle
+        # (which made every per-entry rescan loop O(whole cloud catalog) and
+        # stalled the Flight serving threads via the GIL). Same tuple shape as
+        # ``_entry_state``. Never mutated on a failed rescan, so the last good
+        # snapshot survives a force_full failure (no rollback variable needed).
+        self._cloud_entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        # source_ids whose primary_path is under a cloud root, maintained at commit
+        # time (O(1) per source). Lets the incremental reconcile preserve cloud
+        # sources by a hash-set check instead of resolving every cloud member path.
+        self._cloud_source_ids: Set[str] = set()
 
         # Initialize path tracking from existing claims
         for source_id, claim in self._state.claims.items():
@@ -126,10 +298,10 @@ class SourceManager:
             logger.warning("SourceManager already running")
             return
 
-        # Everything committed from here on is a live (runtime) addition; the
-        # initial startup scan ran before this point and is excluded from the
-        # precache hook.
-        self._runtime_phase = True
+        # The background bootstrap scan runs in this event loop (the watcher
+        # fires its first rescan immediately). Until that first scan completes,
+        # ``_initial_scan_done`` stays False so its sources route to the precache
+        # backlog rather than the prompt enqueue.
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -209,7 +381,51 @@ class SourceManager:
             logger.error(f"Error handling event {event}: {e}", exc_info=True)
 
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan across monitored directories."""
+        """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
+
+        Local directory sources are discovered *before* the tensor-server upstream
+        re-list so a slow/large upstream (hundreds of mirrored sources, each a
+        network round-trip) cannot delay the local catalog from appearing: the
+        local walk streams its sources first and the upstream mirror fills in
+        behind it on the same tick. (biopb/biopb#178 introduced the re-list; this
+        ordering keeps it off the local catalog's critical path -- previously the
+        re-list ran first, so on the boot tick local sources surfaced only after
+        every upstream source had been registered, minutes later.)
+
+        Precache routing subtlety: on the boot tick the local walk flips
+        ``_initial_scan_done`` True *before* the upstream re-list runs, which
+        would otherwise make ``_commit_add_claim`` prompt-enqueue the entire
+        startup upstream mirror at the precache worker's un-idle-gated live tier
+        (hundreds of upstream chunk fetches competing with serving -- the very
+        thing this reorder protects the local catalog from). The whole tick is a
+        startup tick if the scan had not completed when it began, so the upstream
+        mirror it registers is startup set and must route to the slow backlog. We
+        suppress the live enqueue across just that re-list.
+        """
+        # Serialize the whole pass against a concurrent runtime add_local_source
+        # (Flight thread) so the two never mutate the confirmed catalog at once.
+        with self._catalog_lock:
+            startup_tick = not self._initial_scan_done
+            self._rescan_monitored_dirs()
+            # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
+            # cadence -- fast (every tick) while changing/failing, backing off toward
+            # full_rescan_interval while a source set stays stable. Runs AFTER the
+            # local walk (see docstring).
+            if startup_tick:
+                self._suppress_live_precache = True
+                try:
+                    self._reconcile_due_upstreams()
+                finally:
+                    self._suppress_live_precache = False
+            else:
+                self._reconcile_due_upstreams()
+
+    def _rescan_monitored_dirs(self) -> None:
+        """Walk the monitored directories and reconcile the discovered catalog.
+
+        No-op for an upstream-only config (no monitored dirs); that case's
+        freshness signals + first-scan gate are driven by _reconcile_due_upstreams.
+        """
         if not self._monitored_dirs:
             return
 
@@ -218,57 +434,128 @@ class SourceManager:
             return
 
         force_full_rescan = self._should_force_full_rescan()
-        (
-            next_state,
-            next_stable_observations,
-            next_pending_scan,
-            skipped_dirs,
-        ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
-        previous_state = self._entry_state
-        previous_stable_observations = self._entry_stable_observations
-        previous_pending_scan = self._entry_pending_scan
-        previous_skipped_dirs = self._skipped_stable_dirs
-
-        self._entry_state = next_state
-        self._entry_stable_observations = next_stable_observations
-        self._entry_pending_scan = next_pending_scan
-        self._skipped_stable_dirs = skipped_dirs
-
-        rescan_succeeded = False
+        # Progressive-discovery freshness signals: while a *full* reconcile runs,
+        # the health action reports full_scan_in_progress=True; on success it
+        # advances last_full_scan_finished_at. Incremental rescans leave both
+        # untouched (they deliberately skip stable/cloud subtrees, so they are
+        # not a whole-tree reconcile). Guaranteed reset in the outer finally.
+        if force_full_rescan:
+            self._server.set_full_scan_in_progress(True)
         try:
-            # Single traversal: the state walk above already visited every entry and
-            # recorded its (resolved path, is_directory) into next_state in DFS
-            # parent-first order. Drive the claim phase straight off that snapshot
-            # instead of re-walking the filesystem a second time — the duplicate walk
-            # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
-            # skipped_dirs prunes the stable subtrees the state walk carried forward
-            # (their claims are preserved below), exactly as the old per-dir
-            # `if ... in skipped_dirs: continue` did for whole roots.
-            discovered_state = discover_sources_from_entries(
-                (
-                    (path_str, entry[0], entry[1])
-                    for path_str, entry in next_state.items()
-                ),
-                self._registry,
-                dim_labels=self._dim_labels,
-                path_filter=self._should_scan_resolved,
-                skipped_dirs=skipped_dirs,
-            )
+            (
+                next_state,
+                next_stable_observations,
+                next_pending_scan,
+                skipped_dirs,
+                next_cloud,
+            ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
+            previous_state = self._entry_state
+            previous_stable_observations = self._entry_stable_observations
+            previous_pending_scan = self._entry_pending_scan
+            previous_skipped_dirs = self._skipped_stable_dirs
 
-            self._preserve_skipped_claims(discovered_state, skipped_dirs)
+            self._entry_state = next_state
+            self._entry_stable_observations = next_stable_observations
+            self._entry_pending_scan = next_pending_scan
+            self._skipped_stable_dirs = skipped_dirs
 
-            unstable_paths = self._get_unstable_paths()
-            self._reconcile_discovered_state(discovered_state, unstable_paths)
-            rescan_succeeded = True
+            rescan_succeeded = False
+            try:
+                # Progressive population (Option B): on the *first* full scan,
+                # register each source the moment the walk claims it instead of
+                # batching every add into the end-of-walk reconcile, so the
+                # catalog grows within the walk. This is safe only for the first
+                # scan -- it starts empty and force-full, so there are no removals
+                # to diff and every claim is a pure add. The claim phase already
+                # applies the stability gate (path_filter), so deferred/unstable
+                # entries are never claimed and therefore never streamed; they
+                # are picked up by the next steady-state rescan. The end-of-walk
+                # reconcile below still runs and is idempotent for streamed adds.
+                stream_first_scan = force_full_rescan and not self._initial_scan_done
+                discovered_state = DiscoveryState()
+                if stream_first_scan:
+                    discovered_state.on_source_added = self._stream_first_scan_add
+
+                # Single traversal: the state walk above already visited every entry and
+                # recorded its (resolved path, is_directory) into next_state in DFS
+                # parent-first order. Drive the claim phase straight off that snapshot
+                # instead of re-walking the filesystem a second time — the duplicate walk
+                # was ~96% of the post-#61 rescan syscalls (biopb/biopb#56, item 4).
+                # skipped_dirs prunes the stable subtrees the state walk carried forward
+                # (their claims are preserved below), exactly as the old per-dir
+                # `if ... in skipped_dirs: continue` did for whole roots.
+                discovered_state = discover_sources_from_entries(
+                    (
+                        (path_str, entry[0], entry[1])
+                        for path_str, entry in next_state.items()
+                    ),
+                    self._registry,
+                    state=discovered_state,
+                    dim_labels=self._dim_labels,
+                    path_filter=self._should_scan_resolved,
+                    skipped_dirs=skipped_dirs,
+                    cloud_by_path=next_cloud,
+                )
+
+                self._preserve_skipped_claims(discovered_state, skipped_dirs)
+
+                unstable_paths = self._get_unstable_paths()
+                self._reconcile_discovered_state(
+                    discovered_state, unstable_paths, force_full=force_full_rescan
+                )
+                rescan_succeeded = True
+            finally:
+                if not rescan_succeeded:
+                    self._entry_state = previous_state
+                    self._entry_stable_observations = previous_stable_observations
+                    self._entry_pending_scan = previous_pending_scan
+                    self._skipped_stable_dirs = previous_skipped_dirs
+
+            if force_full_rescan and rescan_succeeded:
+                self._last_full_rescan_at = time.time()
+                self._server.set_last_full_scan(self._last_full_rescan_at)
+                # Partition the just-walked cloud entries out of _entry_state into
+                # the cloud partition. This runs only after the force_full claim +
+                # reconcile have already seen the full _entry_state (cloud included),
+                # so cloud sources reconcile normally here; afterwards _entry_state
+                # holds non-cloud only, so the frequent incremental rescans never
+                # iterate cloud entries (the GIL-stall fix). next_state is
+                # self._entry_state (and the companions are aliased too, set above),
+                # so popping trims them in place. Only on success -> a failed
+                # force_full leaves the previous _cloud_entry_state intact.
+                cloud_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+                for path_str, is_cloud in next_cloud.items():
+                    if not is_cloud:
+                        continue
+                    entry = next_state.pop(path_str, None)
+                    if entry is not None:
+                        cloud_state[path_str] = entry
+                    next_stable_observations.pop(path_str, None)
+                    next_pending_scan.pop(path_str, None)
+                self._cloud_entry_state = cloud_state
+                # First full scan done: flip the precache gate (live additions
+                # now prompt-enqueue) and let the launcher seed the backlog with
+                # the established catalog. Fired once, best-effort.
+                if not self._initial_scan_done:
+                    self._initial_scan_done = True
+                    self._fire_initial_scan_complete()
         finally:
-            if not rescan_succeeded:
-                self._entry_state = previous_state
-                self._entry_stable_observations = previous_stable_observations
-                self._entry_pending_scan = previous_pending_scan
-                self._skipped_stable_dirs = previous_skipped_dirs
+            if force_full_rescan:
+                self._server.set_full_scan_in_progress(False)
 
-        if force_full_rescan and rescan_succeeded:
-            self._last_full_rescan_at = time.time()
+    def _fire_initial_scan_complete(self) -> None:
+        """Invoke the first-scan-complete callback, swallowing any error.
+
+        Best-effort, mirroring the precache commit hook: a callback failure must
+        never abort or destabilize the rescan that triggered it.
+        """
+        callback = self._on_initial_scan_complete
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("on_initial_scan_complete callback failed")
 
     def _cleanup_deleted_monitored_dirs(self) -> None:
         """Remove claims for monitored roots that no longer exist."""
@@ -317,6 +604,16 @@ class SourceManager:
             self._entry_state.pop(path_str, None)
             self._entry_pending_scan.pop(path_str, None)
 
+        # Cloud entries live in the partition, not _entry_state; prune them too.
+        cloud_paths_to_remove = [
+            path_str
+            for path_str in self._cloud_entry_state
+            if path_str == deleted_root_str
+            or Path(path_str).is_relative_to(deleted_root)
+        ]
+        for path_str in cloud_paths_to_remove:
+            self._cloud_entry_state.pop(path_str, None)
+
         if removed_source_ids:
             logger.warning(
                 "Removed %d sources after monitored directory disappeared: %s",
@@ -338,12 +635,16 @@ class SourceManager:
         Dict[str, int],
         Dict[str, bool],
         Set[str],
+        Dict[str, bool],
     ]:
         """Refresh cached filesystem signatures for all monitored trees."""
         now = time.time()
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
         next_stable_observations: Dict[str, int] = {}
         next_pending_scan: Dict[str, bool] = {}
+        # path -> whether it is under a cloud root (carried to the claim phase so
+        # cloud-ness is computed once, in the walk, not re-derived per entry).
+        next_cloud: Dict[str, bool] = {}
         skipped_dirs: Set[str] = set()
         # One identity set across all monitored roots for this refresh: breaks
         # directory loops (symlink, Windows junction, hardlink, bind mount) and
@@ -369,11 +670,13 @@ class SourceManager:
                 next_state,
                 next_stable_observations,
                 next_pending_scan,
+                next_cloud,
                 skipped_dirs,
                 force_full,
                 self._aggressive_dir_pruning,
                 visited_identities,
                 is_root=True,
+                cloud=monitored_dir.resolve() in self._cloud_roots,
             )
         if publish:
             self._entry_state = next_state
@@ -385,6 +688,7 @@ class SourceManager:
             next_stable_observations,
             next_pending_scan,
             skipped_dirs,
+            next_cloud,
         )
 
     def _scan_tree_state(
@@ -394,12 +698,15 @@ class SourceManager:
         next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
         next_stable_observations: Dict[str, int],
         next_pending_scan: Dict[str, bool],
+        next_cloud: Dict[str, bool],
         skipped_dirs: Set[str],
         force_full: bool,
         allow_prune: bool,
         visited_identities: Set[str],
         is_root: bool = False,
         dir_entry: Optional[os.DirEntry] = None,
+        cloud: bool = False,
+        depth: int = 0,
     ) -> None:
         """Capture the current filesystem signature state for one subtree.
 
@@ -428,7 +735,46 @@ class SourceManager:
                 # backfill the identity fields; POSIX DirEntry.stat() already does a
                 # real stat, so this only fires on Windows and the syscall-cut win is
                 # untouched.
-                if stat_result.st_ino == 0:
+                #
+                # ...EXCEPT under a cloud root, where that backfill os.stat() is a
+                # whole-extra network round-trip per entry (the cached DirEntry.stat()
+                # is free, served from the directory enumeration; the inode is the one
+                # field that costs a round-trip on a synced placeholder). On a OneDrive
+                # tree this backfill measured ~59s of startup (biopb/biopb#190,
+                # Finding 1). We skip it under cloud, which is correct ONLY because
+                # every consumer of the zeroed inode has a cloud-safe degradation --
+                # do not break these invariants:
+                #
+                #   1. Signature. `_build_entry_signature(cloud=True)` is *already*
+                #      identity-only `(st_dev, st_ino)` and excludes size/mtime/ctime
+                #      on purpose (hydration bumps those -> destructive flap). With a
+                #      zeroed inode it degrades to a constant `(0, 0)` per entry. That
+                #      is residency-invariant (never flaps on hydrate/evict -- strictly
+                #      safer than today) and it is compared *per path_str*, so distinct
+                #      cloud paths never collide into one another.
+                #   2. Stability gate. A constant `(0, 0)` signature means
+                #      `stable_observations` never advances -- but cloud entries
+                #      *bypass* the stability window entirely (`_should_scan_resolved`
+                #      returns True immediately for a cloud path), so that counter is
+                #      never read under cloud. If that bypass is ever removed, this
+                #      skip becomes incorrect.
+                #   3. Identity / loop-breaking. `get_file_identity` falls back to a
+                #      hash of the *resolved path* when `st_ino == 0` (its FAT32 path),
+                #      so `visited_identities` dedup still distinguishes cloud entries
+                #      without a real inode. BUT for *non-symlink* reparse points
+                #      (Windows junction, bind mount) `(st_dev, st_ino)` is the only
+                #      thing that breaks a directory *cycle* (symlinks are skipped
+                #      separately), and a non-symlink entry is never resolve()d, so a
+                #      junction loop `J -> .` yields an ever-growing path that hashes
+                #      to a new identity each descent -- the cycle is never caught.
+                #      That is no longer just a lost-dedup (rare aliasing); it would
+                #      recurse to RecursionError. The `_MAX_WALK_DEPTH` backstop in
+                #      `_scan_tree_state` bounds such a loop to a logged skip instead
+                #      of crashing the refresh thread (biopb/biopb#207 review).
+                #
+                # NOTE: this is a Windows-only effect; on POSIX DirEntry.stat() returns
+                # a real inode, so neither the backfill nor this skip ever fires there.
+                if stat_result.st_ino == 0 and not cloud:
                     stat_result = os.stat(dir_entry.path)
             else:
                 # Root: _refresh_entry_state hands it in pre-resolved, so it is
@@ -447,12 +793,47 @@ class SourceManager:
         # Shared skip policy (hidden / system / cloud-placeholder), identical to the
         # claim walk's. Pass the stat we already took so the offline-placeholder
         # check does not stat the entry a second time. Never applied to a root.
-        if not is_root and should_skip_walk_entry(path, is_directory, stat_result):
+        # Under a `cloud`-opted root, ``admit_nonresident`` keeps dehydrated files
+        # (they are admitted as unresolved sources instead of skipped).
+        if not is_root and should_skip_walk_entry(
+            path, is_directory, stat_result, admit_nonresident=cloud
+        ):
+            # The entry EXISTS on disk -- discovery is declining to traverse a
+            # system/cloud directory (e.g. OneDrive) or to read an offline
+            # placeholder, NOT observing a deletion. Record a skipped *directory*
+            # so the reconcile (via _preserve_skipped_claims) carries forward any
+            # already-registered claim at or under it, exactly as the cloud/stable
+            # skips below do. Without this, a source explicitly registered under
+            # such a path is reaped by the very next reconcile as "disappeared":
+            # add_source treats a drop as a root, which is exempt from this skip
+            # (see _refresh_entry_state's is_root=True), so it happily indexes
+            # OneDrive content -- but the monitored-tree walk that would re-find it
+            # refuses to descend here, so absence from the walk must not be read as
+            # deletion (biopb/biopb#309 drag-drop follow-up).
+            #
+            # Only directories are recorded. A name-skipped subtree (the #309 case)
+            # is bounded -- the walk returns without descending, so it contributes
+            # one entry. Offline-placeholder FILES, by contrast, are leaves reached
+            # by descending normal directories, so recording them would grow
+            # skipped_dirs O(files) (every zero-block/empty/inline file, since
+            # _is_offline_placeholder flags st_blocks == 0) and feed that set into
+            # _preserve_skipped_claims' per-rescan sort + per-entry Path()/
+            # is_relative_to -- the pathlib hot-path cost _copy_cached_subtree_entries
+            # was rewritten to string-prefix to avoid. The only source this omits is
+            # a single dehydrated placeholder file added directly under a non-cloud
+            # root, whose bytes are non-resident (unreadable) anyway.
+            if is_directory:
+                skipped_dirs.add(str(resolved_path))
             return
 
         path_str = str(resolved_path)
-        signature = self._build_entry_signature(stat_result, is_directory)
-        previous_entry = self._entry_state.get(path_str)
+        signature = self._build_entry_signature(stat_result, is_directory, cloud=cloud)
+        # Cloud entries live in the cloud partition (walked only on force_full);
+        # read the prior signature from there so last_changed stays continuous
+        # across the hourly re-walk. Non-cloud reads _entry_state as before.
+        previous_entry = (self._cloud_entry_state if cloud else self._entry_state).get(
+            path_str
+        )
         last_changed = self._get_entry_change_time(stat_result, now)
         stable_observations = 0
         if previous_entry is not None and previous_entry[:2] == (
@@ -460,15 +841,19 @@ class SourceManager:
             signature,
         ):
             last_changed = previous_entry[2]
-            stable_observations = (
-                self._entry_stable_observations.get(path_str, 0) + 1
-            )
+            stable_observations = self._entry_stable_observations.get(path_str, 0) + 1
             pending_scan = self._entry_pending_scan.get(path_str, False)
         else:
             pending_scan = True
         next_state[path_str] = (is_directory, signature, last_changed)
         next_stable_observations[path_str] = stable_observations
         next_pending_scan[path_str] = pending_scan
+        # Record cloud-ness once, here, where the walk already knows it (inherited
+        # per monitored root, see _refresh_entry_state). The claim phase reads this
+        # instead of re-deriving it per entry, so there is a single source of truth
+        # for "is this path under a cloud root" -- consistent with the signature
+        # above, which is also computed with this same `cloud`.
+        next_cloud[path_str] = cloud
 
         # Only real directories are walked further. Never follow a symlinked
         # directory; and break every *other* kind of loop — Windows junction,
@@ -486,10 +871,26 @@ class SourceManager:
             return
         visited_identities.add(identity)
 
+        # Cloud subtree: re-walked only on a force_full pass. Enumerating a cloud
+        # root is expensive and its mtime signature is unreliable (doc S1.2), so the
+        # frequent incremental rescans skip it entirely -- they neither descend nor
+        # re-materialize its descendants. Cloud entries persist in
+        # ``_cloud_entry_state`` (rebuilt only on force_full); the cloud sources are
+        # kept registered across incrementals by the reconcile scoping (see
+        # ``_reconcile_discovered_state``), not by carrying entries forward. The first
+        # rescan is force_full (last-full == -inf), so a cloud root is still
+        # catalogued at startup, and a brand-new cloud dataset surfaces on the next
+        # force_full pass. ``skipped_dirs.add`` records the skip (asserted by tests)
+        # and prunes the cloud root that was just recorded into ``next_state``.
+        if cloud and not force_full:
+            skipped_dirs.add(path_str)
+            return
+
         if (
             allow_prune
-            and
-            not force_full
+            and not force_full
+            # Cloud is handled by the dedicated branch above (a cloud subtree never
+            # reaches this signature-based prune), so no cloud guard is needed here.
             and previous_entry is not None
             and previous_entry[:2] == (is_directory, signature)
             and not pending_scan
@@ -506,6 +907,21 @@ class SourceManager:
             )
             return
 
+        # Depth backstop: if identity dedup ever fails to catch a directory loop
+        # (e.g. a cloud junction whose zeroed inode makes get_file_identity fall back
+        # to an ever-growing path hash, biopb/biopb#207 review), the walk would recurse
+        # to RecursionError -- which the os.scandir `except OSError` below does NOT
+        # catch, so it propagates and kills the refresh thread. Record this entry but
+        # do not descend past the cap, turning any such loop into a bounded skip.
+        if depth >= _MAX_WALK_DEPTH:
+            logger.warning(
+                "Rescan walk hit max depth %d at %s; not descending further "
+                "(possible directory loop)",
+                _MAX_WALK_DEPTH,
+                resolved_path,
+            )
+            return
+
         try:
             # os.scandir yields DirEntry objects carrying d_type and a cached stat,
             # so each child is processed with one stat and no resolve — the per-entry
@@ -519,11 +935,14 @@ class SourceManager:
                         next_state,
                         next_stable_observations,
                         next_pending_scan,
+                        next_cloud,
                         skipped_dirs,
                         force_full,
                         True,
                         visited_identities,
                         dir_entry=entry,
+                        cloud=cloud,
+                        depth=depth + 1,
                     )
         except OSError:
             return
@@ -541,15 +960,15 @@ class SourceManager:
         already covered by the `not pending_scan` clause in the prune gate, so it
         is skipped here.
         """
-        root_path = Path(root_path_str)
+        # String-prefix, not Path(cached_path).is_relative_to(root_path): same
+        # per-entry pathlib-parse cost as _copy_cached_subtree_entries, on the
+        # same large carried-forward entry set. Keys are resolved path strings.
+        prefix = root_path_str + os.sep
         for cached_path, pending in self._entry_pending_scan.items():
             if not pending or cached_path == root_path_str:
                 continue
-            try:
-                if Path(cached_path).is_relative_to(root_path):
-                    return True
-            except OSError:
-                continue
+            if cached_path.startswith(prefix):
+                return True
         return False
 
     def _copy_cached_subtree_entries(
@@ -559,23 +978,34 @@ class SourceManager:
         next_stable_observations: Dict[str, int],
         next_pending_scan: Dict[str, bool],
     ) -> None:
-        """Carry forward cached descendants when a stable subtree is skipped."""
-        root_path = Path(root_path_str)
+        """Carry forward cached descendants when a stable subtree is skipped.
+
+        Hot path: this runs every rescan for each skipped (stable **or cloud**)
+        root and scans the entire cached entry set. Match descendants with a
+        string-prefix test, not ``Path(cached_path).is_relative_to(root_path)``:
+        the latter parses a pathlib ``Path`` per entry, and on a large cloud
+        catalog (tens of thousands of carried-forward entries, walked only hourly
+        but *re-copied* on every 30 s incremental) that per-entry parsing was the
+        single dominant cost of the rescan thread -- it held the GIL for tens of
+        seconds and starved the Flight serving threads, stalling reads
+        (biopb/biopb). Entry keys are resolved path strings produced by the same
+        walk, so a prefix test is exact; this mirrors the string-prefix prune the
+        claim phase already uses (``discover_sources_from_entries._under``).
+        """
+        prefix = root_path_str + os.sep
         for cached_path, entry in self._entry_state.items():
             if cached_path == root_path_str or cached_path in next_state:
                 continue
-            try:
-                if Path(cached_path).is_relative_to(root_path):
-                    next_state[cached_path] = entry
-                    next_stable_observations[cached_path] = (
-                        self._entry_stable_observations.get(cached_path, 0)
-                    )
-                    next_pending_scan[cached_path] = self._entry_pending_scan.get(
-                        cached_path,
-                        False,
-                    )
-            except OSError:
+            if not cached_path.startswith(prefix):
                 continue
+            next_state[cached_path] = entry
+            next_stable_observations[cached_path] = self._entry_stable_observations.get(
+                cached_path, 0
+            )
+            next_pending_scan[cached_path] = self._entry_pending_scan.get(
+                cached_path,
+                False,
+            )
 
     def _should_force_full_rescan(self) -> bool:
         """Return True when a full tree walk should bypass subtree pruning."""
@@ -587,8 +1017,27 @@ class SourceManager:
         self,
         stat_result: Any,
         is_directory: bool,
+        cloud: bool = False,
     ) -> Tuple[Any, ...]:
-        """Build a stable signature tuple for a file or directory."""
+        """Build a stable signature tuple for a file or directory.
+
+        Under a ``cloud = true`` root the signature is **residency-invariant** --
+        keyed on identity (``st_dev``, ``st_ino``) only. Hydrating a placeholder
+        (a consented recall) bumps ``st_size``/``st_mtime_ns``/``st_ctime_ns``;
+        including those would make the next rescan see the just-resolved source as
+        "changed" and destructively remove+re-add it (and re-dehydration/eviction
+        would flap it). Archived cloud data is stable and cloud mtime is
+        untrustworthy anyway, so identity is the right key there. Non-cloud
+        entries keep the full mtime/size-sensitive signature.
+
+        Load-bearing for the cloud inode-backfill skip in ``_scan_tree_state``
+        (biopb/biopb#190): because this branch is identity-only, a zeroed cloud
+        inode degrades it to a constant ``(0, 0)`` that is still residency-
+        invariant and per-path. If you add size/mtime back to the cloud
+        signature, you must restore that backfill (and reintroduce the flap).
+        """
+        if cloud:
+            return (stat_result.st_dev, stat_result.st_ino)
         if is_directory:
             return (
                 stat_result.st_dev,
@@ -618,23 +1067,30 @@ class SourceManager:
 
         return now
 
-    def _should_scan_path(self, path: Path) -> bool:
-        """Return True when a path is stable enough to participate in discovery."""
-        try:
-            resolved_path = path.resolve(strict=False)
-        except OSError:
-            return False
-        return self._should_scan_resolved(str(resolved_path))
+    def _entry_for(
+        self, path_str: str
+    ) -> Optional[Tuple[bool, Tuple[Any, ...], float]]:
+        """Cached signature entry for a path, from either partition.
+
+        Cloud entries live in ``_cloud_entry_state`` (walked only on force_full),
+        non-cloud in ``_entry_state``. Readers that may receive a cloud member path
+        outside the force_full walk (signature diff, stability gate) use this so a
+        cloud member is found in the partition instead of falling through to a live
+        ``Path(member).stat()`` -- a cloud network round-trip.
+        """
+        entry = self._entry_state.get(path_str)
+        if entry is None:
+            entry = self._cloud_entry_state.get(path_str)
+        return entry
 
     def _should_scan_resolved(self, resolved_str: str) -> bool:
         """Stability gate for an entry whose resolved path string is already known.
 
         The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
         keys, which ``_scan_tree_state`` already stored as resolved path strings, so
-        the per-entry ``Path.resolve()`` ``_should_scan_path`` would otherwise repeat
-        is pure waste. Same predicate and the same load-bearing
-        ``_entry_pending_scan`` clear-on-pass side effect (the #53 subtree-pending
-        prune gate depends on it) — only the redundant resolve is dropped.
+        a per-entry ``Path.resolve()`` would be pure waste. This carries the
+        load-bearing ``_entry_pending_scan`` clear-on-pass side effect (the #53
+        subtree-pending prune gate depends on it).
         """
         if os.path.basename(resolved_str).startswith("."):
             return False
@@ -642,9 +1098,28 @@ class SourceManager:
         if resolved_str in self._skipped_stable_dirs:
             return False
 
-        entry = self._entry_state.get(resolved_str)
+        entry = self._entry_for(resolved_str)
         if entry is None:
             return False
+
+        # Cloud/synced-folder entries bypass the stability machinery entirely
+        # (cloud-storage phase 2). Two reasons, both load-bearing:
+        #   * the open-for-append probe below opens the file -- a whole-file recall
+        #     on a dehydrated placeholder, which is exactly what cloud handling must
+        #     avoid; and
+        #   * the mtime/ctime age + stable-rescan gate is unreliable on cloud
+        #     filesystems (doc S1.2), so a placeholder could never stabilize.
+        # Archived dehydrated data is inherently stable (never mid-write), so admit
+        # it immediately. The pending-scan clear side effect is preserved.
+        #
+        # This bypass is also load-bearing for the cloud inode-backfill skip in
+        # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
+        # degrades to a constant (0, 0), so `stable_observations` never advances
+        # -- safe only because this early-return means that counter is never read
+        # for a cloud path. Removing the bypass would make that skip incorrect.
+        if self._is_under_cloud_root(resolved_str):
+            self._entry_pending_scan[resolved_str] = False
+            return True
 
         age = time.time() - entry[2]
         if age < self._stability_window:
@@ -690,13 +1165,24 @@ class SourceManager:
         self,
         discovered_state: DiscoveryState,
         unstable_paths: List[Path],
+        force_full: bool = False,
     ) -> None:
-        """Apply add/remove/update diffs between the current and discovered states."""
+        """Apply add/remove/update diffs between the current and discovered states.
+
+        On an incremental rescan, cloud-root sources are excluded from the
+        candidate set: their subtree was not walked, so they are absent from
+        ``discovered_state`` and would otherwise be diffed/removed. Excluding them
+        by a hash-set check (``_cloud_source_ids``) preserves them untouched -- no
+        removal, no signature diff, no per-member ``Path.resolve()`` -- without the
+        ``_preserve_skipped_claims`` re-injection loop. On a force_full pass cloud
+        sources ARE walked, so they participate in the full reconcile.
+        """
         with self._lock:
             current_claims = {
                 source_id: claim
                 for source_id, claim in self._state.claims.items()
                 if self._is_monitored_claim(claim)
+                and (force_full or source_id not in self._cloud_source_ids)
             }
 
         discovered_claims = discovered_state.claims
@@ -773,8 +1259,16 @@ class SourceManager:
     ) -> Dict[str, Tuple[Any, ...]]:
         """Collect cached member-path signatures for a claim."""
         signatures: Dict[str, Tuple[Any, ...]] = {}
+        # Cloud-root membership is a property of the *source*, not the individual
+        # member: every member lives under ``claim.primary_path``, so they share
+        # one cloud status. Resolve it once -- both to skip a redundant
+        # ``Path.resolve()`` + roots scan per member, and so the whole source's
+        # signatures use one uniform cloud-invariance policy (matching the cached
+        # branch, whose signatures ``_scan_tree_state`` built with a per-tree
+        # ``cloud`` flag).
+        cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
-            entry = self._entry_state.get(member_path)
+            entry = self._entry_for(member_path)
             if entry is not None:
                 signatures[member_path] = entry[1]
                 continue
@@ -785,9 +1279,13 @@ class SourceManager:
             except OSError:
                 continue
 
+            # The cached-entry path above already carries the cloud-invariant
+            # signature. This re-stat fallback has no cloud context, so reuse the
+            # per-claim flag so hydration/eviction does not flap a resolved source.
             signatures[member_path] = self._build_entry_signature(
                 stat_result,
                 resolved_path.is_dir(),
+                cloud=cloud,
             )
         return signatures
 
@@ -805,6 +1303,13 @@ class SourceManager:
             current_claims = list(self._state.claims.values())
 
         for claim in current_claims:
+            if claim.source_id in self._cloud_source_ids:
+                # Cloud sources are preserved by the reconcile scoping (excluded
+                # from the candidate set on incrementals), not re-injected here.
+                # Re-injecting would place them in ``discovered_ids`` while reconcile
+                # drops them from ``current_ids`` -> a spurious re-add every cycle.
+                # Skipping also retires the per-cloud-claim ``Path.resolve()`` loop.
+                continue
             if not self._is_monitored_claim(claim):
                 continue
             if claim.source_id in discovered_state.claims:
@@ -831,9 +1336,41 @@ class SourceManager:
                     return True
         return False
 
-    def _commit_add_claim(self, claim: SourceClaim) -> bool:
-        """Register a discovered source, then commit it into confirmed state."""
-        if not self._register_source_claim(claim):
+    def _stream_first_scan_add(self, claim: SourceClaim) -> None:
+        """Commit a first-scan claim live, as the walk discovers it (Option B).
+
+        Wired as the discovery state's ``on_source_added`` only during the first
+        full scan. Routes through ``_commit_add_claim`` so a streamed add gets
+        the same server registration, metadata-DB sync, signature bookkeeping,
+        and precache gating as a reconcile-driven add.
+
+        Idempotent against a *retried* first scan: a source already committed by
+        a prior partial scan (that later failed before flipping
+        ``_initial_scan_done``) is skipped, so the duplicate-rollback path in
+        ``_commit_add_claim`` -- which would *unregister* it -- is never hit, and
+        the end-of-walk reconcile stays a clean no-op.
+        """
+        with self._lock:
+            if claim.source_id in self._state.claims:
+                return
+        self._commit_add_claim(claim)
+
+    def _commit_add_claim(
+        self,
+        claim: SourceClaim,
+        catalog_seed: Optional[tuple] = None,
+        catalog_url: Optional[str] = None,
+    ) -> bool:
+        """Register a discovered source, then commit it into confirmed state.
+
+        ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
+        remote bulk-seed); ``None`` for local sources. ``catalog_url`` overrides the
+        descriptor's display ``source_url`` (drag-drop re-rooting, see
+        ``_drop_catalog_url``); ``None`` for the discovery/watcher path.
+        """
+        if not self._register_source_claim(
+            claim, catalog_seed=catalog_seed, catalog_url=catalog_url
+        ):
             self._record_failed_source_attempt(claim.source_id)
             return False
 
@@ -846,11 +1383,22 @@ class SourceManager:
             self._source_signatures[claim.source_id] = self._build_claim_signatures(
                 claim
             )
+            # Track cloud-root sources so the incremental reconcile can preserve
+            # them by a hash-set check (see _reconcile_discovered_state).
+            if self._is_under_cloud_root(claim.primary_path):
+                self._cloud_source_ids.add(claim.source_id)
             self._clear_failed_source_attempt(claim.source_id)
 
-        # Notify the precache worker of live additions only (runtime phase).
-        # Best-effort: a hook failure must never abort a source commit.
-        if self._runtime_phase and self._on_source_committed is not None:
+        # Notify the precache worker of live additions only -- those discovered
+        # after the initial scan completes. The startup set (committed while
+        # _initial_scan_done is False, or during the boot-tick upstream re-list
+        # guarded by _suppress_live_precache) is seeded into the slow backlog
+        # instead. Best-effort: a hook failure must never abort a source commit.
+        if (
+            self._initial_scan_done
+            and not self._suppress_live_precache
+            and self._on_source_committed is not None
+        ):
             try:
                 self._on_source_committed(claim.source_id)
             except Exception:
@@ -873,8 +1421,289 @@ class SourceManager:
         with self._lock:
             self._state.remove_claim(claim.primary_path, notify=False)
             self._source_signatures.pop(source_id, None)
+            self._cloud_source_ids.discard(source_id)
             self._clear_failed_source_attempt(source_id)
         return True
+
+    def remove_dropped_root(
+        self, root_url: str
+    ) -> Tuple[List[str], List[Tuple[str, str]]]:
+        """Deregister every drag-dropped source at or under a ``dnd://`` branch root.
+
+        The narrow counterpart to :meth:`add_local_source`: it removes ONLY
+        drag-dropped sources, identified by the ``dnd://`` scheme their catalog
+        ``source_url`` carries. That scheme is stamped by ``_drop_catalog_url``
+        only for drops that are new and outside every monitored root -- i.e.
+        sources nothing will re-add -- so it is a sound authorization key. A
+        source matches when its ``source_url`` equals ``root_url`` or is under it
+        (the ``root_url + "/"`` prefix), so one dropped folder's sources go as a
+        unit.
+
+        Runs under ``self._catalog_lock`` (like add / rescan) so the confirmed
+        catalog stays single-writer. Returns ``(removed_ids, failed)`` where
+        ``failed`` is a list of ``(source_id, reason)``.
+
+        Raises ``ValueError`` if ``root_url`` does not carry the ``dnd://``
+        scheme -- the authorization boundary: only user-dropped sources are ever
+        removable this way. The bare scheme (``dnd://`` with no branch under it)
+        is refused for the same reason: ``rstrip("/")`` would collapse it to a
+        ``dnd:/`` prefix that matches *every* drop, so it must not resolve to a
+        wildcard "remove all drops".
+        """
+        if not root_url.startswith(DND_URL_PREFIX):
+            raise ValueError(
+                f"remove_source only removes drag-dropped ({DND_URL_PREFIX}) "
+                f"sources; refusing root_url: {root_url!r}"
+            )
+        if not root_url[len(DND_URL_PREFIX) :].strip("/\\"):
+            raise ValueError(
+                f"remove_source needs a branch root under {DND_URL_PREFIX}, "
+                f"not the bare scheme; refusing root_url: {root_url!r}"
+            )
+
+        removed: List[str] = []
+        failed: List[Tuple[str, str]] = []
+        prefix = root_url.rstrip("/") + "/"
+        with self._catalog_lock:
+            with self._lock:
+                source_ids = list(self._state.claims.keys())
+            targets = [
+                source_id
+                for source_id in source_ids
+                if (desc := self._descriptor_for(source_id)) is not None
+                and (desc.source_url == root_url or desc.source_url.startswith(prefix))
+            ]
+            for source_id in targets:
+                if self._commit_remove_source(source_id):
+                    removed.append(source_id)
+                else:
+                    failed.append((source_id, "not present (already removed?)"))
+        return removed, failed
+
+    def _reconcile_due_upstreams(self) -> None:
+        """Re-list the upstreams that are due this tick (adaptive backoff).
+
+        Each upstream re-lists on the fast rescan tick while it is changing or
+        failing, and backs off (period doubles per unchanged re-list, capped at
+        full_rescan_interval) while it is stable -- so a stable lab store is not
+        queried every 30s forever, yet a new source / a recovered upstream is
+        mirrored within ~one tick. When there are no monitored *dirs* this is the
+        sole reconcile, so the first pass also drives the progressive-discovery
+        freshness signals + first-scan gate the dir path would otherwise own.
+        """
+        if not self._monitored_upstreams:
+            return
+        due: List[SourceConfig] = []
+        for upstream in self._monitored_upstreams:
+            state = self._upstream_relist.setdefault(
+                upstream.url, {"period": 1, "countdown": 0}
+            )
+            state["countdown"] -= 1
+            if state["countdown"] <= 0:
+                due.append(upstream)
+        if not due:
+            return
+
+        upstream_only = not self._monitored_dirs
+        first_pass = upstream_only and not self._initial_scan_done
+        if first_pass:
+            self._server.set_full_scan_in_progress(True)
+        try:
+            for upstream in due:
+                self._reconcile_and_reschedule(upstream)
+        finally:
+            if upstream_only:
+                # Each completed pass re-verifies the (remote) catalog -> advance
+                # freshness. in_progress / the first-scan gate fire once, on boot.
+                self._last_full_rescan_at = time.time()
+                self._server.set_last_full_scan(self._last_full_rescan_at)
+                if first_pass:
+                    self._server.set_full_scan_in_progress(False)
+                    self._initial_scan_done = True
+                    self._fire_initial_scan_complete()
+
+    def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
+        """Re-list one upstream and set its next-due period from the outcome."""
+        state = self._upstream_relist[upstream.url]
+        try:
+            changed = self._reconcile_one_upstream(upstream)
+        except Exception:
+            # Failure (unreachable): retry on the fast cadence next tick.
+            self._failed_upstreams.add(upstream.url)
+            state["period"] = 1
+            state["countdown"] = state["period"]
+            logger.warning(
+                "Upstream re-list failed for %s; keeping its current catalog "
+                "(retrying on the next rescan)",
+                upstream.url,
+                exc_info=True,
+            )
+            return
+        self._failed_upstreams.discard(upstream.url)
+        if changed:
+            state["period"] = 1  # the catalog moved -> stay fast
+        else:
+            # Stable -> back off (double, capped at full_rescan_interval).
+            state["period"] = min(state["period"] * 2, self._upstream_max_period)
+        state["countdown"] = state["period"]
+
+    def _reconcile_upstreams(
+        self, upstreams: Optional[List[SourceConfig]] = None
+    ) -> None:
+        """Re-list each given tensor-server upstream now (ignoring the backoff
+        schedule); used by tests and any caller that wants an immediate pass.
+
+        Best-effort per upstream: an unreachable upstream leaves its currently
+        mirrored sources in place (no spurious removals) and is marked failed.
+        """
+        if upstreams is None:
+            upstreams = self._monitored_upstreams
+        for upstream in upstreams:
+            try:
+                self._reconcile_one_upstream(upstream)
+            except Exception:
+                self._failed_upstreams.add(upstream.url)
+                logger.warning(
+                    "Upstream re-list failed for %s; keeping its current catalog "
+                    "(will retry on the next rescan)",
+                    upstream.url,
+                    exc_info=True,
+                )
+            else:
+                self._failed_upstreams.discard(upstream.url)
+
+    def _reconcile_one_upstream(self, upstream: SourceConfig) -> bool:
+        """Diff one upstream's live source list against the mirrored catalog.
+
+        Returns whether the mirrored set changed (a source was added or removed).
+
+        The diff is the same add/remove model as the filesystem reconcile, but the
+        "scan" is a remote ``list_sources()`` and the unit is a source_id (not a
+        path signature): desired = the alias-namespaced ids the upstream lists now;
+        current = the tensor-server claims already mirrored from this endpoint.
+        """
+        import json
+
+        from biopb.tensor import TensorFlightClient
+
+        from biopb_tensor_server.adapters.remote_tensor import (
+            _resolve_upstream_token,
+            _split_grpc_url,
+            fetch_upstream_catalog,
+            list_upstream_source_ids,
+        )
+        from biopb_tensor_server.config import _namespaced_source_id
+
+        endpoint, _ = _split_grpc_url(upstream.url)
+        alias = upstream.alias
+        token = _resolve_upstream_token(upstream, self._credentials_config)
+
+        client = TensorFlightClient(endpoint, cache_bytes=0, token=token)
+        try:
+            # ONE bulk query_sources fetches every upstream source's id AND its
+            # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
+            # instead of one per added source at registration (biopb/biopb#266).
+            # Complete: the server-side DuckDB catalog is not truncated like
+            # list_sources() (which would both miss sources AND spuriously remove
+            # the ones past the cap below).
+            rows, complete = fetch_upstream_catalog(client)
+            if rows is not None:
+                seed_by_up_id = {r["source_id"]: r for r in rows}
+                upstream_ids = list(seed_by_up_id.keys())
+            else:
+                # Legacy upstream without a SQL catalog: id-only enumeration, no
+                # seed -> each added source syncs via a live per-source RPC.
+                upstream_ids, complete = list_upstream_source_ids(client)
+                seed_by_up_id = {}
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+
+        desired = {_namespaced_source_id(alias, up_id): up_id for up_id in upstream_ids}
+
+        prefix = f"{endpoint}/"
+        alias_prefix = f"{alias}__" if alias else None
+        with self._lock:
+            current = {
+                source_id
+                for source_id, claim in self._state.claims.items()
+                if claim.source_type == "tensor-server"
+                and str(claim.primary_path).startswith(prefix)
+                and (alias_prefix is None or source_id.startswith(alias_prefix))
+            }
+
+        added = set(desired) - current
+        # Only remove when the upstream list is COMPLETE: a truncated/incomplete
+        # enumeration must never drop a mirrored source it simply failed to see.
+        removed = (current - set(desired)) if complete else set()
+
+        for source_id in sorted(removed):
+            self._commit_remove_source(source_id)
+
+        def _row_to_seed(row):
+            """(tensors, metadata, data_resident, source_url) for seed_catalog, or None."""
+            if row is None:
+                return None
+            raw = row.get("metadata_json")
+            try:
+                metadata = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                metadata = {}
+            return (
+                row.get("tensors") or [],
+                metadata,
+                bool(row.get("data_resident")),
+                row.get("source_url"),
+            )
+
+        extra_config = {}
+        if upstream.credentials_profile:
+            extra_config["credentials_profile"] = upstream.credentials_profile
+        for source_id in sorted(added):
+            up_id = desired[source_id]
+            self._commit_add_claim(
+                SourceClaim(
+                    source_type="tensor-server",
+                    primary_path=f"{endpoint}/{up_id}",
+                    source_id=source_id,
+                    extra_config=dict(extra_config),
+                ),
+                catalog_seed=_row_to_seed(seed_by_up_id.get(up_id)),
+            )
+
+        # Refresh already-mirrored sources from the same bulk result, so an
+        # in-place upstream change -- notably unresolved -> resolved (empty ->
+        # populated tensors, data_resident false -> true) -- is reflected on the
+        # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
+        # DuckDB row only when the seed actually changed, so a steady re-list does
+        # not churn indexed_at.
+        for source_id in sorted(current & set(desired)):
+            seed = _row_to_seed(seed_by_up_id.get(desired[source_id]))
+            if seed is None:
+                continue
+            adapter = self._server._get_source_adapter(source_id)
+            if adapter is None or not hasattr(adapter, "seed_catalog"):
+                continue
+            if adapter.seed_catalog(*seed) and self._metadata_db is not None:
+                try:
+                    self._metadata_db.sync_source_added(source_id, adapter)
+                except Exception:
+                    logger.warning(
+                        "failed to refresh mirrored catalog row for %s",
+                        source_id,
+                        exc_info=True,
+                    )
+
+        if added or removed:
+            logger.info(
+                "Upstream %s re-list: +%d / -%d sources",
+                endpoint,
+                len(added),
+                len(removed),
+            )
+        # Whether the mirrored set moved -- drives the adaptive re-list cadence.
+        return bool(added or removed)
 
     def _should_retry_source(self, source_id: str) -> bool:
         """Return True when a failed source is eligible for another add attempt."""
@@ -935,8 +1764,335 @@ class SourceManager:
             source_id,
         )
 
-    def _register_source_claim(self, claim: SourceClaim) -> bool:
-        """Create and register a source, rolling back on partial failure."""
+    def _is_under_cloud_root(self, path: str) -> bool:
+        """True when *path* is a cloud-opted root or lives under one."""
+        if not self._cloud_roots:
+            return False
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            return False
+        for root in self._cloud_roots:
+            if resolved == root or root in resolved.parents:
+                return True
+        return False
+
+    def _claim_is_unresolved(self, claim: SourceClaim) -> bool:
+        """Whether this claim must be registered as an unresolved cloud source.
+
+        Two triggers, both meaning "do not open the content now":
+        - the adapter's own ``claim.unresolved`` flag -- a reader adapter (OME-Zarr,
+          MicroManager, OME-TIFF, DICOM) recognized the source structurally and
+          deferred its sidecar/container read because it was non-resident; or
+        - under a ``cloud`` root, the source's content is a non-resident
+          placeholder. This catches the content-free *file* formats (NIfTI, CZI,
+          single OME-TIFF, ...) whose ``claim()`` never reads bytes but whose
+          ``create_from_config`` would hydrate the file to learn its shape.
+
+        Cloud-gated so a normal local source is never marked unresolved (and the
+        per-file placeholder stat -- which can false-positive on a resident tiny
+        file on some filesystems -- is only consulted for cloud roots).
+        """
+        if claim.unresolved:
+            return True
+        if not self._is_under_cloud_root(claim.primary_path):
+            return False
+        return self._claim_has_dehydrated_member(claim)
+
+    def _claim_has_dehydrated_member(self, claim: SourceClaim) -> bool:
+        """True when any local member *file* of *claim* is a non-resident placeholder.
+
+        Metadata-only (``os.stat`` via ``_is_offline_placeholder``); never opens
+        content, so it cannot itself trigger a cloud recall. Remote members are
+        ignored.
+
+        A directory source (zarr store, ...) is born resolved from its resident
+        sidecars; only a non-resident *content file* forces deferral. Guard on
+        ``is_file`` so a directory's ``st_blocks == 0`` (macOS APFS) is never a
+        false hit.
+        """
+        for member in claim.member_paths:
+            if is_remote_url(member):
+                continue
+            member_path = Path(member)
+            try:
+                if member_path.is_file() and _is_offline_placeholder(member_path):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def should_warm(self, source_id: str) -> bool:
+        """Whether the precache worker may warm *source_id* right now.
+
+        Residency is decided once, at registration time (``_claim_is_unresolved``):
+        a source whose files were resident then registers as a normal adapter and
+        keeps that registration even if the cloud provider (OneDrive Files
+        On-Demand, ...) later re-dehydrates the bytes. Precache has no per-chunk
+        residency gate, so a later backlog pass would read those bytes and trigger
+        a background recall the ``cloud = true`` policy exists to prevent (#174).
+
+        This re-checks residency at warm time, mirroring the registration-path
+        rule so the two stay in sync. Only sources under a ``cloud`` root are
+        gated -- a normal local source always warms -- and the check is
+        metadata-only, so it never recalls content itself. Returns False (skip)
+        when any member *file* is now a placeholder, or when the source is no
+        longer registered.
+
+        Boundary: like ``_claim_has_dehydrated_member``, the residency check is
+        ``is_file``-guarded, so it does not catch re-dehydration of a
+        dir-claiming source's *interior* files (ome-zarr, micromanager, ndtiff,
+        tiff-sequence, whose ``member_paths`` is just the directory). Those are
+        kept safe today by ``UnresolvedSourceAdapter.list_tensor_descriptors``
+        returning empty until resolved; closing the post-resolution re-warm path
+        is the cloud-storage spec's phase-4 deferral.
+        """
+        with self._lock:
+            claim = self._state.claims.get(source_id)
+        if claim is None:
+            return False
+        if not self._is_under_cloud_root(claim.primary_path):
+            return True
+        return not self._claim_has_dehydrated_member(claim)
+
+    def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
+        """Backfill the metadata DB when an unresolved cloud source resolves.
+
+        ``sync_source_added`` is an INSERT OR REPLACE upsert, so re-syncing the
+        now-resolved adapter overwrites the source's NULL shape/dtype row with the
+        concrete descriptor. Persistence across restart is phase 3 (file-backed
+        DB); here the backfill lives for the process lifetime.
+        """
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_added(source_id, adapter)
+            except Exception:
+                logger.exception(
+                    "metadata-DB backfill failed for resolved source %s", source_id
+                )
+
+    def add_local_source(
+        self,
+        url: str,
+        source_type: str = "",
+        dim_labels: Optional[List[str]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ):
+        """Register ``url`` (a path on the server) as source(s) at runtime.
+
+        Generator, driving the "add_source" Flight action / tensor-browser
+        drag-drop. It yields event tuples the caller maps onto the wire:
+
+        - ``("progress", added_count, current_path)`` -- one per source as it
+          registers (a running count + the path being scanned),
+        - ``("result", added, already_present, failed)`` -- exactly one terminal
+          tally (``added`` is a list of descriptors, ``already_present`` a list
+          of source_ids, ``failed`` a list of ``(path, reason)``).
+
+        The walk + commit run inline on the CALLING (Flight handler) thread, but
+        under ``self._catalog_lock`` -- so they are mutually exclusive with the
+        periodic rescan and the confirmed catalog stays single-writer. A dropped
+        directory that is not itself a dataset is walked recursively and may
+        register several sources; discovery runs into a scratch state so it never
+        mutates the confirmed ``self._state`` until a claim is committed.
+
+        ``should_cancel()`` is polled between sources: a cancel stops discovery
+        but KEEPS everything already committed (registration is not rolled back).
+
+        Whole-request problems raise before the first yield:
+        ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
+        ``ValueError`` (remote URL -- runtime add is local-only for now).
+        """
+        if is_remote_url(url):
+            raise ValueError(
+                "Runtime source add supports local filesystem paths only; "
+                f"got remote URL: {url}"
+            )
+
+        # Server-side locality/existence check (belt-and-suspenders; the client
+        # already gated on a localhost server, which shares this filesystem).
+        real = resolve_local_path(url)
+        if not os.path.exists(real):
+            raise FileNotFoundError(f"Path not found on server: {url}")
+        if not os.access(real, os.R_OK):
+            raise PermissionError(f"Path not readable by the server: {url}")
+        url = real
+        is_dir = os.path.isdir(url)
+
+        added: List[Any] = []
+        already_present: List[str] = []
+        failed: List[Tuple[str, str]] = []
+
+        # Acquire the catalog lock, heart-beating while a rescan holds it so a
+        # long wait does not sit silent long enough to trip a proxy timeout.
+        while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
+            yield ("progress", 0, "waiting for catalog scan to finish")
+        try:
+            # Containment check (case 4): if a STRICT ancestor of the drop is
+            # already owned by a source, the drop is *inside* that source. The
+            # exact-path member dedup in DiscoveryState.add_claim does not catch
+            # this (dir sources record only the dir as a member), so reject here.
+            owner = self._find_containing_source(url)
+            if owner is not None:
+                failed.append((url, f"already part of source '{owner}'"))
+                yield ("result", added, already_present, failed)
+                return
+
+            # Is the dropped path itself a dataset (single claim), or a plain
+            # folder to recurse into? Probe the root once against a scratch state.
+            scratch = DiscoveryState()
+            root_claims = self._registry.get_claims_for_path(
+                ClaimContext(Path(url)), scratch
+            )
+            if root_claims:
+                claims: List[SourceClaim] = [root_claims[0]]
+            elif is_dir:
+                # A plain folder is walked recursively (case 5). The large-drop
+                # footgun guard lives client-side (the tensor browser confirms
+                # before sending an oversized folder): drag-drop is localhost-only,
+                # so the client shares this filesystem and can size the tree before
+                # any scan is sent. A direct SDK caller passing a path is explicit
+                # intent, so the walk is not gated here.
+                discover_sources(
+                    Path(url),
+                    self._registry,
+                    scratch,
+                    dim_labels=dim_labels,
+                )
+                claims = list(scratch.claims.values())
+            else:
+                claims = []
+
+            if not claims:
+                reason = (
+                    "no supported datasets found under directory"
+                    if is_dir
+                    else "not a recognized image format"
+                )
+                failed.append((url, reason))
+                yield ("result", added, already_present, failed)
+                return
+
+            # Assign identity to every claim up front so the overlap check below
+            # can see the whole drop before any of it is committed.
+            for claim in claims:
+                if source_type:
+                    claim.source_type = source_type
+                if dim_labels:
+                    claim.dim_labels = list(dim_labels)
+                if not claim.source_id:
+                    claim.source_id = generate_source_id(
+                        str(claim.primary_path), claim.source_type
+                    )
+
+            # Re-root the drop into its own browser tree root only when it is
+            # ENTIRELY NEW. If any claim is already registered, this drop is a
+            # rescan of a location already represented in the tree -- e.g. a
+            # monitor=false config dir dropped to pick up new files -- so keep the
+            # native source_url on the new siblings. Re-rooting them instead would
+            # split that one dir's old and new contents across two roots with
+            # nothing to reconcile them (a monitor=false dir never rescans).
+            with self._lock:
+                reroot = not any(
+                    claim.source_id in self._state.claims for claim in claims
+                )
+
+            for claim in claims:
+                with self._lock:
+                    already = claim.source_id in self._state.claims
+                if already:
+                    already_present.append(claim.source_id)
+                else:
+                    # Re-rooting (own display root) and the ``dnd://`` origin
+                    # marker are decoupled: a drop under a monitored root still
+                    # gets a tidy display root, but NOT the marker -- the periodic
+                    # rescan re-discovers it, so it is not safely removable. Only a
+                    # drop outside every monitored root is stamped ``dnd://``, so
+                    # the marker stays equivalent to "user-added and nothing will
+                    # re-add it" (what Phase 2 removal authorizes on).
+                    catalog_url = (
+                        _drop_catalog_url(
+                            url,
+                            claim.primary_path,
+                            mark_dnd=not self._is_monitored_claim(claim),
+                        )
+                        if reroot
+                        else None
+                    )
+                    if self._commit_add_claim(claim, catalog_url=catalog_url):
+                        desc = self._descriptor_for(claim.source_id)
+                        added.append(desc)
+                        yield ("progress", len(added), str(claim.primary_path))
+                    else:
+                        failed.append(
+                            (
+                                str(claim.primary_path),
+                                "could not open or register (see server log)",
+                            )
+                        )
+
+                if should_cancel is not None and should_cancel():
+                    break
+
+            yield ("result", added, already_present, failed)
+        finally:
+            self._catalog_lock.release()
+
+    def _find_containing_source(self, path: str) -> Optional[str]:
+        """Return the source_id owning a strict ancestor of ``path``, else None.
+
+        Used by ``add_local_source`` to reject a drop that lands inside an
+        already-registered source (case 4). Only strict ancestors count -- an
+        exact re-drop of a source's own path is handled as ``already_present``.
+        """
+        p = Path(resolve_local_path(path))
+        with self._lock:
+            for ancestor in p.parents:
+                owner = self._state.path_to_source.get(str(ancestor))
+                if owner is not None:
+                    return owner
+        return None
+
+    def _descriptor_for(self, source_id: str):
+        """Fetch the registered source's DataSourceDescriptor (None if missing)."""
+        adapter = self._server._get_source_adapter(source_id)
+        return adapter.get_source_descriptor() if adapter is not None else None
+
+    def _warn_if_experimental(self, claim: SourceClaim) -> None:
+        """Emit a one-time EXPERIMENTAL warning for remote/cloud source families.
+
+        Cloud/synced-folder, remote tensor-server proxy, and remote-URL sources
+        are experimental; classify the claim and warn once per family (see
+        ``_warn_experimental_source``). Cheap, stat-free classification: it reads
+        ``claim.unresolved`` / the configured cloud roots, never opens a file.
+        """
+        if claim.source_type == "tensor-server":
+            family = "tensor-server"
+        elif claim.unresolved or self._is_under_cloud_root(claim.primary_path):
+            family = "cloud"
+        elif is_remote_url(claim.primary_path):
+            family = "remote-url"
+        else:
+            return
+        _warn_experimental_source(family)
+
+    def _register_source_claim(
+        self,
+        claim: SourceClaim,
+        catalog_seed: Optional[tuple] = None,
+        catalog_url: Optional[str] = None,
+    ) -> bool:
+        """Create and register a source, rolling back on partial failure.
+
+        ``catalog_seed`` (biopb/biopb#266) is an optional
+        ``(tensors, metadata, data_resident)`` tuple from a bulk upstream
+        ``query_sources``; when the adapter supports it (the remote proxy), it is
+        applied before ``sync_source_added`` so registration needs no per-source
+        upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
+        ``source_url`` on the adapter *before* register/sync so both ListFlights
+        and the metadata DB record the re-rooted url.
+        """
+        self._warn_if_experimental(claim)
         try:
             source_config = SourceConfig(
                 type=claim.source_type,
@@ -944,22 +2100,42 @@ class SourceManager:
                 source_id=claim.source_id,
                 dim_labels=claim.dim_labels,
                 dataset=claim.extra_config.get("dataset"),
+                credentials_profile=claim.extra_config.get("credentials_profile"),
             )
 
-            adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
-            if adapter_cls is None:
-                self._log_source_failure(
-                    claim.source_id,
-                    "No adapter for type %s for source %s (%s)",
-                    claim.source_type,
-                    claim.source_id,
-                    claim.primary_path,
+            if self._claim_is_unresolved(claim):
+                # Cloud-storage phase 2: register a placeholder that resolves
+                # lazily on first access (re-claim + create_from_config on the
+                # hydrated path) instead of opening the source now.
+                adapter = UnresolvedSourceAdapter(
+                    source_config,
+                    self._registry,
+                    credentials_config=self._credentials_config,
+                    on_resolved=self._on_source_resolved,
+                    cloud_root=self._is_under_cloud_root(claim.primary_path),
                 )
-                return False
+            else:
+                adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
+                if adapter_cls is None:
+                    self._log_source_failure(
+                        claim.source_id,
+                        "No adapter for type %s for source %s (%s)",
+                        claim.source_type,
+                        claim.source_id,
+                        claim.primary_path,
+                    )
+                    return False
 
-            adapter = adapter_cls.create_from_config(
-                source_config, self._credentials_config
-            )
+                adapter = adapter_cls.create_from_config(
+                    source_config, self._credentials_config
+                )
+
+                # Bulk-seed the catalog surface so sync_source_added below needs
+                # no per-source upstream RPC (biopb/biopb#266). Guarded by the
+                # adapter opting in via seed_catalog (only the remote proxy does).
+                if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
+                    tensors, metadata, data_resident, source_url = catalog_seed
+                    adapter.seed_catalog(tensors, metadata, data_resident, source_url)
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
@@ -971,16 +2147,21 @@ class SourceManager:
             )
             return False
 
+        # Drag-drop re-rooting: stamp the display-only source_url override before
+        # register/sync so ListFlights and the metadata-DB row both carry it.
+        if catalog_url:
+            adapter._catalog_url = catalog_url
+
         registered = False
         try:
             self._server.register_source(claim.source_id, adapter)
             registered = True
 
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_added(claim.source_id, adapter)
+            # Raises on failure -> the except below rolls back register_source,
+            # so a catalog write error never leaves a source visible in
+            # ListFlights but absent from DuckDB.
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_added(claim.source_id, adapter)
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
             logger.info(f"Registered source with server: {claim.source_id}")
@@ -1008,11 +2189,8 @@ class SourceManager:
             )
 
         try:
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_removed(source_id)
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_removed(source_id)
         except Exception:
             logger.error(
                 "Rollback failed to remove source %s from metadata DB",
@@ -1025,27 +2203,23 @@ class SourceManager:
         ]
         for path in paths_to_remove:
             self._path_to_source_id.pop(path, None)
+        self._cloud_source_ids.discard(source_id)
 
     def _unregister_source_claim(self, source_id: str) -> bool:
-        """Remove a source from the server and metadata DB."""
+        """Remove a source from the server and metadata DB.
+
+        A server-unregister failure aborts (returns False, leaving the claim in
+        state for a later retry). A catalog-delete failure does NOT abort: like
+        ``_rollback_source_registration`` the ``sync_source_removed`` call is
+        isolated in its own try/except so the server-side unregister and the
+        ``_path_to_source_id`` cleanup still complete -- a stale path-map entry
+        pointing at an already-unregistered ``source_id`` would otherwise
+        mislead a later re-add/reconcile of the same path. The worst case is a
+        leaked catalog row (logged), matching the remove-site log-and-continue
+        policy and the pre-raise behavior.
+        """
         try:
             self._server.unregister_source(source_id)
-            if (
-                hasattr(self._server, "_metadata_db")
-                and self._server._metadata_db is not None
-            ):
-                self._server._metadata_db.sync_source_removed(source_id)
-
-            paths_to_remove = [
-                path
-                for path, sid in self._path_to_source_id.items()
-                if sid == source_id
-            ]
-            for path in paths_to_remove:
-                self._path_to_source_id.pop(path, None)
-
-            logger.info(f"Unregistered source from server: {source_id}")
-            return True
         except Exception as e:
             logger.error(
                 "Failed to unregister source %s: %s",
@@ -1055,6 +2229,25 @@ class SourceManager:
             )
             return False
 
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_removed(source_id)
+            except Exception:
+                logger.error(
+                    "Failed to remove source %s from metadata DB",
+                    source_id,
+                    exc_info=True,
+                )
+
+        paths_to_remove = [
+            path for path, sid in self._path_to_source_id.items() if sid == source_id
+        ]
+        for path in paths_to_remove:
+            self._path_to_source_id.pop(path, None)
+
+        logger.info(f"Unregistered source from server: {source_id}")
+        return True
+
 
 def create_source_manager(
     server: TensorFlightServer,
@@ -1062,6 +2255,7 @@ def create_source_manager(
     watcher: Optional[DirectoryWatcher],
     monitored_sources: Optional[List[SourceConfig]] = None,
     static_sources: Optional[List[SourceConfig]] = None,
+    metadata_db: Optional[MetadataDatabase] = None,
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
     probe_open_files: bool = True,
@@ -1086,6 +2280,8 @@ def create_source_manager(
         watcher: DirectoryWatcher for filesystem events (None for static-only)
         monitored_sources: SourceConfig entries with monitor=True
         static_sources: Explicit SourceConfig entries (monitor=False)
+        metadata_db: MetadataDatabase to keep in sync as sources are added/removed
+            (None when the feature is disabled)
         credentials_config: CredentialsConfig for remote storage authentication
 
     Returns:
@@ -1115,9 +2311,48 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
 
-    if not monitored_dirs and not static_sources:
+    # Monitored tensor-server upstreams (bare-host grpc://, monitor=true): their
+    # catalog is periodically re-listed and reconciled (biopb/biopb#178). A
+    # single-source grpc://host/<id> entry has nothing to re-list, so it is
+    # excluded -- only the bare-host "mirror everything" form qualifies.
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    monitored_upstreams = [
+        ms
+        for ms in monitored_sources
+        if ms.is_remote
+        and ms.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+        and _split_grpc_url(ms.url)[1] is None
+    ]
+
+    # An unreachable monitored upstream contributes no static sources at startup
+    # (its bare-host expansion was skipped), but the re-list will populate it once
+    # it is reachable -- so it counts as "something to serve" and must not let the
+    # server hard-fail to start (#178: require monitor=true for bare-host recovery).
+    if not monitored_dirs and not static_sources and not monitored_upstreams:
         logger.warning("No valid sources to serve")
         return None
+
+    # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
+    # across both monitored and static sources. Under a monitored cloud root the
+    # walk admits dehydrated entries; for any cloud source the registration path
+    # defers a non-resident dataset to lazy resolution (cloud-storage phase 2).
+    cloud_roots: Set[Path] = set()
+    for source in (*monitored_sources, *static_sources):
+        if source.cloud:
+            # EXPERIMENTAL: cloud/synced-folder mode (offline placeholders resolved
+            # lazily on first access) is not yet stable. Warned once per configured
+            # cloud source at startup.
+            logger.warning(
+                "Source %r uses the EXPERIMENTAL 'cloud' mode (offline/synced-folder "
+                "placeholders resolved lazily on first access): its behavior and "
+                "config surface may change without notice in a future release.",
+                source.url,
+            )
+        if source.cloud and not source.is_remote:
+            local_path = source.local_path
+            if local_path is not None:
+                cloud_roots.add(local_path)
 
     # Create discovery state (empty - will be populated after SourceManager is created)
     discovery_state = DiscoveryState()
@@ -1129,6 +2364,7 @@ def create_source_manager(
         discovery_state=discovery_state,
         watcher=watcher,
         monitored_dirs=monitored_dirs,
+        metadata_db=metadata_db,
         dim_labels=monitored_sources[0].dim_labels if monitored_sources else None,
         credentials_config=credentials_config,
         stability_window=stability_window,
@@ -1136,22 +2372,56 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         stable_rescans_required=stable_rescans_required,
         aggressive_dir_pruning=aggressive_dir_pruning,
+        cloud_roots=cloud_roots,
+        monitored_upstreams=monitored_upstreams,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
     # These are added first so monitored discovery skips paths already claimed.
     for source in static_sources:
+        extra_config = {}
+        if source.dataset:
+            extra_config["dataset"] = source.dataset
+        # credentials_profile is dropped by the claim->SourceConfig rebuild in
+        # _register_source_claim; carry it here so a tensor-server proxy's
+        # per-upstream token (and any remote source's profile) reaches
+        # create_from_config.
+        if source.credentials_profile:
+            extra_config["credentials_profile"] = source.credentials_profile
+        # Store the canonical resolved form of a local config path (the same
+        # resolve_local_path the source_id hash, the containment guard, and the
+        # drop path all use) so its claim key compares equal to a drop that lands
+        # inside it. Otherwise a source configured through a symlink/junction
+        # (e.g. /data/current -> /data/2026-07, or a Windows junction / mapped
+        # drive) keeps its raw path, so a drop *inside* it -- whose resolved form
+        # differs -- evades the "already part of <source>" guard and double-
+        # registers. Monitored sources reach the same form via the walk's
+        # Path.resolve. A remote URL is left verbatim -- is_remote_url is
+        # prefix-based, so a Windows drive letter (C:\...) stays a local path.
+        primary_path = source.url
+        if not is_remote_url(source.url):
+            primary_path = resolve_local_path(source.url)
         claim = SourceClaim(
             source_type=source.type,
-            primary_path=source.url,  # str for URL support
+            primary_path=primary_path,  # resolved local path; remote URL verbatim
             source_id=source.source_id,
             dim_labels=source.dim_labels,
-            extra_config={"dataset": source.dataset} if source.dataset else {},
+            extra_config=extra_config,
+            # A static source explicitly flagged cloud is always deferred: the
+            # user said "don't open it eagerly". If it is in fact resident, the
+            # first access still resolves it cheaply.
+            unresolved=bool(source.cloud),
         )
-        manager._commit_add_claim(claim)
+        # source._catalog_url is the alias-derived display tree-root for a local
+        # source (config.resolve_all_sources), or None. Threaded as the descriptor's
+        # source_url override, exactly like the drag-drop re-rooting path.
+        manager._commit_add_claim(claim, catalog_url=source._catalog_url)
 
-    # Bootstrap monitored discovery through the same rescan pipeline used at runtime.
-    if monitored_dirs:
-        manager._handle_rescan()
-
+    # Monitored discovery is NOT run synchronously here: under progressive
+    # discovery the launcher starts the manager's event loop and the watcher
+    # fires the first rescan immediately, so the (possibly slow) bootstrap scan
+    # happens in the background while the server already reports SERVING. A
+    # static-only config (no monitored_dirs) has nothing to scan -- the launcher
+    # drives the first-scan-complete path directly so it still reports a
+    # freshness timestamp and seeds the backlog.
     return manager

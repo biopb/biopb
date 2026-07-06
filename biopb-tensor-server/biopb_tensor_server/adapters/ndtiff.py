@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -53,7 +53,7 @@ class RemoteNdTiffFileIO:
     - isdir_function: callable(path) -> bool
     """
 
-    def __init__(self, store: "RemoteStore"):
+    def __init__(self, store: RemoteStore):
         """Initialize RemoteNdTiffFileIO.
 
         Args:
@@ -134,7 +134,7 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
     SOURCE_TYPE = "ndtiff"
 
     @classmethod
-    def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
+    def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
         """Claim directories containing NDTiff datasets.
 
         Detects NDTiff.index file in directory - this is the signature
@@ -156,14 +156,13 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
         if not index_file.exists():
             return None
 
-        # Claim directory + index file
+        # Dir-claiming policy (biopb/biopb): the directory IS the dataset
+        # boundary. Claim the dir (+ the recall-free NDTiff.index marker) only;
+        # claiming the dir already prunes its whole subtree, so the interior
+        # NDTiffStack_*.tif files are never independently walked. Recording them
+        # as members would just duplicate that prune and pin a brittle glob.
         state.try_claim_path(ctx.path_str)
         state.try_claim_path(index_file.path_str)
-
-        # Also claim any NDTiffStack_*.tif files
-        tiff_files = ctx.glob("NDTiffStack_*.tif")
-        for tiff in tiff_files:
-            state.try_claim_path(tiff.path_str)
 
         return SourceClaim(
             source_type=cls.SOURCE_TYPE,
@@ -174,9 +173,9 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
     @classmethod
     def create_from_config(
         cls,
-        source: "SourceConfig",
+        source: SourceConfig,
         credentials_config: Optional[Any] = None,
-    ) -> "NdTiffAdapter":
+    ) -> NdTiffAdapter:
         """Create adapter instance from SourceConfig.
 
         Args:
@@ -216,7 +215,7 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
 
     def __init__(
         self,
-        dataset: "NDTiffDataset",
+        dataset: NDTiffDataset,
         source_id: str,
         source_url: str,
         dim_labels: Optional[List[str]] = None,

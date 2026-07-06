@@ -12,6 +12,7 @@ import os
 import secrets
 import signal
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -22,18 +23,15 @@ from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
-from biopb_tensor_server.downsample import configure_compute_backend
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (
     CacheConfig,
-    MetadataDbConfig,
     ServerConfig,
     SourceConfig,
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.discovery import discover_sources_async, is_remote_url
 from biopb_tensor_server.http_server import run as run_http_server
 from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
 from biopb_tensor_server.metadata_db import MetadataDatabase
@@ -64,6 +62,7 @@ def _install_sigterm_handler() -> None:
 
     Must be called from the main thread; no-op if that's not possible.
     """
+
     def _handler(signum, frame):
         raise KeyboardInterrupt
 
@@ -79,31 +78,61 @@ def _graceful_shutdown(
 ) -> None:
     """Best-effort orderly shutdown.
 
-    Stops the precache worker and source discovery and the filesystem watcher,
-    shuts down the Flight server, and closes the cache manager so the
-    file-backend process lock is released. Each step is isolated so a failure in
-    one still lets the cache lock be released (the important part for clean
-    restarts). The precache worker is stopped first so no new warm work starts
-    during teardown.
+    Step ORDER is load-bearing for clean restarts (biopb/biopb#300). ``restart``
+    force-kills the daemon after a bounded graceful window (``--timeout``, 10s by
+    default), so releasing the file-cache process lock must not sit behind the
+    slow teardown steps -- otherwise a mid-teardown SIGKILL leaves a stale lock
+    and the next boot pays the full crash-recovery scan (~110s on a large
+    caching-proxy cache):
+
+    1. Stop the precache worker -- no new warm writes.
+    2. Shut down the Flight server -- drains in-flight ``do_get`` streams, after
+       which nothing writes to the cache. On a caching proxy these streams are
+       upstream-latency-gated, so this is the step that can run long.
+    3. Close the cache immediately after -- clears the WAL and releases the
+       process lock while the state is quiescent, BEFORE the source manager's
+       up-to-5s thread join. So a SIGKILL during that join still finds the lock
+       released (no stale-lock recovery next boot).
+    4. Stop the source manager and watcher last -- neither touches the chunk
+       cache, so their teardown no longer gates the lock release.
+
+    Each step is isolated so a failure in one still lets the others run.
     """
+
+    def _close_cache() -> None:
+        # Clear the WAL + release the file-cache process lock (no-op for memory).
+        manager = CacheManager.get_instance()
+        if manager is not None:
+            manager.close()
+
     for label, action in (
         ("precache worker", lambda: precache_worker and precache_worker.stop()),
+        ("flight server", lambda: flight_server and flight_server.shutdown()),
+        ("cache", _close_cache),
         ("source manager", lambda: source_manager and source_manager.stop()),
         ("watcher", lambda: watcher and watcher.stop()),
-        ("flight server", lambda: flight_server and flight_server.shutdown()),
     ):
         try:
             action()
         except Exception as e:  # noqa: BLE001 - shutdown must not raise
             console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
 
-    # Release the file cache process lock (no-op for the memory backend).
-    manager = CacheManager.get_instance()
-    if manager is not None:
-        try:
-            manager.close()
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[yellow]Error closing cache: {e}[/yellow]")
+
+def _is_bare_host_upstream(source: SourceConfig) -> bool:
+    """True for a bare-host ``grpc://host:port`` tensor-server upstream (no ``/<id>``).
+
+    Only the bare-host "mirror everything" form has an upstream catalog to
+    re-list; a single-source ``grpc://host:port/<id>`` names exactly one source
+    and is registered directly. Mirrors the ``monitored_upstreams`` filter in
+    ``source_manager.create_source_manager``.
+    """
+    if not source.is_remote:
+        return False
+    if not source.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
+        return False
+    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+
+    return _split_grpc_url(source.url)[1] is None
 
 
 def _resolve_serve_sources(
@@ -127,6 +156,12 @@ def _resolve_serve_sources(
     monitored_sources: List[SourceConfig] = []
 
     for s in server_config.sources:
+        # The ``monitor`` flag alone decides live monitoring -- identically for
+        # cloud and non-cloud roots. ``cloud`` only controls *gating* (admit
+        # dehydrated placeholders as unresolved sources); it no longer forces a
+        # root onto the monitored pipeline. So a cloud root with monitor=false is
+        # scanned once at startup via the static-expand path (cloud-gated there
+        # too), exactly like any other monitor=false directory.
         if s.monitor and not s.is_remote:
             local_path = s.local_path
             # local_path cannot be None here -- both is_remote and local_path
@@ -155,13 +190,38 @@ def _resolve_serve_sources(
                     "when it appears: %s",
                     s.url,
                 )
+            # A local `alias` sets a catalog tree-root, but that override is
+            # display-only and non-durable: a monitored directory is re-discovered
+            # under its native path on every rescan and re-merges into the shared
+            # tree, so the alias root would flicker away on the first rescan. Ignore
+            # it loudly rather than pretend it holds. (Honored fine for a static /
+            # monitor=false root, and for a monitor=true single *file* -- which is
+            # registered static, above -- neither of which is rescanned.)
+            if s.alias:
+                logger.warning(
+                    "Ignoring 'alias' tree-root %r on monitored directory %s: a "
+                    "monitored root re-merges into the shared path tree on rescan. "
+                    "Drop 'monitor' to keep the alias as its own catalog root.",
+                    s.alias,
+                    s.url,
+                )
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 
-        # Remote monitor entries keep current behavior: registered statically
-        # AND passed to create_source_manager (which logs the no-monitor notice).
+        # Remote monitor entries are also handed to create_source_manager.
         if s.monitor:
             monitored_sources.append(s)
+        # A monitored bare-host tensor-server upstream ("mirror everything") must
+        # NOT be expanded inline here. Inline expansion runs one blocking upstream
+        # RPC per mirrored source *before* mark_ready(), so a large upstream keeps
+        # the server STARTING for minutes -- it never reaches SERVING (observed:
+        # 900s+ stuck registering hundreds of hpc__* proxies). Its sources are
+        # instead discovered and registered in the background by the SourceManager's
+        # periodic upstream re-list (biopb/biopb#178); the first rescan fires
+        # immediately, so the catalog populates progressively -- exactly like a
+        # monitored local directory. Skip the inline expansion.
+        if s.monitor and _is_bare_host_upstream(s):
+            continue
         to_expand.append(s)
 
     # Expand only the non-monitored-dir entries. tolerant=True so one missing or
@@ -174,15 +234,16 @@ def _resolve_serve_sources(
     # Still needed when a non-monitored entry's expansion lands under a
     # monitored root. Remote sources are always static (no filesystem monitoring).
     monitored_dirs = {
-        ms.local_path
-        for ms in monitored_sources
-        if not ms.is_remote and ms.local_path
+        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
     }
     static_sources = [
-        s for s in sources
-        if s.is_remote or (s.local_path and not any(
-            s.local_path.is_relative_to(md) for md in monitored_dirs
-        ))
+        s
+        for s in sources
+        if s.is_remote
+        or (
+            s.local_path
+            and not any(s.local_path.is_relative_to(md) for md in monitored_dirs)
+        )
     ]
     return static_sources, monitored_sources
 
@@ -203,11 +264,6 @@ def _setup_flight_server(
     server_config: ServerConfig,
     host: Optional[str] = None,
     port: Optional[int] = None,
-    compute_backend: Optional[str] = None,
-    gpu_min_input_mb: Optional[float] = None,
-    gpu_min_linear_input_mb: Optional[float] = None,
-    gpu_memory_safety_factor: Optional[int] = None,
-    gpu_min_merged_chunks: Optional[int] = None,
     writable: Optional[bool] = None,
     token: Optional[str] = None,
 ) -> Tuple[
@@ -219,8 +275,6 @@ def _setup_flight_server(
         server_config: Loaded server configuration
         host: Override host
         port: Override port
-        compute_backend: Override compute backend policy
-        gpu_* params: Override GPU policy parameters
         token: Access token for Flight server authentication
 
     Returns:
@@ -234,32 +288,6 @@ def _setup_flight_server(
     port = port or server_config.port
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
-
-    configure_compute_backend(
-        force_backend=compute_backend or server_config.compute_backend,
-        gpu_min_input_bytes=int(
-            (
-                gpu_min_input_mb
-                if gpu_min_input_mb is not None
-                else server_config.gpu_min_input_mb
-            )
-            * 1024
-            * 1024
-        ),
-        gpu_min_linear_input_bytes=int(
-            (
-                gpu_min_linear_input_mb
-                if gpu_min_linear_input_mb is not None
-                else server_config.gpu_min_linear_input_mb
-            )
-            * 1024
-            * 1024
-        ),
-        gpu_memory_safety_factor=gpu_memory_safety_factor
-        or server_config.gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks
-        or server_config.gpu_min_merged_chunks,
-    )
 
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
     # Off by default so recursive scans don't register screenshots/icons/movies.
@@ -287,11 +315,13 @@ def _setup_flight_server(
                 f"[yellow]File cache unavailable at {cache_config.file_cache_dir} "
                 f"({e}); falling back to in-memory cache.[/yellow]"
             )
-            manager = CacheManager.initialize(CacheConfig(
-                backend="memory",
-                memory_max_entries=cache_config.memory_max_entries,
-                memory_max_bytes=cache_config.memory_max_bytes,
-            ))
+            manager = CacheManager.initialize(
+                CacheConfig(
+                    backend="memory",
+                    memory_max_entries=cache_config.memory_max_entries,
+                    memory_max_bytes=cache_config.memory_max_bytes,
+                )
+            )
         if isinstance(manager.backend, ArrowFileBackend):
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] "
@@ -309,9 +339,10 @@ def _setup_flight_server(
                     f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
                     f"lost={recovery_status.lost_entries} entries"
                 )
-                if recovery_status.errors:
-                    for err in recovery_status.errors[:3]:
-                        console.print(f"[red]  Error: {err}[/red]")
+                # (No per-segment error list here: recovery no longer scans
+                # segment bodies -- biopb/biopb#300 -- so it surfaces no read
+                # errors. Corrupt segments are detected, logged, and dropped by
+                # _rebuild_index_from_segments' own logger.error instead.)
         else:
             console.print(
                 "[green]Virtual chunk cache initialized:[/green] backend=memory (fallback)"
@@ -325,9 +356,7 @@ def _setup_flight_server(
 
     # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
-    static_sources, monitored_sources = _resolve_serve_sources(
-        server_config, registry
-    )
+    static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
 
     if not static_sources and not monitored_sources:
         console.print("[yellow]Warning: No data sources configured[/yellow]")
@@ -341,29 +370,18 @@ def _setup_flight_server(
             f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
         )
 
-    console.print(
-        "[green]Compute backend policy:[/green] "
-        f"backend={compute_backend or server_config.compute_backend}, "
-        f"gpu_min_input_mb={gpu_min_input_mb if gpu_min_input_mb is not None else server_config.gpu_min_input_mb}, "
-        f"gpu_min_linear_input_mb={gpu_min_linear_input_mb if gpu_min_linear_input_mb is not None else server_config.gpu_min_linear_input_mb}, "
-        f"gpu_memory_safety_factor={gpu_memory_safety_factor or server_config.gpu_memory_safety_factor}, "
-        f"gpu_min_merged_chunks={gpu_min_merged_chunks or server_config.gpu_min_merged_chunks}"
+    # The metadata database is mandatory (biopb/biopb#225): always constructed --
+    # it is the canonical source-browsing surface (`client.query_sources`).
+    metadata_db = MetadataDatabase(
+        max_query_results=server_config.metadata_db.max_query_results,
+        query_timeout_ms=server_config.metadata_db.query_timeout_ms,
     )
-
-    # Create metadata database if enabled
-    metadata_db: Optional[MetadataDatabase] = None
-    if server_config.metadata_db.enabled:
-        metadata_db = MetadataDatabase(
-            enabled=True,
-            max_query_results=server_config.metadata_db.max_query_results,
-            query_timeout_ms=server_config.metadata_db.query_timeout_ms,
-        )
-        console.print(
-            "[green]Metadata database initialized:[/green] "
-            f"max_query_results={server_config.metadata_db.max_query_results}, "
-            f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
-            f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
-        )
+    console.print(
+        "[green]Metadata database initialized:[/green] "
+        f"max_query_results={server_config.metadata_db.max_query_results}, "
+        f"max_list_flights_results={server_config.metadata_db.max_list_flights_results}, "
+        f"query_timeout_ms={server_config.metadata_db.query_timeout_ms}"
+    )
 
     # Create and start server with gRPC message size tuned for 64MB chunks
     location = _grpc_location(host, port)
@@ -407,6 +425,7 @@ def _setup_flight_server(
         watcher=watcher,
         monitored_sources=monitored_sources,
         static_sources=static_sources,
+        metadata_db=metadata_db,
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
         probe_open_files=server_config.probe_open_files,
@@ -419,25 +438,58 @@ def _setup_flight_server(
         console.print("[red]No sources loaded successfully[/red]")
         raise typer.Exit(1)
 
-    # Initial sync of metadata database (batch insert all discovered sources)
-    if metadata_db is not None:
-        metadata_db.initial_sync(server._sources)
+    # Wire the runtime add_source handler (tensor-browser drag-drop): the server
+    # holds no SourceManager reference, so inject the entrypoint that routes a
+    # dropped path into the same claim -> adapter -> catalog pipeline. Its
+    # counterpart removes a dropped (dnd://) branch.
+    server.set_add_source_handler(source_manager.add_local_source)
+    server.set_remove_source_handler(source_manager.remove_dropped_root)
+
+    # Note: the metadata DB is already populated at this point. Static sources
+    # are seeded via SourceManager._commit_add_claim -> _register_source_claim
+    # (which syncs each), and monitored sources stream in through the background
+    # first scan -- both before this line. No separate initial_sync is needed.
 
     # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start() so runtime additions
-    # are captured; the initial scan was committed before start() and is
-    # excluded. The worker itself no-ops on a memory backend.
+    # Wire the commit hook BEFORE source_manager.start(). Under progressive
+    # discovery the startup set is committed by the *background* scan (after
+    # start); the manager gates it out of the prompt enqueue via
+    # _initial_scan_done and seeds it into the backlog through the first-scan
+    # callback below. The worker no-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
         source_manager._on_source_committed = precache_worker.enqueue
+        # Residency gate (#174): let the worker re-check, at warm time, that a
+        # cloud-root source's files are still resident before reading them, so a
+        # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
+        # registration.
+        precache_worker.should_warm = source_manager.should_warm
 
+    # Seed the precache backlog with the startup catalog the moment the first
+    # full scan establishes it (newest first; warmed when the server is idle).
+    # Wired before start() so the background scan's completion finds it.
+    def _seed_backlog_on_first_scan() -> None:
+        if precache_worker is not None and server_config.precache.backlog_enabled:
+            precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
+
+    source_manager._on_initial_scan_complete = _seed_backlog_on_first_scan
+
+    # Report "a full scan is running" from the first SERVING moment. The
+    # background scan sets this itself on entry, but pre-setting here closes the
+    # brief window between mark_ready() and the event loop picking up the first
+    # rescan, so a client never sees "SERVING, not scanning, never scanned".
+    if monitored_dirs:
+        server.set_full_scan_in_progress(True)
+
+    background_scan_running = False
     if watcher and source_manager:
         try:
             watcher.start(monitored_dirs)
             source_manager.start()
+            background_scan_running = True
             console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
         except Exception as e:
             console.print(f"[red]Failed to start monitoring: {e}[/red]")
@@ -447,16 +499,27 @@ def _setup_flight_server(
     if precache_worker is not None:
         precache_worker.start()
 
-    # Initial scan/registration is complete: flip the health action from
-    # STARTING to SERVING so clients waiting through startup can proceed.
+    # Progressive discovery: reach SERVING immediately. The monitored bootstrap
+    # scan runs in the background; the catalog populates live and the health
+    # action carries its freshness (full_scan_in_progress /
+    # last_full_scan_finished_at). A client needing a complete catalog waits on
+    # those fields, not on SERVING.
     server.mark_ready()
 
-    # Seed the secondary backlog with the local sources discovered at startup,
-    # so they warm (newest first) when the server is otherwise idle. Done after
-    # start()/mark_ready() so the live tier is already wired and the backlog is
-    # exactly the startup set.
-    if precache_worker is not None and server_config.precache.backlog_enabled:
-        precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
+    if not background_scan_running:
+        # No event loop will drive the bootstrap scan. Two cases:
+        #  - monitored dirs but the watcher failed to start: scan synchronously
+        #    now so those sources are still registered (the pre-progressive
+        #    behavior for watcher-less setups); _handle_rescan also stamps
+        #    freshness, flips _initial_scan_done, and seeds the backlog.
+        #  - static-only config (no monitored dirs, nothing to scan): drive the
+        #    completion path directly so it still reports a timestamp and seeds.
+        if monitored_dirs:
+            source_manager._handle_rescan()
+        else:
+            source_manager._initial_scan_done = True
+            server.set_last_full_scan(time.time())
+            _seed_backlog_on_first_scan()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
@@ -496,7 +559,7 @@ def serve(
         "--config",
         "-c",
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -520,31 +583,6 @@ def serve(
         "--port",
         "-p",
         help="Server port (overrides config)",
-    ),
-    compute_backend: Optional[str] = typer.Option(
-        None,
-        "--compute-backend",
-        help="Compute backend policy: auto, cpu, or gpu",
-    ),
-    gpu_min_input_mb: Optional[float] = typer.Option(
-        None,
-        "--gpu-min-input-mb",
-        help="Minimum input size in MB before GPU is considered for area-like methods",
-    ),
-    gpu_min_linear_input_mb: Optional[float] = typer.Option(
-        None,
-        "--gpu-min-linear-input-mb",
-        help="Minimum input size in MB before GPU is considered for linear interpolation",
-    ),
-    gpu_memory_safety_factor: Optional[int] = typer.Option(
-        None,
-        "--gpu-memory-safety-factor",
-        help="Required free-GPU-memory multiplier over estimated working set",
-    ),
-    gpu_min_merged_chunks: Optional[int] = typer.Option(
-        None,
-        "--gpu-min-merged-chunks",
-        help="Minimum merged source chunk count before GPU is preferred",
     ),
     writable: bool = typer.Option(
         False,
@@ -574,11 +612,6 @@ def serve(
         server_config,
         host=host,
         port=port,
-        compute_backend=compute_backend,
-        gpu_min_input_mb=gpu_min_input_mb,
-        gpu_min_linear_input_mb=gpu_min_linear_input_mb,
-        gpu_memory_safety_factor=gpu_memory_safety_factor,
-        gpu_min_merged_chunks=gpu_min_merged_chunks,
         writable=writable,
         token=token,
     )
@@ -603,7 +636,7 @@ def validate(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
 ):
     """Validate a config file.
@@ -617,14 +650,6 @@ def validate(
 
         console.print("[green]✓ Config valid[/green]")
         console.print(f"  Server: {server_config.host}:{server_config.port}")
-        console.print(
-            "  Compute: "
-            f"backend={server_config.compute_backend}, "
-            f"gpu_min_input_mb={server_config.gpu_min_input_mb}, "
-            f"gpu_min_linear_input_mb={server_config.gpu_min_linear_input_mb}, "
-            f"gpu_memory_safety_factor={server_config.gpu_memory_safety_factor}, "
-            f"gpu_min_merged_chunks={server_config.gpu_min_merged_chunks}"
-        )
         console.print(f"  Cache: backend={server_config.cache.backend}, ")
         if server_config.cache.backend == "memory":
             console.print(
@@ -652,7 +677,7 @@ def list_tensors(
     config: Path = typer.Argument(
         ...,
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
 ):
     """List data sources and tensors defined in a config file.
@@ -726,6 +751,38 @@ def version():
     console.print(f"biopb: {biopb_version}")
 
 
+@app.command(name="config-schema")
+def config_schema(
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write the schema to this file instead of stdout.",
+    ),
+):
+    """Print the JSON Schema for the config file.
+
+    The schema is generated from the server's own validation table, so its
+    value bounds and enums match what the server enforces at startup. Save it
+    and reference it from a config via "$schema" for editor autocomplete, or
+    feed it to a JSON Schema validator for pre-flight checks (biopb/biopb#34).
+
+    Example:
+        biopb-tensor-server config-schema -o biopb-config.schema.json
+    """
+    import json
+
+    from biopb_tensor_server.config_schema import build_config_schema
+
+    text = json.dumps(build_config_schema(), indent=2) + "\n"
+    if output is not None:
+        output.write_text(text, encoding="utf-8")
+        console.print(f"[green]✓ Wrote schema to {output}[/green]")
+    else:
+        # Raw stdout (not console.print) so the output is clean, pipeable JSON.
+        typer.echo(text, nl=False)
+
+
 @app.command()
 def launch(
     config: Path = typer.Option(
@@ -733,7 +790,7 @@ def launch(
         "--config",
         "-c",
         exists=True,
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     log_level: Optional[str] = typer.Option(
         None,
@@ -816,7 +873,9 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    setup_logging(effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file)
+    setup_logging(
+        effective_log_level, scope_to_biopb=log_scope_biopb, log_file=log_file
+    )
 
     # --- Determine dev mode ---
     env_dev = os.environ.get("BIOPB_WEB_DEV_BYPASS", "").lower() in ("1", "true", "yes")
@@ -963,6 +1022,7 @@ def launch(
             port=web_port,
             cors_origins=effective_cors,
             static_dir=str(static_dir) if static_dir else None,
+            config_path=str(config),
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")

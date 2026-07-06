@@ -7,7 +7,7 @@ Always run tooling through that interpreter — e.g. `.venv/bin/python -m pytest
 `.venv/bin/python -m black …` — **not** the bare `python`/`pytest` on `PATH`. A
 system or user-site Python can shadow the project env with a *different* (often
 older) `biopb`, which silently breaks tests that depend on newer client APIs
-(e.g. `make_cache_plugin`, added in `biopb >= 0.5.8`).
+(e.g. `configure_cache`, added in `biopb >= 0.5.8`).
 
 biopb-mcp now lives in the **biopb monorepo** (`biopb/biopb-mcp/`) as a uv
 workspace member; see `docs/monorepo-migration.md`. `biopb` and
@@ -180,12 +180,20 @@ idle and the kernel-dependent tools funnel through `KernelHost.execute()`, which
 returns a structured not-ready status — `not_started` (idle → call
 `start_kernel`), `error`/`dead` (call `start_kernel` to retry), or `starting` (a
 watchdog respawn in flight, derived from `is_alive() && !ready`). Conversely,
-**closing the napari window tears the kernel back down to idle**: a reverse of
-the parent-death pipe (the kernel holds the write end of a `BIOPB_WINDOW_CLOSE_FD`
-pipe and the bootstrap fires it from the window's `destroyed` signal; a server
-reader thread calls `shutdown()` on the byte). A user-attributed
-`_teardown_reason` is then surfaced via `execute()` / `server_status` so the
-agent learns *why* a running job vanished. Rebuild with `start_kernel`.
+**closing the napari window tears the kernel back down to idle**: on POSIX a
+reverse of the parent-death pipe (the kernel holds the write end of a
+`BIOPB_WINDOW_CLOSE_FD` pipe and the bootstrap fires it from the window's
+`destroyed` signal; a server reader thread calls `shutdown()` on the byte). On
+**Windows** the inherited fd isn't available (no `subprocess` `pass_fds`), so the
+launcher instead **polls** the in-kernel `_viewer_window_alive()` probe on a
+thread (`_poll_window_close`, default every 2 s) and calls the same `shutdown()`
+on a confirmed close. The poll only acts on a clean "window gone" reading from a
+ready, idle kernel — a busy kernel (a job holds the lock), a not-ready kernel, or
+an in-flight stop are skipped — so it never aborts a running job; the trade-off
+vs. the POSIX byte is that a close during a long job is detected on the next idle
+tick rather than immediately. Either way a user-attributed `_teardown_reason` is
+surfaced via `execute()` / `server_status` so the agent learns *why* a running
+job vanished. Rebuild with `start_kernel`.
 
 **Async job model (`_jobs.py`):** `execute_code` runs agent code in a
 **background daemon thread inside the kernel**, so the kernel main thread (and
@@ -220,8 +228,9 @@ output is not captured (code is exec'd, not run via `run_cell`).
   quick call holds the lock). `ensure_started()` is the synchronous, idempotent
   on-demand start (no eager boot); `restart()` releases dask then group-kills and
   respawns (re-running bootstrap, which clears job state). `_watch_window_close`
-  (a reader thread on the inherited window-close pipe) tears the kernel down to
-  idle when the user closes the viewer, recording a `_teardown_reason`.
+  (POSIX: a reader thread on the inherited window-close pipe) / `_poll_window_close`
+  (Windows: a thread polling the `_viewer_window_alive()` probe) tears the kernel
+  down to idle when the user closes the viewer, recording a `_teardown_reason`.
 - `_bootstrap.py` — runs *inside* the kernel via `exec_lines`. Enables `%gui qt`,
   configures dask, constructs the `TensorConnection`, opens the napari viewer +
   Tensor Browser, builds `ops`, installs the job runner (`_jobs.install`) and
@@ -360,19 +369,24 @@ The `mcp` section is grouped by concern:
   job handle), `parent_death_pipe`, and the `watchdog_*` orphan-hardening knobs
   (issue #13).
 - **`mcp.dask`** — `scheduler` defaults to `distributed`, which with an empty
-  `address` auto-spins a kernel-local multi-process `LocalCluster` (the only mode
-  where `cancel_job` can stop an in-flight `.compute()`); set a non-empty
-  `address` to attach to an external scheduler, or `threads`/`synchronous` for a
-  low-overhead in-process scheduler with no mid-compute cancel.
+  `address` auto-spins a multi-process `LocalCluster`; any distributed mode lets
+  `cancel_job` stop an in-flight `.compute()`. Set a non-empty `address` to
+  attach to an external scheduler, or `threads`/`synchronous` for a low-overhead
+  in-process scheduler with no mid-compute cancel. `owner` (default `daemon`)
+  decides who owns the auto-spun cluster: `daemon` — the MCP daemon owns it and
+  it survives kernel restart/respawn/window-close (the kernel attaches via an
+  injected scheduler address; no cold worker re-spawn per restart, which is the
+  dominant restart cost on Windows), so worker/memory changes need a *daemon*
+  restart, not just `restart_kernel`; `kernel` — the legacy per-kernel cluster.
   `num_workers`/`threads_per_worker`/`memory_limit`/`dashboard_address` size the
   auto-spun cluster (dashboard binds loopback only); `cache_budget` bounds the
   cluster-wide chunk cache (split across workers).
-- **`mcp.tensor`** — `cache_local` (let the data-plane client cache chunks even
-  for a localhost server; translated to `BIOPB_CACHE_LOCAL` in the kernel env)
-  and `health_poll_min_interval`/`health_poll_max_interval` (the background
-  source watcher's backoff bounds; the kernel re-lists when `source_count`
-  changes so a catalog cached mid-index self-heals — issue #44; min `<= 0`
-  disables it).
+- **`mcp.tensor`** — `health_poll_min_interval`/`health_poll_max_interval` (the
+  background source watcher's backoff bounds; the kernel re-lists when
+  `source_count` changes so a catalog cached mid-index self-heals — issue #44;
+  min `<= 0` disables it). (The localhost client-cache decision lives in the
+  tensor client itself — `_resolve_cache_bytes`, off by default with
+  `BIOPB_CACHE_LOCAL=1` as the opt-out — the MCP kernel no longer overrides it.)
 - **`mcp.viewer`** — `compute_scheduler` (default `threads`; pins the napari
   viewer's *serial* slice reads to a single-process scheduler via
   `_viewer_compute.wrap_levels` so they share the one main-process `conn.client`
@@ -488,20 +502,6 @@ pyqt6, jupyter_client, ipykernel, napari-skimage-regionprops.
 ## Development Notes
 
 - setuptools_scm for versioning
-- **Formatting/linting is gated by `pre-commit` only** — `pre-commit run
-  --all-files` (or `--files <changed>`) is the single source of truth; there is
-  no separate lint command to run, and there is no lint step in CI (CI runs only
-  the uv-based tests). Active hooks: `black` (line-length 79), `ruff` (lint), plus
-  `check-docstring-first`, `end-of-file-fixer`, `trailing-whitespace`,
-  `check-yaml`, and `napari-plugin-checks`. The `ruff` hook is **pinned at
-  `v0.9.4`** in `.pre-commit-config.yaml` (a newer ruff adds rules that postdate
-  the `[tool.ruff]` config in `pyproject.toml` — notably `UP045`, which the
-  `UP006`/`UP007` magicgui ignores don't cover); pre-commit fetches that pinned
-  ruff itself, so it need not be in `.venv` (to run it manually, use `uvx
-  ruff@0.9.4 check src/`). `fix = true` is set, so the hook (and a manual `ruff
-  check`) auto-applies safe fixes, matching the `black` workflow. `ruff-format`
-  is deliberately **not** enabled — `black` owns formatting and they would
-  fight. Validate with pre-commit.
 - magicgui for automatic GUI generation in the demo widgets
 - QT API set to pyqt6 in pytest configuration
 - Headless testing uses `QT_QPA_PLATFORM=offscreen`

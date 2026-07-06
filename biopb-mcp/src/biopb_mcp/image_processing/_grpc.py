@@ -210,9 +210,7 @@ def _parse_annotation_tsv(annotation: str) -> pd.DataFrame:
     # Filter out rows where values match header columns (duplicate header rows)
     if len(df) > 0:
         header_values = df.columns.astype(str).tolist()
-        mask = df.apply(
-            lambda row: row.astype(str).tolist() == header_values, axis=1
-        )
+        mask = df.apply(lambda row: row.astype(str).tolist() == header_values, axis=1)
         df = df[~mask].reset_index(drop=True)
 
     return df
@@ -361,9 +359,7 @@ def check_server_health(settings: dict, timeout: float | None = None) -> bool:
         return False
 
 
-def get_op_names(
-    settings: dict, timeout: float | None = None
-) -> proto.OpNames:
+def get_op_names(settings: dict, timeout: float | None = None) -> proto.OpNames:
     """Query server for available operations and their schemas.
 
     Args:
@@ -437,9 +433,7 @@ def grpc_object_detection(
         )
 
     # Get timeout from config
-    timeout = CONFIG.get(
-        f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
-    )
+    timeout = CONFIG.get(f"timeout.{'detection_3d' if is3d else 'detection_2d'}")
 
     server = settings["Server"]
     logger.info("Starting object detection on %s", server)
@@ -540,9 +534,7 @@ def _process_single_chunk(
     """
     # Convert axis order to dim_labels list
     dim_labels = list(iter_spec.axis_order)
-    image_data = serialize_from_numpy_to_image_data(
-        chunk, dim_labels=dim_labels
-    )
+    image_data = serialize_from_numpy_to_image_data(chunk, dim_labels=dim_labels)
 
     request = proto.ProcessRequest(
         image_data=image_data,
@@ -618,9 +610,7 @@ def grpc_process_image(
     """
     # Get timeout and concurrency from config
     is3d = "Z" in iter_spec.axis_order
-    timeout = CONFIG.get(
-        f"timeout.{'detection_3d' if is3d else 'detection_2d'}"
-    )
+    timeout = CONFIG.get(f"timeout.{'detection_3d' if is3d else 'detection_2d'}")
     max_concurrent = CONFIG.get("grpc.max_concurrent_calls")
 
     server = settings["Server"]

@@ -2,8 +2,8 @@
 set -e
 
 # Configuration via environment variables:
-# CONFIG_FILE    - Path to TOML config file (if set and exists, uses this file)
-#                  Otherwise generates config from env vars below
+# CONFIG_FILE    - Path to JSON (or legacy TOML) config file (if set and exists,
+#                  uses this file). Otherwise generates JSON config from env vars below
 # DATA_DIR       - Directory to monitor (default: /data)
 # MONITOR        - Enable live fs monitoring (default: true)
 # BIOPB_BASE_PORT - Base port for all services (default: 8810)
@@ -52,28 +52,30 @@ else
     echo "Generating runtime config from environment variables"
     DATA_DIR="${DATA_DIR:-/data}"
     MONITOR="${MONITOR:-true}"
-    cat > "$BIOPB_TMP/runtime-config.toml" << EOF
-[server]
-host = "$BIND_ADDR"
-port = $GRPC_PORT
-aggressive_dir_pruning = true
-
-[cache]
-backend = "file"
-file_max_segment_mb = ${CACHE_MAX_SEGMENT_MB:-256}
-file_max_total_gb = ${CACHE_MAX_TOTAL_GB:-16}
-
-[metadata_db]
-enabled = true
-
-[compute]
-backend = "${COMPUTE_BACKEND:-auto}"
-
-[[sources]]
-url = "${DATA_DIR}"
-monitor = $MONITOR
+    cat > "$BIOPB_TMP/runtime-config.json" << EOF
+{
+  "server": {
+    "host": "$BIND_ADDR",
+    "port": $GRPC_PORT,
+    "aggressive_dir_pruning": true
+  },
+  "cache": {
+    "backend": "file",
+    "file_max_segment_mb": ${CACHE_MAX_SEGMENT_MB:-256},
+    "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
+  },
+  "compute": {
+    "backend": "${COMPUTE_BACKEND:-auto}"
+  },
+  "sources": [
+    {
+      "url": "${DATA_DIR}",
+      "monitor": $MONITOR
+    }
+  ]
+}
 EOF
-    CONFIG_FILE="$BIOPB_TMP/runtime-config.toml"
+    CONFIG_FILE="$BIOPB_TMP/runtime-config.json"
 fi
 
 # Enable debug logging if dev bypass mode is active

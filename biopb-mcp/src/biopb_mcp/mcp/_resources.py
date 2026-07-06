@@ -183,9 +183,21 @@ else:
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
 # The sources table columns: source_id, source_url, source_type, dtype,
-# indexed_at, metadata_json, shape_summary
+# indexed_at, metadata_json, shape_summary, data_resident, and `tensors`
+# (a LIST of STRUCT(array_id, dim_labels, shape, chunk_shape, dtype) -- one
+# per tensor; `dtype`/`shape_summary` are just the first-tensor projection).
 df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
+
+# Per-tensor queries (multi-field / HCS sources): use the nested `tensors`
+# column with UNNEST or list_filter -- the scalar dtype/shape_summary only
+# describe tensors[0].
+client.query_sources(  # every tensor, one row each
+    "SELECT source_id, t.array_id, t.shape, t.dtype "
+    "FROM sources, UNNEST(tensors) AS u(t)", format="pandas")
+client.query_sources(  # sources having ANY uint16 tensor
+    "SELECT source_id FROM sources "
+    "WHERE len(list_filter(tensors, t -> t.dtype = 'uint16')) > 0", format="pandas")
 
 # Convenience listing (NOTE: capped by the server for large catalogs)
 for sid, src in client.list_sources().items():
@@ -195,6 +207,42 @@ for sid, src in client.list_sources().items():
 # Detailed metadata (OME_JSON) for one source
 meta = client.get_source_metadata("source_id")
 print(meta)
+```
+
+## Cloud / unresolved sources (experimental)
+Cloud / remote source support is **experimental** and may change.
+Some sources (cloud / synced-folder, e.g. OneDrive "Files-On-Demand") are
+catalogued by URL only: their shape/dtype/fields are *unknown* until first read.
+They list with `data_resident == False` and an empty `tensors`, and reading one
+(`get_tensor`/`add_tensor`) raises until you resolve it. Resolving asks the
+server to **download the whole file** (slow, uses disk, fails offline), so it is
+explicit -- never triggered by browsing.
+```python
+src = client.list_sources()["source_id"]
+if not src.data_resident:                    # unresolved / not local
+    src = client.resolve("source_id")        # downloads + resolves (may take minutes)
+    tensors = [(t.array_id, list(t.shape)) for t in src.tensors]  # now populated
+```
+Hydrate-ahead (optional): `resolve()` fetches a multi-file source's *metadata*
+only -- the bulk data files (e.g. zarr/ome-zarr chunks) still recall one-by-one,
+slowly, the first time a read touches them, which makes the first pass over a big
+image stall repeatedly. If you're about to work through the whole source, warm it
+up front so the server pulls every member file resident in one go (server-side;
+no pixels cross to the kernel). It's idempotent and reports progress:
+```python
+done = client.warm("source_id",
+                   on_progress=lambda p: print(f"{p.files_done}/{p.files_total}"))
+# Long-running; interrupt_kernel cancels it (the stream closes, the server stops).
+# Single-file sources are a no-op (resolve already recalled the one file).
+```
+Filter footgun: an unresolved source has NULL `dtype`/`shape_summary` in the
+`sources` table, so `query_sources("... WHERE dtype='uint8'")` silently *drops*
+it -- it's hidden for being unresolved, not for not matching. The table carries
+a `data_resident` column so you can filter on residency on purpose:
+```python
+# what hasn't been resolved (downloaded) yet?
+client.query_sources("SELECT source_id, source_url FROM sources WHERE NOT data_resident",
+                     format="pandas")
 ```
 
 ## Load into Viewer

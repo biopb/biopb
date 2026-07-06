@@ -180,9 +180,7 @@ def test_api_notebook_downloads_ipynb(client, host):
     job2 = code[-1]
     assert "interrupted" in "".join(job2["source"])
     assert job2["metadata"]["biopb"]["status"] == "interrupted"
-    assert any(
-        o.get("name") == "stderr" for o in job2["outputs"]
-    )
+    assert any(o.get("name") == "stderr" for o in job2["outputs"])
 
 
 def test_api_notebook_empty_session(client, host):
@@ -195,12 +193,8 @@ def test_api_notebook_empty_session(client, host):
     assert any(c["cell_type"] == "code" for c in nb["cells"])
 
 
-
-
 def test_api_interrupt_targets_running_job(client, host):
-    host.execute.return_value = _reply(
-        {"job_id": "job-1", "interrupted": True}
-    )
+    host.execute.return_value = _reply({"job_id": "job-1", "interrupted": True})
     r = client.post("/api/kernel/interrupt")
     assert r.status_code == 200
     assert r.json()["interrupted"] is True

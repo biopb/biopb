@@ -56,7 +56,14 @@ _BASE_INSTRUCTIONS = (
     "(server-side DuckDB, complete), not `client.list_sources()` "
     "(server-capped for large catalogs); the `sources` columns are source_id, "
     "source_url, source_type, dtype, indexed_at, metadata_json, "
-    "shape_summary.\n"
+    "shape_summary, data_resident, and `tensors` (a LIST of "
+    "STRUCT(array_id, dim_labels, shape, chunk_shape, dtype), one per tensor -- "
+    "query per-tensor with UNNEST(tensors) or list_filter; the scalar "
+    "dtype/shape_summary only describe tensors[0]). Unresolved (cloud / "
+    "synced-folder) sources "
+    "have NULL dtype/shape_summary, so a predicate like `WHERE dtype='uint8'` "
+    "silently drops them; filter on `data_resident` to opt them in/out on "
+    "purpose (`WHERE NOT data_resident` finds what hasn't been resolved yet).\n"
     "- Prefer lazy dask operations; only `.compute()` the final result.\n"
     "- Put intermediate results back on `viewer` for the user to validate at "
     "each step.\n"
@@ -172,9 +179,7 @@ _SCREENSHOT_SNIPPET = (
     "    _arr = viewer.screenshot(canvas_only={canvas_only})\n"
     "    _bgra = _cv2.cvtColor(_arr, _cv2.COLOR_RGBA2BGRA)\n"
     "    _ok, _buf = _cv2.imencode('.png', _bgra)\n"
-    "    print('"
-    + _PNG_DELIM
-    + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
+    "    print('" + _PNG_DELIM + "' + _b64.b64encode(_buf.tobytes()).decode())\n"
 )
 
 # Self-contained inspection snippet.  Built by string concatenation (no
@@ -224,6 +229,8 @@ try:
         _info = _dask_client.scheduler_info()
         print("  distributed_workers: " + str(len(_info.get("workers", {}))))
         print("  dashboard: " + str(_dask_client.dashboard_link))
+    elif not globals().get("_dask_attach_done", True):
+        print("  distributed: starting (attaching to cluster)")
     else:
         print("  distributed: not active")
 except Exception:
@@ -245,6 +252,11 @@ elif getattr(_conn, "last_status", "") == "starting":
     print("  state: starting — " + str(getattr(_conn, "last_message", "")))
 else:
     print("  connected: false")
+    _lm = str(getattr(_conn, "last_message", ""))
+    if _lm:
+        # issue #86: surface the reason (auth required / unreachable) instead of
+        # a bare "connected: false" the agent can't act on.
+        print("  error: " + _lm)
 
 print("")
 print("## Viewer")
@@ -456,10 +468,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = host.execute(snippet)
-    if (
-        _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM)
-        is not None
-    ):
+    if _extract_delimited(res.get("stdout", ""), _WINDOW_CLOSED_DELIM) is not None:
         return [
             TextContent(
                 type="text",
@@ -472,9 +481,7 @@ def take_screenshot(canvas_only: bool = True) -> list:
         ]
     data = _extract_delimited(res.get("stdout", ""), _PNG_DELIM)
     if data is None:
-        detail = (
-            res.get("error_text") or res.get("stdout") or res.get("status")
-        )
+        detail = res.get("error_text") or res.get("stdout") or res.get("status")
         return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
     return [ImageContent(type="image", mimeType="image/png", data=data)]
 
@@ -506,9 +513,12 @@ def execute_code(python_code: str) -> str:
     * data access (see guide://tensor for more details):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
-      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary
-      (note source_url, not "url"). Prefer this over client.list_sources()
-      (server-capped for large catalogs).
+      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
+      data_resident (note source_url, not "url"). Prefer this over
+      client.list_sources() (server-capped for large catalogs). Unresolved
+      (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
+      predicate hides them; use `data_resident` to filter on residency on
+      purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
     - viewer.add_tensor(source_id, tensor_id=None) loads a source as a layer
       (auto-handles the multiscale pyramid). client.get_tensor(source_id,
       tensor_id=None) returns a lazy dask array without adding a layer.
@@ -535,9 +545,7 @@ def execute_code(python_code: str) -> str:
     snap = submitted
     while time.monotonic() < deadline:
         time.sleep(0.4)
-        snap, res, window_alive = _run_job_call(
-            host, "poll(" + repr(job_id) + ")"
-        )
+        snap, res, window_alive = _run_job_call(host, "poll(" + repr(job_id) + ")")
         if snap is None:
             return _format_execute_result(res)
         if snap.get("status") != "running":
@@ -550,9 +558,7 @@ def execute_code(python_code: str) -> str:
         f"Job {job_id} is still running after {_promote_after:.0f}s. "
         f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
         f"server_status; stop with cancel_job('{job_id}') or restart_kernel.\n"
-        "Partial output:\n"
-        + (partial or "(none yet)")
-        + _window_note(window_alive)
+        "Partial output:\n" + (partial or "(none yet)") + _window_note(window_alive)
     )
 
 
@@ -573,9 +579,7 @@ def poll_job(job_id: str) -> str:
         return _format_execute_result(res)
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'."
-    note = (
-        _window_note(window_alive) if snap.get("status") != "running" else ""
-    )
+    note = _window_note(window_alive) if snap.get("status") != "running" else ""
     return _format_job_status(snap) + note
 
 
@@ -592,9 +596,7 @@ def cancel_job(job_id: str) -> str:
     if host is None:
         return "Error: kernel host not initialized"
 
-    data, res, _window_alive = _run_job_call(
-        host, "cancel(" + repr(job_id) + ")"
-    )
+    data, res, _window_alive = _run_job_call(host, "cancel(" + repr(job_id) + ")")
     if data is None:
         return _format_execute_result(res)
     status = data.get("status")
@@ -723,10 +725,10 @@ def server_status() -> str:
         "## System",
         f"  cpu_usage: {cpu_percent}%",
         f"  cpu_count: {os.cpu_count()}",
-        f"  memory_total: {mem.total / (1024 ** 3):.1f} GB",
-        f"  memory_available: {mem.available / (1024 ** 3):.1f} GB",
+        f"  memory_total: {mem.total / (1024**3):.1f} GB",
+        f"  memory_available: {mem.available / (1024**3):.1f} GB",
         f"  memory_used_percent: {mem.percent}%",
-        f"  process_rss: {proc_mem.rss / (1024 ** 2):.0f} MB",
+        f"  process_rss: {proc_mem.rss / (1024**2):.0f} MB",
         "",
     ]
 
@@ -750,9 +752,7 @@ def server_status() -> str:
         lines.append("  state: not initialized")
         return "\n".join(lines)
 
-    lines.append(
-        f"  display: {'headless (no viewer)' if _headless else 'visible'}"
-    )
+    lines.append(f"  display: {'headless (no viewer)' if _headless else 'visible'}")
     health = host.health()
     lines.append(f"  alive: {health['alive']}")
     lines.append(f"  ready: {health['ready']}")
@@ -768,9 +768,7 @@ def server_status() -> str:
     # startup budget. A user-attributed teardown reason (window close) is shown.
     teardown = health.get("teardown_reason")
     if health["dead"]:
-        lines.append(
-            "  state: DEAD — respawn budget exhausted; call start_kernel"
-        )
+        lines.append("  state: DEAD — respawn budget exhausted; call start_kernel")
         if health.get("start_error"):
             lines.append(f"    last error: {health['start_error']}")
         return "\n".join(lines)
@@ -790,9 +788,7 @@ def server_status() -> str:
                 "  state: starting — kernel/viewer still booting; retry shortly"
             )
         else:
-            line = (
-                "  state: not started — call start_kernel to launch the kernel"
-            )
+            line = "  state: not started — call start_kernel to launch the kernel"
             if teardown:
                 line += f" (torn down: {teardown})"
             lines.append(line)
@@ -807,8 +803,7 @@ def server_status() -> str:
     else:
         lines.append("")
         lines.append(
-            "  kernel query error: "
-            + (res.get("error_text") or str(res.get("status")))
+            "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
     return "\n".join(lines)

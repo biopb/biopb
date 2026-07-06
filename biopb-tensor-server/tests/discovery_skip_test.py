@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-
 from biopb_tensor_server import discovery
 from biopb_tensor_server.discovery import (
     _is_offline_placeholder,

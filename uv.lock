@@ -447,7 +447,7 @@ provides-extras = ["test", "tensor", "doc"]
 
 [[package]]
 name = "biopb-image-base"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "biopb-image-runtime" }
 dependencies = [
     { name = "biopb", extra = ["tensor"] },
@@ -540,7 +540,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "distributed", marker = "extra == 'mcp'" },
+    { name = "distributed", marker = "extra == 'mcp'", specifier = ">=2023.9.0" },
     { name = "grpcio-health-checking" },
     { name = "ipykernel", marker = "extra == 'mcp'" },
     { name = "jupyter-client", marker = "extra == 'mcp'" },
@@ -625,6 +625,7 @@ nifti = [
 test = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "pillow" },
     { name = "pytest" },
     { name = "pytest-timeout" },
@@ -655,6 +656,7 @@ requires-dist = [
     { name = "fsspec" },
     { name = "h5py", marker = "extra == 'hdf5'", specifier = ">=3.0.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
+    { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
     { name = "ndtiff", marker = "extra == 'ndtiff'", specifier = ">=3.0.0" },
     { name = "nibabel", marker = "extra == 'medical'", specifier = ">=5.0.0" },
     { name = "nibabel", marker = "extra == 'nifti'", specifier = ">=5.0.0" },

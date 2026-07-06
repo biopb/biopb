@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 from urllib.parse import urlparse
 
+from biopb._config_location import find_config
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
@@ -39,9 +40,12 @@ logger = logging.getLogger(__name__)
 # Catalogs larger than this switch to server-side SQL filtering.
 SERVER_QUERY_THRESHOLD = 1000
 
-# Default location of the biopb server's TOML config (matches the
-# `biopb server start` CLI default).
-DEFAULT_SERVER_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
+
+# Default location of the biopb server's config (matches the `biopb server
+# start` CLI default). Prefers JSON over legacy TOML and warns when both exist;
+# resolution is shared with the tensor server and the umbrella CLI via the core
+# `biopb` package (biopb/biopb#34).
+DEFAULT_SERVER_CONFIG = find_config()
 
 # Hosts considered "local" — auto-starting a server only makes sense for these.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -97,6 +101,53 @@ def is_local_url(url: str) -> bool:
     return host is None or host in _LOCAL_HOSTS
 
 
+# Substrings (lowercased) that mark a connect failure as an authentication
+# problem across the Flight/gRPC stacks, vs a plain "server is down".
+_AUTH_ERROR_MARKERS = (
+    "unauthenticat",
+    "unauthoriz",
+    "permission denied",
+    "invalid token",
+    "missing token",
+)
+_UNREACHABLE_MARKERS = (
+    "unavailable",
+    "refused",
+    "failed to connect",
+    "deadline",
+    "timed out",
+    "timeout",
+)
+
+
+def connect_error_message(exc: Exception, url: str, token: str | None) -> str:
+    """A human-readable reason for a failed :meth:`TensorConnection.connect`.
+
+    Read by the widget's status label and the MCP ``server_status`` tool, which
+    used to show a *blank* error here (issue #86 secondary). The common cause of
+    the silent failure was an auth problem — a token needed but missing or wrong
+    (e.g. a GUI-entered token lost across a kernel restart) — so that case names
+    the fix; an unreachable server gets a friendly hint; anything else echoes the
+    underlying error so nothing is hidden.
+    """
+    text = f"{type(exc).__name__}: {exc}".strip()
+    low = text.lower()
+    if any(m in low for m in _AUTH_ERROR_MARKERS):
+        if token:
+            return (
+                f"Authentication failed: the tensor server at {url} rejected the token."
+            )
+        return (
+            f"Authentication required: the tensor server at {url} needs a token. "
+            "Enter it in the Tensor Browser (or set BIOPB_TENSOR_TOKEN)."
+        )
+    if any(m in low for m in _UNREACHABLE_MARKERS):
+        return f"Cannot reach the tensor server at {url} — is it running?"
+    if text:
+        return f"Could not connect to the tensor server at {url}: {text}"
+    return f"Could not connect to the tensor server at {url}."
+
+
 class TensorConnection:
     """Owns the tensor client, source catalog, and connection settings."""
 
@@ -110,6 +161,13 @@ class TensorConnection:
         # "error". last_message carries the friendly "starting…" detail.
         self.last_status: str = "disconnected"
         self.last_message: str = ""
+
+        # Most recent health dict observed (from the connect probe and the
+        # source-watch poll), cached so a UI can distinguish "catalog still
+        # indexing" from "genuinely empty" without an extra round-trip on its
+        # paint thread. None until the first health probe; may lack the
+        # progressive-discovery freshness fields on an older server.
+        self.last_health: dict | None = None
 
         cfg = config if config is not None else CONFIG.as_dict()
         self.url, self.token = self.resolve_from_config(cfg)
@@ -178,6 +236,7 @@ class TensorConnection:
             # which stays the authoritative connectivity test.
             try:
                 health = client.health_check()
+                self.last_health = health if isinstance(health, dict) else None
                 status = (
                     health.get("status", "SERVING")
                     if isinstance(health, dict)
@@ -210,12 +269,15 @@ class TensorConnection:
             return sources
         except ServerStarting:
             raise
-        except Exception:
+        except Exception as exc:
             self.client = None
             self.sources = {}
             self.use_server_query = False
             self.last_status = "error"
-            self.last_message = ""
+            # Populate the reason (issue #86 secondary): the disconnect used to
+            # surface as a blank error, hiding the common "token required/wrong"
+            # cause behind a kernel restart.
+            self.last_message = connect_error_message(exc, url, token)
             raise
 
     def refresh(self) -> Dict[str, DataSourceDescriptor]:
@@ -226,6 +288,145 @@ class TensorConnection:
         self.sources = sources
         self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
         return sources
+
+    def mark_disconnected(self, message: str = "") -> None:
+        """Drop the client so ``is_connected`` reflects a lost server.
+
+        ``is_connected`` is only ``client is not None`` and nothing re-validates
+        it after ``connect()``, so a server that dies mid-session leaves the flag
+        (and the widget's status line) stale on "connected". Callers that observe
+        a failure against a previously-connected server — e.g. a failed manual
+        ``refresh()`` — call this to reset the state to disconnected, mirroring
+        the reset ``connect()`` already does on its own failure path. This is a
+        stopgap; a live health signal is the real fix (biopb/biopb#319).
+        """
+        self.client = None
+        self.sources = {}
+        self.use_server_query = False
+        self.last_status = "error"
+        self.last_message = message
+
+    def resolve_source(
+        self,
+        source_id: str,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ) -> DataSourceDescriptor:
+        """Resolve an unresolved (cloud / synced-folder) source, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.resolve` — which asks the
+        server to hydrate the source (for a dehydrated placeholder this **downloads
+        the whole file**, so it is slow and blocking and must be called off the GUI
+        thread) and returns the now-populated ``DataSourceDescriptor``. The local
+        catalog snapshot (:attr:`sources`) is then refreshed so callers re-render
+        from the resolved field list. Returns the resolved descriptor.
+
+        ``on_progress`` (called with a ``ResolveProgress`` per server heartbeat)
+        and ``should_cancel`` (polled per heartbeat; raising
+        :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
+        verbatim so a GUI can show progress and offer a Cancel button.
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        descriptor = self.client.resolve(
+            source_id, on_progress=on_progress, should_cancel=should_cancel
+        )
+        # resolve() already re-listed server-side; mirror it into our snapshot so
+        # the widget/agent see the full field set without a second round-trip.
+        self.refresh()
+        return descriptor
+
+    def warm_source(
+        self,
+        source_id: str,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ):
+        """Hydrate-ahead a resolved multi-file source, recalling its member files.
+
+        Delegates to :meth:`TensorFlightClient.warm` — the server walks the
+        source directory and reads every file to force the sync engine's recall,
+        so later reads are warm and never stall. The recall is entirely
+        server-side (no pixels cross the wire); this is slow and blocking, so call
+        it off the GUI thread. Only meaningful for multi-file (directory) sources;
+        a single-file source returns immediately.
+
+        ``on_progress`` (called with a ``WarmProgress`` per message) and
+        ``should_cancel`` (polled per message; raising
+        :class:`~biopb.tensor.ResolveCancelled` when it returns True) are forwarded
+        verbatim so a GUI can show a non-modal progress + Cancel affordance.
+        Returns the terminal ``WarmProgress`` snapshot. No catalog refresh — warm
+        changes residency, not the descriptor.
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        return self.client.warm(
+            source_id, on_progress=on_progress, should_cancel=should_cancel
+        )
+
+    def is_localhost(self) -> bool:
+        """True if the connected server runs on this machine.
+
+        The tensor-browser drag-drop gate: a dropped path is a *client-side*
+        filesystem path, meaningful to the server only when they share a
+        filesystem, so the drop affordance is enabled only for a localhost
+        server. Cheap and GUI-free so the widget can call it on every drag.
+        """
+        return is_local_url(self.url)
+
+    def add_source(
+        self,
+        path: str,
+        *,
+        on_progress=None,
+        should_cancel=None,
+    ):
+        """Register a local path on the server as a source, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.add_source` — the wire
+        entrypoint behind the tensor-browser drag-drop. The server interprets
+        ``path`` on *its own* filesystem (a localhost server shares ours), routes
+        it through the discovery pipeline, and streams progress as each source
+        registers; a dropped directory may add several. The local catalog
+        snapshot (:attr:`sources`) is then refreshed so the browser shows the new
+        rows. Slow for a large directory, so call off the GUI thread.
+
+        ``on_progress`` (an ``AddSourceProgress`` per registered source) and
+        ``should_cancel`` (polled per message; a cancel stops the walk but keeps
+        what is already registered) are forwarded verbatim. Returns the terminal
+        ``AddSourceResult`` (added / already_present / failed); a directory
+        dropped above the server's large-scan threshold comes back as a
+        ``failed`` entry.
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        result = self.client.add_source(
+            path,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+        )
+        self.refresh()
+        return result
+
+    def remove_source(self, root_url: str):
+        """Deregister a drag-dropped source branch on the server, then refresh.
+
+        Delegates to the SDK's :meth:`TensorFlightClient.remove_source` — the
+        wire entrypoint behind the tensor-browser's dropped-root [x] button.
+        ``root_url`` is a ``dnd://`` branch root; the server removes every source
+        at or under it (a dropped folder's sources go as a unit) and refuses
+        anything that is not a drag-dropped (``dnd://``) source. The local catalog
+        snapshot (:attr:`sources`) is then refreshed so the row disappears. Quick,
+        but still call off the GUI thread (a rescan may briefly hold the catalog
+        lock). Returns the ``RemoveSourceResult`` (removed / failed).
+        """
+        if self.client is None:
+            raise RuntimeError("Not connected")
+        result = self.client.remove_source(root_url)
+        self.refresh()
+        return result
 
     def start_source_watch(
         self,
@@ -257,17 +458,12 @@ class TensorConnection:
         if max_interval is None:
             max_interval = CONFIG.get("mcp.tensor.health_poll_max_interval")
         if not min_interval or min_interval <= 0:
-            logger.info(
-                "Source watch disabled (min_interval=%s)", min_interval
-            )
+            logger.info("Source watch disabled (min_interval=%s)", min_interval)
             return
         max_interval = max(max_interval or min_interval, min_interval)
 
         with self._watch_lock:
-            if (
-                self._watch_thread is not None
-                and self._watch_thread.is_alive()
-            ):
+            if self._watch_thread is not None and self._watch_thread.is_alive():
                 return
             self._watch_stop.clear()
             thread = threading.Thread(
@@ -278,17 +474,13 @@ class TensorConnection:
             )
             self._watch_thread = thread
             thread.start()
-        logger.info(
-            "Source watch started (%.1fs..%.1fs)", min_interval, max_interval
-        )
+        logger.info("Source watch started (%.1fs..%.1fs)", min_interval, max_interval)
 
     def stop_source_watch(self) -> None:
         """Signal the background source watcher to stop (best-effort)."""
         self._watch_stop.set()
 
-    def _source_watch_loop(
-        self, min_interval: float, max_interval: float
-    ) -> None:
+    def _source_watch_loop(self, min_interval: float, max_interval: float) -> None:
         """Poll loop for the source watcher; runs on its own daemon thread.
 
         ``last_count`` is the server ``source_count`` we last reconciled the
@@ -324,11 +516,8 @@ class TensorConnection:
                 interval = min(interval * 2, max_interval)
                 continue
 
-            count = (
-                health.get("source_count")
-                if isinstance(health, dict)
-                else None
-            )
+            self.last_health = health if isinstance(health, dict) else None
+            count = health.get("source_count") if isinstance(health, dict) else None
             if count is None:
                 # Server's health carries no source_count (older server) — there
                 # is nothing to watch; idle at the cap.
@@ -353,17 +542,13 @@ class TensorConnection:
         except Exception:  # noqa: BLE001 - keep the watcher alive on a blip
             logger.exception("Source watch: re-list failed")
             return
-        logger.info(
-            "Source watch: catalog changed, re-listed %d sources", len(sources)
-        )
+        logger.info("Source watch: catalog changed, re-listed %d sources", len(sources))
         callback = self.on_sources_changed
         if callback is not None:
             try:
                 callback(sources)
             except Exception:  # noqa: BLE001 - hook is best-effort
-                logger.exception(
-                    "Source watch: on_sources_changed hook failed"
-                )
+                logger.exception("Source watch: on_sources_changed hook failed")
 
     def query_sources(self, sql: str):
         """Server-side SQL filter passthrough."""
@@ -384,6 +569,27 @@ class TensorConnection:
     def health(self):
         """Return the server health check result, or ``None`` if not connected."""
         return self.client.health_check() if self.client else None
+
+    def scan_in_progress(self) -> bool:
+        """Whether the last-observed health said a full catalog scan is running.
+
+        Reads the cached :attr:`last_health` (no round-trip), so a UI can tell
+        "still indexing" from "genuinely empty" on its paint thread. ``False``
+        when unknown or on an older server lacking the freshness field — i.e.
+        callers treat absence as "not scanning", preserving old behavior.
+        """
+        h = self.last_health
+        return bool(h.get("full_scan_in_progress")) if isinstance(h, dict) else False
+
+    def scan_source_count(self) -> int:
+        """The ``source_count`` from the last-observed health (0 if unknown)."""
+        h = self.last_health
+        if isinstance(h, dict):
+            try:
+                return int(h.get("source_count") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
 
     def can_autostart_server(self) -> bool:
         """Whether a local biopb server could be auto-started for this URL.
@@ -471,9 +677,7 @@ class TensorConnection:
                     url, token, timeout=self.server_start_timeout()
                 )
             except Exception:  # noqa: BLE001
-                logger.exception(
-                    "auto_connect: %s did not finish starting", url
-                )
+                logger.exception("auto_connect: %s did not finish starting", url)
             return
         except Exception:  # noqa: BLE001
             logger.info("auto_connect: %s unreachable", url)

@@ -7,19 +7,16 @@ Tests cover:
 - Server/client roundtrip
 """
 
-import os
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
-
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
@@ -27,7 +24,7 @@ from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 def _ndtiff_available() -> bool:
     """Check if ndtiff is available."""
     try:
-        import ndtiff
+        import ndtiff  # noqa: F401  # availability probe
 
         return True
     except ImportError:
@@ -349,4 +346,9 @@ class TestNdTiffCreateFromConfig:
             adapter = NdTiffAdapter.create_from_config(source)
 
             assert adapter.source_id == "test-source"
-            mock_ndtiff.assert_called_once_with("/test/ndtiff/path")
+            # create_from_config passes the *resolved* path to NDTiffDataset, so
+            # compare against the normalized form rather than the raw URL — on
+            # POSIX resolve() is a fixed point here, but on Windows the call is
+            # NDTiffDataset('C:\\test\\ndtiff\\path') (biopb#179).
+            expected_path = str(Path("/test/ndtiff/path").resolve())
+            mock_ndtiff.assert_called_once_with(expected_path)

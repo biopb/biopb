@@ -19,8 +19,7 @@ Chunk data: stored in CacheManager keyed by full chunk_id
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -28,13 +27,12 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.chunk import ChunkEndpoint, encode_chunk_id
+from biopb_tensor_server.base import CHUNK_WIRE_SCHEMA, SourceAdapter, TensorAdapter
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.chunk import encode_chunk_id
 
 if TYPE_CHECKING:
     from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +51,16 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     _single_tensor_source = True
 
     @classmethod
-    def create_from_config(cls, source: 'SourceConfig', credentials_config: Optional[Any] = None) -> 'CachedSourceAdapter':
+    def create_from_config(
+        cls, source: SourceConfig, credentials_config: Optional[Any] = None
+    ) -> CachedSourceAdapter:
         """Cache-backed sources are not created from config.
 
         Raises NotImplementedError - use direct instantiation via DoPut.
         """
-        raise NotImplementedError("CachedSourceAdapter is created via DoPut, not config")
+        raise NotImplementedError(
+            "CachedSourceAdapter is created via DoPut, not config"
+        )
 
     def __init__(
         self,
@@ -128,10 +130,8 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         Raises:
             FlightServerError: Cannot read data from cache-backed source
         """
-        # Validate bounds first (base class validation)
-        desc = self.get_tensor_descriptor()
-        shape = tuple(desc.shape)
-        self._validate_bounds(bounds, shape)
+        # Validate bounds via the base TensorAdapter.get_data contract.
+        super().get_data(bounds)
 
         raise flight.FlightServerError(
             f"Cannot read data from cache-backed source {self.source_id}. "
@@ -147,8 +147,9 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data (any shape matching bounds)
         """
-        flat_data = pa.array([data.ravel()])
-        self.write_chunk_arrow(bounds, flat_data, data.shape, data.dtype)
+        # Pass the flat element values (a primitive Arrow array), NOT a list<T>
+        # wrapper -- write_chunk_arrow stores the raw value buffer directly.
+        self.write_chunk_arrow(bounds, pa.array(data.ravel()), data.shape, data.dtype)
 
     def write_chunk_arrow(
         self,
@@ -161,7 +162,11 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
 
         Args:
             bounds: Chunk start/stop coordinates
-            data: Flattened Arrow values or list array payload for the chunk
+            data: The chunk's flattened element *values* as a primitive Arrow
+                array (e.g. ``int16``) -- NOT a ``list<T>`` wrapper. Its raw value
+                buffer is stored directly as the unified binary chunk schema
+                (biopb/biopb#293), the same schema ``resolve_chunk_data`` serves,
+                so uploaded chunks read back byte-identically.
             logical_shape: Logical chunk shape matching bounds
             dtype: NumPy dtype or dtype string for the chunk data
         """
@@ -173,26 +178,25 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
 
         if isinstance(data, pa.ChunkedArray):
             data = data.combine_chunks()
-
         if pa.types.is_list(data.type):
-            list_arr = data
-            values = data.values
-        else:
-            offsets = pa.array([0, len(data)], type=pa.int32())
-            list_arr = pa.ListArray.from_arrays(offsets, data)
-            values = data
+            # A list<T> wrapper's buffer[1] is offsets, not the value bytes --
+            # storing it would silently corrupt the chunk. The binary schema takes
+            # the flat values directly (biopb/biopb#293), so reject the wrapper.
+            raise TypeError(
+                "write_chunk_arrow expects the flat element values (a primitive "
+                "array), not a list<T> wrapper"
+            )
 
         logical_shape = list(logical_shape)
         dtype_str = np.dtype(dtype).str
-        size_bytes = values.nbytes
+        values_buf = data.buffers()[1]  # primitive array buffers: [validity, data]
+        size_bytes = values_buf.size
+        offsets = pa.py_buffer(np.array([0, size_bytes], dtype=np.int32))
+        data_col = pa.Array.from_buffers(pa.binary(), 1, [None, offsets, values_buf])
 
         batch = pa.RecordBatch.from_arrays(
-            [
-                list_arr,
-                pa.array([logical_shape]),
-                pa.array([dtype_str]),
-            ],
-            ["data", "shape", "dtype"]
+            [data_col, pa.array([logical_shape]), pa.array([dtype_str])],
+            schema=CHUNK_WIRE_SCHEMA,
         )
 
         entry, is_owner = cache_manager.start_compute(
@@ -244,7 +248,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         entry = cache_manager.get_or_acquire(
             chunk_id,
             lambda: (_raise_no_backend(self.source_id), 0),  # Never actually called
-            metadata={'array_id': self.source_id}
+            metadata={"array_id": self.source_id},
         )
         data = entry.data
         cache_manager.release(chunk_id)

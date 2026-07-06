@@ -17,7 +17,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, IO, Iterator, List, Optional, Set, Tuple
+from typing import IO, Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class CredentialProfile:
         token: Session token (for temporary credentials) or service account JSON path (GCS)
         endpoint_url: Custom endpoint (for S3-compatible storage like MinIO)
     """
+
     name: str
     storage_type: str
     key: Optional[str] = None
@@ -100,6 +101,7 @@ class CredentialsConfig:
         default_profile: Name of the default profile to use
         profiles: List of credential profiles
     """
+
     default_profile: Optional[str] = None
     profiles: List[CredentialProfile] = field(default_factory=list)
 
@@ -139,15 +141,10 @@ def _extract_signed_url_params(url: str) -> Dict[str, Any]:
 
     options: Dict[str, Any] = {}
 
-    # AWS S3 signed URL params
+    # AWS S3 signed URL params. Signature/Expires are carried in the URL itself
+    # and handled by fsspec, so only the credential params are extracted here.
     if "AWSAccessKeyId" in query_params:
         options["key"] = query_params["AWSAccessKeyId"][0]
-    if "Signature" in query_params:
-        # Signature is used differently - part of the URL auth
-        pass
-    if "Expires" in query_params or "X-Amz-Expires" in query_params:
-        # Expiration params - fsspec handles these
-        pass
     if "X-Amz-Security-Token" in query_params:
         options["token"] = query_params["X-Amz-Security-Token"][0]
 
@@ -297,7 +294,9 @@ class RemoteStore:
 
         # 3. Source-level profile (overrides global)
         if self._credentials_config and self._source_profile_name:
-            source_profile = self._credentials_config.get_profile(self._source_profile_name)
+            source_profile = self._credentials_config.get_profile(
+                self._source_profile_name
+            )
             if source_profile:
                 profile_options = source_profile.to_storage_options()
                 storage_options.update(profile_options)
@@ -331,7 +330,7 @@ class RemoteStore:
         url: str,
         credentials_config: Optional[CredentialsConfig] = None,
         profile_name: Optional[str] = None,
-    ) -> "RemoteStore":
+    ) -> RemoteStore:
         """Create RemoteStore from configuration.
 
         Args:
@@ -378,7 +377,9 @@ class RemoteStore:
         Returns:
             List of matching paths
         """
-        return self.fs.find(self.path, pattern=pattern, maxdepth=maxdepth, withdirs=withdirs)
+        return self.fs.find(
+            self.path, pattern=pattern, maxdepth=maxdepth, withdirs=withdirs
+        )
 
     def exists(self, subpath: str = "") -> bool:
         """Check if path exists.
@@ -499,6 +500,7 @@ class RemoteStore:
         except Exception:
             # Fallback to path hash
             import hashlib
+
             return hashlib.sha256(full_path.encode()).hexdigest()[:16]
 
     def _join(self, subpath: str) -> str:
@@ -539,7 +541,9 @@ class RemoteStore:
                 storage_options.update(profile_options)
 
         if self._credentials_config and self._source_profile_name:
-            source_profile = self._credentials_config.get_profile(self._source_profile_name)
+            source_profile = self._credentials_config.get_profile(
+                self._source_profile_name
+            )
             if source_profile:
                 profile_options = source_profile.to_storage_options()
                 storage_options.update(profile_options)

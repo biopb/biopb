@@ -238,9 +238,7 @@ def _exec_capture(code, ns, job):
     if tree.body:
         exec(compile(tree, "<job>", "exec"), ns)
     if last_expr is not None:
-        value = eval(
-            compile(ast.Expression(last_expr.value), "<job>", "eval"), ns
-        )
+        value = eval(compile(ast.Expression(last_expr.value), "<job>", "eval"), ns)
         if value is not None:
             job.result_text = repr(value)
 
@@ -378,9 +376,7 @@ def _raise_in_thread(ident, exctype):
     res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
         ctypes.c_ulong(ident), ctypes.py_object(exctype)
     )
-    if (
-        res > 1
-    ):  # never expected to hit >1; undo to avoid corrupting a bystander
+    if res > 1:  # never expected to hit >1; undo to avoid corrupting a bystander
         ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
         return 0
     return res

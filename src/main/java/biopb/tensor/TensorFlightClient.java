@@ -13,6 +13,7 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.flight.Ticket;
@@ -63,16 +64,23 @@ import net.imglib2.view.Views;
  * endpoint layout matches the descriptor chunk grid. In that case, imglib2's
  * internal cell cache is the primary cache for repeated reads.
  *
+ * <p>A tensor is identified by its globally-unique {@code array_id} (the tensor
+ * identity policy; see the top of {@code proto/biopb/tensor/descriptor.proto}):
+ * either {@code source_id} for a single-tensor source or {@code source_id/field}
+ * for a multi-tensor one. The array_id-first methods ({@link #getTensor(String)},
+ * {@link #getDescriptor(String)}, {@link #getPhysicalScale(String)}) take that one
+ * identifier; the older {@code (sourceId, tensorId)} overloads remain available.
+ *
  * Usage:
- * 
+ *
  * <pre>
  * TensorFlightClient client = new TensorFlightClient("localhost:8815");
  *
  * // List data sources (each may contain multiple tensors)
  * Map&lt;String, DataSourceDescriptor&gt; sources = client.listSources();
  *
- * // Access a specific tensor within a source
- * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source", "tensor-0");
+ * // Access a tensor by its array_id ("source_id" or "source_id/field")
+ * RandomAccessibleInterval&lt;UnsignedByteType&gt; arr = client.getTensor("my-source/tensor-0");
  * long[] pos = { 10, 20, 30 };
  * UnsignedByteType pixel = arr.getAt(pos);
  * client.close();
@@ -255,16 +263,18 @@ public class TensorFlightClient implements AutoCloseable {
      * contain
      * "total_sources" key if result was truncated.
      *
-     * Requires server to have metadata_db.enabled=true in config.
+     * The server-side metadata database is mandatory (biopb/biopb#225), so any
+     * standard tensor-server supports this. Only an embedded server explicitly
+     * constructed without a metadata database rejects the query.
      *
      * @param sql SQL query (e.g., "SELECT source_id FROM sources WHERE source_url
      *            LIKE '%plate%'")
      * @return VectorSchemaRoot with query results (caller must close)
-     * @throws IOException If query fails or server does not have metadata database
-     *                     enabled
+     * @throws IOException If query fails or the server has no metadata database
+     *                     attached
      *
      *                     Example:
-     * 
+     *
      *                     <pre>
      *                     VectorSchemaRoot result = client.querySources("SELECT source_id, source_type FROM sources");
      *                     System.out.println("Found " + result.getRowCount() + " sources");
@@ -343,24 +353,28 @@ public class TensorFlightClient implements AutoCloseable {
         // Create result root with enough capacity
         VectorSchemaRoot result = VectorSchemaRoot.create(schema, allocator);
         result.allocateNew();
-        VectorLoader loader = new VectorLoader(result);
 
-        // Load and copy each batch
+        // Load each batch into its OWN transient root, then copy its rows into
+        // result at the running offset. Loading every batch into result with a
+        // single VectorLoader (the previous approach) overwrites row 0 each
+        // time, so only the last batch survived -- multi-batch results were
+        // silently corrupted.
         int offset = 0;
         for (ArrowRecordBatch batch : batches) {
-            loader.load(batch);
-            // Copy values from current position to offset position
-            for (int i = 0; i < result.getFieldVectors().size(); i++) {
-                org.apache.arrow.vector.ValueVector srcVec = result.getVector(i);
-                org.apache.arrow.vector.ValueVector dstVec = result.getVector(i);
-                // Use slice to get the loaded portion and copy to offset
-                // Since loader loads starting at 0, we need to shift values
-                for (int row = 0; row < batch.getLength(); row++) {
-                    dstVec.copyFromSafe(row, offset + row, srcVec);
+            try (VectorSchemaRoot batchRoot = VectorSchemaRoot.create(schema, allocator)) {
+                new VectorLoader(batchRoot).load(batch);
+                int rows = batch.getLength();
+                for (int i = 0; i < result.getFieldVectors().size(); i++) {
+                    org.apache.arrow.vector.ValueVector srcVec = batchRoot.getVector(i);
+                    org.apache.arrow.vector.ValueVector dstVec = result.getVector(i);
+                    for (int row = 0; row < rows; row++) {
+                        dstVec.copyFromSafe(row, offset + row, srcVec);
+                    }
                 }
+                offset += rows;
+            } finally {
+                batch.close();
             }
-            offset += batch.getLength();
-            batch.close();
         }
 
         result.setRowCount(totalRows);
@@ -368,16 +382,14 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Get source-level OME/vendor metadata.
-     *
-     * Fetches metadata via GetFlightInfo for the first tensor in the source,
-     * since metadataJson is populated in the response TensorDescriptor.
-     * The server wraps metadata in {"type": ..., "dim_label": [...], "metadata":
-     * {...}},
-     * this method returns the inner "metadata" dict.
+     * Get source-level OME/vendor metadata as a map.
      *
      * @param sourceId Source identifier
-     * @return Parsed metadata as Map, or empty map if no metadata
+     * @return The source's metadata map, or an empty map if it carries none
+     * @throws IllegalArgumentException if the source is unknown
+     * @throws IllegalStateException    if the source is unresolved (cloud /
+     *                                  synced-folder) -- call {@link #resolve}
+     *                                  first
      */
     public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
         if (!sources.containsKey(sourceId)) {
@@ -388,10 +400,16 @@ public class TensorFlightClient implements AutoCloseable {
             throw new IllegalArgumentException("Source not found: " + sourceId);
         }
         if (sourceDesc.getTensorsList().isEmpty()) {
-            return new HashMap<>();
+            // Unresolved (cloud / synced-folder) source: tensors are unknown until
+            // resolve. Don't return {} -- that conflates "unresolved" with
+            // "resolved, no metadata". Steer to the explicit, consented resolve().
+            throw unresolvedSourceError(sourceId);
         }
 
-        // Get metadata from first tensor via GetFlightInfo
+        // metadata_json is populated on the descriptor GetFlightInfo returns, so
+        // we fetch it via the source's first tensor. The server wraps it as
+        // {"type": ..., "dim_label": [...], "metadata": {...}}; we return the
+        // inner "metadata" map.
         TensorDescriptor firstTensor = sourceDesc.getTensorsList().get(0);
         FlightCmd cmd = FlightCmd.newBuilder()
                 .setSourceId(sourceId)
@@ -413,6 +431,246 @@ public class TensorFlightClient implements AutoCloseable {
             return (Map<String, Object>) metadataValue;
         }
         return wrapped;
+    }
+
+    /**
+     * Resolve an unresolved source and return its full {@link DataSourceDescriptor}.
+     *
+     * <p>An <i>unresolved</i> source is catalogued by URL only -- its
+     * shape/dtype/field list are unknown until first access (it lists with
+     * {@code data_resident} false and an empty {@code tensors}). The canonical
+     * case is a cloud / synced-folder ("Files-On-Demand") source.
+     *
+     * <p>Resolving asks the server to hydrate it. For a dehydrated placeholder
+     * this <b>downloads the whole file</b> -- a recall that can take minutes,
+     * consume local disk, and fail when offline -- then reads its real shape,
+     * dtype, and field list. This is the heavyweight, <i>consenting</i> operation
+     * that catalog browsing ({@link #listSources} / {@link #querySources})
+     * deliberately avoids; call it only when you intend to read the data.
+     * Afterwards {@link #getTensor} and friends work normally. Idempotent.
+     *
+     * @param sourceId The source to resolve (e.g. {@code "onedrive_a3f2"})
+     * @return The full DataSourceDescriptor with every tensor/field enumerated
+     * @throws IOException If the action fails or the server returns no descriptor
+     */
+    public DataSourceDescriptor resolve(String sourceId) throws IOException {
+        // One dedicated, streaming "resolve" action -- the single server entry
+        // point that performs the (possibly minutes-long) recall and returns the
+        // full descriptor directly. The action streams ResolveStreamMessage
+        // progress heartbeats to keep the connection warm under proxy idle
+        // timeouts; the terminal message carries the descriptor in its `result`
+        // arm. (An empty body / bare serialized descriptor is also accepted for
+        // back-compat with a server predating the progress envelope.)
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+                "resolve",
+                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        DataSourceDescriptor desc = null;
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        while (iter.hasNext()) {
+            byte[] body = iter.next().getBody();
+            if (body == null || body.length == 0) {
+                continue; // legacy empty-body heartbeat (pre-envelope server)
+            }
+            try {
+                ResolveStreamMessage msg = ResolveStreamMessage.parseFrom(body);
+                if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.RESULT) {
+                    desc = msg.getResult();
+                } else if (msg.getPayloadCase() == ResolveStreamMessage.PayloadCase.PROGRESS) {
+                    continue; // heartbeat (no progress callback on the Java client yet)
+                } else {
+                    // Legacy server: a non-empty body IS a bare serialized descriptor.
+                    desc = DataSourceDescriptor.parseFrom(body);
+                }
+            } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+                desc = DataSourceDescriptor.parseFrom(body); // legacy bare descriptor
+            }
+        }
+        if (desc == null) {
+            throw new IOException("resolve('" + sourceId
+                    + "') returned no descriptor (server closed the stream without a result)");
+        }
+        sources.put(sourceId, desc);
+        return desc;
+    }
+
+    /**
+     * Hydrate-ahead: ask the server to recall all of a resolved multi-file
+     * source's member files, so later reads are warm and never stall.
+     *
+     * <p>{@link #resolve} populates a source's metadata but, for a multi-file
+     * cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
+     * leaves the bulk pixel data dehydrated -- each member file then recalls
+     * one-at-a-time, slowly, the first time a read touches it. This walks the
+     * source directory server-side and reads every file to force the sync
+     * engine's recall; no pixels cross the wire, only progress. It is idempotent
+     * (already-resident files are cheap local reads) and a no-op for a
+     * single-file source (resolve already recalled it).
+     *
+     * @param sourceId The (already-resolved) source to warm.
+     * @return The terminal {@link WarmProgress} snapshot (files/bytes made
+     *         resident; {@code filesTotal == 0} for a no-op source).
+     * @throws IOException If the action fails, the server is too old to support
+     *         the {@code warm} action, or it returns no terminal status.
+     */
+    public WarmProgress warm(String sourceId) throws IOException {
+        org.apache.arrow.flight.Action action = new org.apache.arrow.flight.Action(
+                "warm",
+                sourceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        WarmProgress done = null;
+        java.util.Iterator<org.apache.arrow.flight.Result> iter = client.doAction(action, authOption);
+        while (iter.hasNext()) {
+            byte[] body = iter.next().getBody();
+            if (body == null || body.length == 0) {
+                continue;
+            }
+            WarmStreamMessage msg = WarmStreamMessage.parseFrom(body);
+            if (msg.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
+                done = msg.getDone();
+            }
+            // PROGRESS arms are ignored (no progress callback on the Java client yet).
+        }
+        if (done == null) {
+            throw new IOException("warm('" + sourceId
+                    + "') returned no terminal status (server closed the stream without a 'done')");
+        }
+        return done;
+    }
+
+    /**
+     * Fetch one tensor's {@link TensorDescriptor} by its globally-unique array_id.
+     *
+     * <p>A tensor is identified by its {@code array_id} alone (see the tensor
+     * identity policy at the top of {@code proto/biopb/tensor/descriptor.proto}),
+     * so this takes that one identifier rather than a {@code (sourceId, tensorId)}
+     * pair. Works even when the source is beyond the (truncatable)
+     * {@link #listSources} cap, and the result is cached. A bare {@code source_id}
+     * (single-tensor source, or to anchor on a multi-tensor source's default/first
+     * tensor) is accepted. To enumerate ALL tensors/scenes of a source, use
+     * {@code listSources().get(sourceId).getTensorsList()} -- NOT this method.
+     *
+     * <p>This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
+     * synced-folder) source it raises an error pointing at {@link #resolve}.
+     *
+     * @param arrayId Globally-unique tensor id, e.g. {@code "zarr_a3f2"} or
+     *                {@code "aics_7f3/Image:0"}
+     * @return The TensorDescriptor for that tensor
+     */
+    public TensorDescriptor getDescriptor(String arrayId) {
+        // source_id is the slash-free prefix; the full array_id is the tensor_id.
+        return fetchTensorDescriptor(sourceIdFromArrayId(arrayId), arrayId);
+    }
+
+    /**
+     * Per-dimension physical pixel size + unit for a tensor.
+     *
+     * <p>Returns a {@link PhysicalScale} whose {@code scale} and {@code unit}
+     * arrays are aligned with the tensor's {@code dim_labels} (source axis order),
+     * or {@code null} when no physical sizes are known (an older server, or a
+     * format that carries none).
+     *
+     * <p>{@code physical_scale}/{@code physical_unit} are {@code TensorDescriptor}
+     * fields the server fills on every {@code GetFlightInfo} (issue #31), so this
+     * reads the descriptor a prior {@link #getTensor} already cached -- no extra
+     * RPC when it is cached, and it never requests the opt-in {@code metadata_json}
+     * field on that same descriptor. (Contrast {@link #getSourceMetadata}, which
+     * forces {@code with_metadata} to ship the whole OME tree; do not dig physical
+     * sizes out of that -- this is the compact projection meant for display scale.)
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field}). A bare source id anchors on the
+     *                source's default (first) tensor.
+     * @return A PhysicalScale, or {@code null} if no physical scale is known
+     */
+    public PhysicalScale getPhysicalScale(String arrayId) {
+        String sourceId = sourceIdFromArrayId(arrayId);
+        TensorDescriptor desc = descriptors.get(arrayId);
+        if (desc == null) {
+            // Don't silently recall a whole cloud file just to read its pixel
+            // size: if the source is known-unresolved, steer to resolve().
+            DataSourceDescriptor cached = sources.get(sourceId);
+            if (cached != null && cached.getTensorsList().isEmpty()) {
+                throw unresolvedSourceError(sourceId);
+            }
+            desc = fetchTensorDescriptor(sourceId, arrayId);
+        }
+        if (desc.getPhysicalScaleCount() == 0) {
+            return null;
+        }
+        double[] scale = new double[desc.getPhysicalScaleCount()];
+        for (int i = 0; i < scale.length; i++) {
+            scale[i] = desc.getPhysicalScale(i);
+        }
+        String[] unit = desc.getPhysicalUnitList().toArray(new String[0]);
+        return new PhysicalScale(scale, unit);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor by its globally-unique array_id.
+     *
+     * @param arrayId Globally-unique tensor id ({@code source_id} or
+     *                {@code source_id/field})
+     * @param <T>     The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(String arrayId) {
+        return getTensor(arrayId, (SliceHint) null);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with a slice hint.
+     *
+     * @param arrayId   Globally-unique tensor id ({@code source_id} or
+     *                  {@code source_id/field})
+     * @param sliceHint Optional slice hint
+     * @param <T>       The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            SliceHint sliceHint) {
+        return getTensor(arrayId, sliceHint, null, null);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with scaled reads.
+     *
+     * @param arrayId         Globally-unique tensor id ({@code source_id} or
+     *                        {@code source_id/field})
+     * @param scaleHint       Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @param <T>             The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            long[] scaleHint,
+            String reductionMethod) {
+        return getTensor(arrayId, (SliceHint) null, scaleHint, reductionMethod);
+    }
+
+    /**
+     * Get a RandomAccessibleInterval for a tensor (by array_id) with all options.
+     *
+     * @param arrayId         Globally-unique tensor id ({@code source_id} or
+     *                        {@code source_id/field})
+     * @param sliceHint       Optional slice hint
+     * @param scaleHint       Per-dimension scale factors
+     * @param reductionMethod Requested reduction method
+     * @param <T>             The pixel type
+     * @return RandomAccessibleInterval containing the requested tensor
+     */
+    public <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> getTensor(
+            String arrayId,
+            SliceHint sliceHint,
+            long[] scaleHint,
+            String reductionMethod) {
+        // array_id-first addressing: "source_id/field" routes to source_id with
+        // the full array_id as tensor_id; a bare "source_id" leaves tensorId null
+        // so getTensorContext resolves the source's sole/default tensor.
+        String[] route = resolveArrayId(arrayId);
+        return getTensor(route[0], route[1], sliceHint, scaleHint, reductionMethod);
     }
 
     /**
@@ -488,6 +746,11 @@ public class TensorFlightClient implements AutoCloseable {
         RequestContext context = getTensorContext(sourceId, tensorId, sliceHint, scaleHint, reductionMethod);
         RandomAccessibleInterval<T> rai = createArray(context);
 
+        // tensorId may have arrived null (the bare-source_id array_id path);
+        // pin it to the server-resolved array_id so the serializable wrapper can
+        // re-fetch independently in another process.
+        String resolvedTensorId = context.descriptor.getArrayId();
+
         // Crop to the originally requested region.
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         // descriptor.shape may be larger than the requested extent.
@@ -523,7 +786,7 @@ public class TensorFlightClient implements AutoCloseable {
         }
 
         // Return SerializableTensorImg wrapper for serialization support
-        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, tensorId,
+        return new SerializableTensorImg<>(location, token, cacheBytes, sourceId, resolvedTensorId,
                 sliceHint, scaleHint, reductionMethod, context.descriptor, rai);
     }
 
@@ -961,28 +1224,27 @@ public class TensorFlightClient implements AutoCloseable {
             try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
                 double[] values = new double[0];
                 while (stream.next()) {
-                    List<FieldVector> vectors = stream.getRoot().getFieldVectors();
-                    if (vectors.isEmpty()) {
-                        throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
-                    }
-
+                    // Unified binary chunk schema (biopb/biopb#293): "data" is one
+                    // opaque byte[] per row, "dtype" names how to reinterpret it.
                     FieldVector dataVector = stream.getRoot().getVector("data");
-                    if (dataVector == null) {
-                        throw new IllegalStateException("Chunk payload missing 'data' column");
+                    FieldVector dtypeVector = stream.getRoot().getVector("dtype");
+                    if (dataVector == null || dtypeVector == null) {
+                        throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
                     }
 
                     int rowCount = stream.getRoot().getRowCount();
                     for (int row = 0; row < rowCount; row++) {
                         Object rowObj = dataVector.getObject(row);
-                        if (!(rowObj instanceof List)) {
-                            throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                        if (!(rowObj instanceof byte[])) {
+                            throw new IllegalStateException("Data column value is not binary: "
+                                    + (rowObj == null ? "null" : rowObj.getClass()));
                         }
-                        List<?> dataList = (List<?>) rowObj;
+                        Object dtypeObj = dtypeVector.getObject(row);
+                        double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
+                                dtypeObj == null ? "" : dtypeObj.toString());
                         int offset = values.length;
-                        values = Arrays.copyOf(values, offset + dataList.size());
-                        for (int i = 0; i < dataList.size(); i++) {
-                            values[offset + i] = asDouble(dataList.get(i));
-                        }
+                        values = Arrays.copyOf(values, offset + decoded.length);
+                        System.arraycopy(decoded, 0, values, offset, decoded.length);
                     }
                 }
                 return values;
@@ -1154,8 +1416,9 @@ public class TensorFlightClient implements AutoCloseable {
 
         LOGGER.fine("getTensor: sourceId=" + sourceId + ", tensorId=" + tensorId);
 
-        // Ensure sources are loaded
-        if (sources.isEmpty()) {
+        // Ensure sources are loaded; fall back to a direct server fetch when
+        // listSources() didn't return this source (e.g. a truncated catalog).
+        if (!sources.containsKey(sourceId)) {
             try {
                 listSources();
             } catch (IOException e) {
@@ -1165,10 +1428,42 @@ public class TensorFlightClient implements AutoCloseable {
 
         DataSourceDescriptor sourceDesc = sources.get(sourceId);
         if (sourceDesc == null) {
+            // Not in the (capped) listing -- probe the server directly so sources
+            // beyond the list cap still resolve. Swallow a fetch failure and let
+            // the clean "Source not found" below surface (matches the Python
+            // client). An unresolved source still lists with empty tensors, so its
+            // directive is raised from the tensorId==null branch, not here.
+            try {
+                TensorDescriptor td = fetchTensorDescriptor(sourceId, tensorId);
+                sourceDesc = DataSourceDescriptor.newBuilder()
+                        .setSourceId(sourceId)
+                        .addTensors(td)
+                        .build();
+                sources.put(sourceId, sourceDesc);
+            } catch (RuntimeException ignored) {
+                // fall through to the clean error below
+            }
+        }
+        if (sourceDesc == null) {
             throw new IllegalArgumentException("Source not found: " + sourceId);
         }
 
-        // Find tensor descriptor to get shape for validation
+        // Resolve a null tensorId (the bare-source_id array_id path).
+        if (tensorId == null) {
+            int n = sourceDesc.getTensorsCount();
+            if (n == 1) {
+                tensorId = sourceDesc.getTensors(0).getArrayId();
+            } else if (n == 0) {
+                throw unresolvedSourceError(sourceId);
+            } else {
+                throw new IllegalArgumentException(
+                        "Source '" + sourceId + "' has multiple tensors (" + n
+                                + "); a within-source field must be specified (use \"source_id/field\")");
+            }
+        }
+
+        // Find tensor descriptor to get shape for validation; fall back to a
+        // direct server fetch when the cached source descriptor is stale/partial.
         TensorDescriptor baseDescriptor = null;
         for (TensorDescriptor desc : sourceDesc.getTensorsList()) {
             if (desc.getArrayId().equals(tensorId)) {
@@ -1177,7 +1472,17 @@ public class TensorFlightClient implements AutoCloseable {
             }
         }
         if (baseDescriptor == null) {
-            throw new IllegalArgumentException("Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
+            // Stale/partial cached descriptor -- probe the server. Swallow a fetch
+            // failure and surface the clean "not found" below (matches Python).
+            try {
+                baseDescriptor = fetchTensorDescriptor(sourceId, tensorId);
+            } catch (RuntimeException ignored) {
+                // fall through to the clean error below
+            }
+        }
+        if (baseDescriptor == null) {
+            throw new IllegalArgumentException(
+                    "Tensor '" + tensorId + "' not found in source '" + sourceId + "'");
         }
 
         // Validate scale hint dimensionality if provided
@@ -1386,46 +1691,33 @@ public class TensorFlightClient implements AutoCloseable {
         try (FlightStream stream = client.getStream(new Ticket(tensorTicket.toByteArray()), authOption)) {
             double[] values = new double[0];
             while (stream.next()) {
-                List<FieldVector> vectors = stream.getRoot().getFieldVectors();
-                if (vectors.isEmpty()) {
-                    throw new IllegalStateException("Chunk payload did not contain any Arrow vectors");
-                }
-
-                // Read "data" column - it's a ListArray with 1 row per chunk
+                // Unified binary chunk schema (biopb/biopb#293): "data" is one
+                // opaque byte[] per row, "dtype" names how to reinterpret it.
                 FieldVector dataVector = stream.getRoot().getVector("data");
-                if (dataVector == null) {
-                    throw new IllegalStateException("Chunk payload missing 'data' column");
+                FieldVector dtypeVector = stream.getRoot().getVector("dtype");
+                if (dataVector == null || dtypeVector == null) {
+                    throw new IllegalStateException("Chunk payload missing 'data'/'dtype' column");
                 }
 
-                // Each row is one chunk's data as a list
                 int rowCount = stream.getRoot().getRowCount();
                 for (int row = 0; row < rowCount; row++) {
                     Object rowObj = dataVector.getObject(row);
-                    if (!(rowObj instanceof List)) {
-                        throw new IllegalStateException("Data column value is not a list: " + rowObj.getClass());
+                    if (!(rowObj instanceof byte[])) {
+                        throw new IllegalStateException("Data column value is not binary: "
+                                + (rowObj == null ? "null" : rowObj.getClass()));
                     }
-                    List<?> dataList = (List<?>) rowObj;
+                    Object dtypeObj = dtypeVector.getObject(row);
+                    double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
+                            dtypeObj == null ? "" : dtypeObj.toString());
                     int offset = values.length;
-                    values = Arrays.copyOf(values, offset + dataList.size());
-                    for (int i = 0; i < dataList.size(); i++) {
-                        values[offset + i] = asDouble(dataList.get(i));
-                    }
+                    values = Arrays.copyOf(values, offset + decoded.length);
+                    System.arraycopy(decoded, 0, values, offset, decoded.length);
                 }
             }
             return values;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
         }
-    }
-
-    private static double asDouble(Object value) {
-        if (value == null) {
-            throw new IllegalStateException("Chunk payload contains null values");
-        }
-        if (!(value instanceof Number)) {
-            throw new IllegalStateException("Chunk payload is not numeric: " + value.getClass().getName());
-        }
-        return ((Number) value).doubleValue();
     }
 
     private static <T extends NativeType<T> & RealType<T>> void writeChunk(
@@ -1479,51 +1771,60 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     private static void checkSchemaVersion(FlightInfo info) {
-        java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
-        if (!schemaOpt.isPresent()) {
-            return;
-        }
-        Schema schema = schemaOpt.get();
-        Map<String, String> metadata = schema.getCustomMetadata();
-        if (metadata == null) {
-            return;
-        }
-        String serverVersion = metadata.get("tensor_schema_version");
-        if (serverVersion == null || serverVersion.isEmpty()) {
-            return;
-        }
-        String clientVersion = getClientVersion();
-        if (clientVersion == null) {
-            return;
-        }
-        int[] serverParsed = parseVersion(serverVersion);
-        int[] clientParsed = parseVersion(clientVersion);
-        if (clientParsed[0] < serverParsed[0]
-                || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
-                || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
-                        && clientParsed[2] < serverParsed[2])) {
-            LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
-                    + serverVersion + ". Consider upgrading biopb client for compatibility.");
+        // Advisory only: a malformed version string must never fail a read.
+        try {
+            java.util.Optional<Schema> schemaOpt = info.getSchemaOptional();
+            if (!schemaOpt.isPresent()) {
+                return;
+            }
+            Schema schema = schemaOpt.get();
+            Map<String, String> metadata = schema.getCustomMetadata();
+            if (metadata == null) {
+                return;
+            }
+            String serverVersion = metadata.get("tensor_schema_version");
+            if (serverVersion == null || serverVersion.isEmpty()) {
+                return;
+            }
+            String clientVersion = getClientVersion();
+            if (clientVersion == null) {
+                return;
+            }
+            int[] serverParsed = parseVersion(serverVersion);
+            int[] clientParsed = parseVersion(clientVersion);
+            if (clientParsed[0] < serverParsed[0]
+                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] < serverParsed[1])
+                    || (clientParsed[0] == serverParsed[0] && clientParsed[1] == serverParsed[1]
+                            && clientParsed[2] < serverParsed[2])) {
+                LOGGER.warning("Client version " + clientVersion + " is older than server schema version "
+                        + serverVersion + ". Consider upgrading biopb client for compatibility.");
+            }
+        } catch (RuntimeException e) {
+            LOGGER.fine("Skipping schema version check: " + e);
         }
     }
 
     private static String getClientVersion() {
-        try {
-            return System.getProperty("biopb.version",
-                    java.util.jar.Manifest.class.getProtectionDomain().getCodeSource().getLocation().toString());
-        } catch (Exception e) {
-            // Try package version from manifest
-            Package pkg = TensorFlightClient.class.getPackage();
-            if (pkg != null && pkg.getImplementationVersion() != null) {
-                return pkg.getImplementationVersion();
-            }
-            return null;
+        // Explicit override wins; otherwise fall back to the packaged
+        // implementation version. (Do NOT use it as System.getProperty's
+        // default -- getProperty never throws, so the manifest fallback below
+        // would be dead code and the jar URL would leak in as a "version".)
+        String override = System.getProperty("biopb.version");
+        if (override != null && !override.isEmpty()) {
+            return override;
         }
+        Package pkg = TensorFlightClient.class.getPackage();
+        if (pkg != null && pkg.getImplementationVersion() != null) {
+            return pkg.getImplementationVersion();
+        }
+        return null;
     }
 
     private static int[] parseVersion(String version) {
-        // Handle dev versions like "0.3.1.dev43+g..."
-        String base = version.split(".dev")[0].split("+")[0];
+        // Handle dev versions like "0.3.1.dev43+g...". split() takes a regex, so
+        // "." and "+" must be escaped (a bare "+" is a dangling-metacharacter
+        // error, and "." matches any char).
+        String base = version.split("\\.dev")[0].split("\\+")[0];
         String[] parts = base.split("\\.");
         int major = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
         int minor = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
@@ -1688,6 +1989,109 @@ public class TensorFlightClient implements AutoCloseable {
     static String sourceIdFromArrayId(String arrayId) {
         int slash = arrayId.indexOf('/');
         return slash < 0 ? arrayId : arrayId.substring(0, slash);
+    }
+
+    /**
+     * Split an array_id into a {@code {sourceId, tensorId}} route for getTensor.
+     *
+     * <p>A qualified {@code "source_id/field"} routes to
+     * {@code {source_id, full-array_id}}; a bare {@code "source_id"} returns
+     * {@code {source_id, null}}, leaving the tensorId unset so getTensorContext
+     * resolves the source's sole/default tensor.
+     *
+     * <p>Package-private for unit testing.
+     */
+    static String[] resolveArrayId(String arrayId) {
+        if (arrayId.indexOf('/') >= 0) {
+            return new String[] { sourceIdFromArrayId(arrayId), arrayId };
+        }
+        return new String[] { arrayId, null };
+    }
+
+    /**
+     * Directive error for reading an unresolved (cloud / synced-folder) source.
+     *
+     * <p>Shared by every read entry point so the guidance is uniform: name the
+     * cure ({@link #resolve}) instead of leaking a bare internal "no tensors",
+     * and -- for metadata queries like {@link #getPhysicalScale} -- raise rather
+     * than silently recalling (downloading) the whole file. Resolving is the
+     * heavyweight, consenting act; reads must not trigger it implicitly.
+     */
+    private static IllegalStateException unresolvedSourceError(String sourceId) {
+        return new IllegalStateException(
+                "Source '" + sourceId + "' is unresolved (no tensors listed yet). If "
+                        + "this is a cloud / synced-folder source, call resolve('"
+                        + sourceId + "') first to download and resolve it, then read it.");
+    }
+
+    /**
+     * Fetch one tensor's descriptor directly from the server.
+     *
+     * <p>Backs {@link #getDescriptor} and {@link #getPhysicalScale}. Uses the
+     * per-tensor GetFlightInfo RPC, which works even when the source is beyond
+     * the (truncatable) {@link #listSources} cap. A null/empty tensorId, or a
+     * tensorId equal to the sourceId, anchors on the source's default (first)
+     * tensor via the empty-tensor_id path (the server resolves it, #44); a
+     * within-source field is sent verbatim. This is a CHEAP probe: it does NOT
+     * resolve -- an unresolved (cloud / synced-folder) source is restated as the
+     * {@link #unresolvedSourceError} directive steering the caller to
+     * {@link #resolve}, rather than triggering a download.
+     *
+     * <p>The descriptor is cached in {@code descriptors}, keyed by the
+     * echoed-back array_id.
+     */
+    private TensorDescriptor fetchTensorDescriptor(String sourceId, String tensorId) {
+        TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
+                .setWithMetadata(true);
+        if (tensorId != null && !tensorId.equals(sourceId)) {
+            readBuilder.setTensorId(tensorId);
+        }
+        FlightCmd cmd = FlightCmd.newBuilder()
+                .setSourceId(sourceId)
+                .setTensorRead(readBuilder.build())
+                .build();
+        FlightInfo info;
+        try {
+            info = client.getInfo(FlightDescriptor.command(cmd.toByteArray()), authOption);
+        } catch (FlightRuntimeException exc) {
+            // GetFlightInfo no longer resolves on serve: an unresolved (cloud /
+            // synced-folder) source refuses with an "unresolved" error instead of
+            // silently downloading. Restate it as the shared directive so the
+            // caller is pointed at the explicit, consented resolve().
+            String msg = exc.getMessage();
+            if (msg != null && msg.toLowerCase().contains("unresolved")) {
+                throw unresolvedSourceError(sourceId);
+            }
+            throw exc;
+        }
+        TensorDescriptor tensorDesc = parseDescriptorUnchecked(info.getDescriptor().getCommand());
+        descriptors.put(tensorDesc.getArrayId(), tensorDesc);
+        return tensorDesc;
+    }
+
+    /**
+     * Per-dimension physical pixel size + unit for a tensor, as returned by
+     * {@link #getPhysicalScale}. Both arrays are aligned with the tensor's
+     * {@code dim_labels} (source axis order).
+     */
+    public static final class PhysicalScale {
+        private final double[] scale;
+        private final String[] unit;
+
+        PhysicalScale(double[] scale, String[] unit) {
+            this.scale = scale;
+            this.unit = unit;
+        }
+
+        /** Physical pixel size per dimension, aligned with dim_labels. */
+        public double[] getScale() {
+            return scale;
+        }
+
+        /** Physical unit per dimension, aligned with dim_labels. */
+        public String[] getUnit() {
+            return unit;
+        }
     }
 
     private static class EndpointIndex {

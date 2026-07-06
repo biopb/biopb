@@ -7,11 +7,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from rich.console import Console
-from rich.table import Table
 from typing import List, Optional, Tuple
 
 import typer
+from rich.console import Console
+from rich.table import Table
+
+from ._config_location import DEFAULT_CONFIG_DIR, find_config
+from ._proc import (
+    is_process_running as _is_process_running,
+    process_create_time as _process_create_time,
+)
 
 console = Console()
 
@@ -19,7 +25,6 @@ app = typer.Typer(
     name="biopb",
     help="BioPB: open protobuf/gRPC protocols for biomedical image processing",
 )
-console = Console()
 
 
 def _add_optional_typer(name: str, import_path: str, help: str) -> None:
@@ -32,11 +37,10 @@ def _add_optional_typer(name: str, import_path: str, help: str) -> None:
     surfaces the error only when the subcommand is actually invoked.
     """
     import importlib
-    from typing import List
 
     try:
         module = importlib.import_module(import_path)
-        app.add_typer(getattr(module, "app"), name=name, help=help)
+        app.add_typer(module.app, name=name, help=help)
     except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
         error = exc
 
@@ -71,8 +75,13 @@ app.add_typer(server_app, name="server")
 # Daemon management constants
 PID_FILE = Path.home() / ".local" / "share" / "biopb" / "tensor-server.pid"
 LOG_DIR = Path.home() / ".local" / "share" / "biopb" / "logs"
-DEFAULT_CONFIG = Path.home() / ".config" / "biopb" / "biopb.toml"
 DEFAULT_WEBAPP = Path.home() / ".local" / "share" / "biopb" / "webapp"
+
+# Default config path, preferring JSON over legacy TOML and warning when both
+# exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
+# core module, so resolving this typer Option default does not import the heavy
+# server config module (biopb/biopb#34).
+DEFAULT_CONFIG = find_config()
 
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it
@@ -90,15 +99,69 @@ MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
+
+# The installer records the release-v* deployment version it pulled the wheels
+# from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
+# auto-updater's baseline. This is the *deployment* version and is distinct from
+# any single package's version: one release bundles the mutually-paired
+# biopb / biopb-tensor-server / biopb-mcp triple. Kept in sync with
+# CONFIG_DIR/release.version in install/install.sh.
+_RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
+
+# The three wheels the installer bundles in one release-v* deployment (see
+# install/install.sh). `biopb version` reports each separately so a version skew
+# within the installed set is visible; any may be absent, hence "not installed".
+_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp")
+
+
+def _read_release_version() -> str:
+    """The installed deployment version from the installer's marker file, or
+    'unknown' when it is absent (a dev checkout or non-installer setup that never
+    wrote CONFIG_DIR/release.version) or unreadable. Best-effort like
+    ``_package_version`` -- reading a version must never crash ``biopb version``,
+    so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
+    'unknown' rather than propagating."""
+    try:
+        # Explicit utf-8 (the installer writes a plain ASCII/utf-8 version), so
+        # decoding is deterministic across platforms rather than dependent on the
+        # reader's locale (cp1252 on Windows would decode a corrupt marker to
+        # garbage instead of failing to 'unknown').
+        return _RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+    except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
+        return "unknown"
+
+
+def _package_version(dist_name: str) -> str:
+    """Installed version of distribution `dist_name`, or 'not installed'.
+
+    Reads distribution metadata (like biopb.__init__ does for its own version)
+    instead of importing the package, so `biopb version` never drags in the
+    packages' heavy optional stacks just to print a number, and still reports a
+    version when a package is installed but its runtime imports are broken.
+    """
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    try:
+        return _dist_version(dist_name)
+    except PackageNotFoundError:
+        return "not installed"
+    except Exception:  # noqa: BLE001 - metadata read is best-effort
+        return "unknown"
+
+
 @app.command()
 def version():
-    """Show version information."""
-    try:
-        from biopb import __version__ as biopb_version
-    except Exception:
-        biopb_version = "unknown"
+    """Show the installed release version and each bundled package's version."""
+    rows = [("release", _read_release_version())]
+    rows += [(name, _package_version(name)) for name in _RELEASE_PACKAGES]
 
-    console.print(f"biopb: {biopb_version}")
+    # Left-align the labels so the versions line up in a readable column.
+    width = max(len(name) for name, _ in rows) + 1  # +1 for the trailing ':'
+    for name, ver in rows:
+        console.print(f"{name + ':':<{width}} {ver}")
+
 
 def _ensure_dirs():
     """Ensure required directories exist."""
@@ -106,20 +169,40 @@ def _ensure_dirs():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _read_pid_file(pid_file: Path) -> Optional[int]:
-    """Read a PID from `pid_file`, return None if missing or invalid."""
+def _read_pid_record(pid_file: Path) -> Tuple[Optional[int], Optional[int]]:
+    """Read (pid, identity_token) from `pid_file`.
+
+    The file holds one or two whitespace-separated integers: the PID and, since
+    the PID-identity fix, a process create-time token (see _process_create_time)
+    that distinguishes our daemon from an unrelated process that later inherited
+    a reused PID. Tolerates the legacy bare-PID format (token None -> identity
+    unverifiable, callers fall back to a liveness-only check) so a pre-upgrade
+    file still reads. Returns (None, None) if missing or unparseable.
+    """
     if not pid_file.exists():
-        return None
+        return None, None
     try:
-        return int(pid_file.read_text().strip())
-    except (ValueError, IOError):
-        return None
+        parts = pid_file.read_text().split()
+        pid = int(parts[0])
+    except (OSError, ValueError, IndexError):
+        return None, None
+    token: Optional[int] = None
+    if len(parts) > 1:
+        try:
+            token = int(parts[1])
+        except ValueError:
+            token = None
+    return pid, token
 
 
-def _write_pid_file(pid_file: Path, pid: int):
-    """Write `pid` to `pid_file`, creating its parent directory."""
+def _write_pid_file(pid_file: Path, pid: int, token: Optional[int] = None):
+    """Write `pid` (and, when known, its create-time `token`) to `pid_file`.
+
+    The two-line `pid\\ntoken` form is read back by _read_pid_record; a None token
+    falls back to the legacy bare-PID form (callers then verify by liveness only).
+    """
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(pid))
+    pid_file.write_text(f"{pid}\n{token}" if token is not None else str(pid))
 
 
 def _remove_pid_file(pid_file: Path):
@@ -128,15 +211,10 @@ def _remove_pid_file(pid_file: Path):
         pid_file.unlink()
 
 
-def _read_pid() -> Optional[int]:
-    """Read the tensor-server daemon PID, or None if missing/invalid."""
-    return _read_pid_file(PID_FILE)
-
-
 def _write_pid(pid: int):
-    """Write the tensor-server daemon PID."""
+    """Write the tensor-server daemon PID (+ its create-time identity token)."""
     _ensure_dirs()
-    _write_pid_file(PID_FILE, pid)
+    _write_pid_file(PID_FILE, pid, _process_create_time(pid))
 
 
 def _remove_pid():
@@ -144,42 +222,24 @@ def _remove_pid():
     _remove_pid_file(PID_FILE)
 
 
-def _is_process_running(pid: int) -> bool:
-    """Check if process with PID is running."""
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        # On Windows os.kill(pid, 0) is NOT a liveness probe: signal value 0 is
-        # signal.CTRL_C_EVENT, so os.kill would call GenerateConsoleCtrlEvent and
-        # deliver a real Ctrl+C to the console process group (killing the daemon
-        # we just started, mid-import). Query the process handle instead.
-        import ctypes
-        from ctypes import wintypes
+def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
+    """Whether `pid` is alive AND is the daemon we recorded -- not a reused PID.
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)  # Signal 0 just checks if process exists
-        return True
-    except OSError:
+    Returns False only when the PID can be PROVEN to be someone else (alive but a
+    different creation time), so `stop`/`restart` never force-kill, and `status`
+    never trusts, an unrelated process. When identity can't be established -- a
+    legacy bare-PID file, or a platform/moment with no create-time -- it falls
+    back to liveness, matching the pre-fix behavior rather than risk a false
+    "stopped" (which would strand a running daemon).
+    """
+    if not pid or not _is_process_running(pid):
         return False
+    if token is None:
+        return True
+    current = _process_create_time(pid)
+    if current is None:
+        return True
+    return current == token
 
 
 # Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
@@ -199,41 +259,44 @@ def _win_shutdown_sentinel() -> Path:
     return PID_FILE.parent / "tensor-server.stop"
 
 
-def _win_request_shutdown() -> bool:
-    """Windows: ask the daemon to shut down gracefully. Returns True if the
-    request was delivered (not whether the process has exited yet).
+def _win_request_shutdown(sentinel: Path) -> bool:
+    """Windows: ask a daemon to shut down gracefully by dropping its stop
+    sentinel. Returns True if the request was delivered (not whether the
+    process has exited yet).
 
-    The daemon is a windowless background process in its own process group, so it
-    has no console to receive a CTRL_BREAK, and Win32 named events are brittle
-    across sessions/elevation. We instead drop a sentinel *file* the daemon polls
-    for (see _install_windows_shutdown_listener in biopb_tensor_server.http_server);
-    a file under the user's biopb dir is unambiguous regardless of how either
-    process was launched.
+    The daemons are windowless background processes in their own process groups,
+    so they have no console to receive a CTRL_BREAK, and Win32 named events are
+    brittle across sessions/elevation. We instead drop a sentinel *file* the
+    daemon polls for (tensor server: _install_windows_shutdown_listener in
+    biopb_tensor_server.http_server; MCP daemon: _install_shutdown_sentinel_watcher
+    in biopb_mcp.mcp.__main__); a file under the user's biopb dir is unambiguous
+    regardless of how either process was launched.
     """
     global _LAST_WIN_SHUTDOWN_DIAG
     try:
-        _ensure_dirs()
-        _win_shutdown_sentinel().write_text("stop")
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("stop")
         return True
     except OSError as e:
         _LAST_WIN_SHUTDOWN_DIAG = f"could not write shutdown sentinel: {e}"
         return False
 
 
-def _win_remove_sentinel() -> None:
-    """Remove the shutdown sentinel (best effort), so it doesn't linger after a
+def _win_remove_sentinel(sentinel: Path) -> None:
+    """Remove a shutdown sentinel (best effort), so it doesn't linger after a
     force-kill where the daemon never consumed it."""
     try:
-        _win_shutdown_sentinel().unlink()
+        sentinel.unlink()
     except OSError:
         pass
 
 
-def _request_graceful_stop(pid: int) -> bool:
-    """Ask the daemon to shut down gracefully. Returns whether the request was
-    delivered (not whether the process has exited yet)."""
+def _request_graceful_stop(pid: int, sentinel: Path) -> bool:
+    """Ask a daemon to shut down gracefully. Returns whether the request was
+    delivered (not whether the process has exited yet). `sentinel` is that
+    daemon's Windows stop-sentinel path (unused on POSIX, which signals)."""
     if sys.platform == "win32":
-        return _win_request_shutdown()
+        return _win_request_shutdown(sentinel)
     try:
         os.kill(pid, signal.SIGTERM)
         return True
@@ -241,12 +304,17 @@ def _request_graceful_stop(pid: int) -> bool:
         return False
 
 
-def _graceful_stop(pid: int, timeout: int) -> bool:
+def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
     """Stop a running daemon: request graceful shutdown, wait up to `timeout`
     seconds, then force-kill. Removes the PID file. Returns True if it exited
     gracefully, False if it had to be force-killed. Assumes `pid` is running.
+
+    `token` is the recorded create-time identity (see _process_create_time): the
+    wait loop and the force-kill are gated on it so that if the daemon exits and
+    its PID is reused mid-stop, we neither keep waiting on nor TerminateProcess
+    the innocent new owner.
     """
-    delivered = _request_graceful_stop(pid)
+    delivered = _request_graceful_stop(pid, _win_shutdown_sentinel())
     if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
         console.print(
             f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
@@ -255,23 +323,26 @@ def _graceful_stop(pid: int, timeout: int) -> bool:
 
     graceful = False
     for _ in range(timeout):
-        if not _is_process_running(pid):
+        if not _is_our_daemon(pid, token):
             graceful = True
             break
         time.sleep(1)
 
     if not graceful:
         # Force kill. signal.SIGKILL is POSIX-only; on Windows fall back to
-        # SIGTERM, which os.kill maps to an unconditional TerminateProcess.
-        try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except OSError:
-            pass
-        time.sleep(0.5)
+        # SIGTERM, which os.kill maps to an unconditional TerminateProcess. Re-verify
+        # identity first: a reused PID must never take this unconditional kill.
+        if _is_our_daemon(pid, token):
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+            time.sleep(0.5)
 
     _remove_pid()
     if sys.platform == "win32":
-        _win_remove_sentinel()  # tidy up if the daemon never consumed it
+        # tidy up if the daemon never consumed it
+        _win_remove_sentinel(_win_shutdown_sentinel())
     return graceful
 
 
@@ -389,7 +460,7 @@ def _tail_and_follow(
     # truncated out from under us (a `restart` rotates it mid-follow). Track the
     # inode + size so a replaced or shrunk file restarts from the top.
     try:
-        f = open(log_file, "r", errors="replace")
+        f = open(log_file, errors="replace")
     except OSError:
         raise typer.Exit(0)
     try:
@@ -410,11 +481,9 @@ def _tail_and_follow(
                 st = os.stat(log_file)
             except OSError:
                 st = None
-            if st is not None and (
-                st.st_ino != last_ino or st.st_size < f.tell()
-            ):
+            if st is not None and (st.st_ino != last_ino or st.st_size < f.tell()):
                 f.close()
-                f = open(log_file, "r", errors="replace")
+                f = open(log_file, errors="replace")
                 last_ino = os.fstat(f.fileno()).st_ino
                 carry = ""
                 continue
@@ -426,7 +495,9 @@ def _tail_and_follow(
     raise typer.Exit(0)
 
 
-def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5):
+def _rotate_log(
+    log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
+):
     """Rotate log file if it exceeds max_bytes, keeping up to backup_count backups."""
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
         return
@@ -440,13 +511,21 @@ def _rotate_log(log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count:
 
 def _detach_kwargs() -> dict:
     """Popen kwargs that detach a spawned daemon from the launching console and
-    process group, so it survives this command returning and ignores console
-    control events (Ctrl+C, terminal close).
+    process group, so it survives this command returning and isn't killed by
+    the terminal's Ctrl+C or close (SIGHUP).
 
-    POSIX: start_new_session (setsid) gives it its own session/process group.
-    Windows: CREATE_NO_WINDOW runs it without a console *window* (so none pops);
-    CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's Ctrl+C does
-    not reach (start_new_session is a silent no-op on Windows).
+    POSIX: start_new_session (setsid) gives the daemon its own session/process
+    group. Windows: CREATE_NO_WINDOW runs it without a console *window* (so none
+    pops); CREATE_NEW_PROCESS_GROUP makes it a group leader the terminal's
+    Ctrl+C does not reach (start_new_session is a silent no-op on Windows).
+
+    Note this detaches the daemon *within* the login session; it does NOT make
+    it persistent across logout, and is not meant to. Windows hard-kills session
+    processes on logout, and modern systemd-logind kills the user scope on
+    logout regardless of setsid (unless `loginctl enable-linger` is set). A
+    daemon that must outlive the session — e.g. a shared/remote tensor server —
+    must be made persistent at the container/service/wrapper level (a systemd
+    unit, `enable-linger`, or a long-lived container), not here.
     """
     if sys.platform == "win32":
         return {
@@ -463,7 +542,7 @@ def start(
         DEFAULT_CONFIG,
         "--config",
         "-c",
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -495,16 +574,41 @@ def start(
     """Start TensorFlight server as a background daemon."""
     _ensure_dirs()
 
-    # Check if already running
-    existing_pid = _read_pid()
-    if existing_pid and _is_process_running(existing_pid):
-        console.print(f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]")
+    # Check if already running (identity-checked, so a reused stale PID does not
+    # masquerade as a live server and silently block a real start).
+    existing_pid, existing_token = _read_pid_record(PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
+        console.print(
+            f"[yellow]TensorFlight server already running (PID {existing_pid})[/yellow]"
+        )
         raise typer.Exit(0)
 
     # Clean up stale PID file
     if existing_pid:
-        console.print(f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]")
+        console.print(
+            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+        )
         _remove_pid()
+
+    # Refuse to start on top of an already-bound gRPC port. The stale-but-dead
+    # PID was handled above; this catches the orphan case the PID file cannot
+    # see -- a data server still serving after its manager exited, its PID file
+    # deleted, or a second login session -- which would otherwise double-bind,
+    # fail silently in the log, and leave a dead process behind the PID file we
+    # are about to write.
+    probe_host, probe_port = _resolve_grpc_hostport(config)
+    if _port_listening(probe_host, probe_port):
+        console.print(
+            f"[red]gRPC port {probe_host}:{probe_port} is already in use.[/red]"
+        )
+        console.print(
+            "It is held by a process biopb is not tracking (no matching PID "
+            "file -- an orphaned daemon, or another login session), so "
+            "[bold]biopb server stop[/bold] cannot reach it. Identify and stop "
+            f"the owner (`netstat -ano | findstr {probe_port}` on Windows, "
+            f"`lsof -i :{probe_port}` on macOS/Linux), then retry."
+        )
+        raise typer.Exit(1)
 
     # Token: skip only when both web and gRPC are bound to localhost
     _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
@@ -515,13 +619,17 @@ def start(
     if config.exists():
         try:
             from biopb_tensor_server.config import load_config as _load_server_config
+
             grpc_host = _load_server_config(config).host
         except Exception:
             pass
 
-    local_only = not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    local_only = (
+        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    )
     if not token and not local_only:
         import secrets as _secrets
+
         token = _secrets.token_urlsafe(32)
         console.print(f"[bold green]Generated access token:[/bold green] {token}")
 
@@ -542,16 +650,20 @@ def start(
         "-m",
         "biopb_tensor_server.cli",
         "launch",
-        "--config", str(config),
-        "--web-port", str(web_port),
-        "--web-host", str(web_host),
-        "--log-level", str(log_level),
+        "--config",
+        str(config),
+        "--web-port",
+        str(web_port),
+        "--web-host",
+        str(web_host),
+        "--log-level",
+        str(log_level),
     ]
     if static_dir and static_dir.exists():
         cmd.extend(["--static-dir", str(static_dir)])
 
     # Start subprocess
-    console.print(f"[green]Starting TensorFlight server...[/green]")
+    console.print("[green]Starting TensorFlight server...[/green]")
     console.print(f"  Config: {config}")
 
     # Detach the daemon from the launching console/process group so it survives
@@ -572,18 +684,30 @@ def start(
 
     _write_pid(process.pid)
 
-    # Brief wait to check if it started successfully
-    time.sleep(0.5)
-    if not _is_process_running(process.pid):
-        console.print("[red]Failed to start TensorFlight server[/red]")
+    # Wait for the daemon to actually bind its gRPC port -- a readiness check,
+    # not just "is the child alive". A bind collision or early crash surfaces as
+    # the port never coming up (or the process exiting), which we report here
+    # instead of a false "started".
+    if not _await_listening(process.pid, probe_host, probe_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]TensorFlight server started but is not listening on "
+                f"{probe_host}:{probe_port} after 15s.[/red]"
+            )
+            console.print(
+                "It may still be coming up; check [bold]biopb server status -w 30[/bold], "
+                "or [bold]biopb server stop[/bold] if it is wedged."
+            )
+        else:
+            console.print("[red]Failed to start TensorFlight server[/red]")
+            _remove_pid()
         console.print(f"Check logs: {log_file}")
-        _remove_pid()
         raise typer.Exit(1)
 
     console.print(f"[green]TensorFlight server started (PID {process.pid})[/green]")
     url = f"http://{web_host}:{web_port}/" + (f"?token={token}" if token else "")
     console.print(f"  HTTP: {url}")
-    console.print(f"  gRPC: grpc://127.0.0.1:8815")
+    console.print("  gRPC: grpc://127.0.0.1:8815")
     console.print(f"  Logs: {log_file}")
 
 
@@ -597,25 +721,25 @@ def stop(
     ),
 ):
     """Stop TensorFlight server daemon."""
-    pid = _read_pid()
+    pid, token = _read_pid_record(PID_FILE)
 
     if not pid:
         console.print("[yellow]No TensorFlight server running[/yellow]")
         raise typer.Exit(0)
 
-    if not _is_process_running(pid):
-        console.print(f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]")
+    if not _is_our_daemon(pid, token):
+        console.print(
+            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
+        )
         _remove_pid()
         raise typer.Exit(0)
 
     console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
 
-    if _graceful_stop(pid, timeout):
+    if _graceful_stop(pid, timeout, token):
         console.print("[green]TensorFlight server stopped[/green]")
     else:
-        console.print(
-            f"[yellow]Did not stop within {timeout}s; force killed[/yellow]"
-        )
+        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
     raise typer.Exit(0)
 
 
@@ -625,7 +749,7 @@ def restart(
         DEFAULT_CONFIG,
         "--config",
         "-c",
-        help="Path to TOML config file",
+        help="Path to config file (JSON or TOML)",
     ),
     static_dir: Optional[Path] = typer.Option(
         DEFAULT_WEBAPP,
@@ -661,28 +785,34 @@ def restart(
     ),
 ):
     """Restart TensorFlight server daemon."""
-    # Stop first
-    pid = _read_pid()
-    if pid and _is_process_running(pid):
+    # Stop first. Use id_token (the PID-record identity token) so we don't clobber
+    # the `token` access-token parameter, which must be passed through to start().
+    pid, id_token = _read_pid_record(PID_FILE)
+    if _is_our_daemon(pid, id_token):
         console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        _graceful_stop(pid, timeout)
+        _graceful_stop(pid, timeout, id_token)
         time.sleep(1)
 
     # Start with same options
-    start(config=config, static_dir=static_dir, web_port=web_port, web_host=web_host, log_level=log_level, token=token)
+    start(
+        config=config,
+        static_dir=static_dir,
+        web_port=web_port,
+        web_host=web_host,
+        log_level=log_level,
+        token=token,
+    )
 
 
-def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
-    """Best-effort gRPC endpoint + token for a running server's health query.
-
-    Reads host/port from the TOML config (defaults 127.0.0.1:8815); a server
-    bound to 0.0.0.0/:: is reached over loopback. The token comes from
-    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
-    """
+def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
+    """Loopback-reachable gRPC host/port from the config (default
+    127.0.0.1:8815). A server bound to 0.0.0.0/:: is reached over loopback, so
+    the returned host is always something connect()-able locally."""
     host, port = "127.0.0.1", 8815
     if config and config.exists():
         try:
             from biopb_tensor_server.config import load_config as _load_server_config
+
             cfg = _load_server_config(config)
             host = cfg.host or host
             port = int(cfg.port or port)
@@ -690,6 +820,17 @@ def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
             pass
     if host in ("0.0.0.0", "::", ""):
         host = "127.0.0.1"
+    return host, port
+
+
+def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
+    """Best-effort gRPC endpoint + token for a running server's health query.
+
+    Reads host/port from the config (defaults 127.0.0.1:8815); a server
+    bound to 0.0.0.0/:: is reached over loopback. The token comes from
+    BIOPB_TENSOR_TOKEN if set -- localhost-only daemons run without one.
+    """
+    host, port = _resolve_grpc_hostport(config)
     token = os.environ.get("BIOPB_TENSOR_TOKEN") or None
     return f"grpc://{host}:{port}", token
 
@@ -739,7 +880,7 @@ def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
 @server_app.command("status")
 def status(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
     ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit machine-readable JSON instead of a table"
@@ -752,8 +893,8 @@ def status(
     ),
 ):
     """Check TensorFlight server daemon status and live health."""
-    pid = _read_pid()
-    running = bool(pid and _is_process_running(pid))
+    pid, id_token = _read_pid_record(PID_FILE)
+    running = _is_our_daemon(pid, id_token)
     stale = bool(pid and not running)
 
     # When running, ask the daemon for its Flight health (status + source_count),
@@ -846,9 +987,7 @@ def logs(
         "--level",
         help="Minimum level to show: DEBUG, INFO, WARNING, ERROR, CRITICAL",
     ),
-    path: bool = typer.Option(
-        False, "--path", help="Print the log file path and exit"
-    ),
+    path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
     """Show the TensorFlight server daemon log."""
     log_file = _get_log_file()
@@ -916,7 +1055,7 @@ def _render_cache_stats(stats: dict) -> None:
 @server_app.command("cache-stats")
 def cache_stats(
     config: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="Path to TOML config file"
+        DEFAULT_CONFIG, "--config", "-c", help="Path to config file (JSON or TOML)"
     ),
     token: Optional[str] = typer.Option(
         None, "--token", help="Access token (or set BIOPB_TENSOR_TOKEN)"
@@ -926,8 +1065,8 @@ def cache_stats(
     ),
 ):
     """Show cache hit/miss diagnostics from the running server."""
-    pid = _read_pid()
-    if not pid or not _is_process_running(pid):
+    pid, id_token = _read_pid_record(PID_FILE)
+    if not _is_our_daemon(pid, id_token):
         console.print("[yellow]TensorFlight server is not running.[/yellow]")
         raise typer.Exit(1)
 
@@ -946,6 +1085,110 @@ def cache_stats(
         raise typer.Exit(0)
 
     _render_cache_stats(stats)
+
+
+@server_app.command("migrate-config")
+def migrate_config(
+    config: Path = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Config file (or dir) to migrate; defaults to ~/.config/biopb",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Report what would happen; write nothing"
+    ),
+):
+    """Migrate a legacy ``biopb.toml`` to the canonical ``biopb.json``.
+
+    JSON is the canonical on-disk format (biopb/biopb#34); TOML stays readable
+    through a deprecation window. This converts a legacy TOML config in place --
+    reading the raw table (so advanced/unknown keys survive) and writing the
+    sibling ``biopb.json`` (plus its schema sidecar), then backing the old TOML
+    up to ``biopb.toml.bak``. Settings are preserved verbatim, so a running
+    server need not be restarted.
+    """
+    from ._config_location import (
+        CANONICAL_CONFIG_NAME,
+        DEFAULT_CONFIG_DIR,
+        LEGACY_CONFIG_NAME,
+    )
+
+    # Resolve the config directory. --config may point at a file (use its parent)
+    # or a directory; with nothing given, use the standard location.
+    if config is None:
+        config_dir = DEFAULT_CONFIG_DIR
+    elif config.is_dir():
+        config_dir = config
+    else:
+        config_dir = config.parent
+
+    toml_path = config_dir / LEGACY_CONFIG_NAME
+    json_path = config_dir / CANONICAL_CONFIG_NAME
+
+    if not toml_path.exists():
+        if json_path.exists():
+            console.print(
+                f"[green]Already canonical:[/green] {json_path} is JSON; "
+                "nothing to migrate."
+            )
+        else:
+            console.print(
+                f"[yellow]No legacy config found[/yellow] at {toml_path} "
+                "(and no JSON either); nothing to migrate."
+            )
+        raise typer.Exit(0)
+
+    # A legacy TOML exists. If a JSON also exists it already shadows the TOML
+    # (find_config prefers JSON), so we must NOT overwrite it from the TOML --
+    # just retire the stale TOML to clear the both-files shadow warning.
+    if json_path.exists():
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(
+            f"[yellow]Both configs present:[/yellow] {json_path} is already "
+            f"canonical and in use; the legacy {toml_path.name} is ignored."
+        )
+        if dry_run:
+            console.print(f"  [dim](dry run)[/dim] would back it up to {backup.name}")
+            raise typer.Exit(0)
+        toml_path.replace(backup)
+        console.print(f"  Retired the legacy TOML -> {backup.name}")
+        raise typer.Exit(0)
+
+    # The migration case: TOML only. Read the raw table and write canonical JSON.
+    try:
+        from biopb_tensor_server.config import _read_config_file, save_config
+    except Exception as exc:  # noqa: BLE001 - optional dependency
+        console.print(
+            "[red]Config migration is unavailable:[/red] "
+            f"{exc}\n"
+            "[yellow]Re-run the BioPB installer to fix.[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        data = _read_config_file(toml_path)
+    except Exception as exc:  # noqa: BLE001 - surface a parse error cleanly
+        console.print(f"[red]Could not read {toml_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        backup = toml_path.with_name(toml_path.name + ".bak")
+        console.print(f"[cyan](dry run)[/cyan] would migrate {toml_path}")
+        console.print(f"  write  {json_path} (+ schema sidecar)")
+        console.print(f"  backup {toml_path.name} -> {backup.name}")
+        raise typer.Exit(0)
+
+    try:
+        written = save_config(data, toml_path)
+    except Exception as exc:  # noqa: BLE001 - write must surface, not crash
+        console.print(f"[red]Failed to write {json_path}:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Migrated[/green] {toml_path} -> {written} "
+        f"(old file backed up to {toml_path.name}.bak)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -983,14 +1226,14 @@ def _require_biopb_mcp() -> None:
         raise typer.Exit(1)
 
 
-def _read_mcp_pid() -> Optional[int]:
-    """Read the MCP daemon PID, or None if missing/invalid."""
-    return _read_pid_file(MCP_PID_FILE)
-
-
 def _write_mcp_pid(pid: int):
-    """Write the MCP daemon PID."""
-    _write_pid_file(MCP_PID_FILE, pid)
+    """Write the MCP daemon PID (+ its create-time identity token).
+
+    The biopb-mcp daemon also writes this file itself (biopb_mcp.mcp.__main__),
+    with the same pid+token format; whoever writes last is authoritative and both
+    are read by _read_pid_record.
+    """
+    _write_pid_file(MCP_PID_FILE, pid, _process_create_time(pid))
 
 
 def _remove_mcp_pid():
@@ -1071,36 +1314,77 @@ def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
         return False
 
 
-def _stop_mcp(pid: int, timeout: int) -> bool:
-    """Stop the MCP daemon: SIGTERM (its launcher catches it and exits cleanly),
-    wait up to `timeout` seconds, then force-kill. Removes the PID file. Returns
-    True if it exited gracefully. Assumes `pid` is running.
+def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
+    """Block until (host, port) accepts a connection, returning True. Returns
+    False if the process dies first or `timeout` elapses without the port coming
+    up -- a readiness check (did the daemon actually bind?), strictly stronger
+    than "is the child process still alive". Callers re-check liveness to tell a
+    crash apart from a slow/wedged bind."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _is_process_running(pid):
+            return False
+        if _port_listening(host, port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
-    Unlike the tensor server there is no Windows shutdown-sentinel handshake: the
-    MCP launcher installs SIGTERM/SIGINT handlers, and on Windows os.kill maps
-    SIGTERM to TerminateProcess (an immediate, ungraceful stop) - acceptable for
-    a localhost dev daemon with no in-flight durability to protect.
+
+def _mcp_shutdown_sentinel() -> Path:
+    """Path of the MCP daemon's shutdown sentinel (Windows graceful stop).
+
+    Must match _shutdown_sentinel_path() in biopb_mcp.mcp.__main__ (kept as a
+    literal here, like MCP_PID_FILE itself, to avoid importing biopb_mcp just
+    to stop). A single fixed name, not pid-keyed, for the same shim-PID-mismatch
+    reason as _win_shutdown_sentinel().
     """
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
+    return MCP_PID_FILE.parent / "mcp-server.stop"
+
+
+def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
+    """Stop the MCP daemon: request graceful shutdown, wait up to `timeout`
+    seconds, then force-kill. Removes the PID file. Returns True if it exited
+    gracefully. Assumes `pid` is running.
+
+    POSIX: SIGTERM - the launcher's handler reaps the kernel and exits cleanly.
+    Windows: os.kill maps SIGTERM to TerminateProcess, immediate and uncatchable,
+    so the handler never runs and the napari kernel is left to ipykernel's
+    best-effort in-process backstop - abrupt at best, and inert exactly when the
+    kernel is wedged (issue #323). So, like the tensor server, stop instead drops
+    a sentinel file the daemon watches for; the daemon then reaps the kernel
+    itself before exiting.
+
+    `token` is the recorded create-time identity: the wait loop and force-kill are
+    gated on it so a PID reused mid-stop is neither waited on nor TerminateProcess'd.
+    """
+    if _is_our_daemon(pid, token):
+        delivered = _request_graceful_stop(pid, _mcp_shutdown_sentinel())
+        if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
+            console.print(
+                f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
+                f"force killing.[/yellow]"
+            )
 
     graceful = False
     for _ in range(timeout):
-        if not _is_process_running(pid):
+        if not _is_our_daemon(pid, token):
             graceful = True
             break
         time.sleep(1)
 
     if not graceful:
-        try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except OSError:
-            pass
-        time.sleep(0.5)
+        if _is_our_daemon(pid, token):
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+            time.sleep(0.5)
 
     _remove_mcp_pid()
+    if sys.platform == "win32":
+        # tidy up if the daemon never consumed it
+        _win_remove_sentinel(_mcp_shutdown_sentinel())
     return graceful
 
 
@@ -1117,8 +1401,8 @@ def mcp_start(
     _require_biopb_mcp()
     _ensure_mcp_dirs()
 
-    existing_pid = _read_mcp_pid()
-    if existing_pid and _is_process_running(existing_pid):
+    existing_pid, existing_token = _read_pid_record(MCP_PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
         console.print(
             f"[yellow]biopb-mcp server already running (PID {existing_pid})[/yellow]"
         )
@@ -1130,6 +1414,22 @@ def mcp_start(
         _remove_mcp_pid()
 
     resolved_port = port if port is not None else _mcp_default_port()
+
+    # Refuse to start on top of an already-bound port -- the orphan case the PID
+    # file cannot see (daemon still serving with a missing PID file, or another
+    # session). Otherwise the new process double-binds, fails silently in the
+    # log, and leaves a dead process behind the PID file we are about to write.
+    if _port_listening("127.0.0.1", resolved_port):
+        console.print(f"[red]Port 127.0.0.1:{resolved_port} is already in use.[/red]")
+        console.print(
+            "It is held by a process biopb is not tracking (no matching PID "
+            "file -- an orphaned daemon, or another login session), so "
+            "[bold]biopb mcp stop[/bold] cannot reach it. Identify and stop the "
+            f"owner (`netstat -ano | findstr {resolved_port}` on Windows, "
+            f"`lsof -i :{resolved_port}` on macOS/Linux), then retry."
+        )
+        raise typer.Exit(1)
+
     log_file = _get_mcp_log_file()
     _rotate_log(log_file)
 
@@ -1156,12 +1456,22 @@ def mcp_start(
 
     _write_mcp_pid(process.pid)
 
-    # Brief wait to surface an immediate crash (bad config, port in use).
-    time.sleep(0.5)
-    if not _is_process_running(process.pid):
-        console.print("[red]Failed to start biopb-mcp server[/red]")
+    # Wait for the daemon to actually bind its HTTP port -- a readiness check,
+    # not just "is the child alive". A bind collision or early crash surfaces as
+    # the port never coming up (or the process exiting).
+    if not _await_listening(process.pid, "127.0.0.1", resolved_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]biopb-mcp server started but is not listening on "
+                f"127.0.0.1:{resolved_port} after 15s.[/red]"
+            )
+            console.print(
+                "Check the logs; run [bold]biopb mcp stop[/bold] if it is wedged."
+            )
+        else:
+            console.print("[red]Failed to start biopb-mcp server[/red]")
+            _remove_mcp_pid()
         console.print(f"Check logs: {log_file}")
-        _remove_mcp_pid()
         raise typer.Exit(1)
 
     console.print(f"[green]biopb-mcp server started (PID {process.pid})[/green]")
@@ -1177,12 +1487,12 @@ def mcp_stop(
 ):
     """Stop the biopb-mcp server daemon."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
+    pid, token = _read_pid_record(MCP_PID_FILE)
 
     if not pid:
         console.print("[yellow]No biopb-mcp server running[/yellow]")
         raise typer.Exit(0)
-    if not _is_process_running(pid):
+    if not _is_our_daemon(pid, token):
         console.print(
             f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
         )
@@ -1190,7 +1500,7 @@ def mcp_stop(
         raise typer.Exit(0)
 
     console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-    if _stop_mcp(pid, timeout):
+    if _stop_mcp(pid, timeout, token):
         console.print("[green]biopb-mcp server stopped[/green]")
     else:
         console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
@@ -1208,10 +1518,10 @@ def mcp_restart(
 ):
     """Restart the biopb-mcp server daemon."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
-    if pid and _is_process_running(pid):
+    pid, token = _read_pid_record(MCP_PID_FILE)
+    if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-        _stop_mcp(pid, timeout)
+        _stop_mcp(pid, timeout, token)
         time.sleep(1)
     mcp_start(port=port)
 
@@ -1224,8 +1534,8 @@ def mcp_status(
 ):
     """Check biopb-mcp server daemon status and HTTP liveness."""
     _require_biopb_mcp()
-    pid = _read_mcp_pid()
-    running = bool(pid and _is_process_running(pid))
+    pid, token = _read_pid_record(MCP_PID_FILE)
+    running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
 
     port = _mcp_default_port()

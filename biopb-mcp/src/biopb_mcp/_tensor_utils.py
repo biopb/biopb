@@ -210,9 +210,7 @@ def build_pyramid_levels(
     ndim = len(shape)
 
     # Per-tensor labels win; fall back to the source descriptor's labels.
-    dim_labels = tensor_desc.dim_labels or getattr(
-        source_desc, "dim_labels", None
-    )
+    dim_labels = tensor_desc.dim_labels or getattr(source_desc, "dim_labels", None)
     y_idx, x_idx = get_xy_dim_indices(shape, dim_labels)
     z_idx = get_z_dim_index(shape, dim_labels)
     # A degenerate label set could map z onto an x/y axis; drop it if so.
@@ -229,9 +227,7 @@ def build_pyramid_levels(
     # is the fallback for servers that advertise no pyramid -- it recomputes the
     # scale plan and (deliberately) omits reduction_method, which is fine only
     # when there is nothing pre-warmed to miss.
-    advertised = _advertised_pyramid_levels(
-        client, source_id, tensor_id, tensor_desc
-    )
+    advertised = _advertised_pyramid_levels(client, source_id, tensor_id, tensor_desc)
     if advertised:
         levels = [
             client.get_tensor(
@@ -254,9 +250,7 @@ def build_pyramid_levels(
             if z_idx is not None:
                 scale_hint[z_idx] = sz
 
-            arr = client.get_tensor(
-                source_id, tensor_id, scale_hint=scale_hint
-            )
+            arr = client.get_tensor(source_id, tensor_id, scale_hint=scale_hint)
             levels.append(arr)
 
             # Real downsampled extents from the returned array, not
@@ -264,20 +258,14 @@ def build_pyramid_levels(
             lx = arr.shape[x_idx]
             ly = arr.shape[y_idx]
             lz = arr.shape[z_idx] if z_idx is not None else 1
-            if (
-                lx * ly * lz <= pixel_budget
-                and lx <= threshold
-                and ly <= threshold
-            ):
+            if lx * ly * lz <= pixel_budget and lx <= threshold and ly <= threshold:
                 break
 
             # Downsample each axis individually, leaving any at the floor.
             nsx = sx * downscale_factor if lx > axis_floor else sx
             nsy = sy * downscale_factor if ly > axis_floor else sy
             nsz = (
-                sz * downscale_factor
-                if (z_idx is not None and lz > axis_floor)
-                else sz
+                sz * downscale_factor if (z_idx is not None and lz > axis_floor) else sz
             )
             if (nsx, nsy, nsz) == (sx, sy, sz):
                 break  # nothing left to shrink; avoid an infinite loop
@@ -353,9 +341,7 @@ def build_layer_scale(
             dim_labels = tensor_desc.dim_labels
         if not dim_labels:
             dim_labels = getattr(source_desc, "dim_labels", None)
-        src_shape = (
-            list(tensor_desc.shape) if tensor_desc is not None else scale_vec
-        )
+        src_shape = list(tensor_desc.shape) if tensor_desc is not None else scale_vec
         y_idx, x_idx = get_xy_dim_indices(src_shape, dim_labels)
         z_idx = get_z_dim_index(src_shape, dim_labels)
         if z_idx is not None and z_idx in (x_idx, y_idx):
@@ -363,17 +349,11 @@ def build_layer_scale(
 
         def _at(idx):
             return (
-                scale_vec[idx]
-                if (idx is not None and idx < len(scale_vec))
-                else None
+                scale_vec[idx] if (idx is not None and idx < len(scale_vec)) else None
             )
 
         def _unit_at(idx):
-            return (
-                unit_vec[idx]
-                if (idx is not None and idx < len(unit_vec))
-                else None
-            )
+            return unit_vec[idx] if (idx is not None and idx < len(unit_vec)) else None
 
         psx = _positive_float(_at(x_idx))
         psy = _positive_float(_at(y_idx))
@@ -399,6 +379,24 @@ def build_layer_scale(
     except Exception as exc:
         logger.warning("build_layer_scale failed for %s: %s", source_id, exc)
         return None, None
+
+
+def _to_native_byteorder(levels):
+    """Return *levels* with any non-native-endian array swapped to native order.
+
+    Workaround for a napari thumbnail bug (biopb/biopb#296): a big-endian array
+    (e.g. a FITS ``>i2`` source, preserved end-to-end by the #293 binary wire
+    schema) trips ``np.maximum(data, 0, out=data, dtype=data.dtype)`` in napari's
+    ``convert_to_uint8`` -- numpy rejects a ufunc ``dtype=`` that carries byte
+    order. The ``astype`` is lazy on a dask array, so the source bytes are never
+    materialized here and the values are unchanged (only the in-memory byte order
+    napari sees). Native levels pass through untouched. Remove when napari handles
+    non-native byte order upstream.
+    """
+    return [
+        lv.astype(lv.dtype.newbyteorder("=")) if not lv.dtype.isnative else lv
+        for lv in levels
+    ]
 
 
 def add_tensor_layer(
@@ -440,6 +438,14 @@ def add_tensor_layer(
         source_desc=source_desc,
         config=config,
     )
+    # Present napari native-byte-order levels (biopb/biopb#296). napari's
+    # thumbnail path (convert_to_uint8) does np.maximum(data, 0, out=data,
+    # dtype=data.dtype), and numpy rejects a ufunc dtype= carrying byte order ->
+    # TypeError on a big-endian array (e.g. a FITS '>i2' source, now preserved
+    # end-to-end by the #293 binary wire schema). The swap is lazy and only
+    # affects what napari sees; the wire/source bytes stay faithful. Remove once
+    # napari handles non-native byte order (tracked upstream from #296).
+    levels = _to_native_byteorder(levels)
     # Levels are in canonical [..., Z, Y, X] order, so the scale maps onto the
     # output rank directly -- no reordering to keep in sync.
     out_ndim = levels[0].ndim

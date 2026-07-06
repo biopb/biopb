@@ -36,7 +36,7 @@ import heapq
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -59,9 +59,9 @@ class PrecacheWorker:
 
     def __init__(
         self,
-        server: "TensorFlightServer",
-        config: "PrecacheConfig",
-        pyramid_config: Optional["PyramidConfig"] = None,
+        server: TensorFlightServer,
+        config: PrecacheConfig,
+        pyramid_config: Optional[PyramidConfig] = None,
     ):
         self._server = server
         self._cfg = config
@@ -73,7 +73,7 @@ class PrecacheWorker:
 
             pyramid_config = PyramidConfig()
         self._pyramid_cfg = pyramid_config
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._queue: queue.Queue[str] = queue.Queue()
         self._seen: Set[str] = set()
         self._seen_lock = threading.Lock()
         # Backlog tier: a newest-mtime-first heap of (-mtime, seq, source_id).
@@ -83,6 +83,13 @@ class PrecacheWorker:
         self._backlog_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Residency gate: re-checks at warm time whether a cloud-root source's
+        # files are still resident, so we never recall content OneDrive (or
+        # another Files-On-Demand provider) has re-dehydrated since registration
+        # (#174). Wired from SourceManager.should_warm in cli.py; left None when
+        # there is no manager (e.g. static-only deployments), in which case the
+        # gate is a no-op and warming proceeds as before.
+        self.should_warm: Optional[Callable[[str], bool]] = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -133,9 +140,7 @@ class PrecacheWorker:
                 if source_id in self._backlog_ids or source_id in seen_snapshot:
                     continue
                 self._backlog_seq += 1
-                heapq.heappush(
-                    self._backlog, (-mtime, self._backlog_seq, source_id)
-                )
+                heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
                 self._backlog_ids.add(source_id)
                 added += 1
         logger.info(
@@ -274,21 +279,39 @@ class PrecacheWorker:
         if not self._file_backend_active():
             logger.debug("precache: file backend not active, skipping %s", source_id)
             return False
+        # Residency gate (#174): under a cloud root, skip a source whose member
+        # files have been re-dehydrated since registration. Reading them would
+        # recall content the cloud=true policy is meant to keep offline. Coarse
+        # (whole-source) by design, matching the registration-time check; a
+        # partially-evicted cloud source is skipped rather than partly recalled.
+        if self.should_warm is not None and not self.should_warm(source_id):
+            logger.debug(
+                "precache: source %s not resident (cloud), skipping warm", source_id
+            )
+            return False
         cache_manager = CacheManager.get_instance()
 
         source_adapter = self._server._get_source_adapter(source_id)
         if source_adapter is None:
             return False
-        # Skip formats that ship their own multi-resolution pyramid (e.g.
-        # well-formed OME-Zarr): they already serve overviews cheaply from
-        # native coarse levels, so precache gains little. The client's overview
-        # request would also use a synthetic scale that doesn't reuse these
-        # anyway, so warming them is wasted I/O.
-        if source_adapter.has_native_pyramid():
+
+        # Skip non-local (remote) sources entirely (biopb/biopb#299). Warming a
+        # remote-tensor proxy source would speculatively pull every chunk across
+        # the network from the upstream at startup -- costly I/O of questionable
+        # value (the real read path caches on demand, and the upstream caches
+        # too), and it inflates the local file cache (feeding the slow-restart
+        # recovery, #300). It is also unsound today: the proxy does not implement
+        # has_native_pyramid(), so a pyramidal upstream would be warmed at a
+        # computed coarse level the upstream already serves natively -- caching
+        # chunks the native-pyramid skip below is meant to avoid.
+        from biopb_tensor_server.discovery import is_remote_url
+
+        if is_remote_url(getattr(source_adapter, "_source_url", "") or ""):
             logger.debug(
-                "precache: skipping well-formed multiscale source %s", source_id
+                "precache: skipping non-local source %s (warmed on demand)", source_id
             )
             return False
+
         try:
             descriptors = source_adapter.list_tensor_descriptors()
         except Exception:
@@ -300,9 +323,7 @@ class PrecacheWorker:
         for td in descriptors:
             if self._stop.is_set():
                 return False
-            if self._process_tensor(
-                source_adapter, td, cache_manager, backlog=backlog
-            ):
+            if self._process_tensor(source_adapter, td, cache_manager, backlog=backlog):
                 return True  # preempted mid-source
         return False
 
@@ -320,12 +341,25 @@ class PrecacheWorker:
             return False
         if tensor_adapter is None:
             return False
+        # Skip a tensor that ships its own multi-resolution pyramid (e.g. a
+        # well-formed OME-Zarr image, or a pyramidal qptiff/ndtiff series): it
+        # already serves overviews cheaply from its native coarse levels, so
+        # warming is wasted I/O. Per-tensor because pyramid support can vary
+        # between tensors of one source (a pyramidal main series alongside flat
+        # label/macro series).
+        try:
+            if tensor_adapter.has_native_pyramid():
+                logger.debug(
+                    "precache: skipping tensor %s (serves overviews natively)",
+                    tensor_id,
+                )
+                return False
+        except Exception:
+            logger.exception("precache: has_native_pyramid failed for %s", tensor_id)
         try:
             base_desc = tensor_adapter.get_tensor_descriptor()
         except Exception:
-            logger.exception(
-                "precache: get_tensor_descriptor failed for %s", tensor_id
-            )
+            logger.exception("precache: get_tensor_descriptor failed for %s", tensor_id)
             return False
 
         # Warm the coarsest level of the same plan the server advertises (a

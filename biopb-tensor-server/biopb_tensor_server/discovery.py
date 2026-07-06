@@ -18,10 +18,10 @@ Key components:
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import logging
 import os
-import threading
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -136,8 +136,8 @@ def _is_skippable_system_dir(name: str) -> bool:
     low = name.lower()
     if low in _SKIP_DIR_NAMES:
         return True
-    return low == "onedrive" or low.startswith("onedrive -") or low.startswith(
-        "onedrive-"
+    return (
+        low == "onedrive" or low.startswith("onedrive -") or low.startswith("onedrive-")
     )
 
 
@@ -182,7 +182,10 @@ def _is_offline_placeholder(
 
 
 def should_skip_walk_entry(
-    path: Path, is_dir: bool, stat_result: Optional[os.stat_result] = None
+    path: Path,
+    is_dir: bool,
+    stat_result: Optional[os.stat_result] = None,
+    admit_nonresident: bool = False,
 ) -> bool:
     """Shared per-entry skip policy for discovery tree walks.
 
@@ -211,12 +214,20 @@ def should_skip_walk_entry(
     it is forwarded to the offline-placeholder check so a walk that has already
     stat'd the entry (the state walk) does not stat it a second time
     (biopb/biopb#56).
+
+    ``admit_nonresident`` flips the offline-placeholder rule for a ``cloud``-opted
+    root (cloud-storage phase 2): instead of skipping a dehydrated file, the walk
+    admits it so ``claim()`` can register it as an *unresolved* source. The
+    hidden-entry and system/cloud-directory prunes still apply -- only the
+    file-residency skip is lifted, and only under an explicitly configured root.
     """
     name = path.name
     if name.startswith("."):
         return True
     if is_dir:
         return _is_skippable_system_dir(name)
+    if admit_nonresident:
+        return False
     return _is_offline_placeholder(path, stat_result)
 
 
@@ -230,9 +241,11 @@ class ClaimContext:
     def __init__(
         self,
         path: Path | str,
-        store: Optional["RemoteStore"] = None,
+        store: Optional[RemoteStore] = None,
         is_dir: Optional[bool] = None,
         signature: Optional[Tuple] = None,
+        cloud_root: bool = False,
+        child_listing: Optional[List[str]] = None,
     ):
         self._path = Path(path) if store is None else None
         self._store = store
@@ -254,6 +267,31 @@ class ClaimContext:
         # headers from memory instead of disk (biopb/biopb#56, item 6). Local,
         # top-level contexts only; ``join()`` sub-contexts carry no signature.
         self._signature = signature if store is None else None
+        # True when this entry lives under a ``cloud = true`` root. Lets an
+        # adapter's ``claim()`` (and the resolve-time re-claim) suppress
+        # content-membership multi-file grouping under cloud regardless of
+        # per-file residency -- residency can't gate the resolve path, where the
+        # file is already resident. Remote contexts are never "cloud roots" in
+        # this sense (they have their own fetch model), so force False there.
+        self._cloud_root = cloud_root if store is None else False
+        # The directory's child paths as the state walk recorded them
+        # (snapshot-driven discovery only). When present, ``glob()`` serves
+        # single-level name-pattern matches from this list instead of re-reading
+        # the directory off disk. A directory-claiming adapter globs its candidate
+        # directory up to 6× per rescan cycle (TIFF sequence: ``*.tif``, ``*.tiff``
+        # + 4 metadata patterns), and on cloud storage each glob is a directory
+        # enumeration round-trip (~0.5-1 s/dir on OneDrive Files-On-Demand) — yet
+        # the state walk already enumerated every directory's children once, so the
+        # claim phase can reuse that listing instead of re-hitting the filesystem
+        # (biopb/biopb#65). ``None`` on live-walk and ``join()`` sub-contexts, which
+        # fall back to a real ``glob`` (same discipline as the ``is_dir`` /
+        # ``signature`` caches). Local contexts only.
+        self._child_listing = child_listing if store is None else None
+
+    @property
+    def cloud_root(self) -> bool:
+        """Whether this path is under a configured ``cloud = true`` root."""
+        return self._cloud_root
 
     def is_dir(self) -> bool:
         """Check if path is directory."""
@@ -300,7 +338,7 @@ class ClaimContext:
         target = self._path / subpath if subpath else self._path
         return target.read_text()
 
-    def join(self, subpath: str) -> "ClaimContext":
+    def join(self, subpath: str) -> ClaimContext:
         """Create context for subpath."""
         if self._store:
             new_path = (
@@ -311,11 +349,27 @@ class ClaimContext:
             return ClaimContext(new_path, self._store)
         return ClaimContext(self._path / subpath)
 
-    def glob(self, pattern: str) -> List["ClaimContext"]:
-        """Find files matching pattern."""
+    def glob(self, pattern: str) -> List[ClaimContext]:
+        """Find files matching ``pattern`` in this directory (maxdepth 1).
+
+        When a cached child listing is available (snapshot-driven discovery) and
+        the pattern is a single directory level — which every directory-claiming
+        adapter's claim glob is (``*.tif``, ``metadata.txt``, ``*.companion.ome``,
+        …) — the matches are served by ``fnmatch``ing the cached basenames, with no
+        filesystem read (biopb/biopb#65). ``fnmatch`` mirrors ``Path.glob``'s
+        per-platform case sensitivity (case-sensitive on POSIX, case-insensitive on
+        Windows) via ``os.path.normcase``. Multi-level patterns (containing ``/``
+        or ``**``) and contexts without a cached listing fall back to a real glob.
+        """
         if self._store:
             matches = self._store.find(pattern, maxdepth=1)
             return [ClaimContext(m, self._store) for m in matches]
+        if self._child_listing is not None and "/" not in pattern:
+            return [
+                ClaimContext(Path(child))
+                for child in self._child_listing
+                if fnmatch.fnmatch(os.path.basename(child), pattern)
+            ]
         return [ClaimContext(p) for p in self._path.glob(pattern)]
 
     @property
@@ -333,7 +387,7 @@ class ClaimContext:
         return self._path.name
 
     @property
-    def parent(self) -> "ClaimContext":
+    def parent(self) -> ClaimContext:
         """Get parent directory context."""
         if self._store:
             parent_path = (
@@ -348,7 +402,7 @@ class ClaimContext:
         return self._store is not None
 
     @property
-    def store(self) -> Optional["RemoteStore"]:
+    def store(self) -> Optional[RemoteStore]:
         """Get underlying RemoteStore if remote."""
         return self._store
 
@@ -362,12 +416,39 @@ class ClaimContext:
         """
         return self._signature
 
+    def is_resident(self) -> bool:
+        """Recall-free: is this path's content local and cheap to read right now?
+
+        This is the per-read residency gate an adapter's ``claim()`` consults
+        before opening a sidecar or container: when it returns False the read
+        would trigger a whole-file cloud recall (or block offline), so the adapter
+        defers and emits an *unresolved* claim instead (cloud-storage phase 2).
+
+        Remote contexts read via cheap range requests, so they are always treated
+        as resident -- remote claim behavior is unchanged. A local path is
+        resident unless it is an offline cloud placeholder, detected by
+        ``_is_offline_placeholder`` (a stat-only check that never opens content).
+        """
+        if self._store is not None:
+            return True
+        # The placeholder signal (st_blocks == 0) is a per-file concept; a
+        # directory legitimately reports zero blocks on some filesystems (macOS
+        # APFS), so treat a directory as resident -- mirrors SourceAdapter
+        # .is_resident and should_skip_walk_entry (which gates on `not is_dir`).
+        try:
+            if self._path.is_dir():
+                return True
+        except OSError:
+            return False
+        return not _is_offline_placeholder(self._path)
+
 
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
     path_filter: Optional[Callable[[Path], bool]] = None,
     should_descend: Optional[Callable[[Path], bool]] = None,
+    admit_nonresident: bool = False,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
@@ -399,7 +480,9 @@ def walk_with_identity_tracking(
             # (AppData, OneDrive, Windows, …), and offline/placeholder files
             # whose content recalls on read. Pruned by name/metadata so the whole
             # subtree is skipped without a content open that could hang.
-            if should_skip_walk_entry(path, is_dir):
+            if should_skip_walk_entry(
+                path, is_dir, admit_nonresident=admit_nonresident
+            ):
                 logger.debug("walk: skipping %s", path)
                 continue
 
@@ -432,6 +515,7 @@ def walk_with_identity_tracking(
                     visited_identities,
                     path_filter=path_filter,
                     should_descend=should_descend,
+                    admit_nonresident=admit_nonresident,
                 )
     except OSError:
         # Permission issue reading directory
@@ -453,6 +537,11 @@ class SourceClaim:
         dim_labels: Optional dimension labels
         extra_config: Adapter-specific configuration (e.g., HDF5 dataset path)
         is_remote: Flag indicating if this is a remote source
+        unresolved: True when the adapter recognized this source by recall-free
+            signals only (a non-resident cloud/synced-folder target) and deferred
+            its content read. Such a claim carries no shape/dtype yet; the server
+            registers it behind an UnresolvedSourceAdapter and resolves it lazily
+            on first access (cloud-storage phase 2).
     """
 
     __slots__ = (
@@ -463,6 +552,7 @@ class SourceClaim:
         "extra_config",
         "is_remote",
         "member_paths",
+        "unresolved",
     )
 
     def __init__(
@@ -474,6 +564,7 @@ class SourceClaim:
         extra_config: Optional[dict] = None,
         is_remote: bool = False,
         member_paths: Optional[Set[str] | List[str]] = None,
+        unresolved: bool = False,
     ):
         self.source_type = source_type
         self.primary_path = (
@@ -483,6 +574,7 @@ class SourceClaim:
         self.dim_labels = dim_labels
         self.extra_config = extra_config if extra_config is not None else {}
         self.is_remote = is_remote
+        self.unresolved = unresolved
         normalized_member_paths = {self.primary_path}
         if member_paths is not None:
             normalized_member_paths.update(str(path) for path in member_paths)
@@ -493,7 +585,8 @@ class SourceClaim:
             f"SourceClaim(source_type={self.source_type!r}, "
             f"primary_path={self.primary_path!r}, "
             f"source_id={self.source_id!r}, "
-            f"is_remote={self.is_remote!r})"
+            f"is_remote={self.is_remote!r}, "
+            f"unresolved={self.unresolved!r})"
         )
 
 
@@ -536,17 +629,17 @@ class AdapterRegistry:
     def get_claims_for_path(
         self, ctx: ClaimContext, state: DiscoveryState
     ) -> List[SourceClaim]:
-        """Ask all adapters to claim this path.
+        """Ask adapters to claim this path, stopping at the first winner.
 
-        Each adapter's claim(ctx, state) method is called in registration order.
-        First adapter to return a non-None claim wins.
+        Adapters' claim(ctx, state) methods are called in registration order;
+        the first to return a non-None claim wins and the rest are not probed.
 
         Args:
             ctx: ClaimContext for unified filesystem access
             state: DiscoveryState with try_claim_path() callback
 
         Returns:
-            List of SourceClaim objects (may be empty if no adapter claims)
+            List with the single winning SourceClaim, or empty if none claims.
         """
         claims = []
         for adapter_cls in self._adapters:
@@ -562,6 +655,12 @@ class AdapterRegistry:
                         f"Adapter {adapter_cls.__name__} claimed {ctx.path_str} as {claim.source_type}"
                     )
                     self._type_to_adapter[claim.source_type] = adapter_cls
+                    # First claim wins: callers take claims[0] and the registry
+                    # order is load-bearing priority, so stop probing the
+                    # remaining adapters. On cloud roots their claim() probes are
+                    # network round-trips, so this avoids up to 17x the wasted
+                    # stat/glob per non-matching entry (biopb/biopb#190).
+                    break
             except Exception as e:
                 logger.debug(
                     f"Adapter {adapter_cls.__name__} claim() raised exception: {e}"
@@ -737,6 +836,25 @@ class DiscoveryState:
         return set(self.source_to_paths.get(source_id, set()))
 
 
+def resolve_local_path(path: str) -> str:
+    """Canonical absolute form of a LOCAL filesystem path.
+
+    The single canonicalizer for local-path identity across the server: the
+    ``source_id`` hash (``generate_source_id``) and -- in ``source_manager`` --
+    the drag-drop containment guard and the static-config seed all reduce a path
+    to this form, so the same physical location compares equal however it was
+    spelled (symlink / junction / mapped drive / 8.3 / case / trailing sep). The
+    monitored walk reaches the same form via ``Path.resolve`` on its root.
+    ``Path.resolve`` resolves reparse points on Python 3.8+, so it folds those on
+    Windows too.
+
+    Local paths only: a remote URL must NOT be passed here -- ``Path.resolve``
+    mangles the scheme (collapsing ``//`` and prepending the cwd); callers gate
+    on ``is_remote_url`` first.
+    """
+    return str(Path(path).resolve())
+
+
 def generate_source_id(url: str, source_type: str) -> str:
     """Generate deterministic unique source_id from URL.
 
@@ -760,8 +878,9 @@ def generate_source_id(url: str, source_type: str) -> str:
         # Hash the raw URL (trailing slashes stripped so "x.zarr" == "x.zarr/").
         key = url.rstrip("/")
     else:
-        # For local paths, resolve to absolute path for consistency.
-        key = str(Path(url).resolve())
+        # For local paths, resolve to the canonical absolute path so the same
+        # location hashes identically however it was spelled (resolve_local_path).
+        key = resolve_local_path(url)
 
     hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
     return f"{source_type}_{hash_hex}"
@@ -773,6 +892,8 @@ def discover_sources(
     state: Optional[DiscoveryState] = None,
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[Path], bool]] = None,
+    admit_nonresident: bool = False,
+    cloud_root: bool = False,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -784,6 +905,13 @@ def discover_sources(
         registry: Adapter registry for claims
         state: Existing DiscoveryState to update (creates new if None)
         dim_labels: Optional dimension labels to apply to all claims
+        admit_nonresident: Under a cloud root, admit dehydrated placeholders
+            instead of skipping them.
+        cloud_root: Under a cloud root, set ``ClaimContext.cloud_root`` so the
+            content-membership adapters (multi-file OME-TIFF / DICOM series) fall
+            back to single-file sources instead of grouping -- the same ban the
+            monitored rescan applies. Keeps the static one-shot scan of a
+            ``monitor=false`` cloud directory consistent with the monitored path.
 
     Returns:
         DiscoveryState with all discovered sources
@@ -806,7 +934,7 @@ def discover_sources(
         return state
 
     # Check if root itself is a data source (e.g., a .zarr directory)
-    ctx = ClaimContext(root)
+    ctx = ClaimContext(root, cloud_root=cloud_root)
     claims = registry.get_claims_for_path(ctx, state)
     if claims:
         claim = claims[0]
@@ -827,13 +955,14 @@ def discover_sources(
         # probing interior files (e.g. zarr chunk stores) is pure waste
         # (biopb/biopb#55).
         should_descend=lambda p: not state.is_path_claimed(str(p)),
+        admit_nonresident=admit_nonresident,
     ):
         paths_scanned += 1
         path_str = str(path)
         if state.is_path_claimed(path_str):
             continue
 
-        ctx = ClaimContext(path)
+        ctx = ClaimContext(path, cloud_root=cloud_root)
         claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]
@@ -854,6 +983,7 @@ def discover_sources_from_entries(
     dim_labels: Optional[List[str]] = None,
     path_filter: Optional[Callable[[str], bool]] = None,
     skipped_dirs: Optional[Set[str]] = None,
+    cloud_by_path: Optional[Dict[str, bool]] = None,
 ) -> DiscoveryState:
     """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
 
@@ -891,6 +1021,17 @@ def discover_sources_from_entries(
     if state is None:
         state = DiscoveryState()
 
+    # Group the snapshot into each directory's recorded children once (O(n) by
+    # parent path) so a directory's ClaimContext can serve its claim globs from
+    # memory instead of re-reading the directory — the largest remaining per-cycle
+    # cost in the claim phase, and on cloud storage a per-glob round-trip
+    # (biopb/biopb#65). The state walk emits entries parent-first, so a directory
+    # is processed before its children stream in; build the full map up front.
+    entries = list(entries)
+    children_by_dir: Dict[str, List[str]] = {}
+    for path_str, _is_dir, _signature in entries:
+        children_by_dir.setdefault(os.path.dirname(path_str), []).append(path_str)
+
     skipped = skipped_dirs or set()
     prune_stack: List[str] = []
 
@@ -922,7 +1063,17 @@ def discover_sources_from_entries(
                 prune_stack.append(path_str)
             continue
 
-        ctx = ClaimContext(Path(path_str), is_dir=is_dir, signature=signature)
+        ctx = ClaimContext(
+            Path(path_str),
+            is_dir=is_dir,
+            signature=signature,
+            cloud_root=cloud_by_path.get(path_str, False)
+            if cloud_by_path is not None
+            else False,
+            # Only directories glob (every claim glob is maxdepth-1 over a dir's
+            # children); files carry no listing.
+            child_listing=children_by_dir.get(path_str) if is_dir else None,
+        )
         claims = registry.get_claims_for_path(ctx, state)
         if claims:
             claim = claims[0]
@@ -932,9 +1083,7 @@ def discover_sources_from_entries(
             if is_dir:
                 prune_stack.append(path_str)
 
-    logger.debug(
-        "discover_sources_from_entries: found %d sources", len(state.claims)
-    )
+    logger.debug("discover_sources_from_entries: found %d sources", len(state.claims))
     return state
 
 
@@ -1145,5 +1294,8 @@ def is_remote_url(url: str) -> bool:
         "ftp://",
         "az://",
         "azure://",
+        "grpc://",
+        "grpc+tls://",
+        "grpcs://",
     )
     return url.lower().startswith(remote_prefixes)

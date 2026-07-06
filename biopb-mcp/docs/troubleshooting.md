@@ -24,10 +24,11 @@ When auto-start fails, the browser shows the underlying cause inline; the full
 server output is written to `~/.local/share/biopb/logs/`. Common causes:
 
 - **Port already in use** — most likely on a shared machine or HPC node where
-  another user already holds the default port (gRPC `8815`). Either start your
-  server on a different base port with `BIOPB_BASE_PORT` (e.g.
-  `BIOPB_BASE_PORT=9000`), or set `BIOPB_TENSOR_URL` to the existing server
-  instead of starting a new one.
+  another user already holds the default port (gRPC `8815`). Either point at the
+  existing server (`BIOPB_TENSOR_URL`), or give your own a free port: the
+  containerized/HPC server honors `BIOPB_BASE_PORT` (e.g. `BIOPB_BASE_PORT=9000`;
+  HTTP=`BASE+4`, gRPC=`BASE+5`), while a local `biopb server start` takes its
+  gRPC `port` from the TOML config and its HTTP port from `--web-port`.
 - **Server started but not reachable in time** — startup exceeded the timeout;
   check the server log for the real error and try connecting again once it is up.
 

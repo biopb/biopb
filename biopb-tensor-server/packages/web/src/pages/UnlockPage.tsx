@@ -1,8 +1,9 @@
 import { useState, FormEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 export function UnlockPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [value, setValue] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -15,12 +16,22 @@ export function UnlockPage() {
       return;
     }
     sessionStorage.setItem("biopb_token", token);
-    navigate("/");
+    // Return to the page that sent us here (e.g. /admin); only allow same-site
+    // app paths to avoid an open-redirect via the query string.
+    const next = searchParams.get("next");
+    navigate(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
   }
 
   return (
     <main className="unlock-page">
       <div className="unlock-card">
+        <img
+          className="unlock-logo"
+          src="/biopb-logo.png"
+          alt="BioPB"
+          width={48}
+          height={48}
+        />
         <h1>BioPB Tensor Viewer</h1>
         <p className="subtitle">
           Enter the access token shown in the launcher terminal to continue.
@@ -79,7 +90,8 @@ export function UnlockPage() {
           width: 100%;
           max-width: 440px;
         }
-        h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
+        .unlock-logo { display: block; margin: 0 auto 0.75rem; border-radius: 8px; }
+        h1 { margin: 0 0 0.5rem; font-size: 1.5rem; text-align: center; }
         .subtitle {
           font-size: 0.875rem;
           color: #94a3b8;

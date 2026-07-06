@@ -25,9 +25,7 @@ def _isolate_config(monkeypatch, tmp_path):
     own ``Path.home`` / ``get_config_dir`` compose with this -- their setattr
     runs later and wins, sharing the same ``tmp_path``.
     """
-    monkeypatch.setattr(
-        pathlib.Path, "home", classmethod(lambda cls: tmp_path)
-    )
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     CONFIG.reload()
     yield
     CONFIG.reload()

@@ -1,32 +1,54 @@
 <#
 .SYNOPSIS
-    biopb stack installer (Windows / PowerShell)
+    biopb stack installer (Windows / PowerShell) -- interactive console front-end
 
 .DESCRIPTION
-    Windows port of install/install.sh.
     Usage: irm https://biopb.org/install.ps1 | iex
 
     Idempotent: rerun to upgrade to latest version.
 
+    This is the INTERACTIVE CONSOLE front-end. It collects the user's choices
+    (data directory, remote-plugin consent) with friendly prompts, then hands them
+    to the headless install engine (biopb-engine.ps1), which does the real work.
+    Component selection is no longer prompted -- the web interface installs by
+    default and Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS.
+    The Inno Setup GUI wizard is a second front-end over the same engine -- one
+    install brain, two skins, so the console and GUI can never drift.
+
+    The engine is loaded from a sibling biopb-engine.ps1 when present (local
+    checkout / unpacked installer), otherwise downloaded from biopb.org (the
+    `irm | iex` path, where there is no script file on disk).
+
     This installs prebuilt wheels from the latest biopb release-v* GitHub
-    deployment. By default it tracks the latest STABLE release (clean X.Y.Z).
-    Set $env:BIOPB_INSTALL_RC = "1" to instead track the latest release
-    candidate (a/b/rc prerelease, typically cut off the dev branch) — the fast
-    path for testing an upcoming release before it lands on main.
+    deployment. By default it tracks the latest STABLE release; set
+    $env:BIOPB_INSTALL_RC = "1" to track the latest release candidate.
+
+    Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
+    prompt (keeps an existing config; leaves remote plugins off unless
+    $env:BIOPB_REMOTE_PLUGINS = "1"). It is an upgrade feature -- a FRESH unattended
+    install must also set $env:BIOPB_DATA_DIR or it errors out.
 
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
-                  No git, buf, or compiler needed — release wheels ship prebuilt.
-
-    Paths follow the same home-relative XDG layout the Python packages read
-    (config under ~/.config, data under ~/.local/share); on Windows these
-    resolve under %USERPROFILE%, matching Python's Path.home().
 #>
 
-# Stop on any error; mirror `set -euo pipefail`.
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
+$ProgressPreference = 'SilentlyContinue'
 
-# ----- Output helpers (color via Write-Host, robust across terminals) ---------
+# Where to fetch the engine from when running via `irm | iex` (no script on disk).
+# Served from biopb.org alongside install.ps1 (see docs/release-model.md).
+$EngineUrl = "https://biopb.org/biopb-engine.ps1"
+
+$ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
+
+# Non-interactive / unmanned mode: $env:BIOPB_NONINTERACTIVE = "1" suppresses every
+# prompt so the installer can upgrade unattended (Task Scheduler, CI, image bakes).
+# The upgrade path is the common case: an existing config is kept untouched. A fresh
+# unattended install uses $env:BIOPB_DATA_DIR (else a default) and leaves the remote
+# algorithm plugins OFF unless $env:BIOPB_REMOTE_PLUGINS = "1" -- consent can't be
+# asked unattended, so the off-site IP-logging servers are never silently enabled.
+$script:NonInteractive = [bool]$env:BIOPB_NONINTERACTIVE -and ($env:BIOPB_NONINTERACTIVE -ne '0')
+
+# ----- Output helpers used by the front-end's own prompts/summary -------------
 function Write-Step { param([string]$Msg) Write-Host ""; Write-Host $Msg -ForegroundColor White }
 function Write-Ok   { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Green }
 function Write-Inf  { param([string]$Msg) Write-Host "  $Msg" }
@@ -35,351 +57,42 @@ function Write-Err2 { param([string]$Msg) Write-Host "ERROR: $Msg" -ForegroundCo
 function Write-Note { param([string]$Msg) Write-Host "  NOTE: $Msg" -ForegroundColor DarkGray }
 function Write-Cmd  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Cyan }
 
-# Write UTF-8 without a BOM. Windows PowerShell 5.1's `Set-Content -Encoding utf8`
-# emits a BOM, which breaks Python tomllib and 5.1's own ConvertFrom-Json. Paths
-# passed here are absolute, so .NET's cwd does not matter.
-function Set-FileUtf8NoBom {
-    param([string]$Path, [string]$Content)
-    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
-}
-
-# Abort if the most recent native command failed. PowerShell does not honor
-# $ErrorActionPreference='Stop' for external executables, so mirror `set -e`
-# explicitly around the critical install steps.
-function Assert-LastExit {
-    param([string]$What)
-    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
-}
-
-# Pause before the script ends so the final message stays readable. On Windows
-# the host often closes the instant the script returns (double-click, or a window
-# spawned just to run the installer), taking any goodbye or error text with it.
-# Skipped when input is non-interactive (CI, piped stdin) so automation does not
-# hang waiting on a keypress.
+# Pause before the script ends so the final message stays readable. Skipped when
+# input is non-interactive (CI, piped stdin) so automation does not hang.
 function Wait-ForExit {
+    if ($script:NonInteractive) { return }
     if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
         Write-Host ""
         Read-Host "  Press Enter to exit" | Out-Null
     }
 }
 
-# Simplified component selector (replaces the bash in-place ANSI checkbox).
-# Components default ON unless -Defaults supplies a per-label initial state;
-# user types a number to toggle, Enter to confirm. Returns a bool[] aligned
-# with $Labels.
-function Select-Components {
-    param([string[]]$Labels, [bool[]]$Defaults)
-    $n = $Labels.Count
-    $sel = New-Object bool[] $n
-    for ($i = 0; $i -lt $n; $i++) {
-        $sel[$i] = if ($Defaults -and $i -lt $Defaults.Count) { $Defaults[$i] } else { $true }
+# Locate (or download) the headless engine and return its SOURCE TEXT (not a
+# path). The caller dot-sources it as an in-memory scriptblock at SCRIPT scope --
+# dot-sourcing inside this function would define the engine's functions
+# (Invoke-BiopbInstall, the Report-* renderers) in this function's child scope,
+# where they vanish on return and are unavailable to Main. Returning the text and
+# dot-sourcing in Main keeps them alive for the whole session. Dot-sourcing (not
+# running) also skips the engine's auto-run block; we drive it via Invoke-BiopbInstall.
+#
+# We return TEXT rather than a .ps1 path on purpose: a factory-default Windows
+# client ships ExecutionPolicy=Restricted, which blocks dot-sourcing a script
+# *file* -- so writing the downloaded engine to %TEMP% and dot-sourcing it fails
+# mid-install with a cryptic PSSecurityException, even though the `irm | iex`
+# entry ran fine (in-memory expressions are never policy-gated). An in-memory
+# scriptblock is the same in-memory path: it runs under Restricted, needs no
+# temp file, and keeps $MyInvocation.InvocationName '.' so the auto-run guard
+# still skips. (AllSigned / GPO-locked machines still need a signed engine --
+# nothing short of signing helps there.)
+function Resolve-EngineSource {
+    # $PSScriptRoot is empty under `irm | iex` (no file on disk) -> download.
+    $local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { $null }
+    if ($local -and (Test-Path -LiteralPath $local)) {
+        return (Get-Content -Raw -LiteralPath $local)
     }
-
-    while ($true) {
-        Write-Host ""
-        Write-Host "  Optional components:" -ForegroundColor White
-        Write-Host ""
-        for ($i = 0; $i -lt $n; $i++) {
-            $mark  = if ($sel[$i]) { "[x]" } else { "[ ]" }
-            $color = if ($sel[$i]) { "Green" } else { "DarkGray" }
-            Write-Host ("    {0}. " -f ($i + 1)) -NoNewline
-            Write-Host $mark -ForegroundColor $color -NoNewline
-            Write-Host ("  {0}" -f $Labels[$i])
-        }
-        Write-Host ""
-        $choice = Read-Host "  Toggle [1-$n] or Enter to confirm"
-        if ([string]::IsNullOrWhiteSpace($choice)) { break }
-        if ($choice -match '^\d+$') {
-            $idx = [int]$choice - 1
-            if ($idx -ge 0 -and $idx -lt $n) { $sel[$idx] = -not $sel[$idx] }
-        }
-    }
-    return $sel
+    Write-Inf "Fetching install engine..."
+    return (Invoke-RestMethod -Uri $EngineUrl)
 }
-
-# Prompt the user to choose a data directory; returns the chosen path string.
-# With -KeepOption an extra "0) Keep my current config file" choice is shown as
-# the default; selecting it (or Enter, or any invalid input) returns $null as a
-# sentinel meaning "leave the existing config untouched." Callers pass this when
-# a biopb.toml already exists, since hand-editing TOML is error-prone.
-function Select-DataDir {
-    param([string]$BiopbHome, [switch]$KeepOption)
-
-    $candidates = New-Object System.Collections.Generic.List[string]
-    $seen = New-Object System.Collections.Generic.HashSet[string]
-    # Offer dedicated data subfolders only — never the profile root, Documents,
-    # or OneDrive. Those are riddled with OneDrive "Files On-Demand" placeholders
-    # that hydrate-on-read and hang recursive discovery before the server can
-    # bind. Data/Microscopy folders aren't OneDrive-redirected by
-    # default; users who keep data elsewhere can still enter a path manually.
-    foreach ($d in @(
-        (Join-Path $BiopbHome 'Data'),
-        (Join-Path $BiopbHome 'data'),
-        (Join-Path $BiopbHome 'Microscopy')
-    )) {
-        if ((Test-Path -LiteralPath $d) -and $seen.Add($d.ToLowerInvariant())) {
-            $candidates.Add($d) | Out-Null
-        }
-    }
-    # Offer non-system fixed drives (data drives) as roots.
-    foreach ($drv in Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue) {
-        if ($drv.Name -ne 'C' -and $drv.Root -and (Test-Path -LiteralPath $drv.Root)) {
-            if ($seen.Add($drv.Root.ToLowerInvariant())) { $candidates.Add($drv.Root) | Out-Null }
-        }
-    }
-
-    $n = $candidates.Count
-    $manualOpt = $n + 1
-    # Fall back to a dedicated data subfolder, never the profile root: an empty
-    # manual entry must not silently re-point discovery at the whole profile.
-    $defaultDir = if ($n -gt 0) { $candidates[0] } else { (Join-Path $BiopbHome 'Microscopy') }
-
-    Write-Host ""
-    Write-Host "  Select your microscopy data directory:" -ForegroundColor White
-    Write-Host ""
-    if ($KeepOption) {
-        Write-Host "    0) " -ForegroundColor Cyan -NoNewline
-        Write-Host "Keep my current config file (default)"
-    }
-    for ($i = 0; $i -lt $n; $i++) {
-        Write-Host ("    {0}) " -f ($i + 1)) -ForegroundColor Cyan -NoNewline
-        Write-Host $candidates[$i]
-    }
-    Write-Host ("    {0}) " -f $manualOpt) -ForegroundColor Cyan -NoNewline
-    Write-Host "Enter path manually"
-    Write-Host ""
-    # Default differs by mode: keep current config (0) vs first candidate (1).
-    $defaultChoice = if ($KeepOption) { "0" } else { "1" }
-    $choice = Read-Host "  Choice [$defaultChoice]"
-    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
-
-    if ($KeepOption -and $choice -eq "0") { return $null }   # sentinel: keep config
-
-    if ($choice -eq "$manualOpt") {
-        $manual = Read-Host "  Path [$defaultDir]"
-        if ([string]::IsNullOrWhiteSpace($manual)) { return $defaultDir }
-        return $manual
-    }
-    elseif ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $n) {
-        return $candidates[[int]$choice - 1]
-    }
-    elseif ($KeepOption) {
-        # In keep mode, an unrecognized choice is non-destructive: keep the config.
-        Write-Host "  Invalid choice, keeping current config"
-        return $null
-    }
-    else {
-        Write-Host "  Invalid choice, using default"
-        return $defaultDir
-    }
-}
-
-# Ensure a directory is on the user PATH (persisted) and the current session.
-function Add-ToUserPath {
-    param([string]$Dir)
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $Dir) {
-        $newPath = if ([string]::IsNullOrEmpty($userPath)) { $Dir } else { "$userPath;$Dir" }
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-    }
-    if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
-}
-
-# Merge the biopb server into a standard mcpServers JSON config (Claude Desktop,
-# Cursor, ...). Uses native JSON (ConvertFrom/ConvertTo-Json) in place of jq.
-# biopb-mcp speaks stdio, so the client spawns the command itself — a bare
-# command+args entry (no "type") is the form every mcpServers client accepts.
-# Returns $true only if biopb was actually written into the client's config.
-function Merge-McpJson {
-    param([string]$File, [string]$Command, [string[]]$CmdArgs, [string]$Label, [string]$ConfigDir)
-    $dir = Split-Path -Parent $File
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-
-    $entry = [pscustomobject]@{ command = $Command; args = @($CmdArgs) }
-
-    if (Test-Path -LiteralPath $File) {
-        try {
-            $json = Get-Content -Raw -LiteralPath $File | ConvertFrom-Json
-            if ($null -eq $json.mcpServers) {
-                $json | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
-            }
-            if ($json.mcpServers.PSObject.Properties.Name -contains 'biopb') {
-                $json.mcpServers.biopb = $entry
-            } else {
-                $json.mcpServers | Add-Member -NotePropertyName biopb -NotePropertyValue $entry -Force
-            }
-            Set-FileUtf8NoBom -Path $File -Content ($json | ConvertTo-Json -Depth 20)
-            Write-Ok "${Label}: registered biopb (merged into $File)"
-        } catch {
-            Write-Warn2 "${Label}: could not merge $File - add biopb manually (see $ConfigDir\mcp.json)"
-            return $false
-        }
-        return $true
-    }
-
-    $obj = [pscustomobject]@{ mcpServers = [pscustomobject]@{ biopb = $entry } }
-    Set-FileUtf8NoBom -Path $File -Content ($obj | ConvertTo-Json -Depth 20)
-    Write-Ok "${Label}: created $File"
-    return $true
-}
-
-# Detect installed agent systems and register the biopb MCP server with each.
-function Set-McpClients {
-    param([string]$BiopbHome, [string]$ConfigDir)
-
-    # Best-effort agent wiring must never abort the install. Under the script's
-    # ErrorActionPreference='Stop', a native CLI that writes to stderr -- e.g.
-    # `claude mcp get biopb` when biopb is not registered yet -- raises a
-    # TERMINATING NativeCommandError in Windows PowerShell 5.1, even with *>$null.
-    # Soften it for this function only (function-scoped) so that probe can't kill
-    # the install; we gate on $LASTEXITCODE explicitly below.
-    $ErrorActionPreference = 'SilentlyContinue'
-
-    $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
-    if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
-
-    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
-    # (`biopb-mcp --transport stdio`). Recent biopb-mcp makes that child a thin
-    # bridge that brings up — and shares across clients — a local http daemon on
-    # demand (the daemon outlives any one client). The client contract is
-    # unchanged, so each client still needs the *command* to run, not a URL; we
-    # register the resolved absolute path so GUI agents (e.g. Claude Desktop),
-    # which don't inherit the shell PATH, can still find it.
-    $mcpArgs = @("--transport", "stdio")
-
-    # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved
-    # if it already exists so the user's tweaks survive a rerun.
-    $mcpConfigDir = Join-Path $BiopbHome ".config\biopb-mcp"
-    $mcpConfig = Join-Path $mcpConfigDir "config.json"
-    if (-not (Test-Path -LiteralPath $mcpConfigDir)) { New-Item -ItemType Directory -Force -Path $mcpConfigDir | Out-Null }
-    if (Test-Path -LiteralPath $mcpConfig) {
-        Write-Ok "biopb-mcp config exists at $mcpConfig (preserved)"
-    } else {
-        # The default algorithm plugins point at remote, off-site servers (cell
-        # segmentation, etc.) hosted at UConn Health. Those servers log client
-        # IPs, so we ask for consent before enabling them by default rather than
-        # quietly shipping a third-party network dependency. Declining just
-        # leaves process_image_servers empty; the user can add servers later by
-        # editing the config. Default is Yes (Enter = enable).
-        Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
-        Write-Inf "certain computations, e.g. cell segmentation. The servers are"
-        Write-Inf "hosted at UConn Health and log client IP addresses."
-        Write-Host ""
-        $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
-        if ($plug -notmatch '^(n|no)$') {
-            $processImageServers = '        "grpcs://cellpose.biopb.org:443"'
-            Write-Ok "Remote algorithm plugins enabled"
-        } else {
-            $processImageServers = ''
-            Write-Ok "Remote algorithm plugins disabled (add servers later in $mcpConfig)"
-        }
-        $mcpConfigContent = @"
-{
-  "mcp": {
-    "services": {
-      "process_image_servers": [
-$processImageServers
-      ]
-    }
-  }
-}
-"@
-        Set-FileUtf8NoBom -Path $mcpConfig -Content $mcpConfigContent
-        Write-Ok "Created biopb-mcp config: $mcpConfig"
-    }
-
-    # Canonical standalone definition (standard mcpServers JSON; most clients accept it).
-    $canonical = [pscustomobject]@{
-        mcpServers = [pscustomobject]@{ biopb = [pscustomobject]@{ command = $mcpCmd; args = $mcpArgs } }
-    }
-    Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "mcp.json") -Content ($canonical | ConvertTo-Json -Depth 20)
-    Write-Ok "MCP definition written: $ConfigDir\mcp.json"
-
-    # Assume the user has no working wiring until a branch below actually writes
-    # biopb into a client's config; cleared ($false) only on a real registration,
-    # so a detected-but-unregistered client (failed `claude mcp add` or an
-    # unwritable config) still gets the canonical fallback at the end.
-    $needToShowMcpConfig = $true
-
-    # --- Claude Code (managed through the `claude` CLI) ---
-    if (Get-Command claude -ErrorAction SilentlyContinue) {
-        & claude mcp get biopb *> $null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Claude Code: biopb already registered"
-            $needToShowMcpConfig = $false
-        } else {
-            & claude mcp add --scope user biopb -- $mcpCmd @mcpArgs *> $null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok "Claude Code: registered biopb (user scope)"
-                $needToShowMcpConfig = $false
-            } else {
-                Write-Warn2 "Claude Code detected but registration failed - add it manually:"
-                Write-Cmd "claude mcp add --scope user biopb -- $mcpCmd $($mcpArgs -join ' ')"
-            }
-        }
-    }
-
-    # --- Claude Desktop (Windows: %APPDATA%\Claude) ---
-    $cdCfg = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
-    if (Test-Path -LiteralPath (Split-Path -Parent $cdCfg)) {
-        if (Merge-McpJson -File $cdCfg -Command $mcpCmd -CmdArgs $mcpArgs -Label "Claude Desktop" -ConfigDir $ConfigDir) {
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # --- Cursor ---
-    $cursorDir = Join-Path $BiopbHome ".cursor"
-    if (Test-Path -LiteralPath $cursorDir) {
-        if (Merge-McpJson -File (Join-Path $cursorDir "mcp.json") -Command $mcpCmd -CmdArgs $mcpArgs -Label "Cursor" -ConfigDir $ConfigDir) {
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # --- opencode ---
-    $opencodeCfgDir = Join-Path $BiopbHome ".config\opencode"
-    if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $opencodeCfgDir)) {
-        $opencodeCfg = Join-Path $opencodeCfgDir "opencode.json"
-        if (-not (Test-Path -LiteralPath $opencodeCfgDir)) { New-Item -ItemType Directory -Force -Path $opencodeCfgDir | Out-Null }
-
-        $opencodeEntry = [pscustomobject]@{
-            type = "local"
-            command = @($mcpCmd) + $mcpArgs
-            enabled = $true
-        }
-
-        if (Test-Path -LiteralPath $opencodeCfg) {
-            try {
-                $json = Get-Content -Raw -LiteralPath $opencodeCfg | ConvertFrom-Json
-                if ($null -eq $json.mcp) {
-                    $json | Add-Member -NotePropertyName mcp -NotePropertyValue ([pscustomobject]@{}) -Force
-                }
-                if ($json.mcp.PSObject.Properties.Name -contains 'biopb') {
-                    $json.mcp.biopb = $opencodeEntry
-                } else {
-                    $json.mcp | Add-Member -NotePropertyName biopb -NotePropertyValue $opencodeEntry -Force
-                }
-                Set-FileUtf8NoBom -Path $opencodeCfg -Content ($json | ConvertTo-Json -Depth 20)
-                Write-Ok "opencode: registered biopb (merged into $opencodeCfg)"
-                $needToShowMcpConfig = $false
-            } catch {
-                Write-Warn2 "opencode: could not merge $opencodeCfg - add biopb manually"
-                Write-Inf "Add under 'mcp' in $opencodeCfg :"
-                Write-Host ("    `"biopb`": { `"type`": `"local`", `"command`": [`"$mcpCmd`", `"--transport`", `"stdio`"], `"enabled`": true }") -ForegroundColor DarkGray
-            }
-        } else {
-            $opencodeObj = [pscustomobject]@{ mcp = [pscustomobject]@{ biopb = $opencodeEntry } }
-            Set-FileUtf8NoBom -Path $opencodeCfg -Content ($opencodeObj | ConvertTo-Json -Depth 20)
-            Write-Ok "opencode: created $opencodeCfg"
-            $needToShowMcpConfig = $false
-        }
-    }
-
-    # Nothing auto-wired biopb into a client. Defer the notice to the final
-    # summary (via a script-scoped flag) so it groups with the other warnings.
-    $script:McpNeedsManual = $needToShowMcpConfig
-}
-
-$ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 
 function Show-Banner {
     Write-Host ""
@@ -393,23 +106,15 @@ function Show-Banner {
     Write-Host ""
 }
 
-# Two light-hearted pre-flight confirmations. Returns $true if the user opted
-# in to filing a bug report should things go sideways. Exits if they bail.
+# A light-hearted pre-flight confirmation on interactive runs: offer to file a
+# bug report if the install goes sideways. Returns $true if the user opted in
+# (default yes); unattended runs skip it and return $false.
 function Invoke-Preflight {
+    # Unattended runs skip the pre-flight banter; don't nag with a bug-report
+    # offer no one is watching for.
+    if ($script:NonInteractive) { return $false }
     Write-Host ""
     Write-Host "  --- Before we begin ---" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  The Windows installer is shiny, new, and proudly experimental."
-    Write-Host "  It has been road-tested about as much as a chocolate teapot, so"
-    Write-Host "  expect the occasional wobble while we knock off the rough edges."
-    $go = Read-Host "  Feeling brave enough to continue? [y/N]"
-    if ($go -notmatch '^(y|yes)$') {
-        Write-Host ""
-        Write-Host "  Wise. We'll be right here once it's more house-trained. Cheers!" -ForegroundColor Cyan
-        Wait-ForExit
-        exit 0
-    }
-
     Write-Host ""
     Write-Host "  If this script faceplants, a 30-second bug report helps us teach"
     Write-Host "  it to land on its feet. Nothing is sent anywhere automatically --"
@@ -424,508 +129,24 @@ function Invoke-Preflight {
     return $reportOnFailure
 }
 
-# Fetch the latest GitHub release metadata (a parsed object with .tag_name and
-# .assets[].name / .browser_download_url) for a given tag prefix. The monorepo
-# hosts several release lines (release-v*, v*, mcp-v*, server-v*), so
-# /releases/latest is NOT component-specific; list releases (date-desc) and take
-# the newest whose tag is a CLEAN $TagPrefix + X.Y.Z. By default prerelease tags
-# (release-v…a/b/rc — release candidates cut off dev) are skipped; with -AllowRc
-# the regex also admits a PEP 440 prerelease suffix so the newest candidate wins.
-# Throws on network/HTTP error; callers catch.
-function Get-LatestRelease {
-    param([string]$Repo, [string]$TagPrefix = "", [bool]$AllowRc = $false)
-    $headers = @{ "User-Agent" = "biopb-installer" }
-    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100" `
-        -Headers $headers
-    $rx = if ($AllowRc) {
-        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+((a|b|rc)\d+)?$"
-    } else {
-        "^" + [regex]::Escape($TagPrefix) + "\d+\.\d+\.\d+$"
-    }
-    $match = $releases | Where-Object { $_.tag_name -match $rx } | Select-Object -First 1
-    if (-not $match) { throw "No release matching '$TagPrefix' X.Y.Z in $Repo" }
-    return $match
-}
+# Render the human-facing summary from the engine's result object. Wording is a
+# front-end concern, so it lives here rather than in the engine.
+function Show-Summary {
+    param($Result)
+    $BiopbHome = $Result.BiopbHome
+    $configFile = $Result.ConfigFile
+    $ConfigDir = $Result.ConfigDir
 
-# Print the tail of the server log, indented, for diagnosing a bad startup.
-function Show-LogTail {
-    param([string]$LogFile)
-    if (-not (Test-Path -LiteralPath $LogFile)) { return }
-    Write-Inf "recent server log ($LogFile):"
-    Get-Content -LiteralPath $LogFile -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Host "      $_" -ForegroundColor DarkGray
-    }
-}
-
-# Start (or restart) the background data server, then report its health.
-# Best-effort: never aborts the install. Skip with $env:BIOPB_NO_SERVER_START=1.
-# Starting now lets the pre-cache warm overviews before the user opens anything,
-# and a restart makes an already-running (stale) server pick up the new code.
-function Start-DataServer {
-    param([string]$BiopbHome, [string]$ConfigFile)
-
-    $logFile = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
-
-    if ($env:BIOPB_NO_SERVER_START -eq "1") {
-        Write-Inf "Skipping server start (BIOPB_NO_SERVER_START=1)"
-        Write-Inf "  start it later with: biopb server start"
-        return
-    }
-    if (-not (Get-Command biopb -ErrorAction SilentlyContinue)) {
-        Write-Warn2 "biopb not found on PATH; skipping server start"
-        Write-Inf "  start it later with: biopb server start"
-        return
-    }
-
-    # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise.
-    try { & biopb server restart *> $null } catch { }
-
-    # Ask the daemon for its health, polling until SERVING (or 60s). Merge stderr
-    # (live progress: "data server starting - N found so far...") into the stream
-    # and surface it via Write-Inf as it arrives; the JSON verdict (the line
-    # starting with '{') on stdout is captured for parsing below.
-    $result = @{ json = $null }
-    try {
-        & biopb server status --json --wait 60 2>&1 | ForEach-Object {
-            $s = "$_"
-            if ($s.TrimStart().StartsWith("{")) { $result.json = $s.Trim() }
-            elseif ($s.Trim()) { Write-Inf $s.Trim() }
-        }
-    } catch { }
-    $out = $result.json
-    if (-not $out) { $out = "" }
-
-    # Tolerate an older biopb that predates --json/--wait: fall back to a plain
-    # liveness check so the installer still works during a version transition.
-    if (-not $out) {
-        $plain = ""
-        try { $plain = (& biopb server status 2>$null | Out-String) } catch { $plain = "" }
-        if ($plain -match "Running") {
-            Write-Ok "Data server started"
-        } else {
-            Write-Warn2 "Data server may not have started"
-            Show-LogTail -LogFile $logFile
-            Write-Inf "  full log: $logFile"
-        }
-        return
-    }
-
-    $health = $null; $count = $null
-    try {
-        $obj = $out | ConvertFrom-Json
-        $health = $obj.health
-        $count = $obj.source_count
-    } catch { }
-
-    if ($health -ne "SERVING") {
-        Write-Warn2 "Data server did not come up cleanly"
-        Write-Inf "  it may still be scanning a large folder, or failed to start:"
-        Show-LogTail -LogFile $logFile
-        Write-Inf "  full log: $logFile"
-        return
-    }
-
-    if ((-not $count) -or ($count -eq 0)) {
-        Write-Warn2 "Data server is running but found no data sources"
-        Write-Inf "  check that your data folder holds supported images (see config):"
-        Write-Cmd "  $ConfigFile"
-        Show-LogTail -LogFile $logFile
-        return
-    }
-
-    Write-Ok "Data server ready - $count data source(s) found; pre-caching overviews"
-}
-
-function Install-Biopb {
-    # All three wheels (+ webapp) are pulled from ONE biopb release-v*
-    # deployment — a mutually-paired set built from the tagged commit. All three
-    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
-    # subdirectories of biopb/biopb).
-    $BiopbRepoUrl = "https://github.com/biopb/biopb"
-    $RepoUrl      = $BiopbRepoUrl             # webapp release-asset fallback URL
-    $ReleaseRepo  = "biopb/biopb"             # owner/name for the GitHub Releases API
-    # The monorepo hosts multiple release lines; the all-in-one deployment the
-    # installer wants is the release-v* one, so the release fetch filters by this
-    # prefix (see docs/release-model.md).
-    $ReleaseTagPrefix = "release-v"
-    $BiopbHome   = $env:USERPROFILE          # matches Python Path.home() on Windows
-    $WebappDir   = Join-Path $BiopbHome ".local\share\biopb\webapp"
-    $ConfigDir   = Join-Path $BiopbHome ".config\biopb"
-    $LocalBin    = Join-Path $BiopbHome ".local\bin"
-
-    # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
-    # Set $env:BIOPB_INSTALL_RC = "1" to also admit the latest release candidate
-    # (a/b/rc prerelease, typically cut off dev). Both channels install prebuilt
-    # wheels; neither builds from git.
-    $AllowRc = ($env:BIOPB_INSTALL_RC) -and ($env:BIOPB_INSTALL_RC -ne '0')
-    $release = $null   # cached release metadata, fetched on demand below
-
-    # ===== 0. System Check =====
-    Write-Step "[0/7] Checking system..."
-
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    switch ($arch) {
-        "AMD64" { }
-        "ARM64" { }
-        default {
-            Write-Err2 "Unsupported architecture: $arch"
-            Write-Inf "Supported: x86_64 (AMD64), arm64 (ARM64)"
-            Wait-ForExit
-            exit 1
-        }
-    }
-    Write-Ok "Platform: Windows ($arch)"
-
-    # Required tools. curl/Invoke-WebRequest is built in; the release install just
-    # downloads prebuilt wheels, so only tar is needed (no git, buf, or compiler).
-    $requiredTools = @("tar")
-    foreach ($tool in $requiredTools) {
-        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            Write-Err2 "$tool not found"
-            switch ($tool) {
-                "tar"  { Write-Inf "tar ships with Windows 10 1803+; please update Windows" }
-            }
-            Wait-ForExit
-            exit 1
-        }
-        Write-Ok "${tool}: found"
-    }
-    Write-Ok "System check passed"
-
-    # ===== Optional components =====
-    # biopb-mcp is always installed (it is the primary interface), so it is not
-    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
-    # toolchain that most labs don't need (only legacy/proprietary formats need it).
-    $sel = Select-Components -Labels @(
-        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)",
-        "Bio-Formats (more image formats; needs Java and extra setup during first run)"
-    ) -Defaults @($true, $false)
-    $InstallWebapp     = $sel[0]
-    $InstallBioformats = $sel[1]
-    Write-Host ""
-
-    # ===== 1. Install uv (if needed) =====
-    Write-Step "[1/7] Ensuring build tools..."
-
-    # uv's installer (piped in below) voluntarily aborts unless the effective
-    # execution policy is one of Unrestricted/RemoteSigned/Bypass -- even though
-    # code piped through `iex` is otherwise exempt from policy enforcement. Set
-    # the Process scope so that self-check passes: it is session-only (gone when
-    # this window closes), needs no admin, and -- importantly -- cannot override
-    # a GPO-enforced policy, so a genuinely locked-down machine still wins, which
-    # is the correct outcome. We only touch it when the current policy would
-    # block uv, and never fail the install if even that is disallowed.
-    $allowedPolicy = @('Unrestricted', 'RemoteSigned', 'Bypass')
-    if ((Get-ExecutionPolicy).ToString() -notin $allowedPolicy) {
-        Write-Note "Temporarily allowing scripts for this session (execution policy -> RemoteSigned, Process scope) so the uv installer can run."
-        Set-ExecutionPolicy RemoteSigned -Scope Process -Force -ErrorAction SilentlyContinue
-    }
-
-    Add-ToUserPath $LocalBin
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-        Write-Inf "Installing uv..."
-        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
-        # uv installs to %USERPROFILE%\.local\bin; make it usable this session.
-        Add-ToUserPath $LocalBin
-        if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-            Write-Err2 "uv installation did not land on PATH - reopen PowerShell and rerun"
-            Wait-ForExit
-            exit 1
-        }
-        Write-Ok "uv installed"
-    } else {
-        Write-Ok "uv already installed ($(uv --version))"
-    }
-
-    # ===== 2. Python =====
-    Write-Step "[2/7] Ensuring Python..."
-
-    # biopb-mcp (always installed) requires Python >= 3.10.
-    $minMinor = 10
-
-    # $pythonSpec is the interpreter we pin `uv tool install` to below via --python.
-    # Without it, uv auto-discovers an interpreter and may pick an old system
-    # python (e.g. 3.9) that then fails biopb-mcp's Requires-Python>=3.10.
-    $pythonOk = $false
-    $pythonSpec = ""
-    $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if ($pyExe) {
-        $verStr = & $pyExe -c "import sys; print(sys.version_info[0], sys.version_info[1])" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $verStr) {
-            $parts = $verStr.Trim() -split '\s+'
-            $maj = [int]$parts[0]; $min = [int]$parts[1]
-            if ($maj -gt 3 -or ($maj -eq 3 -and $min -ge $minMinor)) {
-                Write-Ok "Using system Python: $(& $pyExe --version)"
-                $pythonOk = $true
-                $pythonSpec = $pyExe
-            } else {
-                Write-Warn2 "System Python too old ($(& $pyExe --version)), need >= 3.$minMinor"
-            }
-        }
-    }
-    if (-not $pythonOk) {
-        Write-Inf "Installing Python 3.11 via uv..."
-        uv python install 3.11
-        Assert-LastExit "Python install"
-        Write-Ok "Python 3.11 ready"
-        $pythonSpec = "3.11"
-    }
-
-    # ===== 3. Install biopb packages =====
-    Write-Step "[3/7] Installing biopb packages..."
-
-    $tensorExtras = "web,aics,medical,ndtiff,hdf5"
-    if ($InstallBioformats) {
-        $tensorExtras = "$tensorExtras,bioformats"
-        Write-Inf "  including Bio-Formats (Java fetched on first use, not now)"
-    }
-
-    # Resolve where the three packages come from. They must be installed as a
-    # matched set from a single build: the tensor server is self-contained and
-    # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
-    # coupled to both - so all three are pinned to the sibling wheels from one
-    # release-v* deployment (release CI builds the mutually-paired triple from the
-    # tagged commit) and the resolver is never allowed to pull biopb /
-    # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
-    # set - no PyPI-vs-release version skew.
-    try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null }
-    if (-not $release) {
-        Write-Err2 "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo."
-        if ($AllowRc) {
-            Write-Inf "No release candidate found. Check your network, or install the stable release (unset BIOPB_INSTALL_RC)."
-        } else {
-            Write-Inf "Check your network and rerun. To try the latest release candidate, set:"
-            Write-Cmd '$env:BIOPB_INSTALL_RC = "1"'
-        }
-        throw "release fetch failed"
-    }
-    $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
-    $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
-    $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset) {
-        Write-Err2 "Release $($release.tag_name) is missing one of the biopb wheels."
-        Write-Inf "Try again later, or report this against $ReleaseRepo."
-        throw "release wheels missing"
-    }
-    Write-Inf "Installing from release $($release.tag_name)"
-    $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
-    if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-    $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
-    $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
-    $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
-    Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
-    Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
-    Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
-    # Direct file:// references pin each package to this exact wheel, so uv
-    # resolves their inter-dependencies (the server's biopb, biopb-mcp's
-    # biopb[tensor]) to the downloaded set rather than to PyPI.
-    $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
-    $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
-
-    # Install everything into ONE uv tool environment so the components can
-    # import and drive each other at runtime:
-    #   - `biopb server start` runs `sys.executable -m biopb_tensor_server.cli`,
-    #     so the server must be importable from biopb's interpreter;
-    #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
-    #     server and runs a napari viewer in this same env.
-    # biopb is the primary tool (exposes the `biopb` command); --with adds the
-    # siblings to the same env and --with-executables-from also links their
-    # console scripts onto PATH (plain --with does not expose executables).
-    #
-    # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client,
-    # ipykernel, psutil) - without it `import mcp` fails; the extra is applied to
-    # the pinned wheel/ref ($mcpReq) like the others. It now ships in the biopb-mcp
-    # release alongside biopb + tensor-server (one matched triple), so unlike the
-    # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
-    # dep still resolved from PyPI (it is decoupled and published normally).
-    $installArgs = @(
-        "tool", "install", "--upgrade", "--force",
-        "--python", $pythonSpec,
-        $biopbReq,
-        "--with", $tensorReq,
-        "--with-executables-from", "biopb-tensor-server"
-    )
-    Write-Inf "  including biopb-mcp + napari"
-    $installArgs += @(
-        "--with", $mcpReq,
-        "--with", "napari[all]",
-        "--with-executables-from", "biopb-mcp"
-    )
-
-    Write-Inf "Installing biopb into one shared environment..."
-    try {
-        uv @installArgs
-        Assert-LastExit "biopb install"
-    } finally {
-        # Remove the temporary wheel download dir on success or failure.
-        # $wheelsDir is only set in release mode; $null (source mode) is a no-op.
-        if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
-            Remove-Item -LiteralPath $wheelsDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    # Refresh PATH so freshly installed tool shims are visible this session.
-    Add-ToUserPath $LocalBin
-    $versionOutput = (biopb-tensor-server version 2>$null)
-    if (-not $versionOutput) { $versionOutput = "installed" }
-    Write-Ok "$versionOutput"
-
-    # ===== 4. Webapp =====
-    Write-Step "[4/7] Installing data browser..."
-
-    if ($InstallWebapp) {
-        if (-not (Test-Path -LiteralPath $WebappDir)) { New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null }
-
-        # Reuse the release metadata already fetched for the wheels (cached).
-        if (-not $release) { try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc } catch { $release = $null } }
-        $latestTag = if ($release) { $release.tag_name } else { "" }
-
-        if ($latestTag -and ($latestTag -notmatch '^[A-Za-z0-9._+/-]+$')) {
-            Write-Warn2 "Unexpected tag format, skipping data browser install"
-            $latestTag = ""
-        }
-
-        if ($latestTag) {
-            $versionFile = Join-Path $WebappDir ".version"
-            $installedTag = if (Test-Path -LiteralPath $versionFile) { (Get-Content -Raw -LiteralPath $versionFile).Trim() } else { "" }
-            if ($installedTag -eq $latestTag) {
-                Write-Ok "Data browser already up to date ($latestTag)"
-            } else {
-                Write-Inf "Downloading $latestTag..."
-                Remove-Item -LiteralPath $WebappDir -Recurse -Force -ErrorAction SilentlyContinue
-                New-Item -ItemType Directory -Force -Path $WebappDir | Out-Null
-                $webAsset = $release.assets | Where-Object { $_.name -eq 'webapp.tar.gz' } | Select-Object -First 1
-                $webUrl = if ($webAsset) { $webAsset.browser_download_url } else { "$RepoUrl/releases/download/$latestTag/webapp.tar.gz" }
-                $tarball = Join-Path $env:TEMP "biopb-webapp.tar.gz"
-                # Guard a missing asset: under $ErrorActionPreference='Stop' a
-                # failed download would abort the whole installer, and writing
-                # .version after a broken extract would stamp it "installed".
-                # Only mark success once the tarball is fetched and unpacked.
-                $webOk = $true
-                try { Invoke-WebRequest -Uri $webUrl -OutFile $tarball }
-                catch { $webOk = $false }
-                if ($webOk) {
-                    tar -xzf $tarball -C $WebappDir --strip-components=1
-                    Remove-Item -LiteralPath $tarball -Force -ErrorAction SilentlyContinue
-                    Set-FileUtf8NoBom -Path $versionFile -Content $latestTag
-                    Write-Ok "Data browser installed to: $WebappDir"
-                } else {
-                    Write-Warn2 "No webapp.tar.gz in release $latestTag; server will run in API-only mode"
-                }
-            }
-        } else {
-            Write-Warn2 "Could not fetch latest release, data browser not installed"
-            Write-Inf "Server will run in API-only mode"
-        }
-    } else {
-        Write-Inf "Skipped"
-    }
-
-    # ===== 5. Config =====
-    Write-Step "[5/7] Config..."
-
-    if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    $configFile = Join-Path $ConfigDir "biopb.toml"
-
-    # We never edit an existing biopb.toml in place — hand-editing TOML is
-    # error-prone and most users can't do it. Instead the data-directory prompt is
-    # always offered; when a config already exists it gains a default "0) Keep my
-    # current config file" option, and choosing a fresh data dir backs up the old
-    # config and writes a brand-new one. $null $dataDir is the "keep" sentinel.
-    $dataDir = $null
-    $keepConfig = $false
-    if ((Test-Path -LiteralPath $configFile) -and (-not $env:BIOPB_DATA_DIR)) {
-        $dataDir = Select-DataDir -BiopbHome $BiopbHome -KeepOption
-        Write-Host ""
-        if ($null -eq $dataDir) { $keepConfig = $true }
-    }
-    elseif (Test-Path -LiteralPath $configFile) {
-        # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
-        # install. With a config already present we keep it (its data dir wins).
-        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $configFile to apply BIOPB_DATA_DIR)."
-        $keepConfig = $true
-    }
-    elseif ($env:BIOPB_DATA_DIR) {
-        $dataDir = $env:BIOPB_DATA_DIR
-        Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
-    }
-    else {
-        $dataDir = Select-DataDir -BiopbHome $BiopbHome
-        Write-Host ""
-        Write-Ok "Data directory: $dataDir"
-    }
-
-    if ($keepConfig) {
-        Write-Ok "Keeping current config: $configFile"
-    } else {
-        # Preserve the previous config (a chosen new data dir must never silently
-        # discard the user's old settings) by renaming it to a timestamped backup.
-        if (Test-Path -LiteralPath $configFile) {
-            $backup = "$configFile.bak." + (Get-Date -Format "yyyyMMddHHmmss")
-            Move-Item -LiteralPath $configFile -Destination $backup -Force
-            Write-Inf "Backed up previous config to $backup"
-        }
-
-        # Escape for a TOML basic string: backslashes first, then quotes.
-        $tomlDataDir = $dataDir -replace '\\', '\\' -replace '"', '\"'
-        $tomlContent = @"
-[server]
-host = "127.0.0.1"
-port = 8815
-aggressive_dir_pruning = true
-
-# Cache decoded chunks on disk as Arrow IPC segments so repeat reads skip
-# re-decoding the raw format. The file backend is now Windows-safe -- it copies
-# batches off the segment mmap so eviction can unlink the file (copy-on-read,
-# biopb/biopb#5). Matches the POSIX installer.
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
-
-[metadata_db]
-enabled = true
-
-[[sources]]
-url = "$tomlDataDir"
-monitor = true
-"@
-        Set-FileUtf8NoBom -Path $configFile -Content $tomlContent
-        Write-Ok "Created: $configFile"
-    }
-
-    # ===== 6. Start the data server =====
-    # Before MCP wiring so a typo in the data dir (step 5) surfaces right after
-    # the choice, while pre-cache gets the earliest possible head start.
-    Write-Step "[6/7] Starting data server..."
-    Start-DataServer -BiopbHome $BiopbHome -ConfigFile $configFile
-
-    # ===== 7. Wire biopb-mcp into the user's agent system =====
-    Write-Step "[7/7] Configuring MCP client..."
-
-    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
-
-    # ===== Summary =====
-    # Two groups, in order: all informational blocks, then all warnings. Every
-    # block is one headline line, optional indented detail lines, then one blank
-    # line. Set-McpClients only sets a flag, so its warning lands in the warning
-    # group below rather than printing inline.
     Write-Host ""
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
     Write-Host ""
 
-    # Headlines via Write-Inf (indent 2, matching Write-Ok/Write-Warn2), detail
-    # lines indent 4.
-    # --- informational blocks ---
     Write-Inf "Your AI agent launches biopb-mcp over stdio - just start your agent"
     Write-Inf "(Claude Code/Desktop, Cursor, opencode); a napari window opens with it."
     Write-Host ""
 
-    if ($InstallWebapp) {
-        Write-Inf "Data browser available at http://localhost:8815"
+    if ($Result.WebappInstalled) {
+        Write-Inf "Web interface available at http://localhost:8814"
         Write-Host ""
     }
 
@@ -940,25 +161,123 @@ monitor = true
     Write-Inf "To upgrade: rerun this script"
     Write-Host ""
 
-    # --- warnings ---
-    if (-not $InstallWebapp) {
-        Write-Warn2 "Data browser not installed"
-        Write-Inf "  rerun this script to install it"
+    if (-not $Result.WebappInstalled) {
+        Write-Warn2 "Web interface not installed (`$env:BIOPB_INSTALL_WEBAPP = `"0`")"
+        Write-Inf "  rerun without that env var to install it"
         Write-Host ""
     }
 
-    if ($script:McpNeedsManual) {
+    if ($Result.McpNeedsManual) {
         Write-Warn2 "biopb is not registered with any MCP client"
         Write-Inf "  register it manually using $ConfigDir\mcp.json"
         Write-Host ""
     }
 }
 
+# ============================================================================
+# Main
+# ============================================================================
 Show-Banner
 $reportOnFailure = Invoke-Preflight
 
 try {
-    Install-Biopb
+    # Dot-source at SCRIPT scope (not inside a helper) so the engine's functions --
+    # Invoke-BiopbInstall, Report-* -- persist through Main. An in-memory
+    # scriptblock (not a .ps1 file) so it runs under a Restricted ExecutionPolicy.
+    . ([scriptblock]::Create((Resolve-EngineSource)))
+
+    $BiopbHome  = $env:USERPROFILE
+    # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
+    # pre-#34 install still counts as "a config exists" for the keep prompt.
+    $configDir  = Join-Path $BiopbHome ".config\biopb"
+    $configFile = Join-Path $configDir "biopb.json"
+    $legacyConfig = Join-Path $configDir "biopb.toml"
+
+    # ----- Resolve component choices (no longer prompted -- biopb/biopb#237) -----
+
+    # Components are no longer offered interactively. The web interface now carries
+    # the server admin page (config / status / restart) on top of the image viewer,
+    # so it installs by default. Bio-Formats stays off by default: the Python
+    # adapters cover the formats most labs use, and it pulls a heavyweight Java
+    # toolchain. Both remain overridable for scripted installs via env vars:
+    #   $env:BIOPB_INSTALL_WEBAPP = "0"      skip the web interface (API-only server)
+    #   $env:BIOPB_INSTALL_BIOFORMATS = "1"  add Bio-Formats (Java fetched on first use)
+    $installWebapp     = ($env:BIOPB_INSTALL_WEBAPP -ne '0')
+    $installBioformats = ($env:BIOPB_INSTALL_BIOFORMATS -eq '1')
+
+    # Data directory / keep-config decision. No prompt: a fresh install lets the
+    # engine seed the sample-image bundle and point the config at it (empty
+    # $dataDir + $keepConfig=$false is the engine's "seed samples" signal), so a
+    # non-CLI user lands on real data with zero questions. An existing config is
+    # kept UNTOUCHED. BIOPB_DATA_DIR still overrides on a fresh install (skips the
+    # samples). Set $env:BIOPB_INSTALL_SAMPLES=0 to seed nothing.
+    $dataDir = ""
+    $keepConfig = $false
+    $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
+    if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
+        # Existing config, no override: keep it exactly as-is (upgrade fast path).
+        $keepConfig = $true
+        Write-Note "Existing config found; keeping it as-is."
+    }
+    elseif ($configExists) {
+        # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
+        $existing = if (Test-Path -LiteralPath $configFile) { $configFile } else { $legacyConfig }
+        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $existing to apply it)."
+        $keepConfig = $true
+    }
+    elseif ($env:BIOPB_DATA_DIR) {
+        $dataDir = $env:BIOPB_DATA_DIR
+        Write-Ok "Using BIOPB_DATA_DIR: $dataDir"
+    }
+    else {
+        # Fresh install, no override: the engine seeds samples and points there
+        # (unless BIOPB_INSTALL_SAMPLES=0 opts out, in which case it points the
+        # config at an empty folder for drag-drop). Don't claim seeding when the
+        # user opted out -- the engine prints the actual outcome either way.
+        if ($env:BIOPB_INSTALL_SAMPLES -eq '0') {
+            Write-Note "Fresh install: sample seeding disabled (BIOPB_INSTALL_SAMPLES=0); starting with an empty data folder."
+        } else {
+            Write-Ok "Fresh install: seeding sample images."
+        }
+    }
+
+    # Remote algorithm plugins consent. The default plugins point at off-site
+    # servers (cell segmentation, etc.) hosted at UConn Health that log client
+    # IPs, so ask before enabling them rather than quietly shipping a third-party
+    # network dependency. Only fires when no biopb-mcp config exists yet, so a
+    # prior choice survives a rerun. Default is Yes (Enter = enable).
+    $noRemotePlugins = $false
+    $mcpConfig = Join-Path $BiopbHome ".config\biopb-mcp\config.json"
+    if (-not (Test-Path -LiteralPath $mcpConfig)) {
+        if ($script:NonInteractive) {
+            # Consent can't be asked unattended: enable only on explicit opt-in.
+            if ($env:BIOPB_REMOTE_PLUGINS -eq '1') {
+                Write-Ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            } else {
+                $noRemotePlugins = $true
+                Write-Ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            }
+        } else {
+            Write-Host ""
+            Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
+            Write-Inf "certain computations, e.g. cell segmentation. The servers are"
+            Write-Inf "hosted at UConn Health and log client IP addresses."
+            Write-Host ""
+            $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
+            if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
+        }
+    }
+
+    # ----- Drive the engine in-process, rendering its progress in color (-Mode console) -----
+    $result = Invoke-BiopbInstall `
+        -DataDir $dataDir `
+        -Webapp:$installWebapp `
+        -Bioformats:$installBioformats `
+        -KeepConfig:$keepConfig `
+        -NoRemotePlugins:$noRemotePlugins `
+        -Mode console
+
+    Show-Summary -Result $result
     Wait-ForExit
 } catch {
     Write-Host ""

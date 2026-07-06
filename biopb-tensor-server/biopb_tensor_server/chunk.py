@@ -10,7 +10,6 @@ This module contains:
 import logging
 import struct
 from dataclasses import dataclass
-from math import lcm
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 MAX_ARROW_BATCH_BYTES = 64 * 1024 * 1024
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.base import BackendAdapter
+    pass
 
 
 @dataclass
@@ -37,6 +36,7 @@ class ChunkEndpoint:
         chunk_id: Backend-specific chunk identifier (bytes)
         bounds: Array coordinates (start, stop) for this chunk
     """
+
     chunk_id: bytes
     bounds: ChunkBounds
 
@@ -61,25 +61,53 @@ def encode_chunk_id(
     Returns:
         Encoded chunk_id bytes
     """
-    array_id_bytes = array_id.encode('utf-8')
+    array_id_bytes = array_id.encode("utf-8")
     ndim = len(bounds.start)
 
     parts = [
-        struct.pack('>I', len(array_id_bytes)),
+        struct.pack(">I", len(array_id_bytes)),
         array_id_bytes,
-        struct.pack('>H', ndim),
+        struct.pack(">H", ndim),
     ]
 
     for val in bounds.start:
-        parts.append(struct.pack('>q', int(val)))
+        parts.append(struct.pack(">q", int(val)))
     for val in bounds.stop:
-        parts.append(struct.pack('>q', int(val)))
+        parts.append(struct.pack(">q", int(val)))
 
-    return b''.join(parts)
+    return b"".join(parts)
+
+
+def rewrite_chunk_id_array_id(chunk_id: bytes, new_array_id: str) -> bytes:
+    """Replace only the array_id field of a chunk_id, preserving everything else.
+
+    The array_id is a self-describing length-prefixed field at the very front of
+    the chunk_id (``[uint32 len][array_id utf-8]``); every byte after it -- ndim,
+    the start/stop bounds, and any scale suffix on a scaled chunk_id -- is
+    independent of the array_id string. So a remote-tensor *proxy* can map a
+    chunk_id between its local (possibly alias-namespaced) array_id and the
+    upstream's array_id with a pure byte splice, without understanding bounds or
+    scale encoding ("understands nothing"). The splice round-trips for both
+    regular and scaled chunk_ids because ``decode_chunk_id`` / ``is_scaled_chunk``
+    / ``decode_scale_info`` all recompute their offsets from the (new) length
+    prefix.
+
+    Args:
+        chunk_id: An encoded chunk_id (regular or scaled).
+        new_array_id: The array_id to substitute in.
+
+    Returns:
+        A new chunk_id with the array_id field replaced and all trailing bytes
+        (ndim/bounds/scale) preserved verbatim.
+    """
+    old_len = struct.unpack(">I", chunk_id[:4])[0]
+    tail = chunk_id[4 + old_len :]
+    new_bytes = new_array_id.encode("utf-8")
+    return struct.pack(">I", len(new_bytes)) + new_bytes + tail
 
 
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
-    """Decode array_id and bounds from chunk_id. Works for both regular 
+    """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload).
 
     Args:
@@ -88,24 +116,25 @@ def decode_chunk_id(chunk_id: bytes) -> Tuple[str, "ChunkBounds"]:
     Returns:
         Tuple of (array_id, bounds)
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
-    array_id = chunk_id[4:4+array_id_len].decode('utf-8')
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
     offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset+2])[0]
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
     offset += 2
 
     start = []
     for _ in range(ndim):
-        start.append(struct.unpack('>q', chunk_id[offset:offset+8])[0])
+        start.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
         offset += 8
 
     stop = []
     for _ in range(ndim):
-        stop.append(struct.unpack('>q', chunk_id[offset:offset+8])[0])
+        stop.append(struct.unpack(">q", chunk_id[offset : offset + 8])[0])
         offset += 8
 
     from biopb.tensor.ticket_pb2 import ChunkBounds
+
     bounds = ChunkBounds(start=start, stop=stop)
 
     return array_id, bounds
@@ -196,100 +225,6 @@ def normalized_scale_hint(
     return scale_hint_tuple
 
 
-def logical_chunk_shape(
-    chunk_shape: Tuple[int, ...],
-    scale_hint: Tuple[int, ...],
-    logical_shape: Tuple[int, ...],
-) -> Tuple[int, ...]:
-    """Compute virtual chunk shape for scaled read.
-
-    Args:
-        chunk_shape: Base chunk shape
-        scale_hint: Scale factors per axis
-        logical_shape: Output shape at target scale
-
-    Returns:
-        Virtual chunk shape at target scale
-    """
-    virtual_chunk = []
-    for chunk, scale, axis_shape in zip(chunk_shape, scale_hint, logical_shape):
-        virtual_axis = lcm(chunk, scale) // scale
-        virtual_chunk.append(min(max(virtual_axis, 1), axis_shape))
-    return tuple(virtual_chunk)
-
-
-# =============================================================================
-# Chunk Splitting Helpers
-# =============================================================================
-
-
-def _choose_split_axis(
-    shape: Tuple[int, ...],
-    dim_labels: Optional[List[str]],
-    n_splits: int,
-) -> int:
-    """Choose axis for splitting with semantic priority.
-
-    Priority order (preserves Y-X spatial plane for common visualization patterns):
-    1. Any axis NOT in {y, x, z, c} — handles 't', 'v', 'frame', unlabeled, etc.
-       If multiple candidates, pick largest.
-    2. 'c' (channel)
-    3. 'z' (depth)
-    4. Larger of 'y' or 'x' (spatial plane)
-    5. Fallback: largest axis (current behavior)
-
-    Args:
-        shape: Chunk shape tuple
-        dim_labels: Optional dimension labels (may be None or partial)
-        n_splits: Number of splits needed (axis must have size >= n_splits)
-
-    Returns:
-        Axis index to split along
-    """
-    SPATIAL_LABELS = {'y', 'x', 'z', 'c'}
-
-    # Build label -> axis mapping (case-insensitive)
-    label_to_axis: Dict[str, int] = {}
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            label_to_axis[label.lower()] = ax
-
-    # Priority 1: Non-spatial axes (t, v, frame, unlabeled, etc.)
-    non_spatial_candidates: List[int] = []
-    if dim_labels:
-        for ax, label in enumerate(dim_labels):
-            if label.lower() not in SPATIAL_LABELS and shape[ax] >= n_splits:
-                non_spatial_candidates.append(ax)
-    else:
-        # No labels: treat all axes as non-spatial candidates, pick largest
-        non_spatial_candidates = [ax for ax in range(len(shape)) if shape[ax] >= n_splits]
-
-    if non_spatial_candidates:
-        return max(non_spatial_candidates, key=lambda ax: shape[ax])
-
-    # Priority 2: 'c' (channel)
-    if 'c' in label_to_axis and shape[label_to_axis['c']] >= n_splits:
-        return label_to_axis['c']
-
-    # Priority 3: 'z' (depth)
-    if 'z' in label_to_axis and shape[label_to_axis['z']] >= n_splits:
-        return label_to_axis['z']
-
-    # Priority 4: Larger of 'y' or 'x' (preserve spatial plane integrity)
-    y_axis = label_to_axis.get('y')
-    x_axis = label_to_axis.get('x')
-    if y_axis is not None and x_axis is not None:
-        if shape[y_axis] >= n_splits and shape[x_axis] >= n_splits:
-            return y_axis if shape[y_axis] >= shape[x_axis] else x_axis
-        elif shape[y_axis] >= n_splits:
-            return y_axis
-        elif shape[x_axis] >= n_splits:
-            return x_axis
-
-    # Fallback: largest axis (current behavior)
-    return max(range(len(shape)), key=lambda ax: shape[ax])
-
-
 # =============================================================================
 # Size Estimation Helpers
 # =============================================================================
@@ -354,16 +289,30 @@ def encode_chunk_id_with_scale(
     """
     base = encode_chunk_id(array_id, bounds)
 
-    method_bytes = reduction_method.encode('utf-8')
-    ndim = len(scale_hint)
+    method_bytes = reduction_method.encode("utf-8")
 
-    scale_payload = b''.join([
-        b''.join(struct.pack('>q', s) for s in scale_hint),
-        struct.pack('>H', len(method_bytes)),
-        method_bytes,
-    ])
+    scale_payload = b"".join(
+        [
+            b"".join(struct.pack(">q", s) for s in scale_hint),
+            struct.pack(">H", len(method_bytes)),
+            method_bytes,
+        ]
+    )
 
     return base + scale_payload
+
+
+def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
+    """``(ndim, bounds_end)`` for a chunk_id.
+
+    ``bounds_end`` is where the standard encoding (array_id + ndim + start +
+    stop) ends; any bytes past it are the scale payload of a scaled chunk_id
+    (see :func:`encode_chunk_id_with_scale`).
+    """
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    offset = 4 + array_id_len
+    ndim = struct.unpack(">H", chunk_id[offset : offset + 2])[0]
+    return ndim, offset + 2 + ndim * 8 + ndim * 8
 
 
 def is_scaled_chunk(chunk_id: bytes) -> bool:
@@ -375,11 +324,26 @@ def is_scaled_chunk(chunk_id: bytes) -> bool:
     Returns:
         True if chunk_id contains scale info
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    _, bounds_end = _bounds_end(chunk_id)
     return len(chunk_id) > bounds_end
+
+
+def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
+    """Canonical cache key for a chunk_id: the reduction method is advisory.
+
+    For a scaled chunk_id, returns array_id + bounds + scale_hint with the
+    trailing ``(uint16 method_len + method bytes)`` suffix dropped, so requests
+    that differ only in reduction_method share one cache entry -- the method
+    only decides how a true miss is computed (biopb/biopb#76). Non-scaled
+    chunk_ids are returned unchanged.
+
+    The result is an opaque cache key: it is NOT a valid chunk_id and must not
+    be fed to :func:`decode_scale_info` or forwarded on the wire.
+    """
+    ndim, bounds_end = _bounds_end(chunk_id)
+    if len(chunk_id) <= bounds_end:
+        return chunk_id
+    return chunk_id[: bounds_end + ndim * 8]
 
 
 def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
@@ -391,20 +355,23 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[Tuple[int, ...], str]:
     Returns:
         Tuple of (scale_hint, reduction_method)
     """
-    array_id_len = struct.unpack('>I', chunk_id[:4])[0]
-    offset = 4 + array_id_len
-    ndim = struct.unpack('>H', chunk_id[offset:offset + 2])[0]
-    bounds_end = offset + 2 + ndim * 8 + ndim * 8
+    ndim, bounds_end = _bounds_end(chunk_id)
 
     # Decode scale_hint
     scale_hint = []
     for ax in range(ndim):
-        scale_hint.append(struct.unpack('>q', chunk_id[bounds_end + ax*8:bounds_end + ax*8 + 8])[0])
+        scale_hint.append(
+            struct.unpack(
+                ">q", chunk_id[bounds_end + ax * 8 : bounds_end + ax * 8 + 8]
+            )[0]
+        )
 
     # Decode method
     method_offset = bounds_end + ndim * 8
-    method_len = struct.unpack('>H', chunk_id[method_offset:method_offset + 2])[0]
-    method = chunk_id[method_offset + 2:method_offset + 2 + method_len].decode('utf-8')
+    method_len = struct.unpack(">H", chunk_id[method_offset : method_offset + 2])[0]
+    method = chunk_id[method_offset + 2 : method_offset + 2 + method_len].decode(
+        "utf-8"
+    )
 
     return tuple(scale_hint), method
 
@@ -481,7 +448,7 @@ def compute_pyramid_scale_hints(
     if ndim < 2:
         return [[1] * ndim]
 
-    budget = pixel_budget_cubic_root ** 3
+    budget = pixel_budget_cubic_root**3
     floor = min(pixel_budget_cubic_root, threshold)
 
     y_idx, x_idx = _precache_xy_indices(shape, dim_labels)
@@ -555,8 +522,8 @@ def build_pyramid_plan(
     same extent ``get_read_plan`` returns for that scale, so a client can size
     the level without a probe read. ``native`` is False (computed, not on-disk).
 
-    For sources that ship a real pyramid, the adapter overrides this with native
-    levels (see ``SourceAdapter.get_native_pyramid_levels``); this is the generic
+    For tensors that ship a real pyramid, the adapter overrides this with native
+    levels (see ``TensorAdapter.get_native_pyramid_levels``); this is the generic
     fallback for everything else.
     """
     scales = compute_pyramid_scale_hints(
@@ -648,11 +615,13 @@ def _choose_split_axis_excluding(
 ) -> Optional[int]:
     """Choose axis for splitting, excluding already-split axes.
 
-    Uses same priority as _choose_split_axis but skips excluded axes.
+    Priority (highest first): non-spatial axes (t/v/frame/unlabeled, largest
+    wins), then 'c', then 'z', then the larger of 'y'/'x' -- skipping any axis
+    in exclude_axes and any that cannot accommodate n_splits.
 
     Returns None if no eligible axis can accommodate n_splits.
     """
-    SPATIAL_LABELS = {'y', 'x', 'z', 'c'}
+    SPATIAL_LABELS = {"y", "x", "z", "c"}
 
     # Build label -> axis mapping
     label_to_axis: Dict[str, int] = {}
@@ -661,8 +630,9 @@ def _choose_split_axis_excluding(
             label_to_axis[label.lower()] = ax
 
     # Eligible axes: not excluded and large enough for splits
-    eligible = [ax for ax in range(len(shape))
-                if ax not in exclude_axes and shape[ax] >= 2]
+    eligible = [
+        ax for ax in range(len(shape)) if ax not in exclude_axes and shape[ax] >= 2
+    ]
 
     if not eligible:
         return None
@@ -681,20 +651,20 @@ def _choose_split_axis_excluding(
         return max(non_spatial, key=lambda ax: shape[ax])
 
     # Priority 2: 'c' (channel)
-    if 'c' in label_to_axis:
-        c_ax = label_to_axis['c']
+    if "c" in label_to_axis:
+        c_ax = label_to_axis["c"]
         if c_ax in eligible:
             return c_ax
 
     # Priority 3: 'z' (depth)
-    if 'z' in label_to_axis:
-        z_ax = label_to_axis['z']
+    if "z" in label_to_axis:
+        z_ax = label_to_axis["z"]
         if z_ax in eligible:
             return z_ax
 
     # Priority 4: Larger of 'y' or 'x'
-    y_ax = label_to_axis.get('y')
-    x_ax = label_to_axis.get('x')
+    y_ax = label_to_axis.get("y")
+    x_ax = label_to_axis.get("x")
     y_eligible = y_ax in eligible if y_ax else False
     x_eligible = x_ax in eligible if x_ax else False
 

@@ -41,9 +41,7 @@ from ._jobs import run_on_main
 # Top-level package names whose objects are Qt-affine and must never be handed to
 # a worker thread unguarded. ``napari._qt`` (e.g. the QtViewer behind
 # ``viewer.window``) is matched separately by prefix.
-_QT_TOPLEVEL = frozenset(
-    {"PyQt6", "PyQt5", "PySide6", "PySide2", "qtpy", "vispy"}
-)
+_QT_TOPLEVEL = frozenset({"PyQt6", "PyQt5", "PySide6", "PySide2", "qtpy", "vispy"})
 
 
 class ViewerThreadError(RuntimeError):
@@ -65,9 +63,7 @@ def _is_proxy(value) -> bool:
 
 
 def _unwrap(value):
-    return (
-        object.__getattribute__(value, "_real") if _is_proxy(value) else value
-    )
+    return object.__getattribute__(value, "_real") if _is_proxy(value) else value
 
 
 def _marshal_call(bound):
@@ -216,9 +212,7 @@ def _proxy_cls(obj):
     if isinstance(obj, (EventedModel, Layer)):
         return _HandleProxy
     module = type(obj).__module__ or ""
-    if module.split(".", 1)[0] in _QT_TOPLEVEL or module.startswith(
-        "napari._qt"
-    ):
+    if module.split(".", 1)[0] in _QT_TOPLEVEL or module.startswith("napari._qt"):
         return _GuardProxy
     return None
 
@@ -227,9 +221,7 @@ def _proxy_cls(obj):
 # (``viewer.layers[0] is viewer.layers[0]``). The proxy strongly refs its real
 # object, so while the proxy is alive id(real) stays valid; the entry is weak so
 # it drops when the proxy is collected.
-_CACHE: "weakref.WeakValueDictionary[int, _ProxyBase]" = (
-    weakref.WeakValueDictionary()
-)
+_CACHE: "weakref.WeakValueDictionary[int, _ProxyBase]" = weakref.WeakValueDictionary()
 
 
 def wrap(obj):

@@ -1,11 +1,11 @@
 import warnings
-
-import numpy as np
-import dask.array as da
 from typing import Optional, Sequence, Tuple, Union
 
-from . import Pixels, BinData, ROI, Rectangle, Point, Mask, ImageData, Tensor
-from biopb.tensor.serialized_pb2 import SerializedTensor
+import dask.array as da
+import numpy as np
+
+from . import ROI, BinData, ImageData, Mask, Pixels, Point, Rectangle, Tensor
+
 # NOTE: TensorFlightClient is imported lazily inside the lazy_data branch below.
 # It pulls in pyarrow, whose compiled SSE4.2 baseline SIGILLs on pre-SSE4.2 CPUs
 # (e.g. old AMD Opterons). Keeping it out of the module top lets eager/pixels
@@ -25,7 +25,7 @@ def _canonicalize_dtype(dtype_str: str) -> str:
         Canonical dtype string without byteorder prefix (e.g., 'u1', 'f4', 'i2')
     """
     dt = np.dtype(dtype_str)
-    kind_map = {'u': 'u', 'i': 'i', 'f': 'f', 'c': 'c'}
+    kind_map = {"u": "u", "i": "i", "f": "f", "c": "c"}
     return kind_map[dt.kind] + str(dt.itemsize)
 
 
@@ -33,7 +33,7 @@ def _serialize_from_numpy(
     np_img: np.ndarray,
     dimension_order: str = "CXYZT",
     np_index_order: str = None,
-    **kwargs
+    **kwargs,
 ) -> Pixels:
     # Validate dimension_order (must be 5 chars, F-order)
     dimension_order = dimension_order.upper()
@@ -70,8 +70,7 @@ def _serialize_from_numpy(
             )
         if len(np_index_order) != len(set(np_index_order)):
             raise ValueError(
-                f"np_index_order must not have duplicate chars, "
-                f"got '{np_index_order}'"
+                f"np_index_order must not have duplicate chars, got '{np_index_order}'"
             )
         if np_img.ndim != len(np_index_order):
             raise ValueError(
@@ -80,21 +79,26 @@ def _serialize_from_numpy(
             )
 
     # Build size dict from input array (np_index_order is C-order: axis i -> letter i)
-    sizes = dict(zip(dimension_order, [1]*5))  # default size 1 for all dimensions
+    sizes = dict(zip(dimension_order, [1] * 5))  # default size 1 for all dimensions
     for i, axis in enumerate(np_index_order):
         sizes[axis] = np_img.shape[i]
 
     byteorder = np_img.dtype.byteorder
     if byteorder == "=":
         import sys
-        byteorder = "<" if sys.byteorder == 'little' else ">"
+
+        byteorder = "<" if sys.byteorder == "little" else ">"
 
     endianness = 1 if byteorder == "<" else 0
 
     # Build the transpose: for each axis in desired output order, find its position in input
     # desired_order_c lists axes from axis 0 to axis -1 (C-order index order)
-    desired_order_c = dimension_order[::-1]  # Reverse F-order to get C-order index order
-    transpose_axes = [np_index_order.index(axis) for axis in desired_order_c if axis in np_index_order]
+    desired_order_c = dimension_order[
+        ::-1
+    ]  # Reverse F-order to get C-order index order
+    transpose_axes = [
+        np_index_order.index(axis) for axis in desired_order_c if axis in np_index_order
+    ]
     np_img = np.transpose(np_img, axes=transpose_axes)
 
     # Ensure C-contiguous memory layout before tobytes()
@@ -104,32 +108,36 @@ def _serialize_from_numpy(
     np_img = np.ascontiguousarray(np_img)
 
     return Pixels(
-        bindata = BinData(data=np_img.tobytes(), endianness=endianness),
-        size_x = sizes['X'],
-        size_y = sizes['Y'],
-        size_c = sizes['C'],
-        size_z = sizes['Z'],
-        size_t = sizes['T'],
-        dimension_order = dimension_order,
-        dtype = _canonicalize_dtype(np_img.dtype.str),
+        bindata=BinData(data=np_img.tobytes(), endianness=endianness),
+        size_x=sizes["X"],
+        size_y=sizes["Y"],
+        size_c=sizes["C"],
+        size_z=sizes["Z"],
+        size_t=sizes["T"],
+        dimension_order=dimension_order,
+        dtype=_canonicalize_dtype(np_img.dtype.str),
         **kwargs,
     )
 
+
 def _deserialize_to_numpy(
-    pixels: Pixels,
-    *,
-    singleton_t: bool = True,
-    np_index_order: str = "ZYXC"
+    pixels: Pixels, *, singleton_t: bool = True, np_index_order: str = "ZYXC"
 ) -> np.ndarray:
     # Check for endianness conflict between dtype prefix and BinData field
     dtype_str = pixels.dtype
-    if dtype_str and dtype_str[0] in '<>|=':
+    if dtype_str and dtype_str[0] in "<>|=":
         dtype_prefix = dtype_str[0]
         # '=' means native byteorder, which could match either
-        if dtype_prefix != '=':
-            expected_endian = '<' if pixels.bindata.endianness == BinData.Endianness.LITTLE else '>'
+        if dtype_prefix != "=":
+            expected_endian = (
+                "<" if pixels.bindata.endianness == BinData.Endianness.LITTLE else ">"
+            )
             if dtype_prefix != expected_endian:
-                endianness_name = "LITTLE" if pixels.bindata.endianness == BinData.Endianness.LITTLE else "BIG"
+                endianness_name = (
+                    "LITTLE"
+                    if pixels.bindata.endianness == BinData.Endianness.LITTLE
+                    else "BIG"
+                )
                 warnings.warn(
                     f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
                     f"but BinData.endianness={endianness_name}. "
@@ -150,9 +158,7 @@ def _deserialize_to_numpy(
     np_index_order = np_index_order.upper()
     valid_chars = set("ZYXCT")
     if len(np_index_order) < 2 or len(np_index_order) > 5:
-        raise ValueError(
-            f"np_index_order must be 2-5 chars, got '{np_index_order}'"
-        )
+        raise ValueError(f"np_index_order must be 2-5 chars, got '{np_index_order}'")
     if not set(np_index_order).issubset(valid_chars):
         raise ValueError(
             f"np_index_order must contain only chars from 'ZYXCT', "
@@ -160,17 +166,16 @@ def _deserialize_to_numpy(
         )
     if len(np_index_order) != len(set(np_index_order)):
         raise ValueError(
-            f"np_index_order must not have duplicate chars, "
-            f"got '{np_index_order}'"
+            f"np_index_order must not have duplicate chars, got '{np_index_order}'"
         )
 
     # Get dimension sizes
     dims = dict(
-        Z = pixels.size_z or 1,
-        Y = pixels.size_y or 1,
-        X = pixels.size_x or 1,
-        C = pixels.size_c or 1,
-        T = pixels.size_t or 1,
+        Z=pixels.size_z or 1,
+        Y=pixels.size_y or 1,
+        X=pixels.size_x or 1,
+        C=pixels.size_c or 1,
+        T=pixels.size_t or 1,
     )
 
     # Validate: dimensions not in output must be singleton
@@ -209,20 +214,20 @@ def _deserialize_to_numpy(
     np_img = np_img.transpose(dim_orig)
 
     # Squeeze dimensions not in np_index_order (they should be singleton)
-    squeeze_axes = [i for i, axis in enumerate(full_target_order) if axis not in np_index_order]
+    squeeze_axes = [
+        i for i, axis in enumerate(full_target_order) if axis not in np_index_order
+    ]
     if squeeze_axes:
         for idx in sorted(squeeze_axes, reverse=True):
             np_img = np_img.squeeze(axis=idx)
 
     return np_img
 
+
 def deserialize_to_numpy(
-    pixels: Pixels,
-    *,
-    singleton_t: bool = True,
-    np_index_order: str = "ZYXC"
+    pixels: Pixels, *, singleton_t: bool = True, np_index_order: str = "ZYXC"
 ) -> np.ndarray:
-    '''Convert protobuf Pixels to a numpy array.
+    """Convert protobuf Pixels to a numpy array.
 
     Args:
         pixels: protobuf data
@@ -237,29 +242,30 @@ def deserialize_to_numpy(
     Returns:
         Numpy array (C-contiguous) with shape matching np_index_order.
         The dtype and byteorder matches the input.
-    '''
+    """
     # Deprecation warning for singleton_t
     if singleton_t is not True:
         warnings.warn(
             "singleton_t parameter is deprecated. Use np_index_order to control "
             "output dimensions (include T to preserve, exclude to squeeze).",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
-    
+
     return _deserialize_to_numpy(
         pixels,
         singleton_t=singleton_t,
         np_index_order=np_index_order,
     )
 
+
 def serialize_from_numpy(
     np_img: np.ndarray,
     dimension_order: str = "CXYZT",
     np_index_order: str = None,
-    **kwargs
+    **kwargs,
 ) -> Pixels:
-    '''Convert numpy array representation of image to protobuf representation.
+    """Convert numpy array representation of image to protobuf representation.
 
     Args:
         np_img: image as numpy array (any memory order is accepted)
@@ -279,11 +285,11 @@ def serialize_from_numpy(
 
     Returns:
         protobuf Pixels
-    '''
+    """
     warnings.warn(
         "serialize_from_numpy is deprecated. Use serialize_from_numpy_to_image_data instead to get ImageData protobuf.",
         DeprecationWarning,
-        stacklevel=2
+        stacklevel=2,
     )
     return _serialize_from_numpy(
         np_img,
@@ -291,6 +297,7 @@ def serialize_from_numpy(
         np_index_order=np_index_order,
         **kwargs,
     )
+
 
 def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
     """Convert a ROI protobuf to a binary mask.
@@ -310,12 +317,12 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
     dim = mask_.ndim
 
     if dim not in (2, 3):
-        raise ValueError(f'Illegal mask dimension {dim}.')
+        raise ValueError(f"Illegal mask dimension {dim}.")
 
     def _get_int_point(p):
         return (int(p.z), int(p.y), int(p.x))
 
-    roi_type = roi.WhichOneof('shape')
+    roi_type = roi.WhichOneof("shape")
     if roi_type == "point":
         if dim == 3:
             mask_[_get_int_point(roi.point)] = 1
@@ -326,13 +333,13 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
         tl = _get_int_point(roi.rectangle.top_left)
         br = _get_int_point(roi.rectangle.bottom_right)
         if dim == 3:
-            mask_[tl[0]:br[0], tl[1]:br[1], tl[2]:br[2]] = 1
+            mask_[tl[0] : br[0], tl[1] : br[1], tl[2] : br[2]] = 1
         else:
-            mask_[tl[1]:br[1], tl[2]:br[2]] = 1
+            mask_[tl[1] : br[1], tl[2] : br[2]] = 1
 
-    elif roi_type == 'polygon':
+    elif roi_type == "polygon":
         if dim != 2:
-            raise NotImplementedError('3D polygon not supported')
+            raise NotImplementedError("3D polygon not supported")
 
         try:
             import cv2
@@ -343,24 +350,24 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
             ) from e
 
         points = np.array([_get_int_point(p)[1:] for p in roi.polygon.points])
-        points = points.reshape(-1, 1, 2)[:, :, ::-1] # reverse x, y
+        points = points.reshape(-1, 1, 2)[:, :, ::-1]  # reverse x, y
 
         cv2.fillPoly(mask_, [points], color=1)
-    
-    elif roi_type == 'mask':
+
+    elif roi_type == "mask":
         tl = _get_int_point(roi.mask.rectangle.top_left)
         br = _get_int_point(roi.mask.rectangle.bottom_right)
 
-        bitorder = 'big' if roi.mask.bin_data.endianness == 0 else 'little'
-        data = np.frombuffer(roi.mask.bin_data.data, dtype='uint8')
+        bitorder = "big" if roi.mask.bin_data.endianness == 0 else "little"
+        data = np.frombuffer(roi.mask.bin_data.data, dtype="uint8")
         data = np.unpackbits(data, bitorder=bitorder)
 
         if dim == 3:
-            rect = mask_[tl[0]:br[0], tl[1]:br[1], tl[2]:br[2]]
+            rect = mask_[tl[0] : br[0], tl[1] : br[1], tl[2] : br[2]]
         else:
-            rect = mask_[tl[1]:br[1], tl[2]:br[2]]
+            rect = mask_[tl[1] : br[1], tl[2] : br[2]]
 
-        rect[:] = data[:rect.size].reshape(rect.shape)
+        rect[:] = data[: rect.size].reshape(rect.shape)
 
     else:
         raise NotImplementedError(f"ROI type: {roi_type}")
@@ -368,7 +375,7 @@ def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
     return mask_.astype(mask.dtype)
 
 
-def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
+def mask_to_roi(mask: np.ndarray, *, bitorder: str = "big") -> ROI:
     """Convert a binary mask to a ROI protobuf.
 
     Args:
@@ -379,14 +386,14 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
         ROI protobuf message containing the mask data.
     """
     dim = mask.ndim
-    
+
     if dim == 2:
         yp, xp = np.where(mask)
         ymin, xmin = yp.min(), xp.min()
         ymax, xmax = yp.max() + 1, xp.max() + 1
         rect = Rectangle(
-            top_left = Point(y=ymin, x=xmin),
-            bottom_right = Point(y=ymax, x=xmax),
+            top_left=Point(y=ymin, x=xmin),
+            bottom_right=Point(y=ymax, x=xmax),
         )
         pixels = mask[ymin:ymax, xmin:xmax]
 
@@ -395,23 +402,27 @@ def mask_to_roi(mask: np.ndarray, *, bitorder: str = 'big') -> ROI:
         zmin, ymin, xmin = zp.min(), yp.min(), xp.min()
         zmax, ymax, xmax = zp.max() + 1, yp.max() + 1, xp.max() + 1
         rect = Rectangle(
-            top_left = Point(z=zmin, y=ymin, x=xmin),
-            bottom_right = Point(z=zmax, y=ymax, x=xmax),
+            top_left=Point(z=zmin, y=ymin, x=xmin),
+            bottom_right=Point(z=zmax, y=ymax, x=xmax),
         )
         pixels = mask[zmin:zmax, ymin:ymax, xmin:xmax]
 
-    roi = ROI( mask = Mask(
-        rectangle = rect,
-        bin_data = BinData(
-            data = np.packbits(pixels, bitorder=bitorder).tobytes(),
-            endianness = 0 if bitorder == 'big' else 1,
-        )),
+    roi = ROI(
+        mask=Mask(
+            rectangle=rect,
+            bin_data=BinData(
+                data=np.packbits(pixels, bitorder=bitorder).tobytes(),
+                endianness=0 if bitorder == "big" else 1,
+            ),
+        ),
     )
 
     return roi
 
 
-def get_image_data_dim_labels(image_data: ImageData, *, implicit: bool = False) -> Optional[Sequence[str]]:
+def get_image_data_dim_labels(
+    image_data: ImageData, *, implicit: bool = False
+) -> Optional[Sequence[str]]:
     """Get a copy of the dimension labels from ImageData.
 
     Args:
@@ -427,10 +438,10 @@ def get_image_data_dim_labels(image_data: ImageData, *, implicit: bool = False) 
         List of dimension labels, or None if unset and implicit=False or
         heuristics don't apply.
     """
-    data_type = image_data.WhichOneof('data')
-    if data_type == 'eager_data':
+    data_type = image_data.WhichOneof("data")
+    if data_type == "eager_data":
         dim_labels = image_data.eager_data.dim_labels
-    elif data_type == 'lazy_data':
+    elif data_type == "lazy_data":
         dim_labels = image_data.lazy_data.tensor_descriptor.dim_labels
     else:
         dim_labels = None
@@ -449,12 +460,12 @@ def get_image_data_dim_labels(image_data: ImageData, *, implicit: bool = False) 
     ndim = len(shape)
 
     if ndim == 2:
-        return ['y', 'x']
+        return ["y", "x"]
     elif ndim == 3:
         if shape[0] <= 4:
-            return ['c', 'y', 'x']
+            return ["c", "y", "x"]
         elif shape[-1] <= 4:
-            return ['y', 'x', 'c']
+            return ["y", "x", "c"]
         else:
             return None
     else:
@@ -462,10 +473,10 @@ def get_image_data_dim_labels(image_data: ImageData, *, implicit: bool = False) 
 
 
 def get_image_data_shape(image_data: ImageData) -> Optional[Tuple[int]]:
-    data_type = image_data.WhichOneof('data')
-    if data_type == 'eager_data':
+    data_type = image_data.WhichOneof("data")
+    if data_type == "eager_data":
         return tuple(image_data.eager_data.dims)
-    elif data_type == 'lazy_data':
+    elif data_type == "lazy_data":
         return tuple(image_data.lazy_data.tensor_descriptor.shape)
     else:
         return None
@@ -474,13 +485,19 @@ def get_image_data_shape(image_data: ImageData) -> Optional[Tuple[int]]:
 def _np_from_pb(tensor: Tensor) -> np.ndarray:
     """Helper to convert protobuf Tensor to numpy array."""
     dtype_str = tensor.dtype
-    if dtype_str and dtype_str[0] in '<>|=':
+    if dtype_str and dtype_str[0] in "<>|=":
         dtype_prefix = dtype_str[0]
         # '=' means native byteorder, which could match either
-        if dtype_prefix != '=':
-            expected_endian = '<' if tensor.bindata.endianness == BinData.Endianness.LITTLE else '>'
+        if dtype_prefix != "=":
+            expected_endian = (
+                "<" if tensor.bindata.endianness == BinData.Endianness.LITTLE else ">"
+            )
             if dtype_prefix != expected_endian:
-                endianness_name = "LITTLE" if tensor.bindata.endianness == BinData.Endianness.LITTLE else "BIG"
+                endianness_name = (
+                    "LITTLE"
+                    if tensor.bindata.endianness == BinData.Endianness.LITTLE
+                    else "BIG"
+                )
                 warnings.warn(
                     f"Endianness conflict: dtype={dtype_str} indicates {dtype_prefix}-endian "
                     f"but BinData.endianness={endianness_name}. "
@@ -496,7 +513,7 @@ def _np_from_pb(tensor: Tensor) -> np.ndarray:
             dt = dt.newbyteorder("<")
 
         return dt
-    
+
     np_array = np.frombuffer(
         tensor.bindata.data,
         dtype=_get_dtype(),
@@ -504,20 +521,23 @@ def _np_from_pb(tensor: Tensor) -> np.ndarray:
     return np_array.reshape(tuple(tensor.dims))
 
 
-def _pb_from_np(np_array: np.ndarray, *, dim_labels: Optional[Sequence[str]] = None) -> Tensor:
+def _pb_from_np(
+    np_array: np.ndarray, *, dim_labels: Optional[Sequence[str]] = None
+) -> Tensor:
     dtype = _canonicalize_dtype(np_array.dtype.str)
 
     byteorder = np_array.dtype.byteorder
     if byteorder == "=":
         import sys
-        byteorder = "<" if sys.byteorder == 'little' else ">"
+
+        byteorder = "<" if sys.byteorder == "little" else ">"
 
     endianness = 1 if byteorder == "<" else 0
 
     tensor = Tensor(
-        bindata = BinData(data=np_array.tobytes(), endianness=endianness),
-        dims = list(np_array.shape),
-        dtype = dtype,
+        bindata=BinData(data=np_array.tobytes(), endianness=endianness),
+        dims=list(np_array.shape),
+        dtype=dtype,
     )
     if dim_labels:
         if len(dim_labels) != np_array.ndim:
@@ -533,7 +553,7 @@ def deserialize_image_data(
     *,
     cache_bytes: int = 1_000_000_000,
 ) -> Union[np.ndarray, da.Array]:
-    '''Convert protobuf ImageData to a numpy array or dask array.
+    """Convert protobuf ImageData to a numpy array or dask array.
 
     Handles both eager (inline) and lazy (Flight server) data representations.
     Also handles legacy pixels field for backward compatibility.
@@ -541,30 +561,32 @@ def deserialize_image_data(
     Args:
         image_data: protobuf ImageData message
     Keyword Args:
-        output_dim_order: Output dimension order string for eager_data deserialization. Default to input order.
         cache_bytes: Cache size for lazy_data chunk cache (default 1GB).
 
     Returns:
         numpy array for eager_data, or dask array for lazy_data.
-    '''
+    """
     # Check oneof field
-    data_type = image_data.WhichOneof('data')
+    data_type = image_data.WhichOneof("data")
 
-    if data_type == 'eager_data':
+    if data_type == "eager_data":
         return _np_from_pb(image_data.eager_data)
-    elif data_type == 'lazy_data':
+    elif data_type == "lazy_data":
         from biopb.tensor.client import TensorFlightClient
+
         return TensorFlightClient.tensor_from_pb(
             image_data.lazy_data,
             cache_bytes=cache_bytes,
         )
     elif data_type is None:
         # Legacy fallback: check deprecated pixels field
-        if image_data.HasField('pixels'):
+        if image_data.HasField("pixels"):
             dim_order = image_data.pixels.dimension_order
             return deserialize_to_numpy(
                 image_data.pixels,
-                np_index_order=dim_order[::-1], # dimension_order is F-order, so reverse for C-order index
+                np_index_order=dim_order[
+                    ::-1
+                ],  # dimension_order is F-order, so reverse for C-order index
             )
         else:
             raise ValueError("ImageData has no data field set")
@@ -636,13 +658,16 @@ def normalize_array_dims(
 
     # Step 1: Squeeze dimensions not in target
     if squeeze_dims:
-        squeeze_axes = tuple(i for i, label in enumerate(dim_labels_upper) if label in squeeze_dims)
-        if isinstance(arr, da.Array):
-            arr = arr.squeeze(axis=squeeze_axes)
-        else:
-            arr = arr.squeeze(axis=squeeze_axes)
-        dim_labels = [label for i, label in enumerate(dim_labels) if i not in squeeze_axes]
-        dim_labels_upper = [label for label in dim_labels_upper if label not in squeeze_dims]
+        squeeze_axes = tuple(
+            i for i, label in enumerate(dim_labels_upper) if label in squeeze_dims
+        )
+        arr = arr.squeeze(axis=squeeze_axes)
+        dim_labels = [
+            label for i, label in enumerate(dim_labels) if i not in squeeze_axes
+        ]
+        dim_labels_upper = [
+            label for label in dim_labels_upper if label not in squeeze_dims
+        ]
 
     # Step 2: Insert singleton dimensions for labels in target but not source
     for target_label in target_dim_labels:
@@ -657,7 +682,9 @@ def normalize_array_dims(
 
     # Step 3: Transpose to match target order
     if dim_labels_upper != target_dim_labels_upper:
-        transpose_axes = tuple(dim_labels_upper.index(label) for label in target_dim_labels_upper)
+        transpose_axes = tuple(
+            dim_labels_upper.index(label) for label in target_dim_labels_upper
+        )
         arr = arr.transpose(transpose_axes)
 
     return arr
@@ -668,7 +695,7 @@ def serialize_from_numpy_to_image_data(
     *,
     dim_labels: Optional[Sequence[str]] = None,
 ) -> ImageData:
-    '''Convert numpy array to protobuf ImageData with eager_data.
+    """Convert numpy array to protobuf ImageData with eager_data.
 
     Args:
         np_img: image as numpy array (any memory order is accepted)
@@ -676,7 +703,7 @@ def serialize_from_numpy_to_image_data(
         dim_labels: Dimension labels for the tensor. Must be same length as np_img.ndim.
     Returns:
         protobuf ImageData with eager_data set.
-    '''
+    """
     tensor = _pb_from_np(
         np_img,
         dim_labels=dim_labels,

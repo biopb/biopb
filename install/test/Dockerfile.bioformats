@@ -1,11 +1,11 @@
 # Scenario: Bio-Formats / ZVI support, end-to-end
-# Verifies that selecting the Bio-Formats component during install pulls the
+# Verifies that opting into Bio-Formats during install pulls the
 # aicsimageio[bioformats] + scyjava + cjdk stack, that cjdk auto-fetches a JDK
 # on first use (NO system Java is installed here, on purpose -- that is the whole
 # point), and that a ZVI file can actually be read.
 #
 # Manual flow:
-#   1. bash /install.sh        # tick the "Bio-Formats support" component
+#   1. BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh   # opt into Bio-Formats
 #   2. /verify_bioformats.sh   # checks adapter, jar, JVM auto-fetch, ZVI read
 #
 # A ZVI sample is optional: mount one with
@@ -45,7 +45,7 @@ RUN if [ -n "$ZVI_SAMPLE_URL" ]; then \
 # Verification script (generated inline, like Dockerfile.rerun's config heredoc).
 RUN cat > /verify_bioformats.sh << 'OUTER'
 #!/bin/bash
-# Verify the Bio-Formats component installed by install.sh works end-to-end.
+# Verify the Bio-Formats extra installed by install.sh works end-to-end.
 set -uo pipefail
 
 # Locate the python of the biopb-tensor-server uv tool environment, where the
@@ -59,7 +59,7 @@ if [ ! -x "$TOOL_PY" ]; then
 fi
 if [ ! -x "$TOOL_PY" ]; then
     echo "ERROR: could not find the biopb-tensor-server tool environment."
-    echo "Run 'bash /install.sh' and tick the Bio-Formats component first."
+    echo "Run 'BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh' first."
     exit 2
 fi
 echo "Using interpreter: $TOOL_PY"

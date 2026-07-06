@@ -20,6 +20,7 @@ Caching behavior depends on the configured CacheManager backend:
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import lcm
@@ -35,6 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.chunk import (
     ChunkEndpoint,
+    cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
     decode_scale_info,
@@ -51,13 +53,110 @@ from biopb_tensor_server.downsample import (
     get_output_dtype,
     normalize_reduction_method,
 )
+from biopb_tensor_server.errors import SourceUnresolvedError
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from biopb.tensor.descriptor_pb2 import PyramidLevel
+
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
+
+
+# --- unified chunk wire schema (biopb/biopb#293) ----------------------------
+# Every chunk crosses the wire as an opaque binary blob plus its numpy dtype
+# string, NOT a typed Arrow ``list<T>``. Arrow arrays are always native-endian,
+# so a typed encoding cannot carry a big-endian source (FITS is ``>i2``) --
+# ``pa.array()`` raises "Byte-swapped arrays not supported". Serializing the raw
+# bytes and reconstructing them client-side with ``np.frombuffer(buf, dtype_str)``
+# preserves the exact dtype (endianness included) and is zero-copy on both ends:
+# the server wraps the numpy buffer with no per-element copy, and the cache
+# stores/serves this same schema with no typed<->binary conversion. It is the ONE
+# schema for the do_get wire, the file cache (``UNIFIED_SCHEMA``), and the memory
+# cache. (Cross-language clients decode the binary column per the dtype string;
+# see the Java client's ``SerializableTensorImg``.)
+CHUNK_WIRE_SCHEMA = pa.schema(
+    [
+        pa.field("data", pa.binary()),
+        pa.field("shape", pa.list_(pa.int64())),
+        pa.field("dtype", pa.string()),
+    ]
+)
+
+
+def pack_chunk_batch(arr: np.ndarray) -> pa.RecordBatch:
+    """Pack a chunk's numpy array into the unified binary RecordBatch (one row).
+
+    Zero-copy: the array's bytes are wrapped as an Arrow buffer without a copy
+    (made C-contiguous first, which copies only a non-contiguous view). The dtype
+    string carries endianness, so byte-swapped sources round-trip losslessly.
+    See ``CHUNK_WIRE_SCHEMA`` / biopb/biopb#293.
+    """
+    arr = np.ascontiguousarray(arr)
+    data_buf = pa.py_buffer(arr)  # keeps ``arr`` alive; no element copy
+    offsets = pa.py_buffer(np.array([0, data_buf.size], dtype=np.int32))
+    data_col = pa.Array.from_buffers(pa.binary(), 1, [None, offsets, data_buf])
+    return pa.RecordBatch.from_arrays(
+        [data_col, pa.array([list(arr.shape)]), pa.array([arr.dtype.str])],
+        schema=CHUNK_WIRE_SCHEMA,
+    )
+
+
+def unpack_chunk_array(batch: pa.RecordBatch) -> np.ndarray:
+    """Reconstruct a chunk's numpy array from a unified binary RecordBatch.
+
+    Inverse of :func:`pack_chunk_batch`: reads the raw bytes and reinterprets them
+    with the per-chunk dtype string, so numpy applies the correct (possibly
+    non-native) byte order. Returns an owned copy so it stays valid after any
+    backing mmap is released. (The Python Flight client has its own copy of this
+    logic, ``_array_from_unified_batch``, since the core ``biopb`` package cannot
+    import server code.)
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    data_buf = batch.column("data").buffers()[2]
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
+    return arr.reshape(shape).copy()
+
+
+# A real URL scheme is 2+ chars followed by "://" (so a bare Windows drive
+# "C:\..." — one char then ":" then "\" — never matches).
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]+://")
+# A forward-slashed Windows absolute path: "C:/Users/...".
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def to_catalog_url(raw: str) -> str:
+    """Normalize a source's URL for the catalog (the descriptor's ``source_url``).
+
+    Local filesystem paths are rewritten to a forward-slash ``file://`` form so a
+    Windows-indexed catalog is byte-for-byte consistent with a POSIX one and every
+    consumer can split on ``/`` alone (biopb/biopb#131)::
+
+        C:\\Users\\me\\Screenshots 1\\img.png  ->  file:///C:/Users/me/Screenshots 1/img.png
+        /data/cells/img.tif                    ->  file:///data/cells/img.tif
+
+    Separators only: spaces / unicode are left literal for readability, not
+    percent-encoded. Already-schemed URLs are returned unchanged — remote stores
+    (s3://, http://, …), an existing ``file://``, and virtual schemes (cache://).
+
+    This is display/catalog only and must not be fed back to the filesystem
+    (callers keep the raw path for that). ``source_id`` is unaffected: it hashes
+    the resolved path, not this string, so the normalization needs no re-index.
+    """
+    if not raw:
+        return raw
+    if _URL_SCHEME_RE.match(raw):
+        return raw  # already a URL (remote / file:// / cache:// / …)
+    fwd = raw.replace("\\", "/")
+    if _WIN_DRIVE_RE.match(fwd):
+        return "file:///" + fwd  # Windows absolute -> file:///C:/...
+    if fwd.startswith("/"):
+        return "file://" + fwd  # POSIX absolute -> file:///data/... (// + /data)
+    return "file:///" + fwd.lstrip("/")  # relative / other: best effort
 
 
 @dataclass
@@ -68,13 +167,31 @@ class TensorReadPlan:
     chunk_endpoints: List[ChunkEndpoint]
 
 
+def require_resolved(desc: TensorDescriptor) -> None:
+    """Guard the read-planning boundary against an unresolved descriptor.
+
+    A descriptor is "resolved" iff it carries a concrete shape and dtype. An
+    unresolved one (e.g. a not-yet-hydrated cloud source) would otherwise crash
+    deep in the planner -- ``np.dtype("")`` in ``get_arrow_schema`` or the
+    pyramid/ndim logic in ``chunk`` -- with raw, illegible errors. Fail here
+    with a clean ``SourceUnresolvedError`` instead.
+    """
+    if not desc.shape or not desc.dtype:
+        raise SourceUnresolvedError(
+            f"tensor {desc.array_id!r} is unresolved (shape/dtype unknown) -- "
+            f"open the source to resolve it"
+        )
+
+
 class SourceAdapter(ABC):
     """Abstract base class for source-level adapters.
 
     Each adapter handles a specific storage format (Zarr, HDF5, OME-TIFF, etc.)
     and provides methods to discover tensors and read metadata.
 
-    Adapters must implement the claim() method to detect if they handle a given path.
+    Adapters that participate in filesystem auto-discovery override the claim()
+    classmethod to detect whether they handle a given path; it is not abstract
+    (the default claims nothing) so a config-only format like HDF5 can opt out.
     """
 
     # Required fields
@@ -82,6 +199,16 @@ class SourceAdapter(ABC):
     _source_url: str  # URL/path to the data source
     _source_type: str  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
+
+    # Display-only override for the catalog ``source_url`` (the descriptor field
+    # the tensor-browser / web viewer group the tree by). Normally None, so the
+    # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
+    # The drag-drop runtime-add path sets it to a re-rooted url so each drop
+    # renders as its own top-level root instead of nesting deep under the shared
+    # absolute-path tree (see SourceManager._drop_catalog_url). It never touches
+    # ``_source_url`` (filesystem ops) or ``source_id`` (path hash), so it is
+    # purely cosmetic and needs no re-index.
+    _catalog_url: Optional[str] = None
 
     @property
     def array_id(self) -> str:
@@ -97,7 +224,7 @@ class SourceAdapter(ABC):
         return f"{self.source_id}/{self._tensor_name}"
 
     @classmethod
-    def claim(cls, ctx: "ClaimContext", state: "DiscoveryState") -> Optional["SourceClaim"]:
+    def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
         """Claim a filesystem path as a data source.
 
         This method is called during discovery to detect if this adapter
@@ -118,7 +245,9 @@ class SourceAdapter(ABC):
 
     @classmethod
     @abstractmethod
-    def create_from_config(cls, source: "SourceConfig", credentials_config: Optional[Any] = None) -> "SourceAdapter":
+    def create_from_config(
+        cls, source: SourceConfig, credentials_config: Optional[Any] = None
+    ) -> SourceAdapter:
         """Create adapter instance from SourceConfig.
 
         This is used by the server to instantiate adapters based on discovery claims.
@@ -130,8 +259,6 @@ class SourceAdapter(ABC):
         Returns:
             An instance of a SourceAdapter subclass initialized with the provided config
         """
-        pass
-
 
     @abstractmethod
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
@@ -160,18 +287,27 @@ class SourceAdapter(ABC):
             Recommended optional fields:
             - dim_labels: Dimension labels (cheap to include)
         """
-        pass    
-
 
     @abstractmethod
     def get_metadata(self) -> dict:
         """Return metadata as dict. In most cases this is OME metadata.
 
-        Used by the metadata engine to create database. 
+        Used by the metadata engine to create database.
         Will be serialized to metadata_json in TensorDescriptor.
         """
-        pass
 
+    def metadata_covers_all_tensors(self) -> bool:
+        """Whether ``get_metadata()`` applies to *every* tensor of this source.
+
+        When True (the default), the catalog's source-level ``metadata_json`` is a
+        valid serve answer for any tensor, so ``GetFlightInfo(with_metadata)`` may
+        read it from the catalog instead of recomputing on the adapter
+        (biopb/biopb#253). Override to False when metadata is genuinely per-tensor
+        (OME-Zarr HCS plates: the source row holds the *plate* ``.zattrs``, which
+        is not any individual field's OME metadata) so the serve path falls back
+        to the per-tensor ``get_metadata()`` for correctness.
+        """
+        return True
 
     def get_source_descriptor(self) -> DataSourceDescriptor:
         """Build DataSourceDescriptor from this adapter.
@@ -181,14 +317,64 @@ class SourceAdapter(ABC):
         """
         return DataSourceDescriptor(
             source_id=self.source_id,
-            source_url=self._source_url,
+            source_url=self._catalog_url or to_catalog_url(self._source_url),
             source_type=self._source_type,
             tensors=self.list_tensor_descriptors(),
             metadata_json="",  # filled by GetFlightInfo()
+            data_resident=self.is_resident(),
         )
 
+    def resolve(self) -> DataSourceDescriptor:
+        """Hydrate this source if needed, then return its full descriptor.
 
-    def get_tensor_adapter(self, tensor_id: str|None) -> 'TensorAdapter':
+        This is the ONE consented entry point that may perform an extended,
+        blocking recall (e.g. downloading a whole cloud / synced-folder file).
+        It is the sole resolution trigger: the serve paths (get_tensor_adapter ->
+        GetFlightInfo / DoGet) never resolve on their own -- they raise
+        SourceUnresolvedError on an unresolved source so the only thing that
+        downloads is an explicit ``resolve``.
+
+        For an already-resident source this is a cheap no-op that just returns the
+        current descriptor (idempotent), so the server's ``resolve`` action works
+        uniformly across all source kinds. ``UnresolvedSourceAdapter`` overrides
+        it to actually hydrate.
+        """
+        return self.get_source_descriptor()
+
+    def is_resident(self) -> bool:
+        """Best-effort, recall-free: is this source's content local and cheap to
+        read right now?
+
+        Remote (fsspec) sources are never resident until their pixels are
+        materialized into a local copy (a later phase); a local source is
+        resident unless it is an offline cloud placeholder. This is the
+        authoritative, point-in-time residency gate -- VOLATILE, so evaluate it
+        at the moment of use and never cache the result. ``data_resident`` on the
+        descriptor is only an advisory snapshot of this.
+        """
+        # Lazy import: base <-> discovery only cross-import under TYPE_CHECKING,
+        # so importing these at module scope would be circular.
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import (
+            _is_offline_placeholder,
+            is_remote_url,
+        )
+
+        if is_remote_url(self._source_url):
+            return False
+        path = Path(self._source_url)
+        # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
+        # -- discovery only consults it for files (see should_skip_walk_entry,
+        # which gates it on `not is_dir`). A directory-based source (zarr,
+        # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
+        # (e.g. macOS APFS), so applying the file check to it would wrongly flag
+        # an entirely local store as non-resident. Treat a directory as resident.
+        if path.is_dir():
+            return True
+        return not _is_offline_placeholder(path)
+
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
 
         Transitions the adapter from source context to tensor context.
@@ -213,56 +399,8 @@ class SourceAdapter(ABC):
         is returned unchanged. Idempotent with the server's own reduction.
         """
         if tensor_id and self.source_id and tensor_id.startswith(f"{self.source_id}/"):
-            return tensor_id[len(self.source_id) + 1:]
+            return tensor_id[len(self.source_id) + 1 :]
         return tensor_id
-
-
-    def has_native_pyramid(self) -> bool:
-        """Whether this source ships a well-formed multi-resolution pyramid.
-
-        Default False. Formats that natively store precomputed downsampled
-        levels (e.g. OME-Zarr multiscales) override this to report True, which
-        lets the precache worker skip them -- they already serve overviews
-        cheaply from their own coarse levels.
-        """
-        return False
-
-    def get_native_pyramid_levels(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[List["PyramidLevel"]]:
-        """Native (precomputed on-disk) pyramid levels for *tensor_id*, or None.
-
-        Returns ``None`` for formats without a real on-disk pyramid (the default),
-        in which case the server advertises a *computed* pyramid via
-        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
-        natively (e.g. OME-Zarr multiscales) override this to return one
-        ``PyramidLevel`` per native dataset, each with ``native=True`` and
-        ``reduction_method="precompute"`` so the client requests the on-disk level
-        directly. Each level's ``scale_hint`` MUST be the value the adapter's own
-        ``get_read_plan`` "precompute" routing matches on, so an advertised level
-        round-trips to its dataset.
-        """
-        return None
-
-    def get_physical_scale(
-        self, tensor_id: Optional[str] = None
-    ) -> Optional[Tuple[List[float], List[str]]]:
-        """Per-dimension physical pixel size + unit, source axis order.
-
-        Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
-        ``dim_labels`` this source's ``get_tensor_descriptor()`` emits (so the
-        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` without remapping). Element ``i`` is the physical
-        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
-        dimension with no known physical size (e.g. T/C axes).
-
-        Returns ``None`` when no physical sizes are known. This is the compact
-        ~200-byte summary the tensor-load hot path needs (issue #31), so it must
-        be **cheap** -- read it straight off the resident metadata model, never
-        a full ``get_metadata()`` dump. Default ``None``; format adapters that
-        carry physical voxel sizes override it.
-        """
-        return None
 
 
 class TensorAdapter(ABC):
@@ -291,19 +429,43 @@ class TensorAdapter(ABC):
             TensorDescriptor with required fields populated (see list_tensor_descriptors
             for field requirements).
         """
-        pass
 
     def get_chunk_size(self) -> Tuple[int, ...]:
         """Return the chunk size for this tensor adapter.
+
+        A descriptor may legitimately carry an empty ``chunk_shape`` -- it is
+        documented as "can be empty [] if not readily available"
+        (:meth:`get_tensor_descriptor`), and the lean ListFlights form omits it,
+        so a descriptor sourced from the catalog (e.g. the bulk-seeded remote
+        proxy, biopb/biopb#266) may have none. Rather than hand the read planner
+        a too-short tuple -- which indexes out of range against the full-rank
+        shape (biopb/biopb#292, IndexError in ``_get_read_plan``) -- derive the
+        default transfer grid from the full shape: one chunk covering the whole
+        tensor, then split under ``MAX_ARROW_BATCH_BYTES`` (non-spatial axes
+        first, Y-X plane kept whole). This is the same sizing policy the server
+        applies everywhere else, so an empty/partial ``chunk_shape`` reads
+        identically to one that was advertised.
+
+        An *unresolved* descriptor (empty shape/dtype -- e.g. a not-yet-hydrated
+        cloud/remote source) is rejected up front: the fallback would otherwise
+        reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
+        illegible ``TypeError``. ``require_resolved`` converts it to a clean
+        ``SourceUnresolvedError`` at this read-planning boundary, exactly as
+        ``get_arrow_schema`` and ``_get_read_plan`` already do.
 
         Returns:
             Tuple of chunk dimensions (e.g., (64, 64, 64) for 3D chunks)
         """
         desc = self.get_tensor_descriptor()
-        return tuple(int(dim) for dim in desc.chunk_shape)
+        require_resolved(desc)
+        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
+        shape = tuple(int(dim) for dim in desc.shape)
+        if len(chunk_shape) == len(shape):
+            return chunk_shape
+        # Empty or rank-mismatched chunk_shape: fall back to the default grid.
+        return compute_safe_chunk_size(shape, desc.dtype, list(desc.dim_labels))
 
-
-    @abstractmethod    
+    @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the backend.
         Subclasses should call super().get_data(bounds) to validate bounds,
@@ -318,7 +480,6 @@ class TensorAdapter(ABC):
         desc = self.get_tensor_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
-
 
     def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
         """Validate that bounds are within array shape.
@@ -344,39 +505,44 @@ class TensorAdapter(ABC):
             if s >= e:
                 raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
 
-
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
 
-        Schema format:
-        - data: list<dtype> - flattened tensor elements per chunk
+        Schema format (the unified binary wire schema, biopb/biopb#293):
+        - data: binary - the chunk's raw C-contiguous bytes per row
         - shape: list<int64> - shape tuple per chunk
-        - dtype: string - numpy dtype string per chunk
+        - dtype: string - numpy dtype string (carries endianness) per chunk
 
-        Each RecordBatch has 1 row per chunk, making data self-describing.
+        Each RecordBatch has 1 row per chunk, making data self-describing. The
+        client reconstructs the array with ``np.frombuffer(data, dtype)``; see
+        ``CHUNK_WIRE_SCHEMA``.
 
         Returns:
             Arrow Schema with data, shape, and dtype fields
         """
         import importlib.metadata
 
+        from biopb.tensor._wire_version import (
+            TENSOR_WIRE_PROTOCOL_VERSION,
+            WIRE_PROTOCOL_METADATA_KEY,
+        )
+
         desc = desc or self.get_tensor_descriptor()
+        require_resolved(desc)
 
-        dtype = np.dtype(desc.dtype)
-        data_field = pa.field("data", pa.list_(pa.from_numpy_dtype(dtype)))
-        shape_field = pa.field("shape", pa.list_(pa.int64()))
-        dtype_field = pa.field("dtype", pa.string())
-
-        # Schema metadata: server version for compatibility tracking and feature detection
+        # Schema metadata: the wire-protocol version is the hard compatibility
+        # gate the client enforces (biopb/biopb#293); tensor_schema_version is
+        # kept as an informational package-version tag.
         metadata = {
             "tensor_schema_version": importlib.metadata.version("biopb-tensor-server"),
+            WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
 
-        return pa.schema([data_field, shape_field, dtype_field], metadata=metadata)
-
+        return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
     def resolve_chunk_data(
-        self, chunk_id: bytes,
+        self,
+        chunk_id: bytes,
         cache_manager: Optional[CacheManager] = None,
     ) -> pa.RecordBatch:
         """Resolve chunk data, handling scaled chunks and backend caching.
@@ -407,30 +573,28 @@ class TensorAdapter(ABC):
             if is_scaled_chunk_flag:
                 scale_hint, reduction_method = decode_scale_info(chunk_id)
                 # Crop and downsample (no padding needed - bounds aligned via floor_div)
-                result_arr = downsample_block(
-                    result_arr, scale_hint, reduction_method
-                )
+                result_arr = downsample_block(result_arr, scale_hint, reduction_method)
 
-            logical_shape = list(result_arr.shape)
-            dtype_str = str(result_arr.dtype)
-
-            result = pa.RecordBatch.from_arrays(
-                [
-                    pa.array([result_arr.ravel()]),
-                    pa.array([logical_shape]),
-                    pa.array([dtype_str]),
-                ],
-                ["data", "shape", "dtype"]
-            )
+            # Serialize into the unified binary wire schema: raw bytes + dtype
+            # string, wrapped zero-copy. This preserves the exact dtype including
+            # endianness (big-endian FITS '>i2' round-trips without conversion)
+            # and avoids the per-element typed-list encoding (biopb/biopb#293).
+            result = pack_chunk_batch(result_arr)
             return result, result_arr.nbytes
 
         if should_cache:
-            entry = cache_manager.get_or_acquire(chunk_id, compute_fn, metadata={'array_id': array_id})
+            # The reduction method is advisory: requests differing only in
+            # method share one entry, so precache-warmed chunks serve any
+            # method at the same bounds/scale (biopb/biopb#76).
+            cache_key = cache_key_for_chunk_id(chunk_id)
+            entry = cache_manager.get_or_acquire(
+                cache_key, compute_fn, metadata={"array_id": array_id}
+            )
             data = entry.data
-            cache_manager.release(chunk_id)
+            cache_manager.release(cache_key)
         else:
             data, _ = compute_fn()
-        
+
         return data
 
     def get_read_plan(self, request_desc: TensorDescriptor) -> TensorReadPlan:
@@ -443,24 +607,132 @@ class TensorAdapter(ABC):
                           include slice_hint and scale_hint/reduction_method directly.
         Returns:
             TensorReadPlan with the logical descriptor and list of chunk endpoints to read.
-        """        
+        """
         base_desc = self.get_tensor_descriptor()
         chunk_size = self.get_chunk_size()
         return _get_read_plan(base_desc, request_desc, chunk_size)
+
+    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+        """Native (precomputed on-disk) pyramid levels for this tensor, or None.
+
+        Returns ``None`` for formats without a real on-disk pyramid (the default),
+        in which case the server advertises a *computed* pyramid via
+        ``chunk.build_pyramid_plan``. Formats that store downsampled levels
+        natively (e.g. OME-Zarr multiscales) override this to return one
+        ``PyramidLevel`` per native dataset, each with ``native=True`` and
+        ``reduction_method="precompute"`` so the client requests the on-disk level
+        directly. Each level's ``scale_hint`` MUST be the value the adapter's own
+        ``get_read_plan`` "precompute" routing matches on, so an advertised level
+        round-trips to its dataset.
+        """
+        return None
+
+    def has_native_pyramid(self) -> bool:
+        """Whether this tensor ships a well-formed multi-resolution pyramid.
+
+        Derived by default from :meth:`get_native_pyramid_levels` -- a tensor
+        has a native pyramid iff it advertises native levels -- so a new format
+        need only override the levels method. The precache worker skips a tensor
+        that reports True: it already serves overviews cheaply from its own coarse
+        levels. Adapters may override this with a cheaper check that avoids
+        enumerating level shapes (e.g. OME-Zarr reads its root ``.zattrs``).
+        """
+        return self.get_native_pyramid_levels() is not None
+
+    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+        """Per-dimension physical pixel size + unit for this tensor, axis order.
+
+        Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
+        ``dim_labels`` this tensor's ``get_tensor_descriptor()`` emits (so the
+        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
+        ``physical_unit`` without remapping). Element ``i`` is the physical
+        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
+        dimension with no known physical size (e.g. T/C axes).
+
+        Returns ``None`` when no physical sizes are known. This is the compact
+        ~200-byte summary the tensor-load hot path needs (issue #31), so it must
+        be **cheap** -- read it straight off the resident metadata model, never
+        a full ``get_metadata()`` dump. Default ``None``; format adapters that
+        carry physical voxel sizes override it.
+        """
+        return None
 
 
 class BackendAdapter(SourceAdapter, TensorAdapter):
     pass
 
 
-def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, chunk_size: Tuple[int, ...]) -> TensorReadPlan:
+# --- role-scope enforcement -------------------------------------------------
+# The two role interfaces must stay disjoint and match their declared scope, so
+# a tensor-scoped method can never silently land on SourceAdapter again (the
+# past scramble that this split fixes). Adding a public method to either ABC
+# without classifying it here fails the equality check; any overlap fails the
+# disjointness check. Underscore-private helpers are intentionally excluded.
+_SOURCE_SCOPED_API = frozenset(
+    {
+        "array_id",
+        "claim",
+        "create_from_config",
+        "list_tensor_descriptors",
+        "get_metadata",
+        "metadata_covers_all_tensors",
+        "get_source_descriptor",
+        "resolve",
+        "is_resident",
+        "get_tensor_adapter",
+    }
+)
+_TENSOR_SCOPED_API = frozenset(
+    {
+        "get_tensor_descriptor",
+        "get_chunk_size",
+        "get_data",
+        "get_arrow_schema",
+        "resolve_chunk_data",
+        "get_read_plan",
+        "get_native_pyramid_levels",
+        "has_native_pyramid",
+        "get_physical_scale",
+    }
+)
+
+
+def _public_api(cls: type) -> frozenset:
+    """Public (non-underscore) attribute names declared directly on ``cls``."""
+    return frozenset(name for name in vars(cls) if not name.startswith("_"))
+
+
+assert _public_api(SourceAdapter) == _SOURCE_SCOPED_API, (
+    "SourceAdapter public API drifted from its declared source-level scope: "
+    f"{sorted(_public_api(SourceAdapter) ^ _SOURCE_SCOPED_API)} "
+    "(classify new methods in base._SOURCE_SCOPED_API / _TENSOR_SCOPED_API)"
+)
+assert _public_api(TensorAdapter) == _TENSOR_SCOPED_API, (
+    "TensorAdapter public API drifted from its declared tensor-level scope: "
+    f"{sorted(_public_api(TensorAdapter) ^ _TENSOR_SCOPED_API)} "
+    "(classify new methods in base._SOURCE_SCOPED_API / _TENSOR_SCOPED_API)"
+)
+assert _SOURCE_SCOPED_API.isdisjoint(_TENSOR_SCOPED_API), (
+    "source/tensor adapter scopes overlap: "
+    f"{sorted(_SOURCE_SCOPED_API & _TENSOR_SCOPED_API)}"
+)
+
+
+def _get_read_plan(
+    base_desc: TensorDescriptor,
+    request_desc: TensorDescriptor,
+    chunk_size: Tuple[int, ...],
+) -> TensorReadPlan:
     """Plan a logical tensor read using uniform chunk grid.
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
     """
+    require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
-    slice_hint = request_desc.slice_hint if request_desc.HasField('slice_hint') else None
+    slice_hint = (
+        request_desc.slice_hint if request_desc.HasField("slice_hint") else None
+    )
 
     # Normalize inputs - use scale_hint/reduction_method directly from TensorDescriptor
     source_start, source_stop = normalized_slice_bounds(base_shape, slice_hint)
@@ -484,8 +756,12 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         logical_chunk_size = safe_chunk_size
         output_dtype = base_desc.dtype
     else:
-        virtual_chunk_size = tuple(lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim))
-        logical_chunk_size = tuple(virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim))
+        virtual_chunk_size = tuple(
+            lcm(safe_chunk_size[ax], scale_hint[ax]) for ax in range(ndim)
+        )
+        logical_chunk_size = tuple(
+            virtual_chunk_size[ax] // scale_hint[ax] for ax in range(ndim)
+        )
         output_dtype = get_output_dtype(base_desc.dtype, reduction_method)
 
     # Snap bounds to virtual_chunk_size grid
@@ -494,14 +770,19 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         for ax in range(ndim)
     )
     realized_stop = tuple(
-        min(ceil_div(source_stop[ax], virtual_chunk_size[ax]) * virtual_chunk_size[ax], base_shape[ax])
+        min(
+            ceil_div(source_stop[ax], virtual_chunk_size[ax]) * virtual_chunk_size[ax],
+            base_shape[ax],
+        )
         for ax in range(ndim)
     )
     realized_shape = tuple(realized_stop[ax] - realized_start[ax] for ax in range(ndim))
 
     # Compute logical shape (for scale_hint case)
     if scale_hint is not None:
-        logical_shape = tuple(ceil_div(realized_shape[ax], scale_hint[ax]) for ax in range(ndim))
+        logical_shape = tuple(
+            ceil_div(realized_shape[ax], scale_hint[ax]) for ax in range(ndim)
+        )
     else:
         logical_shape = realized_shape
 
@@ -537,8 +818,12 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
                 for ax in range(ndim)
             )
         else:
-            logical_start = tuple(virtual_start[ax] - realized_start[ax] for ax in range(ndim))
-            logical_stop = tuple(virtual_stop[ax] - realized_start[ax] for ax in range(ndim))
+            logical_start = tuple(
+                virtual_start[ax] - realized_start[ax] for ax in range(ndim)
+            )
+            logical_stop = tuple(
+                virtual_stop[ax] - realized_start[ax] for ax in range(ndim)
+            )
 
         virtual_bounds = ChunkBounds(start=list(virtual_start), stop=list(virtual_stop))
         logical_bounds = ChunkBounds(start=list(logical_start), stop=list(logical_stop))
@@ -553,7 +838,9 @@ def _get_read_plan(base_desc: TensorDescriptor, request_desc: TensorDescriptor, 
         else:
             chunk_id = encode_chunk_id(base_desc.array_id, virtual_bounds)
 
-        logical_endpoints.append(ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds))
+        logical_endpoints.append(
+            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+        )
 
     # Build descriptor
     logical_desc = TensorDescriptor(

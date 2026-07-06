@@ -12,6 +12,9 @@
  */
 
 import type {
+  AdminConfigResponse,
+  AdminConfigSaveResult,
+  AdminStatus,
   DataSourceDescriptor,
   DiagnosticsSnapshot,
   QuerySourcesResult,
@@ -265,6 +268,59 @@ export class TensorHttpClient {
     const truncated = headers.get("X-Truncated") === "true";
 
     return { rows: data, totalSources, returnedSources, truncated };
+  }
+
+  // -------------------------------------------------------------------------
+  // Admin (config read/write, status, restart)
+  // -------------------------------------------------------------------------
+
+  /** Read the on-disk config, its path, and the JSON Schema (`GET /api/config`). */
+  async getAdminConfig(): Promise<AdminConfigResponse> {
+    return this.fetchJson<AdminConfigResponse>(
+      "/api/config",
+      undefined,
+      this.metadataTimeoutMs,
+    );
+  }
+
+  /**
+   * Validate and write the config (`PUT /api/config`). Does NOT restart.
+   *
+   * On a schema-validation failure the server returns `422` and `fetchJson`
+   * throws a {@link TensorApiError} whose `.detail` is the
+   * {@link AdminConfigValidationBody} (`{detail, errors}`); callers render
+   * `error.detail.errors` inline.
+   */
+  async putAdminConfig(config: Record<string, unknown>): Promise<AdminConfigSaveResult> {
+    return this.fetchJson<AdminConfigSaveResult>(
+      "/api/config",
+      { method: "PUT", body: JSON.stringify(config) },
+      this.metadataTimeoutMs,
+    );
+  }
+
+  /** Backend health merged with process facts (`GET /api/admin/status`). */
+  async getAdminStatus(): Promise<AdminStatus> {
+    return this.fetchJson<AdminStatus>(
+      "/api/admin/status",
+      undefined,
+      this.metadataTimeoutMs,
+    );
+  }
+
+  /**
+   * Spawn a detached `biopb server restart` (`POST /api/admin/restart`).
+   *
+   * Returns `202 {restarting: true}` immediately; the admin routes go dead
+   * while the daemon bounces, so the caller reconnects by polling
+   * {@link livez} then {@link getAdminStatus}.
+   */
+  async restartServer(): Promise<{ restarting: boolean }> {
+    return this.fetchJson<{ restarting: boolean }>(
+      "/api/admin/restart",
+      { method: "POST" },
+      this.metadataTimeoutMs,
+    );
   }
 
   // -------------------------------------------------------------------------

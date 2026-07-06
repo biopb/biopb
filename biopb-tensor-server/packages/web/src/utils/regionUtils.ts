@@ -4,7 +4,7 @@
  * Handles computing slice ranges, scale hints, and missing content detection.
  */
 
-import { buildAxisMap, computeScaleHint, type AxisMap } from "@biopb/tensor-flight-client";
+import { computeScaleHint, type AxisMap } from "@biopb/tensor-flight-client";
 
 // Re-export AxisMap for convenience
 export type { AxisMap } from "@biopb/tensor-flight-client";

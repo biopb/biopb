@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from biopb_mcp.mcp._helpers import (
+    _get_url_stem,
     patch_viewer_add_tensor,
     resync_view_for_capture,
     viewer_window_alive,
@@ -41,6 +42,27 @@ def _make_tensor(array_id, shape, dtype="float32"):
     return t
 
 
+class TestGetUrlStem:
+    """source_url -> last path component (used to name the added viewer layer)."""
+
+    def test_file_url(self):
+        assert _get_url_stem("file:///home/me/data/img.tif") == "img.tif"
+
+    def test_bare_path(self):
+        assert _get_url_stem("/data/cells/exp.zarr") == "exp.zarr"
+
+    def test_dnd_single_source_strips_scheme(self):
+        # dnd:// puts the basename in the netloc, so a naive urlparse().path
+        # yields "" and falls back to the raw url. Must return the basename.
+        assert _get_url_stem("dnd://exp.zarr") == "exp.zarr"
+
+    def test_dnd_folder_child_returns_leaf(self):
+        assert _get_url_stem("dnd://my_experiment/sub/b.tif") == "b.tif"
+
+    def test_empty_url(self):
+        assert _get_url_stem("") == ""
+
+
 class TestPatchViewerAddTensor:
     """Tests for the monkey-patched viewer.add_tensor."""
 
@@ -54,9 +76,7 @@ class TestPatchViewerAddTensor:
         with pytest.raises(RuntimeError, match="No tensor server connected"):
             viewer.add_tensor("some_source")
 
-    def test_raises_when_source_not_found_without_get_source(
-        self, viewer, connection
-    ):
+    def test_raises_when_source_not_found_without_get_source(self, viewer, connection):
         client = MagicMock()
         del client.get_source  # simulate biopb without the direct-fetch method
         connection.client = client
@@ -138,9 +158,7 @@ class TestPatchViewerAddTensor:
             "biopb_mcp._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
-            patch_viewer_add_tensor(
-                viewer, connection, compute_scheduler="threads"
-            )
+            patch_viewer_add_tensor(viewer, connection, compute_scheduler="threads")
             viewer.add_tensor("src1")
 
         (passed,), kwargs = viewer.add_image.call_args
@@ -193,9 +211,7 @@ class TestPatchViewerAddTensor:
             patch_viewer_add_tensor(viewer, connection)
             viewer.add_tensor("src1")
 
-        viewer.add_image.assert_called_once_with(
-            levels, name="big", multiscale=True
-        )
+        viewer.add_image.assert_called_once_with(levels, name="big", multiscale=True)
 
     def test_raises_for_invalid_tensor_id(self, viewer, connection):
         tensor = _make_tensor("t1", [256, 256])

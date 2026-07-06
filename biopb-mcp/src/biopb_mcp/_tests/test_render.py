@@ -151,16 +151,12 @@ class TestRenderPolygons:
         label = np.zeros((25, 25), dtype=np.uint16)
 
         # Without post_process, both rendered
-        result_no_filter = _render_polygons(
-            response, label.copy(), post_process=False
-        )
+        result_no_filter = _render_polygons(response, label.copy(), post_process=False)
         # Inner polygon area should be filled by both (outer overwrites inner due to reversed order)
         assert result_no_filter[7, 7] > 0
 
         # With post_process, inner should be filtered out
-        result_filtered = _render_polygons(
-            response, label.copy(), post_process=True
-        )
+        result_filtered = _render_polygons(response, label.copy(), post_process=True)
         # Still filled, but by outer only
         assert result_filtered[7, 7] > 0
 

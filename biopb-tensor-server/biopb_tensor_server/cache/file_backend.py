@@ -14,12 +14,10 @@ import os
 import sys
 import threading
 import time
-from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Literal, Optional, Tuple
 
-import numpy as np
 import pyarrow as pa
 
 from biopb_tensor_server.cache.base import (
@@ -31,12 +29,12 @@ from biopb_tensor_server.cache.base import (
     PoolStats,
 )
 from biopb_tensor_server.cache.recovery import (
+    PoolQueueInfo,
     ProcessLock,
     RecoveryStatus,
     SegmentEntryInfo,
     SegmentInfo,
     SieveKSegmentInfo,
-    PoolQueueInfo,
     WriteAheadLog,
 )
 
@@ -52,9 +50,9 @@ MMAP_LIFECYCLE_THRESHOLD = 100  # Only manage mmaps when segments > 100
 
 # Size class thresholds for pooling (fixed values, not derived from MAX_ARROW_BATCH_BYTES)
 # With 64MB max chunk size, we want reasonable pooling buckets
-SIZE_CLASS_TINY_THRESHOLD = 1 * 1024 * 1024      # <1MB
-SIZE_CLASS_SMALL_THRESHOLD = 8 * 1024 * 1024     # 1-8MB
-SIZE_CLASS_MEDIUM_THRESHOLD = 32 * 1024 * 1024   # 8-32MB
+SIZE_CLASS_TINY_THRESHOLD = 1 * 1024 * 1024  # <1MB
+SIZE_CLASS_SMALL_THRESHOLD = 8 * 1024 * 1024  # 1-8MB
+SIZE_CLASS_MEDIUM_THRESHOLD = 32 * 1024 * 1024  # 8-32MB
 # large: >=32MB (still cached, just pooled separately)
 
 SizeClass = Literal["tiny", "small", "medium", "large"]
@@ -77,11 +75,13 @@ def _get_size_class(size_bytes: int) -> SizeClass:
 # =============================================================================
 
 # Unified schema for all dtypes - enables single cache pool per size_class
-UNIFIED_SCHEMA = pa.schema([
-    pa.field("data", pa.binary()),
-    pa.field("shape", pa.list_(pa.int64())),
-    pa.field("dtype", pa.string()),
-])
+UNIFIED_SCHEMA = pa.schema(
+    [
+        pa.field("data", pa.binary()),
+        pa.field("shape", pa.list_(pa.int64())),
+        pa.field("dtype", pa.string()),
+    ]
+)
 
 # Name of the per-batch column carrying the entry's cache key. The key MUST
 # travel as a column value, not as schema metadata: an Arrow IPC stream
@@ -98,91 +98,6 @@ CACHE_KEY_FIELD = "__biopb_cache_key__"
 # parse; the server reports it in chunk_locate and a client declines the fast
 # path (falls back to do_get) for any version it doesn't understand.
 CACHE_FILE_FORMAT_VERSION = 1
-
-
-def _cast_to_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
-    """Cast typed batch to unified binary schema for caching.
-
-    Uses buffer-based casting to bypass Arrow's logical type validation.
-
-    Args:
-        batch: RecordBatch with schema [data: list<dtype>, shape: list<int64>, dtype: string]
-
-    Returns:
-        RecordBatch with unified schema [data: binary, shape: list<int64>, dtype: string]
-    """
-    data_col = batch.column("data")
-
-    # Get buffers from the list array
-    # ListArray: buffers = [validity, offsets], children = [values]
-    # Values: primitive array with buffers = [validity, data]
-    values = data_col.values
-
-    # Create binary array from values buffer
-    # Binary needs: [validity, offsets, data]
-    # For single binary blob: offsets = [0, N]
-    values_buf = values.buffers()[1]
-    num_bytes = values_buf.size
-    offsets_buf = pa.py_buffer(np.array([0, num_bytes], dtype=np.int32))
-
-    binary_arr = pa.Array.from_buffers(
-        pa.binary(),
-        1,  # one row (single binary blob)
-        [None, offsets_buf, values_buf]
-    )
-
-    return pa.RecordBatch.from_arrays(
-        [binary_arr, batch.column("shape"), batch.column("dtype")],
-        ["data", "shape", "dtype"]
-    )
-
-
-def _cast_from_unified_schema(batch: pa.RecordBatch) -> pa.RecordBatch:
-    """Cast unified binary batch back to typed schema for client consumption.
-
-    Uses buffer-based casting to bypass Arrow's logical type validation.
-
-    Args:
-        batch: RecordBatch with unified schema [data: binary, shape: list<int64>, dtype: string]
-
-    Returns:
-        RecordBatch with typed schema [data: list<dtype>, shape: list<int64>, dtype: string]
-    """
-    dtype_str = batch.column("dtype").to_pylist()[0]
-    dtype = np.dtype(dtype_str)
-    arrow_dtype = pa.from_numpy_dtype(dtype)
-
-    binary_col = batch.column("data")
-
-    # Binary array: buffers = [validity, offsets, data]
-    binary_bufs = binary_col.buffers()
-    data_buf = binary_bufs[2]  # the actual bytes
-
-    # Number of elements from byte length
-    num_elements = len(data_buf) // dtype.itemsize
-
-    # Create values array from data buffer directly
-    values_arr = pa.Array.from_buffers(
-        arrow_dtype,
-        num_elements,
-        [None, data_buf]
-    )
-
-    # Create list array: buffers = [validity, offsets], children = [values]
-    # For single list containing all elements: offsets = [0, num_elements]
-    list_offsets = pa.py_buffer(np.array([0, num_elements], dtype=np.int32))
-
-    list_arr = pa.ListArray.from_buffers(
-        pa.list_(arrow_dtype),
-        1,  # one row
-        [None, list_offsets],
-        children=[values_arr]
-    )
-
-    return pa.RecordBatch.from_arrays(
-        [list_arr, batch.column("shape"), batch.column("dtype")],
-        ["data", "shape", "dtype"]
-    )
 
 
 def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -212,6 +127,7 @@ def _copy_batch_off_mmap(batch: pa.RecordBatch) -> pa.RecordBatch:
 @dataclass
 class ArrowFileConfig:
     """Configuration for Arrow file cache backend."""
+
     cache_dir: Path
     max_segment_bytes: int = 64 * 1024 * 1024  # 64 MB per segment
     max_total_bytes: int = 4 * 1024 * 1024 * 1024  # 4 GB total
@@ -232,6 +148,7 @@ class ChunkLocation:
     ``generation_id`` is the segment file's inode at locate time, so a client
     can detect a segment that was evicted and recreated at the same path.
     """
+
     segment_path: str
     byte_offset: int
     byte_length: int
@@ -373,6 +290,12 @@ class ArrowFileBackend(CacheBackend):
         # Rebuild metadata index from segment files
         self._rebuild_index_from_segments()
 
+        # Backfill the recovered-entry count from the rebuilt index: _recover()
+        # deliberately skips the segment read (biopb/biopb#300), so the
+        # authoritative count comes from the walk that had to happen anyway.
+        if self._recovery_status is not None:
+            self._recovery_status.recovered_entries = len(self._metadata)
+
         # Find next segment ID (segments are created lazily when first write happens)
         all_segment_ids = set()
         for pool in self._pool_queues.values():
@@ -381,42 +304,42 @@ class ArrowFileBackend(CacheBackend):
         self._next_segment_id = max(all_segment_ids, default=0) + 1
 
     def _recover(self) -> RecoveryStatus:
-        """Recover from crash: clean up incomplete writes."""
-        errors = []
-        recovered_entries = 0
+        """Recover from crash: drop incomplete writes recorded in the WAL.
+
+        The recovered-entry accounting is deliberately cheap and does NOT read
+        segment bodies (biopb/biopb#300). Iterating every record batch to count
+        entries and sum ``batch.nbytes`` faults the entire cache in from disk --
+        tens of GB on a caching-proxy server -- purely for one startup log line,
+        and it duplicates the walk ``_rebuild_index_from_segments()`` does next
+        anyway. So take the recovered byte total from the segment files' on-disk
+        sizes (a ``stat``, no read) and let ``_initialize`` backfill
+        ``recovered_entries`` from the rebuilt index.
+        """
         lost_entries = 0
-        recovered_bytes = 0
-        lost_bytes = 0
 
-        # Get pending keys from WAL
-        pending_keys = self._wal.get_pending_keys()
-
-        # Clear WAL - incomplete writes are lost
-        for key in pending_keys:
+        # Clear WAL - pending (incomplete) writes never reached a segment, so lost.
+        for key in self._wal.get_pending_keys():
             lost_entries += 1
             logger.warning(f"Cache recovery: lost pending write for key {key.hex()}")
         self._wal.clear()
 
-        # Scan existing segments - valid entries survive
+        # Recovered byte total from file sizes -- no segment read (issue #300).
+        # (This is the on-disk footprint; corrupt segments are dropped, and any
+        # read errors are surfaced, by the rebuild pass that follows.)
         segments_dir = self._config.cache_dir / "segments"
+        recovered_bytes = 0
         for seg_file in segments_dir.glob("seg_*.arrow"):
             try:
-                # Just count what's recoverable - actual rebuild happens next
-                with pa.memory_map(str(seg_file), 'r') as mmap:
-                    reader = pa.RecordBatchStreamReader(mmap)
-                    for batch in reader:
-                        recovered_entries += 1
-                        recovered_bytes += batch.nbytes
-            except Exception as e:
-                errors.append(f"Error reading {seg_file}: {e}")
-                logger.error(f"Cache recovery error: {e}")
+                recovered_bytes += seg_file.stat().st_size
+            except OSError:
+                pass
 
         return RecoveryStatus(
-            recovered_entries=recovered_entries,
+            recovered_entries=0,  # backfilled from the rebuilt index in _initialize
             lost_entries=lost_entries,
             recovered_bytes=recovered_bytes,
-            lost_bytes=lost_bytes,
-            errors=errors,
+            lost_bytes=0,
+            errors=[],
         )
 
     def _rebuild_index_from_segments(self) -> None:
@@ -430,11 +353,10 @@ class ArrowFileBackend(CacheBackend):
                 segment_id = int(seg_name.split("_")[1])
 
                 # Memory-map for reading
-                mmap = pa.memory_map(str(seg_file), 'r')
+                mmap = pa.memory_map(str(seg_file), "r")
                 self._segment_mmaps[segment_id] = mmap
 
                 # Read all batches to extract keys and build index
-                offset = 0
                 entry_count = 0
                 segment_size = seg_file.stat().st_size
                 segment_created = seg_file.stat().st_mtime
@@ -554,7 +476,7 @@ class ArrowFileBackend(CacheBackend):
         segment_path = segments_dir / f"seg_{segment_id:04d}.arrow"
 
         # Create writer
-        sink = pa.OSFile(str(segment_path), 'wb')
+        sink = pa.OSFile(str(segment_path), "wb")
         writer = pa.RecordBatchStreamWriter(sink, schema)
 
         # Get or create pool queue
@@ -613,8 +535,7 @@ class ArrowFileBackend(CacheBackend):
             path = self._pool_paths.pop(segment_id, None)
             self._pool_schemas.pop(segment_id, None)
             self._open_pools = {
-                k: v for k, v in self._open_pools.items()
-                if v != segment_id
+                k: v for k, v in self._open_pools.items() if v != segment_id
             }
 
         # Flush + close the handles WITHOUT self._lock (this is the blocking I/O;
@@ -628,7 +549,7 @@ class ArrowFileBackend(CacheBackend):
         # in-memory copies, under the lock.
         with self._lock:
             if path and path.exists():
-                mmap = pa.memory_map(str(path), 'r')
+                mmap = pa.memory_map(str(path), "r")
                 self._segment_mmaps[segment_id] = mmap
 
                 # The segment is now re-readable, so the in-memory RecordBatch
@@ -665,7 +586,9 @@ class ArrowFileBackend(CacheBackend):
         total += len(self._segments_legacy)
         return total
 
-    def _get_pool_key_for_segment(self, segment_id: int) -> Optional[Tuple[str, SizeClass]]:
+    def _get_pool_key_for_segment(
+        self, segment_id: int
+    ) -> Optional[Tuple[str, SizeClass]]:
         """Get the pool key for a given segment ID."""
         for pool_key, pool in self._pool_queues.items():
             if segment_id in pool.segments:
@@ -684,7 +607,9 @@ class ArrowFileBackend(CacheBackend):
     def _do_evict_segment(self, segment_id: int) -> None:
         """Actually evict a segment: remove files, metadata, and mmap."""
         # Remove all entries in this segment from metadata
-        keys_to_remove = [k for k, e in self._metadata.items() if e.segment_id == segment_id]
+        keys_to_remove = [
+            k for k, e in self._metadata.items() if e.segment_id == segment_id
+        ]
         for key in keys_to_remove:
             self._metadata.pop(key, None)
             # Also remove from in-memory entries if present
@@ -694,7 +619,9 @@ class ArrowFileBackend(CacheBackend):
         self._close_writer(segment_id)
         self._pool_paths.pop(segment_id, None)
         self._pool_schemas.pop(segment_id, None)
-        self._open_pools = {k: v for k, v in self._open_pools.items() if v != segment_id}
+        self._open_pools = {
+            k: v for k, v in self._open_pools.items() if v != segment_id
+        }
 
         # Close and remove mmap
         mmap = self._segment_mmaps.pop(segment_id, None)
@@ -728,7 +655,9 @@ class ArrowFileBackend(CacheBackend):
             pool_rates.append((pool_key, hit_rate, pool.queue))
 
         # Select lowest hit rate pool with segments
-        pool_rates.sort(key=lambda x: (x[1], -len(x[2])))  # Lowest rate, then most segments
+        pool_rates.sort(
+            key=lambda x: (x[1], -len(x[2]))
+        )  # Lowest rate, then most segments
         for pool_key, rate, queue in pool_rates:
             if queue:
                 return pool_key
@@ -811,11 +740,13 @@ class ArrowFileBackend(CacheBackend):
         self._ref_held_skips += 1
         return False
 
-    def _reopen_segment_mmap(self, segment_id: int, seg_info: SieveKSegmentInfo) -> None:
+    def _reopen_segment_mmap(
+        self, segment_id: int, seg_info: SieveKSegmentInfo
+    ) -> None:
         """Reopen mmap for cold segment that was accessed."""
         path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         if path.exists():
-            mmap = pa.memory_map(str(path), 'r')
+            mmap = pa.memory_map(str(path), "r")
             self._segment_mmaps[segment_id] = mmap
             seg_info.mmap_released = False
             # On access: increment counter
@@ -833,7 +764,10 @@ class ArrowFileBackend(CacheBackend):
         for pool_key, pool in self._pool_queues.items():
             for seg_id, seg_info in pool.segments.items():
                 age = now - seg_info.last_access_time
-                if seg_info.frequency <= COLD_FREQUENCY_THRESHOLD and age > COLD_THRESHOLD_SECONDS:
+                if (
+                    seg_info.frequency <= COLD_FREQUENCY_THRESHOLD
+                    and age > COLD_THRESHOLD_SECONDS
+                ):
                     mmap = self._segment_mmaps.pop(seg_id, None)
                     if mmap:
                         mmap.close()
@@ -885,9 +819,17 @@ class ArrowFileBackend(CacheBackend):
                 # (issue #5). POSIX keeps the zero-copy mmap read.
                 if self._copy_on_read:
                     batch = _copy_batch_off_mmap(batch)
-                # Cast from unified binary schema back to typed schema
-                typed_batch = _cast_from_unified_schema(batch)
-                return typed_batch
+                # Serve the unified binary schema as-is (biopb/biopb#293); just
+                # strip the internal cache-key column so the wire batch is the
+                # clean [data, shape, dtype]. No binary->typed conversion.
+                return pa.RecordBatch.from_arrays(
+                    [
+                        batch.column("data"),
+                        batch.column("shape"),
+                        batch.column("dtype"),
+                    ],
+                    names=["data", "shape", "dtype"],
+                )
 
         return None
 
@@ -909,7 +851,7 @@ class ArrowFileBackend(CacheBackend):
         """
         path = self._config.cache_dir / "segments" / f"seg_{segment_id:04d}.arrow"
         try:
-            mm = pa.memory_map(str(path), 'r')
+            mm = pa.memory_map(str(path), "r")
         except (OSError, pa.ArrowInvalid):
             return
         # Always close the mapping: an open handle blocks segment deletion on
@@ -993,7 +935,7 @@ class ArrowFileBackend(CacheBackend):
                 return self._build_chunk_location(entry_info)
 
     def _build_chunk_location(
-        self, entry_info: "SegmentEntryInfo"
+        self, entry_info: SegmentEntryInfo
     ) -> Optional[ChunkLocation]:
         """Build a ``ChunkLocation`` for an already-indexed entry.
 
@@ -1001,7 +943,8 @@ class ArrowFileBackend(CacheBackend):
         gone away (evicted/unlinked) since indexing.
         """
         segment_path = (
-            self._config.cache_dir / "segments"
+            self._config.cache_dir
+            / "segments"
             / f"seg_{entry_info.segment_id:04d}.arrow"
         )
         try:
@@ -1207,15 +1150,18 @@ class ArrowFileBackend(CacheBackend):
                 size_class = _get_size_class(size_bytes)
 
                 # Evict if needed before storing
-                while self._get_total_size() + size_bytes > self._config.max_total_bytes:
+                while (
+                    self._get_total_size() + size_bytes > self._config.max_total_bytes
+                ):
                     if not self._evict_segment_sieve_k():
                         break
 
-                # Cast to unified schema (all dtypes share a pool) and attach the
-                # cache key as a per-row column (NOT schema metadata): Arrow IPC
-                # persists the schema once per segment, so schema metadata can't
-                # identify individual batches on rebuild.
-                unified_batch = _cast_to_unified_schema(data)
+                # compute_fn already emits the unified binary schema
+                # (biopb/biopb#293), so store it directly -- no typed->binary cast.
+                # Attach the cache key as a per-row column (NOT schema metadata):
+                # Arrow IPC persists the schema once per segment, so schema
+                # metadata can't identify individual batches on rebuild.
+                unified_batch = data
                 key_col = pa.array([key], type=pa.binary())
                 batch_with_key = pa.RecordBatch.from_arrays(
                     list(unified_batch.columns) + [key_col],
@@ -1283,8 +1229,7 @@ class ArrowFileBackend(CacheBackend):
                 )
                 entry.set_ready(data, size_bytes)
                 need_close = bool(
-                    seg_info
-                    and seg_info.size_bytes >= self._config.max_segment_bytes
+                    seg_info and seg_info.size_bytes >= self._config.max_segment_bytes
                 )
 
             # Rotate a full segment. _close_segment flushes the writer (blocking),

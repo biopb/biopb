@@ -1,0 +1,484 @@
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { Link } from "react-router-dom";
+import {
+  TensorApiError,
+  normalizeConfigForSave,
+  splitConfigErrors,
+  validateConfig,
+} from "@biopb/tensor-flight-client";
+import type {
+  AdminConfigError,
+  AdminStatus,
+  ConfigSchema,
+} from "@biopb/tensor-flight-client";
+import { useAppStore } from "../store";
+import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
+import { AdvancedSections } from "../components/AdvancedSections";
+import { CredentialsEditor } from "../components/CredentialsEditor";
+import { Modal } from "../components/Modal";
+import { AdvancedJsonModal } from "../components/AdvancedJsonModal";
+
+type Config = Record<string, unknown>;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const RESTART_TIMEOUT_MS = 60_000;
+
+function getSources(config: Config | null): SourceEntry[] {
+  const s = config?.sources;
+  return Array.isArray(s) ? (s as SourceEntry[]) : [];
+}
+
+/** "up 4m" / "up 1h 3m" / "up 12s" for the topbar read-out (doc UX). */
+function formatUptime(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return "";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `up ${h}h ${m}m`;
+  if (m > 0) return `up ${m}m`;
+  return `up ${Math.floor(seconds)}s`;
+}
+
+export function AdminPage() {
+  const client = useAppStore((s) => s.client);
+  const connectionState = useAppStore((s) => s.connectionState);
+  const clearSession = useAppStore((s) => s.clearSession);
+
+  const [config, setConfig] = useState<Config | null>(null);
+  const [schema, setSchema] = useState<ConfigSchema | null>(null);
+  const [path, setPath] = useState<string>("");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Server-reported (422) field errors and non-field summary lines. Client-side
+  // pre-flight errors are computed live below and merged for display.
+  const [serverErrors, setServerErrors] = useState<AdminConfigError[]>([]);
+  const [serverGeneral, setServerGeneral] = useState<string[]>([]);
+
+  const [status, setStatus] = useState<AdminStatus | null>(null);
+  const [confirmRestart, setConfirmRestart] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  const [restartMsg, setRestartMsg] = useState<string | null>(null);
+  const [restartScanning, setRestartScanning] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Mirror `restarting` into a ref so the poll loop's timeout branch can tell a
+  // real timeout from a normal post-success teardown.
+  const restartingRef = useRef(false);
+  useEffect(() => {
+    restartingRef.current = restarting;
+  }, [restarting]);
+
+  // The one canonical config object. The Sources editor, the structured
+  // Advanced sections, and the raw-JSON modal all commit through here. Editing
+  // invalidates any stale server-reported errors from a prior save attempt.
+  const applyConfig = useCallback((next: Config, markDirty = true) => {
+    setConfig(next);
+    if (markDirty) {
+      setDirty(true);
+      setSaved(false);
+      setServerErrors([]);
+      setServerGeneral([]);
+    }
+  }, []);
+
+  // Live client-side validation mirroring the server's PUT checks (enum / range
+  // / required url), plus any not-yet-cleared server errors from the last save.
+  const clientErrors = useMemo(
+    () => validateConfig(config, schema),
+    [config, schema],
+  );
+  const combinedErrors = useMemo(
+    () => [...clientErrors, ...serverErrors],
+    [clientErrors, serverErrors],
+  );
+  // Source errors render inline on their rows (by index). Advanced / credentials
+  // client errors render inline in their own components; they are deliberately
+  // NOT rolled into a top banner (that duplicated each inline error and leaked
+  // dotted-path notation). The top summary is reserved for server-side 422 lines
+  // that aren't attributable to a field (`serverGeneral`).
+  const sourceErrors = useMemo(
+    () => splitConfigErrors(combinedErrors).byIndex,
+    [combinedErrors],
+  );
+  const hasErrors = combinedErrors.length > 0;
+
+  const refreshStatus = useCallback(async () => {
+    if (!client) return;
+    try {
+      setStatus(await client.http.getAdminStatus());
+    } catch {
+      /* admin status is best-effort for the header read-out */
+    }
+  }, [client]);
+
+  // Initial load.
+  useEffect(() => {
+    if (!client) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await client.http.getAdminConfig();
+        if (cancelled) return;
+        setPath(res.path);
+        setSchema(res.schema as ConfigSchema);
+        applyConfig(res.config, false);
+        setLoadError(null);
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(err instanceof Error ? err.message : String(err));
+        }
+      }
+      refreshStatus();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, applyConfig, refreshStatus]);
+
+  function onSourcesChange(next: SourceEntry[]) {
+    if (!config) return;
+    applyConfig({ ...config, sources: next });
+  }
+
+  async function onSave() {
+    if (!client || !config) return;
+    // Block save while client-side errors exist; never round-trip a known bad
+    // config just to have the server reject it.
+    if (hasErrors) return;
+    setSaving(true);
+    setSaveError(null);
+    setServerErrors([]);
+    setServerGeneral([]);
+    // Resolve deprecated aliases the runtime tolerates but the server's schema
+    // validation rejects (source `path` -> `url`) before PUT, and reflect the
+    // migration in the editor so the deprecated field clears on success.
+    const payload = normalizeConfigForSave(config) as Config;
+    try {
+      await client.http.putAdminConfig(payload);
+      if (!mounted.current) return;
+      setConfig(payload);
+      setSaved(true);
+      setDirty(false);
+    } catch (err) {
+      if (!mounted.current) return;
+      if (err instanceof TensorApiError && err.status === 422) {
+        const body = err.detail as { errors?: AdminConfigError[] } | undefined;
+        const errs = body?.errors ?? [];
+        setServerErrors(errs);
+        // Anything the splitter can't attribute to a source row is a general
+        // line; keep at least one so a 422 is never silent.
+        const { general } = splitConfigErrors(errs);
+        setServerGeneral(general.length ? general : ["Config failed validation."]);
+      } else {
+        setSaveError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (mounted.current) setSaving(false);
+    }
+  }
+
+  async function doRestart() {
+    if (!client) return;
+    setConfirmRestart(false);
+    setRestarting(true);
+    setRestartScanning(false);
+    setRestartError(null);
+    setRestartMsg("Restarting…");
+    try {
+      await client.http.restartServer();
+    } catch (err) {
+      if (mounted.current) {
+        setRestartError(err instanceof Error ? err.message : String(err));
+        setRestarting(false);
+      }
+      return;
+    }
+
+    const deadline = Date.now() + RESTART_TIMEOUT_MS;
+    // Phase 1: wait for the new daemon to bind (/livez answers).
+    let alive = false;
+    while (mounted.current && Date.now() < deadline) {
+      await sleep(1000);
+      try {
+        await client.http.livez();
+        alive = true;
+        break;
+      } catch {
+        /* still down */
+      }
+    }
+    // Phase 2: watch the discovery scan populate via /api/admin/status.
+    while (alive && mounted.current && Date.now() < deadline) {
+      try {
+        const st = await client.http.getAdminStatus();
+        if (!mounted.current) return;
+        setStatus(st);
+        const n = st.source_count ?? 0;
+        if (st.full_scan_in_progress) {
+          setRestartScanning(true);
+          setRestartMsg(`Reconnected — scanning… ${n} sources`);
+        } else if (st.health === "SERVING") {
+          setRestartScanning(false);
+          setRestartMsg(`Ready — ${n} sources`);
+          await sleep(800);
+          if (!mounted.current) return;
+          setRestarting(false);
+          setRestartMsg(null);
+          setSaved(false);
+          // Reload the freshly-applied config.
+          try {
+            const res = await client.http.getAdminConfig();
+            if (mounted.current) {
+              setPath(res.path);
+              setSchema(res.schema as ConfigSchema);
+              applyConfig(res.config, false);
+            }
+          } catch {
+            /* leave the current view */
+          }
+          return;
+        }
+      } catch {
+        /* admin routes briefly dead during the bounce; keep polling */
+      }
+      await sleep(1500);
+    }
+    if (mounted.current && restartingRef.current) {
+      setRestarting(false);
+      setRestartMsg(null);
+      setRestartError(
+        "Server did not come back within 60s. Check `biopb server status` or the log file.",
+      );
+    }
+  }
+
+  // ---- Render ----
+
+  if (!client) {
+    return (
+      <div className="app-shell admin-shell">
+        <div className="loading-overlay" style={{ position: "static" }}>
+          {connectionState === "error"
+            ? "Cannot reach the server."
+            : "Connecting to server…"}
+        </div>
+      </div>
+    );
+  }
+
+  // "Not running" means the backend health check couldn't reach the Flight
+  // server at all (`health == null`) — a true down process. A reachable server
+  // that is merely warming up (`health` is a non-SERVING string like STARTING /
+  // NOT_SERVING) is NOT down: it keeps the normal read-out + Restart, not Start.
+  const daemonDown =
+    !restarting && !!status && status.running === false && status.health == null;
+  const restartVerb = daemonDown ? "Start" : "Restart";
+
+  const pill = restartScanning
+    ? { cls: "scanning", text: restartMsg ?? "Scanning…" }
+    : restarting
+      ? { cls: "restarting", text: restartMsg ?? "Restarting…" }
+      : daemonDown
+        ? { cls: "error", text: "● Not running" }
+        : loadError
+          ? { cls: "error", text: "Error" }
+          : status
+            ? {
+                cls: "connected",
+                text: [
+                  `● ${status.health ?? "–"}`,
+                  `${status.source_count ?? 0} sources`,
+                  formatUptime(status.uptime_seconds),
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+              }
+            : { cls: "connecting", text: "Loading…" };
+
+  const sources = getSources(config);
+
+  return (
+    <div className="app-shell admin-shell">
+      <header className="app-topbar">
+        <img className="topbar-logo" src="/biopb-logo.png" alt="" aria-hidden="true" />
+        <h1>BioPB · Admin</h1>
+        <span className={`status-pill ${pill.cls}`}>{pill.text}</span>
+        <div className="topbar-spacer" />
+        <button
+          type="button"
+          className="icon-btn"
+          disabled={restarting || !config}
+          onClick={() => setConfirmRestart(true)}
+        >
+          {restartVerb}
+        </button>
+        <Link className="icon-btn" to="/">
+          ← Back
+        </Link>
+        <button className="icon-btn" onClick={clearSession} title="Lock session">
+          Lock
+        </button>
+      </header>
+
+      <main className="app-main admin-main">
+        {loadError && (
+          <div className="admin-banner error">Could not load config: {loadError}</div>
+        )}
+
+        {daemonDown && (
+          <div className="admin-banner degraded">
+            <strong>Server not running.</strong> The Flight server isn't serving
+            (the config file is still editable — Save, then <em>{restartVerb}</em>).
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={restarting}
+              onClick={() => setConfirmRestart(true)}
+            >
+              {restartVerb} now
+            </button>
+          </div>
+        )}
+
+        {path && (
+          <div className="admin-config-path">
+            Editing <code>{path}</code>
+          </div>
+        )}
+
+        {serverGeneral.length > 0 && (
+          <div className="admin-banner error">
+            <strong>Config not saved — fix these:</strong>
+            <ul>
+              {serverGeneral.map((m, i) => (
+                <li key={i}>{m}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {saved && (
+          <div className="admin-banner saved">
+            Saved — {restartVerb.toLowerCase()} required to apply.
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={restarting}
+              onClick={() => setConfirmRestart(true)}
+            >
+              {restartVerb} now
+            </button>
+          </div>
+        )}
+
+        {config && (
+          <>
+            <SourcesEditor
+              sources={sources}
+              onChange={onSourcesChange}
+              errorsByIndex={sourceErrors}
+              disabled={restarting}
+            />
+
+            <AdvancedSections
+              config={config}
+              schema={schema}
+              errors={combinedErrors}
+              disabled={restarting}
+              onChange={applyConfig}
+              onEditRaw={() => setAdvancedOpen(true)}
+            />
+
+            <CredentialsEditor
+              config={config}
+              schema={schema}
+              errors={combinedErrors}
+              disabled={restarting}
+              onChange={applyConfig}
+            />
+
+            <div className="admin-actions">
+              <button
+                type="button"
+                className="submit-btn"
+                disabled={!dirty || saving || restarting || hasErrors}
+                onClick={onSave}
+              >
+                {saving ? "Saving…" : "Save"}
+              </button>
+              {hasErrors ? (
+                <span className="admin-hint error">
+                  Fix the highlighted fields to enable Save.
+                </span>
+              ) : (
+                dirty &&
+                !saved && (
+                  <span className="admin-hint">
+                    Unsaved changes — {restartVerb.toLowerCase()} required to apply.
+                  </span>
+                )
+              )}
+            </div>
+          </>
+        )}
+      </main>
+
+      {confirmRestart && (
+        <Modal
+          title={daemonDown ? "Start the server?" : "Restart the server?"}
+          onClose={() => setConfirmRestart(false)}
+          labelId="admin-restart-title"
+        >
+          <p>
+            {daemonDown
+              ? "Start the tensor server daemon with the current config on disk."
+              : "Restart interrupts the shared live session: connected clients (the napari/MCP kernel, browser viewers, in-flight analyses) drop while the daemon bounces."}
+          </p>
+          <div className="admin-modal-actions">
+            <button type="button" className="icon-btn" onClick={() => setConfirmRestart(false)}>
+              Cancel
+            </button>
+            <button type="button" className="submit-btn" onClick={doRestart}>
+              {restartVerb}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {advancedOpen && config && (
+        <AdvancedJsonModal
+          config={config}
+          onApply={applyConfig}
+          onClose={() => setAdvancedOpen(false)}
+        />
+      )}
+
+      {saveError && (
+        <div className="error-toast">
+          <strong>Save failed</strong>
+          <br />
+          {saveError}
+        </div>
+      )}
+      {restartError && (
+        <div className="error-toast">
+          <strong>{restartVerb}</strong>
+          <br />
+          {restartError}
+        </div>
+      )}
+    </div>
+  );
+}

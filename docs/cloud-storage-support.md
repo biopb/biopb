@@ -1,7 +1,14 @@
 # Cloud storage support in the tensor server (proposal)
 
-> **Status: proposal.** A design sketch, not a build plan — captures the
-> approach and the decisions it rests on so they can be reviewed before any code.
+> **Status: Phase 2 implemented — experimental.** The `cloud` source flag and its
+> lazy-resolve behavior may still change without notice in a future release.
+> Cloud/synced-folder data is
+> registered as *unresolved* sources (`adapters/unresolved.py`) and lazily hydrated
+> via a streaming `do_action("resolve")` (`server.py`), gated by `SourceConfig.cloud`,
+> with the `TensorFlightClient.resolve()` SDK method and napari integration
+> (`tests/cloud_phase2_test.py`, `client_resolve_test.py`). Later phases —
+> metadata-DB durability across restart, the read-tolerance mode below — remain
+> design. The rest of this doc is the original design sketch.
 
 Scope: `biopb-tensor-server` (server + Python SDK), with knock-on effects for the
 Java SDK and a (minimal) carve-out for the TS/web client.
@@ -377,8 +384,71 @@ The same conclusion recurs at every layer, hardening as it goes:
 1. **Descriptor contract** — `resolved` (already implicit) + `data_resident`
    advisory field; `SourceUnresolvedError`; legible failure at the
    `_get_read_plan` boundary. *Pure robustness, no cloud code, unblocks the rest.*
-2. **Unresolved adapter + lazy `get_tensor_descriptor()`** resolution hook;
-   per-source `cloud = true` opt-in; OME-TIFF sniff deferral.
+   **(done — cloud phase 1.)**
+2. **Unresolved adapter + lazy resolution** hook; per-source `cloud = true`
+   opt-in; recall-free `claim()` (residency-guarded defer in each reader adapter)
+   + OME-TIFF sniff deferral. Resolution = re-run claim + `create_from_config` on
+   the hydrated path on first `GetFlightInfo` (resolve-on-serve); the in-memory
+   metadata-DB row is backfilled via the `sync_source_added` upsert. **(done —
+   cloud phase 2; see `biopb-tensor-server/ARCHITECTURE.md` "Cloud / synced-folder
+   sources" and `tests/cloud_phase2_test.py`. Multi-file monolith member grouping
+   degrades on cloud, as designed.)**
+   - **2b. Client-side resolve trigger (the consenting front door).** Resolve-on-
+     serve is *reachable* on the server via `GetFlightInfo`, but the Python SDK's
+     read methods (`get_tensor`/`get_tensor_pb`/`get_source_metadata`) short-circuit
+     on a zero-tensor cached descriptor, so "first read resolves" never actually
+     fires through them — an unresolved source is unreadable with a bare
+     `ValueError`. Fix: an explicit **`TensorFlightClient.resolve(source_id)`**
+     (raw per-tensor `GetFlightInfo` to trigger the hydrate, then re-list to
+     enumerate all fields), a **directive** unresolved error pointing at it, and a
+     `guide://tensor` stanza so the agent discovers it. The napari browser gets the
+     human twin: double-click / "Resolve…" → modal **download warning** →
+     consented, blocking resolve on a worker thread → repopulate. Keeps resolution
+     a foreground, consented act (§2) on both the agent and human paths.
+     `get_descriptor` already existed as the array_id-keyed single-tensor probe;
+     `resolve()` wraps it for the source-level, full-field case. **(done — cloud
+     phase 2; SDK `client.py`, `biopb-mcp` `_connection.py`/`tensor_browser`.)**
+     - **API audit vs. unresolved sources.** Swept every public `TensorFlightClient`
+       method (every identifier-taking one, since a bare `source_id` is a valid
+       `array_id`). Fixed **F1**: `get_physical_scale` silently recalled (downloaded)
+       a whole cloud file via the unguarded `_fetch_tensor_descriptor` — now raises
+       the shared `_unresolved_source_error` when the source is known-unresolved,
+       keeping reads recall-free. **#108 fixed** (PR #113): `get_source_metadata`
+       now raises the directive error on an unresolved source (recall-free) rather
+       than returning `{}`. **#110 fixed**: the `sources` table gained a
+       `data_resident BOOLEAN` column so unresolved (cloud) sources — which carry
+       NULL `dtype`/`shape_summary` and are silently dropped by a `WHERE dtype=…`
+       predicate — are now filterable on purpose (`WHERE NOT data_resident` finds
+       what isn't resolved yet); the column is populated from `is_resident()` at
+       both metadata-DB insert sites, and the `guide://tensor` / MCP catalog docs
+       call out the footgun. Still open: **#109** (`wait_for_upload_ready` hangs to
+       timeout on a non-upload source). `get_tensor`/`get_tensor_pb` already raise
+       the directive error; after the 2c redesign `get_descriptor`/`get_source` are
+       cheap probes that steer to `resolve()` too — only `resolve()` resolves.
+     - **Polyglot parity.** The Java SDK (`TensorFlightClient.java`, ImageJ-facing)
+       still lacks `resolve()` / the directive error and shares the same empty-tensors
+       gaps; tracked as **#111** to mirror the Python change. (JS/TS is the
+       lightweight viewer and refuses cloud data server-side — §7/phase 5 — so no
+       resolve path is needed there.)
+   - **2c. Resolve-path redesign — one dedicated, streaming entry point (#112).**
+     The original "resolve-on-serve via `GetFlightInfo`" smuggled the (minutes-long)
+     hydrate into a descriptor RPC, which forced three problems: `resolve()` needed a
+     `GetFlightInfo` + `list_sources()` two-step that **silently dropped fields** for a
+     multi-field source beyond the list cap; every accessor built on `GetFlightInfo`
+     (`get_descriptor`/`get_source`) inherited a surprise download; and a silent
+     multi-minute block trips proxy idle read timeouts (nginx `grpc_read_timeout`,
+     60s). Replaced with a **single dedicated `do_action("resolve")`**: it is the
+     SOLE resolution trigger. `UnresolvedSourceAdapter.get_tensor_adapter` no longer
+     auto-resolves — it raises `SourceUnresolvedError` (the phase-1 guard, now live),
+     so `GetFlightInfo`/`DoGet` and the SDK probes (`get_descriptor`/`get_source`)
+     become **cheap, recall-free** and steer to `resolve()`. The action **streams**:
+     empty-body heartbeat Results keep the connection warm under proxy timeouts, then
+     one terminal Result carries the full `DataSourceDescriptor` (all fields, in one
+     call — kills the truncation hole). `client.resolve()` is a thin blocking façade
+     over the stream; the napari modal's worker can consume the heartbeats for a
+     progress bar / cancel later. Disconnect-resilient: the recall runs on a daemon
+     thread and caches on the adapter, so a retry coalesces. **(closes #112; tightens
+     #111 — Java/TS must implement the action to resolve at all.)**
 3. **Persistent metadata DB** keyed to roots; resolve-once write-through.
 4. **Pre-cache skip gate** on `is_resident()`; exclude cloud from the backlog.
 5. **Read tolerance mode** (`EXACT|BEST_EFFORT`) + best-effort status return;

@@ -5,6 +5,17 @@
 #
 # Idempotent: rerun to upgrade to latest version
 #
+# A fresh install asks nothing: it seeds a curated sample-image bundle and points
+# the server at it, so a non-CLI user lands on real data immediately (add your own
+# later via the GUI drag-drop / admin page). Set BIOPB_DATA_DIR=/path to point a
+# fresh install at your own folder instead (skips the samples); BIOPB_INSTALL_SAMPLES=0
+# seeds nothing. An existing config is always kept untouched on rerun.
+#
+# Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
+# an existing config; leaves the remote algorithm plugins off unless
+# BIOPB_REMOTE_PLUGINS=1). Example:
+#   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
+#
 # This installs prebuilt wheels from the latest biopb GitHub release-v*
 # deployment (the single release that carries all three mutually-paired wheels).
 # By default it tracks the latest STABLE release (clean X.Y.Z). Set
@@ -41,144 +52,6 @@ _confirm() {
 
     [[ -z "$reply" ]] && reply="y"
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
-}
-
-# Interactive checkbox menu. Redraws in place; all output goes to /dev/tty.
-# Usage: _checkbox "Label one" "Label two" ...
-# Prints space-separated 1/0 values (one per label) to stdout.
-# Items default to checked; set the global CHECKBOX_DEFAULTS array (one 1/0 per
-# label) before calling to override individual initial states.
-_checkbox() {
-    local labels=("$@")
-    local n=${#labels[@]}
-    local sel=()
-    for ((i=0; i<n; i++)); do
-        sel+=("${CHECKBOX_DEFAULTS[$i]:-1}")
-    done
-    local first=1
-
-    while true; do
-        # On subsequent iterations move cursor up and clear to redraw in place.
-        # Lines printed: 1 blank + 1 header + 1 blank + n items + 1 blank + 1 prompt + 1 (Enter newline) = n+5
-        [ "$first" = "0" ] && printf "\033[%dA\033[J" "$((n + 5))" >/dev/tty
-        first=0
-
-        printf "\n  %sOptional components:%s\n\n" "$BOLD" "$RESET" >/dev/tty
-        for ((i=0; i<n; i++)); do
-            local mark
-            if [ "${sel[$i]}" = "1" ]; then
-                mark="${GREEN}[x]${RESET}"
-            else
-                mark="${DIM}[ ]${RESET}"
-            fi
-            printf "    %d. %b  %s\n" "$((i+1))" "$mark" "${labels[$i]}" >/dev/tty
-        done
-        printf "\n  ${DIM}Toggle [1-%d] or Enter to confirm:${RESET} " "$n" >/dev/tty
-
-        local choice; read -r choice </dev/tty
-        if [ -z "$choice" ]; then
-            break
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-            local idx=$((choice - 1))
-            [ "${sel[idx]}" = "1" ] && sel[idx]=0 || sel[idx]=1
-        fi
-    done
-
-    printf '%s' "${sel[*]}"
-}
-
-# Prompt the user to choose a data directory.
-# Usage: _pick_data_dir <varname> [keep]  — writes result into caller's variable
-# (no subshell). All prompts go to /dev/tty. Requires PLATFORM to be set first.
-#
-# When the second arg is non-empty ("keep" mode), an extra "0) Keep my current
-# config file" option is shown as the *default*; choosing it (or Enter, or any
-# invalid input) returns the empty string as a sentinel meaning "don't touch the
-# existing config." Callers pass this when a biopb.toml already exists.
-_pick_data_dir() {
-    # Caller passes the name of a variable to receive the result. We assign into
-    # it with `printf -v` rather than a `local -n` nameref, because namerefs need
-    # bash >= 4.3 and macOS ships bash 3.2.
-    local _retvar_name=$1
-    local keep_mode="${2:-}"
-    local candidates=() seen=()
-
-    for dir in \
-        "$HOME" \
-        "$HOME/data" "$HOME/Data" \
-        "$HOME/microscopy" "$HOME/Microscopy" \
-        "$HOME/Documents" \
-        /mnt/data /data; do
-        [ -d "$dir" ] || continue
-        local real; real=$(realpath "$dir" 2>/dev/null || echo "$dir")
-        local dup=0
-        for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
-        [ "$dup" = "0" ] && candidates+=("$dir") && seen+=("$real")
-    done
-
-    if [ "$PLATFORM" = "WSL" ]; then
-        # On WSL, offer dedicated data subfolders under the Windows profile, but
-        # NEVER the profile root itself. Recursively scanning the profile walks
-        # AppData and, fatally, OneDrive "Files On-Demand" placeholders, which
-        # hydrate-on-read through drvfs and hang discovery before the server can
-        # bind. Data/Microscopy folders aren't OneDrive-redirected
-        # by default the way Documents/Desktop/Pictures are; users who keep data
-        # elsewhere can still type a /mnt/c/... path manually.
-        local win_user; win_user=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
-        if [ -n "$win_user" ]; then
-            for dir in \
-                "/mnt/c/Users/$win_user/Microscopy" \
-                "/mnt/c/Users/$win_user/Data" \
-                "/mnt/c/Users/$win_user/data"; do
-                [ -d "$dir" ] || continue
-                local real; real=$(realpath "$dir" 2>/dev/null || echo "$dir")
-                local dup=0
-                for s in "${seen[@]+"${seen[@]}"}"; do [ "$s" = "$real" ] && dup=1 && break; done
-                [ "$dup" = "0" ] && candidates+=("$dir") && seen+=("$real")
-            done
-        fi
-    fi
-
-    local n=${#candidates[@]}
-    local manual_opt=$((n + 1))
-    local default_dir="${candidates[0]:-$HOME}"
-
-    printf "\n  %sSelect your microscopy data directory:%s\n\n" "$BOLD" "$RESET" >/dev/tty
-    if [ -n "$keep_mode" ]; then
-        printf "    ${CYAN}0)${RESET} Keep my current config file ${DIM}(default)${RESET}\n" >/dev/tty
-    fi
-    local i=1
-    for dir in "${candidates[@]+"${candidates[@]}"}"; do
-        printf "    ${CYAN}%d)${RESET} %s\n" "$i" "$dir" >/dev/tty
-        i=$((i + 1))
-    done
-    printf "    ${CYAN}%d)${RESET} Enter path manually\n\n" "$manual_opt" >/dev/tty
-
-    # Default differs by mode: keep current config (0) vs first candidate (1).
-    local default_choice=1
-    [ -n "$keep_mode" ] && default_choice=0
-    printf "  %sChoice [%s]:%s " "$DIM" "$default_choice" "$RESET" >/dev/tty
-    local choice; read -r choice </dev/tty
-    choice="${choice:-$default_choice}"
-
-    if [ -n "$keep_mode" ] && [ "$choice" = "0" ]; then
-        printf -v "$_retvar_name" '%s' ""   # sentinel: keep the existing config
-    elif [ "$choice" = "$manual_opt" ]; then
-        local manual
-        printf "  Path [%s]: " "$default_dir" >/dev/tty
-        read -r manual </dev/tty
-        manual="${manual%$'\r'}"
-        printf -v "$_retvar_name" '%s' "${manual:-$default_dir}"
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
-        printf -v "$_retvar_name" '%s' "${candidates[$((choice - 1))]}"
-    elif [ -n "$keep_mode" ]; then
-        # In keep mode, an unrecognized choice is non-destructive: keep the config.
-        printf "  Invalid choice, keeping current config\n" >/dev/tty
-        printf -v "$_retvar_name" '%s' ""
-    else
-        printf "  Invalid choice, using default\n" >/dev/tty
-        printf -v "$_retvar_name" '%s' "$default_dir"
-    fi
 }
 
 # Run a short inline Python script (reads the program from stdin, forwards args).
@@ -261,6 +134,86 @@ with os.fdopen(fd, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
 os.replace(tmp, path)
+PY
+}
+
+# Write the tensor-server config as JSON (biopb.json) -- the canonical format
+# (biopb/biopb#34). JSON generation is stdlib on both ends (json.dump), so the
+# old hand-rolled TOML escaping is gone.
+#
+# Usage: _write_server_config <out-json> <data-dir> <monitor:true|false> [prior-config] [alias]
+# <monitor> is the watch flag for the single source: "true" for a user data dir
+# (new files auto-register), "false" for the curated, static sample bundle.
+# <alias>, when set (the sample bundle passes "samples"), makes the source its own
+# catalog tree root in the browser instead of nesting under the absolute path.
+# When <prior-config> exists, its settings (server/cache/...) are loaded and
+# *preserved*; only the `sources` list is replaced with the chosen data dir, so
+# re-running with a new folder no longer discards the user's tuning. A prior
+# JSON is read with the stdlib; a legacy TOML is read for migration when this
+# Python has a TOML parser (3.11+ stdlib `tomllib`, else `tomli`) and otherwise
+# falls back to fresh defaults. The caller retires the legacy TOML. Writes
+# atomically; returns non-zero on any error.
+_write_server_config() {
+    local out="$1" data_dir="$2" monitor="$3" prior="${4:-}" alias="${5:-}"
+    mkdir -p "$(dirname "$out")"
+    _py - "$out" "$data_dir" "$prior" "$monitor" "$alias" <<'PY'
+import json, os, sys
+
+out, data_dir, prior, monitor = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+alias = sys.argv[5] if len(sys.argv) > 5 else ""
+
+data = {}
+if prior and os.path.exists(prior):
+    try:
+        if prior.endswith(".toml"):
+            try:
+                import tomllib
+            except ModuleNotFoundError:
+                import tomli as tomllib  # 3.10 fallback
+            with open(prior, "rb") as fh:
+                data = tomllib.load(fh)
+        else:
+            with open(prior, encoding="utf-8") as fh:
+                data = json.load(fh)
+    except Exception:
+        # Unreadable/unparseable prior config: start clean rather than abort
+        # the install. The new data dir is written either way.
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+
+# A fresh config ships the installer defaults; an existing one keeps whatever
+# server/cache/... values it already had. `metadata_db.enabled` is intentionally
+# omitted -- the DB is on by default and the flag is deprecated (biopb/biopb#225).
+# When migrating a prior config that still carries the flag, strip the noisy
+# `enabled = true` form (it's the default) so the server doesn't warn on every
+# startup. `enabled = false` is a deliberate user choice (read-only mount, disk
+# constraints, etc.) -- preserve it; the deprecation warning on startup is the
+# intended informational signal, and Phase 4 is the single hard cutover.
+data.setdefault("server", {"host": "127.0.0.1", "port": 8815,
+                           "aggressive_dir_pruning": True})
+data.setdefault("cache", {"backend": "file", "file_max_segment_mb": 256,
+                          "file_max_total_gb": 32})
+md = data.pop("metadata_db", None)
+if isinstance(md, dict):
+    if md.get("enabled", True):
+        md.pop("enabled", None)
+    if md:
+        data["metadata_db"] = md
+# Point the server at exactly one folder, replacing any prior sources. The
+# sample bundle is static so it is not monitored; a user data dir is. An alias
+# (set for the sample bundle) makes the source its own catalog tree root in the
+# browser rather than nesting under the absolute install path.
+src = {"url": data_dir, "monitor": monitor == "true"}
+if alias:
+    src["alias"] = alias
+data["sources"] = [src]
+
+tmp = out + ".biopb.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, out)
 PY
 }
 
@@ -409,7 +362,16 @@ _setup_mcp() {
         _info "hosted at UConn Health and log client IP addresses."
         _info ""
         local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
-        if _confirm "Enable the remote algorithm plugins?"; then
+        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+            # Consent can't be asked unattended: enable only on explicit opt-in,
+            # otherwise leave the IP-logging servers off.
+            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
+                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            else
+                process_image_servers=''
+                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            fi
+        elif _confirm "Enable the remote algorithm plugins?"; then
             _ok "Remote algorithm plugins enabled"
         else
             process_image_servers=''
@@ -545,13 +507,13 @@ _ensure_local_bin_on_path() {
 }
 
 # --- Release-based install helpers -------------------------------------------
-# The default install path pulls prebuilt wheels (and the data browser) from the
+# The default install path pulls prebuilt wheels (and the web interface) from the
 # most recent GitHub release rather than building HEAD from git. That drops the
 # git/buf/proto-generation step and keeps the self-contained server wheel paired
 # with the exact biopb wheel it was built against (no PyPI version-coupling).
 
 # Fetch the latest release metadata once and cache it in RELEASE_JSON / RELEASE_TAG.
-# One API call serves both the wheels and the data browser, keeping us under the
+# One API call serves both the wheels and the web interface, keeping us under the
 # unauthenticated GitHub rate limit. Returns non-zero if it can't be fetched.
 _fetch_latest_release() {
     [ -n "${RELEASE_JSON:-}" ] && return 0
@@ -605,6 +567,139 @@ _release_asset_url() {
         | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' \
         | sed -E 's/.*"(https[^"]+)".*/\1/' \
         | grep -E "/$1\$" | head -1 || true
+}
+
+# Print the SHA-256 hex digest of file $1, or nothing if no tool is available
+# (Linux ships GNU `sha256sum`; macOS ships `shasum`). The empty result lets the
+# caller skip the integrity check rather than abort on a toolless host.
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# Verify each wheel path in "$@" against the release's SHA256SUMS asset before it
+# is file://-installed. Hard-fails (exits) on a checksum mismatch or a wheel with
+# no entry in a SHA256SUMS that exists. Fails OPEN (warns, returns 0) when the
+# release predates checksums or no sha256 tool is present, so installs of older
+# releases — and toolless hosts — still work. Requires _fetch_latest_release.
+_verify_wheels() {
+    local sums_url sums
+    sums_url=$(_release_asset_url 'SHA256SUMS')
+    if [ -z "$sums_url" ]; then
+        _warn "Release $RELEASE_TAG has no SHA256SUMS; skipping wheel integrity check"
+        return 0
+    fi
+    sums=$(curl -fsSL "$sums_url" 2>/dev/null) || {
+        _warn "Could not fetch SHA256SUMS; skipping wheel integrity check"
+        return 0
+    }
+
+    local f base expected actual
+    for f in "$@"; do
+        base=$(basename "$f")
+        # SHA256SUMS lines are "<hex>  <filename>"; a leading '*' on the name
+        # marks binary mode (Git Bash / Cygwin emit it, GNU/Linux does not), so
+        # strip it before matching the basename.
+        expected=$(printf '%s' "$sums" \
+            | awk -v b="$base" '{f=$2; sub(/^\*/, "", f)} f == b {print $1; exit}')
+        if [ -z "$expected" ]; then
+            _err "No checksum for $base in the release SHA256SUMS"
+            exit 1
+        fi
+        actual=$(_sha256 "$f")
+        if [ -z "$actual" ]; then
+            _warn "No sha256 tool found; skipping integrity check for $base"
+            continue
+        fi
+        if [ "$actual" != "$expected" ]; then
+            _err "Checksum mismatch for $base — refusing to install"
+            _info "  expected $expected"
+            _info "  actual   $actual"
+            exit 1
+        fi
+    done
+    _ok "Wheel checksums verified"
+}
+
+# Seed the curated sample-image bundle into $1 so a fresh install opens onto real
+# data. Mirrors the webapp fetch (reuse cached release metadata; skip when the
+# .version marker already matches; download; extract), but with its OWN checksum
+# check that fails SOFT: samples are non-critical, so a missing asset, a download
+# error, or a mismatch warns and leaves the folder as-is rather than aborting the
+# whole install (the config still points here and the user can drag-drop data).
+# Honors BIOPB_INSTALL_SAMPLES=0 to skip entirely. Requires _fetch_latest_release.
+_seed_samples() {
+    local dest="$1"
+    if [ "${BIOPB_INSTALL_SAMPLES:-1}" = "0" ]; then
+        _note "Sample images skipped (BIOPB_INSTALL_SAMPLES=0)"
+        return 0
+    fi
+    if ! _fetch_latest_release; then
+        _warn "Could not fetch release metadata; sample images not installed"
+        return 0
+    fi
+    local installed_tag=""
+    [ -f "$dest/.version" ] && installed_tag=$(cat "$dest/.version" 2>/dev/null)
+    if [ "$installed_tag" = "$RELEASE_TAG" ]; then
+        _ok "Sample images already up to date ($RELEASE_TAG)"
+        return 0
+    fi
+
+    local url
+    url=$(_release_asset_url 'biopb-samples\.tar\.gz')
+    url="${url:-$REPO_URL/releases/download/$RELEASE_TAG/biopb-samples.tar.gz}"
+
+    # Download under the real asset basename so the checksum lookup can match it.
+    local tmpdir arc
+    tmpdir=$(mktemp -d)
+    arc="$tmpdir/biopb-samples.tar.gz"
+    if ! curl -fsSL "$url" -o "$arc" 2>/dev/null; then
+        _warn "No biopb-samples.tar.gz in release $RELEASE_TAG; starting with an empty data folder"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+
+    # Soft integrity check against the release SHA256SUMS: never seed corrupt or
+    # tampered data, but never abort the install over it either.
+    local sums_url sums expected actual
+    sums_url=$(_release_asset_url 'SHA256SUMS')
+    if [ -n "$sums_url" ] && sums=$(curl -fsSL "$sums_url" 2>/dev/null); then
+        expected=$(printf '%s' "$sums" \
+            | awk '{f=$2; sub(/^\*/, "", f)} f == "biopb-samples.tar.gz" {print $1; exit}')
+        actual=$(_sha256 "$arc")
+        if [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
+            _warn "Sample bundle checksum mismatch; skipping sample images"
+            rm -rf "$tmpdir"
+            return 0
+        fi
+    fi
+
+    # Sync the bundle into $dest without a blunt `rm -rf` on the user-facing,
+    # monitored data dir. Extract into a staging dir, delete only the files the
+    # *previous* bundle put here (tracked in .bundle-manifest) so a shrunk bundle
+    # leaves no orphans, then copy the new set in. A user who drag-dropped their
+    # own files into the samples dir keeps them across a re-seed.
+    local stage="$tmpdir/stage"
+    mkdir -p "$stage"
+    if ! tar -xzf "$arc" -C "$stage" 2>/dev/null; then
+        _warn "Could not extract sample images; starting with an empty data folder"
+        rm -rf "$tmpdir"
+        return 0
+    fi
+    mkdir -p "$dest"
+    if [ -f "$dest/.bundle-manifest" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && rm -f "$dest/$f"
+        done < "$dest/.bundle-manifest"
+    fi
+    ( cd "$stage" && find . -type f ) | sed 's|^\./||' > "$dest/.bundle-manifest"
+    cp -a "$stage/." "$dest/"
+    printf '%s' "$RELEASE_TAG" > "$dest/.version"
+    _ok "Sample images installed to: $dest"
+    rm -rf "$tmpdir"
 }
 
 # Print the tail of the server log, indented, for diagnosing a bad startup.
@@ -663,22 +758,35 @@ _start_data_server() {
     count=$(printf '%s' "$out" | sed -n 's/.*"source_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
 
     if [ "$health" != "SERVING" ]; then
-        _warn "Data server did not come up cleanly"
-        _info "  it may still be scanning a large folder, or failed to start:"
+        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
+        # folder scan: the server reaches SERVING as soon as it binds and scans in
+        # the background, so a big folder no longer holds it out of SERVING. Not
+        # SERVING after 60s therefore points to a real startup failure (crash,
+        # port already in use, or a wedged bind), not a slow scan.
+        _warn "Data server did not reach SERVING within 60s"
+        _info "  it likely failed to start or is wedged (a slow folder scan no"
+        _info "  longer blocks SERVING, so this is not just \"still scanning\"):"
         _tail_log "$log_file"
         _info "  full log: ${CYAN}$log_file${RESET}"
+        _info "  recheck once with: ${CYAN}biopb server status --wait 30${RESET}"
         return 0
     fi
 
     if [ -z "$count" ] || [ "$count" = "0" ]; then
-        _warn "Data server is running but found no data sources"
-        _info "  check that your data folder holds supported images (see config):"
-        _cmd "  $CONFIG_FILE"
-        _tail_log "$log_file"
+        # SERVING no longer implies a complete catalog: the folder scan runs in
+        # the background and registers sources as it walks. status --wait returns
+        # at the first SERVING, which is normally *before* the scan has indexed
+        # anything -- so 0 sources here usually just means "scan not finished
+        # yet," not "empty folder." The count climbs on its own shortly after.
+        _info "Data server is up; catalog is still building in the background"
+        _info "  no sources indexed yet — normal right after a (re)start"
+        _info "  recheck in a moment: ${CYAN}biopb server status${RESET}"
+        _info "  if it stays at 0, confirm the data folder holds supported images:"
+        _cmd "  ${ACTIVE_CONFIG:-$CONFIG_FILE}"
         return 0
     fi
 
-    _ok "Data server ready — $count data source(s) found; pre-caching overviews"
+    _ok "Data server ready — $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
 # Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
@@ -720,6 +828,7 @@ install_biopb() {
     # by this prefix instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
     WEBAPP_DIR="$HOME/.local/share/biopb/webapp"
+    SAMPLES_DIR="$HOME/.local/share/biopb/samples"
     CONFIG_DIR="$HOME/.config/biopb"
 
     # Release channel: default tracks the latest STABLE release (clean X.Y.Z).
@@ -799,15 +908,35 @@ install_biopb() {
     _ok "System check passed"
 
     # ===== Optional components =====
-    # biopb-mcp is always installed (it is the primary interface), so it is not
-    # offered here. Bio-Formats defaults to off: it pulls in a heavyweight Java
-    # toolchain that most labs don't need (only legacy/proprietary formats need it).
-    CHECKBOX_DEFAULTS=(1 0)
-    read -r INSTALL_WEBAPP INSTALL_BIOFORMATS <<< "$(_checkbox \
-        "Built-in data viewer: see all your images in a browser (Chrome, Safari and others)" \
-        "Bio-Formats (more image formats; needs Java and extra setup during first run)")"
-    unset CHECKBOX_DEFAULTS
-    echo ""
+    # No longer offered interactively (biopb/biopb#237). The web interface now
+    # carries the server admin page (config / status / restart) on top of the
+    # image viewer, so it is installed by default rather than being optional.
+    # Bio-Formats stays off by default: the Python adapters now cover the formats
+    # most labs use, and it pulls in a heavyweight Java toolchain. Both remain
+    # overridable for scripted installs via env vars:
+    #   BIOPB_INSTALL_WEBAPP=0      skip the web interface (API-only server)
+    #   BIOPB_INSTALL_BIOFORMATS=1  add Bio-Formats (Java fetched on first use)
+    if [ "${BIOPB_INSTALL_WEBAPP:-1}" != "0" ]; then INSTALL_WEBAPP=1; else INSTALL_WEBAPP=0; fi
+    if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
+
+    # ===== Non-interactive / unmanned mode =====
+    # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
+    # unattended (cron upgrades, CI, image bakes). It is primarily an UPGRADE
+    # feature: with an existing config, that config is kept untouched and nothing
+    # is asked. A fresh unattended install with no BIOPB_DATA_DIR now follows the
+    # same zero-question path as an interactive fresh install: it seeds the sample
+    # bundle and points the config there (fail-soft — a fetch/checksum problem
+    # just leaves an empty folder). Set BIOPB_DATA_DIR to index your own folder,
+    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty. Either way the
+    # remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1 —
+    # consent can't be asked unattended, so we never silently enable the off-site
+    # IP-logging servers.
+    if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
+        NONINTERACTIVE=1
+        _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
+    else
+        NONINTERACTIVE=0
+    fi
 
     # ===== 1. Install uv (if needed) =====
     _step "[1/7] Ensuring build tools..."
@@ -916,15 +1045,25 @@ install_biopb() {
     # Pin napari from the release's versions.json attribute so the installed
     # napari is identical to the one this release was built/tested against
     # (closes the last dev/deploy version-skew — and the napari[all] Qt
-    # binding, which is napari-version-dependent). Tolerant: an older release
-    # without the manifest falls back to the unversioned spec.
-    local versions_url napari_pin
+    # binding, which is napari-version-dependent). The same manifest carries the
+    # deployment `release` version, which we record post-install as the
+    # auto-updater's baseline (issue #87). Tolerant: an older release without the
+    # manifest falls back to the unversioned napari spec and a tag-derived
+    # version. RELEASE_VERSION is read here but written only after a clean install.
+    local versions_url versions_json napari_pin
     versions_url=$(_release_asset_url 'versions\.json')
     if [ -n "$versions_url" ]; then
-        napari_pin=$(curl -fsSL "$versions_url" 2>/dev/null \
+        versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
+        napari_pin=$(printf '%s' "$versions_json" \
             | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
+        RELEASE_VERSION=$(printf '%s' "$versions_json" \
+            | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     fi
+    # Fall back to the tag (release-vX.Y.Z -> X.Y.Z) when the manifest is absent
+    # or lacks `release`, so the recorded baseline is always a clean PEP 440
+    # version the update check can compare with packaging.version.
+    RELEASE_VERSION="${RELEASE_VERSION:-${RELEASE_TAG#"${RELEASE_TAG_PREFIX:-release-v}"}}"
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
@@ -935,6 +1074,10 @@ install_biopb() {
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
+    # Verify the downloaded wheels against the release's SHA256SUMS before they
+    # are file://-installed (aborts on a mismatch; fails open on an older release
+    # without the manifest). See the auto-updater trust item in issue #87.
+    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
     # `biopb[tensor]`) to the downloaded set rather than to PyPI.
@@ -987,8 +1130,22 @@ install_biopb() {
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
 
+    # Record the installed deployment version as the kernel-start auto-updater's
+    # baseline (issue #87): the check compares the latest release-v* deployment's
+    # versions.json `release` against this marker. Written only now, after a clean
+    # install, so a half-finished run never advertises a version it isn't on.
+    # Best-effort — a write failure only re-prompts a future update, never the
+    # install. (biopb_mcp.__version__ is a decoupled library version and is
+    # deliberately NOT used for this comparison.)
+    if mkdir -p "$CONFIG_DIR" 2>/dev/null \
+        && printf '%s' "$RELEASE_VERSION" > "$CONFIG_DIR/release.version" 2>/dev/null; then
+        _info "  recorded installed release $RELEASE_VERSION"
+    else
+        _warn "Could not record installed release version (update checks may re-prompt)"
+    fi
+
     # ===== 4. Webapp =====
-    _step "[4/7] Installing data browser..."
+    _step "[4/7] Installing web interface..."
 
     if [ "$INSTALL_WEBAPP" = "1" ]; then
         mkdir -p "$WEBAPP_DIR"
@@ -998,7 +1155,7 @@ install_biopb() {
             INSTALLED_TAG=""
             [ -f "$WEBAPP_DIR/.version" ] && INSTALLED_TAG=$(cat "$WEBAPP_DIR/.version")
             if [ "$INSTALLED_TAG" = "$RELEASE_TAG" ]; then
-                _ok "Data browser already up to date ($RELEASE_TAG)"
+                _ok "Web interface already up to date ($RELEASE_TAG)"
             else
                 _info "Downloading $RELEASE_TAG..."
                 rm -rf "${WEBAPP_DIR:?}"
@@ -1011,14 +1168,14 @@ install_biopb() {
                 if curl -fsSL "$webapp_url" -o "$tmp" 2>/dev/null; then
                     tar -xzf "$tmp" -C "$WEBAPP_DIR" --strip-components=1
                     printf '%s' "$RELEASE_TAG" > "$WEBAPP_DIR/.version"
-                    _ok "Data browser installed to: $WEBAPP_DIR"
+                    _ok "Web interface installed to: $WEBAPP_DIR"
                 else
                     _warn "No webapp.tar.gz in release $RELEASE_TAG; server will run in API-only mode"
                 fi
                 rm -f "$tmp"
             fi
         else
-            _warn "Could not fetch latest release, data browser not installed"
+            _warn "Could not fetch latest release, web interface not installed"
             _info "Server will run in API-only mode"
         fi
     else
@@ -1029,66 +1186,80 @@ install_biopb() {
     _step "[5/7] Config..."
 
     mkdir -p "$CONFIG_DIR"
-    CONFIG_FILE="$CONFIG_DIR/biopb.toml"
+    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # canonical format (biopb/biopb#34)
+    LEGACY_CONFIG="$CONFIG_DIR/biopb.toml"      # pre-#34 installs
 
-    # We never edit an existing biopb.toml in place — hand-editing TOML is
-    # error-prone and most users can't do it. Instead the data-directory prompt is
-    # always offered; when a config already exists it gains a default "0) Keep my
-    # current config file" option, and choosing a fresh data dir backs up the old
-    # config and writes a brand-new one. An empty DATA_DIR is the "keep" sentinel.
+    # An existing config in either format counts for the keep-vs-rewrite decision.
+    # biopb.json wins when both are present (matches the server's find_config).
+    local EXISTING_CONFIG=""
+    if [ -f "$CONFIG_FILE" ]; then
+        EXISTING_CONFIG="$CONFIG_FILE"
+    elif [ -f "$LEGACY_CONFIG" ]; then
+        EXISTING_CONFIG="$LEGACY_CONFIG"
+    fi
+
+    # No data-directory prompt: a fresh install seeds the sample-image bundle and
+    # points the server at it, so a non-CLI user lands on real, populated data
+    # with zero questions (they add their own data afterward via the GUI drag-drop
+    # or the admin page; the config/data-dir workflow for keeping data across
+    # restarts is documented). An existing config is kept UNTOUCHED. BIOPB_DATA_DIR
+    # still overrides on a fresh install (power users / unattended provisioning)
+    # and skips the samples. An empty DATA_DIR is the "keep existing" sentinel;
+    # otherwise we write a config whose `sources` points at DATA_DIR (biopb/biopb#34).
     local DATA_DIR
-    if [ -f "$CONFIG_FILE" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
-        _pick_data_dir DATA_DIR keep
-        echo ""
-    elif [ -f "$CONFIG_FILE" ]; then
-        # BIOPB_DATA_DIR is a non-interactive override; it only applies to a fresh
-        # install. With a config already present we keep it (its data dir wins).
-        _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $CONFIG_FILE to apply BIOPB_DATA_DIR)."
+    # Watch a user's own data dir (new files auto-register); leave the static
+    # sample bundle unmonitored. The sample bundle is also given an alias so it
+    # appears as its own "samples" root in the browser (a user data dir keeps its
+    # native path tree -- no alias).
+    local MONITOR="true"
+    local ALIAS=""
+    if [ -n "$EXISTING_CONFIG" ] && [ -z "${BIOPB_DATA_DIR:-}" ]; then
+        # Existing config, no override: keep it exactly as-is (upgrade fast path).
+        DATA_DIR=""
+        _note "Existing config found; keeping it as-is ($EXISTING_CONFIG)."
+    elif [ -n "$EXISTING_CONFIG" ]; then
+        # BIOPB_DATA_DIR only applies to a fresh install; a present config wins.
+        _note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $EXISTING_CONFIG to apply BIOPB_DATA_DIR)."
         DATA_DIR=""
     elif [ -n "${BIOPB_DATA_DIR:-}" ]; then
         DATA_DIR="$BIOPB_DATA_DIR"
         _ok "Using BIOPB_DATA_DIR: $DATA_DIR"
     else
-        _pick_data_dir DATA_DIR
-        echo ""
-        _ok "Data directory: $DATA_DIR"
+        # Fresh install, no override: seed samples and point the config at them.
+        DATA_DIR="$SAMPLES_DIR"
+        MONITOR="false"
+        ALIAS="samples"
+        _seed_samples "$SAMPLES_DIR"
+        _ok "Data directory: $DATA_DIR (sample images)"
     fi
 
+    # ACTIVE_CONFIG is the file the running server will read -- the JSON we write,
+    # or the untouched existing file when the user keeps it (shown in the summary).
+    local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        _ok "Keeping current config: $CONFIG_FILE"
+        _ok "Keeping current config: $EXISTING_CONFIG"
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
             exit 1
         fi
-        # Preserve the previous config (a chosen new data dir must never silently
-        # discard the user's old settings) by renaming it to a timestamped backup.
-        if [ -f "$CONFIG_FILE" ]; then
-            local _config_backup="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
-            mv "$CONFIG_FILE" "$_config_backup"
-            _info "Backed up previous config to $_config_backup"
+        if ! _write_server_config "$CONFIG_FILE" "$DATA_DIR" "$MONITOR" "$EXISTING_CONFIG" "$ALIAS"; then
+            _err "Failed to write config: $CONFIG_FILE"
+            exit 1
         fi
-        TOML_DATA_DIR="${DATA_DIR//\\/\\\\}"
-        TOML_DATA_DIR="${TOML_DATA_DIR//\"/\\\"}"
-        cat > "$CONFIG_FILE" << EOF
-[server]
-host = "127.0.0.1"
-port = 8815
-aggressive_dir_pruning = true
-
-[cache]
-backend = "file"
-file_max_segment_mb = 256
-file_max_total_gb = 128
-
-[metadata_db]
-enabled = true
-
-[[sources]]
-url = "$TOML_DATA_DIR"
-monitor = true
-EOF
-        _ok "Created: $CONFIG_FILE"
+        ACTIVE_CONFIG="$CONFIG_FILE"
+        # Retire a legacy TOML we just superseded so the server does not warn
+        # about both files shadowing (find_config prefers biopb.json). Its
+        # settings were carried into the new JSON above.
+        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && [ -f "$LEGACY_CONFIG" ]; then
+            mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+            _info "Migrated legacy TOML config to JSON (old file backed up)"
+        fi
+        if [ -n "$EXISTING_CONFIG" ]; then
+            _ok "Updated: $CONFIG_FILE"
+        else
+            _ok "Created: $CONFIG_FILE"
+        fi
     fi
 
     # ===== 6. Start the data server =====
@@ -1106,6 +1277,8 @@ EOF
     _detect_agents
     if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
         _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
+    elif [ "$NONINTERACTIVE" = "1" ]; then
+        _note "Non-interactive: no AI agent detected and none installed; set one up later and rerun to wire it in."
     else
         _info ""
         _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
@@ -1132,7 +1305,7 @@ EOF
     # Headlines via _info (indent 2, matching _ok/_warn), detail lines indent 4.
     # --- informational blocks ---
     if [ "$INSTALL_WEBAPP" = "1" ]; then
-        _info "Data browser available at http://localhost:8815"
+        _info "Web interface available at http://localhost:8814"
         echo ""
     fi
 
@@ -1141,7 +1314,7 @@ EOF
     echo ""
 
     _info "Data server configuration file:"
-    _cmd "  $CONFIG_FILE"
+    _cmd "  $ACTIVE_CONFIG"
     echo ""
 
     _info "To upgrade: rerun this script"
@@ -1155,8 +1328,8 @@ EOF
     fi
 
     if [ "$INSTALL_WEBAPP" = "0" ]; then
-        _warn "Data browser not installed"
-        _info "  rerun this script to install it"
+        _warn "Web interface not installed (BIOPB_INSTALL_WEBAPP=0)"
+        _info "  rerun without that env var to install it"
         echo ""
     fi
 
@@ -1192,5 +1365,237 @@ EOF
     printf "%s%s%s%s\n" "${BOLD}" "${GREEN}" "$rule" "${RESET}"
 }
 
-# Only run if script was fully downloaded (function defined completely)
-install_biopb
+# ===== Uninstall path =========================================================
+# Mirrors the Windows engine's -Uninstall / -Purge teardown (biopb-engine.ps1,
+# Invoke-BiopbUninstall): stop the daemons, unregister biopb from every agent
+# this installer wires up, remove the one shared uv tool environment, and — only
+# with --purge — delete config and cached/state data. The user's image data is
+# NEVER touched. Best-effort throughout (no `set -e`): a missing component or a
+# stop that does nothing must not abort the rest of the teardown.
+
+# Remove the biopb stdio entry from a JSON MCP config: delete the "biopb" key
+# under top-level <parent> in <file>. No-op when the file, the parent section,
+# or the entry is absent (the file is left byte-for-byte untouched). Preserves
+# all other content and writes atomically — the exact inverse of _mcp_merge.
+# Prints "removed" iff it deleted an entry, so callers can report per client.
+_mcp_unmerge() {
+    local file="$1" parent="$2"
+    [ -f "$file" ] || return 0
+    _py - "$file" "$parent" 2>/dev/null <<'PY'
+import json, os, sys
+path, parent = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (FileNotFoundError, ValueError):
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+section = data.get(parent)
+if not isinstance(section, dict) or "biopb" not in section:
+    sys.exit(0)
+del section["biopb"]
+tmp = path + ".biopb.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, path)
+print("removed")
+PY
+}
+
+# Unregister biopb from every MCP client the installer can wire it into: Claude
+# Code via its CLI, and the JSON-config clients (Claude Desktop, Cursor,
+# opencode) via _mcp_unmerge. Requires PLATFORM to be set (Claude Desktop's
+# config path is OS-specific).
+_unregister_agents() {
+    local removed_any=0
+
+    # Claude Code — managed through the `claude` CLI. The installer adds it at
+    # user scope; try that first, then the default scope, to cover older wirings.
+    if command -v claude &>/dev/null; then
+        if claude mcp remove biopb -s user &>/dev/null \
+            || claude mcp remove biopb &>/dev/null; then
+            _ok "Claude Code: unregistered biopb"
+            removed_any=1
+        fi
+    fi
+
+    # JSON-config clients. Each row is "label|file|parent-key".
+    local cd_cfg=""
+    case "$PLATFORM" in
+        macOS)     cd_cfg="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
+        Linux|WSL) cd_cfg="$HOME/.config/Claude/claude_desktop_config.json" ;;
+    esac
+    local row label file parent
+    for row in \
+        "Claude Desktop|$cd_cfg|mcpServers" \
+        "Cursor|$HOME/.cursor/mcp.json|mcpServers" \
+        "opencode|$HOME/.config/opencode/opencode.json|mcp"; do
+        IFS='|' read -r label file parent <<< "$row"
+        [ -n "$file" ] || continue
+        if [ "$(_mcp_unmerge "$file" "$parent")" = "removed" ]; then
+            _ok "$label: unregistered biopb ($file)"
+            removed_any=1
+        fi
+    done
+
+    # Hermes' YAML is edited by hand on install, so we can't safely edit it back.
+    if [ -f "$HOME/.hermes/config.yaml" ] \
+        && grep -qE '^\s*biopb:' "$HOME/.hermes/config.yaml" 2>/dev/null; then
+        _info "Hermes: remove the 'biopb:' entry from $HOME/.hermes/config.yaml by hand"
+    fi
+
+    [ "$removed_any" = "0" ] && _info "No MCP client registrations found to remove"
+    return 0
+}
+
+# Print usage for the flag-driven entry point to stderr (help is diagnostic, and
+# stdout may be the curl|bash pipe).
+_usage() {
+    cat >&2 <<EOF
+biopb stack installer
+
+Usage:
+  curl -fsSL https://biopb.org/install.sh | bash                          # install / upgrade
+  curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall [--purge]
+
+Options:
+  --uninstall   Remove the biopb stack: stop the data/MCP servers, unregister
+                biopb from detected AI agents, and remove the package
+                environment. Keeps config and cached data unless --purge.
+  --purge       With --uninstall, also delete config and cached/state data
+                (~/.config/biopb, ~/.config/biopb-mcp, ~/.local/share/biopb, and
+                the file cache under the temp dir). Implies --uninstall. Never
+                touches your image data.
+  -h, --help    Show this help.
+EOF
+}
+
+uninstall_biopb() {
+    local purge="${1:-0}"
+
+    # Minimal platform detection — _unregister_agents needs it for the
+    # OS-specific Claude Desktop config path. (The install path detects this in
+    # its own step-0 system check, which we deliberately skip here.)
+    case "$(uname -s)" in
+        Linux)  if grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then PLATFORM="WSL"; else PLATFORM="Linux"; fi ;;
+        Darwin) PLATFORM="macOS" ;;
+        *)      PLATFORM="Linux" ;;
+    esac
+
+    printf "\n%s%sUninstalling the biopb stack%s\n" "${BOLD}" "${CYAN}" "${RESET}"
+
+    # 1. Stop the daemons first. On some platforms a live process keeps its files
+    #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
+    #    engine hits exactly this — os error 5), so stopping precedes removal.
+    _step "[1/3] Stopping biopb services..."
+    if command -v biopb &>/dev/null; then
+        biopb server stop &>/dev/null || true
+        biopb mcp stop &>/dev/null || true
+        _ok "Data server and MCP server stopped (if they were running)"
+    else
+        _info "biopb command not on PATH; nothing to stop"
+    fi
+
+    # 2. Unregister from agents BEFORE removing the package, while `claude` and
+    #    the config paths are still meaningful.
+    _step "[2/3] Unregistering from AI agents..."
+    _unregister_agents
+
+    # 3. Remove the one shared uv tool environment (holds all three packages and
+    #    their console scripts: biopb, biopb-tensor-server, biopb-mcp).
+    _step "[3/3] Removing biopb packages..."
+    if command -v uv &>/dev/null; then
+        if uv tool uninstall biopb &>/dev/null; then
+            _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
+        else
+            _info "biopb tool environment not present (already removed?)"
+        fi
+    else
+        _warn "uv not found; cannot remove the biopb tool environment"
+        _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
+    fi
+
+    # Optional purge of config + cached/state data. Never the user's images:
+    # only biopb's own dotfile dirs are removed, never any configured data dir.
+    if [ "$purge" = "1" ]; then
+        _step "Purging config and cached data..."
+
+        # The file-backend cache lives in the system temp dir (the tensor
+        # server's _default_file_cache_dir), NOT under ~/.local/share, so the
+        # dotfile sweep below misses it. Remove it best-effort: the per-user
+        # default location, plus any custom cache.file_cache_dir read from the
+        # config *before* we delete the config. The server was stopped in step 1,
+        # so its process lock is already released.
+        local cache_dirs=("${TMPDIR:-${TEMP:-${TMP:-/tmp}}}/biopb-cache-$(id -u)")
+        local cfg="$HOME/.config/biopb/biopb.json"
+        if [ -f "$cfg" ]; then
+            local custom
+            custom="$(_py - "$cfg" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        p = (json.load(fh).get("cache") or {}).get("file_cache_dir")
+    if p:
+        print(p)
+except Exception:
+    pass
+PY
+)"
+            [ -n "$custom" ] && cache_dirs+=("$custom")
+        fi
+        local c
+        for c in "${cache_dirs[@]}"; do
+            if [ -e "$c" ]; then
+                rm -rf "$c" 2>/dev/null && _ok "Removed cache $c" \
+                    || _info "Could not remove cache $c (left in place)"
+            fi
+        done
+
+        local d
+        for d in \
+            "$HOME/.config/biopb" \
+            "$HOME/.config/biopb-mcp" \
+            "$HOME/.local/share/biopb"; do
+            if [ -e "$d" ]; then
+                rm -rf "$d"
+                _ok "Removed $d"
+            fi
+        done
+        _info "Your image data was not touched."
+    else
+        _info "Config and cached data were kept. Remove them with --purge, or:"
+        _cmd "  rm -rf ~/.config/biopb ~/.config/biopb-mcp ~/.local/share/biopb"
+        _cmd "  rm -rf \"\${TMPDIR:-/tmp}/biopb-cache-\$(id -u)\"   # file cache"
+    fi
+
+    printf "\n%s%s=== biopb uninstalled ===%s\n\n" "${BOLD}" "${GREEN}" "${RESET}"
+    _info "uv and any AI agent (e.g. opencode) were left installed."
+    echo ""
+}
+
+# --- entry point -------------------------------------------------------------
+# Parse a tiny flag set so `... | bash -s -- --uninstall [--purge]` works while a
+# bare `... | bash` still installs (no args => install, the unchanged default).
+main() {
+    local action="install" purge=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --uninstall|--remove) action="uninstall" ;;
+            --purge)              action="uninstall"; purge=1 ;;
+            -h|--help)            _usage; return 0 ;;
+            *) _err "Unknown option: $1"; _usage; return 2 ;;
+        esac
+        shift
+    done
+
+    if [ "$action" = "uninstall" ]; then
+        uninstall_biopb "$purge"
+    else
+        install_biopb
+    fi
+}
+
+# Only run if the script was fully downloaded (every function defined completely).
+main "$@"

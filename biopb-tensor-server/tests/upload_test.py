@@ -4,8 +4,6 @@ Tests for CachedSourceAdapter, server-side do_put handler,
 and Python client upload methods.
 """
 
-import json
-import os
 import tempfile
 import threading
 from pathlib import Path
@@ -14,13 +12,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
+from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
 from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.config import CacheConfig
 
 
 class MockMetadataWriter:
@@ -86,9 +83,11 @@ class TestCachedSourceAdapter:
     def test_get_metadata_with_ome(self):
         """OME metadata handling."""
         ome_metadata = {
-            "multiscales": [{
-                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
-            }]
+            "multiscales": [
+                {
+                    "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                }
+            ]
         }
 
         adapter = CachedSourceAdapter(
@@ -103,7 +102,6 @@ class TestCachedSourceAdapter:
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
 
-    
     def test_write_chunk(self):
         """write_chunk stores data in cache."""
         CacheManager.reset()
@@ -169,13 +167,10 @@ class TestCachedSourceAdapter:
         chunk_id = encode_chunk_id("test_resolve", bounds)
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
-        # Verify data matches - data column is list<uint16>
-        data_col = batch.column("data")
-        # Extract values from list array
-        arr = data_col.values.to_numpy()
-        shape = tuple(batch.column("shape").to_pylist()[0])
-        arr = arr.reshape(shape)
+        # Verify data matches - the chunk is the unified binary schema now.
+        from biopb_tensor_server.base import unpack_chunk_array
 
+        arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
 
         CacheManager.reset()
@@ -207,16 +202,33 @@ class TestCachedSourceAdapter:
         CacheManager.get_instance().release(chunk_id)
         CacheManager.reset()
 
+    def test_write_chunk_arrow_rejects_list_wrapper(self):
+        # The binary chunk schema stores the flat value buffer, and the upload
+        # dtype is derived from the primitive Arrow field type; a list<T> wrapper
+        # would corrupt both (buffer[1] is offsets, to_pandas_dtype() is wrong).
+        # write_chunk_arrow must refuse it rather than silently mis-store.
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(backend="memory", memory_max_entries=10))
+        adapter = CachedSourceAdapter(
+            source_id="t", shape=[4], dtype="int16", chunk_shape=[4]
+        )
+        list_wrapper = pa.array([[1, 2, 3, 4]])  # list<int64>, not flat values
+        with pytest.raises(TypeError, match="not a list"):
+            adapter.write_chunk_arrow(
+                ChunkBounds(start=[0], stop=[4]), list_wrapper, [4], np.int16
+            )
+        CacheManager.reset()
+
     def test_write_chunk_with_file_backend_schema(self):
-        """Regression test: write_chunk batch schema must be compatible with _cast_to_unified_schema.
+        """Regression test: write_chunk must emit the unified binary chunk schema.
 
-        The batch must use ListArray (pa.array([flattened_data])) not primitive array,
-        since _cast_to_unified_schema expects data_col.values to be accessible.
-
-        Bug: AttributeError: 'pyarrow.lib.FloatArray' object has no attribute 'values'
+        A cache-backed source stores the batch it will later serve verbatim
+        (resolve_chunk_data returns entry.data), so write_chunk must produce the
+        same [data: binary, shape, dtype] wire schema every read path expects
+        (biopb/biopb#293).
         """
-        import tempfile
         import shutil
+        import tempfile
 
         CacheManager.reset()
 
@@ -247,21 +259,19 @@ class TestCachedSourceAdapter:
             chunk_id = encode_chunk_id("test_file_schema", bounds)
             cache_manager = CacheManager.get_instance()
 
-            # Read back via cache backend (triggers _cast_from_unified_schema)
+            # Read back via cache backend (served as the unified binary schema)
             entry = cache_manager.get_or_acquire(chunk_id, lambda: (None, 0))
             assert entry.state.name == "READY"
 
-            # Verify batch schema: should be [data: list<dtype>, shape: list<int64>, dtype: string]
+            # Verify batch schema: [data: binary, shape: list<int64>, dtype: string]
             batch = entry.data
             assert batch.schema.names == ["data", "shape", "dtype"]
-            assert isinstance(batch.column("data"), pa.ListArray)
+            assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            flat_data = batch.column("data").to_pylist()[0]
-            shape = batch.column("shape").to_pylist()[0]
-            dtype_str = batch.column("dtype").to_pylist()[0]
+            from biopb_tensor_server.base import unpack_chunk_array
 
-            reconstructed = np.array(flat_data, dtype=np.dtype(dtype_str)).reshape(shape)
+            reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
             assert reconstructed.dtype == data.dtype
 
@@ -426,6 +436,65 @@ class TestServerDoPutHandler:
             zarr_dirs = list(Path(tmpdir).glob("*.zarr"))
             assert len(zarr_dirs) == 1
 
+    def test_ome_zarr_upload_synced_to_catalog(self):
+        """File-backed (durable) uploads are added to the catalog so they are
+        discoverable via list_sources/query_sources (biopb/biopb#265)."""
+        from biopb_tensor_server.metadata_db import MetadataDatabase
+        from biopb_tensor_server.server import TensorFlightServer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = MetadataDatabase()
+            server = TensorFlightServer(
+                location="grpc://localhost:0",
+                writable=True,
+                write_dir=Path(tmpdir),
+                metadata_db=db,
+            )
+            req_desc = TensorDescriptor(
+                array_id="ome_zarr:persist",
+                shape=[64, 64],
+                dtype="uint8",
+                chunk_shape=[32, 32],
+                dim_labels=["y", "x"],
+            )
+            writer = MockMetadataWriter()
+            server._handle_create_source(req_desc, writer)
+            response_desc = TensorDescriptor()
+            response_desc.ParseFromString(writer.metadata)
+
+            # The durable upload appears in the catalog.
+            descriptors, _ = db.list_source_descriptors()
+            assert response_desc.array_id in {d.source_id for d in descriptors}
+
+    def test_cache_upload_not_synced_but_readable_by_id(self):
+        """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
+        the row would dangle), but stay readable by their returned id."""
+        from biopb_tensor_server.metadata_db import MetadataDatabase
+        from biopb_tensor_server.server import TensorFlightServer
+
+        db = MetadataDatabase()
+        server = TensorFlightServer(
+            location="grpc://localhost:0", writable=True, metadata_db=db
+        )
+        req_desc = TensorDescriptor(
+            array_id="cache:ephemeral",
+            shape=[64, 64],
+            dtype="uint8",
+            chunk_shape=[32, 32],
+        )
+        writer = MockMetadataWriter()
+        server._handle_create_source(req_desc, writer)
+        response_desc = TensorDescriptor()
+        response_desc.ParseFromString(writer.metadata)
+
+        # Not enumerable via the catalog...
+        descriptors, _ = db.list_source_descriptors()
+        assert response_desc.array_id not in {d.source_id for d in descriptors}
+        # ...but still registered and readable by its returned id.
+        assert isinstance(
+            server._sources.get(response_desc.array_id), CachedSourceAdapter
+        )
+
     def test_create_source_invalid_prefix(self):
         """Invalid array_id prefix raises error."""
         from biopb_tensor_server.server import TensorFlightServer
@@ -448,8 +517,8 @@ class TestServerDoPutHandler:
 
     def test_create_source_action_round_trip(self):
         """Live client create_source should return the server-assigned source_id."""
-        from biopb_tensor_server.server import TensorFlightServer
         from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -578,10 +647,9 @@ class TestChunkUpload:
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        reconstructed = np.array(
-            stored_batch.column("data").to_pylist()[0],
-            dtype=np.dtype(stored_batch.column("dtype").to_pylist()[0]),
-        ).reshape(stored_batch.column("shape").to_pylist()[0])
+        from biopb_tensor_server.base import unpack_chunk_array
+
+        reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
         assert np.array_equal(reconstructed, data)
 
@@ -749,6 +817,6 @@ class TestBuildMinimalOmeMetadata:
         axes = metadata["multiscales"][0]["axes"]
 
         assert axes[0]["type"] == "channel"  # 'c' detected as channel
-        assert axes[1]["type"] == "space"    # 'z' detected as space
-        assert axes[2]["type"] == "space"    # 'y' detected as space
-        assert axes[3]["type"] == "space"    # 'x' detected as space
+        assert axes[1]["type"] == "space"  # 'z' detected as space
+        assert axes[2]["type"] == "space"  # 'y' detected as space
+        assert axes[3]["type"] == "space"  # 'x' detected as space

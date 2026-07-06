@@ -1,0 +1,44 @@
+# Fast Python lint/format gate for the whole monorepo (issue #82). One job,
+# no matrix — ruff is a static analyzer, so a single runner/Python is enough,
+# and it spans all four workspace packages via the root [tool.ruff] config.
+#
+# Keep the ruff version aligned with the pre-commit pin in
+# .pre-commit-config.yaml (ruff-pre-commit rev).
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - '**/*.py'
+      - 'pyproject.toml'
+      - '**/pyproject.toml'
+      - '.pre-commit-config.yaml'
+      - '.github/workflows/lint.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run ruff (lint + format check)
+        uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.15.15
+          args: check --no-fix
+      - name: Run ruff format --check
+        uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.15.15
+          args: format --check
