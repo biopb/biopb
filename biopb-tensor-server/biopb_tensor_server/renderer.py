@@ -186,6 +186,23 @@ AXIS_Z_LABELS = {"z", "depth", "plane", "planes", "slice"}
 AXIS_C_LABELS = {"c", "channel", "channels", "band", "bands"}
 AXIS_Y_LABELS = {"y", "height", "row", "rows"}
 AXIS_X_LABELS = {"x", "width", "col", "cols", "column", "columns"}
+# Interleaved RGB(A) samples axis. aicsimageio labels the samples axis of a
+# photometric-RGB image "S" (dims "TCZYXS"); its size is 3 (RGB) or 4 (RGBA).
+AXIS_S_LABELS = {"s", "samples"}
+
+
+def samples_axis(dim_labels: list[str], shape: tuple[int, ...]) -> Optional[int]:
+    """Index of an interleaved RGB(A) samples axis, or ``None``.
+
+    Detected by *label* (``S`` / ``samples``) gated on a size of 3 or 4, so a
+    size-3 channel or Z axis is never mistaken for color. This axis holds the
+    color components of one pixel and must be composited into RGB, not selected
+    one-plane-at-a-time like T/Z/C.
+    """
+    for i, label in enumerate(dim_labels):
+        if label.lower() in AXIS_S_LABELS and i < len(shape) and shape[i] in (3, 4):
+            return i
+    return None
 
 
 def build_axis_map(dim_labels: list[str]) -> dict[str, Optional[int]]:
@@ -321,10 +338,13 @@ def extract_yx_slice(
     arr: np.ndarray,
     dim_labels: list[str],
 ) -> np.ndarray:
-    """Extract 2D Y/X slice from multi-dimensional array.
+    """Reduce a multi-dimensional array to the plane the renderer displays.
 
-    Uses axis mapping to find Y and X dimensions.
-    Assumes array is already sliced to single T/Z/C indices.
+    Returns a 2-D ``[Y, X]`` array, or a 3-D ``[Y, X, S]`` array when an
+    interleaved RGB(A) samples axis is present (see :func:`samples_axis`). Every
+    other axis (T, Z, C, ...) is reduced to its first index -- the slice request
+    has already pinned those to a single plane -- and the kept axes are ordered
+    ``[Y, X]`` (+ trailing samples), ready for the renderer.
     """
     axis_map = build_axis_map(dim_labels)
 
@@ -338,39 +358,46 @@ def extract_yx_slice(
     if x_idx is None:
         x_idx = arr.ndim - 1
 
-    # If array is already 2D, return it
-    if arr.ndim == 2:
-        return arr
+    s_idx = samples_axis(dim_labels, arr.shape)
 
-    # For 3D+ arrays, squeeze out non-Y/X dimensions that have size 1
-    # Only squeeze dimensions that are actually size 1 to avoid errors
-    squeeze_dims = tuple(
-        i for i in range(arr.ndim) if i not in (y_idx, x_idx) and arr.shape[i] == 1
-    )
-    if squeeze_dims:
-        squeezed = np.squeeze(arr, axis=squeeze_dims)
-        # Update y_idx and x_idx after squeezing (they shift if earlier dims were removed)
-        removed_before_y = sum(1 for d in squeeze_dims if d < y_idx)
-        removed_before_x = sum(1 for d in squeeze_dims if d < x_idx)
-        y_idx = y_idx - removed_before_y
-        x_idx = x_idx - removed_before_x
-    else:
-        squeezed = arr
+    # Keep Y, X and (if any) the samples axis; reduce every other axis to index
+    # 0. Integer indexing drops the reduced axes; the kept axes keep their
+    # relative order, which the transpose below normalizes to [Y, X, (S)].
+    keep = {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
+    index = tuple(slice(None) if i in keep else 0 for i in range(arr.ndim))
+    reduced = arr[index]
 
-    # Ensure we have 2D - take first slice along remaining non-Y/X dimensions
-    while squeezed.ndim > 2:
-        # Find first non-Y/X dimension and take index 0
-        for i in range(squeezed.ndim):
-            if i != y_idx and i != x_idx:
-                squeezed = squeezed[0]
-                # Update indices after removing dimension 0
-                if y_idx > 0:
-                    y_idx -= 1
-                if x_idx > 0:
-                    x_idx -= 1
-                break
+    survivors = [i for i in range(arr.ndim) if i in keep]
+    new_pos = {orig: p for p, orig in enumerate(survivors)}
+    order = [new_pos[y_idx], new_pos[x_idx]]
+    if s_idx is not None:
+        order.append(new_pos[s_idx])
+    return np.transpose(reduced, order)
 
-    return squeezed
+
+def normalize_rgb_samples(
+    plane: np.ndarray,
+    lo_val: float,
+    hi_val: float,
+) -> np.ndarray:
+    """Render an interleaved RGB(A) ``[Y, X, S]`` plane to display RGB ``(H, W, 3)``.
+
+    True color: a *shared* intensity stretch (one ``lo``/``hi`` for all samples)
+    is applied so the color balance is preserved, and no pseudo-color multiplier
+    is used. RGBA (``S == 4``) drops the alpha channel, which the RGB encoders
+    cannot carry.
+    """
+    rgb = plane[:, :, :3]
+    h, w = rgb.shape[:2]
+    if lo_val >= hi_val:
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    scale = 255.0 / (hi_val - lo_val)
+    out = rgb.astype(np.float32)
+    out -= lo_val
+    out *= scale
+    np.clip(out, 0, 255, out=out)
+    return out.astype(np.uint8)
 
 
 def render_array_to_image_bytes(
@@ -396,20 +423,25 @@ def render_array_to_image_bytes(
 
     t0 = time.monotonic()
 
-    # Extract 2D Y/X slice
+    # Reduce to the display plane: 2-D [Y, X], or 3-D [Y, X, S] for RGB(A).
     t1 = time.monotonic()
     yx_slice = extract_yx_slice(arr, dim_labels)
     extract_ms = (time.monotonic() - t1) * 1000
 
-    # Compute percentile cutoffs
+    # Compute percentile cutoffs (shared across samples for a true-color plane,
+    # so the RGB balance is preserved).
     t2 = time.monotonic()
     lo_val, hi_val = compute_percentile_cutoffs(yx_slice, percentile_lo, percentile_hi)
     percentile_ms = (time.monotonic() - t2) * 1000
 
-    # Normalize and colorize in one pass
-    color_multipliers = resolve_color(color, channel_name)
     t3 = time.monotonic()
-    rgb = normalize_and_colorize(yx_slice, lo_val, hi_val, color_multipliers)
+    if yx_slice.ndim == 3:
+        # Interleaved RGB(A) samples: composite directly, no pseudo-color.
+        rgb = normalize_rgb_samples(yx_slice, lo_val, hi_val)
+    else:
+        # Single grayscale plane: pseudo-color per the requested display color.
+        color_multipliers = resolve_color(color, channel_name)
+        rgb = normalize_and_colorize(yx_slice, lo_val, hi_val, color_multipliers)
     colorize_ms = (time.monotonic() - t3) * 1000
 
     height, width = rgb.shape[:2]
