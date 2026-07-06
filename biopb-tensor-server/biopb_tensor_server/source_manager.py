@@ -2311,10 +2311,14 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
 
-    # Monitored tensor-server upstreams (bare-host grpc://, monitor=true): their
-    # catalog is periodically re-listed and reconciled (biopb/biopb#178). A
-    # single-source grpc://host/<id> entry has nothing to re-list, so it is
-    # excluded -- only the bare-host "mirror everything" form qualifies.
+    # Tensor-server upstreams (bare-host grpc://) whose catalog is re-listed and
+    # reconciled in the background (biopb/biopb#178). Every bare-host upstream
+    # qualifies regardless of `monitor`: cli._resolve_serve_sources routes them all
+    # here (never to inline static expansion) so a large upstream neither blocks
+    # SERVING nor pays a per-source get_descriptor RPC -- `monitor=false` only makes
+    # the adaptive cadence back off after the boot-tick reconcile. A single-source
+    # grpc://host/<id> entry has nothing to re-list, so it is excluded -- only the
+    # bare-host "mirror everything" form qualifies.
     from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
 
     monitored_upstreams = [

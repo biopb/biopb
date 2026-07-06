@@ -174,6 +174,37 @@ class TestResolveServeSources:
         assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
         assert static_sources == []
 
+    def test_unmonitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
+        """A bare-host ``grpc://host:port`` upstream with ``monitor=false`` is ALSO
+        routed to the background re-list -- never inline-expanded into static
+        sources (biopb/biopb#178 regression).
+
+        Inline static expansion registered every mirrored source through a blocking
+        per-source ``get_descriptor`` RPC before ``mark_ready()``, so a large
+        upstream both stalled SERVING (~1h for a few hundred OME-TIFF proxies) and
+        skipped the bulk-seed fast path. A bare-host upstream always mirrors via the
+        seeded reconcile; ``monitor=false`` only tunes the re-list cadence, so
+        ``_resolve_serve_sources`` must not touch the network here either.
+        """
+        import biopb_tensor_server.config as cfg_mod
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never be reached
+            raise AssertionError("upstream must not be enumerated at startup")
+
+        monkeypatch.setattr(
+            "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
+            _boom,
+        )
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom, raising=False)
+
+        upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=False)
+        cfg = _config(upstream)
+
+        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+
+        assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
+        assert static_sources == []
+
     def test_monitored_single_source_upstream_is_static(self):
         """A monitored single-source ``grpc://host:port/<id>`` names exactly one
         upstream source (nothing to re-list), so it is still registered as a
