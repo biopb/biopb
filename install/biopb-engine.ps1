@@ -662,6 +662,35 @@ function Show-LogTail {
     }
 }
 
+# Poll `biopb server status --json --wait <Wait>` and return a parsed verdict.
+# Surfaces the daemon's live stderr progress via Report-Info as it arrives and
+# captures the JSON verdict line (stdout) for parsing. Returns a hashtable with
+# the raw json plus parsed running/status/health/count -- nulls when the daemon
+# is unreachable or on an older biopb that predates --json/--wait (json = "").
+function Get-ServerHealth {
+    param([int]$Wait = 60)
+    $result = @{ json = $null }
+    try {
+        & biopb server status --json --wait $Wait 2>&1 | ForEach-Object {
+            $s = "$_"
+            if ($s.TrimStart().StartsWith("{")) { $result.json = $s.Trim() }
+            elseif ($s.Trim()) { Report-Info $s.Trim() }
+        }
+    } catch { }
+    $out = if ($result.json) { $result.json } else { "" }
+    $parsed = @{ json = $out; running = $null; status = $null; health = $null; count = $null }
+    if ($out) {
+        try {
+            $obj = $out | ConvertFrom-Json
+            $parsed.running = [bool]$obj.running
+            $parsed.status  = $obj.status
+            $parsed.health  = $obj.health
+            $parsed.count   = $obj.source_count
+        } catch { }
+    }
+    return $parsed
+}
+
 # Start (or restart) the background data server, then report its health.
 # Best-effort: never aborts the install.
 function Start-DataServer {
@@ -681,25 +710,12 @@ function Start-DataServer {
     }
 
     # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise.
+    # and is a plain start otherwise. Then poll health until SERVING (or 60s).
     try { & biopb server restart *> $null } catch { }
+    $h = Get-ServerHealth -Wait 60
 
-    # Ask the daemon for its health, polling until SERVING (or 60s). Merge stderr
-    # (live progress) into the stream and surface it as it arrives; the JSON
-    # verdict (line starting with '{') on stdout is captured for parsing.
-    $result = @{ json = $null }
-    try {
-        & biopb server status --json --wait 60 2>&1 | ForEach-Object {
-            $s = "$_"
-            if ($s.TrimStart().StartsWith("{")) { $result.json = $s.Trim() }
-            elseif ($s.Trim()) { Report-Info $s.Trim() }
-        }
-    } catch { }
-    $out = $result.json
-    if (-not $out) { $out = "" }
-
-    # Tolerate an older biopb that predates --json/--wait.
-    if (-not $out) {
+    # Tolerate an older biopb that predates --json/--wait (no JSON verdict).
+    if (-not $h.json) {
         $plain = ""
         try { $plain = (& biopb server status 2>$null | Out-String) } catch { $plain = "" }
         if ($plain -match "Running") {
@@ -712,28 +728,43 @@ function Start-DataServer {
         return
     }
 
-    $health = $null; $count = $null
-    try {
-        $obj = $out | ConvertFrom-Json
-        $health = $obj.health
-        $count = $obj.source_count
-    } catch { }
+    # Retry once before giving up. A fresh install/upgrade rewrites every file in
+    # the uv tool env, and on Windows a just-written .pyd can briefly fail to load
+    # (real-time AV scan / slow I/O), crashing the very first launch -- which left
+    # installs finished with the server down even though a manual start seconds
+    # later worked. The transient clears in seconds, so a clean stop+start (the
+    # same recovery a user did by hand) reliably brings it up. Only once, and only
+    # when the first attempt did not already reach SERVING.
+    if ($h.health -ne "SERVING") {
+        Report-Info "Data server not ready yet; retrying once..."
+        try { & biopb server stop  *> $null } catch { }
+        Start-Sleep -Seconds 2
+        try { & biopb server start *> $null } catch { }
+        $h = Get-ServerHealth -Wait 60
+    }
 
-    if ($health -ne "SERVING") {
-        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
-        # folder scan: the server reaches SERVING as soon as it binds and scans in
-        # the background, so a big folder no longer holds it out of SERVING. Not
-        # SERVING after 60s therefore points to a real startup failure (crash,
-        # port already in use, or a wedged bind), not a slow scan.
-        Report-Warn "Data server did not reach SERVING within 60s"
-        Report-Detail "it likely failed to start or is wedged (a slow folder scan no"
-        Report-Detail "longer blocks SERVING, so this is not just still scanning):"
+    if ($h.health -ne "SERVING") {
+        # Still not SERVING after a retry. Report honestly: a daemon that never
+        # came up (status returns immediately when nothing is running -- the real
+        # cause of the old, misleading "did not reach SERVING within 60s" even when
+        # the wait never happened) is a different failure from one that is running
+        # but wedged. Progressive discovery (biopb/biopb#212) decoupled SERVING
+        # from the folder scan, so neither case is "just still scanning".
+        if (-not $h.running) {
+            Report-Warn "Data server failed to start"
+            Report-Detail "the daemon is not running (it likely crashed on launch):"
+        } else {
+            Report-Warn "Data server is running but has not reached SERVING"
+            Report-Detail "it is up but not serving yet (a wedged or very slow bind):"
+        }
         Show-LogTail -LogFile $logFile
         Report-Detail "full log: $logFile"
-        Report-Detail "recheck once with: biopb server status --wait 30"
+        Report-Detail "start it manually with: biopb server start"
+        Report-Detail "then recheck with:      biopb server status --wait 30"
         return
     }
 
+    $count = $h.count
     if ((-not $count) -or ($count -eq 0)) {
         # SERVING no longer implies a complete catalog: the folder scan runs in
         # the background and registers sources as it walks. status --wait returns
