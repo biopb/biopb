@@ -24,6 +24,57 @@ permissions:
   contents: read
 
 jobs:
+  # Gate: a FINAL release-v* deployment must be cut from a commit that is on
+  # main. Tags are branch-agnostic, so nothing stops `release-v1.2.3` being
+  # pushed onto a dev-forked release branch before it merges — but a final
+  # release moves Docker :latest and ships a non-prerelease GitHub release (the
+  # installer's source of truth), so publishing it off unmerged code is a
+  # mistake. RC/prerelease tags (…rc1/a1/b1) are EXEMPT: by design they are cut
+  # off dev to validate the deployment before it lands on main
+  # (docs/release-model.md). When a final tag points at an off-main commit we
+  # skip the whole run (a noop) rather than publish it. Manual workflow_dispatch
+  # is a dry run that never pushes, so it always proceeds.
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || '' }}
+          fetch-depth: 0  # full history so the on-main ancestry check resolves
+
+      - name: Decide whether to release
+        id: decide
+        run: |
+          set -euo pipefail
+          # Not a release-v* tag ref -- the usual case is a manual
+          # workflow_dispatch from a branch. The downstream deploy steps are
+          # themselves `is_tag`-gated (also keyed on this ref), so a non-tag ref
+          # never pushes: there is nothing to guard, so proceed.
+          if [[ "${GITHUB_REF:-}" != refs/tags/release-v* ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "non-release-tag ref (dry run) -> proceed"
+            exit 0
+          fi
+          REL="${GITHUB_REF#refs/tags/release-v}"
+          # A PEP 440 prerelease (…rc/a/b) is branch-agnostic by design.
+          if [[ ! "$REL" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease $REL -> proceed (exempt from the on-main check)"
+            exit 0
+          fi
+          # Final release: require the tagged commit to be reachable from main.
+          git fetch --no-tags --quiet origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "final release $REL is on main -> proceed"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::final release tag $REL points at a commit not on main; skipping the deployment (noop). Merge the commit to main and re-tag, or cut an rc."
+          fi
+
   # Build the Windows GUI installer (Inno Setup) on a Windows runner and hand it
   # to the release job as an artifact. The installer is an ONLINE bootstrapper
   # (ships only install/biopb-engine.ps1; wheels/napari are fetched at run time),
@@ -33,6 +84,8 @@ jobs:
   # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
   # (see docs/windows-installer.md "Code signing").
   windows-installer:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -76,7 +129,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: windows-installer
+    needs: [guard, windows-installer]
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
