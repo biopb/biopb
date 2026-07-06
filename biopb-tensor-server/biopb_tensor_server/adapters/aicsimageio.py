@@ -987,10 +987,6 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 and hasattr(ome_meta, "images")
                 and len(ome_meta.images) == len(scene_ids)
             ):
-                # Get dtype from first scene (assumed consistent)
-                self._aics_image.set_scene(scene_ids[0])
-                dtype = self._aics_image.dask_data.dtype.str
-
                 labels = (
                     list(self.dim_labels)
                     if self.dim_labels
@@ -1007,6 +1003,12 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 # open. Defer those to the authoritative scene-switching fallback
                 # below, mirroring `_tczyx_shape`'s rejection of the S axis.
                 if labels == list(_CANONICAL_DIMS):
+                    # Get dtype from first scene (assumed consistent). Kept inside
+                    # the canonical guard so a deferred RGB/samples source does not
+                    # pay for a scene switch it will redo in the fallback below.
+                    self._aics_image.set_scene(scene_ids[0])
+                    dtype = self._aics_image.dask_data.dtype.str
+
                     # Get shapes from OME metadata (no scene switching)
                     # OME images are in same order as img.scenes
                     for i, im in enumerate(ome_meta.images):
