@@ -680,9 +680,31 @@ function Start-DataServer {
         return
     }
 
+    # Both native calls below merge stderr via 2>&1; under the script's
+    # EAP='Stop', PS 5.1 turns a stderr line into a terminating
+    # NativeCommandError, so soften EAP around them and gate on real exit codes.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+
     # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise.
-    try { & biopb server restart *> $null } catch { }
+    # and is a plain start otherwise. Don't swallow a failure (biopb/biopb#324):
+    # on a start that can never succeed -- e.g. gRPC port 8815 held by a process
+    # biopb is not tracking -- the CLI prints the real cause, and the status poll
+    # below would bury it under a generic "may not have started".
+    $restartOut = @()
+    try { $restartOut = @(& biopb server restart 2>&1 | ForEach-Object { "$_" }) } catch { $restartOut += "$_" }
+    if ($LASTEXITCODE -ne 0) {
+        $ErrorActionPreference = $prevEAP
+        Report-Warn "Data server failed to (re)start"
+        foreach ($line in $restartOut) {
+            $t = "$line".Trim()
+            if ($t) { Report-Detail $t }
+        }
+        Show-LogTail -LogFile $logFile
+        Report-Detail "full log: $logFile"
+        Report-Detail "after fixing the cause, run: biopb server start"
+        return
+    }
 
     # Ask the daemon for its health, polling until SERVING (or 60s). Merge stderr
     # (live progress) into the stream and surface it as it arrives; the JSON
@@ -695,6 +717,7 @@ function Start-DataServer {
             elseif ($s.Trim()) { Report-Info $s.Trim() }
         }
     } catch { }
+    $ErrorActionPreference = $prevEAP
     $out = $result.json
     if (-not $out) { $out = "" }
 
