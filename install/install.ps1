@@ -106,26 +106,15 @@ function Show-Banner {
     Write-Host ""
 }
 
-# Two light-hearted pre-flight confirmations. Returns $true if the user opted in
-# to filing a bug report should things go sideways. Exits if they bail.
+# A light-hearted pre-flight confirmation on interactive runs: offer to file a
+# bug report if the install goes sideways. Returns $true if the user opted in
+# (default yes); unattended runs skip it and return $false.
 function Invoke-Preflight {
     # Unattended runs skip the pre-flight banter; don't nag with a bug-report
     # offer no one is watching for.
     if ($script:NonInteractive) { return $false }
     Write-Host ""
     Write-Host "  --- Before we begin ---" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  The Windows installer is shiny, new, and proudly experimental."
-    Write-Host "  It has been road-tested about as much as a chocolate teapot, so"
-    Write-Host "  expect the occasional wobble while we knock off the rough edges."
-    $go = Read-Host "  Feeling brave enough to continue? [y/N]"
-    if ($go -notmatch '^(y|yes)$') {
-        Write-Host ""
-        Write-Host "  Wise. We'll be right here once it's more house-trained. Cheers!" -ForegroundColor Cyan
-        Wait-ForExit
-        exit 0
-    }
-
     Write-Host ""
     Write-Host "  If this script faceplants, a 30-second bug report helps us teach"
     Write-Host "  it to land on its feet. Nothing is sent anywhere automatically --"
