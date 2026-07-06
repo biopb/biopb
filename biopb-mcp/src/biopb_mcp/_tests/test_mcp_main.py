@@ -8,7 +8,6 @@ daemon.
 import os
 import sys
 import threading
-import time
 
 import pytest
 
@@ -283,20 +282,20 @@ class TestShutdownSentinelWatcher:
         assert fired.wait(5), "watcher never fired on a fresh sentinel"
         assert reasons == ["stop sentinel"]
         # Consumed before shutdown, so a daemon started later can't trip on it
-        # (belt and braces on top of the mtime guard).
+        # (belt and braces on top of the delete-at-install clear).
         assert not sentinel.exists()
 
     def test_stale_sentinel_is_ignored(self, tmp_path):
-        # A leftover from a previous run — mtime before this watcher started —
-        # must not stop a freshly started daemon.
+        # A leftover from a previous run must not stop a freshly started daemon.
+        # The watcher clears any pre-existing sentinel once at install (#345), so
+        # it is neither acted on nor left behind to trip a later check -- no mtime
+        # comparison, regardless of the leftover's timestamp.
         sentinel = tmp_path / "mcp-server.stop"
         sentinel.write_text("stop")
-        past = time.time() - 60
-        os.utime(sentinel, (past, past))
         fired = threading.Event()
         _install_shutdown_sentinel_watcher(sentinel, lambda _r: fired.set(), poll=0.01)
         assert not fired.wait(0.3)
-        assert sentinel.exists()  # ignored via the mtime guard, not deleted
+        assert not sentinel.exists()  # cleared at install, not acted on
 
     def test_missing_sentinel_never_fires(self, tmp_path):
         fired = threading.Event()

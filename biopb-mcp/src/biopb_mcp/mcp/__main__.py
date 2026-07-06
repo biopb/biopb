@@ -147,18 +147,28 @@ def _install_shutdown_sentinel_watcher(sentinel, shutdown, poll=0.2):
     ``shutdown`` here ``os._exit``\\ s and never returns, so the sentinel is
     consumed *before* calling it.
 
-    A leftover sentinel from a previous run is ignored via an mtime guard
-    (only files touched at/after this watcher started count), so no startup
-    delete is needed. The *caller* gates installation on Windows (POSIX uses
-    real signals and needs no watcher); the function itself is
+    A leftover sentinel from a previous run is cleared once, up front, so the
+    watch loop can treat *any* existing sentinel as a live stop request with no
+    clock comparison. (The former mtime guard compared the filesystem's
+    ``st_mtime`` against a process-clock ``time.time()``; on a filesystem whose
+    mtime granularity is coarser than ``time.time()`` a freshly written sentinel
+    could round to just below install time and be misread as stale, dropping a
+    real stop -- biopb/biopb#345.) The *caller* gates installation on Windows
+    (POSIX uses real signals and needs no watcher); the function itself is
     platform-agnostic so tests exercise it on every OS.
     """
-    installed_at = time.time()
+    # Clear a stale leftover exactly once at install, so "fresh vs. leftover"
+    # needs no mtime/clock comparison: after this, any sentinel that appears was
+    # written by a stop request racing or following this watcher.
+    try:
+        sentinel.unlink(missing_ok=True)
+    except OSError:
+        pass
 
     def _watch():
         while True:
             try:
-                if sentinel.exists() and sentinel.stat().st_mtime >= installed_at:
+                if sentinel.exists():
                     logger.info("Stop sentinel found; shutting down.")
                     sentinel.unlink(missing_ok=True)
                     shutdown("stop sentinel")
