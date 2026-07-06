@@ -146,6 +146,78 @@ class TestFastPathParity:
         assert adapter.list_tensor_descriptors() is descriptors
 
 
+class TestRgbSamplesDescriptor:
+    """An RGB (YXS / photometric-rgb) OME-TIFF must yield a descriptor whose
+    dim_labels and shape agree in length.
+
+    aicsimageio folds interleaved samples into a trailing ``S`` axis, so it
+    reports dims.order "TCZYXS" (6) with dask shape ``(1,1,1,H,W,3)``. The
+    OME-metadata fast path in ``list_tensor_descriptors`` builds a canonical 5-D
+    TCZYX shape from ``Pixels`` -- if it paired that 5-D shape with the 6 labels
+    the descriptor would be malformed and ``get_flight_info`` would reject every
+    slice as a dimensionality mismatch (an RGB sample dataset failing to open in
+    the webapp). The fast path must defer such sources to the scene-switching
+    path, exactly as ``_tczyx_shape`` rejects the ``S`` axis.
+    """
+
+    def _write_rgb_ome_tiff(self, tmp_path, h=24, w=32):
+        import tifffile
+
+        path = str(tmp_path / "rgb.ome.tif")
+        data = np.zeros((h, w, 3), dtype=np.uint8)
+        data[..., 0] = 10
+        data[..., 1] = 20
+        data[..., 2] = 30
+        tifffile.imwrite(
+            path, data, ome=True, photometric="rgb", metadata={"axes": "YXS"}
+        )
+        return path
+
+    def test_tifffile_fast_path_defers_rgb(self, tmp_path):
+        # The tifffile-direct fast path rejects the S axis up front.
+        path = self._write_rgb_ome_tiff(tmp_path)
+        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        assert adapter._tifffile_descriptors() is None
+
+    def test_descriptor_labels_and_shape_agree(self, tmp_path):
+        path = self._write_rgb_ome_tiff(tmp_path)
+        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+
+        descriptors = adapter.list_tensor_descriptors()
+
+        assert len(descriptors) == 1
+        d = descriptors[0]
+        assert len(d.dim_labels) == len(d.shape), (
+            f"label/shape length mismatch: {list(d.dim_labels)} vs {list(d.shape)}"
+        )
+        # The authoritative scene-switching descriptor: samples become a trailing
+        # S axis, matching what get_tensor_adapter serves at read time.
+        assert list(d.dim_labels) == list("TCZYXS")
+        assert list(d.shape) == [1, 1, 1, 24, 32, 3]
+
+    def test_slice_round_trips_through_get_flight_info(self, tmp_path):
+        # End-to-end guard on the exact path that was failing: get_flight_info
+        # validates the client's SliceHint against the descriptor dim count.
+        from biopb.tensor.client import TensorFlightClient
+        from biopb_tensor_server.server import TensorFlightServer
+
+        path = self._write_rgb_ome_tiff(tmp_path)
+        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("rgb", adapter)
+        server.mark_ready()
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+            darr = client.get_tensor("rgb/Image:0")
+            assert darr.shape == (1, 1, 1, 24, 32, 3)
+            sub = np.asarray(darr[0, 0, 0, :, :, :])
+            assert sub.shape == (24, 32, 3)
+        finally:
+            server.shutdown()
+
+
 class TestSceneResolutionAndReads:
     def test_scene_index_resolves_from_cache(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
