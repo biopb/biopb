@@ -882,11 +882,17 @@ class TestResolveAction:
             assert proxy.is_resolved is True
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
-        # With a tiny heartbeat interval and a slow resolve, the stream must carry
-        # progress keep-alives BEFORE the terminal descriptor -- this is what keeps
-        # a minutes-long recall under a proxy's idle read timeout, and the elapsed
-        # field lets a client show progress.
-        import time as _time
+        # The stream must carry progress keep-alives BEFORE the terminal descriptor
+        # -- this is what keeps a minutes-long recall under a proxy's idle read
+        # timeout, and the elapsed field lets a client show progress.
+        #
+        # Deterministic drive (no wall-clock race, see issue #177): the fake
+        # resolve() blocks on an Event we only set AFTER pulling the first stream
+        # item. Because the worker thread is parked in resolve() until then, the
+        # server's heartbeat loop is guaranteed to time out its join at least once
+        # and emit a progress message first -- independent of runner load. The old
+        # form raced a 0.06s sleep against a 0.01s interval and flaked on slow CI.
+        import threading
 
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
@@ -894,16 +900,28 @@ class TestResolveAction:
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
 
+        release = threading.Event()
+
         class _SlowAdapter:
             def resolve(self):
-                _time.sleep(0.06)  # ~6 heartbeat intervals
+                # Park until the test has observed the first heartbeat, then finish.
+                # Bounded wait so a broken test can never hang the drain below.
+                release.wait(timeout=5.0)
                 return DataSourceDescriptor(source_id="slow")
 
         server = self._server("slow", _SlowAdapter())
         action = flight.Action("resolve", b"slow")
-        bodies = [bytes(r) for r in server.do_action(None, action)]
+
+        stream = server.do_action(None, action)
+        try:
+            # Worker is parked in resolve() -> the first item is a heartbeat.
+            first = bytes(next(stream))
+        finally:
+            release.set()  # let resolve() complete, then drain the rest
+        bodies = [first] + [bytes(r) for r in stream]
         msgs, kinds = self._parse(bodies)
 
+        assert kinds[0] == "progress"  # deterministically, a heartbeat leads
         assert kinds.count("progress") >= 1  # at least one heartbeat
         assert kinds[-1] == "result"  # terminal is the descriptor
         assert msgs[-1].result.source_id == "slow"
