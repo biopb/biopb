@@ -208,20 +208,26 @@ def _resolve_serve_sources(
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 
+        # A bare-host tensor-server upstream ("mirror everything") is ALWAYS routed
+        # to the background seeded re-list, regardless of `monitor`. Inline
+        # expansion registers every mirrored source through a blocking per-source
+        # upstream get_descriptor RPC *before* mark_ready(), which both keeps the
+        # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
+        # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
+        # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
+        # seeds the entire catalog in ONE upstream query_sources (no per-source RPC,
+        # biopb/biopb#266) and runs in the background, so the server reaches SERVING
+        # immediately and the mirror fills progressively -- exactly like a monitored
+        # local directory. `monitor=false` on a bare-host upstream is not "static":
+        # it just means the adaptive cadence reconciles once at the boot tick and
+        # then backs off toward full_rescan_interval, rather than never mirroring
+        # the upstream at all (biopb/biopb#178).
+        if _is_bare_host_upstream(s):
+            monitored_sources.append(s)
+            continue
         # Remote monitor entries are also handed to create_source_manager.
         if s.monitor:
             monitored_sources.append(s)
-        # A monitored bare-host tensor-server upstream ("mirror everything") must
-        # NOT be expanded inline here. Inline expansion runs one blocking upstream
-        # RPC per mirrored source *before* mark_ready(), so a large upstream keeps
-        # the server STARTING for minutes -- it never reaches SERVING (observed:
-        # 900s+ stuck registering hundreds of hpc__* proxies). Its sources are
-        # instead discovered and registered in the background by the SourceManager's
-        # periodic upstream re-list (biopb/biopb#178); the first rescan fires
-        # immediately, so the catalog populates progressively -- exactly like a
-        # monitored local directory. Skip the inline expansion.
-        if s.monitor and _is_bare_host_upstream(s):
-            continue
         to_expand.append(s)
 
     # Expand only the non-monitored-dir entries. tolerant=True so one missing or
