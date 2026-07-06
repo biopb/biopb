@@ -334,6 +334,50 @@ def normalize_and_colorize(
     return rgb
 
 
+def _resolve_plane_axes(
+    ndim: int,
+    dim_labels: list[str],
+    shape: Tuple[int, ...],
+) -> Tuple[int, int, Optional[int]]:
+    """Pick distinct ``(y_idx, x_idx, s_idx)`` axes for the display plane.
+
+    Robust to malformed/degenerate label sets (a defensive requirement -- the
+    labels are attacker/adapter-supplied, not trusted). Guarantees ``y_idx`` and
+    ``x_idx`` are two *distinct*, in-range axes and ``s_idx`` (if not ``None``)
+    is a third distinct axis, so the caller's transpose can never see a repeated
+    axis. The interleaved-samples axis is honored only when it does not shadow a
+    labeled Y/X and at least two other axes remain to serve as Y and X -- so a
+    malformed ``"CYS"`` or ``"YS"`` degrades to a plain grayscale plane instead
+    of crashing. Assumes ``ndim >= 2`` (the caller guards ``ndim < 2``).
+    """
+    axis_map = build_axis_map(dim_labels)
+    y_lbl = axis_map["y"]
+    x_lbl = axis_map["x"]
+
+    s_idx = samples_axis(dim_labels, shape)
+    # Drop a samples axis that collides with a labeled Y/X, or that would leave
+    # fewer than two axes for the Y/X plane.
+    if s_idx is not None and (s_idx in (y_lbl, x_lbl) or ndim < 3):
+        s_idx = None
+
+    non_samples = [i for i in range(ndim) if i != s_idx]
+
+    # X: labeled X if usable, else the trailing non-samples axis.
+    if x_lbl is not None and x_lbl in non_samples:
+        x_idx = x_lbl
+    else:
+        x_idx = non_samples[-1]
+
+    # Y: labeled Y if usable and distinct from X, else the trailing non-samples
+    # axis that is not X.
+    if y_lbl is not None and y_lbl in non_samples and y_lbl != x_idx:
+        y_idx = y_lbl
+    else:
+        y_idx = next((i for i in reversed(non_samples) if i != x_idx), x_idx)
+
+    return y_idx, x_idx, s_idx
+
+
 def extract_yx_slice(
     arr: np.ndarray,
     dim_labels: list[str],
@@ -346,24 +390,19 @@ def extract_yx_slice(
     has already pinned those to a single plane -- and the kept axes are ordered
     ``[Y, X]`` (+ trailing samples), ready for the renderer.
     """
-    axis_map = build_axis_map(dim_labels)
+    # Below 2-D there is no Y/X plane to reduce to; promote to a 2-D (1 x N)
+    # strip so the renderer always gets at least a plane and never a repeated /
+    # negative transpose axis from _resolve_plane_axes.
+    if arr.ndim < 2:
+        return arr.reshape((1,) * (2 - arr.ndim) + arr.shape)
 
-    # Find Y and X axes
-    y_idx = axis_map["y"]
-    x_idx = axis_map["x"]
-
-    # Fallback: last two dimensions
-    if y_idx is None:
-        y_idx = arr.ndim - 2
-    if x_idx is None:
-        x_idx = arr.ndim - 1
-
-    s_idx = samples_axis(dim_labels, arr.shape)
+    y_idx, x_idx, s_idx = _resolve_plane_axes(arr.ndim, dim_labels, arr.shape)
 
     # Keep Y, X and (if any) the samples axis; reduce every other axis to index
     # 0. Integer indexing drops the reduced axes; the kept axes keep their
-    # relative order, which the transpose below normalizes to [Y, X, (S)].
-    keep = {y_idx, x_idx} | ({s_idx} if s_idx is not None else set())
+    # relative order, which the transpose below normalizes to [Y, X, (S)]. The
+    # three kept indices are distinct by construction, so the transpose is safe.
+    keep = [y_idx, x_idx] + ([s_idx] if s_idx is not None else [])
     index = tuple(slice(None) if i in keep else 0 for i in range(arr.ndim))
     reduced = arr[index]
 

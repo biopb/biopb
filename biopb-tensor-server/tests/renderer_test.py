@@ -70,6 +70,38 @@ class TestExtractYxSlice:
         assert extract_yx_slice(arr, RGB_LABELS).shape == (12, 10, 3)
 
 
+class TestExtractYxSliceMalformed:
+    """Defensive: attacker/adapter-supplied labels must never crash the render.
+
+    Degenerate label sets can map the samples axis onto Y/X, leave Y/X with no
+    distinct axis, or under-rank the array -- all of which previously produced a
+    repeated / negative transpose axis (ValueError / KeyError).
+    """
+
+    @pytest.mark.parametrize(
+        "labels,shape",
+        [
+            (["C", "Y", "S"], (3, 8, 10)),  # S claimed as X by fallback + samples
+            (["C", "Y"], (3, 8)),  # X falls back onto Y's axis
+            (["Y", "S"], (8, 3)),  # samples but too few spatial axes
+            (["S"], (3,)),  # 1-D
+            (["X"], ()),  # 0-D
+            ([], (4, 5)),  # no labels
+            (["Q", "W"], (6, 7)),  # all-unknown labels
+            (["X", "Y"], (6, 7)),  # swapped order
+        ],
+    )
+    def test_no_crash_and_valid_plane(self, labels, shape):
+        arr = np.arange(max(1, int(np.prod(shape))), dtype=np.uint8).reshape(shape)
+        out = extract_yx_slice(arr, labels)
+        assert out.ndim in (2, 3)  # always a usable Y/X (+S) plane
+        # And the full render path stays intact.
+        _, w, h, _, _ = render_array_to_image_bytes(
+            arr=arr, dim_labels=labels, output_format="raw"
+        )
+        assert w >= 1 and h >= 1
+
+
 class TestRenderRgb:
     def _gradient_rgb(self, h=64, w=80):
         arr = np.zeros((1, 1, 1, h, w, 3), np.uint8)
