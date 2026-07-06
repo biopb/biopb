@@ -163,8 +163,10 @@ class TestResolveServeSources:
             "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
             _boom,
         )
-        # Guard the import site used inside _discover_tensor_server too.
-        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom, raising=False)
+        # Guard the expansion entry point too. No raising=False: if
+        # _discover_tensor_server is renamed/removed, this setattr must fail loudly
+        # rather than silently create a dead attribute and let the test pass blind.
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom)
 
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=True)
         cfg = _config(upstream)
@@ -195,7 +197,7 @@ class TestResolveServeSources:
             "biopb_tensor_server.adapters.remote_tensor.list_upstream_source_ids",
             _boom,
         )
-        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom, raising=False)
+        monkeypatch.setattr(cfg_mod, "_discover_tensor_server", _boom)
 
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=False)
         cfg = _config(upstream)
