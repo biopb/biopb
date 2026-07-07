@@ -34,16 +34,6 @@ def _h5py_available() -> bool:
     return importlib.util.find_spec("h5py") is not None
 
 
-def _bioformats_available() -> bool:
-    """Check if bioformats_jar is available for companion.ome support."""
-    try:
-        import bioformats_jar  # noqa: F401  # availability probe
-
-        return True
-    except ImportError:
-        return False
-
-
 class TestZarrIntegration:
     """Integration tests for ZarrAdapter with server/client."""
 
@@ -401,9 +391,9 @@ class TestOmeTiffIntegration:
             # tensor_id is the scene_id (e.g., 'Image:0')
             darr = client.get_tensor("ome-tiff-integration", scene_id)
 
-            # AICSImage uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
+            # OME-TIFF uses TCZYX dimension order, so shape is (T, C, Z, Y, X)
             # Original fixture creates (C, Y, X) = (3, 128, 128) with CYX axes
-            # aicsimageio interprets this as T=1, C=3, Z=1, Y=128, X=128
+            # interpreted as T=1, C=3, Z=1, Y=128, X=128
             expected_shape = (1, 3, 1, 128, 128)
             assert darr.shape == expected_shape
             assert darr.dtype == np.uint16
@@ -464,7 +454,7 @@ class TestOmeTiffIntegration:
 
     def test_read_path_never_parses_ome_model(self, tmp_path):
         """biopb/biopb#213: end-to-end, GetFlightInfo + DoGet over a registered
-        OME-TIFF must not trigger AICSImage's OME parse.
+        OME-TIFF must not trigger a heavy bioio (BioImage) reader parse.
 
         A tripwire is installed on the registered adapter's ``_bio_image`` AFTER
         registration, then a full client round-trip drives GetFlightInfo (via the
@@ -477,7 +467,9 @@ class TestOmeTiffIntegration:
 
         class _Tripwire:
             def __getattr__(self, name):
-                raise AssertionError(f"AICSImage parsed on read path: .{name}")
+                raise AssertionError(
+                    f"heavy reader (BioImage) touched on read path: .{name}"
+                )
 
         path = str(tmp_path / "e2e.ome.tif")
         data = np.zeros((3, 64, 64), np.uint16)
@@ -557,7 +549,7 @@ class TestMultiSeriesOmeTiffIntegration:
             series_adapter = adapter.get_tensor_adapter(scene_id)
             desc = series_adapter.get_tensor_descriptor()
 
-            # Verify shape matches expected (aicsimageio uses TCZYX order)
+            # Verify shape matches expected (OME-TIFF uses TCZYX order)
             assert len(desc.shape) == 5  # T, C, Z, Y, X
             assert desc.shape[3] == 64  # height
             assert desc.shape[4] == 64  # width
@@ -595,7 +587,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
             # Read data
             data = darr.compute()
-            # aicsimageio uses TCZYX order: (T, C, Z, Y, X)
+            # OME-TIFF uses TCZYX order: (T, C, Z, Y, X)
             # Fixture uses CYX axes, so C=2, Z=1
             assert data.shape[1] == 2  # C planes per series (from CYX first axis)
 
@@ -607,7 +599,7 @@ class TestMultiSeriesOmeTiffIntegration:
             server.shutdown()
 
     def test_lazy_tile_loading(self, multi_series_ome_tiff):
-        """Test that aicsimageio provides tile-level lazy loading."""
+        """Test that the OME-TIFF adapter provides tile-level lazy loading."""
         from biopb.tensor.ticket_pb2 import ChunkBounds
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
@@ -833,6 +825,64 @@ class TestConcurrentAccess:
         except Exception:
             server.shutdown()
             raise
+
+
+class TestBioioReadPath:
+    """Exercise the bioio *read* path, not just claim() routing.
+
+    Reading through bioio needs the matching ``bioio-*`` reader plugin installed;
+    a missing one surfaces here as ``UnsupportedFileFormatError`` rather than
+    silently at runtime. In particular ``bioio-ome-tiff`` claims ONLY OME-TIFF,
+    so plain TIFF and Zeiss LSM depend on ``bioio-tifffile`` -- the coverage gap
+    that let that plugin get dropped from the ``[aics]`` extra once.
+    """
+
+    def _read_full(self, path):
+        """Register a file as a bioio source and read its first tensor whole."""
+        from bioio import BioImage
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
+
+        src = AicsImageIoAdapter(
+            BioImage(path), scene_index=None, source_id="s", source_url=path
+        )
+        descs = src.list_tensor_descriptors()
+        assert descs, "bioio produced no tensor descriptors"
+        scene = src.get_tensor_adapter(descs[0].array_id)
+        desc = scene.get_tensor_descriptor()
+        data = scene.get_data(
+            ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
+        )
+        return desc, data
+
+    def test_plain_tiff_read_via_bioio(self, tmp_path):
+        """Plain (non-OME) TIFF reads through bioio-tifffile (the generic
+        AicsImageIoAdapter fallback path)."""
+        import tifffile
+
+        arr = np.arange(5 * 8 * 8, dtype=np.uint16).reshape(5, 8, 8)
+        path = str(tmp_path / "plain.tif")
+        tifffile.imwrite(path, arr)
+
+        desc, data = self._read_full(path)
+        assert tuple(data.shape) == tuple(desc.shape)  # data matches its descriptor
+        assert data.dtype == np.uint16
+        # Pixels round-trip. bioio may permute or insert singleton axes, so
+        # compare value multisets rather than a fixed layout.
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
+
+    def test_lsm_read_via_bioio(self, tmp_path):
+        """Zeiss .lsm (a TIFF variant) reads through bioio-tifffile -- the path
+        ZeissAdapter takes for .lsm. Guards the bioio-tifffile dependency."""
+        import tifffile
+
+        arr = np.arange(5 * 8 * 8, dtype=np.uint16).reshape(5, 8, 8)
+        path = str(tmp_path / "img.lsm")
+        tifffile.imwrite(path, arr)
+
+        desc, data = self._read_full(path)
+        assert tuple(data.shape) == tuple(desc.shape)
+        np.testing.assert_array_equal(np.sort(data.ravel()), np.sort(arr.ravel()))
 
 
 class TestAicsImageIoAdapterClaim:
