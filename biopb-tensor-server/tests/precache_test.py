@@ -428,7 +428,7 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
             fired = []
-            sm._on_source_committed = fired.append
+            sm.set_source_committed_hook(fired.append)
             claim = SimpleNamespace(source_id="s1", primary_path="/x")
 
             # During the initial scan: startup sources go to the backlog, not the
@@ -467,7 +467,7 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
 
             fired = []
-            sm._on_source_committed = fired.append
+            sm.set_source_committed_hook(fired.append)
             sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
 
@@ -503,7 +503,7 @@ class TestRuntimePhaseGating:
             def boom(_sid):
                 raise RuntimeError("hook failure")
 
-            sm._on_source_committed = boom
+            sm.set_source_committed_hook(boom)
             sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="s2", primary_path="/y")
             # Commit still succeeds despite the hook raising.

@@ -311,6 +311,62 @@ class SourceManager:
         self._thread.start()
         logger.info("SourceManager started")
 
+    # --- Startup-protocol seam (biopb/biopb#277 item C) -----------------------
+    # The launcher drives startup through these public methods instead of poking
+    # the private hook attributes / _handle_rescan / _initial_scan_done. Wiring
+    # mirrors the server's set_*_handler injection (see cli.py).
+
+    def set_source_committed_hook(
+        self, callback: Optional[Callable[[str], None]]
+    ) -> None:
+        """Register the hook called with a ``source_id`` when a source is
+        committed *after* the initial scan (a live addition).
+
+        The launcher wires this to the precache worker's prompt-enqueue. Startup
+        sources are gated out of it (they route to the slow backlog) until the
+        first full scan flips the startup boundary -- see ``_commit_add_claim``.
+        """
+        self._on_source_committed = callback
+
+    def set_initial_scan_complete_hook(
+        self, callback: Optional[Callable[[], None]]
+    ) -> None:
+        """Register the hook fired once when the first full scan completes.
+
+        The launcher uses it to seed the precache backlog from the established
+        startup catalog. Fired from the event-loop thread (or from
+        :meth:`complete_initial_scan` on a static-only config).
+        """
+        self._on_initial_scan_complete = callback
+
+    def run_initial_scan(self) -> None:
+        """Run the bootstrap scan synchronously (public seam for the launcher).
+
+        Under progressive discovery the bootstrap scan normally runs in the
+        event loop after :meth:`start`. When no event loop will drive it -- the
+        watcher failed to start but monitored dirs exist -- the launcher calls
+        this to run one full rescan inline. Being the first pass, it force-fulls,
+        stamps freshness, flips the startup gate, and fires the completion hook,
+        exactly as the background path would.
+        """
+        self._handle_rescan()
+
+    def complete_initial_scan(self) -> None:
+        """Advance the startup protocol when there is nothing to walk.
+
+        A static-only config (no monitored dirs) has no bootstrap scan, but the
+        startup protocol must still complete: stamp catalog freshness, flip the
+        precache startup gate, and fire the first-scan-complete hook. Centralizes
+        the completion sequence the launcher previously open-coded against the
+        private members (biopb/biopb#277 item C). Idempotent: the hook fires only
+        on the transition to done.
+        """
+        self._last_full_rescan_at = time.time()
+        self._server.set_last_full_scan(self._last_full_rescan_at)
+        if not self._initial_scan_done:
+            self._initial_scan_done = True
+            self._fire_initial_scan_complete()
+
     def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
         """Return ``(source_id, mtime)`` for every currently-registered *local*
         source, for seeding the precache backlog (newest first).

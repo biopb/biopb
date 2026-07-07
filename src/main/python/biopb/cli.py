@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import typer
 from rich.console import Console
@@ -835,8 +835,14 @@ def _resolve_grpc_endpoint(config: Path) -> Tuple[str, Optional[str]]:
     return f"grpc://{host}:{port}", token
 
 
-def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
-    """Return the server's Flight health dict, or None if unreachable."""
+def _query_server(
+    location: str, token: Optional[str], call: Callable[[Any], dict]
+) -> Optional[dict]:
+    """Open a short-lived TensorFlightClient to *location*, return ``call(client)``.
+
+    Returns None if the client import fails or the server is unreachable; the
+    client is always closed. The shared body behind the status/cache-stats probes.
+    """
     try:
         from biopb.tensor.client import TensorFlightClient
     except Exception:
@@ -844,7 +850,7 @@ def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
     client = None
     try:
         client = TensorFlightClient(location, cache_bytes=0, token=token)
-        return client.health_check()
+        return call(client)
     except Exception:
         return None
     finally:
@@ -854,27 +860,16 @@ def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
                 close()
             except Exception:
                 pass
+
+
+def _query_health(location: str, token: Optional[str]) -> Optional[dict]:
+    """Return the server's Flight health dict, or None if unreachable."""
+    return _query_server(location, token, lambda c: c.health_check())
 
 
 def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
     """Return the server's cache-stats dict, or None if unreachable / no cache."""
-    try:
-        from biopb.tensor.client import TensorFlightClient
-    except Exception:
-        return None
-    client = None
-    try:
-        client = TensorFlightClient(location, cache_bytes=0, token=token)
-        return client.cache_stats()
-    except Exception:
-        return None
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+    return _query_server(location, token, lambda c: c.cache_stats())
 
 
 @server_app.command("status")

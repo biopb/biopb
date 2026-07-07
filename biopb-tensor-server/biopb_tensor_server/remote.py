@@ -518,45 +518,6 @@ class RemoteStore:
         subpath = subpath.lstrip("/")
         return f"{self.path.rstrip('/')}/{subpath}"
 
-    def get_fs_kwargs(self) -> Dict[str, Any]:
-        """Get fsspec kwargs for passing to other libraries.
-
-        Returns storage options suitable for passing to libraries
-        like aicsimageio that accept fs_kwargs.
-
-        Returns:
-            Dictionary of storage options
-        """
-        # Re-run credential resolution to get the final options
-        storage_type = _detect_storage_type(self.url)
-        storage_options: Dict[str, Any] = {}
-
-        env_options = _get_env_credentials(storage_type)
-        storage_options.update(env_options)
-
-        if self._credentials_config:
-            default_profile = self._credentials_config.get_profile()
-            if default_profile:
-                profile_options = default_profile.to_storage_options()
-                storage_options.update(profile_options)
-
-        if self._credentials_config and self._source_profile_name:
-            source_profile = self._credentials_config.get_profile(
-                self._source_profile_name
-            )
-            if source_profile:
-                profile_options = source_profile.to_storage_options()
-                storage_options.update(profile_options)
-
-        if self._profile:
-            profile_options = self._profile.to_storage_options()
-            storage_options.update(profile_options)
-
-        signed_options = _extract_signed_url_params(self.url)
-        storage_options.update(signed_options)
-
-        return storage_options
-
     def download_to_temp(self, subpath: str = "", suffix: Optional[str] = None) -> Path:
         """Download remote file to a temporary local file.
 
