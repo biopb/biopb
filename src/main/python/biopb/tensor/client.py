@@ -319,6 +319,37 @@ class _TensorContext:
     )
 
 
+def _request_crop_slices(
+    ndim: int,
+    original_slice_hint: SliceHint,
+    realized_slice_hint: SliceHint,
+    scale: Optional[Sequence[int]],
+    keep_axes: Tuple[int, ...] = (),
+) -> Tuple[slice, ...]:
+    """Per-axis crop mapping the requested region onto the realized array.
+
+    The server snaps a slice_hint outward to lcm-aligned chunk boundaries, so
+    the realized (returned) bounds can exceed what was requested. This maps the
+    requested world-coordinate bounds onto the realized array's logical indices,
+    accounting for the applied per-axis downsampling ``scale``. Axes listed in
+    ``keep_axes`` are left full (``slice(None)``) -- the websocket render path
+    keeps Y/X uncropped so the rendered tile covers the whole loaded region.
+    """
+    crop = []
+    for ax in range(ndim):
+        if ax in keep_axes:
+            crop.append(slice(None))
+            continue
+        req_start = int(original_slice_hint.start[ax])
+        req_stop = int(original_slice_hint.stop[ax])
+        ret_start = int(realized_slice_hint.start[ax])
+        s = int(scale[ax]) if scale and ax < len(scale) else 1
+        logical_start = (req_start - ret_start) // s
+        logical_stop = (req_stop - ret_start + s - 1) // s
+        crop.append(slice(logical_start, logical_stop))
+    return tuple(crop)
+
+
 # ==============================================================================
 # Module-level pools for worker-local connection caching (pickle-safe)
 # ==============================================================================
@@ -2084,23 +2115,14 @@ class TensorFlightClient:
         if ctx.original_slice_hint is not None and ctx.descriptor.HasField(
             "slice_hint"
         ):
-            realized = ctx.descriptor.slice_hint
-            ndim = len(ctx.descriptor.shape)
-            scale = list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None
-            crop = []
-            for ax in range(ndim):
-                req_start = int(ctx.original_slice_hint.start[ax])
-                req_stop = int(ctx.original_slice_hint.stop[ax])
-                ret_start = int(realized.start[ax])
-                s = int(scale[ax]) if scale and ax < len(scale) else 1
-                if s > 1:
-                    logical_start = (req_start - ret_start) // s
-                    logical_stop = (req_stop - ret_start + s - 1) // s
-                else:
-                    logical_start = req_start - ret_start
-                    logical_stop = req_stop - ret_start
-                crop.append(slice(logical_start, logical_stop))
-            dask_arr = dask_arr[tuple(crop)]
+            dask_arr = dask_arr[
+                _request_crop_slices(
+                    len(ctx.descriptor.shape),
+                    ctx.original_slice_hint,
+                    ctx.descriptor.slice_hint,
+                    list(ctx.read_opt.scale_hint) if ctx.read_opt.scale_hint else None,
+                )
+            ]
 
         return dask_arr
 
@@ -2258,24 +2280,14 @@ class TensorFlightClient:
 
         # Crop to the originally requested region if original_slice_hint present
         if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
-            realized = descriptor.slice_hint
-            original = pb.original_slice_hint
-            ndim = len(descriptor.shape)
-            scale = list(descriptor.scale_hint) if descriptor.scale_hint else None
-            crop = []
-            for ax in range(ndim):
-                req_start = int(original.start[ax])
-                req_stop = int(original.stop[ax])
-                ret_start = int(realized.start[ax])
-                s = int(scale[ax]) if scale and ax < len(scale) else 1
-                if s > 1:
-                    logical_start = (req_start - ret_start) // s
-                    logical_stop = (req_stop - ret_start + s - 1) // s
-                else:
-                    logical_start = req_start - ret_start
-                    logical_stop = req_stop - ret_start
-                crop.append(slice(logical_start, logical_stop))
-            dask_arr = dask_arr[tuple(crop)]
+            dask_arr = dask_arr[
+                _request_crop_slices(
+                    len(descriptor.shape),
+                    pb.original_slice_hint,
+                    descriptor.slice_hint,
+                    list(descriptor.scale_hint) if descriptor.scale_hint else None,
+                )
+            ]
 
         return dask_arr
 
