@@ -1060,3 +1060,53 @@ class TestGetData:
             data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[64, 64]))
             assert data.shape == (64, 64)
             np.testing.assert_array_equal(data, expected)
+
+    def test_micromanager_rgb_get_data_not_collapsed(self):
+        """RGB (YXS) MM frame must read the plane, not index row 0 (biopb#220).
+
+        A photometric-RGB img file gives a ``YXS`` aszarr series, so ``shape[-2:]``
+        is ``(X, samples)``. The old ``zarr_arr[0, y, x]`` indexed Y=0 and returned
+        garbage of the wrong shape; ``get_data`` must instead resolve Y/X from the
+        axes string and fix the samples axis at 0. Non-square H!=W so a Y/X swap is
+        caught too.
+        """
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fname = "img_channel000_position000_time000000000_z000.tif"
+            h, w = 8, 6
+            # Distinct per-sample content so a wrong samples pick is detectable;
+            # channel 0 (red) is the plane get_data should return.
+            red = np.arange(h * w, dtype=np.uint8).reshape(h, w)
+            rgb = np.stack([red, red + 100, red + 200], axis=-1)  # (H, W, 3) YXS
+            tifffile.imwrite(os.path.join(tmpdir, fname), rgb, photometric="rgb")
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Positions": 1,
+                    "Frames": 1,
+                    "Slices": 1,
+                    "AxisOrder": ["time", "channel", "z", "position"],
+                },
+                f"Coords-{fname}": {
+                    "PositionIndex": 0,
+                    "TimeIndex": 0,
+                    "ChannelIndex": 0,
+                    "SliceIndex": 0,
+                },
+                f"Metadata-{fname}": {"Width": w, "Height": h},
+            }
+            with open(os.path.join(tmpdir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            adapter = MicroManagerLegacyAdapter(tmpdir, "mmrgb")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.shape) == [h, w]
+
+            data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[h, w]))
+            assert data.shape == (h, w)
+            np.testing.assert_array_equal(data, red)
