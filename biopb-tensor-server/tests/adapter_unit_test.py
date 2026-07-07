@@ -537,16 +537,16 @@ class TestGetPhysicalScale:
         """Build an AicsImageIoAdapterBase without __init__ (no real file)."""
         from unittest.mock import MagicMock
 
-        from biopb_tensor_server.adapters.aicsimageio import (
-            _AicsImageIoAdapterBase,
+        from biopb_tensor_server.adapters.bioio import (
+            _BioioAdapterBase,
         )
 
-        a = _AicsImageIoAdapterBase.__new__(_AicsImageIoAdapterBase)
+        a = _BioioAdapterBase.__new__(_BioioAdapterBase)
         a.dim_labels = dim_labels
         a.scene_index = scene_index
-        a._aics_image = MagicMock()
-        a._aics_image.scenes = scenes
-        a._aics_image.ome_metadata.images = images
+        a._bio_image = MagicMock()
+        a._bio_image.scenes = scenes
+        a._bio_image.ome_metadata.images = images
         return a
 
     @staticmethod

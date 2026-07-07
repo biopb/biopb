@@ -36,14 +36,9 @@ dependencies = [
     "dask[array] >= 2024.0.0",
     "cachey >= 0.1.0",
     "ome-zarr >= 0.6.1",
-    "aicsimageio >= 4.14.0",
-    # aicsimageio caps zarr at <2.16, which forces zarr 2.15.x. That zarr
-    # imports numcodecs.blosc.cbuffer_sizes/cbuffer_metainfo at import time,
-    # but numcodecs removed those in 0.16.0 (deprecated 0.15.0). Without a
-    # cap the resolver floats numcodecs to >=0.16 and `import zarr` then dies
-    # with "ImportError: cannot import name 'cbuffer_sizes' from
-    # 'numcodecs.blosc'". Pin until aicsimageio lifts its zarr<2.16 cap.
-    "numcodecs < 0.16",
+    # biopb's Zarr adapters target the zarr 2.x API (zarr 3 is a separate port).
+    # See docs/aicsimageio-to-bioio-migration.md.
+    "zarr >= 2.0.0, <3",
   ]
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the
   # release publishes to biopb.org/docs/api/python/ — see docs-api/ and

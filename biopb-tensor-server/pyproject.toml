@@ -13,13 +13,19 @@ license = "MIT"
 dependencies = [
   "biopb",
   "pyarrow >= 14.0.0",
-  "zarr >= 2.0.0",
+  "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
   "dask[array] >= 2024.0.0",
   "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
   "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
-  "tifffile >= 2021.8.30",
-  "numpy < 2.0",
-  "scipy < 1.16",  # scipy >=1.16 requires numpy>=2.0; pulled in transitively via dask[array]'s scipy.sparse import. Keep aligned with the numpy<2.0 pin above.
+  # Lower bound: numpy-2 safe (older tifffile called the removed ndarray.newbyteorder).
+  # Upper bound: tifffile 2025.5.21 dropped Zarr 2 support and requires Zarr 3
+  # (2025.5.10 is the last release that reads via a Zarr-2 store). OmeTiffAdapter's
+  # read path opens series.aszarr() as a Zarr-2 store, matching the zarr<3 pin
+  # above, so tifffile must stay on the Zarr-2 line. See
+  # docs/aicsimageio-to-bioio-migration.md.
+  "tifffile >= 2024.8.10, < 2025.5.21",
+  "numpy",
+  "scipy",
   "typer >= 0.12.0",
   "tomli >= 2.0.0; python_version < '3.11'",
   "duckdb",
@@ -44,12 +50,25 @@ dependencies = [
     # so the dependency list stays defined once, in [web].
     "biopb-tensor-server[web]",
   ]
+  # Vendor microscopy formats via bioio (successor to aicsimageio). Each reader
+  # is its own plugin with modern, uncapped deps, so none re-imposes the
+  # numpy<2 / tifffile<2023.3.15 caps aicsimageio did. See
+  # docs/aicsimageio-to-bioio-migration.md.
   aics = [
-    "aicsimageio >= 4.0.0",
-    "aicspylibczi >= 3.1.1",
-    "readlif >= 0.6.4",
-    "aicsimageio[nd2]",
-    "aicsimageio[dv]",
+    "bioio >= 3.0",
+    "bioio-czi",       # Zeiss CZI (aicspylibczi)
+    "bioio-lif",       # Leica LIF (readlif)
+    "bioio-nd2",       # Nikon ND2
+    "bioio-dv",        # DeltaVision DV (mrc)
+    "bioio-tifffile",  # plain/non-OME TIFF and Zeiss LSM (ZeissAdapter's .lsm path)
+    "bioio-ome-tiff",  # remote/exotic OME-TIFF the pure-tifffile OmeTiffAdapter declines
+    "bioio-imageio",   # generic raster/video fallback
+    # NOTE: bioio-ome-zarr is deliberately NOT listed. (1) It is redundant --
+    # biopb reads OME-Zarr/Zarr via its own OmeZarrAdapter/ZarrAdapter, which win
+    # in the registry ahead of the generic bioio fallback, so a .zarr store never
+    # reaches a bioio reader. (2) It requires zarr>=3, which collides with the
+    # zarr<3 pin above; adopting it is the same trigger as the deferred zarr 2->3
+    # port. See docs/aicsimageio-to-bioio-migration.md.
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",
@@ -65,7 +84,7 @@ dependencies = [
   # reader (ZVI, ...). A JDK is NOT a build/system dependency: scyjava + cjdk
   # download a small, user-cached JDK on first read.
   bioformats = [
-    "bioformats_jar",
+    "bioio-bioformats",
     "scyjava >= 1.9.0",
     "cjdk >= 0.5.0",
   ]

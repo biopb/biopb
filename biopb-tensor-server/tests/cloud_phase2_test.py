@@ -253,7 +253,7 @@ class TestReaderDeferBranches:
     def test_ome_tiff_sniff_skipped_when_nonresident(self, tmp_path, force_nonresident):
         # A non-resident .tif: OmeTiffAdapter declines (skips the IFD sniff) so the
         # extension-only generic AICS adapter claims it instead as an image.
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "img.tif"

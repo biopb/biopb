@@ -935,12 +935,13 @@ function Invoke-BiopbInstall {
     # biopb-mcp (always installed) requires Python >= 3.10.
     $minMinor = 10
 
-    # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
-    # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
-    # interpreter uv builds lxml from source -- which fails on a fresh Windows
-    # box without libxml2/libxslt headers and an MSVC compiler. Cap at 3.12, the
-    # newest Python with a prebuilt lxml 4.x wheel; if the system Python is newer
-    # we fall back to a uv-managed 3.12 below. Mirrors install.sh (MAX_MINOR).
+    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
+    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
+    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # ships no cp313 wheel yet -- on 3.13+ uv would build it from source (cmake +
+    # libCZI + an MSVC compiler), which fails on a fresh Windows box. If the
+    # system Python is newer we fall back to a uv-managed 3.12 below. Mirrors
+    # install.sh (MAX_MINOR).
     $maxMinor = 12
 
     $pythonOk = $false
@@ -956,7 +957,7 @@ function Invoke-BiopbInstall {
                 $pythonOk = $true
                 $pythonSpec = $pyExe
             } elseif ($maj -gt 3 -or ($maj -eq 3 -and $min -gt $maxMinor)) {
-                Report-Warn "System Python too new ($(& $pyExe --version)); using a managed 3.$maxMinor (aicsimageio's lxml<5 has no wheel for 3.13+)"
+                Report-Warn "System Python too new ($(& $pyExe --version)); using a managed 3.$maxMinor (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
             } else {
                 Report-Warn "System Python too old ($(& $pyExe --version)), need >= 3.$minMinor"
             }

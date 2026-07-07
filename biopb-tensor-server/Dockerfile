@@ -16,22 +16,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY wheels/biopb-*.whl /app/wheels/
 COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 
-# Install with correct order:
-# 1. First pin zarr/numcodecs for compatibility
-# 2. Then install both wheels with extras
-# 3. Finally add bioformats-jar for LSM/OIF/OIB (BioFormats fallback for CZI/LIF)
+# Install both wheels with extras. Dependency bounds (zarr<3, the tifffile
+# Zarr-2 window) live in the wheel's own metadata, so no manual pre-pin is
+# needed. The `bioformats` extra pulls bioio-bioformats + scyjava for the Java
+# Bio-Formats fallback (ZVI, ...); the runtime image ships a JDK below.
 WORKDIR /app
 RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
-    && pip install --no-cache-dir "zarr==2.15.0" "numcodecs==0.12.1" \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,medical,ndtiff,hdf5]" \
-    && pip install --no-cache-dir bioformats-jar
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,aics,bioformats,medical,ndtiff,hdf5]"
 
 # Stage 3: Runtime (nginx + python)
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install Java (for bioformats-jar) and runtime deps - NO nginx
+# Install Java (for bioio-bioformats) and runtime deps - NO nginx
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     default-jdk-headless \

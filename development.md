@@ -73,7 +73,7 @@ tensors.
 Key design choices:
 
 - **Format-agnostic ingestion at the server.** Pluggable *adapters*
-  (`tiff`, `zarr`, `ome-zarr`, `aicsimageio`) read whatever microscopy format a
+  (`tiff`, `zarr`, `ome-zarr`, `bioio`) read whatever microscopy format a
   lab has; a *discovery* pass plus a directory *watcher* register files (local
   paths or remote URLs) as **sources** without anyone hand-importing them.
   Clients never deal with proprietary formats — they always see uniform tensors.

@@ -60,13 +60,13 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
     def test_adapter_init_with_embedded_metadata(self, tiled_ome_tiff):
         """Test AicsImageIoAdapter initialization with embedded OME-XML."""
-        from aicsimageio import AICSImage
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
         adapter = AicsImageIoAdapter(
-            AICSImage(path),
+            BioImage(path),
             scene_index=None,
             source_id="test-embedded",
             source_url=path,
@@ -76,18 +76,18 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
         # AicsImageIoAdapter is multi-tensor, list descriptors to get shape
         descriptors = adapter.list_tensor_descriptors()
         assert len(descriptors) == 1
-        # aicsimageio uses TCZYX dimension order, so shape is (T=1, C=3, Z=1, Y=128, X=128)
+        # bioio uses TCZYX dimension order, so shape is (T=1, C=3, Z=1, Y=128, X=128)
         assert descriptors[0].shape == [1, 3, 1, 128, 128]
 
     def test_get_tensor_descriptor(self, tiled_ome_tiff):
         """Test descriptor with embedded metadata."""
-        from aicsimageio import AICSImage
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
         adapter = AicsImageIoAdapter(
-            AICSImage(path),
+            BioImage(path),
             scene_index=None,
             source_id="test-embedded",
             source_url=path,
@@ -100,20 +100,20 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
         # array_id is the globally-unique source_id/field (identity policy); the
         # scene id "Image:0" is the within-source field.
         assert desc.array_id == "test-embedded/Image:0"
-        # aicsimageio uses TCZYX dimension order
+        # bioio uses TCZYX dimension order
         assert list(desc.shape) == [1, 3, 1, 128, 128]
         # dtype is numpy dtype string format (e.g., '<u2' for little-endian uint16)
         assert desc.dtype in ("uint16", "<u2")
 
     def test_get_metadata_from_embedded_ome_xml(self, tiled_ome_tiff):
         """Test metadata extraction from embedded OME-XML."""
-        from aicsimageio import AICSImage
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from bioio import BioImage
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
         adapter = AicsImageIoAdapter(
-            AICSImage(path),
+            BioImage(path),
             scene_index=None,
             source_id="test-embedded",
             source_url=path,
