@@ -345,6 +345,36 @@ class TestTensorServerSourceType:
         # other remote schemes remain non-auto-detectable
         assert detect_source_type("s3://bucket/key") is None
 
+    def test_detect_source_type_does_not_type_local_paths(self):
+        """Filesystem format detection belongs to the adapters (claim()), not here.
+
+        detect_source_type only routes remote schemes now (biopb/biopb#277 item
+        B); every local path -- whatever its extension or layout -- returns None
+        so the adapters remain the single source of truth for format typing.
+        """
+        from biopb_tensor_server.config import detect_source_type
+
+        for url in (
+            "/data/experiment.zarr",
+            "/data/image.ome.tif",
+            "/data/plain.tif",
+            "/data/scan.czi",
+            "/data/acquisition/",
+        ):
+            assert detect_source_type(url) is None, url
+
+    def test_unclaimed_file_raises_instead_of_guessing(self):
+        """A typeless file no adapter claims is a hard error, not a guessed type."""
+        import pytest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mystery = os.path.join(tmpdir, "mystery.xyz")
+            with open(mystery, "wb") as f:
+                f.write(b"\x00\x01\x02\x03")
+
+            with pytest.raises(ValueError, match="Could not detect type for file"):
+                discover_sources(SourceConfig(url=mystery), get_default_registry())
+
     def test_tensor_server_in_type_literal(self):
         # explicit type still round-trips through SourceConfig
         s = SourceConfig(url="grpc://lab:8815", type="tensor-server")
