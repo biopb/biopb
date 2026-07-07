@@ -26,7 +26,6 @@ import net.imglib2.cache.img.SingleCellArrayImg;
 import net.imglib2.cache.img.optional.CacheOptions.CacheType;
 import net.imglib2.img.array.ArrayImg;
 import net.imglib2.img.array.ArrayImgFactory;
-import net.imglib2.img.cell.CellGrid;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
 
@@ -233,8 +232,10 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             long[] dims = toLongArray(responseDescriptor.getShapeList());
             int[] cellDimensions = toIntArray(responseDescriptor.getChunkShapeList());
 
-            EndpointIndex endpointIndex = buildEndpointIndex(responseDescriptor, dims, cellDimensions,
-                    info.getEndpoints());
+            ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
+                    info.getEndpoints(), dims, cellDimensions,
+                    ep -> parseChunkBounds(ep.getAppMetadata()),
+                    ep -> ep);
 
             if (endpointIndex == null) {
                 // Materialize all data into an ArrayImg
@@ -351,12 +352,12 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
 
     private static <T extends NativeType<T> & RealType<T>> void loadCell(
             SingleCellArrayImg<T, ?> cell,
-            EndpointIndex endpointIndex,
+            ChunkGridIndex<FlightEndpoint> endpointIndex,
             FlightClient client,
             CredentialCallOption authOption) {
 
         long cellIndex = endpointIndex.indexFor(cell);
-        FlightEndpoint endpoint = endpointIndex.endpoints.get(cellIndex);
+        FlightEndpoint endpoint = endpointIndex.get(cellIndex);
         if (endpoint == null) {
             throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
         }
@@ -365,68 +366,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
         double[] values = fetchChunkValues(client, authOption, ticket.getChunkId().toByteArray());
         writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    private static EndpointIndex buildEndpointIndex(
-            TensorDescriptor descriptor,
-            long[] dims,
-            int[] cellDimensions,
-            List<FlightEndpoint> endpoints) {
-
-        if (dims.length == 0 || endpoints.isEmpty()) {
-            return null;
-        }
-
-        CellGrid grid = new CellGrid(dims, cellDimensions);
-        java.util.Map<Long, FlightEndpoint> endpointMap = new java.util.HashMap<>();
-        long[] gridDimensions = grid.getGridDimensions();
-        long[] gridPosition = new long[dims.length];
-        long[] expectedMin = new long[dims.length];
-        int[] expectedDimensions = new int[dims.length];
-
-        for (FlightEndpoint endpoint : endpoints) {
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            if (bounds.getStartCount() != dims.length || bounds.getStopCount() != dims.length) {
-                return null;
-            }
-
-            for (int axis = 0; axis < dims.length; axis++) {
-                long start = bounds.getStart(axis);
-                long stop = bounds.getStop(axis);
-                int nominalCellDimension = cellDimensions[axis];
-                if (start < 0 || stop < start || nominalCellDimension <= 0) {
-                    return null;
-                }
-                if (start % nominalCellDimension != 0) {
-                    return null;
-                }
-                gridPosition[axis] = start / nominalCellDimension;
-                if (gridPosition[axis] >= gridDimensions[axis]) {
-                    return null;
-                }
-            }
-
-            grid.getCellDimensions(gridPosition, expectedMin, expectedDimensions);
-            for (int axis = 0; axis < dims.length; axis++) {
-                if (expectedMin[axis] != bounds.getStart(axis)) {
-                    return null;
-                }
-                if ((long) expectedDimensions[axis] != bounds.getStop(axis) - bounds.getStart(axis)) {
-                    return null;
-                }
-            }
-
-            long cellIndex = grid.getCellGridIndexFlat(gridPosition);
-            if (endpointMap.put(cellIndex, endpoint) != null) {
-                return null;
-            }
-        }
-
-        if (endpointMap.size() != cellCount(gridDimensions)) {
-            return null;
-        }
-
-        return new EndpointIndex(grid, cellDimensions, endpointMap);
     }
 
     private static double[] fetchChunkValues(
@@ -555,33 +494,4 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         delegate.dimensions(dimensions);
     }
 
-    // EndpointIndex inner class (same as TensorFlightClient)
-
-    private static class EndpointIndex {
-        final CellGrid grid;
-        final int[] nominalCellDimensions;
-        final java.util.Map<Long, FlightEndpoint> endpoints;
-
-        EndpointIndex(
-                CellGrid grid,
-                int[] nominalCellDimensions,
-                java.util.Map<Long, FlightEndpoint> endpoints) {
-            this.grid = grid;
-            this.nominalCellDimensions = nominalCellDimensions.clone();
-            this.endpoints = endpoints;
-        }
-
-        long indexFor(Interval interval) {
-            long[] gridPosition = new long[interval.numDimensions()];
-            for (int axis = 0; axis < interval.numDimensions(); axis++) {
-                long min = interval.min(axis);
-                int nominalCellDimension = nominalCellDimensions[axis];
-                if (min % nominalCellDimension != 0) {
-                    throw new IllegalStateException("Cell minimum is not aligned to the logical chunk grid");
-                }
-                gridPosition[axis] = min / nominalCellDimension;
-            }
-            return grid.getCellGridIndexFlat(gridPosition);
-        }
-    }
 }
