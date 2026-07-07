@@ -75,6 +75,17 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+# The constraint primitives and the shared pyramid-knob bounds live in the core
+# biopb package so biopb-mcp (which cannot depend on this server package -- not
+# on PyPI) validates the same pyramid rows against the same rules, with no drift
+# (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
+# `_CONSTRAINTS` table and config_schema keep their existing spelling.
+from biopb._config_constraints import (
+    PYRAMID_CONSTRAINTS,
+    Enum as _Enum,
+    Range as _Range,
+)
+
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI and biopb-mcp share one definition (all three depend on
 # `biopb`). Re-exported for back-compat (`biopb_tensor_server.config.find_config`
@@ -190,74 +201,11 @@ _REDUCTION_METHODS = {
 }
 
 
-class _Range:
-    """A numeric bound; ``min``/``max`` are inclusive, either may be omitted."""
-
-    def __init__(self, *, min=None, max=None):
-        self.min = min
-        self.max = max
-
-    def ok(self, value) -> bool:
-        # bool is an int subclass; a bool where a number is expected is wrong.
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return False
-        below = self.min is not None and value < self.min
-        above = self.max is not None and value > self.max
-        return not (below or above)
-
-    def describe(self) -> str:
-        if self.min is not None and self.max is not None:
-            return f"a number in [{self.min}, {self.max}]"
-        if self.min is not None:
-            return f"a number >= {self.min}"
-        return f"a number <= {self.max}"
-
-    def to_json_schema(self) -> dict:
-        """Inclusive bounds as JSON Schema keywords (for the schema emitter)."""
-        out: dict = {}
-        if self.min is not None:
-            out["minimum"] = self.min
-        if self.max is not None:
-            out["maximum"] = self.max
-        return out
-
-
-class _Enum:
-    """Membership in a fixed set, optionally case-insensitive for strings."""
-
-    def __init__(self, allowed, *, case_insensitive=False):
-        self.case_insensitive = case_insensitive
-        self._display = set(allowed)
-        # When case-insensitive, fold the allowed set too so the comparison is
-        # symmetric (else a lowercased value never matches an upper-case member).
-        self.allowed = {
-            a.lower() if (case_insensitive and isinstance(a, str)) else a
-            for a in allowed
-        }
-
-    def ok(self, value) -> bool:
-        if self.case_insensitive and isinstance(value, str):
-            value = value.strip().lower()
-        return value in self.allowed
-
-    def describe(self) -> str:
-        return "one of: " + ", ".join(sorted(map(str, self._display)))
-
-    def to_json_schema(self) -> dict:
-        """The allowed set as a JSON Schema ``enum`` -- but only for
-        case-sensitive enums. A case-insensitive set (``log_level``,
-        ``reduction_method``) accepts any casing the server folds, so a hard
-        ``enum`` of the canonical members would reject values the server
-        actually honors; there we stay lenient and surface the set via
-        :meth:`describe` in the property description instead."""
-        if self.case_insensitive:
-            return {}
-        return {"enum": sorted(self._display, key=str)}
-
-
 # Per-dataclass field constraints, keyed by class name (so this table can sit
 # above the class definitions). full_rescan_interval is intentionally absent:
 # a value <= 0 *disables* the periodic full-scan backstop (documented sentinel).
+# `_Range`/`_Enum` and the pyramid rows (PYRAMID_CONSTRAINTS) come from
+# biopb._config_constraints so biopb-mcp validates the same knobs identically.
 _CONSTRAINTS = {
     "CacheConfig": {
         "backend": _Enum({"memory", "file"}),
@@ -267,10 +215,10 @@ _CONSTRAINTS = {
         "file_max_total_bytes": _Range(min=1),
     },
     "PyramidConfig": {
+        # reduction_method is server-local (on-the-fly reduction is a compute
+        # concern, not a biopb-mcp knob); the numeric rows are shared.
         "reduction_method": _Enum(_REDUCTION_METHODS, case_insensitive=True),
-        "threshold": _Range(min=1),
-        "downscale_factor": _Range(min=2),
-        "pixel_budget_cubic_root": _Range(min=1),
+        **PYRAMID_CONSTRAINTS,
     },
     "PrecacheConfig": {
         "idle_debounce_seconds": _Range(min=0),

@@ -531,3 +531,155 @@ class TestConfigSingleton:
         r.join(2)
 
         assert result["v"] == "grpc://disk:1"
+
+
+def _write_and_load(mock_config_dir, raw: dict) -> dict:
+    """Write *raw* as config.json under the mocked home and load it fresh."""
+    config_path = mock_config_dir / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w") as f:
+        json.dump(raw, f)
+    CONFIG.reload()
+    return load_config()
+
+
+class TestValidation:
+    """Out-of-range / bad-enum leaves are warned and reset to defaults (#182)."""
+
+    def test_pyramid_out_of_range_clamped_to_default(self, mock_config_dir):
+        """The three shared pyramid knobs are the same bug as the tensor server:
+        a bad value would silently break build_pyramid_levels (no pyramid /
+        infinite loop). Each is reset to its default."""
+        defaults = get_default_config()
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "pyramid": {
+                    "downscale_factor": 1,  # >= 2 required (==1 -> no pyramid)
+                    "pixel_budget_cubic_root": 0,  # >= 1 (0 -> infinite loop)
+                    "threshold": -5,  # >= 1
+                }
+            },
+        )
+        assert (
+            get_setting(config, "pyramid.downscale_factor")
+            == defaults["pyramid"]["downscale_factor"]
+        )
+        assert (
+            get_setting(config, "pyramid.pixel_budget_cubic_root")
+            == defaults["pyramid"]["pixel_budget_cubic_root"]
+        )
+        assert (
+            get_setting(config, "pyramid.threshold") == defaults["pyramid"]["threshold"]
+        )
+
+    def test_bad_enum_clamped_to_default(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "mcp": {
+                    "transport": {"kind": "websocket"},
+                    "dask": {"scheduler": "bogus"},
+                }
+            },
+        )
+        assert get_setting(config, "mcp.transport.kind") == "stdio"
+        assert get_setting(config, "mcp.dask.scheduler") == "distributed"
+
+    def test_port_out_of_range_clamped(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir, {"mcp": {"transport": {"port": 99999}}}
+        )
+        assert get_setting(config, "mcp.transport.port") == 8765
+
+    def test_string_number_reset_to_default(self, mock_config_dir):
+        """The no-coercion wrinkle: a JSON string where a number is expected
+        would reach arithmetic as a str (TypeError). It fails the Range check
+        and is replaced by the numeric default before any hot path sees it."""
+        config = _write_and_load(
+            mock_config_dir, {"pyramid": {"downscale_factor": "4"}}
+        )
+        assert get_setting(config, "pyramid.downscale_factor") == 4
+        assert isinstance(get_setting(config, "pyramid.downscale_factor"), int)
+
+    def test_zero_is_valid_where_it_disables(self, mock_config_dir):
+        """0 is a documented sentinel for several knobs (disables the watcher /
+        lets dask pick), so it must pass validation, not be clamped."""
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "mcp": {
+                    "dask": {"num_workers": 0},
+                    "kernel": {"watchdog_interval": 0},
+                    "tensor": {"health_poll_min_interval": 0},
+                }
+            },
+        )
+        assert get_setting(config, "mcp.dask.num_workers") == 0
+        assert get_setting(config, "mcp.kernel.watchdog_interval") == 0
+        assert get_setting(config, "mcp.tensor.health_poll_min_interval") == 0
+
+    def test_valid_values_untouched(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "pyramid": {"downscale_factor": 2},
+                "mcp": {"transport": {"kind": "http", "port": 9000}},
+            },
+        )
+        assert get_setting(config, "pyramid.downscale_factor") == 2
+        assert get_setting(config, "mcp.transport.kind") == "http"
+        assert get_setting(config, "mcp.transport.port") == 9000
+
+    def test_health_poll_inverted_reset_to_defaults(self, mock_config_dir):
+        """min > max would invert the exponential backoff; both reset."""
+        defaults = get_default_config()
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "mcp": {
+                    "tensor": {
+                        "health_poll_min_interval": 90.0,
+                        "health_poll_max_interval": 10.0,
+                    }
+                }
+            },
+        )
+        assert (
+            get_setting(config, "mcp.tensor.health_poll_min_interval")
+            == defaults["mcp"]["tensor"]["health_poll_min_interval"]
+        )
+        assert (
+            get_setting(config, "mcp.tensor.health_poll_max_interval")
+            == defaults["mcp"]["tensor"]["health_poll_max_interval"]
+        )
+
+    def test_warns_naming_key_value_and_range(self, mock_config_dir, caplog):
+        with caplog.at_level("WARNING"):
+            _write_and_load(mock_config_dir, {"pyramid": {"downscale_factor": 1}})
+        msg = "\n".join(caplog.messages)
+        assert "pyramid.downscale_factor" in msg
+        assert "1" in msg
+        assert ">= 2" in msg
+
+    def test_malformed_file_still_falls_back_to_defaults(self, mock_config_dir):
+        """A non-dict-JSON file is unaffected by validation (still defaults)."""
+        config_path = mock_config_dir / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("not json {{{")
+        CONFIG.reload()
+        assert load_config() == get_default_config()
+
+    def test_shipped_defaults_satisfy_every_constraint(self):
+        """DEFAULT_CONFIG must itself pass validation -- otherwise a bad leaf
+        would clamp to a default that is *also* invalid, and shipping defaults
+        that violate our own rules is a bug. This also pins the pyramid defaults
+        against the shared constraint rows, so a drift on either side fails."""
+        from biopb_mcp._config import _CONSTRAINTS, _MISSING, _walk_path
+
+        for path, constraint in _CONSTRAINTS.items():
+            value = _walk_path(DEFAULT_CONFIG, path.split("."))
+            assert value is not _MISSING, f"{path} missing from DEFAULT_CONFIG"
+            assert constraint.ok(value), (
+                f"default {path}={value!r} violates {constraint.describe()}"
+            )

@@ -35,6 +35,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+# Shared with the tensor server so the pyramid knobs (`pyramid.*`) are validated
+# against the exact same rules in both packages -- they are the same bug, not
+# just analogous (biopb/biopb#182, #34). `Range`/`Enum` are the format-agnostic
+# constraint primitives; PYRAMID_CONSTRAINTS carries the three shared rows.
+from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+
 logger = logging.getLogger(__name__)
 
 # Platform-dependent defaults for the two kernel-bring-up knobs that Windows
@@ -493,6 +499,113 @@ def _migrate_legacy_keys(config: dict) -> dict:
     return config
 
 
+# --- Declarative config validation (biopb/biopb#182) --------------------------
+#
+# The merged dict is otherwise trusted: a valid-JSON but out-of-range leaf passes
+# straight through and only blows up on a hot path -- downscale_factor=1 -> a
+# single full-res level (no pyramid); pixel_budget_cubic_root=0 -> an infinite
+# get_tensor loop in build_pyramid_levels; a JSON string "4" -> a TypeError deep
+# in `sx * downscale_factor`. Validate here, keyed by dotted path, reusing the
+# tensor server's constraint primitives so the shared `pyramid.*` rows are judged
+# by the exact same rule in both packages and cannot drift (#182, #34).
+#
+# Severity per #182: the deep-merge already degrades gracefully, so a bad leaf is
+# a logged WARNING, not a startup failure. The offending leaf is reset to its
+# known-good DEFAULT_CONFIG value so the config stays usable -- which also
+# neutralizes the no-coercion wrinkle (a string where a number is expected fails
+# its Range check and is replaced by the numeric default).
+_CONSTRAINTS = {
+    # Pyramid knobs -- the identical rows the tensor server enforces.
+    **{f"pyramid.{field}": rule for field, rule in PYRAMID_CONSTRAINTS.items()},
+    # MCP server transport / kernel / dask / tensor knobs.
+    "mcp.transport.kind": Enum({"http", "stdio"}),
+    "mcp.transport.port": Range(min=1, max=65535),
+    "mcp.transport.display_mode": Enum({"auto", "visible", "headless"}),
+    "mcp.kernel.startup_timeout": Range(exclusive_min=0),
+    "mcp.kernel.execute_timeout": Range(exclusive_min=0),
+    "mcp.kernel.busy_lock_timeout": Range(exclusive_min=0),
+    "mcp.kernel.promote_after": Range(exclusive_min=0),
+    "mcp.kernel.watchdog_interval": Range(min=0),  # 0 disables the watchdog
+    "mcp.kernel.watchdog_max_respawns": Range(min=0),
+    "mcp.kernel.watchdog_respawn_window": Range(min=0),
+    "mcp.dask.scheduler": Enum({"distributed", "threads", "synchronous"}),
+    "mcp.dask.owner": Enum({"daemon", "kernel"}),
+    "mcp.dask.num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
+    "mcp.tensor.health_poll_min_interval": Range(min=0),  # 0 disables the watcher
+    "mcp.tensor.health_poll_max_interval": Range(min=0),
+    # Compute-plane timeouts / limits shared by the demo widgets and `ops`.
+    "timeout.health_check": Range(exclusive_min=0),
+    "timeout.get_op_names": Range(exclusive_min=0),
+    "timeout.detection_2d": Range(exclusive_min=0),
+    "timeout.detection_3d": Range(exclusive_min=0),
+    "timeout.process_image": Range(exclusive_min=0),
+    "grpc.max_message_size_mb": Range(exclusive_min=0),
+    "grpc.max_concurrent_calls": Range(min=1),
+    "memory.warn_threshold_mb": Range(exclusive_min=0),
+    "memory.error_threshold_mb": Range(exclusive_min=0),
+}
+
+
+def _walk_path(node: dict, keys):
+    """Follow dotted-path *keys* into *node*; return ``_MISSING`` on any miss."""
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return _MISSING
+        node = node[key]
+    return node
+
+
+def _validate_and_clamp(config: dict) -> dict:
+    """Warn on each out-of-range leaf and reset it to its default, in place.
+
+    A leaf absent from the merged dict is skipped (nothing to check); a
+    present-but-invalid leaf is logged and replaced with its ``DEFAULT_CONFIG``
+    value so the config stays usable (biopb/biopb#182). Returns *config*.
+    """
+    for path, constraint in _CONSTRAINTS.items():
+        keys = path.split(".")
+        value = _walk_path(config, keys)
+        if value is _MISSING or constraint.ok(value):
+            continue
+        default = _walk_path(DEFAULT_CONFIG, keys)
+        logger.warning(
+            "Invalid config value %s=%r (expected %s); using default %r. "
+            "See biopb/biopb#182.",
+            path,
+            value,
+            constraint.describe(),
+            default,
+        )
+        if default is _MISSING:
+            continue
+        # value was found, so every intermediate on the path is a present dict.
+        parent = config
+        for key in keys[:-1]:
+            parent = parent[key]
+        parent[keys[-1]] = copy.deepcopy(default)
+
+    # Cross-field: the health-poll interval must not invert (min > max), which
+    # would break the exponential backoff. Reset both to defaults if it does.
+    lo_path = ["mcp", "tensor", "health_poll_min_interval"]
+    hi_path = ["mcp", "tensor", "health_poll_max_interval"]
+    lo, hi = _walk_path(config, lo_path), _walk_path(config, hi_path)
+    if lo is not _MISSING and hi is not _MISSING and lo > hi:
+        logger.warning(
+            "Invalid config: mcp.tensor.health_poll_min_interval=%r > "
+            "health_poll_max_interval=%r; using defaults. See biopb/biopb#182.",
+            lo,
+            hi,
+        )
+        tensor = config["mcp"]["tensor"]
+        tensor["health_poll_min_interval"] = copy.deepcopy(
+            _walk_path(DEFAULT_CONFIG, lo_path)
+        )
+        tensor["health_poll_max_interval"] = copy.deepcopy(
+            _walk_path(DEFAULT_CONFIG, hi_path)
+        )
+    return config
+
+
 def _read_and_merge_from_disk() -> dict:
     """Read the config file, migrate legacy keys, and merge onto defaults.
 
@@ -516,6 +629,9 @@ def _read_and_merge_from_disk() -> dict:
         # leaves and every expected key still resolves.
         _migrate_legacy_keys(config)
         merged = _deep_merge(get_default_config(), config)
+        # Reject out-of-range / bad-enum leaves (warn + reset to default) before
+        # any hot path reads them (biopb/biopb#182).
+        _validate_and_clamp(merged)
 
         logger.debug("Loaded config from %s", config_path)
         return merged
