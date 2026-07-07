@@ -243,7 +243,7 @@ def _is_our_daemon(pid: Optional[int], token: Optional[int]) -> bool:
 
 
 # Diagnostic from the most recent _win_request_shutdown() failure, surfaced by
-# _graceful_stop() so a Windows user can see why graceful stop fell back to force-kill.
+# _stop_daemon() so a Windows user can see why graceful stop fell back to force-kill.
 _LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
 
 
@@ -304,22 +304,42 @@ def _request_graceful_stop(pid: int, sentinel: Path) -> bool:
         return False
 
 
-def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
+def _stop_daemon(
+    pid: int,
+    timeout: int,
+    token: Optional[int] = None,
+    *,
+    sentinel: Path,
+    remove_pid: Callable[[], None],
+) -> bool:
     """Stop a running daemon: request graceful shutdown, wait up to `timeout`
-    seconds, then force-kill. Removes the PID file. Returns True if it exited
-    gracefully, False if it had to be force-killed. Assumes `pid` is running.
+    seconds, then force-kill. Clears the PID file via `remove_pid`. Returns True
+    if it exited gracefully, False if it had to be force-killed. Assumes `pid` is
+    running.
 
-    `token` is the recorded create-time identity (see _process_create_time): the
-    wait loop and the force-kill are gated on it so that if the daemon exits and
-    its PID is reused mid-stop, we neither keep waiting on nor TerminateProcess
-    the innocent new owner.
+    The single stop path for both SDK daemons (tensor server and biopb-mcp); the
+    two differ only in `sentinel` (their Windows stop-sentinel path) and
+    `remove_pid` (which PID file to clear).
+
+    On POSIX, graceful shutdown is a SIGTERM the daemon's handler catches. On
+    Windows os.kill is TerminateProcess -- immediate and uncatchable, so a
+    handler never runs and (for the MCP daemon) the napari kernel is not reaped
+    (issue #323); both daemons therefore watch for a sentinel *file* instead
+    (tensor server: http_server._install_windows_shutdown_listener; MCP:
+    mcp.__main__._install_shutdown_sentinel_watcher). See _request_graceful_stop.
+
+    `token` is the recorded create-time identity (see _process_create_time):
+    delivery, the wait loop, and the force-kill are all gated on it so that if
+    the daemon exits and its PID is reused mid-stop, we neither signal, keep
+    waiting on, nor TerminateProcess the innocent new owner.
     """
-    delivered = _request_graceful_stop(pid, _win_shutdown_sentinel())
-    if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
-        console.print(
-            f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
-            f"force killing.[/yellow]"
-        )
+    if _is_our_daemon(pid, token):
+        delivered = _request_graceful_stop(pid, sentinel)
+        if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
+            console.print(
+                f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
+                f"force killing.[/yellow]"
+            )
 
     graceful = False
     for _ in range(timeout):
@@ -339,10 +359,10 @@ def _graceful_stop(pid: int, timeout: int, token: Optional[int] = None) -> bool:
                 pass
             time.sleep(0.5)
 
-    _remove_pid()
+    remove_pid()
     if sys.platform == "win32":
         # tidy up if the daemon never consumed it
-        _win_remove_sentinel(_win_shutdown_sentinel())
+        _win_remove_sentinel(sentinel)
     return graceful
 
 
@@ -736,7 +756,9 @@ def stop(
 
     console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
 
-    if _graceful_stop(pid, timeout, token):
+    if _stop_daemon(
+        pid, timeout, token, sentinel=_win_shutdown_sentinel(), remove_pid=_remove_pid
+    ):
         console.print("[green]TensorFlight server stopped[/green]")
     else:
         console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
@@ -790,7 +812,13 @@ def restart(
     pid, id_token = _read_pid_record(PID_FILE)
     if _is_our_daemon(pid, id_token):
         console.print(f"[green]Stopping TensorFlight server (PID {pid})...[/green]")
-        _graceful_stop(pid, timeout, id_token)
+        _stop_daemon(
+            pid,
+            timeout,
+            id_token,
+            sentinel=_win_shutdown_sentinel(),
+            remove_pid=_remove_pid,
+        )
         time.sleep(1)
 
     # Start with same options
@@ -1337,52 +1365,6 @@ def _mcp_shutdown_sentinel() -> Path:
     return MCP_PID_FILE.parent / "mcp-server.stop"
 
 
-def _stop_mcp(pid: int, timeout: int, token: Optional[int] = None) -> bool:
-    """Stop the MCP daemon: request graceful shutdown, wait up to `timeout`
-    seconds, then force-kill. Removes the PID file. Returns True if it exited
-    gracefully. Assumes `pid` is running.
-
-    POSIX: SIGTERM - the launcher's handler reaps the kernel and exits cleanly.
-    Windows: os.kill maps SIGTERM to TerminateProcess, immediate and uncatchable,
-    so the handler never runs and the napari kernel is left to ipykernel's
-    best-effort in-process backstop - abrupt at best, and inert exactly when the
-    kernel is wedged (issue #323). So, like the tensor server, stop instead drops
-    a sentinel file the daemon watches for; the daemon then reaps the kernel
-    itself before exiting.
-
-    `token` is the recorded create-time identity: the wait loop and force-kill are
-    gated on it so a PID reused mid-stop is neither waited on nor TerminateProcess'd.
-    """
-    if _is_our_daemon(pid, token):
-        delivered = _request_graceful_stop(pid, _mcp_shutdown_sentinel())
-        if not delivered and sys.platform == "win32" and _LAST_WIN_SHUTDOWN_DIAG:
-            console.print(
-                f"[yellow]Graceful stop unavailable ({_LAST_WIN_SHUTDOWN_DIAG}); "
-                f"force killing.[/yellow]"
-            )
-
-    graceful = False
-    for _ in range(timeout):
-        if not _is_our_daemon(pid, token):
-            graceful = True
-            break
-        time.sleep(1)
-
-    if not graceful:
-        if _is_our_daemon(pid, token):
-            try:
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-            except OSError:
-                pass
-            time.sleep(0.5)
-
-    _remove_mcp_pid()
-    if sys.platform == "win32":
-        # tidy up if the daemon never consumed it
-        _win_remove_sentinel(_mcp_shutdown_sentinel())
-    return graceful
-
-
 @mcp_app.command("start")
 def mcp_start(
     port: Optional[int] = typer.Option(
@@ -1495,7 +1477,13 @@ def mcp_stop(
         raise typer.Exit(0)
 
     console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-    if _stop_mcp(pid, timeout, token):
+    if _stop_daemon(
+        pid,
+        timeout,
+        token,
+        sentinel=_mcp_shutdown_sentinel(),
+        remove_pid=_remove_mcp_pid,
+    ):
         console.print("[green]biopb-mcp server stopped[/green]")
     else:
         console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
@@ -1516,7 +1504,13 @@ def mcp_restart(
     pid, token = _read_pid_record(MCP_PID_FILE)
     if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
-        _stop_mcp(pid, timeout, token)
+        _stop_daemon(
+            pid,
+            timeout,
+            token,
+            sentinel=_mcp_shutdown_sentinel(),
+            remove_pid=_remove_mcp_pid,
+        )
         time.sleep(1)
     mcp_start(port=port)
 
