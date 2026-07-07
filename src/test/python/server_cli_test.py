@@ -384,6 +384,81 @@ class TestCacheStats:
         assert captured["token"] == "secret"
 
 
+class TestQueryServerHelper:
+    """_query_server is the shared body behind the status / cache-stats probes
+    (biopb/biopb#277 item F): open a short-lived client, run a call, always close."""
+
+    def _inject_client(self, monkeypatch, fake_cls):
+        import sys
+        import types
+
+        mod = types.ModuleType("biopb.tensor.client")
+        mod.TensorFlightClient = fake_cls
+        monkeypatch.setitem(sys.modules, "biopb.tensor.client", mod)
+
+    def test_runs_call_and_closes_client(self, monkeypatch):
+        closed = []
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def health_check(self):
+                return {"ok": True}
+
+            def close(self):
+                closed.append(True)
+
+        self._inject_client(monkeypatch, FakeClient)
+        result = cli._query_server("grpc://x", "tok", lambda c: c.health_check())
+        assert result == {"ok": True}
+        assert closed == [True]  # closed even on the success path
+
+    def test_call_failure_returns_none_but_still_closes(self, monkeypatch):
+        closed = []
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def close(self):
+                closed.append(True)
+
+        self._inject_client(monkeypatch, FakeClient)
+
+        def boom(_c):
+            raise RuntimeError("action failed")
+
+        assert cli._query_server("grpc://x", None, boom) is None
+        assert closed == [True]
+
+    def test_missing_client_package_returns_none(self, monkeypatch):
+        import sys
+
+        # Simulate the tensor client being unavailable -> the inner import raises.
+        monkeypatch.setitem(sys.modules, "biopb.tensor.client", None)
+        assert cli._query_server("grpc://x", None, lambda c: c.health_check()) is None
+
+    def test_wrappers_route_to_the_right_client_method(self, monkeypatch):
+        class FakeClient:
+            def health_check(self):
+                return {"m": "health"}
+
+            def cache_stats(self):
+                return {"m": "cache"}
+
+        captured = {}
+
+        def fake_query_server(location, token, call):
+            captured["args"] = (location, token)
+            return call(FakeClient())
+
+        monkeypatch.setattr(cli, "_query_server", fake_query_server)
+        assert cli._query_health("grpc://x", "t") == {"m": "health"}
+        assert cli._query_cache_stats("grpc://x", "t") == {"m": "cache"}
+        assert captured["args"] == ("grpc://x", "t")
+
+
 class TestMcpGate:
     """`mcp` subcommands are gated on the optional biopb-mcp package via
     _require_biopb_mcp (checks the import spec, no heavy import)."""
