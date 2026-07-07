@@ -462,6 +462,64 @@ class TestOmeTiffIntegration:
         finally:
             server.shutdown()
 
+    def test_read_path_never_parses_ome_model(self, tmp_path):
+        """biopb/biopb#213: end-to-end, GetFlightInfo + DoGet over a registered
+        OME-TIFF must not trigger AICSImage's OME parse.
+
+        A tripwire is installed on the registered adapter's ``_aics_image`` AFTER
+        registration, then a full client round-trip drives GetFlightInfo (via the
+        #350 ``plan_flight_info`` seam, which also fills the physical scale) and
+        DoGet. Physical scale carries real units, proving the whole chain --
+        descriptor, physical scale, and pixels -- is served from tifffile.
+        """
+        import tifffile
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+
+        class _Tripwire:
+            def __getattr__(self, name):
+                raise AssertionError(f"AICSImage parsed on read path: .{name}")
+
+        path = str(tmp_path / "e2e.ome.tif")
+        data = np.zeros((3, 64, 64), np.uint16)
+        for c in range(3):
+            data[c] = c + 1
+        tifffile.imwrite(
+            path,
+            data,
+            photometric="minisblack",
+            metadata={
+                "axes": "CYX",
+                "PhysicalSizeX": 0.325,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": 0.325,
+                "PhysicalSizeYUnit": "µm",
+            },
+        )
+        adapter = AicsImageIoAdapter.create_from_url(path, "ome213")
+        array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("ome213", adapter)
+        server.mark_ready()
+        adapter._aics_image = _Tripwire()  # any OME parse from here is a failure
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+            darr = client.get_tensor(array_id)  # GetFlightInfo (array_id addressing)
+            assert darr.shape == (1, 3, 1, 64, 64)
+
+            scale, unit = client.get_physical_scale(array_id)
+            assert list(scale) == [0.0, 0.0, 0.0, 0.325, 0.325]
+            assert list(unit) == ["", "", "", "µm", "µm"]
+
+            data = darr[:1, 1:2, :1, :32, :32].compute()  # DoGet
+            assert data.shape == (1, 1, 1, 32, 32)
+            assert (data == 2).all()  # channel 1 -> value 2
+            client.close()
+        finally:
+            server.shutdown()
+
 
 class TestMultiSeriesOmeTiffIntegration:
     """Integration tests for multi-series OME-TIFF with server/client (now handled by AicsImageIoAdapter)."""

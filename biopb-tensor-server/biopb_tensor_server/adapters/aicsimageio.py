@@ -541,6 +541,15 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
     # Multi-tensor source: has multiple scenes
     _single_tensor_source = False
 
+    # Tifffile-authoritative read path (biopb/biopb#213). A scene adapter handed
+    # a descriptor derived from the source-level tifffile fast path trusts that
+    # descriptor and never triggers AICSImage's O(plane-count) OME parse
+    # (set_scene/dask_data) on the read path. The provenance flag records the
+    # source-level accept/miss decision. Class-level defaults keep __new__-built
+    # adapters (unit-test mocks) and any pre-__init__ attribute check safe.
+    _tifffile_descriptor: Optional[TensorDescriptor] = None
+    _descriptors_from_tifffile: bool = False
+
     @classmethod
     def create_from_url(
         cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None
@@ -619,6 +628,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
+        tensor_descriptor: Optional[TensorDescriptor] = None,
     ):
         """Initialize AICSImageIO adapter.
 
@@ -631,6 +641,12 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             io_lock: Optional thread lock for IO serialization. Source-level
                      adapters create a new lock if None; scene-level adapters
                      receive the lock from the source-level adapter.
+            tensor_descriptor: Authoritative per-scene descriptor from the
+                     source-level tifffile fast path (biopb/biopb#213). When
+                     supplied to a scene adapter, the adapter is tifffile-
+                     authoritative: it trusts this descriptor and skips the eager
+                     AICSImage set_scene/OME parse. None (default) keeps the
+                     AICSImage fallback path.
         """
         self._aics_image = aics_image
         self.scene_index = scene_index
@@ -652,11 +668,25 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             self._source_url = ""
         self._source_type = self.SOURCE_TYPE
 
-        # Scene-level: cache dask_data after set_scene (thread-safe)
+        # Scene-level: bind one scene. Two regimes (biopb/biopb#213):
+        #  * Tifffile-authoritative: a descriptor from the source-level tifffile
+        #    fast path was handed down. Trust it -- keep _dask_data None and DO
+        #    NOT set_scene, so the O(plane-count) AICSImage OME parse never runs
+        #    on the read path. Reads serve from the aszarr store;
+        #    _ensure_aics_dask() is the lazy fallback if that store can't open.
+        #  * AICSImage fallback (miss regime): eagerly set_scene + cache dask_data
+        #    exactly as before (RGB samples, non-OME, remote, vendor formats).
         if scene_index is not None:
-            aics_image.set_scene(scene_index)
-            self._dask_data = aics_image.dask_data
-            self.dim_labels = dim_labels if dim_labels else list(aics_image.dims.order)
+            if tensor_descriptor is not None:
+                self._tifffile_descriptor = tensor_descriptor
+                self._dask_data = None
+                self.dim_labels = list(tensor_descriptor.dim_labels)
+            else:
+                aics_image.set_scene(scene_index)
+                self._dask_data = aics_image.dask_data
+                self.dim_labels = (
+                    dim_labels if dim_labels else list(aics_image.dims.order)
+                )
             self._cached_descriptors = None  # Scene-level computes on demand
         else:
             # Source-level: no cached dask_data
@@ -667,9 +697,10 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             )
 
         # Persistent aszarr-store fast path (built lazily on first get_data for
-        # tifffile-backed local sources; see the module-level pool docs). The
-        # descriptor still comes from aicsimageio's dask_data above; only reads
-        # use the persistent store.
+        # tifffile-backed local sources; see the module-level pool docs). On the
+        # tifffile-authoritative regime the descriptor is the handed-down tifffile
+        # one; on the miss regime it comes from aicsimageio's dask_data above.
+        # Either way only reads use the persistent store.
         self._persistent_dask = None
         self._persistent_store = None
         self._persistent_tiff = None
@@ -695,7 +726,10 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape or called on source-level adapter
         """
-        if self._dask_data is None:
+        # scene_index (not _dask_data) marks source vs scene: a tifffile-
+        # authoritative scene adapter also starts with _dask_data = None
+        # (biopb/biopb#213), so keying on _dask_data would wrongly reject reads.
+        if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
@@ -709,7 +743,24 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 # io_lock above serializes it against other reads -- so the
                 # handle is never touched concurrently.
                 return zdask[slices].compute(scheduler="synchronous")
-            return self._dask_data[slices].compute()
+            # Store unavailable (miss regime, or store-open failure): fall back to
+            # the AICSImage dask array, binding it lazily on first use.
+            return self._ensure_aics_dask()[slices].compute()
+
+    def _ensure_aics_dask(self):
+        """Lazily bind this scene's AICSImage dask array (the fallback reader).
+
+        Only the miss regime (no tifffile descriptor) or a store-open failure
+        reaches here. Memoized on ``_dask_data``; caller holds ``self._io_lock``,
+        so the shared ``AICSImage.set_scene`` is serialized exactly as the old
+        eager path was. This is the one place the tifffile-authoritative read path
+        may still trigger the AICSImage OME parse -- and only when the aszarr store
+        genuinely cannot serve the source.
+        """
+        if self._dask_data is None:
+            self._aics_image.set_scene(self.scene_index)
+            self._dask_data = self._aics_image.dask_data
+        return self._dask_data
 
     def _ensure_persistent_dask(self):
         """Return a persistent aszarr-backed dask view, or None to use the
@@ -772,8 +823,19 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 if ax not in axes:
                     z = da.expand_dims(z, axis=i)
 
-            # Correctness gate: must match the trusted aicsimageio descriptor.
-            if (
+            # Correctness gate: the store must match this tensor's authoritative
+            # descriptor. Tifffile-authoritative regime (biopb/biopb#213): compare
+            # against the handed-down tifffile descriptor (a self-consistency
+            # check -- both derive from the same series), so _aics_image is never
+            # touched here. Miss regime: compare against the eager AICSImage
+            # dask_data, exactly as before.
+            if self._tifffile_descriptor is not None:
+                if (
+                    tuple(z.shape) != tuple(self._tifffile_descriptor.shape)
+                    or z.dtype.str != self._tifffile_descriptor.dtype
+                ):
+                    return None
+            elif (
                 tuple(z.shape) != tuple(self._dask_data.shape)
                 or z.dtype != self._dask_data.dtype
             ):
@@ -840,16 +902,22 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         For scene-level adapters (scene_index is set): returns descriptor for that scene.
         For source-level adapters (scene_index=None): returns first scene descriptor.
         """
-        if self._dask_data is not None:
-            # Scene-level: compute from dask array
-            chunks = self._dask_data.chunks
-            chunk_shape = [max(c) for c in chunks]
+        if self.scene_index is not None:
+            # Tifffile-authoritative regime (biopb/biopb#213): return the
+            # handed-down descriptor verbatim. Its chunk_shape=[] is fine
+            # (base.get_chunk_size falls back to compute_safe_chunk_size), and
+            # this avoids the AICSImage OME parse on the read path.
+            if self._tifffile_descriptor is not None:
+                return self._tifffile_descriptor
+            # Miss regime: compute from the eager AICSImage dask array.
+            dask_data = self._ensure_aics_dask()
+            chunk_shape = [max(c) for c in dask_data.chunks]
             return TensorDescriptor(
                 array_id=self.array_id,
                 dim_labels=self.dim_labels if self.dim_labels else [],
-                shape=list(self._dask_data.shape),
+                shape=list(dask_data.shape),
                 chunk_shape=chunk_shape,
-                dtype=self._dask_data.dtype.str,
+                dtype=dask_data.dtype.str,
             )
         # Source-level: return first scene descriptor
         return self.list_tensor_descriptors()[0]
@@ -973,9 +1041,15 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # dims, exotic axes), in which case we fall through to aicsimageio.
         fast = self._tifffile_descriptors()
         if fast is not None:
+            # Provenance (biopb/biopb#213): the accepted regime. Scene adapters
+            # built from these descriptors are tifffile-authoritative.
+            self._descriptors_from_tifffile = True
             self._cached_descriptors = fast
             return fast
 
+        # Miss regime: descriptors come from the AICSImage OME model below, so
+        # scene adapters must eagerly bind AICSImage (no tifffile descriptor).
+        self._descriptors_from_tifffile = False
         descriptors = []
         scene_ids = list(self._aics_image.scenes)
 
@@ -1093,6 +1167,12 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         Returns:
             Adapter for the specified scene, with tensor context set
         """
+        # Populate _cached_descriptors / _descriptors_from_tifffile before
+        # resolving the scene index. Idempotent (cached), and it closes the latent
+        # list(self._aics_image.scenes) parse in _scene_index_for_field for a read
+        # that skipped registration (biopb/biopb#213).
+        descriptors = self.list_tensor_descriptors()
+
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).
         tensor_id = self._within_source_field(tensor_id)
@@ -1107,6 +1187,13 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         else:
             self._tensor_adapters = {}
 
+        # Accepted regime: hand the scene its tifffile descriptor so it trusts
+        # tifffile and never triggers set_scene's OME parse. Miss regime: pass
+        # None -> the child eagerly binds AICSImage as before.
+        tensor_descriptor = (
+            descriptors[scene_idx] if self._descriptors_from_tifffile else None
+        )
+
         adapter = self.__class__(
             self._aics_image,
             scene_index=scene_idx,
@@ -1114,6 +1201,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             dim_labels=self.dim_labels,
             source_url=self._source_url,
             io_lock=self._io_lock,
+            tensor_descriptor=tensor_descriptor,
         )
         # Set tensor context in the adapter
         adapter._tensor_name = tensor_id
@@ -1166,14 +1254,22 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             return {}
 
     def _physical_scale(self):
-        """Per-dim physical pixel size + unit from the resident OME model.
+        """Per-dim physical pixel size + unit, mapped onto ``dim_labels``.
 
-        Reads ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}``
-        directly (no full ``model_dump``) and maps it onto this tensor's
-        ``dim_labels`` by axis label. T/C axes get ``0.0`` / ``""``. Returns
-        ``None`` when no positive physical size is known. See
-        ``TensorAdapter._physical_scale``.
+        Tifffile-authoritative regime (biopb/biopb#213): read the sizes from the
+        local OME-XML (per-plane elements stripped) so the GetFlightInfo read path
+        never triggers the AICSImage OME parse. Return that result **verbatim,
+        including ``None``** -- an OME-TIFF carrying no ``PhysicalSize*`` genuinely
+        has no known scale, and ``_aics_image`` would derive the same ``None`` only
+        after the ~30 s parse the tripwire forbids, so there is no fall-through.
+
+        Miss regime: read ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}``
+        directly (no full ``model_dump``) and map onto ``dim_labels`` by axis
+        label. T/C axes get ``0.0`` / ``""``. Returns ``None`` when no positive
+        size is known. See ``TensorAdapter._physical_scale``.
         """
+        if self._tifffile_descriptor is not None:
+            return self._physical_scale_from_ome_xml()
         try:
             ome = self._aics_image.ome_metadata
             if ome is None or not getattr(ome, "images", None):
@@ -1212,6 +1308,61 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 else:
                     scale.append(0.0)
                     unit.append("")
+            if not any(scale):
+                return None
+            return scale, unit
+        except Exception:
+            return None
+
+    def _physical_scale_from_ome_xml(self):
+        """Physical scale from the local OME-XML, per-plane elements stripped.
+
+        Namespace-agnostic ElementTree scan (NOT an ome-types object build): find
+        the ``<Image>`` at this scene's index in document order, read its
+        ``<Pixels>`` ``PhysicalSizeX/Y/Z`` (+ ``...Unit``), and map onto
+        ``dim_labels`` by lowercased axis label (T/C -> ``0.0`` / ``""``). Physical
+        sizes live on ``<Pixels>`` and survive ``_STRIP_PER_PLANE`` (only
+        ``<Plane>`` / ``<TiffData>`` are stripped). A missing ``*Unit`` defaults to
+        ``"µm"`` (the OME spec default ome-types fills) so results do not drift
+        from the ``_aics_image`` path. Returns ``None`` on any failure or when no
+        positive size is present -- never raises.
+        """
+        try:
+            ome_xml = self._local_ome_xml()
+            if not ome_xml:
+                return None
+            reduced = _STRIP_PER_PLANE.sub("", ome_xml)
+            root = ET.fromstring(reduced)
+
+            def _local(tag):
+                return str(tag).rsplit("}", 1)[-1]
+
+            images = [el for el in root.iter() if _local(el.tag) == "Image"]
+            idx = self.scene_index or 0
+            if idx >= len(images):
+                return None
+            pixels = next((c for c in images[idx] if _local(c.tag) == "Pixels"), None)
+            if pixels is None:
+                return None
+
+            def _size(axis):
+                raw = pixels.get(f"PhysicalSize{axis}")
+                if raw is None:
+                    return 0.0, ""
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return 0.0, ""
+                if v <= 0:
+                    return 0.0, ""
+                return v, (pixels.get(f"PhysicalSize{axis}Unit") or "µm")
+
+            by_label = {"x": _size("X"), "y": _size("Y"), "z": _size("Z")}
+            scale, unit = [], []
+            for lab in self.dim_labels or []:
+                v, u = by_label.get(str(lab).lower(), (0.0, ""))
+                scale.append(v)
+                unit.append(u)
             if not any(scale):
                 return None
             return scale, unit
