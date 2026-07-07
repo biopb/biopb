@@ -20,16 +20,6 @@ from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
 from biopb_tensor_server.config import CacheConfig
 
 
-class MockMetadataWriter:
-    """Mock FlightMetadataWriter for testing."""
-
-    def __init__(self):
-        self.metadata = None
-
-    def write(self, metadata: bytes):
-        self.metadata = metadata
-
-
 class TestCachedSourceAdapter:
     """Tests for CachedSourceAdapter."""
 
@@ -326,13 +316,10 @@ class TestServerDoPutHandler:
         )
 
         # Process creation
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
+        response_desc = server.uploads.create_source(req_desc)
 
         # Check response
-        assert writer.metadata is not None
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        assert response_desc is not None
         assert response_desc.array_id.startswith("cache_")
 
         # Check adapter was registered
@@ -356,10 +343,7 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         assert response_desc.array_id.startswith("cache_")
 
     def test_create_source_not_writable_raises(self):
@@ -378,13 +362,12 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        # The writable check is in do_put, not _handle_create_source
-        # This test verifies _handle_create_source can be called on non-writable server
-        # (the check happens at do_put level)
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        # Source should be created (do_put would reject before reaching this)
-        assert writer.metadata is not None
+        # The writable check is in do_put, not the UploadManager. This test
+        # verifies create_source itself works on a non-writable server (the check
+        # happens at the do_put boundary).
+        response_desc = server.uploads.create_source(req_desc)
+        # Source should be created (do_put would reject before reaching this).
+        assert response_desc is not None
 
     def test_create_source_ome_zarr_requires_write_dir(self):
         """Zarr-backed source requires write_dir."""
@@ -403,9 +386,8 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
         with pytest.raises(flight.FlightServerError, match="write_dir not configured"):
-            server._handle_create_source(req_desc, writer)
+            server.uploads.create_source(req_desc)
 
     def test_create_source_ome_zarr_with_write_dir(self):
         """Create zarr-backed source with write_dir."""
@@ -426,10 +408,7 @@ class TestServerDoPutHandler:
                 dim_labels=["y", "x"],
             )
 
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             assert response_desc.array_id.startswith("ome_zarr_")
 
             # Check zarr directory was created
@@ -457,10 +436,7 @@ class TestServerDoPutHandler:
                 chunk_shape=[32, 32],
                 dim_labels=["y", "x"],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
 
             # The durable upload appears in the catalog.
             descriptors, _ = db.list_source_descriptors()
@@ -482,10 +458,7 @@ class TestServerDoPutHandler:
             dtype="uint8",
             chunk_shape=[32, 32],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
 
         # Not enumerable via the catalog...
         descriptors, _ = db.list_source_descriptors()
@@ -511,9 +484,8 @@ class TestServerDoPutHandler:
             chunk_shape=[50, 50],
         )
 
-        writer = MockMetadataWriter()
         with pytest.raises(flight.FlightServerError, match="Invalid array_id format"):
-            server._handle_create_source(req_desc, writer)
+            server.uploads.create_source(req_desc)
 
     def test_create_source_action_round_trip(self):
         """Live client create_source should return the server-assigned source_id."""
@@ -570,10 +542,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         source_id = response_desc.array_id
 
         # Upload chunk
@@ -592,7 +561,7 @@ class TestChunkUpload:
                 return pa.Table.from_batches([batch])
 
         # Process upload (returns None now)
-        server._handle_chunk_upload(upload, MockReader())
+        server.uploads.write_chunk(upload, MockReader())
 
         # Check chunk was stored
         adapter = server.sources.get(source_id)
@@ -619,10 +588,7 @@ class TestChunkUpload:
             dtype="uint8",
             chunk_shape=[50, 50],
         )
-        writer = MockMetadataWriter()
-        server._handle_create_source(req_desc, writer)
-        response_desc = TensorDescriptor()
-        response_desc.ParseFromString(writer.metadata)
+        response_desc = server.uploads.create_source(req_desc)
         source_id = response_desc.array_id
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
@@ -635,7 +601,7 @@ class TestChunkUpload:
             def read_all(self):
                 return pa.Table.from_batches([batch])
 
-        server._handle_chunk_upload(upload, MockReader())
+        server.uploads.write_chunk(upload, MockReader())
 
         chunk_id = encode_chunk_id(source_id, bounds)
         cache_manager = CacheManager.get_instance()
@@ -675,7 +641,7 @@ class TestChunkUpload:
                 return pa.Table.from_arrays([pa.array([1, 2, 3])], ["data"])
 
         with pytest.raises(flight.FlightServerError, match="Source not found"):
-            server._handle_chunk_upload(upload, MockReader())
+            server.uploads.write_chunk(upload, MockReader())
 
 
 class TestOmeZarrChunkAlignment:
@@ -705,10 +671,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             source_id = response_desc.array_id
 
             # Upload aligned chunk
@@ -725,7 +688,7 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             # Should succeed
-            server._handle_chunk_upload(upload, MockReader())
+            server.uploads.write_chunk(upload, MockReader())
 
             CacheManager.reset()
 
@@ -749,10 +712,7 @@ class TestOmeZarrChunkAlignment:
                 dtype="uint8",
                 chunk_shape=[50, 50],
             )
-            writer = MockMetadataWriter()
-            server._handle_create_source(req_desc, writer)
-            response_desc = TensorDescriptor()
-            response_desc.ParseFromString(writer.metadata)
+            response_desc = server.uploads.create_source(req_desc)
             source_id = response_desc.array_id
 
             # Upload unaligned chunk (start not on grid)
@@ -769,7 +729,7 @@ class TestOmeZarrChunkAlignment:
                     return pa.Table.from_batches([batch])
 
             with pytest.raises(flight.FlightServerError, match="not aligned"):
-                server._handle_chunk_upload(upload, MockReader())
+                server.uploads.write_chunk(upload, MockReader())
 
 
 class TestBuildMinimalOmeMetadata:
@@ -789,7 +749,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["z", "y", "x"],
         )
 
-        metadata = server._build_minimal_ome_metadata(desc)
+        metadata = server.uploads._build_minimal_ome_metadata(desc)
 
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
@@ -813,7 +773,7 @@ class TestBuildMinimalOmeMetadata:
             dim_labels=["c", "z", "y", "x"],
         )
 
-        metadata = server._build_minimal_ome_metadata(desc)
+        metadata = server.uploads._build_minimal_ome_metadata(desc)
         axes = metadata["multiscales"][0]["axes"]
 
         assert axes[0]["type"] == "channel"  # 'c' detected as channel
