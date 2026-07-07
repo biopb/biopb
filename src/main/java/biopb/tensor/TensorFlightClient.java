@@ -32,8 +32,6 @@ import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
-import net.imglib2.FinalInterval;
-import net.imglib2.Interval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
@@ -42,15 +40,17 @@ import net.imglib2.cache.img.SingleCellArrayImg;
 import net.imglib2.cache.img.optional.CacheOptions.CacheType;
 import net.imglib2.img.array.ArrayImg;
 import net.imglib2.img.array.ArrayImgFactory;
-import net.imglib2.img.cell.CellGrid;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.real.DoubleType;
-import net.imglib2.type.numeric.real.FloatType;
-import net.imglib2.view.Views;
+
+import static biopb.tensor.TensorChunkCodec.cellCount;
+import static biopb.tensor.TensorChunkCodec.createType;
+import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
+import static biopb.tensor.TensorChunkCodec.parseTicket;
+import static biopb.tensor.TensorChunkCodec.toIntArray;
+import static biopb.tensor.TensorChunkCodec.toLongArray;
+import static biopb.tensor.TensorChunkCodec.writeChunk;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
@@ -755,34 +755,8 @@ public class TensorFlightClient implements AutoCloseable {
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         // descriptor.shape may be larger than the requested extent.
         if (sliceHint != null && context.descriptor.hasSliceHint()) {
-            SliceHint realized = context.descriptor.getSliceHint();
-            int ndim = context.descriptor.getShapeCount();
-            long[] cropMin = new long[ndim];
-            long[] cropMax = new long[ndim];
-            boolean needsCrop = false;
-            for (int ax = 0; ax < ndim; ax++) {
-                long reqStart = sliceHint.getStart(ax);
-                long reqStop = sliceHint.getStop(ax);
-                long retStart = realized.getStart(ax);
-                long scale = 1L;
-                // Use scale_hint directly from TensorDescriptor
-                if (context.descriptor.getScaleHintCount() > ax) {
-                    scale = context.descriptor.getScaleHint(ax);
-                }
-                if (scale > 1L) {
-                    cropMin[ax] = (reqStart - retStart) / scale;
-                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                } else {
-                    cropMin[ax] = reqStart - retStart;
-                    cropMax[ax] = reqStop - retStart - 1L;
-                }
-                if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
-                    needsCrop = true;
-                }
-            }
-            if (needsCrop) {
-                rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
-            }
+            rai = RegionCrop.cropToRequest(rai, sliceHint, context.descriptor.getSliceHint(),
+                    context.descriptor.getScaleHintList());
         }
 
         // Return SerializableTensorImg wrapper for serialization support
@@ -886,7 +860,10 @@ public class TensorFlightClient implements AutoCloseable {
             pbEffective = pb;
         }
 
-        SerializedEndpointIndex endpointIndex = buildSerializedEndpointIndex(pbEffective, dims, cellDimensions);
+        ChunkGridIndex<SerializedEndpointData> endpointIndex = ChunkGridIndex.build(
+                pbEffective.getEndpointsList(), dims, cellDimensions,
+                SerializedEndpoint::getChunkBounds,
+                ep -> new SerializedEndpointData(ep.getTicket(), ep.getChunkBounds()));
 
         if (endpointIndex == null) {
             // Materialize array for non-aligned endpoint layout
@@ -911,8 +888,7 @@ public class TensorFlightClient implements AutoCloseable {
     private static List<SerializedEndpoint> fetchEndpointsViaGetFlightInfo(SerializedTensor pb) {
         TensorDescriptor descriptor = pb.getTensorDescriptor();
 
-        // Parse location URI
-        Location location = parseLocationUri(pb.getLocation());
+        Location location = LocationUris.parse(pb.getLocation());
 
         // Build TensorReadOption from descriptor's fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
@@ -972,39 +948,15 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Parse location URI string to Arrow Flight Location.
-     */
-    private static Location parseLocationUri(String locationStr) {
-        if (locationStr.startsWith("grpc://")) {
-            String uriPart = locationStr.substring(7);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                return Location.forGrpcInsecure(host, port);
-            }
-        } else if (locationStr.startsWith("grpc+tcp://")) {
-            String uriPart = locationStr.substring(11);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                return Location.forGrpcInsecure(host, port);
-            }
-        }
-        throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
-    }
-
-    /**
      * Load a cell from the Flight server using SerializedEndpoint data.
      */
     private static <T extends NativeType<T> & RealType<T>> void loadCellFromSerialized(
             SingleCellArrayImg<T, ?> cell,
-            SerializedEndpointIndex endpointIndex,
+            ChunkGridIndex<SerializedEndpointData> endpointIndex,
             SerializedTensor pb) {
 
         long cellIndex = endpointIndex.indexFor(cell);
-        SerializedEndpointData epData = endpointIndex.endpoints.get(cellIndex);
+        SerializedEndpointData epData = endpointIndex.get(cellIndex);
         if (epData == null) {
             throw new IllegalStateException("No endpoint found for cell index " + cellIndex);
         }
@@ -1016,70 +968,6 @@ public class TensorFlightClient implements AutoCloseable {
                 pb.getAuthToken(),
                 ticket.getChunkId().toByteArray());
         writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    /**
-     * Build index from SerializedEndpoint list for aligned chunk grid.
-     */
-    private static SerializedEndpointIndex buildSerializedEndpointIndex(
-            SerializedTensor pb,
-            long[] dims,
-            int[] cellDimensions) {
-
-        if (dims.length == 0 || pb.getEndpointsCount() == 0) {
-            return null;
-        }
-
-        CellGrid grid = new CellGrid(dims, cellDimensions);
-        Map<Long, SerializedEndpointData> endpointMap = new HashMap<>();
-        long[] gridDimensions = grid.getGridDimensions();
-        long[] gridPosition = new long[dims.length];
-        long[] expectedMin = new long[dims.length];
-        int[] expectedDimensions = new int[dims.length];
-
-        for (SerializedEndpoint ep : pb.getEndpointsList()) {
-            ChunkBounds bounds = ep.getChunkBounds();
-            if (bounds.getStartCount() != dims.length || bounds.getStopCount() != dims.length) {
-                return null;
-            }
-
-            for (int axis = 0; axis < dims.length; axis++) {
-                long start = bounds.getStart(axis);
-                long stop = bounds.getStop(axis);
-                int nominalCellDimension = cellDimensions[axis];
-                if (start < 0 || stop < start || nominalCellDimension <= 0) {
-                    return null;
-                }
-                if (start % nominalCellDimension != 0) {
-                    return null;
-                }
-                gridPosition[axis] = start / nominalCellDimension;
-                if (gridPosition[axis] >= gridDimensions[axis]) {
-                    return null;
-                }
-            }
-
-            grid.getCellDimensions(gridPosition, expectedMin, expectedDimensions);
-            for (int axis = 0; axis < dims.length; axis++) {
-                if (expectedMin[axis] != bounds.getStart(axis)) {
-                    return null;
-                }
-                if ((long) expectedDimensions[axis] != bounds.getStop(axis) - bounds.getStart(axis)) {
-                    return null;
-                }
-            }
-
-            long cellIndex = grid.getCellGridIndexFlat(gridPosition);
-            if (endpointMap.put(cellIndex, new SerializedEndpointData(ep.getTicket(), ep.getChunkBounds())) != null) {
-                return null;
-            }
-        }
-
-        if (endpointMap.size() != cellCount(gridDimensions)) {
-            return null;
-        }
-
-        return new SerializedEndpointIndex(grid, cellDimensions, endpointMap);
     }
 
     /**
@@ -1106,30 +994,9 @@ public class TensorFlightClient implements AutoCloseable {
             writeChunk(access, bounds, values);
         }
 
-        // Apply cropping if original_slice_hint present
         if (pb.hasOriginalSliceHint() && descriptor.hasSliceHint()) {
-            SliceHint realized = descriptor.getSliceHint();
-            SliceHint original = pb.getOriginalSliceHint();
-            int ndim = descriptor.getShapeCount();
-            long[] cropMin = new long[ndim];
-            long[] cropMax = new long[ndim];
-            for (int ax = 0; ax < ndim; ax++) {
-                long reqStart = original.getStart(ax);
-                long reqStop = original.getStop(ax);
-                long retStart = realized.getStart(ax);
-                long scale = 1L;
-                if (descriptor.getScaleHintCount() > ax) {
-                    scale = descriptor.getScaleHint(ax);
-                }
-                if (scale > 1L) {
-                    cropMin[ax] = (reqStart - retStart) / scale;
-                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                } else {
-                    cropMin[ax] = reqStart - retStart;
-                    cropMax[ax] = reqStop - retStart - 1L;
-                }
-            }
-            return Views.zeroMin(Views.interval(image, new FinalInterval(cropMin, cropMax)));
+            return RegionCrop.cropToRequest(image, pb.getOriginalSliceHint(), descriptor.getSliceHint(),
+                    descriptor.getScaleHintList());
         }
 
         return image;
@@ -1149,37 +1016,6 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
-     * Index mapping cell positions to serialized endpoint data.
-     */
-    private static class SerializedEndpointIndex {
-        final CellGrid grid;
-        final int[] nominalCellDimensions;
-        final Map<Long, SerializedEndpointData> endpoints;
-
-        SerializedEndpointIndex(
-                CellGrid grid,
-                int[] nominalCellDimensions,
-                Map<Long, SerializedEndpointData> endpoints) {
-            this.grid = grid;
-            this.nominalCellDimensions = nominalCellDimensions.clone();
-            this.endpoints = endpoints;
-        }
-
-        long indexFor(Interval interval) {
-            long[] gridPosition = new long[interval.numDimensions()];
-            for (int axis = 0; axis < interval.numDimensions(); axis++) {
-                long min = interval.min(axis);
-                int nominalCellDimension = nominalCellDimensions[axis];
-                if (min % nominalCellDimension != 0) {
-                    throw new IllegalStateException("Cell minimum is not aligned to the logical chunk grid");
-                }
-                gridPosition[axis] = min / nominalCellDimension;
-            }
-            return grid.getCellGridIndexFlat(gridPosition);
-        }
-    }
-
-    /**
      * Fetch chunk values using pooled FlightClient connection.
      */
     private static double[] fetchChunkValuesStatic(String locationStr, String authToken, byte[] chunkId) {
@@ -1188,31 +1024,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .setChunkId(ByteString.copyFrom(chunkId))
                 .build();
 
-        // Parse location URI
-        Location location;
-        if (locationStr.startsWith("grpc://")) {
-            String uriPart = locationStr.substring(7);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                location = Location.forGrpcInsecure(host, port);
-            } else {
-                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
-            }
-        } else if (locationStr.startsWith("grpc+tcp://")) {
-            String uriPart = locationStr.substring(11);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                location = Location.forGrpcInsecure(host, port);
-            } else {
-                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
-            }
-        } else {
-            throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
-        }
+        Location location = LocationUris.parse(locationStr);
 
         // Get pooled client
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
@@ -1569,7 +1381,10 @@ public class TensorFlightClient implements AutoCloseable {
         long[] dims = toLongArray(context.descriptor.getShapeList());
         int[] cellDimensions = toIntArray(context.descriptor.getChunkShapeList());
 
-        EndpointIndex endpointIndex = buildEndpointIndex(context, dims, cellDimensions);
+        ChunkGridIndex<FlightEndpoint> endpointIndex = ChunkGridIndex.build(
+                context.endpoints, dims, cellDimensions,
+                ep -> parseChunkBounds(ep.getAppMetadata()),
+                ep -> ep);
         if (endpointIndex == null) {
             return materializeArray(context);
         }
@@ -1607,10 +1422,10 @@ public class TensorFlightClient implements AutoCloseable {
 
     private <T extends NativeType<T> & RealType<T>> void loadCell(
             SingleCellArrayImg<T, ?> cell,
-            EndpointIndex endpointIndex) {
+            ChunkGridIndex<FlightEndpoint> endpointIndex) {
 
         long cellIndex = endpointIndex.indexFor(cell);
-        FlightEndpoint endpoint = endpointIndex.endpoints.get(cellIndex);
+        FlightEndpoint endpoint = endpointIndex.get(cellIndex);
         if (endpoint == null) {
             throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
         }
@@ -1619,67 +1434,6 @@ public class TensorFlightClient implements AutoCloseable {
         ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
         double[] values = fetchChunkValues(ticket.getChunkId().toByteArray());
         writeChunk(cell.randomAccess(), bounds, values);
-    }
-
-    private EndpointIndex buildEndpointIndex(
-            RequestContext context,
-            long[] dims,
-            int[] cellDimensions) {
-
-        if (dims.length == 0 || context.endpoints.isEmpty()) {
-            return null;
-        }
-
-        CellGrid grid = new CellGrid(dims, cellDimensions);
-        Map<Long, FlightEndpoint> endpointMap = new HashMap<>();
-        long[] gridDimensions = grid.getGridDimensions();
-        long[] gridPosition = new long[dims.length];
-        long[] expectedMin = new long[dims.length];
-        int[] expectedDimensions = new int[dims.length];
-
-        for (FlightEndpoint endpoint : context.endpoints) {
-            ChunkBounds bounds = parseChunkBounds(endpoint.getAppMetadata());
-            if (bounds.getStartCount() != dims.length || bounds.getStopCount() != dims.length) {
-                return null;
-            }
-
-            for (int axis = 0; axis < dims.length; axis++) {
-                long start = bounds.getStart(axis);
-                long stop = bounds.getStop(axis);
-                int nominalCellDimension = cellDimensions[axis];
-                if (start < 0 || stop < start || nominalCellDimension <= 0) {
-                    return null;
-                }
-                if (start % nominalCellDimension != 0) {
-                    return null;
-                }
-                gridPosition[axis] = start / nominalCellDimension;
-                if (gridPosition[axis] >= gridDimensions[axis]) {
-                    return null;
-                }
-            }
-
-            grid.getCellDimensions(gridPosition, expectedMin, expectedDimensions);
-            for (int axis = 0; axis < dims.length; axis++) {
-                if (expectedMin[axis] != bounds.getStart(axis)) {
-                    return null;
-                }
-                if ((long) expectedDimensions[axis] != bounds.getStop(axis) - bounds.getStart(axis)) {
-                    return null;
-                }
-            }
-
-            long cellIndex = grid.getCellGridIndexFlat(gridPosition);
-            if (endpointMap.put(cellIndex, endpoint) != null) {
-                return null;
-            }
-        }
-
-        if (endpointMap.size() != cellCount(gridDimensions)) {
-            return null;
-        }
-
-        return new EndpointIndex(grid, cellDimensions, endpointMap);
     }
 
     private double[] fetchChunkValues(byte[] chunkId) {
@@ -1717,44 +1471,6 @@ public class TensorFlightClient implements AutoCloseable {
             return values;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
-        }
-    }
-
-    private static <T extends NativeType<T> & RealType<T>> void writeChunk(
-            RandomAccess<T> access,
-            ChunkBounds bounds,
-            double[] values) {
-
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
-        }
-        if (expectedSize != values.length) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
-        }
-
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
-            }
-            access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
-        }
-    }
-
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
-        long remaining = index;
-        for (int axis = shape.length - 1; axis >= 0; axis--) {
-            position[axis] = remaining % shape[axis];
-            remaining /= shape[axis];
         }
     }
 
@@ -1832,121 +1548,11 @@ public class TensorFlightClient implements AutoCloseable {
         return new int[] { major, minor, patch };
     }
 
-    private static long[] toLongArray(List<Long> values) {
-        long[] out = new long[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = values.get(i);
-        }
-        return out;
-    }
-
-    private static int[] toIntArray(List<Long> values) {
-        int[] out = new int[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = Math.toIntExact(values.get(i));
-        }
-        return out;
-    }
-
-    private static long cellCount(long[] gridDimensions) {
-        long count = 1L;
-        for (long axisCount : gridDimensions) {
-            count *= axisCount;
-        }
-        return count;
-    }
-
-    private static long estimateChunkBytes(TensorDescriptor descriptor) {
-        long elements = 1L;
-        for (long dim : descriptor.getChunkShapeList()) {
-            elements *= Math.max(dim, 1L);
-        }
-        return elements * bytesPerElement(descriptor.getDtype());
-    }
-
-    private static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return 1;
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return 8;
-            default:
-                return 4;
-        }
-    }
-
     private static TensorDescriptor parseDescriptorUnchecked(byte[] bytes) {
         try {
             return TensorDescriptor.parseFrom(bytes);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to parse TensorDescriptor", e);
-        }
-    }
-
-    private static TensorTicket parseTicket(byte[] bytes) {
-        try {
-            return TensorTicket.parseFrom(bytes);
-        } catch (InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse TensorTicket", e);
-        }
-    }
-
-    private static ChunkBounds parseChunkBounds(byte[] bytes) {
-        try {
-            return ChunkBounds.parseFrom(bytes);
-        } catch (InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse ChunkBounds", e);
-        }
-    }
-
-    private static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-                return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return new DoubleType();
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-            default:
-                return new FloatType();
         }
     }
 
@@ -2091,34 +1697,6 @@ public class TensorFlightClient implements AutoCloseable {
         /** Physical unit per dimension, aligned with dim_labels. */
         public String[] getUnit() {
             return unit;
-        }
-    }
-
-    private static class EndpointIndex {
-        final CellGrid grid;
-        final int[] nominalCellDimensions;
-        final Map<Long, FlightEndpoint> endpoints;
-
-        EndpointIndex(
-                CellGrid grid,
-                int[] nominalCellDimensions,
-                Map<Long, FlightEndpoint> endpoints) {
-            this.grid = grid;
-            this.nominalCellDimensions = nominalCellDimensions.clone();
-            this.endpoints = endpoints;
-        }
-
-        long indexFor(Interval interval) {
-            long[] gridPosition = new long[interval.numDimensions()];
-            for (int axis = 0; axis < interval.numDimensions(); axis++) {
-                long min = interval.min(axis);
-                int nominalCellDimension = nominalCellDimensions[axis];
-                if (min % nominalCellDimension != 0) {
-                    throw new IllegalStateException("Cell minimum is not aligned to the logical chunk grid");
-                }
-                gridPosition[axis] = min / nominalCellDimension;
-            }
-            return grid.getCellGridIndexFlat(gridPosition);
         }
     }
 
