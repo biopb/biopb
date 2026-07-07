@@ -45,11 +45,15 @@ import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.img.cell.CellGrid;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.real.DoubleType;
-import net.imglib2.type.numeric.real.FloatType;
+
+import static biopb.tensor.TensorChunkCodec.cellCount;
+import static biopb.tensor.TensorChunkCodec.createType;
+import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
+import static biopb.tensor.TensorChunkCodec.parseTicket;
+import static biopb.tensor.TensorChunkCodec.toIntArray;
+import static biopb.tensor.TensorChunkCodec.toLongArray;
+import static biopb.tensor.TensorChunkCodec.writeChunk;
 import net.imglib2.view.Views;
 
 /**
@@ -911,8 +915,7 @@ public class TensorFlightClient implements AutoCloseable {
     private static List<SerializedEndpoint> fetchEndpointsViaGetFlightInfo(SerializedTensor pb) {
         TensorDescriptor descriptor = pb.getTensorDescriptor();
 
-        // Parse location URI
-        Location location = parseLocationUri(pb.getLocation());
+        Location location = LocationUris.parse(pb.getLocation());
 
         // Build TensorReadOption from descriptor's fields
         TensorReadOption.Builder readBuilder = TensorReadOption.newBuilder()
@@ -969,30 +972,6 @@ public class TensorFlightClient implements AutoCloseable {
                 // Ignore allocator close errors
             }
         }
-    }
-
-    /**
-     * Parse location URI string to Arrow Flight Location.
-     */
-    private static Location parseLocationUri(String locationStr) {
-        if (locationStr.startsWith("grpc://")) {
-            String uriPart = locationStr.substring(7);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                return Location.forGrpcInsecure(host, port);
-            }
-        } else if (locationStr.startsWith("grpc+tcp://")) {
-            String uriPart = locationStr.substring(11);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                return Location.forGrpcInsecure(host, port);
-            }
-        }
-        throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
     }
 
     /**
@@ -1188,31 +1167,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .setChunkId(ByteString.copyFrom(chunkId))
                 .build();
 
-        // Parse location URI
-        Location location;
-        if (locationStr.startsWith("grpc://")) {
-            String uriPart = locationStr.substring(7);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                location = Location.forGrpcInsecure(host, port);
-            } else {
-                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
-            }
-        } else if (locationStr.startsWith("grpc+tcp://")) {
-            String uriPart = locationStr.substring(11);
-            int colonIdx = uriPart.lastIndexOf(':');
-            if (colonIdx > 0) {
-                String host = uriPart.substring(0, colonIdx);
-                int port = Integer.parseInt(uriPart.substring(colonIdx + 1));
-                location = Location.forGrpcInsecure(host, port);
-            } else {
-                throw new IllegalArgumentException("Invalid location URI: " + locationStr);
-            }
-        } else {
-            throw new IllegalArgumentException("Unsupported location URI scheme: " + locationStr);
-        }
+        Location location = LocationUris.parse(locationStr);
 
         // Get pooled client
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
@@ -1720,44 +1675,6 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    private static <T extends NativeType<T> & RealType<T>> void writeChunk(
-            RandomAccess<T> access,
-            ChunkBounds bounds,
-            double[] values) {
-
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
-        }
-        if (expectedSize != values.length) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
-        }
-
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
-            }
-            access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
-        }
-    }
-
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
-        long remaining = index;
-        for (int axis = shape.length - 1; axis >= 0; axis--) {
-            position[axis] = remaining % shape[axis];
-            remaining /= shape[axis];
-        }
-    }
-
     private static String bytesToHex(byte[] bytes, int limit) {
         StringBuilder sb = new StringBuilder();
         int len = Math.min(bytes.length, limit);
@@ -1832,121 +1749,11 @@ public class TensorFlightClient implements AutoCloseable {
         return new int[] { major, minor, patch };
     }
 
-    private static long[] toLongArray(List<Long> values) {
-        long[] out = new long[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = values.get(i);
-        }
-        return out;
-    }
-
-    private static int[] toIntArray(List<Long> values) {
-        int[] out = new int[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = Math.toIntExact(values.get(i));
-        }
-        return out;
-    }
-
-    private static long cellCount(long[] gridDimensions) {
-        long count = 1L;
-        for (long axisCount : gridDimensions) {
-            count *= axisCount;
-        }
-        return count;
-    }
-
-    private static long estimateChunkBytes(TensorDescriptor descriptor) {
-        long elements = 1L;
-        for (long dim : descriptor.getChunkShapeList()) {
-            elements *= Math.max(dim, 1L);
-        }
-        return elements * bytesPerElement(descriptor.getDtype());
-    }
-
-    private static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return 1;
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return 8;
-            default:
-                return 4;
-        }
-    }
-
     private static TensorDescriptor parseDescriptorUnchecked(byte[] bytes) {
         try {
             return TensorDescriptor.parseFrom(bytes);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to parse TensorDescriptor", e);
-        }
-    }
-
-    private static TensorTicket parseTicket(byte[] bytes) {
-        try {
-            return TensorTicket.parseFrom(bytes);
-        } catch (InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse TensorTicket", e);
-        }
-    }
-
-    private static ChunkBounds parseChunkBounds(byte[] bytes) {
-        try {
-            return ChunkBounds.parseFrom(bytes);
-        } catch (InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse ChunkBounds", e);
-        }
-    }
-
-    private static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-                return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return new DoubleType();
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-            default:
-                return new FloatType();
         }
     }
 

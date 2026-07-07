@@ -6,6 +6,7 @@ import java.util.logging.Logger;
 
 import com.google.protobuf.ByteString;
 
+import biopb.tensor.LocationUris;
 import biopb.tensor.SerializableTensorImg;
 import biopb.tensor.SerializedTensor;
 import net.imglib2.RandomAccessibleInterval;
@@ -752,7 +753,7 @@ public final class Utils {
         // Use SerializableTensorImg's static reconstruction method
         // We create a minimal wrapper that reconstructs on first access
         return new SerializableTensorImg<>(
-                parseLocation(serializedTensor.getLocation()),
+                LocationUris.parse(serializedTensor.getLocation()),
                 serializedTensor.getAuthToken().isEmpty() ? null : serializedTensor.getAuthToken(),
                 100_000_000L,  // Default cache size 100MB
                 serializedTensor.getTensorDescriptor().getArrayId(),
@@ -765,19 +766,6 @@ public final class Utils {
                 serializedTensor.getTensorDescriptor(),
                 null  // delegate reconstructed lazily
         );
-    }
-
-    private static org.apache.arrow.flight.Location parseLocation(String uri) {
-        try {
-            return new org.apache.arrow.flight.Location(java.net.URI.create(uri));
-        } catch (Exception e) {
-            java.net.URI parsed = java.net.URI.create(uri);
-            String scheme = parsed.getScheme();
-            if (scheme == null) {
-                return org.apache.arrow.flight.Location.forGrpcInsecure(parsed.getHost(), parsed.getPort());
-            }
-            return new org.apache.arrow.flight.Location(parsed);
-        }
     }
 
     private static long[] toLongArray(java.util.List<Long> values) {

@@ -29,11 +29,15 @@ import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.img.cell.CellGrid;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
-import net.imglib2.type.numeric.integer.UnsignedByteType;
-import net.imglib2.type.numeric.integer.UnsignedIntType;
-import net.imglib2.type.numeric.integer.UnsignedShortType;
-import net.imglib2.type.numeric.real.DoubleType;
-import net.imglib2.type.numeric.real.FloatType;
+
+import static biopb.tensor.TensorChunkCodec.cellCount;
+import static biopb.tensor.TensorChunkCodec.createType;
+import static biopb.tensor.TensorChunkCodec.estimateChunkBytes;
+import static biopb.tensor.TensorChunkCodec.parseChunkBounds;
+import static biopb.tensor.TensorChunkCodec.parseTicket;
+import static biopb.tensor.TensorChunkCodec.toIntArray;
+import static biopb.tensor.TensorChunkCodec.toLongArray;
+import static biopb.tensor.TensorChunkCodec.writeChunk;
 
 /**
  * Externalizable wrapper for tensor images that enables serialization.
@@ -187,7 +191,7 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             throw new IllegalStateException("Cannot reconstruct tensor: missing connection parameters");
         }
 
-        Location location = parseLocation(locationUri);
+        Location location = LocationUris.parse(locationUri);
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         TensorConnectionPool.PooledConnection conn = TensorConnectionPool.getConnection(location, token, allocator);
         FlightClient client = conn.getClient();
@@ -322,23 +326,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
     }
 
     // Helper methods (adapted from TensorFlightClient)
-
-    private static Location parseLocation(String uri) {
-        try {
-            // Use the Location constructor that accepts URI
-            return new Location(java.net.URI.create(uri));
-        } catch (Exception e) {
-            // Fallback for edge cases - parse URI components manually
-            java.net.URI parsed = java.net.URI.create(uri);
-            String scheme = parsed.getScheme();
-            if (scheme == null) {
-                // Default to grpc+tcp if no scheme
-                return Location.forGrpcInsecure(parsed.getHost(), parsed.getPort());
-            }
-            // Let Location constructor handle it
-            return new Location(parsed);
-        }
-    }
 
     @SuppressWarnings("unchecked")
     private static <T extends NativeType<T> & RealType<T>> RandomAccessibleInterval<T> materializeArray(
@@ -485,154 +472,6 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             return values;
         } catch (Exception e) {
             throw new IllegalStateException("Failed to fetch chunk payload", e);
-        }
-    }
-
-    private static <T extends NativeType<T> & RealType<T>> void writeChunk(
-            RandomAccess<T> access,
-            ChunkBounds bounds,
-            double[] values) {
-
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
-        }
-        if (expectedSize != values.length) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
-        }
-
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
-            }
-            access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
-        }
-    }
-
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
-        long remaining = index;
-        for (int axis = shape.length - 1; axis >= 0; axis--) {
-            position[axis] = remaining % shape[axis];
-            remaining /= shape[axis];
-        }
-    }
-
-    private static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-                return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return new DoubleType();
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-            default:
-                return new FloatType();
-        }
-    }
-
-    private static long[] toLongArray(java.util.List<Long> values) {
-        long[] out = new long[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = values.get(i);
-        }
-        return out;
-    }
-
-    private static int[] toIntArray(java.util.List<Long> values) {
-        int[] out = new int[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            out[i] = java.lang.Math.toIntExact(values.get(i));
-        }
-        return out;
-    }
-
-    private static long cellCount(long[] gridDimensions) {
-        long count = 1L;
-        for (long axisCount : gridDimensions) {
-            count *= axisCount;
-        }
-        return count;
-    }
-
-    private static long estimateChunkBytes(TensorDescriptor descriptor) {
-        long elements = 1L;
-        for (long dim : descriptor.getChunkShapeList()) {
-            elements *= java.lang.Math.max(dim, 1L);
-        }
-        return elements * bytesPerElement(descriptor.getDtype());
-    }
-
-    private static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
-            case "u1":
-            case "uint8":
-            case "|u1":
-                return 1;
-            case "<u2":
-            case ">u2":
-            case "u2":
-            case "uint16":
-                return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
-            case "f8":
-            case "float64":
-                return 8;
-            default:
-                return 4;
-        }
-    }
-
-    private static TensorTicket parseTicket(byte[] bytes) {
-        try {
-            return TensorTicket.parseFrom(bytes);
-        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse TensorTicket", e);
-        }
-    }
-
-    private static ChunkBounds parseChunkBounds(byte[] bytes) {
-        try {
-            return ChunkBounds.parseFrom(bytes);
-        } catch (com.google.protobuf.InvalidProtocolBufferException e) {
-            throw new IllegalStateException("Failed to parse ChunkBounds", e);
         }
     }
 
