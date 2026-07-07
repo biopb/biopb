@@ -11,7 +11,6 @@ The server supports:
 - Metadata queries: SQL queries against source catalog (via DuckDB)
 """
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -40,6 +39,7 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
+from biopb_tensor_server.activity import ActivityTracker
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
@@ -208,18 +208,12 @@ class TensorFlightServer(flight.FlightServerBase):
         # read from gRPC handler threads, hence an Event.
         self._ready = threading.Event()
 
-        # Flight activity tracking for the background precache worker: counts
-        # in-flight heavy reads (do_get) and stamps the last time one finished,
-        # so the worker can stay off the wire while real traffic flows. Cheap --
-        # one uncontended lock + int + monotonic stamp per do_get.
-        self._activity_lock = threading.Lock()
-        self._inflight = 0
-        self._last_active = 0.0  # time.monotonic() of last do_get completion
-
-        # Source ids with a "warm" (hydrate-ahead) recall in flight, so a second
-        # concurrent warm of the same source is rejected rather than doubling the
-        # disk/recall pressure. Guarded by the activity lock (cheap, uncontended).
-        self._warming: set = set()
+        # Flight activity + warm-guard tracking for the background precache
+        # worker: counts in-flight heavy reads (do_get/warm), stamps the last one
+        # to finish (so the worker parks while real traffic flows), and holds the
+        # set of sources with a warm in flight (so a concurrent warm of the same
+        # source is rejected). Cheap -- one uncontended lock.
+        self.activity = ActivityTracker()
 
         # Catalog-freshness signals for the ``health`` action (progressive
         # discovery, biopb/biopb#212). ``SERVING`` only means "up and serving the
@@ -251,27 +245,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # dnd:// sources to remove, so removal is a no-op there anyway.
         self._remove_source_handler: Optional[Callable[..., Any]] = None
 
-    @contextlib.contextmanager
-    def _serving_request(self):
-        """Mark a heavy read in flight for its duration (precache idle signal)."""
-        with self._activity_lock:
-            self._inflight += 1
-        try:
-            yield
-        finally:
-            with self._activity_lock:
-                self._inflight -= 1
-                self._last_active = time.monotonic()
-
     def flight_idle_for(self, seconds: float) -> bool:
         """True if no heavy read is in flight and none finished within *seconds*.
 
-        Used by the precache worker to debounce against live traffic.
+        Used by the precache worker to debounce against live traffic
+        (delegates to ``activity``).
         """
-        with self._activity_lock:
-            if self._inflight > 0:
-                return False
-            return (time.monotonic() - self._last_active) >= seconds
+        return self.activity.idle_for(seconds)
 
     def mark_ready(self) -> None:
         """Signal that initial source registration is complete.
@@ -726,7 +706,7 @@ class TensorFlightServer(flight.FlightServerBase):
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
           (already-warm files are cheap local reads, cold files recall).
-        - **Counts as Flight activity** (wrapped in ``_serving_request``) so the
+        - **Counts as Flight activity** (wrapped in ``activity.serving_request``) so the
           background precache worker yields to it for the duration.
         - Does **not** hold the adapter's per-source IO lock -- these are plain
           filesystem reads, concurrency-safe with real reads, so warming never
@@ -745,12 +725,10 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Reject a second concurrent warm of the same source (avoid doubling the
         # disk/recall pressure); the browser also disables re-trigger while running.
-        with self._activity_lock:
-            if source_id in self._warming:
-                raise flight.FlightServerError(
-                    f"warm already in progress for {source_id!r}"
-                )
-            self._warming.add(source_id)
+        if not self.activity.begin_warm(source_id):
+            raise flight.FlightServerError(
+                f"warm already in progress for {source_id!r}"
+            )
 
         started = time.monotonic()
         last_yield = 0.0
@@ -776,7 +754,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         try:
             # Warming registers as in-flight activity so the precache worker parks.
-            with self._serving_request():
+            with self.activity.serving_request():
                 # 1. Enumerate + stat (recursive, recall-free). os.walk separates
                 #    directories from `names`, so `names` are the data files we
                 #    want; stat does not recall a placeholder.
@@ -864,8 +842,7 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
                 ).SerializeToString()
         finally:
-            with self._activity_lock:
-                self._warming.discard(source_id)
+            self.activity.end_warm(source_id)
 
     def _handle_add_source(
         self, req: AddSourceRequest, context: flight.ServerCallContext
@@ -1296,7 +1273,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Heavy chunk-read path: track it as in-flight so the background
         # precache worker stays idle while real reads are happening.
-        with self._serving_request():
+        with self.activity.serving_request():
             tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 

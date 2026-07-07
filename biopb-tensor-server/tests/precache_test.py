@@ -174,7 +174,7 @@ class TestFlightIdleProbe:
             release = threading.Event()
 
             def hold():
-                with server._serving_request():
+                with server.activity.serving_request():
                     entered.set()
                     release.wait(2.0)
 
@@ -193,7 +193,7 @@ class TestFlightIdleProbe:
     def test_debounce_window(self):
         server = TensorFlightServer("grpc://localhost:0")
         try:
-            with server._serving_request():
+            with server.activity.serving_request():
                 pass
             # Just finished: a 5s debounce is not yet satisfied.
             assert server.flight_idle_for(5.0) is False
@@ -549,7 +549,7 @@ class TestPreemptionAndLifecycle:
             holding = threading.Event()
 
             def hold():
-                with server._serving_request():
+                with server.activity.serving_request():
                     holding.set()
                     release.wait(3.0)
 
