@@ -41,15 +41,31 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-# The set install.sh installs (see install_biopb(): TENSOR_EXTRAS and the *_req
-# vars). Local packages are given as paths so uv reads their real dependency
-# metadata from this checkout rather than from a published release.
-INSTALLER_REQUIREMENTS = [
-    ".[tensor]",
-    "./biopb-tensor-server[web,aics,medical,ndtiff,hdf5]",
-    "./biopb-mcp[mcp]",
-    "napari[all]",
-]
+# The format extras install.sh always installs (see install_biopb(): TENSOR_EXTRAS).
+_BASE_TENSOR_EXTRAS = ["web", "aics", "medical", "ndtiff", "hdf5"]
+
+# install.sh adds the Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw)
+# on every platform EXCEPT Intel macOS, where pylibczirw ships no wheel. Mirror that
+# so the check reflects the set install.sh actually installs per target.
+_CZI_UNAVAILABLE_TARGETS = {"x86_64-apple-darwin"}
+
+
+def installer_requirements(target: str) -> list[str]:
+    """The requirement set install.sh installs for ``target``.
+
+    Local packages are given as paths so uv reads their real dependency metadata
+    from this checkout rather than from a published release.
+    """
+    extras = list(_BASE_TENSOR_EXTRAS)
+    if target not in _CZI_UNAVAILABLE_TARGETS:
+        extras.append("czi")
+    return [
+        ".[tensor]",
+        f"./biopb-tensor-server[{','.join(extras)}]",
+        "./biopb-mcp[mcp]",
+        "napari[all]",
+    ]
+
 
 # Extra constraints install.sh applies for specific platforms. Mirror them here so
 # a green run reflects the *installer's* resolve, not the unconstrained graph.
@@ -97,7 +113,7 @@ def resolve(target: str, python_version: str) -> dict[str, str]:
     (path/file) requirements resolve to non-``name==version`` lines and are
     skipped -- they are this repo's own packages, never the wheel-gap risk.
     """
-    reqs = INSTALLER_REQUIREMENTS + INSTALLER_CONSTRAINTS.get(target, [])
+    reqs = installer_requirements(target) + INSTALLER_CONSTRAINTS.get(target, [])
     proc = subprocess.run(
         [
             "uv",

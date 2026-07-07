@@ -1024,6 +1024,15 @@ install_biopb() {
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
+    # The Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw) ships no
+    # Intel-macOS wheel, so including it there would source-build libCZI and fail.
+    # Add it everywhere except Intel macOS (arm64 macOS, Linux, and Windows all
+    # have a wheel).
+    if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
+        _info "  skipping CZI reader on Intel macOS (bioio-czi has no Intel-mac wheel)"
+    else
+        TENSOR_EXTRAS="$TENSOR_EXTRAS,czi"
+    fi
 
     # Resolve where the three packages come from. They must be installed as a
     # matched set from a single build: the tensor server is self-contained and

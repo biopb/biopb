@@ -937,7 +937,7 @@ function Invoke-BiopbInstall {
 
     # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
     # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # installer's `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
     # ships no cp313 wheel yet -- on 3.13+ uv would build it from source (cmake +
     # libCZI + an MSVC compiler), which fails on a fresh Windows box. If the
     # system Python is newer we fall back to a uv-managed 3.12 below. Mirrors
@@ -995,7 +995,9 @@ function Invoke-BiopbInstall {
     # is absent/broken, since the lock can outlive it).
     Stop-BiopbToolProcesses | Out-Null
 
-    $tensorExtras = "web,aics,medical,ndtiff,hdf5"
+    # Windows has a pylibczirw wheel, so the CZI reader ([czi]) is always included
+    # here -- only Intel macOS lacks the wheel (handled in install.sh).
+    $tensorExtras = "web,aics,czi,medical,ndtiff,hdf5"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
         Report-Info "including Bio-Formats (Java fetched on first use, not now)"

@@ -56,19 +56,29 @@ dependencies = [
   # docs/aicsimageio-to-bioio-migration.md.
   aics = [
     "bioio >= 3.0",
-    "bioio-czi",       # Zeiss CZI (aicspylibczi)
     "bioio-lif",       # Leica LIF (readlif)
     "bioio-nd2",       # Nikon ND2
     "bioio-dv",        # DeltaVision DV (mrc)
     "bioio-tifffile",  # plain/non-OME TIFF and Zeiss LSM (ZeissAdapter's .lsm path)
     "bioio-ome-tiff",  # remote/exotic OME-TIFF the pure-tifffile OmeTiffAdapter declines
     "bioio-imageio",   # generic raster/video fallback
+    # bioio-czi (Zeiss CZI) is carved into its own [czi] extra, NOT bundled here:
+    # its pylibczirw dep ships no Intel-macOS wheel, so bundling it would
+    # source-build libCZI (and fail) on every Intel Mac. install.sh adds [czi] on
+    # all platforms except Intel macOS; a direct install that wants CZI uses [aics,czi].
     # NOTE: bioio-ome-zarr is deliberately NOT listed. (1) It is redundant --
     # biopb reads OME-Zarr/Zarr via its own OmeZarrAdapter/ZarrAdapter, which win
     # in the registry ahead of the generic bioio fallback, so a .zarr store never
     # reaches a bioio reader. (2) It requires zarr>=3, which collides with the
     # zarr<3 pin above; adopting it is the same trigger as the deferred zarr 2->3
     # port. See docs/aicsimageio-to-bioio-migration.md.
+  ]
+  # Zeiss CZI reader, split out of [aics]: bioio-czi -> pylibczirw publishes
+  # arm64-macOS / Linux / Windows wheels but NO Intel-macOS wheel (any version),
+  # so on an Intel Mac it would compile libCZI from source and fail. The installers
+  # add this everywhere except Intel macOS. See docs/aicsimageio-to-bioio-migration.md.
+  czi = [
+    "bioio-czi",
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",
