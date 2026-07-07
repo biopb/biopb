@@ -1,6 +1,6 @@
 # Migrating vendor-format reads from aicsimageio to bioio
 
-Status: **in progress** (this doc drives the change on branch `deps/aicsimageio-to-bioio`).
+Status: **complete** (biopb-tensor-server now reads vendor formats via bioio).
 
 ## 1. Why
 
@@ -195,7 +195,7 @@ Python range:
 | Python | numpy | scipy | tifffile   | zarr (with `<3`) | readers |
 |--------|-------|-------|------------|------------------|---------|
 | 3.10   | 2.2.6 | 1.15.3| 2025.5.10  | 2.18.3           | aicspylibczi 3.3.1, nd2 0.11.3, readlif 0.6.6, mrc 0.4.0 |
-| 3.12   | 2.5.1 | 1.18.0| 2026.6.1   | 2.18.7           | (same) |
+| 3.12   | 2.5.1 | 1.18.0| 2025.5.10  | 2.18.7           | (same) |
 
 Nothing in the bioio plugin tree re-imposes `numpy<2`, `tifffile<2023.3.15`, or
 `scipy<1.16`. Verdict: green.
