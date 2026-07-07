@@ -15,11 +15,9 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 
 import net.imglib2.Cursor;
-import net.imglib2.FinalInterval;
 import net.imglib2.Interval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
-import net.imglib2.view.Views;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgOptions;
 import net.imglib2.cache.img.SingleCellArrayImg;
@@ -254,36 +252,11 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
             RandomAccessibleInterval<T> rai = (RandomAccessibleInterval<T>) factory.create(dims, type,
                     cell -> loadCell(cell, endpointIndex, client, authOption));
 
-            // Apply cropping if needed
+            // Crop back to the originally requested region (the server snaps
+            // slice_hint outward to chunk-aligned bounds, so shape may exceed it).
             if (sliceHint != null && responseDescriptor.hasSliceHint()) {
-                SliceHint realized = responseDescriptor.getSliceHint();
-                int ndim = responseDescriptor.getShapeCount();
-                long[] cropMin = new long[ndim];
-                long[] cropMax = new long[ndim];
-                boolean needsCrop = false;
-                for (int ax = 0; ax < ndim; ax++) {
-                    long reqStart = sliceHint.getStart(ax);
-                    long reqStop = sliceHint.getStop(ax);
-                    long retStart = realized.getStart(ax);
-                    long scale = 1L;
-                    // Use scale_hint directly from TensorDescriptor
-                    if (responseDescriptor.getScaleHintCount() > ax) {
-                        scale = responseDescriptor.getScaleHint(ax);
-                    }
-                    if (scale > 1L) {
-                        cropMin[ax] = (reqStart - retStart) / scale;
-                        cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                    } else {
-                        cropMin[ax] = reqStart - retStart;
-                        cropMax[ax] = reqStop - retStart - 1L;
-                    }
-                    if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
-                        needsCrop = true;
-                    }
-                }
-                if (needsCrop) {
-                    rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
-                }
+                rai = RegionCrop.cropToRequest(rai, sliceHint, responseDescriptor.getSliceHint(),
+                        responseDescriptor.getScaleHintList());
             }
 
             return rai;

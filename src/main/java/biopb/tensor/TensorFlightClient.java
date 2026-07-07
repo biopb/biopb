@@ -32,7 +32,6 @@ import com.google.gson.reflect.TypeToken;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
-import net.imglib2.FinalInterval;
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
@@ -52,7 +51,6 @@ import static biopb.tensor.TensorChunkCodec.parseTicket;
 import static biopb.tensor.TensorChunkCodec.toIntArray;
 import static biopb.tensor.TensorChunkCodec.toLongArray;
 import static biopb.tensor.TensorChunkCodec.writeChunk;
-import net.imglib2.view.Views;
 
 /**
  * Client for accessing tensors from a TensorFlightServer.
@@ -757,34 +755,8 @@ public class TensorFlightClient implements AutoCloseable {
         // The server snaps slice_hint outward to lcm-aligned chunk boundaries, so
         // descriptor.shape may be larger than the requested extent.
         if (sliceHint != null && context.descriptor.hasSliceHint()) {
-            SliceHint realized = context.descriptor.getSliceHint();
-            int ndim = context.descriptor.getShapeCount();
-            long[] cropMin = new long[ndim];
-            long[] cropMax = new long[ndim];
-            boolean needsCrop = false;
-            for (int ax = 0; ax < ndim; ax++) {
-                long reqStart = sliceHint.getStart(ax);
-                long reqStop = sliceHint.getStop(ax);
-                long retStart = realized.getStart(ax);
-                long scale = 1L;
-                // Use scale_hint directly from TensorDescriptor
-                if (context.descriptor.getScaleHintCount() > ax) {
-                    scale = context.descriptor.getScaleHint(ax);
-                }
-                if (scale > 1L) {
-                    cropMin[ax] = (reqStart - retStart) / scale;
-                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                } else {
-                    cropMin[ax] = reqStart - retStart;
-                    cropMax[ax] = reqStop - retStart - 1L;
-                }
-                if (cropMin[ax] != 0 || cropMax[ax] != rai.max(ax)) {
-                    needsCrop = true;
-                }
-            }
-            if (needsCrop) {
-                rai = Views.zeroMin(Views.interval(rai, new FinalInterval(cropMin, cropMax)));
-            }
+            rai = RegionCrop.cropToRequest(rai, sliceHint, context.descriptor.getSliceHint(),
+                    context.descriptor.getScaleHintList());
         }
 
         // Return SerializableTensorImg wrapper for serialization support
@@ -1022,30 +994,9 @@ public class TensorFlightClient implements AutoCloseable {
             writeChunk(access, bounds, values);
         }
 
-        // Apply cropping if original_slice_hint present
         if (pb.hasOriginalSliceHint() && descriptor.hasSliceHint()) {
-            SliceHint realized = descriptor.getSliceHint();
-            SliceHint original = pb.getOriginalSliceHint();
-            int ndim = descriptor.getShapeCount();
-            long[] cropMin = new long[ndim];
-            long[] cropMax = new long[ndim];
-            for (int ax = 0; ax < ndim; ax++) {
-                long reqStart = original.getStart(ax);
-                long reqStop = original.getStop(ax);
-                long retStart = realized.getStart(ax);
-                long scale = 1L;
-                if (descriptor.getScaleHintCount() > ax) {
-                    scale = descriptor.getScaleHint(ax);
-                }
-                if (scale > 1L) {
-                    cropMin[ax] = (reqStart - retStart) / scale;
-                    cropMax[ax] = (reqStop - retStart + scale - 1L) / scale - 1L;
-                } else {
-                    cropMin[ax] = reqStart - retStart;
-                    cropMax[ax] = reqStop - retStart - 1L;
-                }
-            }
-            return Views.zeroMin(Views.interval(image, new FinalInterval(cropMin, cropMax)));
+            return RegionCrop.cropToRequest(image, pb.getOriginalSliceHint(), descriptor.getSliceHint(),
+                    descriptor.getScaleHintList());
         }
 
         return image;
