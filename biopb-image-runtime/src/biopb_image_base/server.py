@@ -185,7 +185,7 @@ class EmbeddedTensorCache:
         # this token gates read-back without a server-wide secret.
         adapter.capability_token = secrets.token_urlsafe(32)
         self._server.register_source(source_id, adapter)
-        self._server.initialize_upload(source_id, array_template.shape, chunk_shape)
+        self._server.uploads.initialize(source_id, array_template.shape, chunk_shape)
         return source_id, array_template, chunk_shape
 
     def create_array(
@@ -206,7 +206,7 @@ class EmbeddedTensorCache:
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             location=self._external_location,
-            auth_token=self._server._get_source_adapter(source_id).capability_token,
+            auth_token=self._server.sources.get(source_id).capability_token,
         )
 
     def upload_array_chunks(
@@ -215,14 +215,14 @@ class EmbeddedTensorCache:
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
-        adapter = self._server._get_source_adapter(source_id)
+        adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
         adapter.write_chunk(endpoint, chunk)
-        self._server.mark_upload_chunk(source_id, endpoint)
+        self._server.uploads.mark_chunk(source_id, endpoint)
 
     def get_upload_status(self, source_id: str) -> dict:
-        return self._server.get_upload_status(source_id)
+        return self._server.uploads.status(source_id)
 
     def create_source(
         self,
@@ -277,7 +277,7 @@ class EmbeddedTensorCache:
         from biopb.tensor.ticket_pb2 import TensorTicket
 
         # Get adapter from server
-        adapter = self._server._get_source_adapter(source_id)
+        adapter = self._server.sources.get(source_id)
         if adapter is None:
             raise ValueError(f"Source not found: {source_id}")
 

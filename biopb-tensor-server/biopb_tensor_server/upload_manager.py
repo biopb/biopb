@@ -99,19 +99,32 @@ class UploadManager:
 
     # -- progress state machine ------------------------------------------------
 
-    def _initialize(
+    def initialize(
         self,
         source_id: str,
         shape: List[int] | Tuple[int, ...],
         chunk_shape: List[int] | Tuple[int, ...],
     ) -> None:
+        """Begin tracking upload progress for a source.
+
+        Called by ``create_source`` on the DoPut wire path, and directly by
+        in-process cache producers (e.g. the image-runtime EmbeddedTensorCache)
+        that register a cache source and write its chunks without going over the
+        wire. Public so those in-process callers reach it through
+        ``server.uploads`` rather than a removed server method.
+        """
         expected = _expected_chunk_count(list(shape), list(chunk_shape))
         with self._lock:
             self._states[source_id] = _UploadState(
                 source_id=source_id, expected_chunks=expected
             )
 
-    def _mark_chunk(self, source_id: str, bounds: ChunkBounds) -> None:
+    def mark_chunk(self, source_id: str, bounds: ChunkBounds) -> None:
+        """Record that the chunk at *bounds* arrived (flips to READY when full).
+
+        Public for the same in-process producers as :meth:`initialize`; the
+        wire path reaches it via :meth:`write_chunk`.
+        """
         chunk_id = encode_chunk_id(source_id, bounds)
         with self._lock:
             state = self._states.get(source_id)
@@ -177,7 +190,7 @@ class UploadManager:
                 ome_metadata=ome_metadata,
             )
             self._registry.register(source_id, adapter)
-            self._initialize(source_id, req_desc.shape, req_desc.chunk_shape)
+            self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created cache-backed source: {source_id}")
 
@@ -240,7 +253,7 @@ class UploadManager:
                         f"Failed to sync uploaded source {source_id} to catalog "
                         f"(readable by id, not listed): {e}"
                     )
-            self._initialize(source_id, req_desc.shape, req_desc.chunk_shape)
+            self.initialize(source_id, req_desc.shape, req_desc.chunk_shape)
 
             logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
 
@@ -290,7 +303,7 @@ class UploadManager:
         except (ValueError, WriteNotSupportedError) as e:
             raise flight.FlightServerError(str(e))
 
-        self._mark_chunk(upload.source_id, bounds)
+        self.mark_chunk(upload.source_id, bounds)
 
         logger.debug(
             f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
