@@ -892,5 +892,16 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                         source_type=cls.SOURCE_TYPE,
                         primary_path=primary_path,
                     )
+                # Single-file OME-TIFF: embedded OME-XML but no <UUID FileName>
+                # references -- the common case, since tifffile and most writers
+                # emit a bare <TiffData IFD=.../> with no file list. Claim the file
+                # itself as a single-member source so it takes the pure-tifffile
+                # path (#168 fast-path descriptors + aszarr reads). Without this it
+                # falls through to the generic aicsimageio adapter, which reverts to
+                # the full O(planes) OME-model parse #168 exists to avoid.
+                return SourceClaim(
+                    source_type=cls.SOURCE_TYPE,
+                    primary_path=ctx.path_str,
+                )
 
         return None

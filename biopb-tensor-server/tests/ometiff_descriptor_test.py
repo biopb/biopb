@@ -176,6 +176,36 @@ class TestFastPathParity:
         assert adapter.list_tensor_descriptors() is descriptors
 
 
+class TestClaim:
+    """Discovery routing: OmeTiffAdapter must claim BOTH single- and multi-file
+    local OME-TIFFs, so they take the pure-tifffile path rather than falling
+    through to the generic aicsimageio adapter (which reverts to the #168 parse).
+    """
+
+    def test_single_file_ome_tiff_is_claimed(self, tmp_path):
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        # Plain single-file OME-TIFF: embedded OME-XML, bare <TiffData/> with no
+        # <UUID FileName> (what tifffile and most writers emit).
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 32, 32))
+        claim = OmeTiffAdapter.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None
+        assert claim.source_type == "ome-tiff"
+        assert str(claim.primary_path) == str(path)
+
+    def test_multi_file_ome_tiff_is_claimed(self, tmp_path):
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        path, _, _ = create_multifile_embedded_ome_tiff(str(tmp_path), n_files=3)
+        claim = OmeTiffAdapter.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None
+        assert claim.source_type == "ome-tiff"
+
+
 class TestPageAlignedChunkShape:
     """The advertised chunk_shape is the page grid -- one whole plane per chunk,
     i.e. series.aszarr(chunkmode="page").chunks mapped onto canonical dim_labels
