@@ -97,13 +97,16 @@ jobs:
           python -m pip install --upgrade pip setuptools
           pip install -e ".[tensor]"
           # Match the format extras the shipped artifacts install
-          # (Dockerfile / install.sh: web,aics,medical,ndtiff,hdf5) so CI
+          # (Dockerfile / install.sh: web,aics,czi,medical,ndtiff,hdf5) so CI
           # actually covers the adapters we ship. Without these the
           # ndtiff/dicom/nifti/h5py-guarded suites self-skip on every job and
           # the adapters get zero CI coverage (biopb#179). [test] pulls [web].
+          # czi (bioio-czi) is safe on every CI runner: Linux, arm64-macOS, and
+          # Windows all have a pylibczirw wheel -- only Intel macOS lacks one, and
+          # no runner is Intel macOS.
           # All platforms incl. Windows, so the ndtiff path-resolution
           # assertion is exercised cross-platform too.
-          pip install -e "./biopb-tensor-server[test,aics,medical,ndtiff,hdf5]"
+          pip install -e "./biopb-tensor-server[test,aics,czi,medical,ndtiff,hdf5]"
 
       - name: Run Python tests
         run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/

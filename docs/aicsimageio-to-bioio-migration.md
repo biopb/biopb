@@ -84,8 +84,17 @@ OME-Zarr, but (1) biopb already reads OME-Zarr/Zarr through its own
 bioio fallback — a `.zarr` store never reaches a bioio reader — and (2)
 `bioio-ome-zarr` requires **zarr ≥ 3**, colliding with the `zarr < 3` pin (§4).
 Adopting it is the same trigger as the deferred zarr 2→3 port. The transitive
-closure of the eight `[aics]` plugins reaches neither `bioio-ome-zarr` nor
+closure of the seven `[aics]` plugins reaches neither `bioio-ome-zarr` nor
 `ome-zarr`, and the whole lock stays on zarr 2.18.x.
+
+**`bioio-czi` (Zeiss CZI) is split into its own `[czi]` extra**, not bundled in
+`[aics]`. Its `pylibczirw` dependency publishes arm64-macOS, Linux, and Windows
+wheels but **no Intel-macOS wheel** (any version), so bundling it in the default
+set would source-build libCZI (cmake + a compiler) and fail on every Intel Mac.
+The installers add `[czi]` on every platform except Intel macOS; a direct install
+that wants CZI everywhere uses `biopb-tensor-server[aics,czi]`. The installer
+wheel-coverage check (`install/test/check_wheel_coverage.py`) mirrors this and
+would have caught the regression at the point the reader was swapped in.
 
 Note: OME-TIFF is **not** in this table — biopb reads OME-TIFF through its own
 pure-tifffile `OmeTiffAdapter` (biopb/biopb#213), which never touched

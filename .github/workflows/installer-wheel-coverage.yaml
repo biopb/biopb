@@ -1,0 +1,50 @@
+name: Installer Wheel Coverage
+
+# Manual / workbench only -- deliberately NOT triggered on push or pull_request.
+# It resolves the exact dependency set `install/install.sh` installs, for each
+# platform install.sh supports, and fails if any resolved package ships wheels
+# for other platforms but not for that one -- i.e. `curl install.sh | bash` would
+# fall back to compiling a C/Rust extension from source (the failure that broke
+# Intel-macOS installs when cryptography 49 dropped its x86_64 wheel; see
+# install.sh + issue #355).
+#
+# All jobs run on ubuntu-latest: uv resolves for a *foreign* target via
+# --python-platform, so no macOS/Windows runners (or their minutes) are needed.
+# The check mirrors the constraints install.sh applies per platform, so a green
+# run means "the installer's resolve is wheel-clean," not "the raw graph is."
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The platforms install.sh supports (uv --python-platform targets).
+        target:
+          - x86_64-apple-darwin       # Intel macOS -- the cryptography-49 gap
+          - aarch64-apple-darwin      # Apple Silicon
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+        # install.sh spans 3.10-3.12; bracket the range (wheels can differ by
+        # interpreter, not just platform).
+        python-version: ["3.10", "3.12"]
+    name: ${{ matrix.target }} (py${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags to read the local package versions
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Check installer wheel coverage
+        run: >-
+          python3 install/test/check_wheel_coverage.py
+          --target ${{ matrix.target }}
+          --python-version ${{ matrix.python-version }}
