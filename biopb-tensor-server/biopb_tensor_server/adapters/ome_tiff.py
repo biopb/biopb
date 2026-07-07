@@ -416,13 +416,6 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
         self._raw_ome_xml_probed = False
 
     @classmethod
-    def create_from_url(
-        cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None
-    ) -> "OmeTiffAdapter":
-        """Create a source-level adapter from a URL/path directly."""
-        return cls(url, source_id, dim_labels=dim_labels)
-
-    @classmethod
     def create_from_config(
         cls, source: "SourceConfig", credentials_config: Optional[object] = None
     ) -> "OmeTiffAdapter":

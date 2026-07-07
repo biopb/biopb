@@ -380,7 +380,7 @@ class TestOmeTiffIntegration:
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "ome-tiff-integration")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -425,7 +425,7 @@ class TestOmeTiffIntegration:
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "ome-tiff-channels")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -495,7 +495,7 @@ class TestOmeTiffIntegration:
                 "PhysicalSizeYUnit": "µm",
             },
         )
-        adapter = OmeTiffAdapter.create_from_url(path, "ome213")
+        adapter = OmeTiffAdapter(path, "ome213")
         array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
 
         server = TensorFlightServer("grpc://localhost:0")
@@ -530,7 +530,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-test")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-test")
 
         # List all tensors (series)
         descriptors = adapter.list_tensor_descriptors()
@@ -546,7 +546,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-access")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
         descriptors = adapter.list_tensor_descriptors()
@@ -568,7 +568,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-server")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multi-series-server", adapter)
@@ -613,7 +613,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = OmeTiffAdapter.create_from_url(tiff_path, "lazy-tile-test")
+        adapter = OmeTiffAdapter(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
         descriptors = adapter.list_tensor_descriptors()

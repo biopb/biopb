@@ -211,36 +211,6 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
     _single_tensor_source = False
 
     @classmethod
-    def create_from_url(
-        cls, url: str, source_id: str, dim_labels: Optional[List[str]] = None
-    ) -> "_AicsImageIoAdapterBase":
-        """Create source-level adapter instance from URL directly.
-
-        Convenience method for creating adapter without SourceConfig.
-
-        Args:
-            url: URL or path to the file
-            source_id: Unique identifier for this source
-            dim_labels: Optional dimension labels
-
-        Returns:
-            Adapter instance (source-level, scene_index=None)
-        """
-        from aicsimageio import AICSImage
-
-        # Companion.ome files are handled directly by AICSImage when bioformats_jar is available
-        # No special handling needed - AICSImage will use BioformatsReader
-
-        img = AICSImage(url)
-        return cls(
-            img,
-            scene_index=None,
-            source_id=source_id,
-            dim_labels=dim_labels,
-            source_url=url,
-        )
-
-    @classmethod
     def create_from_config(
         cls,
         source: "SourceConfig",
