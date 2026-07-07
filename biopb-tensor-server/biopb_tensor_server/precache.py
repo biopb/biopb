@@ -306,7 +306,7 @@ class PrecacheWorker:
         # chunks the native-pyramid skip below is meant to avoid.
         from biopb_tensor_server.discovery import is_remote_url
 
-        if is_remote_url(getattr(source_adapter, "_source_url", "") or ""):
+        if is_remote_url(source_adapter.source_url or ""):
             logger.debug(
                 "precache: skipping non-local source %s (warmed on demand)", source_id
             )

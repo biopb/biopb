@@ -232,7 +232,7 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
         # size may only shrink at the edge, never exceed the nominal chunk
         actual_size = [stop - start for start, stop in zip(bounds.start, bounds.stop)]
         for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
-            if actual != expected and actual > expected:
+            if actual > expected:
                 raise ValueError(
                     f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
                 )

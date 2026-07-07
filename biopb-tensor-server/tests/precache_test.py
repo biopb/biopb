@@ -340,7 +340,7 @@ class TestWarming:
 
             class _RemoteAdapter:
                 # A caching-proxy source advertises a grpc:// source_url.
-                _source_url = "grpc://upstream:8815/img"
+                source_url = "grpc://upstream:8815/img"
 
                 def list_tensor_descriptors(self):
                     listed.append(True)  # must NOT be reached
