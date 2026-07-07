@@ -11,16 +11,16 @@ and the cache stays bounded.
 
 from pathlib import Path
 
-import biopb_tensor_server.adapters.aicsimageio as aics
+import biopb_tensor_server.adapters.ome_tiff as ome_tiff_mod
 import pytest
-from biopb_tensor_server.adapters.aicsimageio import _get_ome_metadata_from_tiff
+from biopb_tensor_server.adapters.ome_tiff import _get_ome_metadata_from_tiff
 
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    aics._OME_META_CACHE.clear()
+    ome_tiff_mod._OME_META_CACHE.clear()
     yield
-    aics._OME_META_CACHE.clear()
+    ome_tiff_mod._OME_META_CACHE.clear()
 
 
 @pytest.fixture
@@ -33,7 +33,7 @@ def counting_probe(monkeypatch):
         calls["paths"].append(str(path))
         return value["ret"]
 
-    monkeypatch.setattr(aics, "_probe_ome_metadata_from_tiff", fake)
+    monkeypatch.setattr(ome_tiff_mod, "_probe_ome_metadata_from_tiff", fake)
     return calls, value
 
 
@@ -80,7 +80,7 @@ def test_signature_none_never_caches(counting_probe):
     _get_ome_metadata_from_tiff(p, None)
 
     assert calls["paths"] == [str(p), str(p)]  # uncached: probed every time
-    assert len(aics._OME_META_CACHE) == 0
+    assert len(ome_tiff_mod._OME_META_CACHE) == 0
 
 
 def test_distinct_paths_are_independent(counting_probe):
@@ -97,12 +97,12 @@ def test_distinct_paths_are_independent(counting_probe):
 
 def test_cache_is_bounded(counting_probe, monkeypatch):
     calls, _ = counting_probe
-    monkeypatch.setattr(aics, "_OME_META_CACHE_MAX", 4)
+    monkeypatch.setattr(ome_tiff_mod, "_OME_META_CACHE_MAX", 4)
 
     for i in range(6):
         _get_ome_metadata_from_tiff(Path(f"/data/f{i}.tif"), (1, i, 0, 0, 0))
 
-    assert len(aics._OME_META_CACHE) == 4  # capped
+    assert len(ome_tiff_mod._OME_META_CACHE) == 4  # capped
 
     # The two oldest were evicted, so re-requesting f0 re-probes.
     n_before = len(calls["paths"])

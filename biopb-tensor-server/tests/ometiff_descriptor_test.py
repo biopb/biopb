@@ -15,10 +15,11 @@ These tests lock the two things that make that safe:
 
 import numpy as np
 import pytest
-from biopb_tensor_server.adapters.aicsimageio import (
+from biopb_tensor_server.adapters.ome_tiff import (
     _STRIP_PER_PLANE,
-    AicsImageIoAdapter,
+    OmeTiffAdapter,
     _fast_ome_metadata,
+    _ome_axes_shape,
     _ome_scene_ids,
     _tczyx_shape,
 )
@@ -54,6 +55,35 @@ class TestTczyxShape:
     )
     def test_non_canonical_axes_signal_fallback(self, shape, axes):
         assert _tczyx_shape(shape, axes) is None
+
+
+class TestOmeAxesShape:
+    @pytest.mark.parametrize(
+        "shape,axes,dims,expected",
+        [
+            ((3, 16, 16), "CYX", "TCZYX", [1, 3, 1, 16, 16]),  # canonical
+            ((4, 2, 3, 16, 16), "TCZYX", "TCZYX", [4, 2, 3, 16, 16]),
+            ((16, 16, 3), "YXS", "TCZYXS", [1, 1, 1, 16, 16, 3]),  # RGB samples
+            ((12, 10, 4), "YXS", "TCZYXS", [1, 1, 1, 12, 10, 4]),  # RGBA samples
+        ],
+    )
+    def test_maps_canonical_and_samples(self, shape, axes, dims, expected):
+        got = _ome_axes_shape(shape, axes)
+        assert got is not None
+        got_dims, got_shape = got
+        assert "".join(got_dims) == dims
+        assert got_shape == expected
+
+    @pytest.mark.parametrize(
+        "shape,axes",
+        [
+            ((4, 16, 16), "QYX"),  # unknown (non-OME) axis
+            ((2, 16, 16), "CZYX"),  # axes/shape length mismatch
+            ((16, 16), ""),  # no axes
+        ],
+    )
+    def test_declines_non_ome_axes(self, shape, axes):
+        assert _ome_axes_shape(shape, axes) is None
 
 
 class TestOmeSceneIds:
@@ -104,12 +134,12 @@ class TestFastPathParity:
 
     def test_single_series_parity(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        adapter = AicsImageIoAdapter.create_from_url(path, "single")
+        adapter = OmeTiffAdapter(path, "single")
         assert self._fast(adapter) == self._aics_truth(path)
 
     def test_multi_series_parity(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
-        adapter = AicsImageIoAdapter.create_from_url(path, "multi")
+        adapter = OmeTiffAdapter(path, "multi")
         assert self._fast(adapter) == self._aics_truth(path)
 
     def test_multifile_embedded_ome_parity(self, tmp_path):
@@ -120,7 +150,7 @@ class TestFastPathParity:
         path, names, full_shape = create_multifile_embedded_ome_tiff(
             str(tmp_path), n_files=3
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "mfembed")
+        adapter = OmeTiffAdapter(path, "mfembed")
 
         fast = self._fast(adapter)
         assert fast == self._aics_truth(path)
@@ -132,7 +162,7 @@ class TestFastPathParity:
         # The registration path must build the catalog row without ever touching
         # AICSImage (the ome-types parse is the startup cost being removed).
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "noparse")
+        adapter = OmeTiffAdapter(path, "noparse")
         adapter._aics_image = _Tripwire()
 
         descriptors = adapter.list_tensor_descriptors()
@@ -144,6 +174,110 @@ class TestFastPathParity:
         # Cached, and still served from cache without parsing.
         assert adapter._cached_descriptors is descriptors
         assert adapter.list_tensor_descriptors() is descriptors
+
+
+class TestClaim:
+    """Discovery routing: OmeTiffAdapter must claim BOTH single- and multi-file
+    local OME-TIFFs, so they take the pure-tifffile path rather than falling
+    through to the generic aicsimageio adapter (which reverts to the #168 parse).
+    """
+
+    def test_single_file_ome_tiff_is_claimed(self, tmp_path):
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        # Plain single-file OME-TIFF: embedded OME-XML, bare <TiffData/> with no
+        # <UUID FileName> (what tifffile and most writers emit).
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 32, 32))
+        claim = OmeTiffAdapter.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None
+        assert claim.source_type == "ome-tiff"
+        assert str(claim.primary_path) == str(path)
+
+    def test_multi_file_ome_tiff_is_claimed(self, tmp_path):
+        from pathlib import Path
+
+        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+
+        path, _, _ = create_multifile_embedded_ome_tiff(str(tmp_path), n_files=3)
+        claim = OmeTiffAdapter.claim(ClaimContext(Path(path)), DiscoveryState())
+        assert claim is not None
+        assert claim.source_type == "ome-tiff"
+
+
+class TestPageAlignedChunkShape:
+    """The advertised chunk_shape is the page grid -- one whole plane per chunk,
+    i.e. series.aszarr(chunkmode="page").chunks mapped onto canonical dim_labels
+    (biopb/biopb#8). Recovers the fine read granularity a small OME-TIFF lost when
+    the read path stopped advertising aicsimageio's per-(T,C) grid.
+    """
+
+    def _za_page_chunks_canonical(self, path, dim_labels):
+        import tifffile
+        import zarr
+
+        with tifffile.TiffFile(path) as tf:
+            s = tf.series[0]
+            za = zarr.open(s.aszarr(level=0, chunkmode="page"), mode="r")
+            by_axis = {ax: int(c) for ax, c in zip(str(s.axes), za.chunks)}
+        return [by_axis.get(d, 1) for d in dim_labels]
+
+    def test_chunk_shape_is_page_grid(self, tmp_path):
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        desc = OmeTiffAdapter(path, "pg").list_tensor_descriptors()[0]
+        # 1 on every non-spatial axis, full Y/X -- one plane per chunk.
+        assert list(desc.chunk_shape) == [1, 1, 1, 64, 64]
+        # And that grid IS za.chunks(page) mapped to canonical order.
+        assert list(desc.chunk_shape) == self._za_page_chunks_canonical(
+            path, list(desc.dim_labels)
+        )
+
+    def test_page_grid_ignores_internal_tiling(self, tmp_path):
+        import tifffile
+
+        p = tmp_path / "tiled.ome.tif"
+        tifffile.imwrite(
+            str(p),
+            np.random.randint(0, 9, (2, 128, 128), np.uint16),
+            metadata={"axes": "CYX"},
+            tile=(32, 32),
+        )
+        desc = OmeTiffAdapter(str(p), "tl").list_tensor_descriptors()[0]
+        # Whole plane per chunk despite the 32x32 internal tiling (chunkmode="page").
+        assert list(desc.chunk_shape) == [1, 1, 1, 128, 128]
+
+
+class TestOpenStoreFdHygiene:
+    """The store-open reject path must not leak file descriptors: the success
+    path stashes the handle for reuse, so the descriptor-mismatch path has to
+    close the freshly-opened store + TiffFile itself before bailing.
+    """
+
+    def test_shape_mismatch_closes_store_and_tiff(self, tmp_path, monkeypatch):
+        import tifffile
+
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+
+        opened = []
+        real_tifffile = tifffile.TiffFile
+
+        def spy(*a, **k):
+            tf = real_tifffile(*a, **k)
+            opened.append(tf)
+            return tf
+
+        monkeypatch.setattr(tifffile, "TiffFile", spy)
+
+        source = OmeTiffAdapter(path, "x")
+        scene = source.get_tensor_adapter("Image:0")
+        # Force the correctness gate to reject: descriptor shape != store shape.
+        scene._tifffile_descriptor.shape[:] = [9, 9, 9, 9, 9]
+
+        opened.clear()  # track only the rejected _open_store open
+        assert scene._open_store() is None
+        assert opened, "expected _open_store to open a TiffFile"
+        assert all(tf.filehandle.closed for tf in opened)
 
 
 class TestRgbSamplesDescriptor:
@@ -173,15 +307,19 @@ class TestRgbSamplesDescriptor:
         )
         return path
 
-    def test_tifffile_fast_path_defers_rgb(self, tmp_path):
-        # The tifffile-direct fast path rejects the S axis up front.
+    def test_tifffile_maps_rgb_natively(self, tmp_path):
+        # RGB (YXS) is tifffile-native (biopb/biopb#213 follow-up): the descriptor
+        # path maps the trailing samples axis to a 6-D TCZYXS descriptor.
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
-        assert adapter._tifffile_descriptors() is None
+        adapter = OmeTiffAdapter(path, "rgb")
+        descs = adapter._tifffile_descriptors()
+        assert descs is not None
+        assert list(descs[0].dim_labels) == list("TCZYXS")
+        assert list(descs[0].shape) == [1, 1, 1, 24, 32, 3]
 
     def test_descriptor_labels_and_shape_agree(self, tmp_path):
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        adapter = OmeTiffAdapter(path, "rgb")
 
         descriptors = adapter.list_tensor_descriptors()
 
@@ -190,8 +328,8 @@ class TestRgbSamplesDescriptor:
         assert len(d.dim_labels) == len(d.shape), (
             f"label/shape length mismatch: {list(d.dim_labels)} vs {list(d.shape)}"
         )
-        # The authoritative scene-switching descriptor: samples become a trailing
-        # S axis, matching what get_tensor_adapter serves at read time.
+        # Interleaved samples become a trailing S axis (TCZYXS), the layout the
+        # webapp renderer expects.
         assert list(d.dim_labels) == list("TCZYXS")
         assert list(d.shape) == [1, 1, 1, 24, 32, 3]
 
@@ -202,7 +340,7 @@ class TestRgbSamplesDescriptor:
         from biopb_tensor_server.server import TensorFlightServer
 
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        adapter = OmeTiffAdapter(path, "rgb")
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("rgb", adapter)
         server.mark_ready()
@@ -221,7 +359,7 @@ class TestRgbSamplesDescriptor:
 class TestSceneResolutionAndReads:
     def test_scene_index_resolves_from_cache(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
-        adapter = AicsImageIoAdapter.create_from_url(path, "idx")
+        adapter = OmeTiffAdapter(path, "idx")
         descriptors = adapter.list_tensor_descriptors()
         fields = [d.array_id.split("/", 1)[1] for d in descriptors]
 
@@ -237,7 +375,7 @@ class TestSceneResolutionAndReads:
         path, _, _ = create_multi_series_ome_tiff(
             str(tmp_path), n_series=3, series_shape=(2, 32, 32)
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "reads")
+        adapter = OmeTiffAdapter(path, "reads")
         descriptors = adapter.list_tensor_descriptors()
 
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -390,7 +528,7 @@ class TestFastMetadata:
         # get_metadata runs at registration (metadata-DB sync); it must build the
         # dict from the stripped OME-XML without touching AICSImage.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        adapter = AicsImageIoAdapter.create_from_url(path, "md")
+        adapter = OmeTiffAdapter(path, "md")
 
         hits = []
 
@@ -414,7 +552,7 @@ class TestFastMetadata:
         # The descriptor fast path populates the OME-XML cache so get_metadata
         # does not reopen the file.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "cache")
+        adapter = OmeTiffAdapter(path, "cache")
         assert adapter._raw_ome_xml_probed is False
 
         adapter.list_tensor_descriptors()  # descriptor fast path
@@ -428,15 +566,13 @@ class TestFallback:
         # Build on a local file (no S3 round-trip at construction), then point the
         # source_url at a remote URL to exercise the no-local-handle gate.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "remote")
+        adapter = OmeTiffAdapter(path, "remote")
         adapter._source_url = "s3://bucket/x.ome.tif"
         assert adapter._tifffile_descriptors() is None
 
     def test_custom_dim_labels_fall_back(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(
-            path, "customdims", dim_labels=["C", "Y", "X"]
-        )
+        adapter = OmeTiffAdapter(path, "customdims", dim_labels=["C", "Y", "X"])
         assert adapter._tifffile_descriptors() is None
 
     def test_plain_non_ome_tiff_falls_back(self, tmp_path):
@@ -444,7 +580,7 @@ class TestFallback:
 
         plain = tmp_path / "plain.tif"
         tifffile.imwrite(str(plain), np.zeros((16, 16), np.uint8))  # no OME-XML
-        adapter = AicsImageIoAdapter.create_from_url(str(plain), "plain")
+        adapter = OmeTiffAdapter(str(plain), "plain")
         assert adapter._tifffile_descriptors() is None
 
 
@@ -487,3 +623,216 @@ class TestOmeParseDedup:
             omr.from_xml = real_from_xml
 
         assert calls["n"] == 1, f"expected a single OME parse, got {calls['n']}"
+
+
+class TestReadPathTifffileAuthoritative:
+    """The OME-TIFF read path is pure tifffile (biopb/biopb#213 + detachment).
+
+    ``OmeTiffAdapter`` has no aicsimageio dependency at all -- descriptors, reads,
+    metadata, and physical scale come from tifffile / the embedded OME-XML.
+    Correctness is asserted as internal consistency of the tifffile store (data
+    matches its descriptor; sub-regions are correct; ragged gaps are
+    deterministic), and that the adapter never grows an ``_aics_image``.
+    """
+
+    def _scene(self, path, source_id, field="Image:0"):
+        """Registered source adapter + its scene adapter for ``field``."""
+        adapter = OmeTiffAdapter(path, source_id)
+        descriptors = adapter.list_tensor_descriptors()
+        assert descriptors, "expected tifffile descriptors for a local OME-TIFF"
+        scene = adapter.get_tensor_adapter(field)
+        assert scene._tifffile_descriptor is not None
+        return adapter, scene
+
+    def test_read_path_has_no_aicsimageio(self, tmp_path):
+        # Core lock post-detachment: exercise the whole read path -- plan_flight_info
+        # (the #350 GetFlightInfo seam: descriptor + pyramid + physical scale) and
+        # get_data (DoGet) -- and assert the adapter never holds an aicsimageio image.
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+        from biopb_tensor_server.config import PyramidConfig
+
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        _, scene = self._scene(path, "pure")
+        assert not hasattr(scene, "_aics_image")
+
+        plan = scene.plan_flight_info(TensorReadOption(), PyramidConfig())
+        assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
+        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid
+
+        bounds = ChunkBounds(start=[0, 1, 0, 0, 0], stop=[1, 2, 1, 64, 64])
+        arr = np.asarray(scene.get_data(bounds))
+        assert arr.shape == (1, 1, 1, 64, 64)
+        assert (arr == 2).all()  # channel 1 -> fixture value 2
+
+        assert list(scene.get_tensor_descriptor().shape) == [1, 3, 1, 64, 64]
+        assert scene._physical_scale() is None  # fixture carries no PhysicalSize
+
+    def test_descriptor_data_self_consistency_multi_series(self, tmp_path):
+        # For each scene the data matches its advertised descriptor (shape/dtype)
+        # and the known per-series fill lands at the right position -- locking
+        # correct scene->series mapping and TCZYX axis order.
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        path, _, _ = create_multi_series_ome_tiff(
+            str(tmp_path), n_series=3, series_shape=(2, 32, 32)
+        )
+        adapter = OmeTiffAdapter(path, "consist")
+        descriptors = adapter.list_tensor_descriptors()
+
+        for k, desc in enumerate(descriptors):
+            field = desc.array_id.split("/", 1)[1]
+            scene = adapter.get_tensor_adapter(field)
+            arr = np.asarray(
+                scene.get_data(
+                    ChunkBounds(start=[0, 0, 0, 0, 0], stop=list(desc.shape))
+                )
+            )
+            assert arr.shape == tuple(desc.shape)
+            assert arr.dtype.str == desc.dtype
+            for p in range(arr.shape[1]):  # fixture: series k, plane p -> k*100+p+1
+                assert arr[0, p, 0, 0, 0] == k * 100 + p + 1
+
+    def test_ragged_gap_is_internally_consistent(self, tmp_path):
+        # A sparse OME-TIFF (SizeC=3, channel 1 absent) reads to the declared shape;
+        # present channels carry their true values and the ragged gap is filled
+        # DETERMINISTICALLY (repeat reads identical) -- internal consistency of the
+        # tifffile store, not a specific gap value.
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        path, present = self._write_sparse_multifile_ome_tiff(str(tmp_path))
+        adapter = OmeTiffAdapter(path, "ragged")
+        descriptors = adapter.list_tensor_descriptors()
+        assert descriptors
+
+        desc = descriptors[0]
+        full = ChunkBounds(start=[0, 0, 0, 0, 0], stop=list(desc.shape))
+        arr = np.asarray(adapter.get_tensor_adapter("Image:0").get_data(full))
+        assert arr.shape == tuple(desc.shape)  # (1, 3, 1, 16, 16) -- gap included
+        for c, val in present.items():
+            assert arr[0, c, 0, 0, 0] == val
+        arr2 = np.asarray(adapter.get_tensor_adapter("Image:0").get_data(full))
+        assert np.array_equal(arr, arr2)  # ragged fill is deterministic
+
+    def test_rgb_reads_via_tifffile_store(self, tmp_path):
+        # RGB (YXS) is tifffile-native end-to-end: the scene serves a TCZYXS block.
+        import tifffile
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        p = str(tmp_path / "rgb.ome.tif")
+        data = np.zeros((24, 32, 3), np.uint8)
+        data[..., 0], data[..., 1], data[..., 2] = 10, 20, 30
+        tifffile.imwrite(p, data, ome=True, photometric="rgb", metadata={"axes": "YXS"})
+        _, scene = self._scene(p, "rgb")
+        desc = scene.get_tensor_descriptor()
+        assert list(desc.dim_labels) == list("TCZYXS")
+        arr = np.asarray(
+            scene.get_data(ChunkBounds(start=[0] * 6, stop=list(desc.shape)))
+        )
+        assert arr.shape == (1, 1, 1, 24, 32, 3)
+        assert arr[0, 0, 0, 0, 0, 0] == 10 and arr[0, 0, 0, 0, 0, 2] == 30
+
+    def test_physical_scale_from_stripped_xml(self, tmp_path):
+        path = self._write_ome_tiff_with_physical_sizes(
+            str(tmp_path / "phys.ome.tif"), psx=0.325, psy=0.325, psz=2.0
+        )
+        _, scene = self._scene(path, "phys")
+        scale, unit = scene._physical_scale()
+        assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]  # TCZYX
+        assert unit == ["", "", "µm", "µm", "µm"]
+
+    def test_physical_scale_missing_unit_defaults_to_micron(self, tmp_path):
+        # tifffile always stamps a unit, so inject an OME-XML that omits it to lock
+        # the "µm" default (the OME spec default).
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(1, 16, 16))
+        _, scene = self._scene(path, "nounit")
+        scene._raw_ome_xml = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" '
+            'Type="uint16" SizeX="16" SizeY="16" SizeZ="1" SizeC="1" SizeT="1" '
+            'PhysicalSizeX="0.5" PhysicalSizeY="0.5">'
+            '<Channel ID="Channel:0:0" SamplesPerPixel="1"/>'
+            "</Pixels></Image></OME>"
+        )
+        scene._raw_ome_xml_probed = True
+        scale, unit = scene._physical_scale()
+        assert scale == [0.0, 0.0, 0.0, 0.5, 0.5]  # Z absent -> 0.0
+        assert unit == ["", "", "", "µm", "µm"]
+
+    def test_no_physical_scale_returns_none(self, tmp_path):
+        # An OME-TIFF with no PhysicalSize* has no known scale -> None.
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 16, 16))
+        _, scene = self._scene(path, "nophys")
+        assert scene._physical_scale() is None
+
+    # ---- local fixture writers ----
+
+    @staticmethod
+    def _write_ome_tiff_with_physical_sizes(path, psx, psy, psz):
+        import tifffile
+
+        tifffile.imwrite(
+            path,
+            np.zeros((2, 16, 16), np.uint16),
+            photometric="minisblack",
+            metadata={
+                "axes": "CYX",
+                "PhysicalSizeX": psx,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": psy,
+                "PhysicalSizeYUnit": "µm",
+                "PhysicalSizeZ": psz,
+                "PhysicalSizeZUnit": "µm",
+            },
+        )
+        return path
+
+    @staticmethod
+    def _write_sparse_multifile_ome_tiff(tmpdir, present=None):
+        """Multi-file embedded OME-TIFF declaring SizeC=3 with channel 1 missing.
+
+        Returns (master_path, {channel_index: fill_value}) for the PRESENT
+        channels; the absent channel is a ragged gap tifffile fills
+        deterministically. Mirrors ``create_multifile_embedded_ome_tiff`` but omits
+        one channel's TiffData/sibling to model a sparse acquisition.
+        """
+        import uuid as _uuid
+        from pathlib import Path as _Path
+
+        import tifffile
+
+        h, w = 16, 16
+        present = present or {0: 10, 2: 30}
+        first = min(present)
+        uuids = {c: f"urn:uuid:{_uuid.UUID(int=c + 1)}" for c in present}
+        names = {c: f"sparse_{c}.ome.tif" for c in present}
+        tiff_data = "".join(
+            f'<TiffData FirstC="{c}" FirstZ="0" FirstT="0" IFD="0" PlaneCount="1">'
+            f'<UUID FileName="{names[c]}">{uuids[c]}</UUID></TiffData>'
+            for c in present
+        )
+        channels = "".join(
+            f'<Channel ID="Channel:0:{c}" SamplesPerPixel="1"/>' for c in range(3)
+        )
+        master_xml = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
+            f'UUID="{uuids[first]}"><Image ID="Image:0" Name="sparse">'
+            '<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint16" '
+            f'SizeX="{w}" SizeY="{h}" SizeZ="1" SizeC="3" SizeT="1">'
+            f"{channels}{tiff_data}</Pixels></Image></OME>"
+        )
+        for c, val in present.items():
+            xml = (
+                master_xml
+                if c == first
+                else (
+                    '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" '
+                    f'UUID="{uuids[c]}"><BinaryOnly UUID="{uuids[first]}" '
+                    f'MetadataFile="{names[first]}"/></OME>'
+                )
+            )
+            with tifffile.TiffWriter(str(_Path(tmpdir) / names[c])) as wr:
+                wr.write(
+                    np.full((h, w), val, np.uint16), description=xml, metadata=None
+                )
+        return str(_Path(tmpdir) / names[first]), present

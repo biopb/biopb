@@ -13,6 +13,7 @@ from biopb_tensor_server.base import BackendAdapter, SourceAdapter, TensorAdapte
 from biopb_tensor_server.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
+from .ome_tiff import OmeTiffAdapter
 from .ome_zarr import OmeZarrAdapter
 from .remote_tensor import RemoteTensorAdapter
 from .tiff import (
@@ -36,11 +37,9 @@ try:
         LeicaAdapter,
         NikonAdapter,
         OlympusAdapter,
-        OmeTiffAdapter,
         ZeissAdapter,
     )
 except ImportError:
-    OmeTiffAdapter = None  # type: ignore
     ZeissAdapter = None  # type: ignore
     LeicaAdapter = None  # type: ignore
     NikonAdapter = None  # type: ignore
@@ -116,9 +115,12 @@ def get_default_registry() -> AdapterRegistry:
     """
     registry = AdapterRegistry()
 
+    # Pure-tifffile OME-TIFF adapter first, so it wins for a local OME-TIFF; a
+    # remote/exotic .tif it declines falls through to the generic aicsimageio
+    # adapter registered below (no aicsimageio dependency, so always available).
+    registry.register_with_type("ome-tiff", OmeTiffAdapter)
+
     # Register aicsimageio-based adapters in priority order (most specific first)
-    if OmeTiffAdapter is not None:
-        registry.register_with_type("ome-tiff", OmeTiffAdapter)
     if ZeissAdapter is not None:
         registry.register_with_type("zeiss", ZeissAdapter)
     if LeicaAdapter is not None:

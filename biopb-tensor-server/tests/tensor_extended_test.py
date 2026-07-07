@@ -60,11 +60,17 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
     def test_adapter_init_with_embedded_metadata(self, tiled_ome_tiff):
         """Test AicsImageIoAdapter initialization with embedded OME-XML."""
+        from aicsimageio import AICSImage
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            AICSImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         assert adapter.source_id == "test-embedded"
         # AicsImageIoAdapter is multi-tensor, list descriptors to get shape
@@ -75,11 +81,17 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
     def test_get_tensor_descriptor(self, tiled_ome_tiff):
         """Test descriptor with embedded metadata."""
+        from aicsimageio import AICSImage
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            AICSImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         # For multi-scene AicsImageIoAdapter, use list_tensor_descriptors
         descriptors = adapter.list_tensor_descriptors()
@@ -95,11 +107,17 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
     def test_get_metadata_from_embedded_ome_xml(self, tiled_ome_tiff):
         """Test metadata extraction from embedded OME-XML."""
+        from aicsimageio import AICSImage
         from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
 
         path = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(path, "test-embedded")
+        adapter = AicsImageIoAdapter(
+            AICSImage(path),
+            scene_index=None,
+            source_id="test-embedded",
+            source_url=path,
+        )
 
         metadata = adapter.get_metadata()
         assert isinstance(metadata, dict)

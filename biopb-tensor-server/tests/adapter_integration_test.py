@@ -372,15 +372,15 @@ class TestOmeZarrIntegration:
 
 
 class TestOmeTiffIntegration:
-    """Integration tests for OME-TIFF files (now handled by AicsImageIoAdapter)."""
+    """Integration tests for OME-TIFF files (now handled by OmeTiffAdapter)."""
 
     def test_tiled_tiff_read(self, tiled_ome_tiff):
         """Test reading from tiled OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-integration")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -421,11 +421,11 @@ class TestOmeTiffIntegration:
 
     def test_channel_access(self, tiled_ome_tiff):
         """Test accessing different channels through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-channels")
+        adapter = OmeTiffAdapter(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -462,17 +462,75 @@ class TestOmeTiffIntegration:
         finally:
             server.shutdown()
 
+    def test_read_path_never_parses_ome_model(self, tmp_path):
+        """biopb/biopb#213: end-to-end, GetFlightInfo + DoGet over a registered
+        OME-TIFF must not trigger AICSImage's OME parse.
+
+        A tripwire is installed on the registered adapter's ``_aics_image`` AFTER
+        registration, then a full client round-trip drives GetFlightInfo (via the
+        #350 ``plan_flight_info`` seam, which also fills the physical scale) and
+        DoGet. Physical scale carries real units, proving the whole chain --
+        descriptor, physical scale, and pixels -- is served from tifffile.
+        """
+        import tifffile
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+
+        class _Tripwire:
+            def __getattr__(self, name):
+                raise AssertionError(f"AICSImage parsed on read path: .{name}")
+
+        path = str(tmp_path / "e2e.ome.tif")
+        data = np.zeros((3, 64, 64), np.uint16)
+        for c in range(3):
+            data[c] = c + 1
+        tifffile.imwrite(
+            path,
+            data,
+            photometric="minisblack",
+            metadata={
+                "axes": "CYX",
+                "PhysicalSizeX": 0.325,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": 0.325,
+                "PhysicalSizeYUnit": "µm",
+            },
+        )
+        adapter = OmeTiffAdapter(path, "ome213")
+        array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
+
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("ome213", adapter)
+        server.mark_ready()
+        adapter._aics_image = _Tripwire()  # any OME parse from here is a failure
+        try:
+            client = TensorFlightClient(
+                f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+            )
+            darr = client.get_tensor(array_id)  # GetFlightInfo (array_id addressing)
+            assert darr.shape == (1, 3, 1, 64, 64)
+
+            scale, unit = client.get_physical_scale(array_id)
+            assert list(scale) == [0.0, 0.0, 0.0, 0.325, 0.325]
+            assert list(unit) == ["", "", "", "µm", "µm"]
+
+            data = darr[:1, 1:2, :1, :32, :32].compute()  # DoGet
+            assert data.shape == (1, 1, 1, 32, 32)
+            assert (data == 2).all()  # channel 1 -> value 2
+            client.close()
+        finally:
+            server.shutdown()
+
 
 class TestMultiSeriesOmeTiffIntegration:
-    """Integration tests for multi-series OME-TIFF with server/client (now handled by AicsImageIoAdapter)."""
+    """Integration tests for multi-series OME-TIFF with server/client (now handled by OmeTiffAdapter)."""
 
     def test_multi_series_list_tensors(self, multi_series_ome_tiff):
         """Test listing all series as tensors in multi-series OME-TIFF."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-test")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-test")
 
         # List all tensors (series)
         descriptors = adapter.list_tensor_descriptors()
@@ -484,11 +542,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_multi_series_tensor_access(self, multi_series_ome_tiff):
         """Test accessing specific series via get_tensor_adapter."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-access")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
         descriptors = adapter.list_tensor_descriptors()
@@ -506,11 +564,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_multi_series_server_client(self, multi_series_ome_tiff):
         """Test reading from multi-series OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-server")
+        adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multi-series-server", adapter)
@@ -551,11 +609,11 @@ class TestMultiSeriesOmeTiffIntegration:
     def test_lazy_tile_loading(self, multi_series_ome_tiff):
         """Test that aicsimageio provides tile-level lazy loading."""
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "lazy-tile-test")
+        adapter = OmeTiffAdapter(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
         descriptors = adapter.list_tensor_descriptors()
@@ -573,74 +631,21 @@ class TestMultiSeriesOmeTiffIntegration:
 
 
 class TestCompanionOmeIntegration:
-    """Integration tests for companion OME files (claimed by OmeTiffAdapter; read
-    via aicsimageio/bioformats)."""
+    """`.companion.ome` support was dropped when OmeTiffAdapter went pure-tifffile
+    (it was bioformats-only, with no tifffile path). It is no longer claimed."""
 
-    @pytest.mark.skipif(
-        not _bioformats_available(), reason="bioformats_jar not available"
-    )
-    def test_companion_claim(self, companion_ome_dataset):
-        """Test claiming companion.ome file."""
-        # .companion.ome is handled by OmeTiffAdapter (the generic
-        # AicsImageIoAdapter excludes it); the claim parses the OME-XML and groups
-        # the referenced TIFFs into one multi-file source.
+    def test_companion_ome_is_not_claimed(self, companion_ome_dataset):
+        # The pure-tifffile OmeTiffAdapter declines .companion.ome (only tifffile
+        # embedded-OME-XML is supported); the generic AicsImageIoAdapter also
+        # excludes it. So a companion sidecar is claimed by no one.
         from pathlib import Path
 
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
-
-        companion_path, tiff_files, metadata_info = companion_ome_dataset
-
-        # Test claim method
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
+        companion_path, _tiff_files, _metadata_info = companion_ome_dataset
         ctx = ClaimContext(Path(companion_path))
-        state = DiscoveryState()
-        claim = OmeTiffAdapter.claim(ctx, state)
-        assert claim is not None
-        assert claim.source_type == "ome-tiff"
-        # Primary path is the first referenced TIFF (the master), not the
-        # companion sidecar.
-        assert str(claim.primary_path) == tiff_files[0]
-        # The companion sidecar and every referenced TIFF are consumed (tracked
-        # via try_claim_path).
-        assert companion_path in state.consumed_paths
-        for tiff_file in tiff_files:
-            assert tiff_file in state.consumed_paths
-
-    @pytest.mark.skipif(
-        not _bioformats_available(), reason="bioformats_jar not available"
-    )
-    def test_companion_data_access(self, companion_ome_dataset):
-        """Test reading data from companion OME dataset."""
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
-
-        companion_path, tiff_files, metadata_info = companion_ome_dataset
-
-        # Create adapter from companion file
-        adapter = AicsImageIoAdapter.create_from_url(companion_path, "companion-test")
-
-        # Get first series
-        descriptors = adapter.list_tensor_descriptors()
-        assert len(descriptors) > 0
-
-        # Read data. The companion OME-XML yields a full TCZYX tensor (the
-        # referenced TIFFs stack along Z), so read by the descriptor's own shape
-        # and locate the Z axis by label rather than assuming a 3-D layout.
-        desc = descriptors[0]
-        series_adapter = adapter.get_tensor_adapter(desc.array_id)
-
-        shape = list(desc.shape)
-        dim_labels = list(desc.dim_labels)
-        bounds = ChunkBounds(start=[0] * len(shape), stop=shape)
-        data = series_adapter.get_data(bounds)
-        assert tuple(data.shape) == tuple(shape)
-
-        z_axis = dim_labels.index("Z")
-        assert shape[z_axis] == metadata_info["n_files"]
-        # The first plane along Z comes from data_001.tif (filled with value 1).
-        first_plane = data.take(indices=0, axis=z_axis)
-        assert first_plane.mean() == 1
+        assert OmeTiffAdapter.claim(ctx, DiscoveryState()) is None
 
 
 class TestHdf5Integration:
