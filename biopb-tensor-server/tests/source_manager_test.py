@@ -1413,7 +1413,7 @@ class TestProgressiveDiscoveryFreshness:
     def test_first_full_rescan_pushes_freshness_and_fires_callback(self, tmp_path):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         manager._handle_rescan()
 
@@ -1427,7 +1427,7 @@ class TestProgressiveDiscoveryFreshness:
     def test_incremental_rescan_leaves_freshness_untouched(self, tmp_path):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         manager._handle_rescan()  # first: force-full
         first_ts = server.last_full_scan_at
@@ -1444,7 +1444,7 @@ class TestProgressiveDiscoveryFreshness:
     def test_failed_first_scan_resets_progress_and_retries(self, tmp_path, monkeypatch):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
-        manager._on_initial_scan_complete = lambda: fired.append(True)
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
         # Fail the reconcile of the first (force-full) scan.
         def boom(*a, **k):
@@ -1467,6 +1467,40 @@ class TestProgressiveDiscoveryFreshness:
         manager._handle_rescan()
         assert manager._initial_scan_done is True
         assert server.last_full_scan_at is not None
+        assert fired == [True]
+
+    def test_run_initial_scan_drives_the_bootstrap_scan(self, tmp_path):
+        # The launcher's public seam for the watcher-less path (biopb/biopb#277 C)
+        # runs one full rescan: same effect as the internal _handle_rescan.
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
+
+        manager.run_initial_scan()
+
+        assert server.scan_in_progress_history == [True, False]
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done is True
+        assert fired == [True]
+
+    def test_complete_initial_scan_advances_protocol_without_walking(self, tmp_path):
+        # The static-only launcher path (biopb/biopb#277 C): no bootstrap scan,
+        # but the startup protocol still stamps freshness, flips the gate, and
+        # fires the one-shot completion hook.
+        server, manager = self._manager_with_source(tmp_path)
+        fired = []
+        manager.set_initial_scan_complete_hook(lambda: fired.append(True))
+
+        manager.complete_initial_scan()
+
+        # No force-full pass ran, so in_progress was never toggled.
+        assert server.scan_in_progress_history == []
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done is True
+        assert fired == [True]
+
+        # Idempotent: a second call re-stamps freshness but never re-fires.
+        manager.complete_initial_scan()
         assert fired == [True]
 
 

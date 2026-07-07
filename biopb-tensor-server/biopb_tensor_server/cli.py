@@ -12,7 +12,6 @@ import os
 import secrets
 import signal
 import threading
-import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -467,7 +466,7 @@ def _setup_flight_server(
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
-        source_manager._on_source_committed = precache_worker.enqueue
+        source_manager.set_source_committed_hook(precache_worker.enqueue)
         # Residency gate (#174): let the worker re-check, at warm time, that a
         # cloud-root source's files are still resident before reading them, so a
         # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
@@ -481,7 +480,7 @@ def _setup_flight_server(
         if precache_worker is not None and server_config.precache.backlog_enabled:
             precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
 
-    source_manager._on_initial_scan_complete = _seed_backlog_on_first_scan
+    source_manager.set_initial_scan_complete_hook(_seed_backlog_on_first_scan)
 
     # Report "a full scan is running" from the first SERVING moment. The
     # background scan sets this itself on entry, but pre-setting here closes the
@@ -516,16 +515,14 @@ def _setup_flight_server(
         # No event loop will drive the bootstrap scan. Two cases:
         #  - monitored dirs but the watcher failed to start: scan synchronously
         #    now so those sources are still registered (the pre-progressive
-        #    behavior for watcher-less setups); _handle_rescan also stamps
-        #    freshness, flips _initial_scan_done, and seeds the backlog.
-        #  - static-only config (no monitored dirs, nothing to scan): drive the
-        #    completion path directly so it still reports a timestamp and seeds.
+        #    behavior for watcher-less setups); run_initial_scan also stamps
+        #    freshness, flips the startup gate, and seeds the backlog.
+        #  - static-only config (no monitored dirs, nothing to scan): advance the
+        #    completion protocol directly so it still reports a timestamp and seeds.
         if monitored_dirs:
-            source_manager._handle_rescan()
+            source_manager.run_initial_scan()
         else:
-            source_manager._initial_scan_done = True
-            server.set_last_full_scan(time.time())
-            _seed_backlog_on_first_scan()
+            source_manager.complete_initial_scan()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
