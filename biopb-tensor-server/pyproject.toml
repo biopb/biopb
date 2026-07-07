@@ -60,6 +60,7 @@ dependencies = [
     "bioio-lif",       # Leica LIF (readlif)
     "bioio-nd2",       # Nikon ND2
     "bioio-dv",        # DeltaVision DV (mrc)
+    "bioio-tifffile",  # plain/non-OME TIFF and Zeiss LSM (ZeissAdapter's .lsm path)
     "bioio-ome-tiff",  # remote/exotic OME-TIFF the pure-tifffile OmeTiffAdapter declines
     "bioio-imageio",   # generic raster/video fallback
     # NOTE: bioio-ome-zarr is deliberately NOT listed. (1) It is redundant --

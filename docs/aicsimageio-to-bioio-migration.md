@@ -162,8 +162,15 @@ Core `dependencies`:
 | `readlif >= 0.6.4`        | `bioio-lif`    |
 | `aicsimageio[nd2]`        | `bioio-nd2`    |
 | `aicsimageio[dv]`         | `bioio-dv`     |
+| (plain TIFF / Zeiss LSM)  | `bioio-tifffile` |
 | (generic imageio)         | `bioio-imageio`|
 | (plain/remote OME-TIFF)   | `bioio-ome-tiff` |
+
+`bioio-tifffile` is **required, not optional**: without it `BioImage` cannot read
+plain non-OME `.tif` or `.lsm` (`bioio-ome-tiff` only claims OME-TIFF), so
+`ZeissAdapter`'s `.lsm` path and the generic fallback's plain-`.tif` path raise
+`UnsupportedFileFormatError`. Under aicsimageio these went through its bundled
+tifffile reader; bioio splits that into its own plugin.
 
 `[bioformats]` extra — Bio-Formats moves to its own bioio plugin:
 
