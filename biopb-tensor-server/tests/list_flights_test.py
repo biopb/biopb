@@ -57,11 +57,13 @@ def test_list_flights_skips_failing_source():
     """A source that raises during descriptor build is skipped, not fatal."""
     server = TensorFlightServer(location="grpc://localhost:0")
 
-    server._sources = {
-        "good-1": _HealthyAdapter("good-1"),
-        "bad": _FailingAdapter("bad"),
-        "good-2": _HealthyAdapter("good-2"),
-    }
+    server.sources.replace(
+        {
+            "good-1": _HealthyAdapter("good-1"),
+            "bad": _FailingAdapter("bad"),
+            "good-2": _HealthyAdapter("good-2"),
+        }
+    )
 
     infos = list(server.list_flights(None, b""))
 
@@ -73,10 +75,12 @@ def test_list_flights_all_healthy():
     """All sources returned when none fail."""
     server = TensorFlightServer(location="grpc://localhost:0")
 
-    server._sources = {
-        "good-1": _HealthyAdapter("good-1"),
-        "good-2": _HealthyAdapter("good-2"),
-    }
+    server.sources.replace(
+        {
+            "good-1": _HealthyAdapter("good-1"),
+            "good-2": _HealthyAdapter("good-2"),
+        }
+    )
 
     infos = list(server.list_flights(None, b""))
 
@@ -115,14 +119,14 @@ class _CatalogAdapter:
 
 def test_list_flights_served_from_catalog_not_adapters():
     """With a metadata DB, ListFlights reflects the catalog, not the adapter
-    registry: a source only in the DB shows up; a source only in ``_sources``
+    registry: a source only in the DB shows up; a source only in ``sources``
     does not. This is the single-source-of-truth switch."""
     db = MetadataDatabase()
     db.sync_source_added("in-db", _CatalogAdapter("in-db"))
 
     server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
     # Present in the adapter registry but NOT in the catalog -> must be invisible.
-    server._sources = {"only-adapter": _HealthyAdapter("only-adapter")}
+    server.sources.replace({"only-adapter": _HealthyAdapter("only-adapter")})
 
     returned_ids = {_command_source_id(i) for i in server.list_flights(None, b"")}
     assert returned_ids == {"in-db"}

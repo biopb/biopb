@@ -251,7 +251,7 @@ class TestWarming:
 
             # Rebuild the same read plan and assert every chunk now locates on
             # disk -- i.e. a future do_get is a warm hit, no decode needed.
-            adapter = server._get_source_adapter("warm-src")
+            adapter = server.sources.get("warm-src")
             td = adapter.list_tensor_descriptors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
@@ -300,13 +300,11 @@ class TestWarming:
 
             # Pin the ordering contract of #174: the gate must fire *before* any
             # adapter access, so a denied warm never touches the source at all.
-            # A spy on _get_source_adapter (and the cache stats) catches a future
+            # A spy on sources.get (and the cache stats) catches a future
             # re-ordering of the gate below adapter/list/compute.
             adapter_calls = []
-            real_get = server._get_source_adapter
-            server._get_source_adapter = lambda sid: (
-                adapter_calls.append(sid) or real_get(sid)
-            )
+            real_get = server.sources.get
+            server.sources.get = lambda sid: adapter_calls.append(sid) or real_get(sid)
 
             worker._process_source("warm-src")
 
@@ -346,7 +344,7 @@ class TestWarming:
                     listed.append(True)  # must NOT be reached
                     return []
 
-            server._get_source_adapter = lambda sid: _RemoteAdapter()
+            server.sources.get = lambda sid: _RemoteAdapter()
 
             preempted = worker._process_source("remote-src")
 
@@ -624,7 +622,7 @@ def _located_all(server, cache_manager, source_ids):
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
     for sid in source_ids:
-        adapter = server._get_source_adapter(sid)
+        adapter = server.sources.get(sid)
         td = adapter.list_tensor_descriptors()[0]
         ta = adapter.get_tensor_adapter(td.array_id)
         scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
@@ -870,7 +868,7 @@ class TestBacklogWarming:
             # A live source is waiting -> a backlog tensor must yield immediately,
             # before warming any chunk.
             worker._queue.put("live")
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor(adapter, td, cm, backlog=True)
@@ -890,7 +888,7 @@ class TestBacklogWarming:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor(adapter, td, cm, backlog=True)
@@ -909,7 +907,7 @@ class TestBacklogWarming:
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            adapter = server._get_source_adapter("src")
+            adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             # Empty live queue + plenty of headroom -> warms, no preempt.

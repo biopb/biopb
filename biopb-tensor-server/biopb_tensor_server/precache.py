@@ -291,7 +291,7 @@ class PrecacheWorker:
             return False
         cache_manager = CacheManager.get_instance()
 
-        source_adapter = self._server._get_source_adapter(source_id)
+        source_adapter = self._server.sources.get(source_id)
         if source_adapter is None:
             return False
 

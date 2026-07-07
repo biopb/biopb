@@ -1701,9 +1701,9 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
 
             manager._reconcile_upstreams()
 
-            assert set(proxy._sources) == {"lab__img", "lab__img2"}
+            assert set(proxy.sources) == {"lab__img", "lab__img2"}
             for sid in ("lab__img", "lab__img2"):
-                adapter = proxy._sources[sid]
+                adapter = proxy.sources.get(sid)
                 assert adapter._descriptors_cache is not None  # seeded, not live
                 assert adapter._metadata_cache is not None
                 assert adapter._client is None  # no per-source upstream dial
@@ -1848,7 +1848,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             resident, tensors = _row()
             assert resident is False  # unresolved mirror, not advertised resident
             assert tensors == []
-            assert proxy._sources["lab__cloud"].is_resident() is False
+            assert proxy.sources.get("lab__cloud").is_resident() is False
 
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(
@@ -1875,7 +1875,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             assert resident is True  # refreshed from the bulk re-list
             assert len(tensors) == 1
             assert tensors[0]["array_id"] == "lab__cloud"  # localized
-            assert proxy._sources["lab__cloud"].is_resident() is True
+            assert proxy.sources.get("lab__cloud").is_resident() is True
         finally:
             proxy.shutdown()
     finally:

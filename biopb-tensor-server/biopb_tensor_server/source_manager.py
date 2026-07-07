@@ -1682,7 +1682,7 @@ class SourceManager:
             seed = _row_to_seed(seed_by_up_id.get(desired[source_id]))
             if seed is None:
                 continue
-            adapter = self._server._get_source_adapter(source_id)
+            adapter = self._server.sources.get(source_id)
             if adapter is None or not hasattr(adapter, "seed_catalog"):
                 continue
             if adapter.seed_catalog(*seed) and self._metadata_db is not None:
@@ -2055,7 +2055,7 @@ class SourceManager:
 
     def _descriptor_for(self, source_id: str):
         """Fetch the registered source's DataSourceDescriptor (None if missing)."""
-        adapter = self._server._get_source_adapter(source_id)
+        adapter = self._server.sources.get(source_id)
         return adapter.get_source_descriptor() if adapter is not None else None
 
     def _warn_if_experimental(self, claim: SourceClaim) -> None:

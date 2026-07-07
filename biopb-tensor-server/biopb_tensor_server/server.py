@@ -55,6 +55,7 @@ from biopb_tensor_server.errors import (
     WriteNotSupportedError,
 )
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.source_registry import SourceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -79,20 +80,6 @@ def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
     for dim, chunk in zip(shape, chunk_shape):
         count *= ceil(dim / chunk)
     return count
-
-
-def _close_adapter(adapter) -> None:
-    """Best-effort release of an adapter's resources (e.g. open file handles).
-
-    Adapters that hold long-lived handles expose ``close()``; others don't.
-    Never raises -- shutdown/unregister must not fail on a balky adapter.
-    """
-    close = getattr(adapter, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:  # pragma: no cover - cleanup must not fail
-            logger.debug("error closing source adapter", exc_info=True)
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -199,8 +186,7 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)
-        self._sources: Dict[str, SourceAdapter] = {}
-        self._sources_lock = threading.RLock()
+        self.sources = SourceRegistry()
         self._writable = writable
         self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
@@ -339,48 +325,14 @@ class TensorFlightServer(flight.FlightServerBase):
         self._remove_source_handler = handler
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Register a data source with the server.
-
-        Args:
-            source_id: Unique identifier for the data source. Must be non-empty
-                and slash-free (see Raises).
-            adapter: Source adapter for the data source
-
-        Raises:
-            ValueError: If *source_id* is empty or contains ``"/"``. The tensor
-                identity policy (proto/biopb/tensor/descriptor.proto) requires a
-                slash-free source_id: the internal chunk-route id is
-                ``"source_id/array_id"`` and is decoded by splitting on the first
-                ``"/"``, so a ``"/"`` in source_id would make the
-                (source_id, array_id) pair undecodable. Auto-generated ids are
-                already slash-free; this guards caller-supplied ones. This is the
-                single registration chokepoint -- discovery, the source manager,
-                uploads, and direct use all funnel through here.
-        """
-        if not source_id:
-            raise ValueError("register_source: source_id must be non-empty")
-        if "/" in source_id:
-            raise ValueError(
-                f"register_source: source_id must not contain '/' (got "
-                f"{source_id!r}); the chunk-route id source_id/array_id decodes "
-                f"by splitting on the first '/'."
-            )
-        with self._sources_lock:
-            self._sources[source_id] = adapter
-        logger.debug(f"Registered source: {source_id}")
+        """Register a data source with the server (delegates to ``sources``)."""
+        self.sources.register(source_id, adapter)
 
     def unregister_source(self, source_id: str) -> None:
-        """Unregister a data source from the server.
-
-        Args:
-            source_id: Unique identifier for the data source
-        """
-        with self._sources_lock:
-            adapter = self._sources.pop(source_id, None)
+        """Unregister a data source and drop any in-flight upload state."""
+        self.sources.unregister(source_id)
         with self._upload_state_lock:
             self._upload_states.pop(source_id, None)
-        _close_adapter(adapter)
-        logger.debug(f"Unregistered source: {source_id}")
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -390,10 +342,7 @@ class TensorFlightServer(flight.FlightServerBase):
         handles -- required on Windows, where an open file cannot be deleted
         (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
         """
-        with self._sources_lock:
-            adapters = list(self._sources.values())
-        for adapter in adapters:
-            _close_adapter(adapter)
+        self.sources.close_all()
         super().shutdown()
 
     def initialize_upload(
@@ -445,16 +394,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "uploaded_chunks": state["uploaded_chunks"],
             }
 
-    def _get_source_adapter(self, source_id: str) -> Optional[SourceAdapter]:
-        """Thread-safe source lookup."""
-        with self._sources_lock:
-            return self._sources.get(source_id)
-
-    def _get_sources_snapshot(self) -> List[Tuple[str, SourceAdapter]]:
-        """Return a stable snapshot of registered sources for iteration."""
-        with self._sources_lock:
-            return list(self._sources.items())
-
     def _authorize_source(
         self, context: flight.ServerCallContext, source_id: str
     ) -> None:
@@ -469,7 +408,7 @@ class TensorFlightServer(flight.FlightServerBase):
         ``BearerAuthMiddlewareFactory``, so this is backward compatible with the
         standalone tensor server.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         expected = adapter.capability_token if adapter is not None else None
         if not expected:
             return
@@ -537,7 +476,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self._get_source_adapter(source_id)
+        source_adapter = self.sources.get(source_id)
         if source_adapter is None:
             return None
 
@@ -556,7 +495,7 @@ class TensorFlightServer(flight.FlightServerBase):
         source_id, *rest = array_id.split("/")
         rest = "/".join(rest) if rest else None
 
-        source_adapter = self._get_source_adapter(source_id)
+        source_adapter = self.sources.get(source_id)
         if source_adapter is None:
             return None
 
@@ -624,7 +563,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 last_full_scan_at = self._last_full_scan_at
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
-                "source_count": len(self._get_sources_snapshot()),
+                "source_count": len(self.sources),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
@@ -694,7 +633,7 @@ class TensorFlightServer(flight.FlightServerBase):
         to completion and caches the result on the adapter, so a retry coalesces
         onto the finished work rather than downloading again.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -793,7 +732,7 @@ class TensorFlightServer(flight.FlightServerBase):
           filesystem reads, concurrency-safe with real reads, so warming never
           blocks a live viewer read.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -1081,7 +1020,7 @@ class TensorFlightServer(flight.FlightServerBase):
         image-base result-cache server). Honors per-source capability tokens by
         skipping token-protected sources from enumeration.
         """
-        source_items = self._get_sources_snapshot()
+        source_items = self.sources.snapshot()
         total_sources = len(source_items)
         max_sources = self._max_list_flights_results
         returned_count = min(total_sources, max_sources)
@@ -1220,7 +1159,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # rather than at every adapter call site. The first descriptor's array_id
         # is the same default the client's own get_tensor path resolves to (#44).
         if not tensor_id:
-            default_adapter = self._get_source_adapter(source_id)
+            default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:
@@ -1254,7 +1193,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
-            source_adapter = self._get_source_adapter(source_id)
+            source_adapter = self.sources.get(source_id)
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
@@ -1625,7 +1564,7 @@ class TensorFlightServer(flight.FlightServerBase):
         table = reader.read_all()
         data_column = table.column(0)
 
-        adapter = self._sources.get(upload.source_id)
+        adapter = self.sources.get(upload.source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {upload.source_id}")
 

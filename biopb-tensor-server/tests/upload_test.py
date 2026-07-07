@@ -336,7 +336,7 @@ class TestServerDoPutHandler:
         assert response_desc.array_id.startswith("cache_")
 
         # Check adapter was registered
-        adapter = server._sources.get(response_desc.array_id)
+        adapter = server.sources.get(response_desc.array_id)
         assert adapter is not None
         assert isinstance(adapter, CachedSourceAdapter)
 
@@ -492,7 +492,7 @@ class TestServerDoPutHandler:
         assert response_desc.array_id not in {d.source_id for d in descriptors}
         # ...but still registered and readable by its returned id.
         assert isinstance(
-            server._sources.get(response_desc.array_id), CachedSourceAdapter
+            server.sources.get(response_desc.array_id), CachedSourceAdapter
         )
 
     def test_create_source_invalid_prefix(self):
@@ -540,7 +540,7 @@ class TestServerDoPutHandler:
                 chunk_shape=(5, 5),
             )
             assert source_id.startswith("cache_")
-            assert source_id in server._sources
+            assert source_id in server.sources
         finally:
             client.close()
             server.shutdown()
@@ -595,7 +595,7 @@ class TestChunkUpload:
         server._handle_chunk_upload(upload, MockReader())
 
         # Check chunk was stored
-        adapter = server._sources.get(source_id)
+        adapter = server.sources.get(source_id)
         assert adapter is not None
 
         CacheManager.reset()

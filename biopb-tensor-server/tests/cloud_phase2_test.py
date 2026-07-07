@@ -604,9 +604,12 @@ class TestPrecacheSkipsUnresolved:
 
         monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
 
-        class _Srv:
-            def _get_source_adapter(self, sid):
+        class _Registry:
+            def get(self, sid):
                 return proxy if sid == "s1" else None
+
+        class _Srv:
+            sources = _Registry()
 
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
         # Past the file-backend gate so the real source-processing logic runs.
