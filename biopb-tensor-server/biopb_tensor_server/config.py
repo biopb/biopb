@@ -966,11 +966,42 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
                     _warn_extra_keys(prof, profile_keys, "credentials.profiles")
 
 
+def _carry(
+    dst: Dict[str, Any],
+    field: str,
+    src: Dict[str, Any],
+    key: Optional[str] = None,
+    cast=None,
+) -> None:
+    """Copy ``src[key]`` into ``dst[field]`` iff the key is present and non-null.
+
+    The heart of the "defaults live in one place" contract (biopb/biopb#277 A):
+    an absent (or ``null``) config key is simply *not* forwarded, so the
+    dataclass constructor supplies its own default -- no default literal is
+    written a second time here. ``key`` defaults to ``field`` (they differ only
+    for the on-disk aliases catalogued in ``config_schema._ONDISK_OVERRIDES``);
+    ``cast`` applies the field's wire->value coercion (unit scaling, float/int).
+    """
+    on_disk = key or field
+    value = src.get(on_disk)
+    if value is not None:
+        dst[field] = cast(value) if cast is not None else value
+
+
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Parse configuration from a dictionary.
 
     Format-agnostic: ``data`` is a plain dict already read from JSON or TOML by
     :func:`load_config`.
+
+    Field **defaults** are owned solely by the config dataclasses: this parser
+    forwards only the keys actually present in ``data`` (via :func:`_carry`) and
+    lets each dataclass fill the rest, so a default is never declared twice
+    (biopb/biopb#277 item A). What stays here is the wire<->dataclass mapping the
+    dataclasses cannot express: on-disk key aliases (``cache.max_entries`` ->
+    ``memory_max_entries``), unit scaling (``*_mb``/``*_gb`` -> ``*_bytes``),
+    legacy back-compat keys (``watcher_type``, ``poll_interval``, the ``[precache]``
+    pyramid knobs, source ``path``), and per-field coercions.
 
     Args:
         data: Config dictionary (from JSON or TOML)
@@ -980,57 +1011,73 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """
     _warn_unknown_config_keys(data)
 
-    # Parse server settings
+    # Parse server settings. Only present keys are carried; ServerConfig supplies
+    # every default.
     server_data = data.get("server", {})
-    host = server_data.get("host", "0.0.0.0")
-    port = server_data.get("port", 8815)
-    log_level = server_data.get("log_level", "INFO")
-    log_scope_to_biopb = server_data.get("log_scope_to_biopb", True)
+    server_kwargs: Dict[str, Any] = {}
+    _carry(server_kwargs, "host", server_data)
+    _carry(server_kwargs, "port", server_data)
+    _carry(server_kwargs, "log_level", server_data)
+    _carry(server_kwargs, "log_scope_to_biopb", server_data)
+
+    # monitor_mode: honor the value directly, else derive it from the legacy
+    # `watcher_type` alias; if neither is set, ServerConfig's default applies.
     monitor_mode = server_data.get("monitor_mode")
-    if monitor_mode is None:
-        legacy_watcher_type = server_data.get("watcher_type", "auto")
-        monitor_mode = "off" if legacy_watcher_type == "off" else "periodic"
+    if monitor_mode is None and "watcher_type" in server_data:
+        monitor_mode = "off" if server_data.get("watcher_type") == "off" else "periodic"
+    if monitor_mode is not None:
+        server_kwargs["monitor_mode"] = monitor_mode
 
-    rescan_interval = server_data.get("rescan_interval")
-    if rescan_interval is None:
-        rescan_interval = server_data.get("poll_interval", 30.0)
+    # rescan_interval: `poll_interval` is the legacy alias.
+    _carry(server_kwargs, "rescan_interval", server_data, cast=float)
+    if "rescan_interval" not in server_kwargs:
+        _carry(
+            server_kwargs, "rescan_interval", server_data, "poll_interval", cast=float
+        )
 
-    full_rescan_interval = server_data.get("full_rescan_interval", 3600.0)
-    stability_window = server_data.get("stability_window", 30.0)
-    stable_rescans_required = server_data.get("stable_rescans_required", 0)
-    probe_open_files = server_data.get("probe_open_files", True)
-    aggressive_dir_pruning = server_data.get("aggressive_dir_pruning", False)
-    claim_generic_images = server_data.get("claim_generic_images", False)
-    writable = server_data.get("writable", False)
-    write_dir_str = server_data.get("write_dir", None)
-    write_dir = Path(write_dir_str) if write_dir_str else None
+    _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
+    _carry(server_kwargs, "stability_window", server_data, cast=float)
+    _carry(
+        server_kwargs,
+        "stable_rescans_required",
+        server_data,
+        cast=lambda v: max(0, int(v)),
+    )
+    _carry(server_kwargs, "probe_open_files", server_data, cast=bool)
+    _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
+    _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
+    _carry(server_kwargs, "writable", server_data)
+    write_dir_str = server_data.get("write_dir")
+    if write_dir_str:
+        server_kwargs["write_dir"] = Path(write_dir_str)
 
-    # Parse cache settings
+    # Parse cache settings. The wire form of four fields diverges from the
+    # dataclass (aliases + MB/GB->bytes scaling); everything else is a direct
+    # carry. Mapping mirrors config_schema._ONDISK_OVERRIDES.
     cache_data = data.get("cache", {})
-    cache_backend = cache_data.get("backend", _default_cache_backend())
-
-    # Parse memory backend settings
-    memory_max_entries = cache_data.get("max_entries", 1024)
-    memory_max_bytes = cache_data.get("max_bytes", 512 * 1024 * 1024)
-
-    # Parse file backend settings (convert MB/GB to bytes if specified)
-    file_cache_dir_raw = cache_data.get("file_cache_dir")
-    file_cache_dir = (
-        Path(file_cache_dir_raw) if file_cache_dir_raw else DEFAULT_FILE_CACHE_DIR
+    cache_kwargs: Dict[str, Any] = {}
+    _carry(cache_kwargs, "backend", cache_data)
+    _carry(cache_kwargs, "memory_max_entries", cache_data, "max_entries")
+    _carry(cache_kwargs, "memory_max_bytes", cache_data, "max_bytes")
+    _carry(
+        cache_kwargs,
+        "file_max_segment_bytes",
+        cache_data,
+        "file_max_segment_mb",
+        cast=lambda mb: int(mb) * 1024 * 1024,
     )
-    file_max_segment_mb = cache_data.get("file_max_segment_mb", 64)
-    file_max_segment_bytes = int(file_max_segment_mb) * 1024 * 1024
-    file_max_total_gb = cache_data.get("file_max_total_gb", 4)
-    file_max_total_bytes = int(file_max_total_gb) * 1024 * 1024 * 1024
-
-    cache_config = CacheConfig(
-        backend=cache_backend,
-        memory_max_entries=memory_max_entries,
-        memory_max_bytes=memory_max_bytes,
-        file_cache_dir=file_cache_dir,
-        file_max_segment_bytes=file_max_segment_bytes,
-        file_max_total_bytes=file_max_total_bytes,
+    _carry(
+        cache_kwargs,
+        "file_max_total_bytes",
+        cache_data,
+        "file_max_total_gb",
+        cast=lambda gb: int(gb) * 1024 * 1024 * 1024,
     )
+    # CacheConfig.__post_init__ coerces a str file_cache_dir to Path; a falsy
+    # value means "unset" -> the dataclass default.
+    if cache_data.get("file_cache_dir"):
+        cache_kwargs["file_cache_dir"] = Path(cache_data["file_cache_dir"])
+    cache_config = CacheConfig(**cache_kwargs)
 
     # Parse pyramid settings -- the authority for level definition, shared by the
     # advertised TensorDescriptor.pyramid and the precache worker.
@@ -1038,32 +1085,29 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
     precache_data = data.get("precache", {})
 
     # Back-compat: these knobs used to live under [precache]; honor an old
-    # [precache] value when [pyramid] omits the key, so existing configs don't
-    # silently revert to defaults.
-    def _pyramid_knob(key, default, cast):
-        if key in pyramid_data:
-            return cast(pyramid_data[key])
-        if key in precache_data:
-            return cast(precache_data[key])
-        return default
-
-    pyramid_config = PyramidConfig(
-        reduction_method=_pyramid_knob("reduction_method", "area", str),
-        threshold=_pyramid_knob("threshold", 4096, int),
-        downscale_factor=_pyramid_knob("downscale_factor", 4, int),
-        pixel_budget_cubic_root=_pyramid_knob("pixel_budget_cubic_root", 512, int),
-    )
+    # [precache] value when [pyramid] omits the key. An absent knob falls through
+    # to PyramidConfig's default.
+    pyramid_kwargs: Dict[str, Any] = {}
+    for _knob, _cast in (
+        ("reduction_method", str),
+        ("threshold", int),
+        ("downscale_factor", int),
+        ("pixel_budget_cubic_root", int),
+    ):
+        if _knob in pyramid_data:
+            pyramid_kwargs[_knob] = _cast(pyramid_data[_knob])
+        elif _knob in precache_data:
+            pyramid_kwargs[_knob] = _cast(precache_data[_knob])
+    pyramid_config = PyramidConfig(**pyramid_kwargs)
 
     # Parse precache settings (operational knobs only).
-    precache_config = PrecacheConfig(
-        enabled=bool(precache_data.get("enabled", True)),
-        idle_debounce_seconds=float(precache_data.get("idle_debounce_seconds", 2.0)),
-        backlog_enabled=bool(precache_data.get("backlog_enabled", True)),
-        backlog_high_water=float(precache_data.get("backlog_high_water", 0.8)),
-        backlog_idle_recheck_seconds=float(
-            precache_data.get("backlog_idle_recheck_seconds", 5.0)
-        ),
-    )
+    precache_kwargs: Dict[str, Any] = {}
+    _carry(precache_kwargs, "enabled", precache_data, cast=bool)
+    _carry(precache_kwargs, "idle_debounce_seconds", precache_data, cast=float)
+    _carry(precache_kwargs, "backlog_enabled", precache_data, cast=bool)
+    _carry(precache_kwargs, "backlog_high_water", precache_data, cast=float)
+    _carry(precache_kwargs, "backlog_idle_recheck_seconds", precache_data, cast=float)
+    precache_config = PrecacheConfig(**precache_kwargs)
 
     # Parse credentials settings (NEW)
     credentials_data = data.get("credentials", {})
@@ -1113,19 +1157,14 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
                 "starts WITH the SQL catalog (`client.query_sources(...)`) despite "
                 "this setting. Drop the flag from your config. See biopb/biopb#225."
             )
-    metadata_db_max_query_results = metadata_db_data.get("max_query_results", 100000)
-    metadata_db_max_list_flights_results = metadata_db_data.get(
-        "max_list_flights_results", 100000
-    )
-    metadata_db_query_timeout_ms = metadata_db_data.get("query_timeout_ms", 30000)
+    metadata_db_kwargs: Dict[str, Any] = {}
+    _carry(metadata_db_kwargs, "max_query_results", metadata_db_data)
+    _carry(metadata_db_kwargs, "max_list_flights_results", metadata_db_data)
+    _carry(metadata_db_kwargs, "query_timeout_ms", metadata_db_data)
+    metadata_db_config = MetadataDbConfig(**metadata_db_kwargs)
 
-    metadata_db_config = MetadataDbConfig(
-        max_query_results=metadata_db_max_query_results,
-        max_list_flights_results=metadata_db_max_list_flights_results,
-        query_timeout_ms=metadata_db_query_timeout_ms,
-    )
-
-    # Parse sources
+    # Parse sources. `url` accepts the legacy `path` alias; every other field is
+    # carried only when present so SourceConfig owns the defaults.
     sources_data = data.get("sources", [])
     sources: List[SourceConfig] = []
 
@@ -1135,42 +1174,25 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
         if url is None:
             raise ValueError("Source config requires 'url' field")
 
-        source = SourceConfig(
-            type=src_data.get("type"),  # Optional - auto-detected if None
-            url=url,
-            source_id=src_data.get("source_id"),  # Optional - auto-generated if None
-            dim_labels=src_data.get("dim_labels"),
-            dataset=src_data.get("dataset"),
-            monitor=src_data.get("monitor", False),  # Optional - default False
-            cloud=src_data.get("cloud", False),  # Optional - default False
-            credentials_profile=src_data.get("credentials_profile", None),  # NEW
-            alias=src_data.get(
-                "alias", None
-            ),  # Optional - tensor-server proxy namespace
-        )
-        sources.append(source)
+        src_kwargs: Dict[str, Any] = {"url": url}
+        _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
+        _carry(src_kwargs, "source_id", src_data)  # auto-generated when omitted
+        _carry(src_kwargs, "dim_labels", src_data)
+        _carry(src_kwargs, "dataset", src_data)
+        _carry(src_kwargs, "monitor", src_data)
+        _carry(src_kwargs, "cloud", src_data)
+        _carry(src_kwargs, "credentials_profile", src_data)
+        _carry(src_kwargs, "alias", src_data)  # tensor-server proxy namespace
+        sources.append(SourceConfig(**src_kwargs))
 
     return ServerConfig(
-        host=host,
-        port=port,
-        log_level=log_level,
-        log_scope_to_biopb=log_scope_to_biopb,
-        monitor_mode=monitor_mode,
-        rescan_interval=float(rescan_interval),
-        full_rescan_interval=float(full_rescan_interval),
-        stability_window=float(stability_window),
-        stable_rescans_required=max(0, int(stable_rescans_required)),
-        probe_open_files=bool(probe_open_files),
-        aggressive_dir_pruning=bool(aggressive_dir_pruning),
-        claim_generic_images=bool(claim_generic_images),
-        writable=writable,
-        write_dir=write_dir,
         cache=cache_config,
         pyramid=pyramid_config,
         precache=precache_config,
         credentials=credentials_config,
         metadata_db=metadata_db_config,
         sources=sources,
+        **server_kwargs,
     )
 
 
