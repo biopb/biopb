@@ -35,6 +35,19 @@ The FastAPI server handles both API requests and serves the static React webapp.
 **Class:** `TensorFlightServer(flight.FlightServerBase)`
 **Default location:** `grpc://0.0.0.0:8815`
 
+`TensorFlightServer` is a thin Flight protocol handler; its mutable state lives
+in three collaborators it composes (biopb/biopb#278 item A):
+
+| Collaborator | Module | Owns |
+|---|---|---|
+| `server.sources` (`SourceRegistry`) | `source_registry.py` | the `source_id → SourceAdapter` map, the registration chokepoint (slash-free id validation), and adapter-lifecycle cleanup (close on unregister/shutdown) |
+| `server.activity` (`ActivityTracker`) | `activity.py` | in-flight heavy-read counters + last-active stamp (the precache idle signal) and the warm-in-progress guard set |
+| `server.uploads` (`UploadManager`) | `upload_manager.py` | the writable-server DoPut path: source creation (`cache:`/`ome_zarr:`), polymorphic chunk writes, and the per-source upload-progress state machine |
+
+`register_source` / `unregister_source` / `flight_idle_for` / `mark_ready`
+remain on the server as thin delegators, so the CLI, source manager, and
+precache worker drive it through the same public surface as before.
+
 ### Registration
 
 ```python

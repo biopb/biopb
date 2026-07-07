@@ -120,6 +120,16 @@ class TensorFlightServer(flight.FlightServerBase):
     Supports multifield acquisitions where tensors within a data source
     have different shapes (e.g., MicroManager multi-position datasets).
 
+    State is delegated to three collaborators (biopb/biopb#278 item A), so this
+    class stays a thin Flight protocol handler:
+
+    - ``self.sources`` (:class:`SourceRegistry`) -- the ``source_id`` -> adapter
+      map, registration chokepoint, and adapter-lifecycle cleanup.
+    - ``self.activity`` (:class:`ActivityTracker`) -- in-flight-read counters
+      (the precache idle signal) and the warm-in-progress guard.
+    - ``self.uploads`` (:class:`UploadManager`) -- the writable-server DoPut path
+      (source creation, chunk writing, upload-progress state).
+
     The normal entry point is the ``biopb-tensor-server`` CLI
     (``launch`` / ``serve``), which scans the data folder and calls
     ``mark_ready()`` for you once registration completes. The low-level usage
