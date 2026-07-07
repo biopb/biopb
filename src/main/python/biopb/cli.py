@@ -942,13 +942,16 @@ def _emit_daemon_status(
     json_fields: dict,
     table_rows: List[Tuple[str, str]],
 ) -> None:
-    """Render one daemon's status (JSON or table) and exit(0).
+    """Render one daemon's status (JSON or table); the command exits 0.
 
     The running/stale/stopped verdict and the common PID / PID-file / Log-file
     rows are identical for both daemons; `json_fields` and `table_rows` carry the
     per-daemon extras (Flight health for the tensor server, the HTTP endpoint for
     biopb-mcp). `table_rows` are inserted between the PID row and the trailing
     PID-file / Log-file rows, preserving each command's original row order.
+
+    The JSON and not-running paths short-circuit via `typer.Exit(0)`; the
+    running-table path returns normally, which typer likewise maps to exit 0.
     """
     if json_output:
         print(
