@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from biopb_tensor_server.adapters.aicsimageio import (
     _STRIP_PER_PLANE,
-    AicsImageIoAdapter,
+    OmeTiffAdapter,
     _fast_ome_metadata,
     _ome_scene_ids,
     _tczyx_shape,
@@ -104,12 +104,12 @@ class TestFastPathParity:
 
     def test_single_series_parity(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        adapter = AicsImageIoAdapter.create_from_url(path, "single")
+        adapter = OmeTiffAdapter.create_from_url(path, "single")
         assert self._fast(adapter) == self._aics_truth(path)
 
     def test_multi_series_parity(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
-        adapter = AicsImageIoAdapter.create_from_url(path, "multi")
+        adapter = OmeTiffAdapter.create_from_url(path, "multi")
         assert self._fast(adapter) == self._aics_truth(path)
 
     def test_multifile_embedded_ome_parity(self, tmp_path):
@@ -120,7 +120,7 @@ class TestFastPathParity:
         path, names, full_shape = create_multifile_embedded_ome_tiff(
             str(tmp_path), n_files=3
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "mfembed")
+        adapter = OmeTiffAdapter.create_from_url(path, "mfembed")
 
         fast = self._fast(adapter)
         assert fast == self._aics_truth(path)
@@ -132,7 +132,7 @@ class TestFastPathParity:
         # The registration path must build the catalog row without ever touching
         # AICSImage (the ome-types parse is the startup cost being removed).
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "noparse")
+        adapter = OmeTiffAdapter.create_from_url(path, "noparse")
         adapter._aics_image = _Tripwire()
 
         descriptors = adapter.list_tensor_descriptors()
@@ -176,12 +176,12 @@ class TestRgbSamplesDescriptor:
     def test_tifffile_fast_path_defers_rgb(self, tmp_path):
         # The tifffile-direct fast path rejects the S axis up front.
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        adapter = OmeTiffAdapter.create_from_url(path, "rgb")
         assert adapter._tifffile_descriptors() is None
 
     def test_descriptor_labels_and_shape_agree(self, tmp_path):
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        adapter = OmeTiffAdapter.create_from_url(path, "rgb")
 
         descriptors = adapter.list_tensor_descriptors()
 
@@ -202,7 +202,7 @@ class TestRgbSamplesDescriptor:
         from biopb_tensor_server.server import TensorFlightServer
 
         path = self._write_rgb_ome_tiff(tmp_path)
-        adapter = AicsImageIoAdapter.create_from_url(path, "rgb")
+        adapter = OmeTiffAdapter.create_from_url(path, "rgb")
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("rgb", adapter)
         server.mark_ready()
@@ -221,7 +221,7 @@ class TestRgbSamplesDescriptor:
 class TestSceneResolutionAndReads:
     def test_scene_index_resolves_from_cache(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
-        adapter = AicsImageIoAdapter.create_from_url(path, "idx")
+        adapter = OmeTiffAdapter.create_from_url(path, "idx")
         descriptors = adapter.list_tensor_descriptors()
         fields = [d.array_id.split("/", 1)[1] for d in descriptors]
 
@@ -237,7 +237,7 @@ class TestSceneResolutionAndReads:
         path, _, _ = create_multi_series_ome_tiff(
             str(tmp_path), n_series=3, series_shape=(2, 32, 32)
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "reads")
+        adapter = OmeTiffAdapter.create_from_url(path, "reads")
         descriptors = adapter.list_tensor_descriptors()
 
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -390,7 +390,7 @@ class TestFastMetadata:
         # get_metadata runs at registration (metadata-DB sync); it must build the
         # dict from the stripped OME-XML without touching AICSImage.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        adapter = AicsImageIoAdapter.create_from_url(path, "md")
+        adapter = OmeTiffAdapter.create_from_url(path, "md")
 
         hits = []
 
@@ -414,7 +414,7 @@ class TestFastMetadata:
         # The descriptor fast path populates the OME-XML cache so get_metadata
         # does not reopen the file.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "cache")
+        adapter = OmeTiffAdapter.create_from_url(path, "cache")
         assert adapter._raw_ome_xml_probed is False
 
         adapter.list_tensor_descriptors()  # descriptor fast path
@@ -428,13 +428,13 @@ class TestFallback:
         # Build on a local file (no S3 round-trip at construction), then point the
         # source_url at a remote URL to exercise the no-local-handle gate.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(path, "remote")
+        adapter = OmeTiffAdapter.create_from_url(path, "remote")
         adapter._source_url = "s3://bucket/x.ome.tif"
         assert adapter._tifffile_descriptors() is None
 
     def test_custom_dim_labels_fall_back(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-        adapter = AicsImageIoAdapter.create_from_url(
+        adapter = OmeTiffAdapter.create_from_url(
             path, "customdims", dim_labels=["C", "Y", "X"]
         )
         assert adapter._tifffile_descriptors() is None
@@ -444,7 +444,7 @@ class TestFallback:
 
         plain = tmp_path / "plain.tif"
         tifffile.imwrite(str(plain), np.zeros((16, 16), np.uint8))  # no OME-XML
-        adapter = AicsImageIoAdapter.create_from_url(str(plain), "plain")
+        adapter = OmeTiffAdapter.create_from_url(str(plain), "plain")
         assert adapter._tifffile_descriptors() is None
 
 
@@ -508,7 +508,7 @@ class TestReadPathTifffileAuthoritative:
         The tripwire is installed AFTER registration, so any AICSImage access on
         the ensuing read path fails loudly (the whole point of #213).
         """
-        adapter = AicsImageIoAdapter.create_from_url(path, source_id)
+        adapter = OmeTiffAdapter.create_from_url(path, source_id)
         adapter.list_tensor_descriptors()
         assert adapter._descriptors_from_tifffile is True
         adapter._aics_image = _Tripwire()
@@ -548,7 +548,7 @@ class TestReadPathTifffileAuthoritative:
         path, _, _ = create_multi_series_ome_tiff(
             str(tmp_path), n_series=3, series_shape=(2, 32, 32)
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "consist")
+        adapter = OmeTiffAdapter.create_from_url(path, "consist")
         descriptors = adapter.list_tensor_descriptors()
         adapter._aics_image = _Tripwire()
 
@@ -573,7 +573,7 @@ class TestReadPathTifffileAuthoritative:
         from biopb.tensor.ticket_pb2 import ChunkBounds
 
         path, present = self._write_sparse_multifile_ome_tiff(str(tmp_path))
-        adapter = AicsImageIoAdapter.create_from_url(path, "ragged")
+        adapter = OmeTiffAdapter.create_from_url(path, "ragged")
         descriptors = adapter.list_tensor_descriptors()
         assert adapter._descriptors_from_tifffile is True
         adapter._aics_image = _Tripwire()
@@ -635,7 +635,7 @@ class TestReadPathTifffileAuthoritative:
         data[..., 0], data[..., 1], data[..., 2] = 10, 20, 30
         tifffile.imwrite(p, data, ome=True, photometric="rgb", metadata={"axes": "YXS"})
 
-        adapter = AicsImageIoAdapter.create_from_url(p, "rgb")
+        adapter = OmeTiffAdapter.create_from_url(p, "rgb")
         descriptors = adapter.list_tensor_descriptors()
         assert adapter._descriptors_from_tifffile is False
         scene = adapter.get_tensor_adapter(descriptors[0].array_id)
@@ -657,7 +657,7 @@ class TestReadPathTifffileAuthoritative:
 
         plain = str(tmp_path / "plain.tif")
         tifffile.imwrite(plain, np.full((16, 16), 7, np.uint8))  # no OME-XML
-        adapter = AicsImageIoAdapter.create_from_url(plain, "plain")
+        adapter = OmeTiffAdapter.create_from_url(plain, "plain")
         descriptors = adapter.list_tensor_descriptors()
         assert adapter._descriptors_from_tifffile is False
         scene = adapter.get_tensor_adapter(descriptors[0].array_id)

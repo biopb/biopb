@@ -372,15 +372,15 @@ class TestOmeZarrIntegration:
 
 
 class TestOmeTiffIntegration:
-    """Integration tests for OME-TIFF files (now handled by AicsImageIoAdapter)."""
+    """Integration tests for OME-TIFF files (now handled by OmeTiffAdapter)."""
 
     def test_tiled_tiff_read(self, tiled_ome_tiff):
         """Test reading from tiled OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-integration")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -421,11 +421,11 @@ class TestOmeTiffIntegration:
 
     def test_channel_access(self, tiled_ome_tiff):
         """Test accessing different channels through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_shape, tile_info = tiled_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "ome-tiff-channels")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
         descriptors = adapter.list_tensor_descriptors()
@@ -473,7 +473,7 @@ class TestOmeTiffIntegration:
         descriptor, physical scale, and pixels -- is served from tifffile.
         """
         import tifffile
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         class _Tripwire:
             def __getattr__(self, name):
@@ -495,7 +495,7 @@ class TestOmeTiffIntegration:
                 "PhysicalSizeYUnit": "µm",
             },
         )
-        adapter = AicsImageIoAdapter.create_from_url(path, "ome213")
+        adapter = OmeTiffAdapter.create_from_url(path, "ome213")
         array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
 
         server = TensorFlightServer("grpc://localhost:0")
@@ -522,15 +522,15 @@ class TestOmeTiffIntegration:
 
 
 class TestMultiSeriesOmeTiffIntegration:
-    """Integration tests for multi-series OME-TIFF with server/client (now handled by AicsImageIoAdapter)."""
+    """Integration tests for multi-series OME-TIFF with server/client (now handled by OmeTiffAdapter)."""
 
     def test_multi_series_list_tensors(self, multi_series_ome_tiff):
         """Test listing all series as tensors in multi-series OME-TIFF."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-test")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-test")
 
         # List all tensors (series)
         descriptors = adapter.list_tensor_descriptors()
@@ -542,11 +542,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_multi_series_tensor_access(self, multi_series_ome_tiff):
         """Test accessing specific series via get_tensor_adapter."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-access")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
         descriptors = adapter.list_tensor_descriptors()
@@ -564,11 +564,11 @@ class TestMultiSeriesOmeTiffIntegration:
 
     def test_multi_series_server_client(self, multi_series_ome_tiff):
         """Test reading from multi-series OME-TIFF through server."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "multi-series-server")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "multi-series-server")
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("multi-series-server", adapter)
@@ -609,11 +609,11 @@ class TestMultiSeriesOmeTiffIntegration:
     def test_lazy_tile_loading(self, multi_series_ome_tiff):
         """Test that aicsimageio provides tile-level lazy loading."""
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         tiff_path, fixture_series_names, series_info = multi_series_ome_tiff
 
-        adapter = AicsImageIoAdapter.create_from_url(tiff_path, "lazy-tile-test")
+        adapter = OmeTiffAdapter.create_from_url(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
         descriptors = adapter.list_tensor_descriptors()
@@ -671,12 +671,12 @@ class TestCompanionOmeIntegration:
     def test_companion_data_access(self, companion_ome_dataset):
         """Test reading data from companion OME dataset."""
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
 
         companion_path, tiff_files, metadata_info = companion_ome_dataset
 
         # Create adapter from companion file
-        adapter = AicsImageIoAdapter.create_from_url(companion_path, "companion-test")
+        adapter = OmeTiffAdapter.create_from_url(companion_path, "companion-test")
 
         # Get first series
         descriptors = adapter.list_tensor_descriptors()
