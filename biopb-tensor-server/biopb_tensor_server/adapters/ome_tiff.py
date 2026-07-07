@@ -628,6 +628,17 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                         # A non-OME axis (Q/I): decline the whole source.
                         return None
                     dim_labels, shape = mapped
+                    # Page-aligned transfer grid: one whole plane per chunk --
+                    # series.aszarr(chunkmode="page").chunks in canonical order
+                    # (full Y/X and RGB samples S, 1 elsewhere). This is the read
+                    # path's native unit, so a plane read transfers one plane rather
+                    # than the 64 MiB-packed default the server derives from an empty
+                    # chunk_shape. A >cap single plane is still re-split at read-plan
+                    # time (base.get_chunk_size -> _get_read_plan).
+                    chunk_shape = [
+                        n if d in ("Y", "X", "S") else 1
+                        for d, n in zip(dim_labels, shape)
+                    ]
                     descriptors.append(
                         TensorDescriptor(
                             # Identity policy: array_id = source_id/field; the
@@ -635,7 +646,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                             array_id=f"{self.source_id}/{scene_ids[i]}",
                             dim_labels=dim_labels,
                             shape=shape,
-                            chunk_shape=[],  # call get_flight_info for chunk info
+                            chunk_shape=chunk_shape,
                             dtype=s.dtype.str,
                         )
                     )
@@ -764,6 +775,16 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                 canonical != tuple(self._tifffile_descriptor.shape)
                 or za.dtype.str != self._tifffile_descriptor.dtype
             ):
+                # Not this scene's store: close the fresh store + file handle
+                # before bailing. The success path stashes them below for reuse;
+                # the reject path must not leak the open fd.
+                for obj in (store, tiff):
+                    try:
+                        obj.close()
+                    except Exception:
+                        logger.debug(
+                            "error closing rejected aszarr store", exc_info=True
+                        )
                 return None
         except Exception:
             tiff.close()

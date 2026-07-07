@@ -176,6 +176,80 @@ class TestFastPathParity:
         assert adapter.list_tensor_descriptors() is descriptors
 
 
+class TestPageAlignedChunkShape:
+    """The advertised chunk_shape is the page grid -- one whole plane per chunk,
+    i.e. series.aszarr(chunkmode="page").chunks mapped onto canonical dim_labels
+    (biopb/biopb#8). Recovers the fine read granularity a small OME-TIFF lost when
+    the read path stopped advertising aicsimageio's per-(T,C) grid.
+    """
+
+    def _za_page_chunks_canonical(self, path, dim_labels):
+        import tifffile
+        import zarr
+
+        with tifffile.TiffFile(path) as tf:
+            s = tf.series[0]
+            za = zarr.open(s.aszarr(level=0, chunkmode="page"), mode="r")
+            by_axis = {ax: int(c) for ax, c in zip(str(s.axes), za.chunks)}
+        return [by_axis.get(d, 1) for d in dim_labels]
+
+    def test_chunk_shape_is_page_grid(self, tmp_path):
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
+        desc = OmeTiffAdapter(path, "pg").list_tensor_descriptors()[0]
+        # 1 on every non-spatial axis, full Y/X -- one plane per chunk.
+        assert list(desc.chunk_shape) == [1, 1, 1, 64, 64]
+        # And that grid IS za.chunks(page) mapped to canonical order.
+        assert list(desc.chunk_shape) == self._za_page_chunks_canonical(
+            path, list(desc.dim_labels)
+        )
+
+    def test_page_grid_ignores_internal_tiling(self, tmp_path):
+        import tifffile
+
+        p = tmp_path / "tiled.ome.tif"
+        tifffile.imwrite(
+            str(p),
+            np.random.randint(0, 9, (2, 128, 128), np.uint16),
+            metadata={"axes": "CYX"},
+            tile=(32, 32),
+        )
+        desc = OmeTiffAdapter(str(p), "tl").list_tensor_descriptors()[0]
+        # Whole plane per chunk despite the 32x32 internal tiling (chunkmode="page").
+        assert list(desc.chunk_shape) == [1, 1, 1, 128, 128]
+
+
+class TestOpenStoreFdHygiene:
+    """The store-open reject path must not leak file descriptors: the success
+    path stashes the handle for reuse, so the descriptor-mismatch path has to
+    close the freshly-opened store + TiffFile itself before bailing.
+    """
+
+    def test_shape_mismatch_closes_store_and_tiff(self, tmp_path, monkeypatch):
+        import tifffile
+
+        path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
+
+        opened = []
+        real_tifffile = tifffile.TiffFile
+
+        def spy(*a, **k):
+            tf = real_tifffile(*a, **k)
+            opened.append(tf)
+            return tf
+
+        monkeypatch.setattr(tifffile, "TiffFile", spy)
+
+        source = OmeTiffAdapter(path, "x")
+        scene = source.get_tensor_adapter("Image:0")
+        # Force the correctness gate to reject: descriptor shape != store shape.
+        scene._tifffile_descriptor.shape[:] = [9, 9, 9, 9, 9]
+
+        opened.clear()  # track only the rejected _open_store open
+        assert scene._open_store() is None
+        assert opened, "expected _open_store to open a TiffFile"
+        assert all(tf.filehandle.closed for tf in opened)
+
+
 class TestRgbSamplesDescriptor:
     """An RGB (YXS / photometric-rgb) OME-TIFF must yield a descriptor whose
     dim_labels and shape agree in length.
