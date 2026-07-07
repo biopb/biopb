@@ -183,7 +183,7 @@ class EmbeddedTensorCache:
         # that receives this SerializedTensor (carried in its auth_token). The
         # embedded server runs writable=False and writes happen in-process, so
         # this token gates read-back without a server-wide secret.
-        adapter.token = secrets.token_urlsafe(32)
+        adapter.capability_token = secrets.token_urlsafe(32)
         self._server.register_source(source_id, adapter)
         self._server.initialize_upload(source_id, array_template.shape, chunk_shape)
         return source_id, array_template, chunk_shape
@@ -206,7 +206,7 @@ class EmbeddedTensorCache:
             chunk_shape=chunk_shape,
             dim_labels=dim_labels,
             location=self._external_location,
-            auth_token=self._server._get_source_adapter(source_id).token,
+            auth_token=self._server._get_source_adapter(source_id).capability_token,
         )
 
     def upload_array_chunks(
@@ -296,7 +296,7 @@ class EmbeddedTensorCache:
         serialized = SerializedTensor(
             tensor_descriptor=descriptor,
             location=self._external_location,
-            auth_token=adapter.token or "",
+            auth_token=adapter.capability_token or "",
             endpoints=endpoints,
         )
 
@@ -349,7 +349,7 @@ def _start_embedded_tensor_cache(
 
     # Read-only over Flight: results are written in-process (adapter.write_chunk),
     # so the Flight write path (do_put / create_source) is pure attack surface here.
-    # Read-back is gated by per-source capability tokens (adapter.token).
+    # Read-back is gated by per-source capability tokens (adapter.capability_token).
     tensor_server = TensorFlightServer(
         location,
         writable=False,
