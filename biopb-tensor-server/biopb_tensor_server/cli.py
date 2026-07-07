@@ -22,7 +22,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
-from biopb_tensor_server.adapters.aicsimageio import set_claim_generic_images
+from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 from biopb_tensor_server.config import (

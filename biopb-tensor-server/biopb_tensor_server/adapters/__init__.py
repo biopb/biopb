@@ -28,9 +28,9 @@ try:
 except ImportError:
     NdTiffAdapter = None  # type: ignore
 
-# Optional aicsimageio adapters (format-specific subclasses)
+# Optional bioio adapters (format-specific subclasses)
 try:
-    from .aicsimageio import (
+    from .bioio import (
         AicsImageIoAdapter,
         BioformatsAdapter,
         DvAdapter,
@@ -99,7 +99,7 @@ def get_default_registry() -> AdapterRegistry:
     - OlympusAdapter - Olympus OIF/OIB files
     - BioformatsAdapter - Legacy Bio-Formats-only formats (ZVI, ...; requires the
       optional bioformats component)
-    - AicsImageIoAdapter - Fallback for other aicsimageio-supported formats
+    - AicsImageIoAdapter - Fallback for other bioio-supported formats
     - OmeZarrAdapter - OME-Zarr specific (handles both single images and HCS plates)
     - ZarrAdapter - Generic Zarr fallback
     - NdTiffAdapter - Micro-Manager NDTiff storage (NDTiff.index + NDTiffStack_*.tif)
@@ -115,12 +115,12 @@ def get_default_registry() -> AdapterRegistry:
     """
     registry = AdapterRegistry()
 
-    # Pure-tifffile OME-TIFF adapter first, so it wins for a local OME-TIFF; a
-    # remote/exotic .tif it declines falls through to the generic aicsimageio
-    # adapter registered below (no aicsimageio dependency, so always available).
+    # Pure-tifffile OME-TIFF adapter first (no bioio dependency, so always
+    # available), so it wins for a local OME-TIFF; a remote/exotic .tif it
+    # declines falls through to the generic bioio adapter registered below.
     registry.register_with_type("ome-tiff", OmeTiffAdapter)
 
-    # Register aicsimageio-based adapters in priority order (most specific first)
+    # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:
         registry.register_with_type("zeiss", ZeissAdapter)
     if LeicaAdapter is not None:

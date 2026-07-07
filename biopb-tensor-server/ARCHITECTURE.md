@@ -163,7 +163,7 @@ Concrete adapters:
 | `OmeTiffAdapter` | OME-TIFF (single- and multi-file), pure-tifffile — no aicsimageio |
 | `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
-| `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via aicsimageio |
+| `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via bioio (successor to aicsimageio; per-format `bioio-*` plugins). Module: `adapters/bioio.py` |
 
 ### Chunk caching
 
@@ -379,7 +379,7 @@ Registration order (by priority/specificity, highest first — callers take
    multi-file); pure-tifffile, no aicsimageio dependency
 2. `ZeissAdapter` / `LeicaAdapter` / `NikonAdapter` / `DvAdapter` /
    `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats
-   and the generic aicsimageio fallback (which also picks up a remote or non-OME
+   and the generic bioio fallback (which also picks up a remote or non-OME
    `.tif` that OmeTiffAdapter declines)
 3. `OmeZarrAdapter` (+ HCS) — OME-Zarr multiscales
 4. `ZarrAdapter` — generic Zarr
@@ -390,7 +390,7 @@ Registration order (by priority/specificity, highest first — callers take
 8. `RemoteTensorAdapter` — caching passthrough proxy (explicit `tensor-server`
    type only; never claims a filesystem path)
 
-The optional aicsimageio/ndtiff/dicom/nifti adapters register only when their
+The optional bioio/ndtiff/dicom/nifti adapters register only when their
 dependency is importable, so a slimmer install collapses the list without
 changing the relative order of what remains.
 
@@ -402,7 +402,7 @@ TiffSequenceAdapter makes a *directory*-level claim on plain TIFF stacks and
 Registering OmeTiffAdapter first — together with that exclude — guarantees an
 `.ome.tif` becomes its own OME-TIFF source rather than being welded into a plain
 sequence. OmeTiffAdapter declines a non-OME `.tif` (and any remote/cloud path),
-so those fall through to the generic aicsimageio adapter or the sequence adapter
+so those fall through to the generic bioio adapter or the sequence adapter
 with no regression.
 
 **OME-Zarr before plain Zarr is load-bearing.** A `.zarr` dir can be claimed by

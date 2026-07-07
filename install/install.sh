@@ -977,11 +977,11 @@ install_biopb() {
     # biopb-mcp (always installed) requires Python >= 3.10.
     MIN_MINOR=10
 
-    # Upper bound: the default `aics` extra pulls aicsimageio, which hard-pins
-    # `lxml<5`. No lxml 4.x ships a wheel for CPython >= 3.13, so on a 3.13+
-    # interpreter lxml is built from source — which fails on a fresh machine
-    # without libxml2/libxslt dev headers (the common WSL install failure).
-    # Cap at 3.12, the newest Python with a prebuilt lxml 4.x wheel; if the
+    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
+    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
+    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
+    # libCZI), which fails on a fresh machine without a C++ toolchain. If the
     # system Python is newer we fall back to a uv-managed 3.12 below.
     MAX_MINOR=12
 
@@ -1000,7 +1000,7 @@ install_biopb() {
                 _ok "Using system Python: $(python3 --version)"
                 PYTHON_SPEC=$(command -v python3)
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
-                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (aicsimageio's lxml<5 has no wheel for 3.13+)"
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
                 PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"

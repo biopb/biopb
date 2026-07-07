@@ -1,7 +1,7 @@
 """TIFF sequence adapters for tensor storage.
 
 Handles plain TIFF file sequences and legacy MicroManager datasets.
-OME-TIFF files are handled by the aicsimageio adapter.
+OME-TIFF files are handled by OmeTiffAdapter (pure-tifffile).
 """
 
 import json

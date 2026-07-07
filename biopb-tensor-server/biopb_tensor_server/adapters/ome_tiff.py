@@ -9,7 +9,7 @@ interleaved RGB(A) (a trailing ``S`` samples axis) are both native.
 What this adapter deliberately does NOT handle (there is no aicsimageio fallback):
 
 - **Remote OME-TIFF** -- ``claim`` declines a remote URL, so the generic
-  ``AicsImageIoAdapter`` (which claims ``.tif``) picks it up via aicsimageio.
+  ``AicsImageIoAdapter`` (which claims ``.tif``) picks it up via bioio.
 - **``.companion.ome``** (multi-file OME-TIFF with a separate companion metadata
   file, historically read via bioformats) -- no longer claimed at all.
 - **Truly non-OME axes** (``Q``/``I``) -- ``_ome_axes_shape`` returns ``None`` and
@@ -897,7 +897,7 @@ class OmeTiffAdapter(SourceAdapter, TensorAdapter):
                 # emit a bare <TiffData IFD=.../> with no file list. Claim the file
                 # itself as a single-member source so it takes the pure-tifffile
                 # path (#168 fast-path descriptors + aszarr reads). Without this it
-                # falls through to the generic aicsimageio adapter, which reverts to
+                # falls through to the generic bioio adapter, which reverts to
                 # the full O(planes) OME-model parse #168 exists to avoid.
                 return SourceClaim(
                     source_type=cls.SOURCE_TYPE,

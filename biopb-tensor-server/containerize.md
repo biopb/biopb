@@ -21,13 +21,17 @@ _Pre-built docker image is uploaded to docker hub (docker://jiyuuchc/biopb-tenso
 
 ### Dependency Version Notes
 
-**numpy < 2.0 required**: The tensor server requires `numpy < 2.0` due to compatibility issues with `tifffile` and `aicsimageio`. numpy 2.0+ removed `ndarray.newbyteorder()` which older tifffile versions rely on. This constraint is enforced in `pyproject.toml` and `benchmarks/biopb-bench.def`.
+The tensor server runs on **numpy 2.x**. Two version pins are load-bearing and
+enforced in `pyproject.toml` (see `docs/aicsimageio-to-bioio-migration.md` for
+the full rationale):
 
-If you encounter `AttributeError: 'numpy.ndarray' object has no attribute 'newbyteorder'` when reading TIFF files, ensure numpy is pinned to < 2.0:
+- **`zarr < 3`** — biopb's Zarr/OME-Zarr adapters target the Zarr 2.x API.
+- **`tifffile >= 2024.8.10, < 2025.5.21`** — the lower bound is numpy-2 safe;
+  the upper bound keeps tifffile's `aszarr` store on Zarr 2 (2025.5.21 dropped
+  Zarr 2), which the OME-TIFF read path depends on.
 
-```bash
-pip install "numpy<2.0"
-```
+Vendor microscopy formats (CZI, LIF, ND2, DV, …) are read via **bioio** (the
+maintained successor to aicsimageio), installed through the `[aics]` extra.
 
 ### Step 1: Build Wheel Locally
 
@@ -266,20 +270,21 @@ Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since
 | OME-TIFF | `.ome.tiff`, `.ome.tif` | Single- and multi-file; native (`tifffile`) |
 | TIFF | `.tif`, `.tiff` | Standard TIFF and TIFF sequences; native |
 | Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
-| Zeiss | `.czi`, `.lsm` | Native (`aicspylibczi`; `.lsm` via `tifffile`) |
-| Leica | `.lif` | Native (`readlif`) |
-| Nikon | `.nd2` | Native (`aicsimageio[nd2]`) |
-| DeltaVision | `.dv` | Native (`aicsimageio[dv]`) |
-| Olympus | `.oif`, `.oib` | Native (`aicsimageio`) |
-| Imaris | `.ims` | Native (`aicsimageio`) |
+| Zeiss | `.czi`, `.lsm` | Native (`bioio-czi`; `.lsm` via `tifffile`) |
+| Leica | `.lif` | Native (`bioio-lif`) |
+| Nikon | `.nd2` | Native (`bioio-nd2`) |
+| DeltaVision | `.dv` | Native (`bioio-dv`) |
+| Olympus | `.oif`, `.oib` | Java Bio-Formats (`bioio-bioformats`) |
+| Imaris | `.ims` | Java Bio-Formats (`bioio-bioformats`) |
 | HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
 | DICOM | `.dcm` | Single files and multi-file series; native (`pydicom`) |
 | NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
-| Zeiss (legacy) | `.zvi` | No native Python reader — bundled Java Bio-Formats (`bioformats-jar`) |
+| Zeiss (legacy) | `.zvi` | No native Python reader — Java Bio-Formats (`bioio-bioformats`) |
 
-Other formats are also handled but omitted here for brevity: additional
-Bio-Formats types (`.lei`, `.vsi`) and assorted scientific/image formats via the
-`aicsimageio` fallback.
+Vendor readers are provided by **bioio** (successor to aicsimageio), each as its
+own `bioio-*` plugin. Other formats are also handled but omitted here for
+brevity: additional Bio-Formats types (`.lei`, `.vsi`) and assorted
+scientific/image formats via the generic bioio fallback.
 
 ## Troubleshooting
 

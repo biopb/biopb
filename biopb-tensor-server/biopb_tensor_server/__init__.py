@@ -14,6 +14,9 @@ Note: This package is not distributed via PyPI. Install locally with:
 """
 
 from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
+
+# OME-TIFF is pure-tifffile (always available); it lives in its own module.
+from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.tiff import (
     MicroManagerLegacyAdapter,
@@ -21,19 +24,17 @@ from biopb_tensor_server.adapters.tiff import (
 )
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
-# Optional aicsimageio adapters
+# Optional bioio vendor-format adapters (installed via the [aics] extra)
 try:
-    from biopb_tensor_server.adapters.aicsimageio import (
+    from biopb_tensor_server.adapters.bioio import (
         AicsImageIoAdapter,
         DvAdapter,
         LeicaAdapter,
         NikonAdapter,
         OlympusAdapter,
-        OmeTiffAdapter,
         ZeissAdapter,
     )
 except ImportError:
-    OmeTiffAdapter = None  # type: ignore
     ZeissAdapter = None  # type: ignore
     LeicaAdapter = None  # type: ignore
     NikonAdapter = None  # type: ignore

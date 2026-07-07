@@ -107,7 +107,7 @@ class TestOmeSceneIds:
 class _Tripwire:
     """Stand-in for AICSImage that fails on ANY attribute access.
 
-    Installed in place of ``adapter._aics_image`` to prove the registration
+    Installed in place of ``adapter._bio_image`` to prove the registration
     (descriptor) path never touches aicsimageio -- the whole point of the fix.
     """
 
@@ -117,10 +117,10 @@ class _Tripwire:
 
 class TestFastPathParity:
     def _aics_truth(self, path):
-        """The descriptor aicsimageio would produce: (scene_id, shape, dtype)."""
-        from aicsimageio import AICSImage
+        """The descriptor the bioio reader would produce: (scene_id, shape, dtype)."""
+        from bioio import BioImage
 
-        img = AICSImage(path)
+        img = BioImage(path)
         out = []
         for i, scene in enumerate(img.scenes):
             img.set_scene(i)
@@ -163,7 +163,7 @@ class TestFastPathParity:
         # AICSImage (the ome-types parse is the startup cost being removed).
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
         adapter = OmeTiffAdapter(path, "noparse")
-        adapter._aics_image = _Tripwire()
+        adapter._bio_image = _Tripwire()
 
         descriptors = adapter.list_tensor_descriptors()
 
@@ -542,7 +542,7 @@ class TestFastMetadata:
                 hits.append(n)
                 return None
 
-        adapter._aics_image = Recorder()
+        adapter._bio_image = Recorder()
         md = adapter.get_metadata()
 
         assert hits == [], f"AICSImage accessed in get_metadata: {hits}"
@@ -584,47 +584,6 @@ class TestFallback:
         assert adapter._tifffile_descriptors() is None
 
 
-class TestOmeParseDedup:
-    """The OME parse is shared across aicsimageio's redundant probes (#192)."""
-
-    def test_get_ome_is_memoized(self):
-        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
-
-        get_ome = OmeTiffReader.__dict__["_get_ome"]
-        assert getattr(get_ome.__func__, "_biopb_dedup", False), (
-            "OmeTiffReader._get_ome should be wrapped by _install_ome_parse_dedup"
-        )
-
-    def test_construction_parses_ome_xml_once_not_three_times(self, tmp_path):
-        # Stock aicsimageio parses the OME-XML 3x per OME-TIFF construction
-        # (determine_reader probe + reader _is_supported probe + stored _ome).
-        # The dedup memo collapses them to a single from_xml.
-        import aicsimageio.readers.ome_tiff_reader as omr
-        from aicsimageio import AICSImage
-        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
-
-        # Drop any shared-cache entry so this fixture's XML is a real miss.
-        OmeTiffReader.__dict__["_get_ome"].__func__.cache_clear()
-
-        calls = {"n": 0}
-        real_from_xml = omr.from_xml
-
-        def counting_from_xml(*args, **kwargs):
-            calls["n"] += 1
-            return real_from_xml(*args, **kwargs)
-
-        omr.from_xml = counting_from_xml
-        try:
-            path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 32, 32))
-            img = AICSImage(path)
-            assert type(img.reader).__name__ == "OmeTiffReader"
-            assert len(img.scenes) == 1  # force the model to be fully built
-        finally:
-            omr.from_xml = real_from_xml
-
-        assert calls["n"] == 1, f"expected a single OME parse, got {calls['n']}"
-
-
 class TestReadPathTifffileAuthoritative:
     """The OME-TIFF read path is pure tifffile (biopb/biopb#213 + detachment).
 
@@ -632,7 +591,7 @@ class TestReadPathTifffileAuthoritative:
     metadata, and physical scale come from tifffile / the embedded OME-XML.
     Correctness is asserted as internal consistency of the tifffile store (data
     matches its descriptor; sub-regions are correct; ragged gaps are
-    deterministic), and that the adapter never grows an ``_aics_image``.
+    deterministic), and that the adapter never grows an ``_bio_image``.
     """
 
     def _scene(self, path, source_id, field="Image:0"):
@@ -654,7 +613,7 @@ class TestReadPathTifffileAuthoritative:
 
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
         _, scene = self._scene(path, "pure")
-        assert not hasattr(scene, "_aics_image")
+        assert not hasattr(scene, "_bio_image")
 
         plan = scene.plan_flight_info(TensorReadOption(), PyramidConfig())
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]

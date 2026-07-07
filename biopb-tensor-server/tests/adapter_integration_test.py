@@ -466,7 +466,7 @@ class TestOmeTiffIntegration:
         """biopb/biopb#213: end-to-end, GetFlightInfo + DoGet over a registered
         OME-TIFF must not trigger AICSImage's OME parse.
 
-        A tripwire is installed on the registered adapter's ``_aics_image`` AFTER
+        A tripwire is installed on the registered adapter's ``_bio_image`` AFTER
         registration, then a full client round-trip drives GetFlightInfo (via the
         #350 ``plan_flight_info`` seam, which also fills the physical scale) and
         DoGet. Physical scale carries real units, proving the whole chain --
@@ -501,7 +501,7 @@ class TestOmeTiffIntegration:
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("ome213", adapter)
         server.mark_ready()
-        adapter._aics_image = _Tripwire()  # any OME parse from here is a failure
+        adapter._bio_image = _Tripwire()  # any OME parse from here is a failure
         try:
             client = TensorFlightClient(
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
@@ -840,7 +840,7 @@ class TestAicsImageIoAdapterClaim:
 
     def test_claim_generic_files_rejected(self):
         """Generic file types (txt, csv, cfg) should not be claimed."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -857,7 +857,7 @@ class TestAicsImageIoAdapterClaim:
 
     def test_microscopy_files_always_claimed(self):
         """Microscopy/scientific extensions are claimed regardless of the flag."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -875,7 +875,7 @@ class TestAicsImageIoAdapterClaim:
     def test_generic_images_rejected_by_default(self):
         """Generic raster/video must NOT be claimed during discovery by default
         (biopb/biopb#40) — they flood the catalog with screenshots/icons/movies."""
-        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
         from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -893,7 +893,7 @@ class TestAicsImageIoAdapterClaim:
 
     def test_generic_images_claimed_when_opted_in(self):
         """With claim_generic_images enabled, generic raster/video are claimed."""
-        from biopb_tensor_server.adapters.aicsimageio import (
+        from biopb_tensor_server.adapters.bioio import (
             AicsImageIoAdapter,
             set_claim_generic_images,
         )

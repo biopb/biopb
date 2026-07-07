@@ -1241,7 +1241,7 @@ def detect_source_type(url: str) -> Optional[str]:
     if path.is_file():
         name = path.name.lower()
 
-        # aicsimageio-supported vendor formats
+        # bioio-supported vendor formats
         aics_extensions = [
             ".czi",
             ".lif",
@@ -1477,7 +1477,7 @@ def _discover_by_type(
                         )
 
     elif source_type == "aics":
-        # Discover aicsimageio-supported files (one source per file)
+        # Discover bioio-supported files (one source per file)
         aics_extensions = ["*.czi", "*.lif", "*.nd2", "*.dv", "*.lsm"]
         for pattern in aics_extensions:
             for file_path in sorted(path.glob(pattern)):

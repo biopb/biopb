@@ -1,7 +1,10 @@
-"""AICSImageIO adapters for vendor microscopy formats.
+"""bioio adapters for vendor microscopy formats.
 
 This module provides a base class and format-specific subclasses for reading
-various microscopy formats through aicsimageio's AICSImage class.
+various microscopy formats through bioio's BioImage class. bioio is the
+maintained successor to aicsimageio (its API is a near drop-in); each vendor
+reader ships as its own ``bioio-*`` plugin, so a slimmer install pulls only the
+formats it needs. See docs/aicsimageio-to-bioio-migration.md.
 
 Format-specific subclasses provide meaningful source_type values:
 - ZeissAdapter: "zeiss" (CZI, LSM)
@@ -36,62 +39,14 @@ from biopb_tensor_server.discovery import ClaimContext, SourceClaim
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from aicsimageio import AICSImage
+    from bioio import BioImage
 
     from biopb_tensor_server.base import BackendAdapter
     from biopb_tensor_server.config import SourceConfig
     from biopb_tensor_server.discovery import DiscoveryState
 
 
-def _install_ome_parse_dedup() -> None:
-    """Collapse aicsimageio's 3x redundant OME-XML parse at OME-TIFF construction.
-
-    Building an ``AICSImage`` for an OME-TIFF parses the embedded OME model THREE
-    times -- ``determine_reader``'s support probe, ``OmeTiffReader``'s own
-    ``_is_supported_image`` probe, and the stored ``self._ome`` -- each an
-    ``ome_types.from_xml`` over the full model. For a 40k-plane MMStack that parse
-    is ~27 s, so the redundancy is ~3x the dominant registration cost and the bulk
-    of the startup tail (biopb/biopb#192). cProfile attributes ~100% of the ~80 s
-    construction to these parses; the tifffile IFD walk is ~2.5 s by comparison.
-
-    All three call sites pass the identical ``tiff.pages[0].description`` string,
-    so a tiny LRU on ``OmeTiffReader._get_ome`` makes them share a single parse
-    (measured 80 s -> 27 s, ~3x, scenes byte-identical). It is deliberately NOT a
-    forced ``AICSImage(reader=OmeTiffReader)``: ``determine_reader``'s probe is what
-    falls back to ``TiffReader`` when the OME does not validate (e.g. a MicroManager
-    file with a degenerate self-closing ``<BinData/>``, biopb/biopb#199), and a
-    parse that *raises* is not cached, so that fallback path is unchanged.
-
-    Idempotent and best-effort: a guard prevents double-wrapping and any aicsimageio
-    layout change just leaves the stock (slower) parse in place.
-    """
-    try:
-        from aicsimageio.readers.ome_tiff_reader import OmeTiffReader
-    except Exception:  # pragma: no cover - aicsimageio is a hard dep in practice
-        return
-    current = OmeTiffReader.__dict__.get("_get_ome")
-    if current is None or getattr(current.__func__, "_biopb_dedup", False):
-        return
-
-    import functools
-
-    original = current.__func__  # unwrap the staticmethod
-
-    # maxsize=2 holds at most the in-flight file's model (registration is serial;
-    # a concurrent rescan adds at most one more) so memory stays bounded -- the
-    # parsed OME is already retained for the source's lifetime via the reader.
-    @functools.lru_cache(maxsize=2)
-    def _get_ome_cached(ome_xml: str, clean_metadata: bool = True):
-        return original(ome_xml, clean_metadata)
-
-    _get_ome_cached._biopb_dedup = True
-    OmeTiffReader._get_ome = staticmethod(_get_ome_cached)
-
-
-_install_ome_parse_dedup()
-
-
-# Canonical OME dimension order. The aicsimageio scene-listing path uses it to
+# Canonical OME dimension order. The scene-listing path uses it to
 # detect a plain TCZYX source (which it can shape from OME Pixels) versus an
 # RGB/samples one it must defer to scene switching.
 _CANONICAL_DIMS = "TCZYX"
@@ -186,11 +141,11 @@ def _claim_extensions() -> frozenset:
     return MICROSCOPY_EXTENSIONS
 
 
-class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
-    """Base adapter for aicsimageio-supported vendor formats.
+class _BioioAdapterBase(SourceAdapter, TensorAdapter):
+    """Base adapter for bioio-supported vendor formats.
 
     This base class provides full functionality for reading microscopy data
-    through aicsimageio's AICSImage class. Subclasses implement claim() with
+    through bioio's BioImage class. Subclasses implement claim() with
     format-specific detection and provide meaningful source_type values.
 
     Dual-role adapter:
@@ -201,7 +156,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
     Each scene is identified by its scene_id from img.scenes.
 
     Supports lazy loading via dask arrays.
-    Supports remote storage via fsspec (passes fs_kwargs to AICSImage).
+    Supports remote storage via fsspec (passes fs_kwargs to BioImage).
     """
 
     # Class-level source type (override in subclasses)
@@ -215,7 +170,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         cls,
         source: "SourceConfig",
         credentials_config: Optional[Any] = None,
-    ) -> "_AicsImageIoAdapterBase":
+    ) -> "_BioioAdapterBase":
         """Create source-level adapter instance from SourceConfig.
 
         Args:
@@ -225,7 +180,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         Returns:
             Adapter instance (source-level, scene_index=None)
         """
-        from aicsimageio import AICSImage
+        from bioio import BioImage
 
         if source.is_remote:
             # Remote storage: resolve storage_options for fsspec authentication
@@ -235,12 +190,12 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 if profile:
                     storage_options = profile.to_storage_options()
 
-            # Note: aicsimageio's OmeZarrReader has a gap where fs_kwargs
-            # are not passed to ome-zarr-py. For OME-Zarr, use OmeZarrAdapter instead.
-            img = AICSImage(source.url, fs_kwargs=storage_options)
+            # Note: for OME-Zarr, use OmeZarrAdapter (which threads fs_kwargs
+            # through to zarr) rather than bioio's OME-Zarr reader.
+            img = BioImage(source.url, fs_kwargs=storage_options)
         else:
             # Local filesystem
-            img = AICSImage(str(source.url))
+            img = BioImage(str(source.url))
 
         return cls(
             img,
@@ -252,17 +207,17 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
 
     def __init__(
         self,
-        aics_image: "AICSImage",
+        bio_image: "BioImage",
         scene_index: Optional[int],
         source_id: str,
         dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
-        """Initialize AICSImageIO adapter.
+        """Initialize bioio adapter.
 
         Args:
-            aics_image: AICSImage instance
+            bio_image: BioImage instance
             scene_index: None for source-level, int for scene-level
             source_id: Unique identifier for this data source
             dim_labels: Optional dimension labels (overrides auto-detected dims)
@@ -271,7 +226,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                      adapters create a new lock if None; scene-level adapters
                      receive the lock from the source-level adapter.
         """
-        self._aics_image = aics_image
+        self._bio_image = bio_image
         self.scene_index = scene_index
         self.source_id = source_id
 
@@ -285,8 +240,8 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # Source-level metadata for DataSourceDescriptor
         if source_url:
             self._source_url = source_url
-        elif hasattr(aics_image, "source") and hasattr(aics_image.source, "path"):
-            self._source_url = str(aics_image.source.path)
+        elif hasattr(bio_image, "source") and hasattr(bio_image.source, "path"):
+            self._source_url = str(bio_image.source.path)
         else:
             self._source_url = ""
         self._source_type = self.SOURCE_TYPE
@@ -294,18 +249,18 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         self._dask_data = None  # scene-level dask array, bound below
         self._cached_descriptors = None  # cached on first list_tensor_descriptors
         if scene_index is not None:
-            # Scene-level: bind this scene's aicsimageio dask array eagerly.
-            self._aics_image.set_scene(scene_index)
-            self._dask_data = self._aics_image.dask_data
+            # Scene-level: bind this scene's bioio dask array eagerly.
+            self._bio_image.set_scene(scene_index)
+            self._dask_data = self._bio_image.dask_data
             self.dim_labels = (
-                dim_labels if dim_labels else list(self._aics_image.dims.order)
+                dim_labels if dim_labels else list(self._bio_image.dims.order)
             )
         else:
             # Source-level: no bound reader; dim_labels is the default for scenes.
             self.dim_labels = dim_labels
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds from this scene's aicsimageio dask array.
+        """Read data within bounds from this scene's bioio dask array.
 
         Args:
             bounds: Chunk bounds (start, stop coordinates per axis)
@@ -325,9 +280,9 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             return self._dask_data[slices].compute()
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return TensorDescriptor for this adapter (aicsimageio).
+        """Return TensorDescriptor for this adapter (bioio).
 
-        Scene-level (scene_index set): computed from the aicsimageio dask array.
+        Scene-level (scene_index set): computed from the bioio dask array.
         Source-level (scene_index=None): the first scene's descriptor.
         """
         if self.scene_index is not None:
@@ -344,7 +299,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         return self.list_tensor_descriptors()[0]
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """List all tensors (scenes) available in this source via aicsimageio.
+        """List all tensors (scenes) available in this source via bioio.
 
         Uses OME metadata for shapes without scene switching when possible, else
         falls back to per-scene switching. Chunk info is NOT populated -- clients
@@ -358,11 +313,11 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             return self._cached_descriptors
 
         descriptors = []
-        scene_ids = list(self._aics_image.scenes)
+        scene_ids = list(self._bio_image.scenes)
 
         # Try OME metadata first (much faster - no scene switching)
         try:
-            ome_meta = self._aics_image.ome_metadata
+            ome_meta = self._bio_image.ome_metadata
             if (
                 ome_meta is not None
                 and hasattr(ome_meta, "images")
@@ -371,11 +326,11 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 labels = (
                     list(self.dim_labels)
                     if self.dim_labels
-                    else list(self._aics_image.dims.order)
+                    else list(self._bio_image.dims.order)
                 )
                 # The OME-pixels shape below is canonical 5-D TCZYX. It only
                 # agrees with `labels` when the image really is plain TCZYX. An
-                # RGB/samples source reports dims.order "TCZYXS" (aicsimageio
+                # RGB/samples source reports dims.order "TCZYXS" (bioio
                 # folds the interleaved samples into a trailing S axis, and its
                 # dask shape carries C=1,S=3 where OME reports C=3,no-S), so the
                 # 5-D shape would disagree with the 6 labels and yield a
@@ -387,8 +342,8 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                     # Get dtype from first scene (assumed consistent). Kept inside
                     # the canonical guard so a deferred RGB/samples source does not
                     # pay for a scene switch it will redo in the fallback below.
-                    self._aics_image.set_scene(scene_ids[0])
-                    dtype = self._aics_image.dask_data.dtype.str
+                    self._bio_image.set_scene(scene_ids[0])
+                    dtype = self._bio_image.dask_data.dtype.str
 
                     # Get shapes from OME metadata (no scene switching)
                     # OME images are in same order as img.scenes
@@ -422,8 +377,8 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         # Fallback: scene switching (slower but always works)
         if not descriptors:
             for scene_id in scene_ids:
-                self._aics_image.set_scene(scene_id)
-                dask_data = self._aics_image.dask_data
+                self._bio_image.set_scene(scene_id)
+                dask_data = self._bio_image.dask_data
 
                 descriptors.append(
                     TensorDescriptor(
@@ -432,7 +387,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                         array_id=f"{self.source_id}/{scene_id}",
                         dim_labels=self.dim_labels
                         if self.dim_labels
-                        else list(self._aics_image.dims.order),
+                        else list(self._bio_image.dims.order),
                         shape=list(dask_data.shape),
                         chunk_shape=[],  # Not populated - call get_flight_info for chunk info
                         dtype=dask_data.dtype.str,
@@ -447,10 +402,10 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         """Resolve a within-source scene field to its integer scene index.
 
         Prefers the cached descriptor order (biopb/biopb#168) so a read does NOT
-        re-enumerate ``AICSImage.scenes`` -- which would trigger the OME-XML
+        re-enumerate ``BioImage.scenes`` -- which would trigger the OME-XML
         object parse the fast path avoided at registration. The cached
         descriptors are in series/scene order, so the position IS the scene
-        index, and aicsimageio's ``set_scene`` takes that int directly. Falls
+        index, and bioio's ``set_scene`` takes that int directly. Falls
         back to enumerating scenes when no descriptors are cached (e.g. a read
         without a prior list_tensor_descriptors).
         """
@@ -459,7 +414,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 if self._within_source_field(d.array_id) == field:
                     return i
             raise ValueError(f"Unknown scene: {field}")
-        scene_ids = list(self._aics_image.scenes)
+        scene_ids = list(self._bio_image.scenes)
         try:
             return scene_ids.index(field)
         except ValueError:
@@ -475,7 +430,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             Adapter for the specified scene, with tensor context set
         """
         # Populate _cached_descriptors before resolving the scene index. Idempotent
-        # (cached), and it closes the latent list(self._aics_image.scenes) parse in
+        # (cached), and it closes the latent list(self._bio_image.scenes) parse in
         # _scene_index_for_field for a read that skipped registration.
         self.list_tensor_descriptors()
 
@@ -494,7 +449,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             self._tensor_adapters = {}
 
         adapter = self.__class__(
-            self._aics_image,
+            self._bio_image,
             scene_index=scene_idx,
             source_id=self.source_id,
             dim_labels=self.dim_labels,
@@ -508,13 +463,13 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         return adapter
 
     def get_metadata(self) -> dict:
-        """Return OME metadata as a dict (aicsimageio ``ome_metadata`` model_dump).
+        """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
 
         Returns:
             OME metadata as dict, or empty dict if unavailable.
         """
         try:
-            ome_meta = self._aics_image.ome_metadata
+            ome_meta = self._bio_image.ome_metadata
             if ome_meta is None:
                 return {}
 
@@ -537,7 +492,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
             return {}
 
     def _physical_scale(self):
-        """Per-dim physical pixel size + unit from the aicsimageio OME model.
+        """Per-dim physical pixel size + unit from the bioio OME model.
 
         Reads ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}`` directly
         (no full ``model_dump``) and maps onto ``dim_labels`` by axis label. T/C
@@ -545,7 +500,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         See ``TensorAdapter._physical_scale``.
         """
         try:
-            ome = self._aics_image.ome_metadata
+            ome = self._bio_image.ome_metadata
             if ome is None or not getattr(ome, "images", None):
                 return None
 
@@ -568,7 +523,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
                 "z": (px.physical_size_z, _unit(px.physical_size_z_unit)),
             }
 
-            labels = self.dim_labels or list(self._aics_image.dims.order)
+            labels = self.dim_labels or list(self._bio_image.dims.order)
             scale, unit = [], []
             for lab in labels:
                 v, u = by_label.get(str(lab).lower(), (None, ""))
@@ -594,7 +549,7 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
 # =============================================================================
 
 
-class ZeissAdapter(_AicsImageIoAdapterBase):
+class ZeissAdapter(_BioioAdapterBase):
     """Adapter for Zeiss microscopy files (CZI and LSM)."""
 
     SOURCE_TYPE = "zeiss"
@@ -616,7 +571,7 @@ class ZeissAdapter(_AicsImageIoAdapterBase):
         return None
 
 
-class LeicaAdapter(_AicsImageIoAdapterBase):
+class LeicaAdapter(_BioioAdapterBase):
     """Adapter for Leica LIF files."""
 
     SOURCE_TYPE = "leica"
@@ -638,7 +593,7 @@ class LeicaAdapter(_AicsImageIoAdapterBase):
         return None
 
 
-class NikonAdapter(_AicsImageIoAdapterBase):
+class NikonAdapter(_BioioAdapterBase):
     """Adapter for Nikon ND2 files."""
 
     SOURCE_TYPE = "nikon"
@@ -660,7 +615,7 @@ class NikonAdapter(_AicsImageIoAdapterBase):
         return None
 
 
-class DvAdapter(_AicsImageIoAdapterBase):
+class DvAdapter(_BioioAdapterBase):
     """Adapter for DeltaVision DV files."""
 
     SOURCE_TYPE = "dv"
@@ -682,7 +637,7 @@ class DvAdapter(_AicsImageIoAdapterBase):
         return None
 
 
-class OlympusAdapter(_AicsImageIoAdapterBase):
+class OlympusAdapter(_BioioAdapterBase):
     """Adapter for Olympus OIF and OIB files."""
 
     SOURCE_TYPE = "olympus"
@@ -704,18 +659,18 @@ class OlympusAdapter(_AicsImageIoAdapterBase):
         return None
 
 
-class BioformatsAdapter(_AicsImageIoAdapterBase):
+class BioformatsAdapter(_BioioAdapterBase):
     """Bio-Formats fallback for legacy formats with no pure-Python reader.
 
     Handles proprietary/legacy formats that only the Java Bio-Formats library
     can read -- ZVI (Zeiss AxioVision) being the headline case. Claims a file
-    only when ``bioformats_jar`` is importable, so installs without the optional
+    only when ``bioio_bioformats`` is importable, so installs without the optional
     ``bioformats`` component skip these files (with a warning) instead of
     failing later at read time.
 
-    Reading goes through AICSImage's BioformatsReader, which is auto-selected
-    once bioformats_jar is present. A Java runtime is fetched lazily by
-    scyjava/cjdk on first read; it is not a build or system dependency.
+    Reading goes through bioio's Bio-Formats plugin (``bioio-bioformats``), which
+    BioImage auto-selects once the plugin is present. A Java runtime is fetched
+    lazily by scyjava/cjdk on first read; it is not a build or system dependency.
 
     Only claims extensions not already handled by a more specific adapter
     (.oib/.oif -> OlympusAdapter, .ims -> AicsImageIoAdapter).
@@ -737,11 +692,11 @@ class BioformatsAdapter(_AicsImageIoAdapterBase):
         if not any(name.endswith(ext) for ext in cls.BIOFORMATS_ONLY_EXTENSIONS):
             return None
 
-        # Gate on the Bio-Formats jar (importing it does NOT start a JVM).
+        # Gate on the Bio-Formats plugin (importing it does NOT start a JVM).
         # Without it, skip the file loudly rather than claiming and failing
         # later at read time.
         try:
-            import bioformats_jar  # noqa: F401
+            import bioio_bioformats  # noqa: F401
         except ImportError:
             import logging
 
@@ -762,8 +717,8 @@ class BioformatsAdapter(_AicsImageIoAdapterBase):
         )
 
 
-class AicsImageIoAdapter(_AicsImageIoAdapterBase):
-    """Fallback adapter for remaining aicsimageio-supported formats.
+class AicsImageIoAdapter(_BioioAdapterBase):
+    """Fallback adapter for remaining bioio-supported formats.
 
     Claims microscopy/scientific image files not handled by format-specific
     subclasses. By default the claim set is MICROSCOPY_EXTENSIONS; generic
@@ -786,7 +741,7 @@ class AicsImageIoAdapter(_AicsImageIoAdapterBase):
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
-        """Claim aicsimageio-supported files not handled by other adapters."""
+        """Claim bioio-supported files not handled by other adapters."""
         if not ctx.is_file():
             return None
 
@@ -809,7 +764,7 @@ class AicsImageIoAdapter(_AicsImageIoAdapterBase):
             if name.endswith(ext):
                 return None  # Let the specific adapter handle this
 
-        # Check for remaining aicsimageio extensions. Microscopy/scientific
+        # Check for remaining bioio-supported extensions. Microscopy/scientific
         # formats are always eligible; generic raster/video are included only
         # when the generic-images opt-in is on (biopb/biopb#40).
         for ext in _claim_extensions():
