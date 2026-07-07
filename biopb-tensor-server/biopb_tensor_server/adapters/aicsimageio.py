@@ -1165,14 +1165,14 @@ class _AicsImageIoAdapterBase(SourceAdapter, TensorAdapter):
         except Exception:
             return {}
 
-    def get_physical_scale(self):
+    def _physical_scale(self):
         """Per-dim physical pixel size + unit from the resident OME model.
 
         Reads ``ome_metadata.images[scene].pixels.physical_size_{x,y,z}``
         directly (no full ``model_dump``) and maps it onto this tensor's
         ``dim_labels`` by axis label. T/C axes get ``0.0`` / ``""``. Returns
         ``None`` when no positive physical size is known. See
-        ``TensorAdapter.get_physical_scale``.
+        ``TensorAdapter._physical_scale``.
         """
         try:
             ome = self._aics_image.ome_metadata

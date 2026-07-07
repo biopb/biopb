@@ -340,7 +340,7 @@ class TestWarming:
 
             class _RemoteAdapter:
                 # A caching-proxy source advertises a grpc:// source_url.
-                _source_url = "grpc://upstream:8815/img"
+                source_url = "grpc://upstream:8815/img"
 
                 def list_tensor_descriptors(self):
                     listed.append(True)  # must NOT be reached
@@ -1277,7 +1277,7 @@ class TestPrecacheAdvertisedAlignment:
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()
-            advertised = server._advertised_pyramid(adapter, base_desc)
+            advertised = adapter._advertised_pyramid(base_desc, server._pyramid_config)
             # The worker warms build_pyramid_plan(...)[-1]; the server advertises
             # the same plan -- so their coarsest scales are identical.
             worker_coarsest = build_pyramid_plan(

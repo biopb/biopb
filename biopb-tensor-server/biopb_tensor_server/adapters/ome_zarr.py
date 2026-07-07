@@ -663,7 +663,7 @@ class OmeZarrAdapter(ZarrAdapter):
         metadata does cover its (single) tensor."""
         return not self._is_hcs_plate
 
-    def get_physical_scale(self):
+    def _physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
 
         Physical size of an axis = (optional multiscales-level scale transform)
@@ -673,7 +673,7 @@ class OmeZarrAdapter(ZarrAdapter):
         otherwise a dimensionless (relative) downsample factor, so unit-less
         axes (and channel/index axes) get ``0.0`` / ``""``. Returns ``None``
         when no axis declares a unit (no physical information). See
-        ``TensorAdapter.get_physical_scale``.
+        ``TensorAdapter._physical_scale``.
         """
         try:
             multiscales = self.ome_metadata.get("multiscales", [])

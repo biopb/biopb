@@ -903,6 +903,9 @@ class TestResolveAction:
         release = threading.Event()
 
         class _SlowAdapter:
+            source_url = None
+            capability_token = None
+
             def resolve(self):
                 # Park until the test has observed the first heartbeat, then finish.
                 # Bounded wait so a broken test can never hang the drain below.
@@ -945,7 +948,7 @@ class _SlowSentinel:
     """A registered placeholder so the server has a (different) source; the
     `resolve` test above targets a *missing* id to exercise the not-found path."""
 
-    token = None
+    capability_token = None
 
 
 # --------------------------------------------------------------------------- #
@@ -957,10 +960,14 @@ class _DirAdapter:
     """Minimal registered adapter exposing only ``_source_url`` -- all `warm`
     needs (it walks that directory and reads files; format-agnostic)."""
 
-    token = None
+    capability_token = None
 
     def __init__(self, url):
         self._source_url = url
+
+    @property
+    def source_url(self):
+        return self._source_url
 
 
 class _Ctx:

@@ -669,7 +669,7 @@ def _phys_zarr_cls():
     from biopb_tensor_server import ZarrAdapter
 
     class _PhysZarr(ZarrAdapter):
-        def get_physical_scale(self):
+        def _physical_scale(self):
             return list(_PHYS_SCALE), list(_PHYS_UNIT)
 
     return _PhysZarr
@@ -776,12 +776,13 @@ def test_get_metadata_empty_when_upstream_has_no_metadata_db(simple_zarr_array):
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
-    """The proxy's get_physical_scale() *method* returns None even when the
-    upstream advertises a scale: physical scale is surfaced at a different layer
-    -- it rides the whole-call forward (forward_flight_info -> the upstream
-    descriptor's physical_scale), not a per-open get_descriptor RPC from this
-    method (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for
-    the end-to-end path."""
+    """The proxy's own ``_physical_scale()`` hook returns None (it does not
+    override it) even when the upstream advertises a scale: physical scale is
+    surfaced at a different layer -- it rides the whole-call forward
+    (plan_flight_info -> forward_flight_info -> the upstream descriptor's
+    physical_scale), not a per-open get_descriptor RPC from this hook
+    (biopb/biopb#295). See test_physical_scale_surfaced_through_proxy for the
+    end-to-end path."""
     import zarr
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -797,7 +798,7 @@ def test_get_physical_scale_returns_none_unimplemented(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.get_physical_scale() is None
+        assert adapter._physical_scale() is None
     finally:
         upstream.shutdown()
 
@@ -844,10 +845,10 @@ def test_physical_scale_surfaced_through_proxy(simple_zarr_array):
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_server_get_flight_info_uses_proxy_forward():
-    """server.get_flight_info special-cases a proxy: it forwards to the upstream
-    and returns ITS native pyramid, rather than running the local planner (which
-    would advertise a *computed*, non-native pyramid). Calls the server method
-    directly to exercise the isinstance(RemoteTensorAdapter) branch (biopb/biopb#295).
+    """A proxy tensor forwards to the upstream and returns ITS native pyramid,
+    rather than running the local planner (which would advertise a *computed*,
+    non-native pyramid). Calls server.get_flight_info directly to exercise the
+    proxy's plan_flight_info forward (biopb/biopb#295).
     """
     import tempfile
 

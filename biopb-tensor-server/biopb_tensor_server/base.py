@@ -36,6 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.chunk import (
     ChunkEndpoint,
+    build_pyramid_plan,
     cache_key_for_chunk_id,
     compute_safe_chunk_size,
     decode_chunk_id,
@@ -53,15 +54,15 @@ from biopb_tensor_server.downsample import (
     get_output_dtype,
     normalize_reduction_method,
 )
-from biopb_tensor_server.errors import SourceUnresolvedError
+from biopb_tensor_server.errors import SourceUnresolvedError, WriteNotSupportedError
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from biopb.tensor.descriptor_pb2 import PyramidLevel
+    from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorReadOption
 
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.config import PyramidConfig, SourceConfig
     from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
 
 
@@ -196,9 +197,17 @@ class SourceAdapter(ABC):
 
     # Required fields
     source_id: str  # Data source identifier
-    _source_url: str  # URL/path to the data source
-    _source_type: str  # Source type identifier
+    _source_url: Optional[str] = None  # URL/path to the data source
+    _source_type: Optional[str] = None  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
+
+    # Optional per-source capability token. When set, the Flight server requires
+    # callers to present a matching Bearer token to read this source (see
+    # ``TensorFlightServer._authorize_source``). None = no per-source gate (falls
+    # back to the server-wide token). Only the result-cache and remote-proxy
+    # adapters set it; the base default keeps the ``capability_token`` property
+    # total for every other adapter.
+    _capability_token: Optional[str] = None
 
     # Display-only override for the catalog ``source_url`` (the descriptor field
     # the tensor-browser / web viewer group the tree by). Normally None, so the
@@ -209,6 +218,32 @@ class SourceAdapter(ABC):
     # ``_source_url`` (filesystem ops) or ``source_id`` (path hash), so it is
     # purely cosmetic and needs no re-index.
     _catalog_url: Optional[str] = None
+
+    @property
+    def source_url(self) -> Optional[str]:
+        """The source's URL/path, used for filesystem ops (warm/recall).
+
+        Wraps the backing ``_source_url``; None when the adapter never set one.
+        """
+        return self._source_url
+
+    @property
+    def source_type(self) -> Optional[str]:
+        """Format/source-type identifier (e.g. ``"ome_zarr"``).
+
+        Wraps the backing ``_source_type``; None when the adapter never set one.
+        """
+        return self._source_type
+
+    @property
+    def capability_token(self) -> Optional[str]:
+        """Per-source capability token, or None for the server-wide auth fallback.
+
+        When set, the Flight server requires a matching Bearer token to read this
+        source (``TensorFlightServer._authorize_source``). Only the result-cache
+        and remote-proxy adapters set the backing ``_capability_token``.
+        """
+        return self._capability_token
 
     @property
     def array_id(self) -> str:
@@ -387,6 +422,31 @@ class SourceAdapter(ABC):
             TensorAdapter for the specified tensor, with tensor context set
         """
         return self
+
+    def put_chunk(
+        self,
+        bounds: ChunkBounds,
+        data: pa.Array | pa.ChunkedArray,
+        expected_shape: Tuple[int, ...],
+        dtype: Any,
+    ) -> None:
+        """Write one uploaded chunk into this source's backing store.
+
+        The DoPut path calls this after reading a chunk's Arrow payload, instead
+        of sniffing the adapter's attributes. The default rejects the write --
+        most source formats are read-only. Writable formats override with their
+        own contract: ``ZarrAdapter`` enforces chunk-grid alignment, while
+        ``CachedSourceAdapter`` accepts arbitrary bounds.
+
+        Args:
+            bounds: Chunk start/stop coordinates for the write.
+            data: The chunk's flattened element values as a primitive Arrow array.
+            expected_shape: Logical chunk shape implied by ``bounds``.
+            dtype: NumPy dtype (or string) of the chunk elements.
+        """
+        raise WriteNotSupportedError(
+            f"source {self.source_id!r} ({self._source_type}) does not support writes"
+        )
 
     def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
         """Reduce a source-qualified array_id to its within-source field.
@@ -612,6 +672,51 @@ class TensorAdapter(ABC):
         chunk_size = self.get_chunk_size()
         return _get_read_plan(base_desc, request_desc, chunk_size)
 
+    def plan_flight_info(
+        self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
+    ) -> TensorReadPlan:
+        """Build the open-time read plan for this tensor -- descriptor-authoritative.
+
+        The single seam the server's ``get_flight_info`` calls per tensor. It
+        returns the ``TensorReadPlan`` whose descriptor carries the native chunk
+        grid, the server-advertised resolution pyramid, and the compact physical
+        scale -- everything a client needs to open the tensor, filled here at open
+        time (never in ``list_flights``, like ``metadata_json``, so discovery
+        stays lean). ``metadata_json`` itself is still filled by the server from
+        the catalog, not here.
+
+        The default plans locally: it applies the request's slice/scale/reduction
+        hints to this tensor's descriptor, runs ``get_read_plan``, then advertises
+        the pyramid and physical scale. A remote-proxy adapter overrides this to
+        forward the upstream's authoritative plan instead (biopb/biopb#295).
+        """
+        base_desc = self.get_tensor_descriptor()
+        request_desc = TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
+        if read_opt.HasField("slice_hint"):
+            request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
+        # scale_hint / reduction_method route the read to a downsampled level.
+        if read_opt.scale_hint:
+            request_desc.scale_hint[:] = list(read_opt.scale_hint)
+        if read_opt.reduction_method:
+            request_desc.reduction_method = read_opt.reduction_method
+
+        read_plan = self.get_read_plan(request_desc)
+
+        # Advertise the server-decided resolution pyramid, then the compact
+        # physical scale -- both open-time only (never in list_flights).
+        read_plan.descriptor.ClearField("pyramid")
+        read_plan.descriptor.pyramid.extend(
+            self._advertised_pyramid(base_desc, pyramid_config)
+        )
+        self._fill_physical_scale(read_plan.descriptor)
+        return read_plan
+
     def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """Native (precomputed on-disk) pyramid levels for this tensor, or None.
 
@@ -639,23 +744,78 @@ class TensorAdapter(ABC):
         """
         return self.get_native_pyramid_levels() is not None
 
-    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
+    def _advertised_pyramid(
+        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
+    ) -> List[PyramidLevel]:
+        """The resolution-pyramid levels to advertise for this tensor.
+
+        Native (precomputed on-disk) levels when the tensor ships them, else a
+        computed pyramid from the server's ``[pyramid]`` knobs (``pyramid_config``,
+        threaded in because adapters are constructed without the server's config).
+        Cheap (arithmetic + already-memoized level adapters), so it is recomputed
+        per open rather than cached. Consumed by ``plan_flight_info``.
+        """
+        levels = None
+        try:
+            levels = self.get_native_pyramid_levels()
+        except Exception:
+            logger.exception(
+                "pyramid: native enumeration failed for %s", base_desc.array_id
+            )
+            levels = None
+        if levels is None:
+            cfg = pyramid_config
+            levels = build_pyramid_plan(
+                list(base_desc.shape),
+                list(base_desc.dim_labels),
+                reduction_method=cfg.reduction_method,
+                threshold=cfg.threshold,
+                downscale_factor=cfg.downscale_factor,
+                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
+            )
+        return levels
+
+    def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dimension physical pixel size + unit for this tensor, axis order.
 
         Returns ``(scale, unit)``: two equal-length lists aligned 1:1 with the
-        ``dim_labels`` this tensor's ``get_tensor_descriptor()`` emits (so the
-        server can copy them straight onto ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` without remapping). Element ``i`` is the physical
-        extent of one sample along dimension ``i``; ``0.0`` / ``""`` mark a
-        dimension with no known physical size (e.g. T/C axes).
+        ``dim_labels`` this tensor's ``get_tensor_descriptor()`` emits. Element
+        ``i`` is the physical extent of one sample along dimension ``i``; ``0.0``
+        / ``""`` mark a dimension with no known physical size (e.g. T/C axes).
 
         Returns ``None`` when no physical sizes are known. This is the compact
         ~200-byte summary the tensor-load hot path needs (issue #31), so it must
-        be **cheap** -- read it straight off the resident metadata model, never
-        a full ``get_metadata()`` dump. Default ``None``; format adapters that
-        carry physical voxel sizes override it.
+        be **cheap** -- read it straight off the resident metadata model, never a
+        full ``get_metadata()`` dump. Default ``None``; format adapters that carry
+        physical voxel sizes override it. There is no standalone public accessor:
+        physical scale reaches clients only via the descriptor's
+        ``physical_scale`` / ``physical_unit`` fields, filled by
+        ``_fill_physical_scale`` inside ``plan_flight_info``.
         """
         return None
+
+    def _fill_physical_scale(self, descriptor: TensorDescriptor) -> None:
+        """Copy this tensor's compact physical scale onto ``descriptor``.
+
+        Filled at open time (always, like the pyramid -- NOT gated on
+        ``with_metadata``), never in ``list_flights``, so the common tensor-load
+        path gets physical sizes without fetching the full OME tree (issue #31).
+        Full-res values: physical scale is level-0 and is not rescaled by
+        ``scale_hint``. Clears the fields when ``_physical_scale`` is unknown or
+        its lengths do not match the descriptor's ``dim_labels``.
+        """
+        descriptor.ClearField("physical_scale")
+        descriptor.ClearField("physical_unit")
+        try:
+            phys = self._physical_scale()
+        except Exception:
+            phys = None
+        if phys is not None:
+            scale_vec, unit_vec = phys
+            ndim = len(descriptor.dim_labels)
+            if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
+                descriptor.physical_scale[:] = scale_vec
+                descriptor.physical_unit[:] = unit_vec
 
 
 class BackendAdapter(SourceAdapter, TensorAdapter):
@@ -671,6 +831,9 @@ class BackendAdapter(SourceAdapter, TensorAdapter):
 _SOURCE_SCOPED_API = frozenset(
     {
         "array_id",
+        "source_url",
+        "source_type",
+        "capability_token",
         "claim",
         "create_from_config",
         "list_tensor_descriptors",
@@ -680,6 +843,7 @@ _SOURCE_SCOPED_API = frozenset(
         "resolve",
         "is_resident",
         "get_tensor_adapter",
+        "put_chunk",
     }
 )
 _TENSOR_SCOPED_API = frozenset(
@@ -692,7 +856,7 @@ _TENSOR_SCOPED_API = frozenset(
         "get_read_plan",
         "get_native_pyramid_levels",
         "has_native_pyramid",
-        "get_physical_scale",
+        "plan_flight_info",
     }
 )
 

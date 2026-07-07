@@ -208,6 +208,38 @@ class ZarrAdapter(SourceAdapter, TensorAdapter):
 
         self.zarr_array[slices] = data
 
+    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        """Chunk-aligned write: ``bounds`` must land on the zarr chunk grid.
+
+        Absorbs the alignment/reshape the DoPut handler used to perform inline,
+        then delegates the store to ``write_chunk``. The grid comes straight off
+        ``self.zarr_array.chunks`` -- the same grid ``write_chunk`` writes into
+        (and equal to the descriptor's ``chunk_shape``) -- so validation and
+        storage never disagree, and the method stays purely source-level.
+        """
+        arr = data.to_numpy()
+        if expected_shape:
+            arr = arr.reshape(expected_shape)
+        chunk_shape = list(self.zarr_array.chunks)
+
+        # start must align to the chunk grid
+        for d, (start, chunk_size) in enumerate(zip(bounds.start, chunk_shape)):
+            if start % chunk_size != 0:
+                raise ValueError(
+                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
+                )
+
+        # size may only shrink at the edge, never exceed the nominal chunk
+        actual_size = [stop - start for start, stop in zip(bounds.start, bounds.stop)]
+        for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
+            if actual > expected:
+                raise ValueError(
+                    f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
+                )
+
+        chunk_idx = tuple(int(s // cs) for s, cs in zip(bounds.start, chunk_shape))
+        self.write_chunk(chunk_idx, arr)
+
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,

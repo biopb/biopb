@@ -432,7 +432,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.325, 0.325]
             assert unit == ["micrometer", "micrometer"]
 
@@ -462,7 +462,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.5, 0.5]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -488,7 +488,7 @@ class TestGetPhysicalScale:
                 ]
             }
             adapter = self._make_ome_zarr(tmpdir, zattrs)
-            assert adapter.get_physical_scale() is None
+            assert adapter._physical_scale() is None
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_ome_zarr_channel_axis_zeroed(self):
@@ -516,7 +516,7 @@ class TestGetPhysicalScale:
             adapter = self._make_ome_zarr(
                 tmpdir, zattrs, shape=(2, 100, 100), chunks=(1, 50, 50)
             )
-            scale, unit = adapter.get_physical_scale()
+            scale, unit = adapter._physical_scale()
             assert scale == [0.0, 0.5, 0.5]
             assert unit == ["", "micrometer", "micrometer"]
 
@@ -531,7 +531,7 @@ class TestGetPhysicalScale:
                 zarr_path, mode="w", shape=(64, 64), chunks=(32, 32), dtype="uint8"
             )
             adapter = ZarrAdapter(arr, "plain", ["y", "x"])
-            assert adapter.get_physical_scale() is None
+            assert adapter._physical_scale() is None
 
     def _make_aics_adapter(self, dim_labels, scene_index, scenes, images):
         """Build an AicsImageIoAdapterBase without __init__ (no real file)."""
@@ -568,7 +568,7 @@ class TestGetPhysicalScale:
         adapter = self._make_aics_adapter(
             ["T", "C", "Z", "Y", "X"], scene_index=0, scenes=["s0"], images=[img]
         )
-        scale, unit = adapter.get_physical_scale()
+        scale, unit = adapter._physical_scale()
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]
         assert unit == ["", "", "µm", "µm", "µm"]
 
@@ -587,7 +587,7 @@ class TestGetPhysicalScale:
             scenes=["s0", "s1"],
             images=[img0, img1],
         )
-        scale, _ = adapter.get_physical_scale()
+        scale, _ = adapter._physical_scale()
         assert scale == [0.0, 0.5, 0.5]
 
     def test_aics_physical_scale_none_when_no_sizes(self):
@@ -596,7 +596,7 @@ class TestGetPhysicalScale:
         adapter = self._make_aics_adapter(
             ["Y", "X"], scene_index=0, scenes=["s0"], images=[img]
         )
-        assert adapter.get_physical_scale() is None
+        assert adapter._physical_scale() is None
 
 
 class TestOmeZarrPrecompute:

@@ -568,8 +568,8 @@ class MockImage0Adapter(BackendAdapter):
         self.source_id = source_id
         self._tensor_name = "Image:0"  # array_id property -> source_id/Image:0
         self._shape = shape
-        self._physical_scale = physical_scale
-        self._physical_unit = physical_unit
+        self._phys_scale = physical_scale
+        self._phys_unit = physical_unit
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-aics"
 
@@ -598,8 +598,8 @@ class MockImage0Adapter(BackendAdapter):
     def get_metadata(self) -> dict:
         return {}
 
-    def get_physical_scale(self):
-        return list(self._physical_scale), list(self._physical_unit)
+    def _physical_scale(self):
+        return list(self._phys_scale), list(self._phys_unit)
 
     def get_data(self, bounds) -> np.ndarray:
         super().get_data(bounds)

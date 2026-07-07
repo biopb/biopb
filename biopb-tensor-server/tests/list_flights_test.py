@@ -13,7 +13,7 @@ from biopb_tensor_server.server import TensorFlightServer
 class _HealthyAdapter:
     """Minimal adapter stub whose descriptor build succeeds."""
 
-    token = None
+    capability_token = None
 
     def __init__(self, source_id):
         self.source_id = source_id
@@ -37,7 +37,7 @@ class _HealthyAdapter:
 class _FailingAdapter:
     """Adapter stub whose descriptor build raises, mimicking aicsimageio."""
 
-    token = None
+    capability_token = None
 
     def __init__(self, source_id):
         self.source_id = source_id

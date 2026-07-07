@@ -86,7 +86,7 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         # requires callers to present a matching Bearer token to read this
         # source (see TensorFlightServer._authorize_source). None = no per-source
         # gate (falls back to the server-wide token, if any).
-        self.token: Optional[str] = None
+        self._capability_token: Optional[str] = None
         self._shape = tuple(shape)
         self._dtype = dtype
         self._chunk_shape = tuple(chunk_shape)
@@ -150,6 +150,14 @@ class CachedSourceAdapter(SourceAdapter, TensorAdapter):
         # Pass the flat element values (a primitive Arrow array), NOT a list<T>
         # wrapper -- write_chunk_arrow stores the raw value buffer directly.
         self.write_chunk_arrow(bounds, pa.array(data.ravel()), data.shape, data.dtype)
+
+    def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        """Arbitrary-bounds write: cache-backed sources accept any bounds.
+
+        Delegates straight to ``write_chunk_arrow`` (no NumPy round-trip -- the
+        Arrow value buffer is stored as the unified binary chunk schema).
+        """
+        self.write_chunk_arrow(bounds, data, expected_shape, dtype)
 
     def write_chunk_arrow(
         self,
