@@ -1404,14 +1404,15 @@ def discover_sources(
     scheme routing (grpc -> tensor-server).
 
     Supports multiple modes:
-    - Explicit source: type + source_id both set -> single source
+    - Explicit source: type set -> returned as-is (single source). source_id is
+      always present (__post_init__ auto-fills it), so type is the discriminator.
     - Remote URL: requires explicit 'type' in config (cannot auto-discover)
     - tensor-server (grpc://) URL: a caching proxy in front of an upstream biopb
       tensor server -- a bare ``grpc://host:port`` mirrors *every* upstream source
       (one concrete source each, alias-namespaced), and ``grpc://host:port/<id>``
       mirrors a single upstream source.
     - Local file with no type: claim-based detection (error if unclaimed)
-    - Local directory with no type and no source_id: claim-based discovery
+    - Local directory with no type: claim-based discovery
 
     Args:
         source: Source configuration
@@ -1452,7 +1453,8 @@ def discover_sources(
     if not local_path.exists():
         raise ValueError(f"Path does not exist: {local_path}")
 
-    # Case 1: Explicit source (type + source_id both set)
+    # Case 1: explicit type -> return as-is. source_id is always set by
+    # __post_init__, so it never discriminates here; type is the real gate.
     if source.type and source.source_id:
         return [source]
 
@@ -1482,7 +1484,7 @@ def discover_sources(
             f"Please specify 'type' explicitly in config."
         )
 
-    # Case 3: Directory with no type and no source_id - use claim-based discovery
+    # Case 3: Directory with no type - use claim-based discovery.
     # First check if the directory itself is a data source
     ctx = ClaimContext(local_path, cloud_root=source.cloud)
     state = DiscoveryState()
