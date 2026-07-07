@@ -39,46 +39,88 @@ class TestRequestGracefulStop:
             req.assert_called_once_with(sentinel)  # the pid plays no part
 
 
-class TestGracefulStop:
-    def test_returns_true_when_process_exits(self, monkeypatch):
+class TestStopDaemon:
+    """The single stop path both daemons share (`_stop_daemon`): wait-then-
+    force-kill, gated on identity, driven by a per-daemon `sentinel` path and
+    `remove_pid` callback. Delivery is mocked here; the real SIGTERM/sentinel
+    mechanism is exercised in TestStopDaemonDelivery."""
+
+    def test_returns_true_when_process_exits(self, monkeypatch, tmp_path):
         monkeypatch.setattr("sys.platform", "linux")
-        # Alive on the first poll, gone on the second.
-        alive = iter([True, False])
-        monkeypatch.setattr(cli, "_is_process_running", lambda _pid: next(alive))
+        # Ours for the delivery check, gone on the first wait poll.
+        ours = iter([True, False])
+        monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: next(ours))
         monkeypatch.setattr(cli, "_request_graceful_stop", lambda *_a: True)
         remove = MagicMock()
-        monkeypatch.setattr(cli, "_remove_pid", remove)
         with patch.object(cli.os, "kill") as kill:
-            assert cli._graceful_stop(1234, timeout=5) is True
+            assert (
+                cli._stop_daemon(
+                    1234, timeout=5, sentinel=tmp_path / "d.stop", remove_pid=remove
+                )
+                is True
+            )
             kill.assert_not_called()  # never escalated to force-kill
         remove.assert_called_once()
 
-    def test_force_kills_when_unresponsive(self, monkeypatch):
+    def test_force_kills_when_unresponsive(self, monkeypatch, tmp_path):
         monkeypatch.setattr("sys.platform", "linux")
-        monkeypatch.setattr(cli, "_is_process_running", lambda _pid: True)
+        monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: True)
         monkeypatch.setattr(cli, "_request_graceful_stop", lambda *_a: True)
         remove = MagicMock()
-        monkeypatch.setattr(cli, "_remove_pid", remove)
         with patch.object(cli.os, "kill") as kill:
-            assert cli._graceful_stop(1234, timeout=2) is False
+            assert (
+                cli._stop_daemon(
+                    1234, timeout=2, sentinel=tmp_path / "d.stop", remove_pid=remove
+                )
+                is False
+            )
             # Last call is the force-kill: SIGKILL on POSIX, SIGTERM on Windows
             # (signal.SIGKILL doesn't exist there) - matches the code's fallback.
             expected_sig = getattr(cli.signal, "SIGKILL", cli.signal.SIGTERM)
             kill.assert_called_with(1234, expected_sig)
         remove.assert_called_once()
 
-    def test_force_kill_surfaces_diag_when_delivery_failed(self, monkeypatch, capsys):
+    def test_force_kill_surfaces_diag_when_delivery_failed(
+        self, monkeypatch, capsys, tmp_path
+    ):
         monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: True)
         monkeypatch.setattr(cli, "_request_graceful_stop", lambda *_a: False)
         monkeypatch.setattr(
             cli, "_LAST_WIN_SHUTDOWN_DIAG", "could not write shutdown sentinel: boom"
         )
-        monkeypatch.setattr(cli, "_is_process_running", lambda _pid: True)
-        monkeypatch.setattr(cli, "_remove_pid", MagicMock())
         monkeypatch.setattr(cli, "_win_remove_sentinel", MagicMock())
         with patch.object(cli.os, "kill"):
-            assert cli._graceful_stop(1234, timeout=1) is False
+            assert (
+                cli._stop_daemon(
+                    1234,
+                    timeout=1,
+                    sentinel=tmp_path / "d.stop",
+                    remove_pid=MagicMock(),
+                )
+                is False
+            )
         assert "Graceful stop unavailable" in capsys.readouterr().out
+
+    def test_reused_pid_is_never_signaled(self, monkeypatch, tmp_path):
+        # A stale PID now owned by an unrelated process: identity fails, so
+        # delivery and force-kill are both skipped, but the PID file is cleaned.
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: False)
+        remove = MagicMock()
+        with patch.object(cli.os, "kill") as kill:
+            assert (
+                cli._stop_daemon(
+                    1234,
+                    timeout=3,
+                    token=42,
+                    sentinel=tmp_path / "d.stop",
+                    remove_pid=remove,
+                )
+                is True
+            )
+            kill.assert_not_called()  # the innocent PID owner is untouched
+        remove.assert_called_once()  # but the stale file is still cleaned up
 
 
 class TestStatusHealth:
@@ -644,7 +686,7 @@ class TestMcpStop:
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
         monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
         stop = MagicMock(return_value=graceful)
-        monkeypatch.setattr(cli, "_stop_mcp", stop)
+        monkeypatch.setattr(cli, "_stop_daemon", stop)
         res = CliRunner().invoke(cli.app, ["mcp", "stop"])
         return res, stop
 
@@ -818,60 +860,66 @@ class TestWinRequestShutdown:
         assert not sentinel.exists()
 
 
-class TestStopMcp:
-    """_stop_mcp mirrors _graceful_stop: SIGTERM on POSIX, a stop-sentinel
-    file on Windows (issue #323 - os.kill there is TerminateProcess, so the
-    daemon's handlers never run and the napari kernel is not reaped
-    gracefully), then wait / force-kill / clean up."""
+class TestStopDaemonDelivery:
+    """The real graceful-stop delivery `_stop_daemon` drives: SIGTERM on POSIX,
+    a stop-sentinel file on Windows (issue #323 - os.kill there is
+    TerminateProcess, so the daemon's handlers never run and the napari kernel is
+    not reaped gracefully), then wait / force-kill / tidy the sentinel."""
 
-    def test_posix_sends_sigterm_and_waits(self, monkeypatch):
+    def test_posix_sends_sigterm_and_waits(self, monkeypatch, tmp_path):
         monkeypatch.setattr("sys.platform", "linux")
         # Ours before the stop request, gone on the first wait poll.
         ours = iter([True, False])
         monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: next(ours))
         remove = MagicMock()
-        monkeypatch.setattr(cli, "_remove_mcp_pid", remove)
         with patch.object(cli.os, "kill") as kill:
-            assert cli._stop_mcp(1234, timeout=5, token=42) is True
+            assert (
+                cli._stop_daemon(
+                    1234,
+                    timeout=5,
+                    token=42,
+                    sentinel=tmp_path / "mcp-server.stop",
+                    remove_pid=remove,
+                )
+                is True
+            )
             kill.assert_called_once_with(1234, cli.signal.SIGTERM)
         remove.assert_called_once()
 
     def test_windows_writes_sentinel_never_signals(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(cli, "MCP_PID_FILE", tmp_path / "mcp-server.pid")
         # Keep the final tidy-up from consuming the sentinel we want to inspect.
         monkeypatch.setattr(cli, "_win_remove_sentinel", MagicMock())
         ours = iter([True, False])
         monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: next(ours))
-        monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
+        sentinel = tmp_path / "mcp-server.stop"
         with patch.object(cli.os, "kill") as kill:
-            assert cli._stop_mcp(1234, timeout=5, token=42) is True
+            assert (
+                cli._stop_daemon(
+                    1234, timeout=5, token=42, sentinel=sentinel, remove_pid=MagicMock()
+                )
+                is True
+            )
             kill.assert_not_called()  # graceful stop must not TerminateProcess
-        # What the daemon's watcher polls for: fixed name, next to the PID file.
-        assert (tmp_path / "mcp-server.stop").read_text() == "stop"
+        # What the daemon's watcher polls for: the per-daemon sentinel path.
+        assert sentinel.read_text() == "stop"
 
     def test_windows_force_kill_tidies_unconsumed_sentinel(self, tmp_path, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
-        monkeypatch.setattr(cli, "MCP_PID_FILE", tmp_path / "mcp-server.pid")
         monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: True)  # wedged
-        monkeypatch.setattr(cli, "_remove_mcp_pid", MagicMock())
+        sentinel = tmp_path / "mcp-server.stop"
         with patch.object(cli.os, "kill") as kill:
-            assert cli._stop_mcp(1234, timeout=1, token=42) is False
+            assert (
+                cli._stop_daemon(
+                    1234, timeout=1, token=42, sentinel=sentinel, remove_pid=MagicMock()
+                )
+                is False
+            )
             expected_sig = getattr(cli.signal, "SIGKILL", cli.signal.SIGTERM)
             kill.assert_called_with(1234, expected_sig)
         # The daemon never consumed it, so stop removed it (a lingering fresh
         # sentinel would stop the next daemon the moment it starts).
-        assert not (tmp_path / "mcp-server.stop").exists()
-
-    def test_reused_pid_is_never_signaled(self, monkeypatch):
-        monkeypatch.setattr("sys.platform", "linux")
-        monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: False)
-        remove = MagicMock()
-        monkeypatch.setattr(cli, "_remove_mcp_pid", remove)
-        with patch.object(cli.os, "kill") as kill:
-            assert cli._stop_mcp(1234, timeout=3, token=42) is True
-            kill.assert_not_called()  # the innocent PID owner is untouched
-        remove.assert_called_once()  # the stale file is still cleaned up
+        assert not sentinel.exists()
 
 
 class TestMigrateConfig:
