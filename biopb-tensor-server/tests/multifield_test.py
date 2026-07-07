@@ -12,6 +12,7 @@ from biopb_tensor_server.base import (
     BackendAdapter,
     DataSourceDescriptor,
     TensorDescriptor,
+    strip_source_prefix,
 )
 
 
@@ -633,6 +634,36 @@ class TestFieldWithinSource:
 
     def test_empty_resolves_to_default(self):
         assert TensorFlightServer._field_within_source("src", "") is None
+
+    def test_field_equal_to_source_id_is_preserved_not_defaulted(self):
+        # Precedence edge: a real field that happens to equal the source_id
+        # (array_id "src/src" -> field "src") must survive, because the
+        # ==source_id -> default check runs BEFORE the prefix strip. If they were
+        # reordered, "src/src" would strip to "src" and then wrongly default.
+        assert TensorFlightServer._field_within_source("src", "src/src") == "src"
+
+
+class TestStripSourcePrefix:
+    """strip_source_prefix: the pure, policy-free reduction shared by the server
+    chokepoint and the adapters' _within_source_field (biopb/biopb#277 item F)."""
+
+    def test_strips_prefix(self):
+        assert strip_source_prefix("src", "src/Image:0") == "Image:0"
+
+    def test_splits_only_first_slash(self):
+        assert strip_source_prefix("plate", "plate/A01/0") == "A01/0"
+
+    def test_bare_field_unchanged(self):
+        assert strip_source_prefix("src", "Image:0") == "Image:0"
+
+    def test_source_id_itself_unchanged_no_default_policy(self):
+        # Unlike the server helper, the pure strip invents no None: a bare
+        # source_id is returned as-is (the "default tensor" call is the caller's).
+        assert strip_source_prefix("src", "src") == "src"
+
+    def test_none_and_empty_pass_through(self):
+        assert strip_source_prefix("src", None) is None
+        assert strip_source_prefix("src", "") == ""
 
 
 class TestDescriptorCacheCollision:

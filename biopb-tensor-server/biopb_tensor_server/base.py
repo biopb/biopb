@@ -160,6 +160,25 @@ def to_catalog_url(raw: str) -> str:
     return "file:///" + fwd.lstrip("/")  # relative / other: best effort
 
 
+def strip_source_prefix(source_id: str, array_id: Optional[str]) -> Optional[str]:
+    """Reduce an ``array_id`` to its within-source field by removing the
+    ``source_id/`` prefix.
+
+    Pure and total: ``None``/``""`` pass through, and an id with no prefix -- a
+    bare field, or the source_id itself for a single-tensor source -- is returned
+    unchanged. It carries **no** "default tensor" policy; that decision belongs to
+    the caller (only the server's ``_field_within_source`` maps the no-field cases
+    to ``None`` = default tensor).
+
+    Identity policy (proto/biopb/tensor/descriptor.proto): array_id is
+    ``source_id`` or ``source_id/field``; source_id is slash-free, so the first
+    '/' is the source boundary and the field may itself contain '/'.
+    """
+    if array_id and source_id and array_id.startswith(f"{source_id}/"):
+        return array_id[len(source_id) + 1 :]
+    return array_id
+
+
 @dataclass
 class TensorReadPlan:
     """Logical tensor read plan returned by the server planning layer."""
@@ -458,18 +477,16 @@ class SourceAdapter(ABC):
         )
 
     def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
-        """Reduce a source-qualified array_id to its within-source field.
+        """Reduce a source-qualified array_id to its within-source field, for the
+        multi-tensor ``get_tensor_adapter`` overrides.
 
-        Per the tensor identity policy, a tensor's array_id is ``source_id`` or
-        ``source_id/field``. Multi-tensor ``get_tensor_adapter`` overrides key on
-        the ``field`` part, but a caller may legitimately hand them the full
-        array_id ("a tensor is identifiable by array_id alone"). Strip the
-        ``source_id/`` prefix when present (split on the first '/'); a bare field
-        is returned unchanged. Idempotent with the server's own reduction.
+        A caller may legitimately hand them the full array_id ("a tensor is
+        identifiable by array_id alone"); this strips the ``source_id/`` prefix
+        (pure reduction -- see :func:`strip_source_prefix`), leaving a bare field
+        unchanged. This layer never invents ``None``: "default tensor" is decided
+        upstream at the server chokepoint, not here.
         """
-        if tensor_id and self.source_id and tensor_id.startswith(f"{self.source_id}/"):
-            return tensor_id[len(self.source_id) + 1 :]
-        return tensor_id
+        return strip_source_prefix(self.source_id, tensor_id)
 
 
 class TensorAdapter(ABC):

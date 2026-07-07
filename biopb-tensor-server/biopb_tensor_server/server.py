@@ -38,7 +38,12 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.activity import ActivityTracker
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
+from biopb_tensor_server.base import (
+    SourceAdapter,
+    TensorAdapter,
+    decode_chunk_id,
+    strip_source_prefix,
+)
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import cache_key_for_chunk_id
 from biopb_tensor_server.config import PyramidConfig
@@ -367,26 +372,23 @@ class TensorFlightServer(flight.FlightServerBase):
 
     @staticmethod
     def _field_within_source(source_id: str, tensor_id: str) -> Optional[str]:
-        """Reduce a request tensor_id to the within-source field name that
-        ``get_tensor_adapter`` keys on.
+        """Reduce a request tensor_id to the within-source field, or ``None``
+        meaning *select the source's default (first) tensor*.
 
-        Per the tensor identity policy, array_id is ``source_id`` (single-tensor)
-        or ``source_id/field`` (multi-tensor), and a client normally sends that
-        array_id back as the request tensor_id. The within-source adapters key on
-        the ``field`` part only, so strip the ``source_id/`` prefix (split on the
-        first '/'; source_id is slash-free, the field may itself contain '/').
-        Liberal for back-compat: also accepts a bare field name or the source_id
-        itself; returns ``None`` for the single-tensor / "source addressed by its
-        own id" case.
+        ``None`` has exactly one meaning here, which ``get_tensor_adapter``
+        honors. Both inputs that name no within-source field map to it: a bare
+        ``source_id`` (single-tensor source addressed by its own id) and an
+        unset/empty id (a degenerate request whose default-substitution upstream
+        could not resolve). Any real field is returned verbatim -- the
+        ``== source_id`` test runs *before* the strip, so a genuine field that
+        happens to equal the source_id (array_id ``src/src`` -> field ``src``) is
+        preserved rather than collapsing to ``None``. The prefix strip itself is
+        the shared :func:`strip_source_prefix` (identity policy: array_id is
+        ``source_id`` or ``source_id/field``, source_id slash-free).
         """
-        if not tensor_id:
+        if not tensor_id or tensor_id == source_id:
             return None
-        prefix = f"{source_id}/"
-        if tensor_id.startswith(prefix):
-            return tensor_id[len(prefix) :]
-        if tensor_id == source_id:
-            return None
-        return tensor_id
+        return strip_source_prefix(source_id, tensor_id)
 
     def _get_adapter_for_tensor(
         self, source_id: str, tensor_id: str
@@ -1076,11 +1078,11 @@ class TensorFlightServer(flight.FlightServerBase):
         # Resolve an unset/empty tensor_id (proto3 default "") to the source's
         # default (first) tensor. get_source / get_physical_scale are documented
         # to accept no tensor_id, but the client sends "" for the unset case;
-        # forwarding that to a multi-tensor adapter's get_tensor_adapter blows up
-        # (aicsimageio's scene_ids.index("") -> "Unknown scene: ", OME-Zarr HCS
-        # field parsing), so honor the documented default in this one chokepoint
-        # rather than at every adapter call site. The first descriptor's array_id
-        # is the same default the client's own get_tensor path resolves to (#44).
+        # forwarding that to a multi-tensor adapter's get_tensor_adapter selects a
+        # bogus field (a bioio scene lookup on "", OME-Zarr HCS field parsing), so
+        # honor the documented default in this one chokepoint rather than at every
+        # adapter call site. The first descriptor's array_id is the same default
+        # the client's own get_tensor path resolves to (#44).
         if not tensor_id:
             default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
@@ -1088,10 +1090,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 if descriptors:
                     tensor_id = descriptors[0].array_id
 
-        # Reduce the (now possibly source-qualified) tensor_id to the
-        # within-source field the adapters key on (identity policy: array_id is
-        # source_id or source_id/field). The wire descriptor still reports the
-        # full array_id -- which the adapter's get_tensor_descriptor() carries.
+        # Reduce the (now source-qualified, or still "" for an unknown/empty
+        # source) tensor_id to the within-source field -- or None = the source's
+        # default tensor (identity policy: array_id is source_id or
+        # source_id/field). The wire descriptor still reports the full array_id,
+        # carried by the adapter's get_tensor_descriptor().
         field = self._field_within_source(source_id, tensor_id)
 
         logger.debug(
