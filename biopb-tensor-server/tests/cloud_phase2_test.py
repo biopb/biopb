@@ -604,9 +604,12 @@ class TestPrecacheSkipsUnresolved:
 
         monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
 
-        class _Srv:
-            def _get_source_adapter(self, sid):
+        class _Registry:
+            def get(self, sid):
                 return proxy if sid == "s1" else None
+
+        class _Srv:
+            sources = _Registry()
 
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
         # Past the file-backend gate so the real source-processing logic runs.
@@ -1047,7 +1050,7 @@ class TestWarmAction:
         ]
         assert prog_files == sorted(prog_files)
         # guard cleaned up
-        assert server._warming == set()
+        assert server.activity.warming == set()
 
     def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1121,7 +1124,7 @@ class TestWarmAction:
         assert kinds[-1] == "done"  # still emits a terminal snapshot
         done = msgs[-1].done
         assert done.files_done < done.files_total  # did not finish all 12
-        assert server._warming == set()  # guard released even on cancel
+        assert server.activity.warming == set()  # guard released even on cancel
 
     def test_warm_rejects_concurrent_warm_of_same_source(self, tmp_path):
         import pyarrow.flight as flight
@@ -1130,7 +1133,7 @@ class TestWarmAction:
         os.makedirs(root)
         self._make_files(root, {"a.bin": 8})
         server = self._server("s6", _DirAdapter(root))
-        server._warming.add("s6")  # simulate an in-flight warm
+        server.activity.begin_warm("s6")  # simulate an in-flight warm
         with pytest.raises(flight.FlightServerError, match="already in progress"):
             list(server.do_action(_Ctx(), flight.Action("warm", b"s6")))
 

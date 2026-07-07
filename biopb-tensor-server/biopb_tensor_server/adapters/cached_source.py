@@ -3,14 +3,14 @@
 Design: One adapter instance per cache-backed source, following the existing
 BackendAdapter pattern used by OmeZarrAdapter, etc.
 
-- CachedSourceAdapter instances registered in server._sources dict (same as other adapters)
+- CachedSourceAdapter instances registered in server.sources registry (same as other adapters)
 - Metadata (shape, dtype, chunk_shape) stored in adapter instance
 - Chunk data stored in CacheManager keyed by chunk_id
 - When cache evicts chunks, adapter returns Flight error on read (source "gone")
 - "Dead" adapters accumulate until server restart (acceptable for ephemeral sources)
 
 Registration flow (bypasses discovery/registry):
-DoPut → direct instantiation → server._sources
+DoPut → direct instantiation → server.sources registry
 
 Chunk ID format: array_id + "/" + chunk_key
 Chunk data: stored in CacheManager keyed by full chunk_id
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class CachedSourceAdapter(SourceAdapter, TensorAdapter):
     """Adapter for cache-backed uploaded sources.
 
-    One instance per source, registered in server._sources dict.
+    One instance per source, registered in server.sources registry.
 
     Chunk ID format: array_id + "/" + chunk_key (bounds start coords as "0/1/2")
     Chunk data stored in CacheManager keyed by full chunk_id.

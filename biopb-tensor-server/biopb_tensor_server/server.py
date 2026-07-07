@@ -11,14 +11,11 @@ The server supports:
 - Metadata queries: SQL queries against source catalog (via DuckDB)
 """
 
-import contextlib
-import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from math import ceil
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -40,21 +37,18 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
-from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
-from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+from biopb_tensor_server.activity import ActivityTracker
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.chunk import (
-    cache_key_for_chunk_id,
-    encode_chunk_id,
-)
+from biopb_tensor_server.chunk import cache_key_for_chunk_id
 from biopb_tensor_server.config import PyramidConfig
 from biopb_tensor_server.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
-    WriteNotSupportedError,
 )
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.source_registry import SourceRegistry
+from biopb_tensor_server.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
 
@@ -72,27 +66,6 @@ _RESOLVE_HEARTBEAT_SECONDS = 15.0
 # resolve heartbeat cadence.
 _WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
 _WARM_PROGRESS_MIN_INTERVAL = 0.5
-
-
-def _expected_chunk_count(shape: List[int], chunk_shape: List[int]) -> int:
-    count = 1
-    for dim, chunk in zip(shape, chunk_shape):
-        count *= ceil(dim / chunk)
-    return count
-
-
-def _close_adapter(adapter) -> None:
-    """Best-effort release of an adapter's resources (e.g. open file handles).
-
-    Adapters that hold long-lived handles expose ``close()``; others don't.
-    Never raises -- shutdown/unregister must not fail on a balky adapter.
-    """
-    close = getattr(adapter, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:  # pragma: no cover - cleanup must not fail
-            logger.debug("error closing source adapter", exc_info=True)
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -147,6 +120,16 @@ class TensorFlightServer(flight.FlightServerBase):
     Supports multifield acquisitions where tensors within a data source
     have different shapes (e.g., MicroManager multi-position datasets).
 
+    State is delegated to three collaborators (biopb/biopb#278 item A), so this
+    class stays a thin Flight protocol handler:
+
+    - ``self.sources`` (:class:`SourceRegistry`) -- the ``source_id`` -> adapter
+      map, registration chokepoint, and adapter-lifecycle cleanup.
+    - ``self.activity`` (:class:`ActivityTracker`) -- in-flight-read counters
+      (the precache idle signal) and the warm-in-progress guard.
+    - ``self.uploads`` (:class:`UploadManager`) -- the writable-server DoPut path
+      (source creation, chunk writing, upload-progress state).
+
     The normal entry point is the ``biopb-tensor-server`` CLI
     (``launch`` / ``serve``), which scans the data folder and calls
     ``mark_ready()`` for you once registration completes. The low-level usage
@@ -199,10 +182,8 @@ class TensorFlightServer(flight.FlightServerBase):
         middleware = kwargs.pop("middleware", {})
         middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
         super().__init__(location, middleware=middleware, **kwargs)
-        self._sources: Dict[str, SourceAdapter] = {}
-        self._sources_lock = threading.RLock()
+        self.sources = SourceRegistry()
         self._writable = writable
-        self._write_dir = write_dir
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
         self._max_list_flights_results = max_list_flights_results
         # Authoritative resolution-pyramid knobs. Used to advertise
@@ -211,8 +192,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # advertised ones.
         self._pyramid_config = pyramid_config or PyramidConfig()
         self._start_time: float = time.time()
-        self._upload_state_lock = threading.RLock()
-        self._upload_states: Dict[str, Dict[str, Any]] = {}
+        # DoPut upload path: source creation, chunk writes, and per-source upload
+        # progress. Registers created sources through the shared registry.
+        self.uploads = UploadManager(self.sources, write_dir, metadata_db)
         # Readiness gate: the Flight port binds (and gRPC starts serving) in the
         # base __init__ above, *before* the caller scans/registers the data
         # folder -- a scan that can be slow for large catalogs. Until the caller
@@ -222,18 +204,12 @@ class TensorFlightServer(flight.FlightServerBase):
         # read from gRPC handler threads, hence an Event.
         self._ready = threading.Event()
 
-        # Flight activity tracking for the background precache worker: counts
-        # in-flight heavy reads (do_get) and stamps the last time one finished,
-        # so the worker can stay off the wire while real traffic flows. Cheap --
-        # one uncontended lock + int + monotonic stamp per do_get.
-        self._activity_lock = threading.Lock()
-        self._inflight = 0
-        self._last_active = 0.0  # time.monotonic() of last do_get completion
-
-        # Source ids with a "warm" (hydrate-ahead) recall in flight, so a second
-        # concurrent warm of the same source is rejected rather than doubling the
-        # disk/recall pressure. Guarded by the activity lock (cheap, uncontended).
-        self._warming: set = set()
+        # Flight activity + warm-guard tracking for the background precache
+        # worker: counts in-flight heavy reads (do_get/warm), stamps the last one
+        # to finish (so the worker parks while real traffic flows), and holds the
+        # set of sources with a warm in flight (so a concurrent warm of the same
+        # source is rejected). Cheap -- one uncontended lock.
+        self.activity = ActivityTracker()
 
         # Catalog-freshness signals for the ``health`` action (progressive
         # discovery, biopb/biopb#212). ``SERVING`` only means "up and serving the
@@ -265,27 +241,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # dnd:// sources to remove, so removal is a no-op there anyway.
         self._remove_source_handler: Optional[Callable[..., Any]] = None
 
-    @contextlib.contextmanager
-    def _serving_request(self):
-        """Mark a heavy read in flight for its duration (precache idle signal)."""
-        with self._activity_lock:
-            self._inflight += 1
-        try:
-            yield
-        finally:
-            with self._activity_lock:
-                self._inflight -= 1
-                self._last_active = time.monotonic()
-
     def flight_idle_for(self, seconds: float) -> bool:
         """True if no heavy read is in flight and none finished within *seconds*.
 
-        Used by the precache worker to debounce against live traffic.
+        Used by the precache worker to debounce against live traffic
+        (delegates to ``activity``).
         """
-        with self._activity_lock:
-            if self._inflight > 0:
-                return False
-            return (time.monotonic() - self._last_active) >= seconds
+        return self.activity.idle_for(seconds)
 
     def mark_ready(self) -> None:
         """Signal that initial source registration is complete.
@@ -339,48 +301,13 @@ class TensorFlightServer(flight.FlightServerBase):
         self._remove_source_handler = handler
 
     def register_source(self, source_id: str, adapter: SourceAdapter) -> None:
-        """Register a data source with the server.
-
-        Args:
-            source_id: Unique identifier for the data source. Must be non-empty
-                and slash-free (see Raises).
-            adapter: Source adapter for the data source
-
-        Raises:
-            ValueError: If *source_id* is empty or contains ``"/"``. The tensor
-                identity policy (proto/biopb/tensor/descriptor.proto) requires a
-                slash-free source_id: the internal chunk-route id is
-                ``"source_id/array_id"`` and is decoded by splitting on the first
-                ``"/"``, so a ``"/"`` in source_id would make the
-                (source_id, array_id) pair undecodable. Auto-generated ids are
-                already slash-free; this guards caller-supplied ones. This is the
-                single registration chokepoint -- discovery, the source manager,
-                uploads, and direct use all funnel through here.
-        """
-        if not source_id:
-            raise ValueError("register_source: source_id must be non-empty")
-        if "/" in source_id:
-            raise ValueError(
-                f"register_source: source_id must not contain '/' (got "
-                f"{source_id!r}); the chunk-route id source_id/array_id decodes "
-                f"by splitting on the first '/'."
-            )
-        with self._sources_lock:
-            self._sources[source_id] = adapter
-        logger.debug(f"Registered source: {source_id}")
+        """Register a data source with the server (delegates to ``sources``)."""
+        self.sources.register(source_id, adapter)
 
     def unregister_source(self, source_id: str) -> None:
-        """Unregister a data source from the server.
-
-        Args:
-            source_id: Unique identifier for the data source
-        """
-        with self._sources_lock:
-            adapter = self._sources.pop(source_id, None)
-        with self._upload_state_lock:
-            self._upload_states.pop(source_id, None)
-        _close_adapter(adapter)
-        logger.debug(f"Unregistered source: {source_id}")
+        """Unregister a data source and drop any in-flight upload state."""
+        self.sources.unregister(source_id)
+        self.uploads.forget(source_id)
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -390,70 +317,8 @@ class TensorFlightServer(flight.FlightServerBase):
         handles -- required on Windows, where an open file cannot be deleted
         (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
         """
-        with self._sources_lock:
-            adapters = list(self._sources.values())
-        for adapter in adapters:
-            _close_adapter(adapter)
+        self.sources.close_all()
         super().shutdown()
-
-    def initialize_upload(
-        self,
-        source_id: str,
-        shape: List[int] | Tuple[int, ...],
-        chunk_shape: List[int] | Tuple[int, ...],
-    ) -> None:
-        expected_chunks = _expected_chunk_count(list(shape), list(chunk_shape))
-        with self._upload_state_lock:
-            self._upload_states[source_id] = {
-                "source_id": source_id,
-                "state": "PENDING",
-                "expected_chunks": expected_chunks,
-                "uploaded_chunks": 0,
-                "uploaded_chunk_ids": set(),
-            }
-
-    def mark_upload_chunk(self, source_id: str, bounds: ChunkBounds) -> None:
-        chunk_id = encode_chunk_id(source_id, bounds)
-        with self._upload_state_lock:
-            state = self._upload_states.get(source_id)
-            if state is None:
-                return
-            uploaded_chunk_ids = state["uploaded_chunk_ids"]
-            if chunk_id not in uploaded_chunk_ids:
-                uploaded_chunk_ids.add(chunk_id)
-                state["uploaded_chunks"] = len(uploaded_chunk_ids)
-            state["state"] = (
-                "READY"
-                if state["uploaded_chunks"] >= state["expected_chunks"]
-                else "PENDING"
-            )
-
-    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        with self._upload_state_lock:
-            state = self._upload_states.get(source_id)
-            if state is None:
-                return {
-                    "source_id": source_id,
-                    "state": "UNKNOWN",
-                    "expected_chunks": 0,
-                    "uploaded_chunks": 0,
-                }
-            return {
-                "source_id": source_id,
-                "state": state["state"],
-                "expected_chunks": state["expected_chunks"],
-                "uploaded_chunks": state["uploaded_chunks"],
-            }
-
-    def _get_source_adapter(self, source_id: str) -> Optional[SourceAdapter]:
-        """Thread-safe source lookup."""
-        with self._sources_lock:
-            return self._sources.get(source_id)
-
-    def _get_sources_snapshot(self) -> List[Tuple[str, SourceAdapter]]:
-        """Return a stable snapshot of registered sources for iteration."""
-        with self._sources_lock:
-            return list(self._sources.items())
 
     def _authorize_source(
         self, context: flight.ServerCallContext, source_id: str
@@ -469,7 +334,7 @@ class TensorFlightServer(flight.FlightServerBase):
         ``BearerAuthMiddlewareFactory``, so this is backward compatible with the
         standalone tensor server.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         expected = adapter.capability_token if adapter is not None else None
         if not expected:
             return
@@ -537,7 +402,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self._get_source_adapter(source_id)
+        source_adapter = self.sources.get(source_id)
         if source_adapter is None:
             return None
 
@@ -556,7 +421,7 @@ class TensorFlightServer(flight.FlightServerBase):
         source_id, *rest = array_id.split("/")
         rest = "/".join(rest) if rest else None
 
-        source_adapter = self._get_source_adapter(source_id)
+        source_adapter = self.sources.get(source_id)
         if source_adapter is None:
             return None
 
@@ -624,7 +489,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 last_full_scan_at = self._last_full_scan_at
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
-                "source_count": len(self._get_sources_snapshot()),
+                "source_count": len(self.sources),
                 "metadata_db_enabled": self._metadata_db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
@@ -641,11 +506,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            response_desc = self._create_source(req_desc)
+            response_desc = self.uploads.create_source(req_desc)
             yield response_desc.SerializeToString()
         elif action.type == "upload_status":
             source_id = action.body.to_pybytes().decode("utf-8")
-            yield json.dumps(self.get_upload_status(source_id)).encode("utf-8")
+            yield json.dumps(self.uploads.status(source_id)).encode("utf-8")
         elif action.type == "chunk_locate":
             ticket_bytes = action.body.to_pybytes()
             ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
@@ -694,7 +559,7 @@ class TensorFlightServer(flight.FlightServerBase):
         to completion and caches the result on the adapter, so a retry coalesces
         onto the finished work rather than downloading again.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -787,13 +652,13 @@ class TensorFlightServer(flight.FlightServerBase):
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
           (already-warm files are cheap local reads, cold files recall).
-        - **Counts as Flight activity** (wrapped in ``_serving_request``) so the
+        - **Counts as Flight activity** (wrapped in ``activity.serving_request``) so the
           background precache worker yields to it for the duration.
         - Does **not** hold the adapter's per-source IO lock -- these are plain
           filesystem reads, concurrency-safe with real reads, so warming never
           blocks a live viewer read.
         """
-        adapter = self._get_source_adapter(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -806,12 +671,10 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Reject a second concurrent warm of the same source (avoid doubling the
         # disk/recall pressure); the browser also disables re-trigger while running.
-        with self._activity_lock:
-            if source_id in self._warming:
-                raise flight.FlightServerError(
-                    f"warm already in progress for {source_id!r}"
-                )
-            self._warming.add(source_id)
+        if not self.activity.begin_warm(source_id):
+            raise flight.FlightServerError(
+                f"warm already in progress for {source_id!r}"
+            )
 
         started = time.monotonic()
         last_yield = 0.0
@@ -837,7 +700,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         try:
             # Warming registers as in-flight activity so the precache worker parks.
-            with self._serving_request():
+            with self.activity.serving_request():
                 # 1. Enumerate + stat (recursive, recall-free). os.walk separates
                 #    directories from `names`, so `names` are the data files we
                 #    want; stat does not recall a placeholder.
@@ -925,8 +788,7 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
                 ).SerializeToString()
         finally:
-            with self._activity_lock:
-                self._warming.discard(source_id)
+            self.activity.end_warm(source_id)
 
     def _handle_add_source(
         self, req: AddSourceRequest, context: flight.ServerCallContext
@@ -1081,7 +943,7 @@ class TensorFlightServer(flight.FlightServerBase):
         image-base result-cache server). Honors per-source capability tokens by
         skipping token-protected sources from enumeration.
         """
-        source_items = self._get_sources_snapshot()
+        source_items = self.sources.snapshot()
         total_sources = len(source_items)
         max_sources = self._max_list_flights_results
         returned_count = min(total_sources, max_sources)
@@ -1220,7 +1082,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # rather than at every adapter call site. The first descriptor's array_id
         # is the same default the client's own get_tensor path resolves to (#44).
         if not tensor_id:
-            default_adapter = self._get_source_adapter(source_id)
+            default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:
@@ -1254,7 +1116,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
-            source_adapter = self._get_source_adapter(source_id)
+            source_adapter = self.sources.get(source_id)
 
             # Populate metadata_json in response descriptor if requested
             if read_opt.with_metadata:
@@ -1357,7 +1219,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # Heavy chunk-read path: track it as in-flight so the background
         # precache worker stays idle while real reads are happening.
-        with self._serving_request():
+        with self.activity.serving_request():
             tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
@@ -1474,7 +1336,7 @@ class TensorFlightServer(flight.FlightServerBase):
         try:
             req_desc = TensorDescriptor.FromString(command)
             if req_desc.shape and req_desc.dtype:
-                self._handle_create_source(req_desc, writer)
+                writer.write(self.uploads.create_source(req_desc).SerializeToString())
                 return
         except Exception:
             pass
@@ -1482,210 +1344,10 @@ class TensorFlightServer(flight.FlightServerBase):
         # Chunk upload - use ChunkUpload wrapper
         try:
             upload = ChunkUpload.FromString(command)
-            self._handle_chunk_upload(upload, reader)
+            self.uploads.write_chunk(upload, reader)
             return
         except Exception as e:
             raise flight.FlightServerError(f"Invalid upload command: {e}")
-
-    def _create_source(self, req_desc: TensorDescriptor) -> TensorDescriptor:
-        """Create source from TensorDescriptor and return its resolved descriptor.
-
-        array_id format in request:
-        - "cache:name" → cache-backed with given name
-        - "cache:" → cache-backed with server-generated name
-        - "ome_zarr:name" → zarr-backed with given name
-        - "ome_zarr:" → zarr-backed with server-generated name
-
-        Args:
-            req_desc: TensorDescriptor request
-        Returns:
-            TensorDescriptor with resolved server-side source_id
-        """
-        array_id = req_desc.array_id
-
-        if array_id.startswith("cache:"):
-            # Cache-backed source
-            provided_name = array_id[6:]  # After 'cache:'
-            if provided_name:
-                source_id = (
-                    f"cache_{hashlib.sha256(provided_name.encode()).hexdigest()[:12]}"
-                )
-            else:
-                source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
-
-            ome_metadata = (
-                json.loads(req_desc.metadata_json) if req_desc.metadata_json else {}
-            )
-
-            adapter = CachedSourceAdapter(
-                source_id=source_id,
-                shape=list(req_desc.shape),
-                dtype=req_desc.dtype,
-                chunk_shape=list(req_desc.chunk_shape),
-                dim_labels=list(req_desc.dim_labels) if req_desc.dim_labels else None,
-                ome_metadata=ome_metadata,
-            )
-            self.register_source(source_id, adapter)
-            self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
-
-            logger.info(f"Created cache-backed source: {source_id}")
-
-        elif array_id.startswith("ome_zarr:"):
-            # Zarr-backed source
-            import zarr
-
-            provided_name = array_id[9:]  # After 'ome_zarr:'
-            zarr_name = (
-                provided_name
-                or f"upload_{hashlib.sha256(os.urandom(16)).hexdigest()[:8]}"
-            )
-
-            if self._write_dir is None:
-                raise flight.FlightServerError(
-                    "write_dir not configured for zarr-backed sources"
-                )
-
-            zarr_path = self._write_dir / f"{zarr_name}.zarr"
-            zarr_path.mkdir(parents=True, exist_ok=True)
-
-            store = zarr.DirectoryStore(str(zarr_path))
-            arr = zarr.create(
-                store=store,
-                shape=req_desc.shape,
-                dtype=req_desc.dtype,
-                chunks=req_desc.chunk_shape,
-            )
-
-            # Write OME metadata
-            if req_desc.metadata_json:
-                zattrs = json.loads(req_desc.metadata_json)
-            else:
-                zattrs = self._build_minimal_ome_metadata(req_desc)
-
-            with open(zarr_path / ".zattrs", "w") as f:
-                json.dump(zattrs, f)
-
-            source_id = f"ome_zarr_{hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()[:12]}"
-
-            adapter = OmeZarrAdapter(
-                arr,
-                source_id,
-                list(req_desc.dim_labels) if req_desc.dim_labels else None,
-            )
-
-            self.register_source(source_id, adapter)
-            # File-backed uploads are durable (a real .zarr on disk), so add them
-            # to the catalog to be discoverable via list_sources/query_sources.
-            # Cache-backed uploads (the `cache:` branch above) are intentionally
-            # NOT synced: they are volatile and have no removal hook, so a row
-            # would dangle after eviction -- they stay readable by their returned
-            # id but are not enumerable (biopb/biopb#265). Best-effort: a catalog
-            # write must not fail the upload (the source is already usable by id).
-            if self._metadata_db is not None:
-                try:
-                    self._metadata_db.sync_source_added(source_id, adapter)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to sync uploaded source {source_id} to catalog "
-                        f"(readable by id, not listed): {e}"
-                    )
-            self.initialize_upload(source_id, req_desc.shape, req_desc.chunk_shape)
-
-            logger.info(f"Created zarr-backed source: {source_id} at {zarr_path}")
-
-        else:
-            raise flight.FlightServerError(
-                f"Invalid array_id format: {array_id}. Use 'cache:' or 'ome_zarr:' prefix"
-            )
-
-        return TensorDescriptor(
-            array_id=source_id,
-            dim_labels=req_desc.dim_labels,
-            shape=req_desc.shape,
-            chunk_shape=req_desc.chunk_shape,
-            dtype=req_desc.dtype,
-        )
-
-    def _handle_create_source(
-        self, req_desc: TensorDescriptor, writer: flight.FlightMetadataWriter
-    ) -> None:
-        """Backward-compatible DoPut handler for source creation."""
-        writer.write(self._create_source(req_desc).SerializeToString())
-
-    def _handle_chunk_upload(
-        self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
-    ) -> None:
-        """Write chunk data by delegating to the source adapter's ``put_chunk``.
-
-        Each source format owns its write contract: OmeZarr/Zarr enforce
-        chunk-grid alignment; cache-backed sources accept arbitrary bounds;
-        read-only formats reject the write. The handler no longer sniffs adapter
-        attributes to pick a path.
-        """
-        table = reader.read_all()
-        data_column = table.column(0)
-
-        adapter = self._sources.get(upload.source_id)
-        if adapter is None:
-            raise flight.FlightServerError(f"Source not found: {upload.source_id}")
-
-        bounds = upload.bounds
-        expected_shape = tuple(
-            stop - start for start, stop in zip(bounds.start, bounds.stop)
-        )
-
-        # Dispatch the write polymorphically: each source format owns its write
-        # contract (Zarr/OmeZarr enforce chunk-grid alignment; a cache source
-        # takes arbitrary bounds; read-only formats raise WriteNotSupportedError).
-        # Adapters stay transport-agnostic, so translate their write errors into a
-        # Flight error at this server boundary (alignment/size -> ValueError).
-        dtype = table.schema.field(0).type.to_pandas_dtype()
-        try:
-            adapter.put_chunk(bounds, data_column, expected_shape, dtype)
-        except (ValueError, WriteNotSupportedError) as e:
-            raise flight.FlightServerError(str(e))
-
-        self.mark_upload_chunk(upload.source_id, bounds)
-
-        logger.debug(
-            f"Uploaded chunk to {upload.source_id}: bounds={list(bounds.start)}-{list(bounds.stop)}"
-        )
-
-    def _build_minimal_ome_metadata(self, desc: TensorDescriptor) -> dict:
-        """Build minimal OME-Zarr metadata from TensorDescriptor."""
-        dim_labels = (
-            list(desc.dim_labels)
-            if desc.dim_labels
-            else [f"dim{i}" for i in range(len(desc.shape))]
-        )
-
-        axes = []
-        for i, label in enumerate(dim_labels):
-            if label.lower() in ("x", "y", "z"):
-                axes.append({"name": label, "type": "space"})
-            elif label.lower() in ("c", "channel"):
-                axes.append({"name": label, "type": "channel"})
-            elif label.lower() in ("t", "time"):
-                axes.append({"name": label, "type": "time"})
-            else:
-                axes.append({"name": label})
-
-        return {
-            "multiscales": [
-                {
-                    "version": "0.4",
-                    "axes": axes,
-                    "datasets": [
-                        {
-                            "path": "0",
-                            "coordinateTransformations": [
-                                {"type": "scale", "scale": [1.0] * len(desc.shape)}
-                            ],
-                        }
-                    ],
-                }
-            ]
-        }
 
 
 def serve(
