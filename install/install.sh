@@ -1135,6 +1135,18 @@ install_biopb() {
         --with-executables-from biopb-mcp
     )
 
+    # cryptography >= 49 dropped its universal2/x86_64 macOS wheel and now ships
+    # arm64 only, so on an Intel Mac uv finds no wheel and compiles the Rust/OpenSSL
+    # sdist -- which fails on a stock machine without OpenSSL dev headers. It reaches
+    # us purely transitively (mcp -> pyjwt[crypto]), so cap it below 49 on Intel macOS
+    # where uv then picks 48.x's universal2 wheel. arm64 macOS, Linux, and Windows all
+    # have a 49 wheel and are unaffected. Remove once cryptography ships an Intel-mac
+    # wheel again (or biopb-mcp's MCP dep drops the pyjwt crypto extra).
+    if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
+        install_args+=(--with "cryptography<49")
+        _info "  pinning cryptography<49 (Intel macOS: 49 dropped its x86_64 wheel)"
+    fi
+
     # Retire any running old-code MCP daemon before the new wheels land, so the
     # next agent reconnect brings up the just-installed code (the daemon is
     # spawned on demand, so there is nothing to restart here).
