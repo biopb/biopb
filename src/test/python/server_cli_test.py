@@ -123,6 +123,33 @@ class TestStopDaemon:
         remove.assert_called_once()  # but the stale file is still cleaned up
 
 
+class TestProbeDaemon:
+    """`_probe_daemon` is the one liveness/health snapshot both `status` commands
+    and the readiness loop share. It must never raise: a failed health RPC comes
+    back health=None, a closed port listening=False."""
+
+    def test_health_answer_defines_liveness(self, monkeypatch):
+        # A daemon that answers its health RPC is, by that fact, listening.
+        health = {"status": "SERVING", "source_count": 3}
+        probe = cli._probe_daemon("h", 1, health_fn=lambda: health)
+        assert probe.listening is True and probe.health is health
+
+    def test_unreachable_health_is_not_listening(self, monkeypatch):
+        # health_fn already swallows errors and returns None; the probe treats
+        # that as down without a TCP fallback (the RPC *is* the liveness signal).
+        probe = cli._probe_daemon("h", 1, health_fn=lambda: None)
+        assert probe.listening is False and probe.health is None
+
+    def test_tcp_only_when_no_health_fn(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: True)
+        probe = cli._probe_daemon("127.0.0.1", 8765)
+        assert probe.listening is True and probe.health is None
+
+    def test_tcp_closed_port(self, monkeypatch):
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        assert cli._probe_daemon("127.0.0.1", 8765).listening is False
+
+
 class TestStatusHealth:
     """`server status` now queries the live Flight health (status + source_count)
     and can emit JSON for scripting (used by the installer)."""

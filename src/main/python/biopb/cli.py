@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -900,6 +901,90 @@ def _query_cache_stats(location: str, token: Optional[str]) -> Optional[dict]:
     return _query_server(location, token, lambda c: c.cache_stats())
 
 
+@dataclass
+class Probe:
+    """A daemon's liveness/health snapshot. `listening` says the daemon is up;
+    `health` is a richer status dict a daemon may expose (None if it exposes none,
+    or if the query failed -- probing never raises, so callers render either
+    daemon uniformly instead of guarding every query)."""
+
+    listening: bool
+    health: Optional[dict] = None
+
+
+def _probe_daemon(
+    host: str, port: int, health_fn: Optional[Callable[[], Optional[dict]]] = None
+) -> Probe:
+    """One uniform liveness/health snapshot for either SDK daemon (never raises).
+
+    Readiness and health are the same question at two fidelities, unified here. A
+    daemon that exposes a health RPC passes `health_fn`: its answer both fills
+    `health` and *defines* liveness (it answered -> it is up). A daemon with only
+    a bound port passes none, and a cheap TCP connect to (host, port) defines
+    liveness. Either way the caller gets a Probe it can render or poll without a
+    try/except -- a failed RPC comes back health=None, a closed port listening=False.
+    """
+    if health_fn is not None:
+        health = health_fn()
+        return Probe(listening=health is not None, health=health)
+    return Probe(listening=_port_listening(host, port))
+
+
+def _emit_daemon_status(
+    *,
+    title: str,
+    pid: Optional[int],
+    running: bool,
+    stale: bool,
+    pid_file: Path,
+    log_file: Path,
+    json_output: bool,
+    json_fields: dict,
+    table_rows: List[Tuple[str, str]],
+) -> None:
+    """Render one daemon's status (JSON or table) and exit(0).
+
+    The running/stale/stopped verdict and the common PID / PID-file / Log-file
+    rows are identical for both daemons; `json_fields` and `table_rows` carry the
+    per-daemon extras (Flight health for the tensor server, the HTTP endpoint for
+    biopb-mcp). `table_rows` are inserted between the PID row and the trailing
+    PID-file / Log-file rows, preserving each command's original row order.
+    """
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "running": running,
+                    "pid": pid if running else None,
+                    "status": "running"
+                    if running
+                    else ("stale" if stale else "stopped"),
+                    **json_fields,
+                }
+            )
+        )
+        raise typer.Exit(0)
+
+    table = Table(title=title)
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="green")
+
+    if not running:
+        table.add_row("Status", "Not running (stale PID)" if stale else "Not running")
+        if stale:
+            table.add_row("PID file", str(pid_file) + " (stale)")
+        console.print(table)
+        raise typer.Exit(0)
+
+    table.add_row("Status", "Running")
+    table.add_row("PID", str(pid))
+    for label, value in table_rows:
+        table.add_row(label, value)
+    table.add_row("PID file", str(pid_file))
+    table.add_row("Log file", str(log_file))
+    console.print(table)
+
+
 @server_app.command("status")
 def status(
     config: Path = typer.Option(
@@ -925,10 +1010,13 @@ def status(
     health: Optional[dict] = None
     if running:
         location, token = _resolve_grpc_endpoint(config)
+        host, port = _resolve_grpc_hostport(config)
         deadline = time.monotonic() + max(0.0, wait)
         last_report = None
         while True:
-            health = _query_health(location, token)
+            health = _probe_daemon(
+                host, port, lambda: _query_health(location, token)
+            ).health
             st = health.get("status") if health else None
             n = health.get("source_count") if health else None
             # While waiting, log human-facing progress to stderr so stdout stays
@@ -950,51 +1038,36 @@ def status(
     health_status = health.get("status") if health else None
     source_count = health.get("source_count") if health else None
 
-    if json_output:
-        print(
-            json.dumps(
-                {
-                    "running": running,
-                    "pid": pid if running else None,
-                    "status": "running"
-                    if running
-                    else ("stale" if stale else "stopped"),
-                    "health": health_status,
-                    "source_count": source_count,
-                    "writable": health.get("writable") if health else None,
-                    "uptime_seconds": health.get("uptime_seconds") if health else None,
-                }
-            )
-        )
-        raise typer.Exit(0)
+    table_rows: List[Tuple[str, str]] = []
+    if running:
+        if health:
+            table_rows.append(("Health", str(health_status)))
+            if source_count is not None:
+                table_rows.append(("Sources", str(source_count)))
+            if health.get("uptime_seconds") is not None:
+                table_rows.append(("Uptime", f"{health.get('uptime_seconds')}s"))
+            if health.get("writable") is not None:
+                table_rows.append(("Writable", str(health.get("writable"))))
+        else:
+            table_rows.append(("Health", "unreachable"))
+        table_rows.append(("Config", str(config)))
 
-    table = Table(title="TensorFlight Server Status")
-    table.add_column("Property", style="cyan")
-    table.add_column("Value", style="green")
-
-    if not running:
-        table.add_row("Status", "Not running (stale PID)" if stale else "Not running")
-        if stale:
-            table.add_row("PID file", str(PID_FILE) + " (stale)")
-        console.print(table)
-        raise typer.Exit(0)
-
-    table.add_row("Status", "Running")
-    table.add_row("PID", str(pid))
-    if health:
-        table.add_row("Health", str(health_status))
-        if source_count is not None:
-            table.add_row("Sources", str(source_count))
-        if health.get("uptime_seconds") is not None:
-            table.add_row("Uptime", f"{health.get('uptime_seconds')}s")
-        if health.get("writable") is not None:
-            table.add_row("Writable", str(health.get("writable")))
-    else:
-        table.add_row("Health", "unreachable")
-    table.add_row("Config", str(config))
-    table.add_row("PID file", str(PID_FILE))
-    table.add_row("Log file", str(_get_log_file()))
-    console.print(table)
+    _emit_daemon_status(
+        title="TensorFlight Server Status",
+        pid=pid,
+        running=running,
+        stale=stale,
+        pid_file=PID_FILE,
+        log_file=_get_log_file(),
+        json_output=json_output,
+        json_fields={
+            "health": health_status,
+            "source_count": source_count,
+            "writable": health.get("writable") if health else None,
+            "uptime_seconds": health.get("uptime_seconds") if health else None,
+        },
+        table_rows=table_rows,
+    )
 
 
 @server_app.command("logs")
@@ -1347,7 +1420,7 @@ def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
     while True:
         if not _is_process_running(pid):
             return False
-        if _port_listening(host, port):
+        if _probe_daemon(host, port).listening:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1528,44 +1601,27 @@ def mcp_status(
     stale = bool(pid and not running)
 
     port = _mcp_default_port()
-    listening = _port_listening("127.0.0.1", port) if running else False
+    listening = _probe_daemon("127.0.0.1", port).listening if running else False
 
-    if json_output:
-        print(
-            json.dumps(
-                {
-                    "running": running,
-                    "pid": pid if running else None,
-                    "status": "running"
-                    if running
-                    else ("stale" if stale else "stopped"),
-                    "port": port,
-                    "listening": listening,
-                    "url": _mcp_url(port) if running else None,
-                }
-            )
-        )
-        raise typer.Exit(0)
-
-    table = Table(title="biopb-mcp Server Status")
-    table.add_column("Property", style="cyan")
-    table.add_column("Value", style="green")
-
-    if not running:
-        table.add_row("Status", "Not running (stale PID)" if stale else "Not running")
-        if stale:
-            table.add_row("PID file", str(MCP_PID_FILE) + " (stale)")
-        console.print(table)
-        raise typer.Exit(0)
-
-    table.add_row("Status", "Running")
-    table.add_row("PID", str(pid))
-    table.add_row("Port", str(port))
-    table.add_row("MCP", _mcp_url(port))
-    table.add_row("Listening", "yes" if listening else "no (not bound yet?)")
-    table.add_row("PID file", str(MCP_PID_FILE))
-    table.add_row("Log file", str(_resolve_mcp_log_for_read()))
-    console.print(table)
+    _emit_daemon_status(
+        title="biopb-mcp Server Status",
+        pid=pid,
+        running=running,
+        stale=stale,
+        pid_file=MCP_PID_FILE,
+        log_file=_resolve_mcp_log_for_read(),
+        json_output=json_output,
+        json_fields={
+            "port": port,
+            "listening": listening,
+            "url": _mcp_url(port) if running else None,
+        },
+        table_rows=[
+            ("Port", str(port)),
+            ("MCP", _mcp_url(port)),
+            ("Listening", "yes" if listening else "no (not bound yet?)"),
+        ],
+    )
 
 
 @mcp_app.command("logs")
