@@ -160,10 +160,10 @@ Concrete adapters:
 |---------|--------|
 | `ZarrAdapter` | Zarr v2 arrays |
 | `OmeZarrAdapter` | OME-Zarr with precomputed pyramid routing |
-| `OmeTiffAdapter` | Single-file OME-TIFF |
-| `MultiFileOmeTiffAdapter` | Multi-file OME-TIFF / Micro-Manager datasets |
+| `OmeTiffAdapter` | OME-TIFF (single- and multi-file), pure-tifffile — no aicsimageio |
+| `TiffSequenceAdapter` | Plain TIFF stacks (directory of non-OME `.tif`) |
 | `Hdf5Adapter` | HDF5 chunked datasets |
-| `AicsAdapter` | Vendor formats (CZI, LIF, ND2, DV) via aicsimageio |
+| `AicsImageIoAdapter` (+ `Zeiss`/`Leica`/`Nikon`/`Dv`/`Olympus`/`Bioformats` subclasses) | Vendor formats (CZI, LIF, ND2, DV, …) and remote/non-OME `.tif` via aicsimageio |
 
 ### Chunk caching
 
@@ -373,13 +373,37 @@ class AdapterRegistry:
     def get_adapter_for_type(source_type: str) -> Type[BackendAdapter]
 ```
 
-Registration order (by priority/specificity):
-1. `AicsImageIoAdapter` — CZI, LIF, ND2, DV, LSM
-2. `OmeZarrAdapter` — OME-Zarr multiscales
-3. `ZarrAdapter` — Generic Zarr
-4. `MultiFileOmeTiffAdapter` — MicroManager datasets
-5. `OmeTiffAdapter` — Single-file OME-TIFF
-6. `Hdf5Adapter` — HDF5 (requires explicit config)
+Registration order (by priority/specificity, highest first — callers take
+`claims[0]`; see `adapters/__init__.py::get_default_registry`):
+1. `OmeTiffAdapter` — local OME-TIFF with embedded OME-XML (single- and
+   multi-file); pure-tifffile, no aicsimageio dependency
+2. `ZeissAdapter` / `LeicaAdapter` / `NikonAdapter` / `DvAdapter` /
+   `OlympusAdapter` / `BioformatsAdapter` / `AicsImageIoAdapter` — vendor formats
+   and the generic aicsimageio fallback (which also picks up a remote or non-OME
+   `.tif` that OmeTiffAdapter declines)
+3. `OmeZarrAdapter` (+ HCS) — OME-Zarr multiscales
+4. `ZarrAdapter` — generic Zarr
+5. `NdTiffAdapter` / `MicroManagerLegacyAdapter` / `TiffSequenceAdapter` —
+   Micro-Manager NDTiff, legacy MM datasets, plain TIFF stacks
+6. `DicomSeriesAdapter` / `DicomAdapter` / `NiftiAdapter` — medical imaging
+7. `Hdf5Adapter` — HDF5 (explicit `hdf5` type only)
+8. `RemoteTensorAdapter` — caching passthrough proxy (explicit `tensor-server`
+   type only; never claims a filesystem path)
+
+The optional aicsimageio/ndtiff/dicom/nifti adapters register only when their
+dependency is importable, so a slimmer install collapses the list without
+changing the relative order of what remains.
+
+**OME-TIFF before TIFF-sequence is load-bearing.** OmeTiffAdapter makes a
+*file*-level claim on a local `.tif`/`.tiff` that carries embedded OME-XML
+(consuming multi-file siblings via the master's OME-XML file list);
+TiffSequenceAdapter makes a *directory*-level claim on plain TIFF stacks and
+**excludes** OME-named files (`exclude_ome`, plus a `.companion.ome` guard).
+Registering OmeTiffAdapter first — together with that exclude — guarantees an
+`.ome.tif` becomes its own OME-TIFF source rather than being welded into a plain
+sequence. OmeTiffAdapter declines a non-OME `.tif` (and any remote/cloud path),
+so those fall through to the generic aicsimageio adapter or the sequence adapter
+with no regression.
 
 **OME-Zarr before plain Zarr is load-bearing.** A `.zarr` dir can be claimed by
 both; `get_claims_for_path` returns claims in registration order and callers take
