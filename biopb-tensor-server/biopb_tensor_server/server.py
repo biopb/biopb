@@ -30,7 +30,6 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceResult,
     AddSourceStreamMessage,
     FlightCmd,
-    PyramidLevel,
     RemoveSourceRequest,
     RemoveSourceResult,
     ResolveProgress,
@@ -43,11 +42,9 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 from biopb_tensor_server.base import SourceAdapter, TensorAdapter, decode_chunk_id
 from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
 from biopb_tensor_server.chunk import (
-    build_pyramid_plan,
     cache_key_for_chunk_id,
     encode_chunk_id,
 )
@@ -55,6 +52,7 @@ from biopb_tensor_server.config import PyramidConfig
 from biopb_tensor_server.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
+    WriteNotSupportedError,
 )
 from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
 
@@ -452,41 +450,6 @@ class TensorFlightServer(flight.FlightServerBase):
         with self._sources_lock:
             return self._sources.get(source_id)
 
-    def _advertised_pyramid(
-        self,
-        tensor_adapter: Optional[TensorAdapter],
-        base_desc: TensorDescriptor,
-    ) -> List["PyramidLevel"]:
-        """The pyramid levels to advertise for a tensor.
-
-        Native (precomputed on-disk) levels when the tensor ships them, else a
-        computed pyramid from the authoritative ``[pyramid]`` knobs. Filled only
-        by ``get_flight_info`` -- ``list_flights`` leaves ``pyramid`` empty, like
-        ``metadata_json``. Cheap (arithmetic + already-memoized level adapters),
-        so it is recomputed per open rather than separately cached.
-        """
-        levels = None
-        if tensor_adapter is not None:
-            try:
-                levels = tensor_adapter.get_native_pyramid_levels()
-            except Exception:
-                logger.exception(
-                    "pyramid: native enumeration failed for %s",
-                    base_desc.array_id,
-                )
-                levels = None
-        if levels is None:
-            cfg = self._pyramid_config
-            levels = build_pyramid_plan(
-                list(base_desc.shape),
-                list(base_desc.dim_labels),
-                reduction_method=cfg.reduction_method,
-                threshold=cfg.threshold,
-                downscale_factor=cfg.downscale_factor,
-                pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-            )
-        return levels
-
     def _get_sources_snapshot(self) -> List[Tuple[str, SourceAdapter]]:
         """Return a stable snapshot of registered sources for iteration."""
         with self._sources_lock:
@@ -507,7 +470,7 @@ class TensorFlightServer(flight.FlightServerBase):
         standalone tensor server.
         """
         adapter = self._get_source_adapter(source_id)
-        expected = getattr(adapter, "token", None)
+        expected = adapter.capability_token if adapter is not None else None
         if not expected:
             return
         mw = context.get_middleware("auth")
@@ -738,7 +701,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Name/size of what is being recalled, computed once (stat is recall-free).
         # Best-effort: an unresolved adapter exposes its URL; a directory or a
         # remote URL has no single file size, so target_bytes stays 0 (unknown).
-        source_url = getattr(adapter, "_source_url", None) or source_id
+        source_url = adapter.source_url or source_id
         target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
         target_bytes = 0
         try:
@@ -834,7 +797,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
-        root = getattr(adapter, "_source_url", None)
+        root = adapter.source_url
         # Single-file / remote / non-directory source: nothing to warm beyond what
         # resolve already recalled. One terminal `done`, files_total == 0.
         if not root or not os.path.isdir(root):
@@ -1145,7 +1108,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Token-protected sources (per-source capabilities) are not
             # enumerable: knowing the source_id must not be enough to list them.
-            if getattr(adapter, "token", None):
+            if adapter.capability_token:
                 continue
 
             # Building a source's descriptor can fail (e.g. an aicsimageio
@@ -1279,82 +1242,15 @@ class TensorFlightServer(flight.FlightServerBase):
             logger.warning(f"Tensor not found: {source_id}/{tensor_id}")
             raise flight.FlightServerError(f"Tensor not found: {source_id}/{tensor_id}")
 
-        # Build request descriptor for the specific tensor
+        # Build the read plan and advertise the pyramid + physical scale. Each
+        # adapter owns this seam (plan_flight_info): a remote proxy forwards the
+        # upstream's authoritative GetFlightInfo (native grid + server-advertised
+        # pyramid + physical scale, localized), while every other adapter plans
+        # locally against its native grid and the server's pyramid config.
+        # metadata_json is still filled below from the local mirror catalog (the
+        # #253 no-extra-RPC path), not by the adapter.
         try:
-            # A remote-proxy tensor mirrors an upstream source 1:1 and re-derives
-            # no chunk grid, pyramid, or physical scale of its own. Consult the
-            # upstream once for its authoritative GetFlightInfo and use it as-is
-            # rather than planning against a locally-guessed 64 MB grid and a
-            # locally-computed pyramid (biopb/biopb#295): the forwarded descriptor
-            # already carries the upstream's native grid, its server-advertised
-            # pyramid (a pyramidal OME-Zarr upstream's precompute levels
-            # included), and its physical scale -- so the pyramid/physical
-            # overwrite below is skipped for it (they are already authoritative).
-            # metadata_json still comes from the local mirror catalog (the #253
-            # no-extra-RPC path). A None return (upstream unreachable/unparseable)
-            # falls through to the local planner -- never worse than before.
-            read_plan = None
-            if isinstance(tensor_adapter, RemoteTensorAdapter):
-                read_plan = tensor_adapter.forward_flight_info(read_opt)
-
-            if read_plan is None:
-                base_desc = tensor_adapter.get_tensor_descriptor()
-                tensor_desc = TensorDescriptor(
-                    array_id=tensor_id,
-                    dim_labels=base_desc.dim_labels,
-                    shape=base_desc.shape,
-                    chunk_shape=base_desc.chunk_shape,
-                    dtype=base_desc.dtype,
-                )
-                if read_opt.HasField("slice_hint"):
-                    tensor_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-                    logger.debug(
-                        f"get_flight_info: slice_hint={list(read_opt.slice_hint.start)}-{list(read_opt.slice_hint.stop)}"
-                    )
-                # Apply scale_hint and reduction_method directly to TensorDescriptor
-                if read_opt.scale_hint:
-                    tensor_desc.scale_hint[:] = list(read_opt.scale_hint)
-                if read_opt.reduction_method:
-                    tensor_desc.reduction_method = read_opt.reduction_method
-
-                read_plan = tensor_adapter.get_read_plan(tensor_desc)
-
-                # The response descriptor's array_id is the adapter's own
-                # source-unique array_id (source_id or source_id/field), carried
-                # through get_read_plan from get_tensor_descriptor(). Under the
-                # identity policy this same qualified array_id is what list_flights
-                # advertises, the chunk_ids encode, and the client caches -- one
-                # form everywhere, so there is nothing to strip here (cf. the
-                # removed #45 bare-form normalization; the bare/qualified split it
-                # papered over no longer exists).
-
-                # Advertise the server-decided resolution pyramid. Filled here
-                # (open time), never in list_flights -- like metadata_json -- so
-                # discovery stays lean. The client reads each advertised level via
-                # the normal scale_hint path; native sources get their precomputed
-                # levels.
-                read_plan.descriptor.ClearField("pyramid")
-                read_plan.descriptor.pyramid.extend(
-                    self._advertised_pyramid(tensor_adapter, base_desc)
-                )
-
-                # Compact per-dim physical scale summary. Filled here at open time
-                # (always, like pyramid -- NOT gated on with_metadata), never in
-                # list_flights, so the common tensor-load path gets physical sizes
-                # without fetching the full OME tree (issue #31). Full-res values:
-                # do not scale by scale_hint (napari multiscale scale is level-0).
-                read_plan.descriptor.ClearField("physical_scale")
-                read_plan.descriptor.ClearField("physical_unit")
-                try:
-                    phys = tensor_adapter.get_physical_scale()
-                except Exception:
-                    phys = None
-                if phys is not None:
-                    scale_vec, unit_vec = phys
-                    ndim = len(read_plan.descriptor.dim_labels)
-                    if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
-                        read_plan.descriptor.physical_scale[:] = scale_vec
-                        read_plan.descriptor.physical_unit[:] = unit_vec
+            read_plan = tensor_adapter.plan_flight_info(read_opt, self._pyramid_config)
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
@@ -1388,7 +1284,7 @@ class TensorFlightServer(flight.FlightServerBase):
                     raw_metadata = tensor_adapter.get_metadata()
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
-                        "type": source_adapter._source_type,
+                        "type": source_adapter.source_type,
                         "dim_label": list(read_plan.descriptor.dim_labels),
                         "metadata": raw_metadata,
                     }
@@ -1719,10 +1615,12 @@ class TensorFlightServer(flight.FlightServerBase):
     def _handle_chunk_upload(
         self, upload: ChunkUpload, reader: flight.MetadataRecordBatchReader
     ) -> None:
-        """Write chunk data.
+        """Write chunk data by delegating to the source adapter's ``put_chunk``.
 
-        For OmeZarr-backed sources: enforces chunk_bounds aligns with chunk_shape.
-        For cache-backed sources: arbitrary bounds allowed.
+        Each source format owns its write contract: OmeZarr/Zarr enforce
+        chunk-grid alignment; cache-backed sources accept arbitrary bounds;
+        read-only formats reject the write. The handler no longer sniffs adapter
+        attributes to pick a path.
         """
         table = reader.read_all()
         data_column = table.column(0)
@@ -1736,45 +1634,16 @@ class TensorFlightServer(flight.FlightServerBase):
             stop - start for start, stop in zip(bounds.start, bounds.stop)
         )
 
-        # Check chunk alignment for OmeZarr-backed sources
-        if hasattr(adapter, "zarr_array"):
-            data = data_column.to_numpy()
-            if expected_shape:
-                data = data.reshape(expected_shape)
-            desc = adapter.get_tensor_descriptor()
-            chunk_shape = list(desc.chunk_shape)
-
-            # Verify start aligns to chunk_shape grid
-            for d, (start, chunk_size) in enumerate(zip(bounds.start, chunk_shape)):
-                if start % chunk_size != 0:
-                    raise flight.FlightServerError(
-                        f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
-                    )
-
-            # Verify chunk size matches (or is edge chunk)
-            actual_size = [
-                stop - start for start, stop in zip(bounds.start, bounds.stop)
-            ]
-            for d, (actual, expected) in enumerate(zip(actual_size, chunk_shape)):
-                if actual != expected and actual > expected:
-                    raise flight.FlightServerError(
-                        f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
-                    )
-
-            # Convert bounds to chunk_idx for zarr
-            chunk_idx = tuple(int(s // cs) for s, cs in zip(bounds.start, chunk_shape))
-            if hasattr(adapter, "write_chunk"):
-                adapter.write_chunk(chunk_idx, data)
-            else:
-                raise flight.FlightServerError("Source does not support writes")
-
-        elif isinstance(adapter, CachedSourceAdapter):
-            # Cache-backed sources accept arbitrary bounds
-            dtype = table.schema.field(0).type.to_pandas_dtype()
-            adapter.write_chunk_arrow(bounds, data_column, expected_shape, dtype)
-
-        else:
-            raise flight.FlightServerError("Source type does not support writes")
+        # Dispatch the write polymorphically: each source format owns its write
+        # contract (Zarr/OmeZarr enforce chunk-grid alignment; a cache source
+        # takes arbitrary bounds; read-only formats raise WriteNotSupportedError).
+        # Adapters stay transport-agnostic, so translate their write errors into a
+        # Flight error at this server boundary (alignment/size -> ValueError).
+        dtype = table.schema.field(0).type.to_pandas_dtype()
+        try:
+            adapter.put_chunk(bounds, data_column, expected_shape, dtype)
+        except (ValueError, WriteNotSupportedError) as e:
+            raise flight.FlightServerError(str(e))
 
         self.mark_upload_chunk(upload.source_id, bounds)
 

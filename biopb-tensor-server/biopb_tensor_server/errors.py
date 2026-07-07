@@ -35,3 +35,14 @@ class SourceResolveRetriableError(SourceUnresolvedError):
     for this subclass *first* and maps it to a retriable status (UNAVAILABLE),
     while a bare ``SourceUnresolvedError`` maps to a permanent status.
     """
+
+
+class WriteNotSupportedError(Exception):
+    """The source format has no write contract (it is read-only).
+
+    Raised by the default ``SourceAdapter.put_chunk`` for formats that only read
+    (the common case). The DoPut boundary wraps it into a Flight error. Kept off
+    the ``ValueError`` hierarchy on purpose so it is never swallowed by the
+    read-path ``except ValueError`` guards -- a write rejection is unrelated to
+    read planning.
+    """

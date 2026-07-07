@@ -262,9 +262,9 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         self._upstream_source_id = upstream_source_id
         self._token = token
         # Per-source capability token for the LOCAL server's auth (server reads
-        # adapter.token in _authorize_source). Proxied sources inherit server-wide
-        # auth, so leave it unset.
-        self.token: Optional[str] = None
+        # adapter.capability_token in _authorize_source). Proxied sources inherit
+        # server-wide auth, so leave it unset.
+        self._capability_token: Optional[str] = None
 
         self._client = None  # lazy TensorFlightClient to the upstream
         # Best-effort reachability, updated by every catalog-surface call to the
@@ -574,20 +574,26 @@ class RemoteTensorAdapter(SourceAdapter, TensorAdapter):
         view._tensor_name = field
         return view
 
-    def get_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
-        """Not implemented for the caching proxy yet -- always ``None``.
+    def plan_flight_info(self, read_opt, pyramid_config):
+        """Forward the upstream's authoritative GetFlightInfo, else plan locally.
 
-        The local server fills ``TensorDescriptor.physical_scale`` /
-        ``physical_unit`` on every ``GetFlightInfo`` from ``get_physical_scale()``,
-        so mirroring the upstream's scale would mean a per-open ``get_descriptor``
-        RPC to the upstream on every serve. That is the wrong layer: the mirror
-        catalog is bulk-seeded from a single upstream ``query_sources``
-        (biopb/biopb#266), and physical scale should ride that seed / the mirrored
-        descriptor rather than a lazy per-open round-trip. Until #266 carries it,
-        return ``None`` -- the proxy advertises no physical scale, exactly like a
-        format that carries none. Tracked by #266.
+        A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
+        pyramid, or physical scale of its own, so consult the upstream once
+        (``forward_flight_info``) and use its localized plan verbatim -- the
+        forwarded descriptor already carries the upstream's native grid, its
+        server-advertised pyramid, and its physical scale (kept by
+        ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
+        refilled locally from the mirror catalog). On an upstream failure the
+        forward returns ``None`` and we fall back to the base local planner --
+        never worse than a non-proxy adapter (biopb/biopb#295). On that fallback
+        the proxy advertises no physical scale of its own (inherited
+        ``_physical_scale`` default ``None``, exactly as before; tracked by
+        #266/#274).
         """
-        return None
+        plan = self.forward_flight_info(read_opt)
+        if plan is not None:
+            return plan
+        return super().plan_flight_info(read_opt, pyramid_config)
 
     # -------------------------------------------------------------- tensor layer
 

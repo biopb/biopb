@@ -17,6 +17,8 @@ from biopb_tensor_server.metadata_db import MetadataDatabase
 class MockAdapter:
     """Mock adapter for testing metadata sync."""
 
+    capability_token = None
+
     def __init__(
         self, source_id, source_url, source_type, shape, dtype, data_resident=True
     ):

@@ -32,7 +32,7 @@ def test_declared_scopes_match_the_abcs():
 
 def test_pyramid_and_scale_methods_are_tensor_scoped():
     """The moved methods live on TensorAdapter and are absent from SourceAdapter."""
-    moved = {"get_physical_scale", "get_native_pyramid_levels", "has_native_pyramid"}
+    moved = {"plan_flight_info", "get_native_pyramid_levels", "has_native_pyramid"}
     assert moved <= _public_api(TensorAdapter)
     assert moved.isdisjoint(_public_api(SourceAdapter))
     # Not merely inherited from a shared base: declared directly on TensorAdapter.
@@ -82,7 +82,7 @@ def test_unresolved_proxy_is_source_only():
     assert issubclass(UnresolvedSourceAdapter, SourceAdapter)
     assert not issubclass(UnresolvedSourceAdapter, TensorAdapter)
     for name in (
-        "get_physical_scale",
+        "plan_flight_info",
         "get_native_pyramid_levels",
         "has_native_pyramid",
     ):
