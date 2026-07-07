@@ -15,10 +15,11 @@ These tests lock the two things that make that safe:
 
 import numpy as np
 import pytest
-from biopb_tensor_server.adapters.aicsimageio import (
+from biopb_tensor_server.adapters.ome_tiff import (
     _STRIP_PER_PLANE,
     OmeTiffAdapter,
     _fast_ome_metadata,
+    _ome_axes_shape,
     _ome_scene_ids,
     _tczyx_shape,
 )
@@ -54,6 +55,35 @@ class TestTczyxShape:
     )
     def test_non_canonical_axes_signal_fallback(self, shape, axes):
         assert _tczyx_shape(shape, axes) is None
+
+
+class TestOmeAxesShape:
+    @pytest.mark.parametrize(
+        "shape,axes,dims,expected",
+        [
+            ((3, 16, 16), "CYX", "TCZYX", [1, 3, 1, 16, 16]),  # canonical
+            ((4, 2, 3, 16, 16), "TCZYX", "TCZYX", [4, 2, 3, 16, 16]),
+            ((16, 16, 3), "YXS", "TCZYXS", [1, 1, 1, 16, 16, 3]),  # RGB samples
+            ((12, 10, 4), "YXS", "TCZYXS", [1, 1, 1, 12, 10, 4]),  # RGBA samples
+        ],
+    )
+    def test_maps_canonical_and_samples(self, shape, axes, dims, expected):
+        got = _ome_axes_shape(shape, axes)
+        assert got is not None
+        got_dims, got_shape = got
+        assert "".join(got_dims) == dims
+        assert got_shape == expected
+
+    @pytest.mark.parametrize(
+        "shape,axes",
+        [
+            ((4, 16, 16), "QYX"),  # unknown (non-OME) axis
+            ((2, 16, 16), "CZYX"),  # axes/shape length mismatch
+            ((16, 16), ""),  # no axes
+        ],
+    )
+    def test_declines_non_ome_axes(self, shape, axes):
+        assert _ome_axes_shape(shape, axes) is None
 
 
 class TestOmeSceneIds:
@@ -173,11 +203,15 @@ class TestRgbSamplesDescriptor:
         )
         return path
 
-    def test_tifffile_fast_path_defers_rgb(self, tmp_path):
-        # The tifffile-direct fast path rejects the S axis up front.
+    def test_tifffile_maps_rgb_natively(self, tmp_path):
+        # RGB (YXS) is tifffile-native (biopb/biopb#213 follow-up): the descriptor
+        # path maps the trailing samples axis to a 6-D TCZYXS descriptor.
         path = self._write_rgb_ome_tiff(tmp_path)
         adapter = OmeTiffAdapter.create_from_url(path, "rgb")
-        assert adapter._tifffile_descriptors() is None
+        descs = adapter._tifffile_descriptors()
+        assert descs is not None
+        assert list(descs[0].dim_labels) == list("TCZYXS")
+        assert list(descs[0].shape) == [1, 1, 1, 24, 32, 3]
 
     def test_descriptor_labels_and_shape_agree(self, tmp_path):
         path = self._write_rgb_ome_tiff(tmp_path)
@@ -190,8 +224,8 @@ class TestRgbSamplesDescriptor:
         assert len(d.dim_labels) == len(d.shape), (
             f"label/shape length mismatch: {list(d.dim_labels)} vs {list(d.shape)}"
         )
-        # The authoritative scene-switching descriptor: samples become a trailing
-        # S axis, matching what get_tensor_adapter serves at read time.
+        # Interleaved samples become a trailing S axis (TCZYXS), the layout the
+        # webapp renderer expects.
         assert list(d.dim_labels) == list("TCZYXS")
         assert list(d.shape) == [1, 1, 1, 24, 32, 3]
 
@@ -490,46 +524,39 @@ class TestOmeParseDedup:
 
 
 class TestReadPathTifffileAuthoritative:
-    """biopb/biopb#213: the OME-TIFF READ path is tifffile-authoritative.
+    """The OME-TIFF read path is pure tifffile (biopb/biopb#213 + detachment).
 
-    Registration was already AICSImage-parse-free (TestFastPathParity); these lock
-    that the *read* path -- GetFlightInfo (via plan_flight_info) and DoGet
-    (get_data) -- also never triggers AICSImage's O(plane-count) OME parse for an
-    accepted (canonical) OME-TIFF. Per the maintainer, correctness here is
-    *internal consistency* of the tifffile store (data matches its descriptor;
-    sub-regions are correct; ragged gaps are deterministic), NOT parity against
-    AICSImage.dask_data -- comparing to the removed dependency would re-couple the
-    read path to it.
+    ``OmeTiffAdapter`` has no aicsimageio dependency at all -- descriptors, reads,
+    metadata, and physical scale come from tifffile / the embedded OME-XML.
+    Correctness is asserted as internal consistency of the tifffile store (data
+    matches its descriptor; sub-regions are correct; ragged gaps are
+    deterministic), and that the adapter never grows an ``_aics_image``.
     """
 
-    def _accepted_scene(self, path, source_id, field="Image:0"):
-        """Registered adapter + a tripwired accepted-regime scene adapter.
-
-        The tripwire is installed AFTER registration, so any AICSImage access on
-        the ensuing read path fails loudly (the whole point of #213).
-        """
+    def _scene(self, path, source_id, field="Image:0"):
+        """Registered source adapter + its scene adapter for ``field``."""
         adapter = OmeTiffAdapter.create_from_url(path, source_id)
-        adapter.list_tensor_descriptors()
-        assert adapter._descriptors_from_tifffile is True
-        adapter._aics_image = _Tripwire()
+        descriptors = adapter.list_tensor_descriptors()
+        assert descriptors, "expected tifffile descriptors for a local OME-TIFF"
         scene = adapter.get_tensor_adapter(field)
         assert scene._tifffile_descriptor is not None
         return adapter, scene
 
-    def test_read_path_does_not_parse_aicsimageio(self, tmp_path):
-        # T1: the core regression lock -- exercise the WHOLE read path with the
-        # AICSImage tripwired: plan_flight_info (the #350 GetFlightInfo seam:
-        # descriptor + pyramid + physical scale) and get_data (DoGet).
+    def test_read_path_has_no_aicsimageio(self, tmp_path):
+        # Core lock post-detachment: exercise the whole read path -- plan_flight_info
+        # (the #350 GetFlightInfo seam: descriptor + pyramid + physical scale) and
+        # get_data (DoGet) -- and assert the adapter never holds an aicsimageio image.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb.tensor.ticket_pb2 import ChunkBounds
         from biopb_tensor_server.config import PyramidConfig
 
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
-        _, scene = self._accepted_scene(path, "readnoparse")
+        _, scene = self._scene(path, "pure")
+        assert not hasattr(scene, "_aics_image")
 
         plan = scene.plan_flight_info(TensorReadOption(), PyramidConfig())
         assert list(plan.descriptor.shape) == [1, 3, 1, 64, 64]
-        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid, no AICSImage
+        assert len(plan.descriptor.pyramid) >= 1  # computed pyramid
 
         bounds = ChunkBounds(start=[0, 1, 0, 0, 0], stop=[1, 2, 1, 64, 64])
         arr = np.asarray(scene.get_data(bounds))
@@ -540,9 +567,9 @@ class TestReadPathTifffileAuthoritative:
         assert scene._physical_scale() is None  # fixture carries no PhysicalSize
 
     def test_descriptor_data_self_consistency_multi_series(self, tmp_path):
-        # T2: for each scene the data matches its advertised descriptor
-        # (shape/dtype) and the known per-series fill lands at the right position,
-        # locking correct scene->series mapping and TCZYX axis order. No AICSImage.
+        # For each scene the data matches its advertised descriptor (shape/dtype)
+        # and the known per-series fill lands at the right position -- locking
+        # correct scene->series mapping and TCZYX axis order.
         from biopb.tensor.ticket_pb2 import ChunkBounds
 
         path, _, _ = create_multi_series_ome_tiff(
@@ -550,7 +577,6 @@ class TestReadPathTifffileAuthoritative:
         )
         adapter = OmeTiffAdapter.create_from_url(path, "consist")
         descriptors = adapter.list_tensor_descriptors()
-        adapter._aics_image = _Tripwire()
 
         for k, desc in enumerate(descriptors):
             field = desc.array_id.split("/", 1)[1]
@@ -566,17 +592,16 @@ class TestReadPathTifffileAuthoritative:
                 assert arr[0, p, 0, 0, 0] == k * 100 + p + 1
 
     def test_ragged_gap_is_internally_consistent(self, tmp_path):
-        # T3: a sparse OME-TIFF (SizeC=3, channel 1 absent) reads to the declared
-        # shape; present channels carry their true values and the ragged gap is
-        # filled DETERMINISTICALLY (repeat reads identical). We assert internal
-        # consistency of the tifffile store, not a specific gap value.
+        # A sparse OME-TIFF (SizeC=3, channel 1 absent) reads to the declared shape;
+        # present channels carry their true values and the ragged gap is filled
+        # DETERMINISTICALLY (repeat reads identical) -- internal consistency of the
+        # tifffile store, not a specific gap value.
         from biopb.tensor.ticket_pb2 import ChunkBounds
 
         path, present = self._write_sparse_multifile_ome_tiff(str(tmp_path))
         adapter = OmeTiffAdapter.create_from_url(path, "ragged")
         descriptors = adapter.list_tensor_descriptors()
-        assert adapter._descriptors_from_tifffile is True
-        adapter._aics_image = _Tripwire()
+        assert descriptors
 
         desc = descriptors[0]
         full = ChunkBounds(start=[0, 0, 0, 0, 0], stop=list(desc.shape))
@@ -587,22 +612,38 @@ class TestReadPathTifffileAuthoritative:
         arr2 = np.asarray(adapter.get_tensor_adapter("Image:0").get_data(full))
         assert np.array_equal(arr, arr2)  # ragged fill is deterministic
 
+    def test_rgb_reads_via_tifffile_store(self, tmp_path):
+        # RGB (YXS) is tifffile-native end-to-end: the scene serves a TCZYXS block.
+        import tifffile
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        p = str(tmp_path / "rgb.ome.tif")
+        data = np.zeros((24, 32, 3), np.uint8)
+        data[..., 0], data[..., 1], data[..., 2] = 10, 20, 30
+        tifffile.imwrite(p, data, ome=True, photometric="rgb", metadata={"axes": "YXS"})
+        _, scene = self._scene(p, "rgb")
+        desc = scene.get_tensor_descriptor()
+        assert list(desc.dim_labels) == list("TCZYXS")
+        arr = np.asarray(
+            scene.get_data(ChunkBounds(start=[0] * 6, stop=list(desc.shape)))
+        )
+        assert arr.shape == (1, 1, 1, 24, 32, 3)
+        assert arr[0, 0, 0, 0, 0, 0] == 10 and arr[0, 0, 0, 0, 0, 2] == 30
+
     def test_physical_scale_from_stripped_xml(self, tmp_path):
-        # T4: physical scale comes from the local OME-XML (per-plane stripped) with
-        # AICSImage tripwired -- T/C axes map to 0.0/''.
         path = self._write_ome_tiff_with_physical_sizes(
             str(tmp_path / "phys.ome.tif"), psx=0.325, psy=0.325, psz=2.0
         )
-        _, scene = self._accepted_scene(path, "phys")
+        _, scene = self._scene(path, "phys")
         scale, unit = scene._physical_scale()
         assert scale == [0.0, 0.0, 2.0, 0.325, 0.325]  # TCZYX
         assert unit == ["", "", "µm", "µm", "µm"]
 
     def test_physical_scale_missing_unit_defaults_to_micron(self, tmp_path):
-        # T4 (cont.): tifffile always stamps a unit, so inject an OME-XML that omits
-        # it to lock the "µm" default (what ome-types fills on the _aics_image path).
+        # tifffile always stamps a unit, so inject an OME-XML that omits it to lock
+        # the "µm" default (the OME spec default).
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(1, 16, 16))
-        _, scene = self._accepted_scene(path, "nounit")
+        _, scene = self._scene(path, "nounit")
         scene._raw_ome_xml = (
             '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
             '<Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" '
@@ -616,60 +657,11 @@ class TestReadPathTifffileAuthoritative:
         assert scale == [0.0, 0.0, 0.0, 0.5, 0.5]  # Z absent -> 0.0
         assert unit == ["", "", "", "µm", "µm"]
 
-    def test_no_physical_scale_does_not_fall_through_to_aicsimageio(self, tmp_path):
-        # T4 (gate): an accepted OME-TIFF with no PhysicalSize* returns None WITHOUT
-        # touching _aics_image -- the miss-regime "fall through on None" must not
-        # fire here (it would trigger the OME parse the tripwire forbids).
+    def test_no_physical_scale_returns_none(self, tmp_path):
+        # An OME-TIFF with no PhysicalSize* has no known scale -> None.
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 16, 16))
-        _, scene = self._accepted_scene(path, "nophys")
-        assert scene._physical_scale() is None  # _Tripwire never fires
-
-    def test_miss_regime_rgb_defers_to_aicsimageio(self, tmp_path):
-        # T5(a): RGB (YXS) is a fast-path miss -- the scene adapter must NOT be
-        # tifffile-authoritative and must still read via the AICSImage fallback.
-        import tifffile
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-
-        p = str(tmp_path / "rgb.ome.tif")
-        data = np.zeros((24, 32, 3), np.uint8)
-        data[..., 0], data[..., 1], data[..., 2] = 10, 20, 30
-        tifffile.imwrite(p, data, ome=True, photometric="rgb", metadata={"axes": "YXS"})
-
-        adapter = OmeTiffAdapter.create_from_url(p, "rgb")
-        descriptors = adapter.list_tensor_descriptors()
-        assert adapter._descriptors_from_tifffile is False
-        scene = adapter.get_tensor_adapter(descriptors[0].array_id)
-        assert scene._tifffile_descriptor is None  # miss regime
-        desc = scene.get_tensor_descriptor()
-        arr = np.asarray(
-            scene.get_data(
-                ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
-            )
-        )
-        assert arr.shape == tuple(desc.shape)  # (1, 1, 1, 24, 32, 3)
-        assert arr[..., 0].max() == 10 and arr[..., 2].max() == 30
-
-    def test_miss_regime_plain_non_ome_tiff_defers(self, tmp_path):
-        # T5(b): a plain non-OME .tif is a miss -- descriptor and scene both defer
-        # to AICSImage, and the read still returns the right data.
-        import tifffile
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-
-        plain = str(tmp_path / "plain.tif")
-        tifffile.imwrite(plain, np.full((16, 16), 7, np.uint8))  # no OME-XML
-        adapter = OmeTiffAdapter.create_from_url(plain, "plain")
-        descriptors = adapter.list_tensor_descriptors()
-        assert adapter._descriptors_from_tifffile is False
-        scene = adapter.get_tensor_adapter(descriptors[0].array_id)
-        assert scene._tifffile_descriptor is None
-        desc = scene.get_tensor_descriptor()
-        arr = np.asarray(
-            scene.get_data(
-                ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
-            )
-        )
-        assert arr.shape == tuple(desc.shape)
-        assert (arr == 7).all()
+        _, scene = self._scene(path, "nophys")
+        assert scene._physical_scale() is None
 
     # ---- local fixture writers ----
 

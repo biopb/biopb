@@ -253,10 +253,8 @@ class TestReaderDeferBranches:
     def test_ome_tiff_sniff_skipped_when_nonresident(self, tmp_path, force_nonresident):
         # A non-resident .tif: OmeTiffAdapter declines (skips the IFD sniff) so the
         # extension-only generic AICS adapter claims it instead as an image.
-        from biopb_tensor_server.adapters.aicsimageio import (
-            AicsImageIoAdapter,
-            OmeTiffAdapter,
-        )
+        from biopb_tensor_server.adapters.aicsimageio import AicsImageIoAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "img.tif"
         f.write_bytes(b"II*\x00not-a-real-tiff")
@@ -1199,7 +1197,7 @@ class TestCloudMultiFileBan:
     def test_ome_tiff_does_not_group_under_cloud(self, tmp_path):
         # Even a *resident* .tif must not be sniffed/grouped under cloud -- the
         # raising ctx proves no content read happens.
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "img.tif"
         f.write_bytes(b"II*\x00real-bytes-but-cloud")
@@ -1209,7 +1207,7 @@ class TestCloudMultiFileBan:
         )
 
     def test_companion_ome_skipped_under_cloud(self, tmp_path):
-        from biopb_tensor_server.adapters.aicsimageio import OmeTiffAdapter
+        from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 
         f = tmp_path / "set.companion.ome"
         f.write_text("<OME/>")
