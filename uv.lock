@@ -764,7 +764,6 @@ dependencies = [
 [package.optional-dependencies]
 aics = [
     { name = "bioio" },
-    { name = "bioio-czi" },
     { name = "bioio-dv" },
     { name = "bioio-imageio" },
     { name = "bioio-lif" },
@@ -776,6 +775,9 @@ bioformats = [
     { name = "bioio-bioformats" },
     { name = "cjdk" },
     { name = "scyjava" },
+]
+czi = [
+    { name = "bioio-czi" },
 ]
 dicom = [
     { name = "pydicom" },
@@ -814,7 +816,7 @@ web = [
 requires-dist = [
     { name = "bioio", marker = "extra == 'aics'", specifier = ">=3.0" },
     { name = "bioio-bioformats", marker = "extra == 'bioformats'" },
-    { name = "bioio-czi", marker = "extra == 'aics'" },
+    { name = "bioio-czi", marker = "extra == 'czi'" },
     { name = "bioio-dv", marker = "extra == 'aics'" },
     { name = "bioio-imageio", marker = "extra == 'aics'" },
     { name = "bioio-lif", marker = "extra == 'aics'" },
@@ -851,7 +853,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.30.0" },
     { name = "zarr", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["web", "test", "aics", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical"]
+provides-extras = ["web", "test", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical"]
 
 [[package]]
 name = "black"
