@@ -373,8 +373,16 @@ def _bootstrap_impl():
 
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
+    #    With Qt live (but before the slow napari import), pop a splash so the
+    #    scientist sees "starting, please wait" rather than a blank screen while
+    #    the viewer is built (best-effort; _NullSplash when off/unavailable).
+    from ._splash import _NullSplash, show_splash
+
+    splash = _NullSplash()  # replaced below when a real one can be shown
     if not headless:
         ip.enable_gui("qt")
+        if get_setting(config, "mcp.viewer.splash"):
+            splash = show_splash()
 
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
@@ -493,15 +501,19 @@ def _bootstrap_impl():
             "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
         )
 
+        splash.message("Loading napari…")  # the slow step
         import napari
 
         from ..tensor_browser import TensorBrowserWidget
 
+        splash.message("Opening viewer…")
         viewer = napari.Viewer()
         tbw = TensorBrowserWidget(
             viewer, connection=conn, compute_scheduler=compute_scheduler
         )
         viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+        # Hand the splash off to the viewer window (closes once it's shown).
+        splash.finish(viewer)
         # Tear the kernel down to idle when the user closes the window: signal
         # the launcher's reader thread over the inherited window-close pipe.
         _install_window_close_hook(viewer)

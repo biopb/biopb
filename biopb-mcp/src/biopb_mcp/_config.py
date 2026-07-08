@@ -292,6 +292,13 @@ DEFAULT_CONFIG = {
             # still sees exactly the frame it requested. Set False to keep the
             # old fully-synchronous slicing.
             "async_slicing": True,
+            # Show a Qt splash screen while the kernel opens the napari viewer.
+            # Kernel bring-up is slow (mostly the napari import + Viewer build,
+            # worse on Windows / first launch); the splash tells the watching
+            # scientist to wait instead of staring at a blank screen. Purely
+            # cosmetic and best-effort; set False to suppress it. GUI branch
+            # only — a headless kernel has no Qt loop.
+            "splash": True,
         },
         "services": {
             # biopb.image ProcessImage servicer URLs (grpc:// or grpcs://).
