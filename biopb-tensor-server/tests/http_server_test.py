@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from biopb_tensor_server.http_server import _request_array_id, create_app
+from biopb_tensor_server.serving.http_server import _request_array_id, create_app
 from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def auth_client():
     """TestClient backed by a mocked Flight client, token auth enabled."""
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(token=_TOKEN, dev_mode=False)
@@ -100,7 +100,7 @@ def dev_client():
     """TestClient in dev_mode (no auth required)."""
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(token=None, dev_mode=True)
@@ -322,7 +322,7 @@ class TestSliceEndpoint:
         )
         mock_fc = _build_mock_client(qualified)
         with patch(
-            "biopb_tensor_server.http_server.TensorFlightClient",
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
         ):
             app = create_app(token=_TOKEN, dev_mode=False)
@@ -434,7 +434,7 @@ class TestChunkEndpoint:
 
         # Mock do_get to return a table
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -456,7 +456,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -479,7 +479,7 @@ class TestChunkEndpoint:
         ticket_hex = self._make_ticket_hex()
 
         import pyarrow as pa
-        from biopb_tensor_server.base import pack_chunk_batch
+        from biopb_tensor_server.core.base import pack_chunk_batch
 
         # do_get returns the unified binary chunk batch (biopb/biopb#293).
         batch = pack_chunk_batch(np.zeros((16, 16), dtype="uint16"))
@@ -845,7 +845,7 @@ class TestWindowsShutdownListener:
     def test_sentinel_path_matches_stop_side_contract(self):
         from pathlib import Path
 
-        from biopb_tensor_server.http_server import shutdown_sentinel_path
+        from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
         # Must match biopb.cli._win_shutdown_sentinel (PID_FILE.parent / name).
         # Fixed name (not pid-keyed) so stop and the daemon always agree.
@@ -853,11 +853,13 @@ class TestWindowsShutdownListener:
         assert shutdown_sentinel_path() == expected
 
     def test_noop_off_windows(self):
-        from biopb_tensor_server.http_server import _install_windows_shutdown_listener
+        from biopb_tensor_server.serving.http_server import (
+            _install_windows_shutdown_listener,
+        )
 
         server = SimpleNamespace(should_exit=False)
         before = threading.active_count()
-        with patch("biopb_tensor_server.http_server.sys") as mock_sys:
+        with patch("biopb_tensor_server.serving.http_server.sys") as mock_sys:
             mock_sys.platform = "linux"
             _install_windows_shutdown_listener(server)  # must not raise
         assert threading.active_count() == before  # no watcher thread started
@@ -886,7 +888,7 @@ def admin_client(tmp_path):
         "last_full_scan_finished_at": None,
     }
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(
@@ -1041,7 +1043,7 @@ def admin_client_with_creds(tmp_path):
     )
     mock_fc = _build_mock_client()
     with patch(
-        "biopb_tensor_server.http_server.TensorFlightClient",
+        "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
     ):
         app = create_app(
@@ -1057,7 +1059,7 @@ def admin_client_with_creds(tmp_path):
 
 class TestAdminConfigSecretRedaction:
     def test_get_masks_credential_secrets(self, admin_client_with_creds):
-        from biopb_tensor_server.config import REDACTED_SENTINEL
+        from biopb_tensor_server.core.config import REDACTED_SENTINEL
 
         tc, _ = admin_client_with_creds
         prof = tc.get("/api/config").json()["config"]["credentials"]["profiles"][0]
@@ -1070,7 +1072,7 @@ class TestAdminConfigSecretRedaction:
     ):
         import json as _json
 
-        from biopb_tensor_server.config import REDACTED_SENTINEL
+        from biopb_tensor_server.core.config import REDACTED_SENTINEL
 
         tc, config_path = admin_client_with_creds
         # Round-trip the masked GET body back, editing only a non-secret field.

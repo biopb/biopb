@@ -47,7 +47,7 @@ def test_serve_reads_metadata_from_catalog_without_recompute(simple_zarr_array):
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -81,7 +81,7 @@ def test_serve_falls_back_to_adapter_when_row_is_null(simple_zarr_array):
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -154,7 +154,7 @@ def test_serve_hcs_like_source_uses_per_tensor_metadata_not_catalog(simple_zarr_
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.metadata_db import MetadataDatabase
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")

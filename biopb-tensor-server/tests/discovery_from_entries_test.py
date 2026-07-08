@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     discover_sources,
     discover_sources_from_entries,

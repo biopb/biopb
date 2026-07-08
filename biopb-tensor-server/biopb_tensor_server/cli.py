@@ -24,20 +24,23 @@ from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import ArrowFileBackend
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     CacheConfig,
     ServerConfig,
     SourceConfig,
     load_config,
     resolve_all_sources,
 )
-from biopb_tensor_server.http_server import run as run_http_server
-from biopb_tensor_server.logging_config import get_log_level_from_env, setup_logging
-from biopb_tensor_server.metadata_db import MetadataDatabase
-from biopb_tensor_server.precache import PrecacheWorker
-from biopb_tensor_server.server import TensorFlightServer
-from biopb_tensor_server.source_manager import create_source_manager
-from biopb_tensor_server.watcher import get_watcher
+from biopb_tensor_server.core.logging_config import (
+    get_log_level_from_env,
+    setup_logging,
+)
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.http_server import run as run_http_server
+from biopb_tensor_server.serving.precache import PrecacheWorker
+from biopb_tensor_server.serving.server import TensorFlightServer
+from biopb_tensor_server.sources.source_manager import create_source_manager
+from biopb_tensor_server.sources.watcher import get_watcher
 
 app = typer.Typer(
     name="biopb-tensor-server",
@@ -775,7 +778,7 @@ def config_schema(
     """
     import json
 
-    from biopb_tensor_server.config_schema import build_config_schema
+    from biopb_tensor_server.core.config_schema import build_config_schema
 
     text = json.dumps(build_config_schema(), indent=2) + "\n"
     if output is not None:

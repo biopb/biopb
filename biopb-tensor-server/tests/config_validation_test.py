@@ -9,8 +9,8 @@ later on the request path. Enforcement lives in each dataclass's
 import logging
 
 import pytest
-from biopb_tensor_server import config as cfg
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core import config as cfg
+from biopb_tensor_server.core.config import (
     CacheConfig,
     MetadataDbConfig,
     PrecacheConfig,

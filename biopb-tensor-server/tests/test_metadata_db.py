@@ -11,7 +11,7 @@ Tests cover:
 import json
 
 import pytest
-from biopb_tensor_server.metadata_db import MetadataDatabase
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
 
 
 class MockAdapter:
@@ -835,7 +835,7 @@ class TestListFlightsTruncation:
 
     def test_list_flights_schema_metadata(self):
         """Test that list_flights includes truncation metadata in schema."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         # Bind to port 0: the OS assigns a free port and this test never connects
         # a client (it calls list_flights in-process), so the value is irrelevant.
@@ -867,7 +867,7 @@ class TestListFlightsTruncation:
 
     def test_list_flights_truncation(self):
         """Test that list_flights truncates and signals via metadata."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         # Bind to port 0: the OS assigns a free port and this test never connects
         # a client (it calls list_flights in-process), so the value is irrelevant.
@@ -900,7 +900,7 @@ class TestListFlightsTruncation:
 
     def test_list_flights_uses_stable_snapshot_during_mutation(self):
         """list_flights should not fail if sources mutate mid-iteration."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         # Bind to port 0: the OS assigns a free port and this test never connects
         # a client (it calls list_flights in-process), so the value is irrelevant.

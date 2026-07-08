@@ -185,7 +185,7 @@ class TestClaim:
     def test_single_file_ome_tiff_is_claimed(self, tmp_path):
         from pathlib import Path
 
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         # Plain single-file OME-TIFF: embedded OME-XML, bare <TiffData/> with no
         # <UUID FileName> (what tifffile and most writers emit).
@@ -198,7 +198,7 @@ class TestClaim:
     def test_multi_file_ome_tiff_is_claimed(self, tmp_path):
         from pathlib import Path
 
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         path, _, _ = create_multifile_embedded_ome_tiff(str(tmp_path), n_files=3)
         claim = OmeTiffAdapter.claim(ClaimContext(Path(path)), DiscoveryState())
@@ -337,7 +337,7 @@ class TestRgbSamplesDescriptor:
         # End-to-end guard on the exact path that was failing: get_flight_info
         # validates the client's SliceHint against the descriptor dim count.
         from biopb.tensor.client import TensorFlightClient
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         path = self._write_rgb_ome_tiff(tmp_path)
         adapter = OmeTiffAdapter(path, "rgb")
@@ -609,7 +609,7 @@ class TestReadPathTifffileAuthoritative:
         # get_data (DoGet) -- and assert the adapter never holds an aicsimageio image.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.config import PyramidConfig
+        from biopb_tensor_server.core.config import PyramidConfig
 
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
         _, scene = self._scene(path, "pure")

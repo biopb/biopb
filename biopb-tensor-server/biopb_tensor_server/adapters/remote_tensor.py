@@ -44,13 +44,13 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
-from biopb_tensor_server.base import (
+from biopb_tensor_server.core.base import (
     SourceAdapter,
     TensorAdapter,
     TensorReadPlan,
     unpack_chunk_array,
 )
-from biopb_tensor_server.chunk import (
+from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     cache_key_for_chunk_id,
     decode_chunk_id,
@@ -60,7 +60,7 @@ from biopb_tensor_server.chunk import (
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 

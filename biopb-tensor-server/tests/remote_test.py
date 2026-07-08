@@ -5,8 +5,8 @@ import os
 
 import fsspec
 import pytest
-from biopb_tensor_server.discovery import generate_source_id
-from biopb_tensor_server.remote import (
+from biopb_tensor_server.core.discovery import generate_source_id
+from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
     RemoteStore,
@@ -556,7 +556,7 @@ class TestZarrAdapterRemote:
         """ZarrAdapter works with memory filesystem."""
         import zarr
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from biopb_tensor_server.remote import RemoteStore
+        from biopb_tensor_server.core.remote import RemoteStore
         from zarr.storage import FSStore
 
         fs, path = memory_zarr

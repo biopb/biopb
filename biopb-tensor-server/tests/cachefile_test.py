@@ -22,15 +22,15 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb_tensor_server.base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
 )
-from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.base import pack_chunk_batch, unpack_chunk_array
+from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 def _zarr_available() -> bool:

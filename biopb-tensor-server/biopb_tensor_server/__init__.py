@@ -42,12 +42,6 @@ except ImportError:
     OlympusAdapter = None  # type: ignore
     AicsImageIoAdapter = None  # type: ignore
 
-from biopb_tensor_server.base import (
-    BackendAdapter,
-    SourceAdapter,
-    TensorAdapter,
-    TensorReadPlan,
-)
 from biopb_tensor_server.cache import (
     CacheBackend,
     CacheEntry,
@@ -56,11 +50,17 @@ from biopb_tensor_server.cache import (
     EntryState,
     MemoryCacheBackend,
 )
-from biopb_tensor_server.chunk import ChunkEndpoint
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.base import (
+    BackendAdapter,
+    SourceAdapter,
+    TensorAdapter,
+    TensorReadPlan,
+)
+from biopb_tensor_server.core.chunk import ChunkEndpoint
+from biopb_tensor_server.core.config import (
     CacheConfig,
 )
-from biopb_tensor_server.server import (
+from biopb_tensor_server.serving.server import (
     TensorFlightServer,
     serve,
 )

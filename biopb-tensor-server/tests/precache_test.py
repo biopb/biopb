@@ -5,14 +5,14 @@ import time
 
 import numpy as np
 import pytest
-from biopb_tensor_server.chunk import (
+from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     compute_precache_scale_hint,
     is_scaled_chunk,
 )
-from biopb_tensor_server.config import PrecacheConfig
-from biopb_tensor_server.precache import PrecacheWorker
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.config import PrecacheConfig
+from biopb_tensor_server.serving.precache import PrecacheWorker
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 def _zarr_available() -> bool:
@@ -230,7 +230,7 @@ class TestWarming:
 
     def test_warms_scaled_chunks_into_file_cache(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -287,7 +287,7 @@ class TestWarming:
         # a cloud root) must short-circuit before any chunk is read, so OneDrive
         # is never asked to recall the bytes.
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -324,7 +324,7 @@ class TestWarming:
         # across the network from the upstream, and the proxy does not implement
         # has_native_pyramid() so it would mis-warm a pyramidal upstream.
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -360,7 +360,7 @@ class TestWarming:
 
     def test_memory_backend_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(backend="memory"))
@@ -385,8 +385,8 @@ class TestWarming:
 
 class TestRuntimePhaseGating:
     def _bare_source_manager(self):
-        from biopb_tensor_server.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.source_manager import SourceManager
+        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("grpc://localhost:0")
         sm = SourceManager(
@@ -535,7 +535,7 @@ class TestPreemptionAndLifecycle:
         import zarr
         from biopb_tensor_server import ZarrAdapter
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -666,7 +666,7 @@ class _FakeBackend:
 
 class TestHeadroomProbe:
     def test_has_headroom_tracks_high_water(self, monkeypatch):
-        from biopb_tensor_server import precache as pc
+        from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
         backend = _FakeBackend(total=0, mx=1000)
@@ -682,7 +682,7 @@ class TestHeadroomProbe:
         assert worker._has_headroom() is False
 
     def test_no_headroom_when_unbounded_or_missing(self, monkeypatch):
-        from biopb_tensor_server import precache as pc
+        from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig())
         # max_bytes <= 0 -> can't reason about fill, treat as no headroom.
@@ -731,8 +731,8 @@ class TestBacklogSeeding:
 
 class TestIterLocalSourceMtimes:
     def _bare_sm(self):
-        from biopb_tensor_server.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.source_manager import SourceManager
+        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
+        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("grpc://localhost:0")
         sm = SourceManager(
@@ -813,7 +813,7 @@ class TestIterLocalSourceMtimes:
 class TestBacklogWarming:
     def _init_file_cache(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -994,7 +994,7 @@ class TestSkipNativePyramid:
 
     def test_precache_skips_native_multiscale_source(self, multires_ome_zarr, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
         CacheManager.initialize(
@@ -1024,7 +1024,7 @@ class TestBuildPyramidPlan:
     """The full computed plan generalizes the coarsest-only helper."""
 
     def test_level_zero_is_full_resolution(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([20000, 20000], ["y", "x"])
         assert list(levels[0].scale_hint) == [1, 1]
@@ -1033,7 +1033,7 @@ class TestBuildPyramidPlan:
         assert levels[0].reduction_method == "area"
 
     def test_coarsest_matches_precache_helper(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         for shape, labels in [
             ([20000, 20000], ["y", "x"]),
@@ -1047,8 +1047,8 @@ class TestBuildPyramidPlan:
             )
 
     def test_each_level_shape_is_ceil_div(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
-        from biopb_tensor_server.downsample import ceil_div
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.downsample import ceil_div
 
         shape = [1000, 8000, 8000]
         levels = build_pyramid_plan(shape, ["z", "y", "x"])
@@ -1057,7 +1057,7 @@ class TestBuildPyramidPlan:
             assert list(level.shape) == expected
 
     def test_levels_strictly_coarsen(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([20000, 20000], ["y", "x"])
         # Each successive level downsamples at least one axis further.
@@ -1065,7 +1065,7 @@ class TestBuildPyramidPlan:
             assert any(b > a for a, b in zip(prev.scale_hint, nxt.scale_hint))
 
     def test_small_source_is_single_full_res_level(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan([512, 512], ["y", "x"])
         assert len(levels) == 1
@@ -1082,7 +1082,7 @@ class TestBuildPyramidPlan:
     def test_sub_2d_is_single_unscaled_level(self, shape, labels):
         # <2-D tensors have no Y/X plane: one full-resolution level, never a raise
         # (regression -- _precache_xy_indices used to raise, breaking GetFlightInfo).
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan(shape, labels)
         assert len(levels) == 1
@@ -1092,7 +1092,7 @@ class TestBuildPyramidPlan:
         assert compute_precache_scale_hint(shape, labels) == [1] * len(shape)
 
     def test_reduction_method_is_configurable(self):
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         levels = build_pyramid_plan(
             [20000, 20000], ["y", "x"], reduction_method="nearest"
@@ -1273,7 +1273,7 @@ class TestPrecacheAdvertisedAlignment:
     def test_worker_coarsest_equals_advertised_coarsest(self, tmp_path):
         import zarr
         from biopb_tensor_server import ZarrAdapter
-        from biopb_tensor_server.chunk import build_pyramid_plan
+        from biopb_tensor_server.core.chunk import build_pyramid_plan
 
         arr = zarr.open_array(
             str(tmp_path / "big.zarr"),

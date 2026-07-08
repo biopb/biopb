@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.config import SourceConfig, _reroot_catalog_url
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.config import SourceConfig, _reroot_catalog_url
+from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
     DiscoveryState,
@@ -25,17 +25,17 @@ from biopb_tensor_server.discovery import (
     is_remote_url,
     resolve_local_path,
 )
-from biopb_tensor_server.reconciler import Reconciler, is_under_cloud_root
-from biopb_tensor_server.tree_scanner import EntryState, TreeScanner
-from biopb_tensor_server.watcher import (
+from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
+from biopb_tensor_server.sources.tree_scanner import EntryState, TreeScanner
+from biopb_tensor_server.sources.watcher import (
     DirectoryWatcher,
     WatcherEvent,
     WatcherEventType,
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.metadata_db import MetadataDatabase
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
 

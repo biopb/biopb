@@ -41,11 +41,11 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
-from biopb_tensor_server.chunk import build_pyramid_plan
+from biopb_tensor_server.core.chunk import build_pyramid_plan
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import PrecacheConfig, PyramidConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class PrecacheWorker:
         # TensorDescriptor.pyramid, so the warmed scale == the advertised scale.
         # Defaults to the canonical knobs when a caller omits it.
         if pyramid_config is None:
-            from biopb_tensor_server.config import PyramidConfig
+            from biopb_tensor_server.core.config import PyramidConfig
 
             pyramid_config = PyramidConfig()
         self._pyramid_cfg = pyramid_config
@@ -304,7 +304,7 @@ class PrecacheWorker:
         # has_native_pyramid(), so a pyramidal upstream would be warmed at a
         # computed coarse level the upstream already serves natively -- caching
         # chunks the native-pyramid skip below is meant to avoid.
-        from biopb_tensor_server.discovery import is_remote_url
+        from biopb_tensor_server.core.discovery import is_remote_url
 
         if is_remote_url(source_adapter.source_url or ""):
             logger.debug(

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
     discover_sources,
@@ -106,7 +106,7 @@ def _scan(root: Path, registry, *, prune: bool) -> DiscoveryState:
 
 
 def _identity(path: Path) -> str:
-    from biopb_tensor_server.discovery import get_file_identity
+    from biopb_tensor_server.core.discovery import get_file_identity
 
     return get_file_identity(path)
 

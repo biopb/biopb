@@ -10,7 +10,7 @@ axis by indexing the Y axis, rendering a 512x3 strip instead of the image.
 
 import numpy as np
 import pytest
-from biopb_tensor_server.renderer import (
+from biopb_tensor_server.serving.renderer import (
     extract_yx_slice,
     render_array_to_image_bytes,
     samples_axis,

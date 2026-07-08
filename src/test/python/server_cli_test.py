@@ -972,7 +972,7 @@ class TestMigrateConfig:
         )
 
     def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
-        # The actual migration reuses biopb_tensor_server.config (save_config /
+        # The actual migration reuses biopb_tensor_server.core.config (save_config /
         # _read_config_file). That package ships only with the full installer,
         # not on PyPI, so it is absent from the lightweight `biopb[test,tensor]`
         # CI env -- skip there; the command's own "unavailable" fallback is what

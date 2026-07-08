@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import biopb_tensor_server.cli as cli
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
+from biopb_tensor_server.core.config import CacheConfig
 
 
 class _FakeServer:

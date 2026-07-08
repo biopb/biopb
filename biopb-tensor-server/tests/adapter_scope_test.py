@@ -9,7 +9,7 @@ already asserts the invariant at import time; these tests re-check it from the
 test surface and extend it to the concrete adapter registry.
 """
 
-from biopb_tensor_server.base import (
+from biopb_tensor_server.core.base import (
     _SOURCE_SCOPED_API,
     _TENSOR_SCOPED_API,
     SourceAdapter,

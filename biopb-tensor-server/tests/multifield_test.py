@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.base import (
+from biopb_tensor_server.core.base import (
     BackendAdapter,
     DataSourceDescriptor,
     TensorDescriptor,

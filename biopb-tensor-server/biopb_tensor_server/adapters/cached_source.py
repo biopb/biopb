@@ -27,12 +27,16 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import CHUNK_WIRE_SCHEMA, SourceAdapter, TensorAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.chunk import encode_chunk_id
+from biopb_tensor_server.core.base import (
+    CHUNK_WIRE_SCHEMA,
+    SourceAdapter,
+    TensorAdapter,
+)
+from biopb_tensor_server.core.chunk import encode_chunk_id
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 

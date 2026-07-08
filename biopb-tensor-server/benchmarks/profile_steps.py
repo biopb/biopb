@@ -29,7 +29,7 @@ def _setup():
     import zarr
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.core.config import CacheConfig
 
     tmp = tempfile.mkdtemp()
     shape = (CHUNK_Z * 4, 1024, 1344)

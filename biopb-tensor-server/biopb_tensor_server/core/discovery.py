@@ -37,8 +37,8 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.base import BackendAdapter
-    from biopb_tensor_server.remote import RemoteStore
+    from biopb_tensor_server.core.base import BackendAdapter
+    from biopb_tensor_server.core.remote import RemoteStore
 
 logger = logging.getLogger(__name__)
 
@@ -1111,7 +1111,7 @@ def discover_remote_source(
     Returns:
         DiscoveryState with discovered remote source
     """
-    from biopb_tensor_server.remote import RemoteStore
+    from biopb_tensor_server.core.remote import RemoteStore
 
     if state is None:
         state = DiscoveryState()

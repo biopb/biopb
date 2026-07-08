@@ -13,14 +13,14 @@ from urllib.parse import urlparse
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.base import TensorReadPlan
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
-from biopb_tensor_server.downsample import normalize_reduction_method
+from biopb_tensor_server.core.base import TensorReadPlan
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.downsample import normalize_reduction_method
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.base import BackendAdapter
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
+    from biopb_tensor_server.core.base import BackendAdapter
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
 
 
 logger = logging.getLogger(__name__)
@@ -960,7 +960,7 @@ class OmeZarrAdapter(ZarrAdapter):
         # Compute scale_hint directly from TensorDescriptor
         base_desc = self.get_tensor_descriptor()
         base_shape = tuple(int(dim) for dim in base_desc.shape)
-        from biopb_tensor_server.chunk import normalized_scale_hint
+        from biopb_tensor_server.core.chunk import normalized_scale_hint
 
         scale_hint = normalized_scale_hint(base_shape, request_desc.scale_hint)
 

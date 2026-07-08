@@ -6,14 +6,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
     generate_source_id,
 )
-from biopb_tensor_server.source_manager import SourceManager
-from biopb_tensor_server.tree_scanner import EntryState, ScanSnapshot, _WalkContext
-from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+from biopb_tensor_server.sources.source_manager import SourceManager
+from biopb_tensor_server.sources.tree_scanner import (
+    EntryState,
+    ScanSnapshot,
+    _WalkContext,
+)
+from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
 
 
 def _walk_ctx(*, prev_entry_states=None, prev_cloud_entry_states=None, next_state=None):
@@ -289,7 +293,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -364,7 +368,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -488,7 +492,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -526,7 +530,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -574,7 +578,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -636,7 +640,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         # Settle and prune the (empty) root.
@@ -721,7 +725,7 @@ class TestSourceManagerRegressions:
         base_time = time.time()
         clock = {"now": base_time}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         # Settle and prune the (empty) nested subdirectory.
@@ -1050,7 +1054,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         manager._handle_rescan()
@@ -1093,7 +1097,7 @@ class TestSourceManagerRegressions:
 
         clock = {"now": 100.0}
         monkeypatch.setattr(
-            "biopb_tensor_server.source_manager.time.time", lambda: clock["now"]
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
         )
 
         caplog.set_level("ERROR")
@@ -1239,7 +1243,7 @@ class TestSignatureScanLoopAndSkip:
         # descents share an identity). Without the depth cap this recurses forever.
         import itertools
 
-        from biopb_tensor_server import tree_scanner as ts_module
+        from biopb_tensor_server.sources import tree_scanner as ts_module
 
         counter = itertools.count()
         monkeypatch.setattr(
@@ -1396,7 +1400,7 @@ class TestCloudInodeBackfillSkip:
         # back to hashing the resolved path, so distinct cloud entries still get
         # distinct identities and visited_identities dedup does not collapse the
         # walk into a single (0, 0) bucket.
-        from biopb_tensor_server.discovery import get_file_identity
+        from biopb_tensor_server.core.discovery import get_file_identity
 
         a, b = tmp_path / "a", tmp_path / "b"
         a.mkdir()
@@ -1699,9 +1703,9 @@ class TestStaticCatalogSeeding:
     """
 
     def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         db = MetadataDatabase()
         server = _FakeServer()

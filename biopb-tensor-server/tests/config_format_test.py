@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import pytest
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     CANONICAL_CONFIG_NAME,
     LEGACY_CONFIG_NAME,
     find_config,

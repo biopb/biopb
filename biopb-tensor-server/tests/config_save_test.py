@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     CANONICAL_CONFIG_NAME,
     REDACTED_SENTINEL,
     SCHEMA_SIDECAR_NAME,

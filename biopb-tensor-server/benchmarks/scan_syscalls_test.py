@@ -59,11 +59,11 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     discover_sources_from_entries,
 )
-from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.sources.source_manager import SourceManager
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
 
@@ -162,8 +162,8 @@ class _SyscallCounter:
         import builtins
         import pathlib
 
-        import biopb_tensor_server.discovery as discovery
-        import biopb_tensor_server.tree_scanner as tree_scanner
+        import biopb_tensor_server.core.discovery as discovery
+        import biopb_tensor_server.sources.tree_scanner as tree_scanner
 
         c = self.counts
 

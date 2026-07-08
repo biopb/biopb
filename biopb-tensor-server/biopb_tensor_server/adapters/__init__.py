@@ -9,8 +9,8 @@ Usage:
     claims = registry.get_claims_for_path(path, visited)
 """
 
-from biopb_tensor_server.base import BackendAdapter, SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import AdapterRegistry
+from biopb_tensor_server.core.base import BackendAdapter, SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
 from .ome_tiff import OmeTiffAdapter

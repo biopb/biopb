@@ -6,8 +6,8 @@ skipped while the remaining healthy sources are still returned.
 """
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
-from biopb_tensor_server.metadata_db import MetadataDatabase
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 class _HealthyAdapter:

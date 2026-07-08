@@ -15,19 +15,17 @@ import os
 import tempfile
 
 import pytest
-from biopb_tensor_server import (
-    discovery,
-    reconciler as rec_mod,
-)
 from biopb_tensor_server.adapters import tiff as tiff_mod
-from biopb_tensor_server.config import SourceConfig, parse_config
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core import discovery
+from biopb_tensor_server.core.config import SourceConfig, parse_config
+from biopb_tensor_server.core.discovery import (
     ClaimContext,
     DiscoveryState,
     SourceClaim,
     should_skip_walk_entry,
 )
-from biopb_tensor_server.tree_scanner import build_entry_signature
+from biopb_tensor_server.sources import reconciler as rec_mod
+from biopb_tensor_server.sources.tree_scanner import build_entry_signature
 
 
 def _zarr_available():
@@ -336,7 +334,7 @@ class TestUnresolvedProxy:
         # on its own -- it refuses with SourceUnresolvedError until resolve() has
         # run, so the only thing that downloads is the explicit resolve action.
         import zarr
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         with tempfile.TemporaryDirectory() as d:
             zpath = os.path.join(d, "img.zarr")
@@ -394,7 +392,7 @@ class TestUnresolvedProxy:
             assert calls == ["s1"]  # on_resolved fired exactly once
 
     def test_resolution_failure_raises_source_unresolved(self):
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         proxy = self._make_proxy("/nonexistent/path.zarr", source_type="ome-zarr")
         with pytest.raises(SourceUnresolvedError):
@@ -437,7 +435,7 @@ class _FakeServer:
 
 def _make_manager(server, cloud_roots=None, monitored=None):
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.source_manager import SourceManager
+    from biopb_tensor_server.sources.source_manager import SourceManager
 
     return SourceManager(
         server=server,
@@ -597,8 +595,8 @@ class TestPrecacheSkipsUnresolved:
         # source is never hydrated by background warming.
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-        from biopb_tensor_server.config import PrecacheConfig
-        from biopb_tensor_server.precache import PrecacheWorker
+        from biopb_tensor_server.core.config import PrecacheConfig
+        from biopb_tensor_server.serving.precache import PrecacheWorker
 
         cfg = SourceConfig(url="/data/cloud/x.zarr", type="ome-zarr", source_id="s1")
         proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
@@ -847,7 +845,7 @@ class TestResolveAction:
     ``result`` arm."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source(source_id, adapter)
@@ -903,7 +901,7 @@ class TestResolveAction:
 
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-        from biopb_tensor_server import server as server_mod
+        from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
 
@@ -998,7 +996,7 @@ class TestWarmAction:
     emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source(source_id, adapter)
@@ -1015,7 +1013,7 @@ class TestWarmAction:
     def _no_throttle(monkeypatch):
         # Force a progress message at every file/block boundary (the default
         # 0.5s throttle would suppress them for tiny fast files).
-        from biopb_tensor_server import server as server_mod
+        from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_WARM_PROGRESS_MIN_INTERVAL", -1.0)
 
@@ -1165,7 +1163,7 @@ class TestCloudRootFlag:
         # cloud_by_path carries the per-path cloud flag the walk computed once; it
         # must reach the adapter's claim() via its ClaimContext. A path absent from
         # the map defaults to False.
-        from biopb_tensor_server.discovery import (
+        from biopb_tensor_server.core.discovery import (
             AdapterRegistry,
             discover_sources_from_entries,
         )
@@ -1279,7 +1277,7 @@ class TestCloudMultiFileBan:
         # multi-file ban fires there too, not only on the monitored rescan. Spy on
         # the series adapter to capture the cloud_root it is handed.
         from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
-        from biopb_tensor_server.config import discover_sources
+        from biopb_tensor_server.core.config import discover_sources
 
         d = tmp_path / "series"
         d.mkdir()
@@ -1407,7 +1405,7 @@ class TestResolveErrorSurfacing:
     def test_reclaim_oserror_surfaces_retriable(self, monkeypatch):
         # An OSError while re-claiming (recall/IO) must surface as retriable,
         # NOT silently degrade to the claim-time guessed type.
-        from biopb_tensor_server.errors import SourceResolveRetriableError
+        from biopb_tensor_server.core.errors import SourceResolveRetriableError
 
         proxy = self._make_proxy("/data/cloud/x.zarr")
 
@@ -1420,7 +1418,7 @@ class TestResolveErrorSurfacing:
 
     def test_create_from_config_oserror_is_retriable(self, monkeypatch, tmp_path):
         import zarr
-        from biopb_tensor_server.errors import SourceResolveRetriableError
+        from biopb_tensor_server.core.errors import SourceResolveRetriableError
 
         zpath = str(tmp_path / "img.zarr")
         zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
@@ -1444,7 +1442,7 @@ class TestResolveErrorSurfacing:
         # A nonexistent path: re-claim yields nothing and create_from_config
         # fails permanently (no retriable cause) -> plain SourceUnresolvedError,
         # and NOT the retriable subclass.
-        from biopb_tensor_server.errors import (
+        from biopb_tensor_server.core.errors import (
             SourceResolveRetriableError,
             SourceUnresolvedError,
         )

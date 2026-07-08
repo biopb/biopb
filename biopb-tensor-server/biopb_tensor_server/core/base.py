@@ -34,7 +34,7 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.chunk import (
+from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
     build_pyramid_plan,
     cache_key_for_chunk_id,
@@ -48,13 +48,16 @@ from biopb_tensor_server.chunk import (
     normalized_scale_hint,
     normalized_slice_bounds,
 )
-from biopb_tensor_server.downsample import (
+from biopb_tensor_server.core.downsample import (
     ceil_div,
     downsample_block,
     get_output_dtype,
     normalize_reduction_method,
 )
-from biopb_tensor_server.errors import SourceUnresolvedError, WriteNotSupportedError
+from biopb_tensor_server.core.errors import (
+    SourceUnresolvedError,
+    WriteNotSupportedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +65,12 @@ if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorReadOption
 
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import PyramidConfig, SourceConfig
-    from biopb_tensor_server.discovery import ClaimContext, DiscoveryState, SourceClaim
+    from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
+    from biopb_tensor_server.core.discovery import (
+        ClaimContext,
+        DiscoveryState,
+        SourceClaim,
+    )
 
 
 # --- unified chunk wire schema (biopb/biopb#293) ----------------------------
@@ -419,7 +426,7 @@ class SourceAdapter(ABC):
         # so importing these at module scope would be circular.
         from pathlib import Path
 
-        from biopb_tensor_server.discovery import (
+        from biopb_tensor_server.core.discovery import (
             _is_offline_placeholder,
             is_remote_url,
         )

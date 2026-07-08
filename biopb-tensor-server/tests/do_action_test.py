@@ -4,8 +4,8 @@ import json
 
 import pyarrow.flight as flight
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 def test_cache_stats_action_returns_stats():

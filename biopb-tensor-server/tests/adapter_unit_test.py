@@ -17,9 +17,9 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import (
     OmeZarrAdapter,
     ZarrAdapter,
-    downsample as _ds,
 )
-from biopb_tensor_server.config import parse_config
+from biopb_tensor_server.core import downsample as _ds
+from biopb_tensor_server.core.config import parse_config
 
 
 def _zarr_available() -> bool:
@@ -64,7 +64,7 @@ class TestTensorConfig:
         """The removed [compute] section is warn-and-ignore, never an error."""
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.config"):
+        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.core.config"):
             config = parse_config(
                 {
                     "server": {
@@ -164,7 +164,9 @@ class TestReductionMethodNormalization:
     def test_linear_aliases_to_area_with_warning(self, caplog):
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="biopb_tensor_server.downsample"):
+        with caplog.at_level(
+            logging.WARNING, logger="biopb_tensor_server.core.downsample"
+        ):
             assert _ds.normalize_reduction_method("linear") == "area"
         assert any("deprecated" in rec.getMessage() for rec in caplog.records)
 
@@ -173,7 +175,7 @@ class TestReductionMethodNormalization:
             _ds.normalize_reduction_method("cubic")
 
     def test_pyramid_config_accepts_linear_alias(self):
-        from biopb_tensor_server.config import PyramidConfig
+        from biopb_tensor_server.core.config import PyramidConfig
 
         # Tolerated deprecated alias: old configs must keep validating.
         PyramidConfig(reduction_method="linear")
@@ -183,7 +185,7 @@ class TestAdvisoryReductionCacheKey:
     """reduction_method is advisory: excluded from the cache key (biopb#76)."""
 
     def test_cache_key_strips_method(self):
-        from biopb_tensor_server.chunk import (
+        from biopb_tensor_server.core.chunk import (
             cache_key_for_chunk_id,
             encode_chunk_id,
             encode_chunk_id_with_scale,
@@ -205,8 +207,8 @@ class TestAdvisoryReductionCacheKey:
         """A chunk warmed under one method serves a request for another."""
         import zarr
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.chunk import encode_chunk_id_with_scale
-        from biopb_tensor_server.config import CacheConfig
+        from biopb_tensor_server.core.chunk import encode_chunk_id_with_scale
+        from biopb_tensor_server.core.config import CacheConfig
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.zarr")
@@ -314,7 +316,7 @@ class TestEmptyChunkShapeFallback:
     the full-rank shape, so every read of such a source raised IndexError.
     """
 
-    from biopb_tensor_server.base import TensorAdapter
+    from biopb_tensor_server.core.base import TensorAdapter
 
     class _StubTensorAdapter(TensorAdapter):
         """Minimal tensor adapter whose descriptor carries no chunk_shape."""
@@ -340,7 +342,7 @@ class TestEmptyChunkShapeFallback:
         shape = [1, 1, 1000, 512, 512]
         adapter = self._StubTensorAdapter(shape, ">i2", ["T", "C", "Z", "Y", "X"])
 
-        from biopb_tensor_server.chunk import compute_safe_chunk_size
+        from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
         chunk = adapter.get_chunk_size()
         # A full-rank grid (no longer a 0-length tuple).
@@ -371,7 +373,7 @@ class TestEmptyChunkShapeFallback:
         # An unresolved descriptor (shape known, dtype still empty) must fail the
         # read-planning boundary cleanly, not blow up on np.dtype("") in the
         # default-grid fallback (biopb/biopb#292 follow-up).
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter(
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
@@ -380,7 +382,7 @@ class TestEmptyChunkShapeFallback:
             adapter.get_chunk_size()
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
-        from biopb_tensor_server.errors import SourceUnresolvedError
+        from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):

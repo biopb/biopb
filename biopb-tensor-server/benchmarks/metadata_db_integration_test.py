@@ -22,8 +22,8 @@ import time
 
 import pytest
 from biopb.tensor import TensorFlightClient
-from biopb_tensor_server.metadata_db import MetadataDatabase
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 
 class MockAdapter:
@@ -85,7 +85,7 @@ def _create_server_with_sources(n_sources: int):
     for different source counts.
     """
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.core.config import CacheConfig
 
     CacheManager.initialize(CacheConfig(backend="memory"))
 
@@ -139,7 +139,7 @@ def server_with_metadata_db():
     operation itself (need fresh state each time).
     """
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.core.config import CacheConfig
 
     CacheManager.initialize(CacheConfig(backend="memory"))
 
