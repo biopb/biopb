@@ -35,7 +35,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow.flight as flight
-from biopb.tensor.client import TensorFlightClient
+from biopb.tensor.client import TensorFlightClient, _request_crop_slices
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
     APIRouter,
@@ -996,22 +996,16 @@ def _ws_crop_to_request(dask_arr: Any, ctx_: Any, y_idx: int, x_idx: int) -> Any
     every axis except Y/X, accounting for the realized slice start and scale."""
     if ctx_.original_slice_hint is None or not ctx_.descriptor.HasField("slice_hint"):
         return dask_arr
-    realized = ctx_.descriptor.slice_hint
-    ndim = len(ctx_.descriptor.shape)
     scale = list(ctx_.read_opt.scale_hint) if ctx_.read_opt.scale_hint else None
-    crop = []
-    for ax in range(ndim):
-        if ax in (y_idx, x_idx):
-            crop.append(slice(None))  # keep full range for y/x
-        else:
-            req_start = int(ctx_.original_slice_hint.start[ax])
-            req_stop = int(ctx_.original_slice_hint.stop[ax])
-            ret_start = int(realized.start[ax])
-            s = int(scale[ax]) if scale and ax < len(scale) else 1
-            logical_start = (req_start - ret_start) // s
-            logical_stop = (req_stop - ret_start + s - 1) // s
-            crop.append(slice(logical_start, logical_stop))
-    return dask_arr[tuple(crop)]
+    return dask_arr[
+        _request_crop_slices(
+            len(ctx_.descriptor.shape),
+            ctx_.original_slice_hint,
+            ctx_.descriptor.slice_hint,
+            scale,
+            keep_axes=(y_idx, x_idx),
+        )
+    ]
 
 
 def _ws_loaded_region(
