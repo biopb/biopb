@@ -1035,8 +1035,17 @@ function Invoke-BiopbInstall {
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime. biopb is the primary tool; --with adds the
     # siblings and --with-executables-from links their console scripts onto PATH.
+    # --verbose is deliberate, not debug noise: uv only draws its live progress
+    # bar on a TTY, but the install below pipes uv through Report-Detail (for
+    # transcript/GUI capture), which makes it non-TTY. Without --verbose uv then
+    # emits nothing between "downloaded" and the final "Installed N packages", so
+    # the console looks FROZEN for minutes during the post-download unpack/link
+    # phase -- especially on Windows, where Defender real-time-scans every written
+    # file (bash installs unpiped and keeps its bar, so it never looks stuck).
+    # --verbose makes uv log line-oriented per-package progress that survives the
+    # pipe, restoring visible activity. (See biopb/biopb#384 for the Defender tax.)
     $installArgs = @(
-        "tool", "install", "--upgrade", "--force",
+        "tool", "install", "--verbose", "--upgrade", "--force",
         "--python", $pythonSpec,
         $biopbReq,
         "--with", $tensorReq,
