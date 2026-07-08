@@ -5,7 +5,7 @@ is that each filesystem entry costs ~20-30 metadata syscalls per forced rescan,
 spread across the two walks the rescan runs back to back, and that most of those
 syscalls are redundant:
 
-- the **state walk** ``SourceManager._scan_tree_state`` — captures a stat-signature
+- the **state walk** ``TreeScanner._scan_tree_state`` — captures a stat-signature
   per entry for change/stability tracking;
 - the **claim walk** — asks the adapters to claim each stable entry. Post-#56 item 4
   this no longer re-walks the filesystem: ``discover_sources_from_entries`` drives the
@@ -163,7 +163,7 @@ class _SyscallCounter:
         import pathlib
 
         import biopb_tensor_server.discovery as discovery
-        import biopb_tensor_server.source_manager as source_manager
+        import biopb_tensor_server.tree_scanner as tree_scanner
 
         c = self.counts
 
@@ -214,7 +214,7 @@ class _SyscallCounter:
         # --- logical get_file_identity (now reuses the caller's stat; #56) ---
         # Both walks call it, but each module that does `from ... import
         # get_file_identity` holds its own binding, so patch every such module —
-        # patching only discovery would miss the state walk's calls (source_manager).
+        # patching only discovery would miss the state walk's calls (tree_scanner).
         # Accept the optional stat_result arg #56 added.
         orig_identity = discovery.get_file_identity
 
@@ -222,7 +222,7 @@ class _SyscallCounter:
             c["logical_get_file_identity"] += 1
             return orig_identity(path, *args, **kwargs)
 
-        for mod in (discovery, source_manager):
+        for mod in (discovery, tree_scanner):
             self._saved[(mod.__name__, "get_file_identity")] = mod.get_file_identity
             mod.get_file_identity = identity_wrapper
 
@@ -234,7 +234,7 @@ class _SyscallCounter:
             os.scandir = self._saved[("os", "scandir")]
             builtins.open = self._saved[("builtins", "open")]
             pathlib.Path.resolve = self._saved[("Path", "resolve")]
-            for mod in (discovery, source_manager):
+            for mod in (discovery, tree_scanner):
                 mod.get_file_identity = self._saved[(mod.__name__, "get_file_identity")]
 
     @property
@@ -250,7 +250,7 @@ def _make_manager(root: Path) -> SourceManager:
     discovery gate on the first pass (so the claim walk actually probes the whole
     tree); ``probe_open_files=True`` exercises the per-file append probe (#56 item 5);
     ``full_rescan_interval=0`` forces the full sweep. ``server=None`` is safe: the two
-    measured methods (``_refresh_entry_state`` and the snapshot-driven claim phase)
+    measured methods (``TreeScanner.scan`` and the snapshot-driven claim phase)
     never touch it — only reconcile/registration would, and we don't run that here.
     """
     return SourceManager(
@@ -267,9 +267,17 @@ def _make_manager(root: Path) -> SourceManager:
 
 
 def _run_state_walk(manager: SourceManager) -> None:
-    """Phase 1: the stat-signature sweep. publish=True so the claim walk's
-    ``_should_scan_resolved`` gate sees the freshly captured entry state."""
-    manager._refresh_entry_state(force_full=True, publish=True)
+    """Phase 1: the stat-signature sweep. Publish the snapshot into the manager's
+    live caches so the claim walk's ``_should_scan_resolved`` gate sees it."""
+    snapshot = manager._scanner.scan(
+        monitored_dirs=manager._monitored_dirs,
+        cloud_roots=manager._cloud_roots,
+        force_full=True,
+        prev_entry_states=manager._entry_states,
+        prev_cloud_entry_states=manager._cloud_entry_states,
+    )
+    manager._entry_states = snapshot.entry_states
+    manager._skipped_stable_dirs = snapshot.skipped_dirs
 
 
 def _run_claim_walk(manager: SourceManager, root: Path):

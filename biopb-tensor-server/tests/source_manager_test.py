@@ -11,12 +11,25 @@ from biopb_tensor_server.discovery import (
     SourceClaim,
     generate_source_id,
 )
-from biopb_tensor_server.source_manager import (
-    EntryState,
-    SourceManager,
-    _WalkContext,
-)
+from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.tree_scanner import EntryState, ScanSnapshot, _WalkContext
 from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
+
+
+def _walk_ctx(*, prev_entry_states=None, prev_cloud_entry_states=None, next_state=None):
+    """Build a _WalkContext for unit-testing scanner methods in isolation."""
+    return _WalkContext(
+        now=time.time(),
+        prev_entry_states=prev_entry_states if prev_entry_states is not None else {},
+        prev_cloud_entry_states=(
+            prev_cloud_entry_states if prev_cloud_entry_states is not None else {}
+        ),
+        next_state=next_state if next_state is not None else {},
+        next_cloud={},
+        skipped_dirs=set(),
+        force_full=True,
+        visited_identities=set(),
+    )
 
 
 class _FakeAdapter:
@@ -358,21 +371,24 @@ class TestSourceManagerRegressions:
         source_id = next(iter(state.claims))
         data_path.unlink()
 
-        original_refresh = manager._refresh_entry_state
-        refresh_calls = {"count": 0}
+        original_scan = manager._scanner.scan
+        scan_calls = {"count": 0}
 
-        def fake_refresh(force_full=False, publish=True):
-            refresh_calls["count"] += 1
-            if refresh_calls["count"] == 1:
-                manager._skipped_stable_dirs = {str(monitored_dir.resolve())}
-                return (
-                    manager._entry_states,
-                    manager._skipped_stable_dirs,
-                    {},  # next_cloud (empty: no cloud roots in this test)
+        def fake_scan(**kwargs):
+            scan_calls["count"] += 1
+            if scan_calls["count"] == 1:
+                # First rescan after the change: pretend the monitored subtree was
+                # pruned as stable (entries unchanged, root recorded skipped), so
+                # the claim phase preserves the existing source instead of dropping
+                # it. The next rescan runs the real walk and reaps the deletion.
+                return ScanSnapshot(
+                    entry_states=manager._entry_states,
+                    skipped_dirs={str(monitored_dir.resolve())},
+                    cloud_by_path={},  # no cloud roots in this test
                 )
-            return original_refresh(force_full=force_full, publish=publish)
+            return original_scan(**kwargs)
 
-        monkeypatch.setattr(manager, "_refresh_entry_state", fake_refresh)
+        monkeypatch.setattr(manager._scanner, "scan", fake_scan)
 
         clock["now"] = 101.0
         manager._handle_rescan()
@@ -1119,14 +1135,18 @@ def _make_signature_manager(monitored_dirs):
 
 def _scan(manager):
     """Run one signature refresh and return its {resolved_path_str: EntryState} map."""
-    next_state, _skipped, _cloud = manager._refresh_entry_state(
-        force_full=True, publish=False
+    snapshot = manager._scanner.scan(
+        monitored_dirs=manager._monitored_dirs,
+        cloud_roots=manager._cloud_roots,
+        force_full=True,
+        prev_entry_states=manager._entry_states,
+        prev_cloud_entry_states=manager._cloud_entry_states,
     )
-    return next_state
+    return snapshot.entry_states
 
 
 class TestSignatureScanLoopAndSkip:
-    """The signature/stability scan (_scan_tree_state) must share the claim
+    """The signature/stability scan (TreeScanner._scan_tree_state) must share the claim
     walk's skip policy and never wedge on a directory loop. Symlink-correctness
     alone is not enough: junctions / hardlinks / bind mounts don't present as
     symlinks, so the real guard is filesystem-identity dedup.
@@ -1139,7 +1159,7 @@ class TestSignatureScanLoopAndSkip:
             pytest.skip("symlinks not supported on this platform/filesystem")
 
     def test_terminates_on_symlink_cycle(self, tmp_path):
-        # root/loop -> root is a self-cycle. Before the fix, _scan_tree_state
+        # root/loop -> root is a self-cycle. Before the fix, TreeScanner._scan_tree_state
         # checked is_symlink() on the *resolved* path (always False), so the
         # symlink guard never fired and the cycle recursed to RecursionError.
         root = tmp_path / "monitored"
@@ -1217,13 +1237,13 @@ class TestSignatureScanLoopAndSkip:
         # descents share an identity). Without the depth cap this recurses forever.
         import itertools
 
-        from biopb_tensor_server import source_manager as sm_module
+        from biopb_tensor_server import tree_scanner as ts_module
 
         counter = itertools.count()
         monkeypatch.setattr(
-            sm_module, "get_file_identity", lambda *a, **k: f"id-{next(counter)}"
+            ts_module, "get_file_identity", lambda *a, **k: f"id-{next(counter)}"
         )
-        return sm_module
+        return ts_module
 
     def test_depth_cap_breaks_loop_when_identity_dedup_fails(
         self, tmp_path, monkeypatch
@@ -1231,8 +1251,8 @@ class TestSignatureScanLoopAndSkip:
         # With identity dedup defeated, a tree deeper than the cap must still
         # terminate (no RecursionError that the os.scandir except OSError can't catch
         # and that would kill the refresh thread) and must stop descending at the cap.
-        sm_module = self._defeat_identity_dedup(monkeypatch)
-        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 4)
+        ts_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(ts_module, "_MAX_WALK_DEPTH", 4)
 
         root = tmp_path / "monitored"
         deep = root
@@ -1249,8 +1269,8 @@ class TestSignatureScanLoopAndSkip:
         assert str((root / "d0").resolve()) in next_state
 
     def test_depth_cap_logs_warning(self, tmp_path, monkeypatch, caplog):
-        sm_module = self._defeat_identity_dedup(monkeypatch)
-        monkeypatch.setattr(sm_module, "_MAX_WALK_DEPTH", 3)
+        ts_module = self._defeat_identity_dedup(monkeypatch)
+        monkeypatch.setattr(ts_module, "_MAX_WALK_DEPTH", 3)
 
         root = tmp_path / "monitored"
         deep = root
@@ -1296,7 +1316,7 @@ class _FakeStat:
 
 
 class _FakeDirEntry:
-    """``os.DirEntry`` stand-in exposing only what ``_scan_tree_state`` reads."""
+    """``os.DirEntry`` stand-in exposing only what ``TreeScanner._scan_tree_state`` reads."""
 
     def __init__(self, path, stat_result):
         self.path = str(path)
@@ -1310,7 +1330,7 @@ class _FakeDirEntry:
 
 
 class TestCloudInodeBackfillSkip:
-    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``_scan_tree_state``
+    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``TreeScanner._scan_tree_state``
     backfills it with a real ``os.stat``. Under a cloud root that backfill is an
     extra whole network round-trip per entry, so it is skipped (biopb/biopb#190,
     Finding 1). This is correct ONLY because the cloud signature is identity-only
@@ -1330,15 +1350,8 @@ class TestCloudInodeBackfillSkip:
 
         monkeypatch.setattr(os, "stat", _counting_stat)
 
-        ctx = _WalkContext(
-            now=time.time(),
-            next_state={},
-            next_cloud={},
-            skipped_dirs=set(),
-            force_full=True,
-            visited_identities=set(),
-        )
-        manager._scan_tree_state(
+        ctx = _walk_ctx()
+        manager._scanner._scan_tree_state(
             f,
             ctx,
             is_root=False,
@@ -1737,7 +1750,7 @@ class TestRescanCarryForwardPrefix:
         # case a bare startswith(root) (no separator) would wrongly include.
         decoy = str(tmp_path / "data_backup" / "x.tif")
         unrelated = str(tmp_path / "other" / "y.tif")
-        mgr._entry_states = {
+        prev = {
             root: EntryState(True, (0, 0), 0.0),
             child: EntryState(
                 False, (0, 0), 0.0, stable_observations=3, pending_scan=True
@@ -1746,36 +1759,42 @@ class TestRescanCarryForwardPrefix:
             decoy: EntryState(False, (0, 0), 0.0),
             unrelated: EntryState(False, (0, 0), 0.0),
         }
-
         # root already recorded by the walk
-        next_state = {root: EntryState(True, (0, 0), 0.0)}
-        mgr._copy_cached_subtree_entries(root, next_state)
+        ctx = _walk_ctx(
+            prev_entry_states=prev, next_state={root: EntryState(True, (0, 0), 0.0)}
+        )
+        mgr._scanner._copy_cached_subtree_entries(root, ctx)
 
-        assert set(next_state) - {root} == {child, deep}
-        assert decoy not in next_state  # exact-prefix guard (root + os.sep)
-        assert unrelated not in next_state
+        assert set(ctx.next_state) - {root} == {child, deep}
+        assert decoy not in ctx.next_state  # exact-prefix guard (root + os.sep)
+        assert unrelated not in ctx.next_state
         # The whole EntryState is carried, stability fields intact.
-        assert next_state[child].stable_observations == 3
-        assert next_state[child].pending_scan is True
-        assert next_state[deep].stable_observations == 2
-        assert next_state[deep].pending_scan is False
+        assert ctx.next_state[child].stable_observations == 3
+        assert ctx.next_state[child].pending_scan is True
+        assert ctx.next_state[deep].stable_observations == 2
+        assert ctx.next_state[deep].pending_scan is False
 
     def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
         mgr = self._manager(tmp_path)
         root = str(tmp_path / "data")
 
-        def _pending(path_str, pending):
-            return {path_str: EntryState(False, (0, 0), 0.0, pending_scan=pending)}
+        def _ctx(path_str, pending):
+            return _walk_ctx(
+                prev_entry_states={
+                    path_str: EntryState(False, (0, 0), 0.0, pending_scan=pending)
+                }
+            )
 
+        scanner = mgr._scanner
         # bare-prefix sibling must not count
-        mgr._entry_states = _pending(str(tmp_path / "data_backup" / "x.tif"), True)
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(str(tmp_path / "data_backup" / "x.tif"), True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False
         # a real pending descendant counts
-        mgr._entry_states = _pending(str(tmp_path / "data" / "sub" / "f.tif"), True)
-        assert mgr._subtree_has_pending_scan(root) is True
+        ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is True
         # the root's own pending flag does not count (the prune gate handles it)
-        mgr._entry_states = _pending(root, True)
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(root, True)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False
         # a non-pending descendant does not count
-        mgr._entry_states = _pending(str(tmp_path / "data" / "sub" / "f.tif"), False)
-        assert mgr._subtree_has_pending_scan(root) is False
+        ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), False)
+        assert scanner._subtree_has_pending_scan(root, ctx) is False

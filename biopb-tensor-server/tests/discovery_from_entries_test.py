@@ -22,7 +22,7 @@ from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
 
 def _sig(stat_result, is_dir):
-    """The content-identity signature shape ``_build_entry_signature`` emits."""
+    """The content-identity signature shape ``build_entry_signature`` emits."""
     if is_dir:
         return (
             stat_result.st_dev,
@@ -42,7 +42,7 @@ def _sig(stat_result, is_dir):
 def _snapshot(root):
     """A (resolved_path_str, is_dir, signature) DFS parent-first snapshot of ``root``.
 
-    Mirrors what ``SourceManager._scan_tree_state`` records into ``next_state``:
+    Mirrors what ``TreeScanner._scan_tree_state`` records into ``next_state``:
     resolved path strings with their stat signature, parent before its children.
     """
     root = Path(root).resolve()

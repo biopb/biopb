@@ -24,6 +24,7 @@ from biopb_tensor_server.discovery import (
     SourceClaim,
     should_skip_walk_entry,
 )
+from biopb_tensor_server.tree_scanner import build_entry_signature
 
 
 def _zarr_available():
@@ -760,7 +761,7 @@ class TestCloudRescanGating:
         def _boom(*a, **k):
             raise AssertionError("incremental must not iterate cloud entries")
 
-        monkeypatch.setattr(mgr, "_copy_cached_subtree_entries", _boom)
+        monkeypatch.setattr(mgr._scanner, "_copy_cached_subtree_entries", _boom)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
         partition_before = dict(mgr._cloud_entry_states)
 
@@ -1356,12 +1357,11 @@ class TestDirClaimingMembership:
 
 class TestCloudSignatureInvariance:
     def test_cloud_file_signature_is_identity_only(self, tmp_path):
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"abc")
         st = f.stat()
-        cloud_sig = mgr._build_entry_signature(st, is_directory=False, cloud=True)
-        plain_sig = mgr._build_entry_signature(st, is_directory=False, cloud=False)
+        cloud_sig = build_entry_signature(st, is_directory=False, cloud=True)
+        plain_sig = build_entry_signature(st, is_directory=False, cloud=False)
         assert cloud_sig == (st.st_dev, st.st_ino)
         assert plain_sig != cloud_sig  # plain carries size/mtime/ctime
 
@@ -1371,19 +1371,17 @@ class TestCloudSignatureInvariance:
         # will not put the just-resolved source in changed_ids.
         import os as _os
 
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"placeholder-stub")
-        before = mgr._build_entry_signature(f.stat(), is_directory=False, cloud=True)
+        before = build_entry_signature(f.stat(), is_directory=False, cloud=True)
         # "Hydrate": grow the file and bump times.
         f.write_bytes(b"hydrated-full-content-now-much-larger")
         _os.utime(f, None)
-        after = mgr._build_entry_signature(f.stat(), is_directory=False, cloud=True)
+        after = build_entry_signature(f.stat(), is_directory=False, cloud=True)
         assert before == after
         # A non-cloud signature WOULD change on the same hydration.
         assert (
-            mgr._build_entry_signature(f.stat(), is_directory=False, cloud=False)
-            != before
+            build_entry_signature(f.stat(), is_directory=False, cloud=False) != before
         )
 
 
