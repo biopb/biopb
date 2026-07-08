@@ -7,8 +7,8 @@ failed-source retry state). It is the single writer of that catalog, reached fro
 the three desired-state sources, all of which reduce to the same
 add/remove/register primitives:
 
-  * the periodic filesystem rescan  -> :meth:`reconcile_discovered_state` /
-    :meth:`preserve_skipped_claims` (fed the walk's discovered claims);
+  * the periodic filesystem rescan  -> :meth:`_reconcile_discovered_state` /
+    :meth:`_preserve_skipped_claims` (fed the walk's discovered claims);
   * a runtime drag-drop / SDK add   -> :meth:`_commit_add_claim` (driven by
     ``SourceManager.add_local_source``);
   * a tensor-server upstream re-list -> :meth:`_reconcile_one_upstream`.
@@ -781,7 +781,7 @@ class Reconciler:
         """Create and register a source, rolling back on partial failure.
 
         ``catalog_seed`` (biopb/biopb#266) is an optional
-        ``(tensors, metadata, data_resident)`` tuple from a bulk upstream
+        ``(tensors, metadata, data_resident, source_url)`` tuple from a bulk upstream
         ``query_sources``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
         upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
