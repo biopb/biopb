@@ -1357,7 +1357,6 @@ class TestDirClaimingMembership:
 
 class TestCloudSignatureInvariance:
     def test_cloud_file_signature_is_identity_only(self, tmp_path):
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"abc")
         st = f.stat()
@@ -1372,7 +1371,6 @@ class TestCloudSignatureInvariance:
         # will not put the just-resolved source in changed_ids.
         import os as _os
 
-        mgr = _make_manager(_FakeServer())
         f = tmp_path / "x.bin"
         f.write_bytes(b"placeholder-stub")
         before = build_entry_signature(f.stat(), is_directory=False, cloud=True)

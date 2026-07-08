@@ -699,7 +699,7 @@ class SourceManager:
         """Stability gate for an entry whose resolved path string is already known.
 
         The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
-        keys, which ``_scan_tree_state`` already stored as resolved path strings, so
+        keys, which ``TreeScanner._scan_tree_state`` already stored as resolved path strings, so
         a per-entry ``Path.resolve()`` would be pure waste. This carries the
         load-bearing ``pending_scan`` clear-on-pass side effect (the #53
         subtree-pending prune gate depends on it) by mutating the cached
@@ -726,7 +726,7 @@ class SourceManager:
         # it immediately. The pending-scan clear side effect is preserved.
         #
         # This bypass is also load-bearing for the cloud inode-backfill skip in
-        # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
+        # TreeScanner._scan_tree_state (biopb/biopb#190): under cloud the entry signature
         # degrades to a constant (0, 0), leaving the stability counter meaningless
         # -- safe only because this early-return means that counter is never read
         # for a cloud path. Removing the bypass would make that skip incorrect.
@@ -873,7 +873,7 @@ class SourceManager:
         # one cloud status. Resolve it once -- both to skip a redundant
         # ``Path.resolve()`` + roots scan per member, and so the whole source's
         # signatures use one uniform cloud-invariance policy (matching the cached
-        # branch, whose signatures ``_scan_tree_state`` built with a per-tree
+        # branch, whose signatures ``TreeScanner._scan_tree_state`` built with a per-tree
         # ``cloud`` flag).
         cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):

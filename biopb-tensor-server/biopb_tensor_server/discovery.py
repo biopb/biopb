@@ -190,7 +190,7 @@ def should_skip_walk_entry(
 
     Both traversals over the monitored trees route their skip decision through
     this one predicate — the claim walk (``walk_with_identity_tracking``) and the
-    signature/stability scan (``SourceManager._scan_tree_state``) — so the policy
+    signature/stability scan (``TreeScanner._scan_tree_state``) — so the policy
     cannot drift between them. That drift is exactly what left the signature scan
     descending into OneDrive placeholders the claim walk had already learned to
     prune.
@@ -987,7 +987,7 @@ def discover_sources_from_entries(
     """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
 
     The periodic rescan already walks every monitored tree once to capture
-    stat-signatures (``SourceManager._scan_tree_state``). That walk holds everything
+    stat-signatures (``TreeScanner._scan_tree_state``). That walk holds everything
     the claim phase needs — each entry's resolved path and whether it is a directory —
     so re-walking the filesystem a second time just to probe adapters is pure
     duplication (it was ~96% of the post-#61 rescan syscalls). This drives the same
@@ -995,7 +995,7 @@ def discover_sources_from_entries(
     (biopb/biopb#56, item 4).
 
     ``entries`` is an ordered ``(resolved_path_str, is_dir, signature)`` stream in
-    **DFS parent-first order** (the order ``_scan_tree_state`` inserts into its state
+    **DFS parent-first order** (the order ``TreeScanner._scan_tree_state`` inserts into its state
     dict), which is what lets a directory-level claim or skip prune its whole subtree
     before any interior entry is probed. ``signature`` is the state walk's content
     identity for the entry, carried onto the ``ClaimContext`` so content-probing

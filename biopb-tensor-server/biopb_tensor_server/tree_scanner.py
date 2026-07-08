@@ -283,7 +283,7 @@ class TreeScanner:
                 # every consumer of the zeroed inode has a cloud-safe degradation --
                 # do not break these invariants:
                 #
-                #   1. Signature. `_build_entry_signature(cloud=True)` is *already*
+                #   1. Signature. `build_entry_signature(cloud=True)` is *already*
                 #      identity-only `(st_dev, st_ino)` and excludes size/mtime/ctime
                 #      on purpose (hydration bumps those -> destructive flap). With a
                 #      zeroed inode it degrades to a constant `(0, 0)` per entry. That
@@ -315,7 +315,7 @@ class TreeScanner:
                 if stat_result.st_ino == 0 and not cloud:
                     stat_result = os.stat(dir_entry.path)
             else:
-                # Root: _refresh_entry_state hands it in pre-resolved, so it is
+                # Root: scan() hands it in pre-resolved, so it is
                 # canonical and not itself a symlink.
                 is_symlink = False
                 stat_result = path.stat()
@@ -344,7 +344,7 @@ class TreeScanner:
             # skips below do. Without this, a source explicitly registered under
             # such a path is reaped by the very next reconcile as "disappeared":
             # add_source treats a drop as a root, which is exempt from this skip
-            # (see _refresh_entry_state's is_root=True), so it happily indexes
+            # (see scan()'s is_root=True), so it happily indexes
             # OneDrive content -- but the monitored-tree walk that would re-find it
             # refuses to descend here, so absence from the walk must not be read as
             # deletion (biopb/biopb#309 drag-drop follow-up).
@@ -391,7 +391,7 @@ class TreeScanner:
             pending_scan=pending_scan,
         )
         # Record cloud-ness once, here, where the walk already knows it (inherited
-        # per monitored root, see _refresh_entry_state). The claim phase reads this
+        # per monitored root, see scan()). The claim phase reads this
         # instead of re-deriving it per entry, so there is a single source of truth
         # for "is this path under a cloud root" -- consistent with the signature
         # above, which is also computed with this same `cloud`.
@@ -401,7 +401,7 @@ class TreeScanner:
         # directory; and break every *other* kind of loop — Windows junction,
         # hardlink, bind mount, none of which present as a symlink — by
         # filesystem identity, since the symlink flag alone is not enough.
-        # (A configured root passes this only because _refresh_entry_state hands
+        # (A configured root passes this only because scan() hands
         # it in pre-resolved, so is_symlink is False — see the call site.)
         if not is_directory or is_symlink:
             return

@@ -517,9 +517,10 @@ class WatcherEventType(Enum):
 #### Rescan Cadence
 
 The watcher emits a `RESCAN` event on a fixed interval. `SourceManager` then:
-- refreshes cached directory and file signatures
-- skips unstable subtrees until they satisfy the stability window
-- performs discovery on stable paths only
+- delegates the filesystem signature walk to `TreeScanner` (`tree_scanner.py`), a pure
+  producer that refreshes cached directory/file signatures and skips unstable subtrees
+  until they satisfy the stability window, returning an immutable `ScanSnapshot`
+- performs discovery on the snapshot's stable paths only
 - diffs the discovered snapshot against the confirmed catalog state
 
 #### Move Handling
@@ -595,7 +596,7 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
     safely — a directory can hold several such datasets, so the dir is not the
     boundary and the deferred member set could diverge at resolve. They are gated
     on the new **`ClaimContext.cloud_root`** flag (at scan the rescan walk records
-    each entry's cloud-ness once — `_scan_tree_state` already knows it per
+    each entry's cloud-ness once — `TreeScanner._scan_tree_state` already knows it per
     monitored root — into a per-path map the claim phase reads via
     `discover_sources_from_entries(cloud_by_path=…)`; at resolve it comes from
     `UnresolvedSourceAdapter`, so it holds at *both* scan and resolve — residency
@@ -631,7 +632,7 @@ catalogued. `cloud = true` opts one configured root into the phase-2 model:
   ban exactly like the monitored path (the expanded configs also keep `cloud`, so
   they defer as unresolved).
 - **Cloud subtrees are walked only on a `force_full` rescan (the monitored path).**
-  `_scan_tree_state` **skips a cloud subtree entirely** on an incremental
+  `TreeScanner._scan_tree_state` **skips a cloud subtree entirely** on an incremental
   (non-`force_full`) rescan — carrying its cached claims forward untouched — and
   re-walks it only on the periodic `force_full` pass (`full_rescan_interval`,
   default 1h). The first rescan is `force_full` (last-full = −∞), so a cloud root

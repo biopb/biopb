@@ -1146,7 +1146,7 @@ def _scan(manager):
 
 
 class TestSignatureScanLoopAndSkip:
-    """The signature/stability scan (_scan_tree_state) must share the claim
+    """The signature/stability scan (TreeScanner._scan_tree_state) must share the claim
     walk's skip policy and never wedge on a directory loop. Symlink-correctness
     alone is not enough: junctions / hardlinks / bind mounts don't present as
     symlinks, so the real guard is filesystem-identity dedup.
@@ -1159,7 +1159,7 @@ class TestSignatureScanLoopAndSkip:
             pytest.skip("symlinks not supported on this platform/filesystem")
 
     def test_terminates_on_symlink_cycle(self, tmp_path):
-        # root/loop -> root is a self-cycle. Before the fix, _scan_tree_state
+        # root/loop -> root is a self-cycle. Before the fix, TreeScanner._scan_tree_state
         # checked is_symlink() on the *resolved* path (always False), so the
         # symlink guard never fired and the cycle recursed to RecursionError.
         root = tmp_path / "monitored"
@@ -1316,7 +1316,7 @@ class _FakeStat:
 
 
 class _FakeDirEntry:
-    """``os.DirEntry`` stand-in exposing only what ``_scan_tree_state`` reads."""
+    """``os.DirEntry`` stand-in exposing only what ``TreeScanner._scan_tree_state`` reads."""
 
     def __init__(self, path, stat_result):
         self.path = str(path)
@@ -1330,7 +1330,7 @@ class _FakeDirEntry:
 
 
 class TestCloudInodeBackfillSkip:
-    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``_scan_tree_state``
+    """Windows ``DirEntry.stat()`` zeroes ``st_ino``, so ``TreeScanner._scan_tree_state``
     backfills it with a real ``os.stat``. Under a cloud root that backfill is an
     extra whole network round-trip per entry, so it is skipped (biopb/biopb#190,
     Finding 1). This is correct ONLY because the cloud signature is identity-only

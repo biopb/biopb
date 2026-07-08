@@ -5,7 +5,7 @@ is that each filesystem entry costs ~20-30 metadata syscalls per forced rescan,
 spread across the two walks the rescan runs back to back, and that most of those
 syscalls are redundant:
 
-- the **state walk** ``SourceManager._scan_tree_state`` — captures a stat-signature
+- the **state walk** ``TreeScanner._scan_tree_state`` — captures a stat-signature
   per entry for change/stability tracking;
 - the **claim walk** — asks the adapters to claim each stable entry. Post-#56 item 4
   this no longer re-walks the filesystem: ``discover_sources_from_entries`` drives the
@@ -250,7 +250,7 @@ def _make_manager(root: Path) -> SourceManager:
     discovery gate on the first pass (so the claim walk actually probes the whole
     tree); ``probe_open_files=True`` exercises the per-file append probe (#56 item 5);
     ``full_rescan_interval=0`` forces the full sweep. ``server=None`` is safe: the two
-    measured methods (``_refresh_entry_state`` and the snapshot-driven claim phase)
+    measured methods (``TreeScanner.scan`` and the snapshot-driven claim phase)
     never touch it — only reconcile/registration would, and we don't run that here.
     """
     return SourceManager(
