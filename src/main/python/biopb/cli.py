@@ -1659,5 +1659,183 @@ def mcp_logs(
 app.add_typer(mcp_app, name="mcp")
 
 
+# ---------------------------------------------------------------------------
+# quick-start: Windows Defender exclusion for the biopb install (issue #384)
+# ---------------------------------------------------------------------------
+# Windows Defender real-time scanning of biopb's DLLs / .pyd / .pyc on every
+# launch is the single largest first-start tax on Windows (see #384). Excluding
+# the install dir from scanning removes it. This is the *privileged* half of
+# #384 -- it needs admin -- so it lives here as an opt-in command, separate from
+# the admin-free bytecode precompile the installer already does for everyone.
+
+
+def _defender_venv_path() -> Path:
+    """The biopb install dir to exclude -- this interpreter's venv (`sys.prefix`).
+
+    `sys.prefix` is the shared uv tool venv holding biopb, the tensor server, and
+    biopb-mcp, so one folder exclusion covers every biopb process' DLL/.pyd/.pyc
+    loads. Resolved at runtime, never hardcoded.
+    """
+    return Path(sys.prefix)
+
+
+def _run_elevated_ps(inner: str) -> int:
+    """Run a PowerShell snippet elevated (one UAC prompt); return its exit code.
+
+    Writes the snippet to a temp .ps1 and launches it via
+    `Start-Process -Verb RunAs -Wait -PassThru`, propagating the elevated
+    process's exit code. A nonzero code also covers the launch itself failing --
+    most commonly the user declining the UAC prompt (Start-Process then throws,
+    so the outer shell exits nonzero).
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".ps1", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(inner)
+        script = f.name
+    ps_script = script.replace("'", "''")  # single-quote-safe for the launcher
+    try:
+        launcher = (
+            "$p = Start-Process powershell -Verb RunAs -Wait -PassThru "
+            "-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass',"
+            f"'-File','{ps_script}'; exit $p.ExitCode"
+        )
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-Command", launcher]
+        ).returncode
+    finally:
+        try:
+            os.unlink(script)
+        except OSError:
+            pass
+
+
+def _defender_exclusion(venv: Path, *, add: bool) -> None:
+    """Add/remove a Defender path exclusion for `venv`, elevating then VERIFYING.
+
+    Admin is necessary but not sufficient: Tamper Protection (consumer) or
+    Intune/GPO (managed) can silently no-op the write even when elevated. So the
+    elevated snippet re-reads Get-MpPreference and reports the truth (exit 0 = it
+    took, 3 = blocked) rather than assuming success from a clean return.
+    """
+    verb = "Add" if add else "Remove"
+    # After the change the path SHOULD be present (add) / absent (remove).
+    check = "$present" if add else "-not $present"
+    ps_path = str(venv).replace("'", "''")  # single-quote-safe in the snippet
+    # Placeholder substitution (not an f-string) so PowerShell's literal { }
+    # blocks don't collide with brace escaping.
+    inner = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$p = '__PATH__'\n"
+        "try { __VERB__-MpPreference -ExclusionPath $p }\n"
+        'catch { Write-Host "FAILED: $($_.Exception.Message)"; exit 2 }\n'
+        "$present = (Get-MpPreference).ExclusionPath -contains $p\n"
+        "if (__CHECK__) { exit 0 } else { exit 3 }\n"
+    )
+    inner = (
+        inner.replace("__PATH__", ps_path)
+        .replace("__VERB__", verb)
+        .replace("__CHECK__", check)
+    )
+
+    rc = _run_elevated_ps(inner)
+    path = str(venv)
+    if rc == 0:
+        console.print(
+            f"[green]Defender exclusion {'added' if add else 'removed'}:[/green] {path}"
+        )
+        if add:
+            console.print("  biopb should now start faster on this machine.")
+        return
+    if rc == 2:
+        console.print(
+            f"[red]Could not {verb.lower()} the Defender exclusion[/red] "
+            "(the Set-MpPreference call failed)."
+        )
+    elif rc == 3:
+        console.print(
+            "[yellow]Defender exclusion did not take[/yellow] -- blocked by Tamper "
+            "Protection or your organization's policy. This is expected on managed "
+            "machines; the bytecode precompile still helps."
+        )
+    else:
+        console.print(
+            "[red]Could not change the Defender exclusion[/red] "
+            "(elevation was declined or failed)."
+        )
+    raise typer.Exit(1)
+
+
+def _defender_status(venv: Path) -> None:
+    """Print whether `venv` is currently a Defender exclusion (best-effort, no admin).
+
+    Get-MpPreference is usually readable by a normal user; when it isn't we say
+    'unknown' rather than guess.
+    """
+    ps_path = str(venv).replace("'", "''")
+    inner = (
+        "$ErrorActionPreference='Stop'; "
+        "try { if ((Get-MpPreference).ExclusionPath -contains '__PATH__') "
+        "{ Write-Host 'ON' } else { Write-Host 'OFF' } } "
+        "catch { Write-Host 'UNKNOWN' }"
+    ).replace("__PATH__", ps_path)
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", inner],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        out = "UNKNOWN"
+
+    path = str(venv)
+    if out == "ON":
+        console.print(f"[green]Defender exclusion is enabled[/green] for {path}")
+        console.print("  Remove it with: biopb quick-start --disable")
+    elif out == "OFF":
+        console.print(f"Defender exclusion is [yellow]not set[/yellow] for {path}")
+        console.print(
+            "  Enable it for a faster startup (needs admin): biopb quick-start --enable"
+        )
+    else:
+        console.print(
+            "[yellow]Could not read the Defender exclusion state[/yellow] "
+            "(Get-MpPreference unavailable). Enable with: biopb quick-start --enable"
+        )
+
+
+@app.command("quick-start", hidden=os.name != "nt")
+def quick_start(
+    enabled: Optional[bool] = typer.Option(
+        None,
+        "--enable/--disable",
+        help="Enable (add) or disable (remove) the Defender exclusion; "
+        "omit to show the current status.",
+    ),
+):
+    """Speed up biopb startup on Windows via a Defender exclusion (issue #384).
+
+    Windows Defender rescans biopb's DLLs / .pyd / .pyc on every launch, which
+    dominates the first-start wait. This adds (or removes, with --disable) a
+    Defender exclusion for the biopb install directory so those files aren't
+    rescanned. It needs admin -- one UAC prompt -- and is fully reversible.
+    Windows only.
+    """
+    if os.name != "nt":
+        console.print(
+            "[yellow]quick-start is Windows-only[/yellow] -- Defender exclusions "
+            "don't apply on this platform (nothing to do)."
+        )
+        raise typer.Exit(0)
+
+    venv = _defender_venv_path()
+    if enabled is None:
+        _defender_status(venv)
+        return
+    _defender_exclusion(venv, add=enabled)
+
+
 if __name__ == "__main__":
     app()

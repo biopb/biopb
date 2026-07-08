@@ -161,6 +161,14 @@ function Show-Summary {
     Write-Inf "To upgrade: rerun this script"
     Write-Host ""
 
+    # Discoverability for the opt-in Defender exclusion (issue #384). Bytecode is
+    # already precompiled at install (admin-free); this is the extra, privileged
+    # win that needs one UAC prompt, so we only point at it rather than doing it.
+    Write-Inf "Faster startup (optional): exclude the biopb install from Windows"
+    Write-Inf "Defender real-time scanning (needs admin - one UAC prompt):"
+    Write-Cmd "  biopb quick-start --enable"
+    Write-Host ""
+
     if (-not $Result.WebappInstalled) {
         Write-Warn2 "Web interface not installed (`$env:BIOPB_INSTALL_WEBAPP = `"0`")"
         Write-Inf "  rerun without that env var to install it"
