@@ -782,6 +782,49 @@ function Start-DataServer {
     Report-Ok "Data server ready - $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
+# `biopb mcp start` and first start_kernel don't pay the one-time compile cost
+# (biopb/biopb#384). This is the biggest EASY win on Windows: Defender scans each
+# freshly written .pyc and .pyd on first import, so paying the compile once at
+# install time (admin-free) removes a large slice of the first-launch wait. It
+# covers both trees regardless of which process imports them -- the server stack
+# the `biopb mcp` daemon loads, and the heavy napari/Qt tree the child kernel
+# loads on first start_kernel (where the user waits longest). Idempotent (a
+# rerun after an upgrade compiles only new files) and best-effort: any failure
+# just means the first run recompiles as before. (The privileged half of #384 --
+# a Windows Defender path exclusion -- is deliberately left to an opt-in CLI
+# command, since it needs elevation; precompile needs none, so it runs always.)
+function Invoke-Precompile {
+    try {
+        # Soften EAP for this whole function (function-scoped, auto-restored on
+        # return): the engine runs under EAP='Stop', where a native command's
+        # `2>&1` turns any benign stderr line into a terminating
+        # NativeCommandError (the same trap the uv-install call documents). Under
+        # 'Stop' the compileall below would abort on the first stderr line a
+        # vendored py2-only module prints -- leaving a PARTIAL cache on exactly
+        # the platform (Windows) precompile matters most. 'Continue' lets it run
+        # to completion; the try/catch remains the outer safety net.
+        $ErrorActionPreference = 'Continue'
+
+        $toolDir = (uv tool dir 2>$null)
+        if (-not $toolDir) { return }
+        # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
+        $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
+        if (-not (Test-Path -LiteralPath $py)) { return }
+        # Compile exactly the env's own site-packages (whatever was just installed).
+        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>$null)
+        if (-not $site -or -not (Test-Path -LiteralPath $site)) { return }
+        Report-Info "Precompiling Python bytecode (removes the first-launch compile lag)..."
+        # -j 0 = all cores; -q = quiet. compileall exits nonzero if any single
+        # file fails to compile (a vendored py2-only module, say) -- harmless
+        # here, so the exit code is ignored.
+        & $py -m compileall -q -j 0 "$site" 2>&1 | Out-Null
+        Report-Ok "Bytecode precompiled (first viewer launch will be faster)"
+    } catch {
+        # Non-fatal: the first run just recompiles, exactly as before this ran.
+    }
+}
+
 # ============================================================================
 # Invoke-BiopbInstall -- the headless install body (was Install-Biopb). Returns a
 # result object the front-end uses to render its summary. Throws on fatal errors
@@ -1084,25 +1127,63 @@ function Invoke-BiopbInstall {
         "--with-executables-from", "biopb-mcp"
     )
 
-    Report-Info "Installing biopb into one shared environment..."
+    Report-Info "Installing biopb into one shared environment (first run can take several minutes; on Windows, antivirus scans every file uv writes)..."
+    $uvOutLog = Join-Path $env:TEMP "biopb-uv-install.out.log"
+    $uvErrLog = Join-Path $env:TEMP "biopb-uv-install.err.log"
     try {
-        # Stream uv's own stdout+stderr through the reporter so the live install
-        # detail is BOTH visible (the GUI shows it in its scrolling log; the
-        # console prints it) and captured in the diagnostic transcript. A native
-        # child run UNPIPED writes straight to the console handle, which
-        # Start-Transcript does not intercept -- so the real error (e.g. the
-        # os-error-5 lock above) would otherwise be lost and only the generic
-        # "exit code 2" survive. The wizard now uses this streaming detail as its
-        # primary progress feedback (it no longer drives a determinate gauge, so
-        # the volume of uv/pip lines is no longer a problem). 2>&1 under EAP='Stop'
-        # can turn a benign uv stderr line into a terminating NativeCommandError,
-        # so soften EAP for the call and gate on the real exit code via Assert-LastExit.
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        uv @installArgs 2>&1 | ForEach-Object { Report-Detail "$_" }
-        $ErrorActionPreference = $prevEAP
+        # uv only animates its progress bar on a TTY, and it goes SILENT for
+        # minutes during the prepare/link phase (no per-line output there) -- which
+        # reads as a frozen console, worst on Windows where Defender real-time-scans
+        # every file uv unpacks/links (see biopb/biopb#384). --verbose does NOT help:
+        # it front-loads a burst during the ~seconds-long resolve, then is just as
+        # silent through the ~minute of prepare+install.
+        #
+        # So run uv detached with its output redirected to a log, emit our OWN
+        # heartbeat while it works, then replay the log through the reporter so uv's
+        # full detail (the "Installed N packages" summary, or the real error on
+        # failure) still lands in the console/GUI/diagnostic transcript. Start-Process
+        # is given a single pre-quoted argument line, not an -ArgumentList array:
+        # the requirement specs are PEP 508 direct refs containing spaces
+        # ("biopb[tensor] @ file:///..."), which an array would split under Windows
+        # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
+        $uvExe = (Get-Command uv -ErrorAction Stop).Source
+        $argLine = ($installArgs | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' '
+
+        $proc = Start-Process -FilePath $uvExe -ArgumentList $argLine -NoNewWindow -PassThru `
+            -RedirectStandardOutput $uvOutLog -RedirectStandardError $uvErrLog
+        # Touch .Handle so the Process object retains the native handle; without
+        # this, Start-Process -PassThru discards it on exit and $proc.ExitCode
+        # comes back $null -- which Assert-LastExit would misread as a failure.
+        $null = $proc.Handle
+        # Wait in 1s slices so we notice a fast (warm-cache) exit promptly, but
+        # only emit a heartbeat every ~10s so a slow install shows steady life
+        # without spamming. WaitForExit(ms) returns true the instant uv exits.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastTick = 0
+        while (-not $proc.WaitForExit(1000)) {
+            $elapsed = [int]$sw.Elapsed.TotalSeconds
+            if (($elapsed - $lastTick) -ge 10) {
+                $lastTick = $elapsed
+                Report-Detail "  ...still installing (${elapsed}s elapsed) -- normal for a first install"
+            }
+        }
+
+        # Replay captured output (after exit, so the streams are flushed/closed).
+        foreach ($f in @($uvOutLog, $uvErrLog)) {
+            if (Test-Path -LiteralPath $f) {
+                Get-Content -LiteralPath $f | ForEach-Object {
+                    if ($_ -ne '') { Report-Detail "$_" }
+                }
+            }
+        }
+        # Start-Process leaves $LASTEXITCODE untouched, so set it from the process
+        # object for the shared Assert-LastExit gate.
+        $global:LASTEXITCODE = $proc.ExitCode
         Assert-LastExit "biopb install"
     } finally {
+        Remove-Item -LiteralPath $uvOutLog, $uvErrLog -Force -ErrorAction SilentlyContinue
         if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
             Remove-Item -LiteralPath $wheelsDir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -1113,6 +1194,9 @@ function Invoke-BiopbInstall {
     $versionOutput = (biopb-tensor-server version 2>$null)
     if (-not $versionOutput) { $versionOutput = "installed" }
     Report-Ok "$versionOutput"
+
+    # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
+    Invoke-Precompile
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's

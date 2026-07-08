@@ -829,6 +829,33 @@ _stop_mcp_server() {
     biopb mcp stop >/dev/null 2>&1 || true
 }
 
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
+# `biopb mcp start` and first `start_kernel` don't pay the one-time compile cost
+# (biopb/biopb#384). This covers BOTH trees regardless of which process imports
+# them — the (smaller) server stack the `biopb mcp` daemon loads, and the heavy
+# napari/Qt tree the child kernel loads on first `start_kernel`, which is where
+# the user waits longest. Admin-free, so it runs on every install; idempotent —
+# a rerun after an upgrade just compiles the newly added files. Best-effort: a
+# failure only means the first run recompiles as before, so it never aborts the
+# install. (The Windows Defender exclusion — the other, privileged mitigation in
+# #384 — is intentionally NOT here; it belongs in an opt-in CLI command.)
+_precompile_bytecode() {
+    local tool_dir py site
+    tool_dir=$(uv tool dir 2>/dev/null) || return 0
+    py="$tool_dir/biopb/bin/python"   # POSIX tool-venv layout (Scripts/ on Windows)
+    [ -x "$py" ] || return 0
+    # Resolve the env's own site-packages so we compile exactly what was installed.
+    site=$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null) || return 0
+    [ -n "$site" ] && [ -d "$site" ] || return 0
+
+    _info "Precompiling Python bytecode (removes the first-launch compile lag)..."
+    # -j 0 = all cores; -q = quiet (only errors). compileall exits nonzero if any
+    # single file fails to compile (e.g. a vendored py2-only module) — harmless
+    # here, so we don't treat it as a failure.
+    "$py" -m compileall -q -j 0 "$site" >/dev/null 2>&1 || true
+    _ok "Bytecode precompiled (first viewer launch will be faster)"
+}
+
 install_biopb() {
     set -euo pipefail
 
@@ -1167,6 +1194,9 @@ install_biopb() {
 
     VERSION_OUTPUT=$(biopb-tensor-server version 2>/dev/null || echo "installed")
     _ok "$VERSION_OUTPUT"
+
+    # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
+    _precompile_bytecode
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
