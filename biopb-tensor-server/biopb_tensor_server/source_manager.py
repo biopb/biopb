@@ -2244,56 +2244,23 @@ class SourceManager:
                 self._rollback_source_registration(claim.source_id)
             return False
 
-    def _rollback_source_registration(self, source_id: str) -> None:
-        """Best-effort rollback after a partial add failure."""
-        try:
-            self._server.unregister_source(source_id)
-        except Exception:
-            logger.error(
-                "Rollback failed to unregister source %s", source_id, exc_info=True
-            )
+    def _teardown_source_bookkeeping(self, source_id: str) -> None:
+        """Drop a source's catalog row and path-map entries (best-effort).
 
-        try:
-            if self._metadata_db is not None:
-                self._metadata_db.sync_source_removed(source_id)
-        except Exception:
-            logger.error(
-                "Rollback failed to remove source %s from metadata DB",
-                source_id,
-                exc_info=True,
-            )
+        The teardown shared by the add-failure rollback
+        (:meth:`_rollback_source_registration`) and the confirmed remove
+        (:meth:`_unregister_source_claim`): the metadata-DB delete is isolated in
+        its own try/except -- a catalog-delete failure is logged, never
+        propagated (worst case a leaked row) -- and every ``_path_to_source_id``
+        entry pointing at ``source_id`` is dropped so a later re-add/reconcile of
+        the same path is not misled by a stale mapping.
 
-        paths_to_remove = [
-            path for path, sid in self._path_to_source_id.items() if sid == source_id
-        ]
-        for path in paths_to_remove:
-            self._path_to_source_id.pop(path, None)
-        self._cloud_source_ids.discard(source_id)
-
-    def _unregister_source_claim(self, source_id: str) -> bool:
-        """Remove a source from the server and metadata DB.
-
-        A server-unregister failure aborts (returns False, leaving the claim in
-        state for a later retry). A catalog-delete failure does NOT abort: like
-        ``_rollback_source_registration`` the ``sync_source_removed`` call is
-        isolated in its own try/except so the server-side unregister and the
-        ``_path_to_source_id`` cleanup still complete -- a stale path-map entry
-        pointing at an already-unregistered ``source_id`` would otherwise
-        mislead a later re-add/reconcile of the same path. The worst case is a
-        leaked catalog row (logged), matching the remove-site log-and-continue
-        policy and the pre-raise behavior.
+        Deliberately does NOT touch the server registration (callers own that,
+        with differing abort semantics) nor ``_cloud_source_ids``: the remove
+        path discards that under ``self._lock`` in :meth:`_commit_remove_source`,
+        while the rollback path -- which runs outside that lock -- discards it
+        itself.
         """
-        try:
-            self._server.unregister_source(source_id)
-        except Exception as e:
-            logger.error(
-                "Failed to unregister source %s: %s",
-                source_id,
-                e,
-                exc_info=True,
-            )
-            return False
-
         if self._metadata_db is not None:
             try:
                 self._metadata_db.sync_source_removed(source_id)
@@ -2310,6 +2277,42 @@ class SourceManager:
         for path in paths_to_remove:
             self._path_to_source_id.pop(path, None)
 
+    def _rollback_source_registration(self, source_id: str) -> None:
+        """Best-effort rollback after a partial add failure."""
+        try:
+            self._server.unregister_source(source_id)
+        except Exception:
+            logger.error(
+                "Rollback failed to unregister source %s", source_id, exc_info=True
+            )
+        self._teardown_source_bookkeeping(source_id)
+        self._cloud_source_ids.discard(source_id)
+
+    def _unregister_source_claim(self, source_id: str) -> bool:
+        """Remove a source from the server and metadata DB.
+
+        A server-unregister failure aborts (returns False, leaving the claim in
+        state for a later retry). A catalog-delete failure does NOT abort: the
+        shared :meth:`_teardown_source_bookkeeping` isolates the
+        ``sync_source_removed`` call in its own try/except so the server-side
+        unregister and the ``_path_to_source_id`` cleanup still complete -- a
+        stale path-map entry pointing at an already-unregistered ``source_id``
+        would otherwise mislead a later re-add/reconcile of the same path. The
+        worst case is a leaked catalog row (logged), matching the remove-site
+        log-and-continue policy and the pre-raise behavior.
+        """
+        try:
+            self._server.unregister_source(source_id)
+        except Exception as e:
+            logger.error(
+                "Failed to unregister source %s: %s",
+                source_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+        self._teardown_source_bookkeeping(source_id)
         logger.info(f"Unregistered source from server: {source_id}")
         return True
 
