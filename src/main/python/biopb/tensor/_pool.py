@@ -1,0 +1,756 @@
+"""Pickle-safe worker-side connection/cache pool and chunk-fetch subsystem.
+
+Extracted from :mod:`biopb.tensor.client` (issue #278 item C): the dask arrays
+returned by ``TensorFlightClient`` fetch chunks lazily, so the leaf tasks must be
+picklable and reconnect per worker process. This module owns exactly that
+subsystem and holds no reference to ``TensorFlightClient``:
+
+- **Connection/cache pools** keyed by ``(location, token)``: a per-thread
+  ``FlightClient`` for lock-free access, plus a cross-thread ``Cache`` and
+  ``FlightCallOptions``. Fork-safe (each entry records the pid that created it).
+- **The localhost cache-file fast path** (issue #9): read a chunk straight from
+  the server's on-disk segment via ``chunk_locate`` + mmap instead of ``do_get``.
+- **The chunk-fetch leaf functions and dask-array builder**: pickle-safe because
+  they close over no ``FlightClient`` -- connections/caches/call options are
+  recreated lazily per worker from the module-level pools above.
+
+``client.py`` re-exports these names, so ``biopb.tensor.client.<name>`` stays a
+stable import surface for existing callers (e.g. biopb-mcp's ``configure_cache``
+worker plugin, the cachefile / connection-pool tests, and the benchmarks).
+"""
+
+import atexit
+import json
+import logging
+import os
+import threading
+from functools import cache
+from typing import Any, Dict, List, Optional, Tuple
+
+import dask.array as da
+import numpy as np
+import pyarrow as pa
+import pyarrow.flight as flight
+from cachey import Cache
+from dask.delayed import delayed
+
+from biopb.tensor.ticket_pb2 import TensorTicket
+
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Cache-file transfer optimization (localhost fast path, issue #9)
+# ==============================================================================
+#
+# On localhost the tensor server's file cache already holds every decoded chunk
+# as an Arrow IPC message in a segment file. Instead of re-sending those bytes
+# through the loopback gRPC socket (do_get), the client asks the server to
+# locate the chunk (chunk_locate action), then mmaps the segment file and reads
+# just that message -- copying it out and releasing the mapping immediately so
+# it never holds a file lock across a server-side eviction. Gated to POSIX
+# (Windows file-mmap blocks segment unlink -- see biopb/biopb#5).
+
+# Highest on-disk segment format version this client can parse. The client
+# reads server-written segment bytes directly, so the layout is a cross-process
+# contract: chunk_locate reports the server's CACHE_FILE_FORMAT_VERSION, and we
+# decline the fast path (fall back to do_get) for anything newer than this
+# rather than risk misreading the mmap. Bump in lockstep with the server when
+# this client learns to parse a newer format.
+_CACHEFILE_SUPPORTED_FORMAT = 1
+
+# Per-location capability cache: dask workers are separate processes, so each
+# memoizes independently after its first probe. None = unknown, False = the
+# server doesn't support chunk_locate (old server) so don't retry.
+_cachefile_support: Dict[str, bool] = {}
+_cachefile_support_lock = threading.Lock()
+
+
+def _is_cachefile_disabled_by_env() -> bool:
+    """Whether the cache-file fast path is explicitly disabled via env var."""
+    return os.environ.get("BIOPB_CACHEFILE_TRANSFER_DISABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _cachefile_supported(location: str) -> Optional[bool]:
+    with _cachefile_support_lock:
+        return _cachefile_support.get(location)
+
+
+def _set_cachefile_supported(location: str, supported: bool) -> None:
+    with _cachefile_support_lock:
+        _cachefile_support[location] = supported
+
+
+def _cache_local_enabled() -> bool:
+    """Whether to keep a client-side chunk cache for a *localhost* server.
+
+    Default ``False``: on localhost the tensor server already caches its data
+    (and the cache-file fast path makes a re-fetch cheap), so a per-process client
+    cache is mostly a redundant second copy -- and under a multi-process dask
+    cluster it is replicated in every worker, multiplying memory use. Set
+    ``BIOPB_CACHE_LOCAL=1`` to opt back in (e.g. a slow loopback proxy).
+    """
+    return os.environ.get("BIOPB_CACHE_LOCAL", "").lower() in ("1", "true", "yes")
+
+
+def _resolve_cache_bytes(location: str, requested: int) -> int:
+    """Effective per-process chunk-cache size for a connection.
+
+    Single point that decides whether (and how big) a client-side cache is.
+    Folds in the localhost rule: a localhost server gets no cache (returns 0)
+    unless explicitly re-enabled; otherwise the requested size is honored.
+    """
+    if requested <= 0:
+        return 0
+    if not _cache_local_enabled() and _is_localhost_location(location):
+        return 0
+    return requested
+
+
+@cache
+def _is_localhost_location(location: str) -> bool:
+    """Check if location points to localhost.
+
+    Parses location URI and checks hostname against localhost variants.
+    Uses socket.getaddrinfo() to resolve hostname to loopback.
+
+    Memoized: this is called on every chunk fetch (cache-policy + fast-path checks)
+    and may do a DNS lookup, so the per-location result is cached for the life
+    of the process.
+
+    Args:
+        location: Flight server location string (e.g., "grpc://localhost:8815")
+
+    Returns:
+        True if location resolves to loopback address
+    """
+    import re
+    import socket
+
+    # Parse location URI - handle various formats
+    # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
+    # IPv6 format: grpc://[::1]:port
+    match = re.match(
+        r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location
+    )
+    if not match:
+        return False
+
+    # IPv6 bracketed or regular hostname
+    hostname = match.group(1) or match.group(2)
+
+    # Direct localhost matches
+    localhost_names = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    if hostname.lower() in localhost_names or hostname in localhost_names:
+        return True
+
+    # Resolve hostname via getaddrinfo
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+        for family, _, _, _, sockaddr in addrinfo:
+            # Check if address is loopback
+            if family == socket.AF_INET:
+                if sockaddr[0] == "127.0.0.1":
+                    return True
+            elif family == socket.AF_INET6:
+                if sockaddr[0] == "::1":
+                    return True
+    except socket.gaierror:
+        # Hostname resolution failed, not localhost
+        pass
+
+    return False
+
+
+def _should_try_cachefile(location: str) -> bool:
+    """Whether to attempt the localhost cache-file fast path for this location.
+
+    Requires: not disabled by env, a POSIX host (Windows file-mmap blocks the
+    server's segment unlink -- biopb/biopb#5), a loopback server (shared
+    filesystem), and a server not already known to lack chunk_locate.
+    """
+    if _is_cachefile_disabled_by_env():
+        return False
+    if os.name != "posix":
+        return False
+    if not _is_localhost_location(location):
+        return False
+    return _cachefile_supported(location) is not False
+
+
+def _array_from_unified_batch(batch: pa.RecordBatch) -> np.ndarray:
+    """Reconstruct a numpy array from the server's unified cache schema.
+
+    The file cache stores each chunk as ``[data: binary, shape: list<int64>,
+    dtype: string, ...]`` where ``data`` is the raw C-contiguous bytes of the
+    raveled array. Returns an owned copy so it stays valid after the segment
+    mmap is closed.
+    """
+    dtype = np.dtype(batch.column("dtype")[0].as_py())
+    shape = tuple(batch.column("shape").to_pylist()[0])
+    count = int(np.prod(shape)) if shape else 0
+    # binary array buffers = [validity, offsets, data]; data holds the blob.
+    data_buf = batch.column("data").buffers()[2]
+    arr = np.frombuffer(data_buf, dtype=dtype, count=count)
+    return arr.reshape(shape).copy()
+
+
+def _try_cachefile_transfer(
+    client: flight.FlightClient,
+    location: str,
+    token: Optional[str],
+    chunk_id: bytes,
+    call_options: flight.FlightCallOptions,
+) -> Optional[np.ndarray]:
+    """Attempt the cache-file fast path for a chunk.
+
+    Asks the server to locate the chunk on disk (chunk_locate), then mmaps the
+    segment file, reads the single IPC message, copies it out, and releases the
+    mapping. Returns the array, or None to fall back to do_get (server too old,
+    chunk not cached/locatable, or any read failure).
+    """
+    ticket = TensorTicket(chunk_id=chunk_id)
+    action = flight.Action("chunk_locate", ticket.SerializeToString())
+
+    try:
+        results = client.do_action(action, options=call_options)
+        payload = next(results).body.to_pybytes().decode("utf-8")
+    except flight.FlightError as e:
+        # An old server doesn't know the action -- stop probing this location.
+        if "Unknown action" in str(e):
+            _set_cachefile_supported(location, False)
+        else:
+            logger.debug(f"chunk_locate failed, falling back to do_get: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"chunk_locate failed, falling back to do_get: {e}")
+        return None
+
+    _set_cachefile_supported(location, True)
+
+    try:
+        info = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not info.get("available"):
+        return None
+
+    # The segment layout is a cross-process contract; refuse to parse a format
+    # newer than we understand. The server's format won't change mid-session,
+    # so stop probing this location.
+    if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
+        logger.debug(
+            "chunk_locate reports segment format %s > supported %s; using do_get",
+            info.get("format_version"),
+            _CACHEFILE_SUPPORTED_FORMAT,
+        )
+        _set_cachefile_supported(location, False)
+        return None
+
+    try:
+        segment_path = info["segment_path"]
+        byte_offset = int(info["byte_offset"])
+        generation_id = int(info["generation_id"])
+        # Detect a segment evicted and recreated at the same path before we map.
+        if os.stat(segment_path).st_ino != generation_id:
+            return None
+        mm = pa.memory_map(segment_path, "r")
+        try:
+            schema = pa.ipc.open_stream(mm).schema
+            mm.seek(byte_offset)
+            msg = pa.ipc.read_message(mm)
+            batch = pa.ipc.read_record_batch(msg, schema)
+            arr = _array_from_unified_batch(batch)
+        finally:
+            mm.close()
+        logger.debug(f"_try_cachefile_transfer: read {arr.nbytes} bytes via mmap")
+        return arr
+    except (OSError, ValueError, KeyError, pa.ArrowInvalid) as e:
+        logger.debug(f"cache-file read failed, falling back to do_get: {e}")
+        return None
+
+
+# ==============================================================================
+# Module-level pools for worker-local connection caching (pickle-safe)
+# ==============================================================================
+#
+# FlightClient connections are stored per-thread for lock-free access.
+# Cache and CallOptions remain shared across threads for cross-thread cache hits.
+#
+# Fork-safety: Each thread stores (pid, client) to detect forked processes.
+# When a process forks, child threads detect pid mismatch and create fresh
+# connections (inherited gRPC sockets are broken).
+#
+
+# Per-thread storage: thread gets its own FlightClient per (location, token)
+_THREAD_LOCAL = threading.local()
+
+# Global registry for cleanup: thread_id -> {(location, token): FlightClient}
+_CONNECTION_REGISTRY: Dict[
+    int, Dict[Tuple[str, Optional[str]], flight.FlightClient]
+] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+# Shared pools for cache and call options (cross-thread cache hits enabled)
+#
+# Cache pool value is tri-state per (location, token):
+#   - absent          -> never configured; first fetch creates a default cache
+#   - (pid, Cache)    -> pinned/created with that budget
+#   - (pid, None)     -> deliberately pinned OFF by configure_cache(); a later
+#                        fetch must honor this and NOT recreate a cache.
+_CACHE_POOL: Dict[Tuple[str, Optional[str]], Tuple[int, Optional[Cache]]] = {}
+_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
+_POOL_LOCK = threading.Lock()
+
+
+@atexit.register
+def _cleanup_connection_pool():
+    """Clean up all pooled FlightClient connections on process exit."""
+    with _REGISTRY_LOCK:
+        for thread_id, clients in _CONNECTION_REGISTRY.items():
+            for key, client in clients.items():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        _CONNECTION_REGISTRY.clear()
+
+    with _POOL_LOCK:
+        _CACHE_POOL.clear()
+        _CALL_OPTS_POOL.clear()
+
+
+def _evict_dead_threads():
+    """Close connections from threads that have died."""
+    for thread_id, clients in list(_CONNECTION_REGISTRY.items()):
+        # Check if thread is alive using threading._active (tracks all live threads)
+        if thread_id not in threading._active:
+            # Thread died - close all its connections
+            for key, client in clients.items():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            del _CONNECTION_REGISTRY[thread_id]
+
+
+def _get_thread_client(location: str, token: Optional[str]) -> flight.FlightClient:
+    """Get thread-local FlightClient (no lock for read access).
+
+    Creates FlightClient lazily on first call per thread. Thread-safe via
+    thread-local storage. Fork-safe: stale connections from parent process
+    are detected and cleaned up before use.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+
+    Returns:
+        FlightClient for this thread and location
+    """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    # Fast path: thread already has client for this location (no lock)
+    local_pool = getattr(_THREAD_LOCAL, "clients", None)
+    if local_pool is None:
+        local_pool = {}
+        _THREAD_LOCAL.clients = local_pool
+    elif key in local_pool:
+        pid_client = local_pool[key]
+        if isinstance(pid_client, tuple):
+            pid, client = pid_client
+            if pid == current_pid:
+                return client
+            # Forked child - inherited gRPC socket is broken, create new
+            try:
+                client.close()
+            except Exception:
+                pass
+            del local_pool[key]
+        else:
+            # Legacy format (shouldn't happen, but handle gracefully)
+            return pid_client
+
+    # Slow path: create new client with gRPC options tuned for 64MB chunks, register for cleanup
+    # 80MB max message size (slightly above 64MB chunk threshold)
+    client = flight.FlightClient(
+        location,
+        generic_options=[
+            ("grpc.max_send_message_size", 80 * 1024 * 1024),
+            ("grpc.max_receive_message_size", 80 * 1024 * 1024),
+        ],
+    )
+    local_pool[key] = (current_pid, client)
+
+    thread_id = threading.current_thread().ident
+    if thread_id is not None:
+        with _REGISTRY_LOCK:
+            # Eviction: clean up dead threads
+            _evict_dead_threads()
+            # Register this thread's connection
+            if thread_id not in _CONNECTION_REGISTRY:
+                _CONNECTION_REGISTRY[thread_id] = {}
+            _CONNECTION_REGISTRY[thread_id][key] = client
+
+    return client
+
+
+def _get_shared_cache(
+    location: str, token: Optional[str], cache_bytes: int
+) -> Optional[Cache]:
+    """Get shared Cache for cross-thread cache hits, or None if caching is off.
+
+    The requested size is run through :func:`_resolve_cache_bytes`, so a
+    localhost server (default) yields ``None`` and no Cache is ever allocated.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Requested cache size for worker-local cache
+
+    Returns:
+        Cache instance shared across threads, or None when caching is disabled.
+    """
+    key = (location, token)
+    current_pid = os.getpid()
+
+    # An already-pooled entry wins: it may have been pinned by configure_cache()
+    # at worker startup, in which case the per-fetch cache_bytes is irrelevant.
+    # The stored cache may be None -- a sentinel meaning "pinned OFF" -- which we
+    # return as-is so the decision is not undone by this fetch's cache_bytes.
+    with _POOL_LOCK:
+        if key in _CACHE_POOL:
+            pool_pid, cache = _CACHE_POOL[key]
+            if pool_pid == current_pid:
+                return cache
+            del _CACHE_POOL[key]  # fork-safety: inherited stale entry
+
+    # Not pooled yet: resolve the requested size and create lazily (or skip).
+    effective = _resolve_cache_bytes(location, cache_bytes)
+    if effective <= 0:
+        return None
+
+    with _POOL_LOCK:
+        if key not in _CACHE_POOL:
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+        return _CACHE_POOL[key][1]
+
+
+def _get_shared_call_options(
+    location: str, token: Optional[str]
+) -> flight.FlightCallOptions:
+    """Get shared FlightCallOptions.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+
+    Returns:
+        FlightCallOptions for this connection
+    """
+    key = (location, token)
+
+    with _POOL_LOCK:
+        if key not in _CALL_OPTS_POOL:
+            if token:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions(
+                    headers=[(b"authorization", f"Bearer {token}".encode())]
+                )
+            else:
+                _CALL_OPTS_POOL[key] = flight.FlightCallOptions()
+
+    return _CALL_OPTS_POOL[key]
+
+
+def _get_worker_resources(location: str, token: Optional[str], cache_bytes: int):
+    """Get cached FlightClient, Cache, and CallOptions for a connection namespace.
+
+    Creates resources lazily on first call per (location, token) key.
+    FlightClient is per-thread for lock-free access. Cache and CallOptions
+    are shared across threads for cross-thread cache hits.
+
+    Each worker process has its own pool after unpickle. If a process
+    forks after pool was populated, the child detects pid mismatch and
+    creates fresh connections.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Cache size for worker-local cache
+
+    Returns:
+        Tuple of (FlightClient, Optional[Cache], FlightCallOptions). The cache
+        is None when caching is disabled for this connection (e.g. localhost).
+    """
+    client = _get_thread_client(location, token)
+    cache = _get_shared_cache(location, token, cache_bytes)
+    call_options = _get_shared_call_options(location, token)
+
+    return (client, cache, call_options)
+
+
+def configure_cache(location: str, token: Optional[str], cache_bytes: int) -> int:
+    """Pin this process's chunk-cache budget for a connection, authoritatively.
+
+    Sets the per-process chunk cache to ``cache_bytes`` and keeps it there: every
+    later fetch honors this budget regardless of the ``cache_bytes`` it requests.
+    Idempotent. Call it once per worker process (e.g. from a dask worker-init
+    plugin) to fix the budget deterministically across a dynamically-sized
+    cluster.
+
+    A localhost server (the default) or ``cache_bytes <= 0`` pins the cache OFF;
+    later fetches then skip caching rather than recreating one of their own.
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        cache_bytes: Requested per-process cache size in bytes
+
+    Returns:
+        The effective (resolved) cache size that was pinned, in bytes.
+    """
+    # Unlike the lazy first-touch creation in _get_shared_cache, this (re)sizes
+    # the pooled cache now and records a None sentinel for the disabled case, so
+    # a later fetch can't undo the decision from its own cache_bytes.
+    effective = _resolve_cache_bytes(location, cache_bytes)
+    key = (location, token)
+    current_pid = os.getpid()
+
+    with _POOL_LOCK:
+        existing = _CACHE_POOL.get(key)
+        if effective <= 0:
+            # Pin OFF authoritatively: store a None-cache sentinel instead of
+            # deleting, so a later fetch's _get_shared_cache honors the decision
+            # rather than recreating a cache from its own cache_bytes.
+            _CACHE_POOL[key] = (current_pid, None)
+            return 0
+        # (Re)create when absent, inherited from a fork, or a different size.
+        if (
+            existing is None
+            or existing[0] != current_pid
+            or existing[1].available_bytes != effective
+        ):
+            _CACHE_POOL[key] = (current_pid, Cache(available_bytes=effective))
+
+    return effective
+
+
+def _fetch_chunk_distributed(
+    location: str,
+    token: Optional[str],
+    chunk_id: bytes,
+    bounds_start: Tuple[int, ...],
+    bounds_stop: Tuple[int, ...],
+    cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]] = None,
+) -> np.ndarray:
+    """Fetch a chunk from Flight server using worker-local resources.
+
+    This function is pickle-safe because it has no closure references to
+    non-serializable objects (FlightClient). Connection and cache are
+    obtained from module-level pools at runtime.
+
+    For POSIX localhost connections, attempts the cache-file fast path
+    (chunk_locate + mmap) first before falling back to do_get().
+
+    Args:
+        location: Flight server location string
+        token: Bearer token (or None for no auth)
+        chunk_id: Chunk identifier bytes
+        bounds_start: Chunk start coordinates as tuple
+        bounds_stop: Chunk stop coordinates as tuple
+        cache_bytes: Cache size for worker-local cache
+        schema_metadata: Optional schema metadata dict. Not used by the
+            cache-file fast path (support is probed via chunk_locate); retained
+            for signature compatibility with the chunk-fetch call sites.
+
+    Returns:
+        numpy array with chunk data
+    """
+    client, cache, call_options = _get_worker_resources(location, token, cache_bytes)
+
+    # Cache lookup (cache is None when caching is disabled, e.g. localhost)
+    cache_key = chunk_id.hex()
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"fetch_chunk_distributed: cache hit for {cache_key[:16]}")
+            return cached
+
+    logger.debug(f"fetch_chunk_distributed: fetching {cache_key[:16]} from server")
+
+    arr = None
+
+    # Try the localhost cache-file fast path if all conditions met (issue #9)
+    if _should_try_cachefile(location):
+        arr = _try_cachefile_transfer(client, location, token, chunk_id, call_options)
+
+    # Fallback to do_get if the fast path wasn't attempted or failed
+    if arr is None:
+        ticket = TensorTicket(chunk_id=chunk_id)
+        reader = client.do_get(
+            flight.Ticket(ticket.SerializeToString()), options=call_options
+        )
+        # do_get returns a single-row unified binary batch [data, shape, dtype];
+        # decode it exactly like the cache-file fast path (raw bytes reinterpreted
+        # via the dtype string, so endianness round-trips -- biopb/biopb#293).
+        arr = _array_from_unified_batch(reader.read_all().to_batches()[0])
+
+    # Cache the result (skipped when caching is disabled)
+    if cache is not None:
+        cache.put(cache_key, arr, cost=arr.nbytes)
+
+    return arr
+
+
+def _fetch_chunk_block(
+    id_map: Dict[Tuple[int, ...], bytes],
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]] = None,
+    block_info=None,
+) -> np.ndarray:
+    """``da.map_blocks`` callback that fetches one block by its grid location.
+
+    The single-Blockwise-layer construction (see
+    ``_build_dask_array_from_chunk_map``) routes here. ``id_map`` maps a block's
+    grid index -> ``chunk_id``; the block's bounds are taken from dask's own
+    ``block_info`` ``array-location`` (which equals the chunk bounds, since the
+    array's chunk grid is built from exactly those bounds), so only the opaque
+    ``chunk_id`` needs to ride in the graph literal. Pickle-safe for the same
+    reason as :func:`_fetch_chunk_distributed`: no closure over a FlightClient.
+    """
+    info = block_info[None]
+    chunk_id = id_map[tuple(info["chunk-location"])]
+    array_location = info["array-location"]  # [(start, stop), ...] per axis
+    bounds_start = tuple(int(start) for start, _ in array_location)
+    bounds_stop = tuple(int(stop) for _, stop in array_location)
+    return _fetch_chunk_distributed(
+        location,
+        token,
+        chunk_id,
+        bounds_start,
+        bounds_stop,
+        cache_bytes,
+        schema_metadata,
+    )
+
+
+def _regular_grid_chunks(
+    chunk_map: Dict[Tuple[int, ...], Tuple[bytes, Any]],
+    grid_shape: Tuple[int, ...],
+    shape: Tuple[int, ...],
+) -> Optional[Tuple[Tuple[int, ...], ...]]:
+    """Return the dask ``chunks`` tuple iff the grid is a regular tiling.
+
+    A regular tiling is a full Cartesian product of blocks whose per-axis sizes
+    are *separable* (the extent along axis *d* depends only on the block's index
+    along *d*) and contiguous, covering the full shape. That is exactly the
+    precondition for representing the array as a single ``Blockwise`` (map_blocks)
+    layer instead of an O(n_chunks)-layer ``da.block`` graph.
+
+    Returns the per-axis chunk-size tuple (suitable for ``da.map_blocks``'s
+    ``chunks=`` argument), or ``None`` if the grid is ragged/sparse and the
+    caller must fall back to ``da.block``.
+    """
+    ndim = len(shape)
+    axis_chunks: List[Tuple[int, ...]] = []
+    for axis in range(ndim):
+        # index along this axis -> (start, stop), verified consistent
+        extents: Dict[int, Tuple[int, int]] = {}
+        for chunk_idx, (_chunk_id, bounds) in chunk_map.items():
+            i = chunk_idx[axis]
+            extent = (int(bounds.start[axis]), int(bounds.stop[axis]))
+            if extents.setdefault(i, extent) != extent:
+                return None  # ragged: same index, different extent
+        if len(extents) != grid_shape[axis]:
+            return None  # missing indices along this axis
+        sizes: List[int] = []
+        expected_start = 0
+        for i in range(grid_shape[axis]):
+            if i not in extents:
+                return None
+            start, stop = extents[i]
+            if start != expected_start:
+                return None  # non-contiguous tiling
+            sizes.append(stop - start)
+            expected_start = stop
+        if expected_start != shape[axis]:
+            return None  # does not cover the full extent
+        axis_chunks.append(tuple(sizes))
+
+    n_blocks = 1
+    for g in grid_shape:
+        n_blocks *= g
+    if len(chunk_map) != n_blocks:
+        return None  # sparse grid (Cartesian product not fully populated)
+
+    return tuple(axis_chunks)
+
+
+def _build_dask_array_from_chunk_map(
+    chunk_map: Dict[Tuple[int, ...], Tuple[bytes, Any]],
+    grid_shape: Tuple[int, ...],
+    shape: Tuple[int, ...],
+    dtype: np.dtype,
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    schema_metadata: Optional[Dict[str, str]],
+) -> da.Array:
+    """Build the lazy chunk-fetching dask array from a chunk-index map.
+
+    Shared by ``tensor_from_pb`` and ``_build_dask_array``. For a regular chunk
+    grid (the common case) this emits a *single* ``Blockwise`` (map_blocks)
+    layer, so slicing one chunk culls to O(1) tasks and graph optimization is
+    O(1) rather than O(n_chunks). This makes serial single-plane reads (napari
+    scrubbing a large T axis) and partial computes dramatically cheaper without
+    changing per-chunk fetch behavior or leaf-task parallelism. Ragged/sparse
+    grids fall back to the ``da.block``-of-``from_delayed`` construction.
+    """
+    if not chunk_map:
+        raise ValueError("No chunks found")
+
+    chunks = _regular_grid_chunks(chunk_map, grid_shape, shape)
+    if chunks is not None:
+        id_map = {
+            chunk_idx: chunk_id for chunk_idx, (chunk_id, _b) in chunk_map.items()
+        }
+        return da.map_blocks(
+            _fetch_chunk_block,
+            id_map,
+            location,
+            token,
+            cache_bytes,
+            schema_metadata,
+            dtype=dtype,
+            chunks=chunks,
+            meta=np.empty((0,) * len(shape), dtype=dtype),
+        )
+
+    # Fallback: ragged/sparse grid -> one delayed task per chunk.
+    blocks = np.empty(grid_shape, dtype=object)
+    for chunk_idx, (chunk_id, bounds) in chunk_map.items():
+        chunk_shape = tuple(
+            stop - start for start, stop in zip(bounds.start, bounds.stop)
+        )
+        blocks[chunk_idx] = da.from_delayed(
+            delayed(_fetch_chunk_distributed)(
+                location,
+                token,
+                chunk_id,
+                tuple(bounds.start),
+                tuple(bounds.stop),
+                cache_bytes,
+                schema_metadata,
+            ),
+            shape=chunk_shape,
+            dtype=dtype,
+        )
+    return da.block(blocks.tolist())

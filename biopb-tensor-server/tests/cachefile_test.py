@@ -441,7 +441,9 @@ class TestCachefileIntegration:
         try:
             cmod._cachefile_support.clear()
             # Pretend this client can't parse the server's (>=1) segment format.
-            with patch.object(cmod, "_CACHEFILE_SUPPORTED_FORMAT", 0):
+            # The constant is read by _try_cachefile_transfer in biopb.tensor._pool
+            # (issue #278 item C), so patch it there, not on the client re-export.
+            with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
                 client = TensorFlightClient(loc, cache_bytes=0)
                 got = client.get_tensor("z", "z").compute(scheduler="threads")
                 assert np.array_equal(got, src)  # correct via do_get fallback

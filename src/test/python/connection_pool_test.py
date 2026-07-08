@@ -8,7 +8,11 @@ import os
 import threading
 from unittest.mock import MagicMock, patch
 
-# Import the module to test pool behavior
+# Import the module to test pool behavior. The pool subsystem itself lives in
+# biopb.tensor._pool (issue #278 item C); client re-exports its names, but a
+# function patched here must be patched where the *calling* pool code resolves
+# it -- i.e. on _pool, not on the client re-export binding.
+import biopb.tensor._pool as pool_module
 import biopb.tensor.client as client_module
 import pyarrow.flight as flight
 import pytest
@@ -157,21 +161,21 @@ class TestCachePolicy:
         assert client_module._resolve_cache_bytes("grpc://remote:8815", -5) == 0
 
     def test_resolve_remote_keeps_requested_size(self):
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             assert (
                 client_module._resolve_cache_bytes("grpc://remote:8815", 1000) == 1000
             )
 
     def test_resolve_localhost_disables_by_default(self, monkeypatch):
         monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
-        with patch.object(client_module, "_is_localhost_location", return_value=True):
+        with patch.object(pool_module, "_is_localhost_location", return_value=True):
             assert (
                 client_module._resolve_cache_bytes("grpc://localhost:8815", 1000) == 0
             )
 
     def test_resolve_localhost_opt_in_via_env(self, monkeypatch):
         monkeypatch.setenv("BIOPB_CACHE_LOCAL", "1")
-        with patch.object(client_module, "_is_localhost_location", return_value=True):
+        with patch.object(pool_module, "_is_localhost_location", return_value=True):
             assert (
                 client_module._resolve_cache_bytes("grpc://localhost:8815", 1000)
                 == 1000
@@ -179,7 +183,7 @@ class TestCachePolicy:
 
     def test_shared_cache_is_none_for_localhost(self, monkeypatch):
         monkeypatch.delenv("BIOPB_CACHE_LOCAL", raising=False)
-        with patch.object(client_module, "_is_localhost_location", return_value=True):
+        with patch.object(pool_module, "_is_localhost_location", return_value=True):
             assert (
                 client_module._get_shared_cache("grpc://localhost:8815", None, 1000)
                 is None
@@ -187,7 +191,7 @@ class TestCachePolicy:
 
     def test_shared_cache_created_for_remote(self):
         loc = "grpc://remote-cache-test:9999"
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             cache = client_module._get_shared_cache(loc, None, 1000)
             try:
                 assert cache is not None
@@ -210,7 +214,7 @@ class TestConfigureCache:
         client_module._CACHE_POOL.clear()
 
     def test_pins_size_for_remote(self):
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             eff = client_module.configure_cache("grpc://remote:8815", None, 1000)
         assert eff == 1000
         cache = client_module._CACHE_POOL[("grpc://remote:8815", None)][1]
@@ -218,7 +222,7 @@ class TestConfigureCache:
 
     def test_resizes_in_place(self):
         loc = "grpc://remote:8815"
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
             client_module.configure_cache(loc, None, 2000)
         assert client_module._CACHE_POOL[(loc, None)][1].available_bytes == 2000
@@ -226,9 +230,9 @@ class TestConfigureCache:
     def test_localhost_pins_off(self):
         loc = "grpc://srv:8815"
         # first create a real cache as if remote, then re-resolve as localhost
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
-        with patch.object(client_module, "_is_localhost_location", return_value=True):
+        with patch.object(pool_module, "_is_localhost_location", return_value=True):
             eff = client_module.configure_cache(loc, None, 1000)
         assert eff == 0
         # pinned off -> entry present with a None-cache sentinel (not deleted)
@@ -236,7 +240,7 @@ class TestConfigureCache:
 
     def test_zero_pins_off(self):
         loc = "grpc://remote:8815"
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 1000)
             assert client_module.configure_cache(loc, None, 0) == 0
         assert client_module._CACHE_POOL[(loc, None)][1] is None
@@ -244,14 +248,14 @@ class TestConfigureCache:
     def test_pinned_off_survives_later_fetch_request(self):
         """configure_cache(.., 0) must not be undone by a later nonzero fetch."""
         loc = "grpc://remote:8815"
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             assert client_module.configure_cache(loc, None, 0) == 0
             # a later fetch carrying the default 1GB must NOT recreate a cache
             assert client_module._get_shared_cache(loc, None, 1_000_000_000) is None
 
     def test_get_shared_cache_honors_configured_size(self):
         loc = "grpc://remote:8815"
-        with patch.object(client_module, "_is_localhost_location", return_value=False):
+        with patch.object(pool_module, "_is_localhost_location", return_value=False):
             client_module.configure_cache(loc, None, 500)
             # a later fetch requesting a different size must get the pinned cache
             cache = client_module._get_shared_cache(loc, None, 999_999_999)
