@@ -782,6 +782,39 @@ function Start-DataServer {
     Report-Ok "Data server ready - $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
+# Precompile the tool env's Python bytecode (.py -> .pyc) so the first
+# `biopb mcp start` and first start_kernel don't pay the one-time compile cost
+# (biopb/biopb#384). This is the biggest EASY win on Windows: Defender scans each
+# freshly written .pyc and .pyd on first import, so paying the compile once at
+# install time (admin-free) removes a large slice of the first-launch wait. It
+# covers both trees regardless of which process imports them -- the server stack
+# the `biopb mcp` daemon loads, and the heavy napari/Qt tree the child kernel
+# loads on first start_kernel (where the user waits longest). Idempotent (a
+# rerun after an upgrade compiles only new files) and best-effort: any failure
+# just means the first run recompiles as before. (The privileged half of #384 --
+# a Windows Defender path exclusion -- is deliberately left to an opt-in CLI
+# command, since it needs elevation; precompile needs none, so it runs always.)
+function Invoke-Precompile {
+    try {
+        $toolDir = (uv tool dir 2>$null)
+        if (-not $toolDir) { return }
+        # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
+        $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
+        if (-not (Test-Path -LiteralPath $py)) { return }
+        # Compile exactly the env's own site-packages (whatever was just installed).
+        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>$null)
+        if (-not $site -or -not (Test-Path -LiteralPath $site)) { return }
+        Report-Info "Precompiling Python bytecode (removes the first-launch compile lag)..."
+        # -j 0 = all cores; -q = quiet. compileall exits nonzero if any single
+        # file fails to compile (a vendored py2-only module, say) -- harmless
+        # here, so the exit code is ignored.
+        & $py -m compileall -q -j 0 "$site" 2>&1 | Out-Null
+        Report-Ok "Bytecode precompiled (first viewer launch will be faster)"
+    } catch {
+        # Non-fatal: the first run just recompiles, exactly as before this ran.
+    }
+}
+
 # ============================================================================
 # Invoke-BiopbInstall -- the headless install body (was Install-Biopb). Returns a
 # result object the front-end uses to render its summary. Throws on fatal errors
@@ -1113,6 +1146,9 @@ function Invoke-BiopbInstall {
     $versionOutput = (biopb-tensor-server version 2>$null)
     if (-not $versionOutput) { $versionOutput = "installed" }
     Report-Ok "$versionOutput"
+
+    # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
+    Invoke-Precompile
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
