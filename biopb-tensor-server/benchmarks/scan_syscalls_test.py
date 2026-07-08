@@ -275,12 +275,12 @@ def _run_state_walk(manager: SourceManager) -> None:
 def _run_claim_walk(manager: SourceManager, root: Path):
     """Phase 2: adapter discovery driven from the state walk's published snapshot —
     exactly how ``_handle_rescan`` drives it post-#56 item 4 (no second filesystem
-    walk). ``_run_state_walk`` published ``_entry_state``/``_skipped_stable_dirs``, so
-    this consumes them just like the runtime rescan does."""
+    walk). ``_run_state_walk`` published ``_entry_states``/``_skipped_stable_dirs``,
+    so this consumes them just like the runtime rescan does."""
     return discover_sources_from_entries(
         (
-            (path_str, entry[0], entry[1])
-            for path_str, entry in manager._entry_state.items()
+            (path_str, entry.is_directory, entry.signature)
+            for path_str, entry in manager._entry_states.items()
         ),
         manager._registry,
         path_filter=manager._should_scan_resolved,
