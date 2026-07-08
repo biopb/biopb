@@ -501,28 +501,37 @@ def _bootstrap_impl():
             "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
         )
 
-        splash.message("Loading napari…")  # the slow step
-        import napari
+        try:
+            splash.message("Loading napari…")  # the slow step
+            import napari
 
-        from ..tensor_browser import TensorBrowserWidget
+            from ..tensor_browser import TensorBrowserWidget
 
-        splash.message("Opening viewer…")
-        viewer = napari.Viewer()
-        tbw = TensorBrowserWidget(
-            viewer, connection=conn, compute_scheduler=compute_scheduler
-        )
-        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-        # Hand the splash off to the viewer window (closes once it's shown).
-        splash.finish(viewer)
-        # Tear the kernel down to idle when the user closes the window: signal
-        # the launcher's reader thread over the inherited window-close pipe.
-        _install_window_close_hook(viewer)
+            splash.message("Opening viewer…")
+            viewer = napari.Viewer()
+            tbw = TensorBrowserWidget(
+                viewer, connection=conn, compute_scheduler=compute_scheduler
+            )
+            viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+            # Hand the splash off to the viewer window (closes once it's shown).
+            splash.finish(viewer)
+            # Tear the kernel down to idle when the user closes the window: signal
+            # the launcher's reader thread over the inherited window-close pipe.
+            _install_window_close_hook(viewer)
 
-        # Kernel-start update reminder (issue #87): once a window exists, check
-        # in the background whether a newer release-v* deployment is available
-        # and, if so, remind the user to run the upgrade script. GUI branch only;
-        # never blocks window paint.
-        _start_update_check(viewer, config)
+            # Kernel-start update reminder (issue #87): once a window exists, check
+            # in the background whether a newer release-v* deployment is available
+            # and, if so, remind the user to run the upgrade script. GUI branch only;
+            # never blocks window paint.
+            _start_update_check(viewer, config)
+
+        except Exception:
+            # Happy path: finish() hands the splash off to the viewer window (it
+            # closes once the window shows). If a step above fails first, close it
+            # so it can't linger before the kernel is torn down, then re-raise for
+            # bootstrap()'s BOOTSTRAP_ERROR handler.
+            splash.close()
+            raise
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
