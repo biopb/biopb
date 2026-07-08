@@ -2,8 +2,9 @@
 (issue #384).
 
 OS calls (PowerShell, elevation) are mocked so the tests are deterministic on any
-platform; `os.name` is monkeypatched to 'nt' to drive the Windows code path from
-a POSIX CI box.
+platform; the platform gate is driven by patching `cli._is_windows` rather than
+the global `os.name` (which pathlib reads to choose WindowsPath/PosixPath, so
+mutating it would break every `Path(...)` in the process on POSIX).
 """
 
 from pathlib import Path
@@ -18,7 +19,7 @@ runner = CliRunner()
 
 def _win(monkeypatch):
     """Pretend we're on Windows for the command body's platform gate."""
-    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli, "_is_windows", lambda: True)
 
 
 class TestQuickStartDispatch:
@@ -50,18 +51,19 @@ class TestQuickStartDispatch:
         excl.assert_not_called()
 
     def test_non_windows_is_a_noop(self, monkeypatch):
-        monkeypatch.setattr(cli.os, "name", "posix")
+        monkeypatch.setattr(cli, "_is_windows", lambda: False)
         with patch.object(cli, "_defender_exclusion") as excl:
             res = runner.invoke(cli.app, ["quick-start", "--enable"])
         assert res.exit_code == 0
         assert "Windows-only" in res.output
         excl.assert_not_called()
 
-    def test_hidden_on_this_platform(self):
-        """Registered but hidden on non-Windows (help doesn't advertise it)."""
+    def test_hidden_matches_platform(self):
+        """Registered everywhere, but hidden from help off Windows."""
         qs = next(c for c in cli.app.registered_commands if c.name == "quick-start")
-        # Evaluated at import against the real os.name; on the POSIX test host -> hidden.
-        assert qs.hidden is True
+        # hidden is fixed at import from the real platform: shown on Windows,
+        # hidden elsewhere. Assert the relationship, not a hardcoded value.
+        assert qs.hidden == (not cli._is_windows())
 
 
 class TestDefenderExclusion:

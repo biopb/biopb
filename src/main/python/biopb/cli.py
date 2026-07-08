@@ -1669,6 +1669,17 @@ app.add_typer(mcp_app, name="mcp")
 # the admin-free bytecode precompile the installer already does for everyone.
 
 
+def _is_windows() -> bool:
+    """Whether we're on Windows.
+
+    A function (not an inline `os.name == "nt"`) so tests can simulate Windows
+    without monkeypatching the global `os.name` -- which `pathlib` reads to pick
+    WindowsPath vs PosixPath, so mutating it breaks every `Path(...)` in the
+    process (a WindowsPath can't be instantiated on POSIX before Python 3.13).
+    """
+    return os.name == "nt"
+
+
 def _defender_venv_path() -> Path:
     """The biopb install dir to exclude -- this interpreter's venv (`sys.prefix`).
 
@@ -1806,7 +1817,7 @@ def _defender_status(venv: Path) -> None:
         )
 
 
-@app.command("quick-start", hidden=os.name != "nt")
+@app.command("quick-start", hidden=not _is_windows())
 def quick_start(
     enabled: Optional[bool] = typer.Option(
         None,
@@ -1823,7 +1834,7 @@ def quick_start(
     rescanned. It needs admin -- one UAC prompt -- and is fully reversible.
     Windows only.
     """
-    if os.name != "nt":
+    if not _is_windows():
         console.print(
             "[yellow]quick-start is Windows-only[/yellow] -- Defender exclusions "
             "don't apply on this platform (nothing to do)."
