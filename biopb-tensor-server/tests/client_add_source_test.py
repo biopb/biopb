@@ -34,10 +34,18 @@ def _result_body(added=(), already=(), failed=()):
 
 
 def _bare_client():
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+    # add_source / resolve / warm now live on CatalogClient (#278 item C); build
+    # the shared state + collaborators (no connection) and inject the fake flight
+    # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
-    client._sources = {}
-    client._descriptors = {}
-    client._call_options = None
+    state = _ClientState(
+        client=None, call_options=None, location="", token=None, cache_bytes=0
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
     return client
 
 
@@ -88,20 +96,20 @@ class TestAddSource:
     def test_terminal_result_returned(self):
         client = _bare_client()
         added = DataSourceDescriptor(source_id="s1")
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(_result_body(added=[added], already=["s0"]))]
         )
 
         out = client.add_source("/drop")
 
-        assert client._client.action.type == "add_source"
+        assert client._state.client.action.type == "add_source"
         assert [d.source_id for d in out.added] == ["s1"]
         assert list(out.already_present) == ["s0"]
 
     def test_progress_envelopes_reported_then_terminal_taken(self):
         client = _bare_client()
         seen = []
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(1, "/d/a.zarr")),
                 _FakeResult(_progress_body(2, "/d/b.zarr")),
@@ -116,7 +124,7 @@ class TestAddSource:
 
     def test_unknown_action_maps_to_runtimeerror(self):
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             raise_exc=flight.FlightServerError("Unknown action 'add_source'")
         )
         with pytest.raises(RuntimeError, match="too old"):
@@ -124,7 +132,9 @@ class TestAddSource:
 
     def test_no_terminal_result_raises(self):
         client = _bare_client()
-        client._client = _FakeFlight([_FakeResult(_progress_body(1, "/d/a.zarr"))])
+        client._state.client = _FakeFlight(
+            [_FakeResult(_progress_body(1, "/d/a.zarr"))]
+        )
         with pytest.raises(RuntimeError, match="no terminal result"):
             client.add_source("/drop")
 
@@ -135,7 +145,7 @@ class TestAddSource:
         # would have broken before capturing it and returned an empty tally.
         client = _bare_client()
         added = DataSourceDescriptor(source_id="s1")
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(1, "/d/s1")),
                 _FakeResult(_result_body(added=[added], already=["s0"])),
@@ -152,7 +162,7 @@ class TestAddSource:
         # empty tally rather than raising; sources already registered surface
         # later via the watcher re-list.
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(1, "/d/a.zarr")),
                 _FakeResult(_progress_body(2, "/d/b.zarr")),
