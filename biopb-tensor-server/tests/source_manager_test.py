@@ -2,6 +2,7 @@
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -402,7 +403,13 @@ class TestSourceManagerRegressions:
         )
 
         manager._handle_rescan()
-        previous_entry_states = dict(manager._entry_states)
+        # Value-level snapshot: EntryState is mutable (pending_scan is cleared in
+        # place), so a shallow dict() copy would share objects with the live cache
+        # and a leaked mutation could silently mutate the snapshot too, making the
+        # rollback assertion vacuous. Copy each record so the guarantee is real.
+        previous_entry_states = {
+            k: replace(v) for k, v in manager._entry_states.items()
+        }
         previous_skipped_dirs = set(manager._skipped_stable_dirs)
 
         data_path.write_text("changed")

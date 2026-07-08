@@ -828,8 +828,8 @@ class SourceManager:
                 #      is residency-invariant (never flaps on hydrate/evict -- strictly
                 #      safer than today) and it is compared *per path_str*, so distinct
                 #      cloud paths never collide into one another.
-                #   2. Stability gate. A constant `(0, 0)` signature means
-                #      `stable_observations` never advances -- but cloud entries
+                #   2. Stability gate. Under a constant `(0, 0)` signature the
+                #      stability counter is meaningless -- but cloud entries
                 #      *bypass* the stability window entirely (`_should_scan_resolved`
                 #      returns True immediately for a cloud path), so that counter is
                 #      never read under cloud. If that bypass is ever removed, this
@@ -1064,6 +1064,17 @@ class SourceManager:
                 continue
             if not cached_path.startswith(prefix):
                 continue
+            # Carried by reference, sharing the previous-generation instance.
+            # WARNING: EntryState is mutable -- `_should_scan_resolved` clears
+            # `pending_scan` in place -- so a mutation of a carried record would
+            # leak across generations and break the swap-then-rollback isolation
+            # `_rescan_monitored_dirs` relies on (the rolled-back "previous" cache
+            # would already carry the mutation). This is safe ONLY because a
+            # carried entry sits under a root just added to `skipped_dirs`, which
+            # the claim walk prunes (`discover_sources_from_entries._under`), so
+            # `_should_scan_resolved` never runs on it -- nothing mutates a carried
+            # record. If you ever mutate carried EntryStates, or decouple this
+            # carry prefix from the skip prefix, copy the record here instead.
             next_state[cached_path] = entry
 
     def _should_force_full_rescan(self) -> bool:
@@ -1172,7 +1183,7 @@ class SourceManager:
         #
         # This bypass is also load-bearing for the cloud inode-backfill skip in
         # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
-        # degrades to a constant (0, 0), so `stable_observations` never advances
+        # degrades to a constant (0, 0), leaving the stability counter meaningless
         # -- safe only because this early-return means that counter is never read
         # for a cloud path. Removing the bypass would make that skip incorrect.
         if self._is_under_cloud_root(resolved_str):
