@@ -15,7 +15,10 @@ import os
 import tempfile
 
 import pytest
-from biopb_tensor_server import discovery, source_manager as sm_mod
+from biopb_tensor_server import (
+    discovery,
+    reconciler as rec_mod,
+)
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.config import SourceConfig, parse_config
 from biopb_tensor_server.discovery import (
@@ -47,7 +50,7 @@ def force_nonresident(monkeypatch):
     fake = lambda path, stat_result=None: True  # noqa: E731
     monkeypatch.setattr(discovery, "_is_offline_placeholder", fake)
     monkeypatch.setattr(tiff_mod, "_is_offline_placeholder", fake)
-    monkeypatch.setattr(sm_mod, "_is_offline_placeholder", fake)
+    monkeypatch.setattr(rec_mod, "_is_offline_placeholder", fake)
 
 
 # --------------------------------------------------------------------------- #
@@ -451,14 +454,14 @@ class TestUnresolvedDecision:
     def test_flagged_claim_is_unresolved(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         claim = SourceClaim("ome-zarr", str(tmp_path / "x.zarr"), unresolved=True)
-        assert mgr._claim_is_unresolved(claim) is True
+        assert mgr._reconciler._claim_is_unresolved(claim) is True
 
     def test_resident_claim_outside_cloud_root_is_not_unresolved(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f))
-        assert mgr._claim_is_unresolved(claim) is False
+        assert mgr._reconciler._claim_is_unresolved(claim) is False
 
     def test_nonresident_file_under_cloud_root_is_unresolved(
         self, tmp_path, force_nonresident
@@ -469,7 +472,7 @@ class TestUnresolvedDecision:
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f))
-        assert mgr._claim_is_unresolved(claim) is True
+        assert mgr._reconciler._claim_is_unresolved(claim) is True
 
     def test_directory_member_not_false_flagged(self, tmp_path, force_nonresident):
         # Even with every path looking non-resident, a directory primary_path is
@@ -479,7 +482,7 @@ class TestUnresolvedDecision:
         store = tmp_path / "img.zarr"
         store.mkdir()
         claim = SourceClaim("ome-zarr", str(store))  # no unresolved flag, dir member
-        assert mgr._claim_is_unresolved(claim) is False
+        assert mgr._reconciler._claim_is_unresolved(claim) is False
 
 
 class TestShouldWarm:
@@ -490,7 +493,7 @@ class TestShouldWarm:
     """
 
     def _register(self, mgr, claim):
-        mgr._state.claims[claim.source_id] = claim
+        mgr._reconciler._state.claims[claim.source_id] = claim
 
     def test_unknown_source_not_warmed(self, tmp_path):
         mgr = _make_manager(_FakeServer())
@@ -546,7 +549,7 @@ class TestCloudRegistrationEndToEnd:
 
         # Register an ome-zarr claim flagged unresolved (as the defer branch would).
         claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
-        assert mgr._register_source_claim(claim) is True
+        assert mgr._reconciler._register_source_claim(claim) is True
 
         # Registered as the proxy; catalog row carries NULL shape (empty tensors).
         adapter = server.registered["cloud1"]
@@ -755,7 +758,7 @@ class TestCloudRescanGating:
         assert not any(
             p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_states
         )
-        assert sid in mgr._cloud_source_ids
+        assert sid in mgr._reconciler._cloud_source_ids
 
         # Incremental: the per-entry cloud carry-forward must never be invoked.
         def _boom(*a, **k):
@@ -786,15 +789,15 @@ class TestCloudRescanGating:
         sid = next(iter(server.registered))
         added_before = len(server._metadata_db.added)
 
-        orig_sig = mgr._build_claim_signatures
+        orig_sig = mgr._reconciler._build_claim_signatures
 
         def guard(claim):
-            assert claim.source_id not in mgr._cloud_source_ids, (
+            assert claim.source_id not in mgr._reconciler._cloud_source_ids, (
                 "cloud source must not be signature-diffed on an incremental"
             )
             return orig_sig(claim)
 
-        monkeypatch.setattr(mgr, "_build_claim_signatures", guard)
+        monkeypatch.setattr(mgr._reconciler, "_build_claim_signatures", guard)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
 
         mgr._handle_rescan()
@@ -826,7 +829,9 @@ class TestCloudRescanGating:
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
         mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
         assert len(server.registered) == 2
-        assert all(sid in mgr._cloud_source_ids for sid in server.registered)
+        assert all(
+            sid in mgr._reconciler._cloud_source_ids for sid in server.registered
+        )
 
 
 # --------------------------------------------------------------------------- #
