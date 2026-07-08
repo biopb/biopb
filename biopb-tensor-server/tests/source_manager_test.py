@@ -2,6 +2,7 @@
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,11 @@ from biopb_tensor_server.discovery import (
     SourceClaim,
     generate_source_id,
 )
-from biopb_tensor_server.source_manager import SourceManager
+from biopb_tensor_server.source_manager import (
+    EntryState,
+    SourceManager,
+    _WalkContext,
+)
 from biopb_tensor_server.watcher import WatcherEvent, WatcherEventType
 
 
@@ -361,9 +366,7 @@ class TestSourceManagerRegressions:
             if refresh_calls["count"] == 1:
                 manager._skipped_stable_dirs = {str(monitored_dir.resolve())}
                 return (
-                    manager._entry_state,
-                    manager._entry_stable_observations,
-                    manager._entry_pending_scan,
+                    manager._entry_states,
                     manager._skipped_stable_dirs,
                     {},  # next_cloud (empty: no cloud roots in this test)
                 )
@@ -400,9 +403,13 @@ class TestSourceManagerRegressions:
         )
 
         manager._handle_rescan()
-        previous_entry_state = dict(manager._entry_state)
-        previous_stable_observations = dict(manager._entry_stable_observations)
-        previous_pending_scan = dict(manager._entry_pending_scan)
+        # Value-level snapshot: EntryState is mutable (pending_scan is cleared in
+        # place), so a shallow dict() copy would share objects with the live cache
+        # and a leaked mutation could silently mutate the snapshot too, making the
+        # rollback assertion vacuous. Copy each record so the guarantee is real.
+        previous_entry_states = {
+            k: replace(v) for k, v in manager._entry_states.items()
+        }
         previous_skipped_dirs = set(manager._skipped_stable_dirs)
 
         data_path.write_text("changed")
@@ -415,9 +422,7 @@ class TestSourceManagerRegressions:
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
 
-        assert manager._entry_state == previous_entry_state
-        assert manager._entry_stable_observations == previous_stable_observations
-        assert manager._entry_pending_scan == previous_pending_scan
+        assert manager._entry_states == previous_entry_states
         assert manager._skipped_stable_dirs == previous_skipped_dirs
 
     def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
@@ -1113,8 +1118,8 @@ def _make_signature_manager(monitored_dirs):
 
 
 def _scan(manager):
-    """Run one signature refresh and return its {resolved_path_str: ...} map."""
-    next_state, _obs, _pending, _skipped, _cloud = manager._refresh_entry_state(
+    """Run one signature refresh and return its {resolved_path_str: EntryState} map."""
+    next_state, _skipped, _cloud = manager._refresh_entry_state(
         force_full=True, publish=False
     )
     return next_state
@@ -1325,23 +1330,22 @@ class TestCloudInodeBackfillSkip:
 
         monkeypatch.setattr(os, "stat", _counting_stat)
 
-        next_state, next_cloud = {}, {}
-        manager._scan_tree_state(
-            path=f,
+        ctx = _WalkContext(
             now=time.time(),
-            next_state=next_state,
-            next_stable_observations={},
-            next_pending_scan={},
-            next_cloud=next_cloud,
+            next_state={},
+            next_cloud={},
             skipped_dirs=set(),
             force_full=True,
-            allow_prune=True,
             visited_identities=set(),
+        )
+        manager._scan_tree_state(
+            f,
+            ctx,
             is_root=False,
             dir_entry=entry,
             cloud=cloud,
         )
-        return str(f), next_state, next_cloud, backfill_calls
+        return str(f), ctx.next_state, ctx.next_cloud, backfill_calls
 
     def test_cloud_skips_backfill_and_degrades_signature(self, tmp_path, monkeypatch):
         manager = _make_signature_manager({tmp_path})
@@ -1354,8 +1358,7 @@ class TestCloudInodeBackfillSkip:
         # The entry is still recorded, with the signature degraded to the
         # identity-only (0, 0) (residency-invariant, never flaps on hydrate).
         assert path_str in next_state
-        _is_dir, signature, _changed = next_state[path_str]
-        assert signature == (0, 0)
+        assert next_state[path_str].signature == (0, 0)
         assert next_cloud[path_str] is True
 
     def test_non_cloud_still_backfills_inode(self, tmp_path, monkeypatch):
@@ -1368,8 +1371,7 @@ class TestCloudInodeBackfillSkip:
         # load-bearing for the full mtime/size signature and NTFS identity (#56).
         assert backfill_calls == [path_str]
         assert path_str in next_state
-        _is_dir, signature, _changed = next_state[path_str]
-        assert signature[:2] == (7, 4242)  # backfilled (st_dev, st_ino)
+        assert next_state[path_str].signature[:2] == (7, 4242)  # backfilled dev,ino
         assert next_cloud[path_str] is False
 
     def test_get_file_identity_path_hash_fallback_distinguishes_zero_inode(
@@ -1735,42 +1737,45 @@ class TestRescanCarryForwardPrefix:
         # case a bare startswith(root) (no separator) would wrongly include.
         decoy = str(tmp_path / "data_backup" / "x.tif")
         unrelated = str(tmp_path / "other" / "y.tif")
-        sig = (False, (0, 0), 0.0)
-        mgr._entry_state = {
-            root: (True, (0, 0), 0.0),
-            child: sig,
-            deep: sig,
-            decoy: sig,
-            unrelated: sig,
+        mgr._entry_states = {
+            root: EntryState(True, (0, 0), 0.0),
+            child: EntryState(
+                False, (0, 0), 0.0, stable_observations=3, pending_scan=True
+            ),
+            deep: EntryState(False, (0, 0), 0.0, stable_observations=2),
+            decoy: EntryState(False, (0, 0), 0.0),
+            unrelated: EntryState(False, (0, 0), 0.0),
         }
-        mgr._entry_stable_observations = {child: 3, deep: 2}
-        mgr._entry_pending_scan = {child: True}
 
-        next_state = {root: (True, (0, 0), 0.0)}  # root already recorded by the walk
-        nso: dict = {}
-        nps: dict = {}
-        mgr._copy_cached_subtree_entries(root, next_state, nso, nps)
+        # root already recorded by the walk
+        next_state = {root: EntryState(True, (0, 0), 0.0)}
+        mgr._copy_cached_subtree_entries(root, next_state)
 
         assert set(next_state) - {root} == {child, deep}
         assert decoy not in next_state  # exact-prefix guard (root + os.sep)
         assert unrelated not in next_state
-        assert nso == {child: 3, deep: 2}
-        assert nps[child] is True
-        assert nps[deep] is False  # default when no pending record exists
+        # The whole EntryState is carried, stability fields intact.
+        assert next_state[child].stable_observations == 3
+        assert next_state[child].pending_scan is True
+        assert next_state[deep].stable_observations == 2
+        assert next_state[deep].pending_scan is False
 
     def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
         mgr = self._manager(tmp_path)
         root = str(tmp_path / "data")
 
+        def _pending(path_str, pending):
+            return {path_str: EntryState(False, (0, 0), 0.0, pending_scan=pending)}
+
         # bare-prefix sibling must not count
-        mgr._entry_pending_scan = {str(tmp_path / "data_backup" / "x.tif"): True}
+        mgr._entry_states = _pending(str(tmp_path / "data_backup" / "x.tif"), True)
         assert mgr._subtree_has_pending_scan(root) is False
         # a real pending descendant counts
-        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): True}
+        mgr._entry_states = _pending(str(tmp_path / "data" / "sub" / "f.tif"), True)
         assert mgr._subtree_has_pending_scan(root) is True
         # the root's own pending flag does not count (the prune gate handles it)
-        mgr._entry_pending_scan = {root: True}
+        mgr._entry_states = _pending(root, True)
         assert mgr._subtree_has_pending_scan(root) is False
         # a non-pending descendant does not count
-        mgr._entry_pending_scan = {str(tmp_path / "data" / "sub" / "f.tif"): False}
+        mgr._entry_states = _pending(str(tmp_path / "data" / "sub" / "f.tif"), False)
         assert mgr._subtree_has_pending_scan(root) is False

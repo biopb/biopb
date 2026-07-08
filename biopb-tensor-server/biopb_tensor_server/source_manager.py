@@ -145,6 +145,55 @@ class _FailureTracker:
     last_log_at: float = float("-inf")
 
 
+@dataclass
+class EntryState:
+    """Cached filesystem snapshot for one walked path (file or directory).
+
+    Collapses the former three parallel path-keyed dicts into one record:
+
+      * ``is_directory`` / ``signature`` / ``last_changed`` -- the change-detection
+        signature (identity + mtime/size tuple, plus the last observed change
+        epoch);
+      * ``stable_observations`` -- consecutive unchanged rescans since the last
+        change (the stability-window counter);
+      * ``pending_scan`` -- True until the entry passes one eligible discovery
+        pass; the #53 subtree-pending prune gate keys on it.
+
+    Under a cloud root the last two fields are inert -- cloud entries bypass the
+    stability machinery (``_should_scan_resolved`` short-circuits), so nothing
+    reads them; only the signature triplet is meaningful in ``_cloud_entry_states``.
+    """
+
+    is_directory: bool
+    signature: Tuple[Any, ...]
+    last_changed: float
+    stable_observations: int = 0
+    pending_scan: bool = False
+
+
+@dataclass
+class _WalkContext:
+    """Per-refresh accumulators + invariant flags threaded through the recursive
+    signature walk (``_scan_tree_state``).
+
+    Replaces the walk's former 8-positional-param recursion: everything constant
+    across the whole refresh lives here, so the recursion only passes the
+    per-entry values (``path``, ``dir_entry``, ``is_root``, ``cloud``, ``depth``).
+    ``allow_prune`` is *not* here -- it is derived per call from ``is_root`` (the
+    monitored root honors the ``aggressive_dir_pruning`` config; descendants
+    always allow subtree pruning).
+    """
+
+    now: float
+    next_state: Dict[str, EntryState]
+    # path -> whether it is under a cloud root (carried to the claim phase so
+    # cloud-ness is computed once, in the walk, not re-derived per entry).
+    next_cloud: Dict[str, bool]
+    skipped_dirs: Set[str]
+    force_full: bool
+    visited_identities: Set[str]
+
+
 class SourceManager:
     """Manages periodic rescans and source lifecycle reconciliation."""
 
@@ -254,12 +303,8 @@ class SourceManager:
         # Maps resolved path -> source_id (str keys for URL support)
         self._path_to_source_id: Dict[str, str] = {}
         # Cached filesystem signatures for stability and change detection.
-        # path -> (is_directory, signature_tuple, last_changed_epoch)
-        self._entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
-        # path -> consecutive unchanged rescans observed since the last change.
-        self._entry_stable_observations: Dict[str, int] = {}
-        # path -> whether the current signature still needs one eligible discovery pass.
-        self._entry_pending_scan: Dict[str, bool] = {}
+        # path -> EntryState (signature + stability counter + pending-scan flag).
+        self._entry_states: Dict[str, EntryState] = {}
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         # source_id -> retry/logging state for repeatedly failing datasets.
@@ -271,12 +316,13 @@ class SourceManager:
         # only on the hourly force_full pass; on the frequent incremental rescans
         # they are skipped entirely. To keep that O(non-cloud), cloud entries live
         # here -- rebuilt only at the end of a successful force_full -- instead of
-        # being re-materialized into ``_entry_state``/``next_state`` every cycle
+        # being re-materialized into ``_entry_states``/``next_state`` every cycle
         # (which made every per-entry rescan loop O(whole cloud catalog) and
-        # stalled the Flight serving threads via the GIL). Same tuple shape as
-        # ``_entry_state``. Never mutated on a failed rescan, so the last good
-        # snapshot survives a force_full failure (no rollback variable needed).
-        self._cloud_entry_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+        # stalled the Flight serving threads via the GIL). Same ``EntryState``
+        # shape as ``_entry_states`` (the stability fields inert -- see EntryState).
+        # Never mutated on a failed rescan, so the last good snapshot survives a
+        # force_full failure (no rollback variable needed).
+        self._cloud_entry_states: Dict[str, EntryState] = {}
         # source_ids whose primary_path is under a cloud root, maintained at commit
         # time (O(1) per source). Lets the incremental reconcile preserve cloud
         # sources by a hash-set check instead of resolving every cloud member path.
@@ -500,19 +546,13 @@ class SourceManager:
         try:
             (
                 next_state,
-                next_stable_observations,
-                next_pending_scan,
                 skipped_dirs,
                 next_cloud,
             ) = self._refresh_entry_state(force_full=force_full_rescan, publish=False)
-            previous_state = self._entry_state
-            previous_stable_observations = self._entry_stable_observations
-            previous_pending_scan = self._entry_pending_scan
+            previous_state = self._entry_states
             previous_skipped_dirs = self._skipped_stable_dirs
 
-            self._entry_state = next_state
-            self._entry_stable_observations = next_stable_observations
-            self._entry_pending_scan = next_pending_scan
+            self._entry_states = next_state
             self._skipped_stable_dirs = skipped_dirs
 
             rescan_succeeded = False
@@ -542,7 +582,7 @@ class SourceManager:
                 # `if ... in skipped_dirs: continue` did for whole roots.
                 discovered_state = discover_sources_from_entries(
                     (
-                        (path_str, entry[0], entry[1])
+                        (path_str, entry.is_directory, entry.signature)
                         for path_str, entry in next_state.items()
                     ),
                     self._registry,
@@ -562,33 +602,29 @@ class SourceManager:
                 rescan_succeeded = True
             finally:
                 if not rescan_succeeded:
-                    self._entry_state = previous_state
-                    self._entry_stable_observations = previous_stable_observations
-                    self._entry_pending_scan = previous_pending_scan
+                    self._entry_states = previous_state
                     self._skipped_stable_dirs = previous_skipped_dirs
 
             if force_full_rescan and rescan_succeeded:
                 self._last_full_rescan_at = time.time()
                 self._server.set_last_full_scan(self._last_full_rescan_at)
-                # Partition the just-walked cloud entries out of _entry_state into
+                # Partition the just-walked cloud entries out of _entry_states into
                 # the cloud partition. This runs only after the force_full claim +
-                # reconcile have already seen the full _entry_state (cloud included),
-                # so cloud sources reconcile normally here; afterwards _entry_state
-                # holds non-cloud only, so the frequent incremental rescans never
-                # iterate cloud entries (the GIL-stall fix). next_state is
-                # self._entry_state (and the companions are aliased too, set above),
-                # so popping trims them in place. Only on success -> a failed
-                # force_full leaves the previous _cloud_entry_state intact.
-                cloud_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
+                # reconcile have already seen the full _entry_states (cloud
+                # included), so cloud sources reconcile normally here; afterwards
+                # _entry_states holds non-cloud only, so the frequent incremental
+                # rescans never iterate cloud entries (the GIL-stall fix). next_state
+                # is self._entry_states (set above), so popping trims it in place.
+                # Only on success -> a failed force_full leaves the previous
+                # _cloud_entry_states intact.
+                cloud_state: Dict[str, EntryState] = {}
                 for path_str, is_cloud in next_cloud.items():
                     if not is_cloud:
                         continue
                     entry = next_state.pop(path_str, None)
                     if entry is not None:
                         cloud_state[path_str] = entry
-                    next_stable_observations.pop(path_str, None)
-                    next_pending_scan.pop(path_str, None)
-                self._cloud_entry_state = cloud_state
+                self._cloud_entry_states = cloud_state
                 # First full scan done: flip the precache gate (live additions
                 # now prompt-enqueue) and let the launcher seed the backlog with
                 # the established catalog. Fired once, best-effort.
@@ -652,23 +688,22 @@ class SourceManager:
 
         entry_paths_to_remove = [
             path_str
-            for path_str in self._entry_state
+            for path_str in self._entry_states
             if path_str == deleted_root_str
             or Path(path_str).is_relative_to(deleted_root)
         ]
         for path_str in entry_paths_to_remove:
-            self._entry_state.pop(path_str, None)
-            self._entry_pending_scan.pop(path_str, None)
+            self._entry_states.pop(path_str, None)
 
-        # Cloud entries live in the partition, not _entry_state; prune them too.
+        # Cloud entries live in the partition, not _entry_states; prune them too.
         cloud_paths_to_remove = [
             path_str
-            for path_str in self._cloud_entry_state
+            for path_str in self._cloud_entry_states
             if path_str == deleted_root_str
             or Path(path_str).is_relative_to(deleted_root)
         ]
         for path_str in cloud_paths_to_remove:
-            self._cloud_entry_state.pop(path_str, None)
+            self._cloud_entry_states.pop(path_str, None)
 
         if removed_source_ids:
             logger.warning(
@@ -687,25 +722,22 @@ class SourceManager:
         force_full: bool = False,
         publish: bool = True,
     ) -> Tuple[
-        Dict[str, Tuple[bool, Tuple[Any, ...], float]],
-        Dict[str, int],
-        Dict[str, bool],
+        Dict[str, EntryState],
         Set[str],
         Dict[str, bool],
     ]:
         """Refresh cached filesystem signatures for all monitored trees."""
-        now = time.time()
-        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]] = {}
-        next_stable_observations: Dict[str, int] = {}
-        next_pending_scan: Dict[str, bool] = {}
-        # path -> whether it is under a cloud root (carried to the claim phase so
-        # cloud-ness is computed once, in the walk, not re-derived per entry).
-        next_cloud: Dict[str, bool] = {}
-        skipped_dirs: Set[str] = set()
-        # One identity set across all monitored roots for this refresh: breaks
-        # directory loops (symlink, Windows junction, hardlink, bind mount) and
-        # also stops overlapping roots from walking a shared subtree twice.
-        visited_identities: Set[str] = set()
+        ctx = _WalkContext(
+            now=time.time(),
+            next_state={},
+            next_cloud={},
+            skipped_dirs=set(),
+            force_full=force_full,
+            # One identity set across all monitored roots for this refresh: breaks
+            # directory loops (symlink, Windows junction, hardlink, bind mount) and
+            # also stops overlapping roots from walking a shared subtree twice.
+            visited_identities=set(),
+        )
         for monitored_dir in sorted(self._monitored_dirs):
             # An explicitly-configured root is honored unconditionally — even if
             # it is a symlink, hidden, or named like a pruned system dir; the
@@ -722,49 +754,31 @@ class SourceManager:
             # stops being scanned.
             self._scan_tree_state(
                 monitored_dir.resolve(),
-                now,
-                next_state,
-                next_stable_observations,
-                next_pending_scan,
-                next_cloud,
-                skipped_dirs,
-                force_full,
-                self._aggressive_dir_pruning,
-                visited_identities,
+                ctx,
                 is_root=True,
                 cloud=monitored_dir.resolve() in self._cloud_roots,
             )
         if publish:
-            self._entry_state = next_state
-            self._entry_stable_observations = next_stable_observations
-            self._entry_pending_scan = next_pending_scan
-            self._skipped_stable_dirs = skipped_dirs
-        return (
-            next_state,
-            next_stable_observations,
-            next_pending_scan,
-            skipped_dirs,
-            next_cloud,
-        )
+            self._entry_states = ctx.next_state
+            self._skipped_stable_dirs = ctx.skipped_dirs
+        return (ctx.next_state, ctx.skipped_dirs, ctx.next_cloud)
 
     def _scan_tree_state(
         self,
         path: Path,
-        now: float,
-        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
-        next_stable_observations: Dict[str, int],
-        next_pending_scan: Dict[str, bool],
-        next_cloud: Dict[str, bool],
-        skipped_dirs: Set[str],
-        force_full: bool,
-        allow_prune: bool,
-        visited_identities: Set[str],
+        ctx: _WalkContext,
+        *,
         is_root: bool = False,
         dir_entry: Optional[os.DirEntry] = None,
         cloud: bool = False,
         depth: int = 0,
     ) -> None:
         """Capture the current filesystem signature state for one subtree.
+
+        ``ctx`` carries the refresh-wide accumulators + flags (see ``_WalkContext``);
+        only the per-entry values are explicit args. ``allow_prune`` is derived
+        below: the monitored root honors the ``aggressive_dir_pruning`` config,
+        every descendant always allows subtree pruning.
 
         ``dir_entry`` is the ``os.DirEntry`` the parent's ``os.scandir`` produced for
         this entry (None for an explicitly-configured root, which the caller hands in
@@ -773,8 +787,14 @@ class SourceManager:
         the single stat we take, and a non-symlink child of an already-resolved
         directory is canonical by construction — so we never re-``resolve()`` it.
         Only the rare symlink entry pays a ``resolve()``, to preserve the
-        resolved-target keying that ``next_state`` and the loop guard depend on.
+        resolved-target keying that ``ctx.next_state`` and the loop guard depend on.
         """
+        now = ctx.now
+        force_full = ctx.force_full
+        # The root's pruning is config-gated; descendants always prune stable
+        # subtrees. (Formerly threaded as the ``allow_prune`` param -- root call
+        # passed ``self._aggressive_dir_pruning``, recursion passed ``True``.)
+        allow_prune = self._aggressive_dir_pruning if is_root else True
         try:
             if dir_entry is not None:
                 # is_symlink reads the entry's own d_type (the symlink-ness of the
@@ -808,8 +828,8 @@ class SourceManager:
                 #      is residency-invariant (never flaps on hydrate/evict -- strictly
                 #      safer than today) and it is compared *per path_str*, so distinct
                 #      cloud paths never collide into one another.
-                #   2. Stability gate. A constant `(0, 0)` signature means
-                #      `stable_observations` never advances -- but cloud entries
+                #   2. Stability gate. Under a constant `(0, 0)` signature the
+                #      stability counter is meaningless -- but cloud entries
                 #      *bypass* the stability window entirely (`_should_scan_resolved`
                 #      returns True immediately for a cloud path), so that counter is
                 #      never read under cloud. If that bypass is ever removed, this
@@ -879,37 +899,41 @@ class SourceManager:
             # a single dehydrated placeholder file added directly under a non-cloud
             # root, whose bytes are non-resident (unreadable) anyway.
             if is_directory:
-                skipped_dirs.add(str(resolved_path))
+                ctx.skipped_dirs.add(str(resolved_path))
             return
 
         path_str = str(resolved_path)
         signature = self._build_entry_signature(stat_result, is_directory, cloud=cloud)
         # Cloud entries live in the cloud partition (walked only on force_full);
         # read the prior signature from there so last_changed stays continuous
-        # across the hourly re-walk. Non-cloud reads _entry_state as before.
-        previous_entry = (self._cloud_entry_state if cloud else self._entry_state).get(
-            path_str
-        )
+        # across the hourly re-walk. Non-cloud reads _entry_states as before.
+        previous_entry = (
+            self._cloud_entry_states if cloud else self._entry_states
+        ).get(path_str)
         last_changed = self._get_entry_change_time(stat_result, now)
         stable_observations = 0
-        if previous_entry is not None and previous_entry[:2] == (
-            is_directory,
-            signature,
-        ):
-            last_changed = previous_entry[2]
-            stable_observations = self._entry_stable_observations.get(path_str, 0) + 1
-            pending_scan = self._entry_pending_scan.get(path_str, False)
+        if previous_entry is not None and (
+            previous_entry.is_directory,
+            previous_entry.signature,
+        ) == (is_directory, signature):
+            last_changed = previous_entry.last_changed
+            stable_observations = previous_entry.stable_observations + 1
+            pending_scan = previous_entry.pending_scan
         else:
             pending_scan = True
-        next_state[path_str] = (is_directory, signature, last_changed)
-        next_stable_observations[path_str] = stable_observations
-        next_pending_scan[path_str] = pending_scan
+        ctx.next_state[path_str] = EntryState(
+            is_directory=is_directory,
+            signature=signature,
+            last_changed=last_changed,
+            stable_observations=stable_observations,
+            pending_scan=pending_scan,
+        )
         # Record cloud-ness once, here, where the walk already knows it (inherited
         # per monitored root, see _refresh_entry_state). The claim phase reads this
         # instead of re-deriving it per entry, so there is a single source of truth
         # for "is this path under a cloud root" -- consistent with the signature
         # above, which is also computed with this same `cloud`.
-        next_cloud[path_str] = cloud
+        ctx.next_cloud[path_str] = cloud
 
         # Only real directories are walked further. Never follow a symlinked
         # directory; and break every *other* kind of loop — Windows junction,
@@ -923,15 +947,15 @@ class SourceManager:
         # get_file_identity so it reuses (st_dev, st_ino) instead of re-resolving
         # and re-stat'ing (biopb/biopb#56).
         identity = get_file_identity(resolved_path, stat_result)
-        if identity in visited_identities:
+        if identity in ctx.visited_identities:
             return
-        visited_identities.add(identity)
+        ctx.visited_identities.add(identity)
 
         # Cloud subtree: re-walked only on a force_full pass. Enumerating a cloud
         # root is expensive and its mtime signature is unreliable (doc S1.2), so the
         # frequent incremental rescans skip it entirely -- they neither descend nor
         # re-materialize its descendants. Cloud entries persist in
-        # ``_cloud_entry_state`` (rebuilt only on force_full); the cloud sources are
+        # ``_cloud_entry_states`` (rebuilt only on force_full); the cloud sources are
         # kept registered across incrementals by the reconcile scoping (see
         # ``_reconcile_discovered_state``), not by carrying entries forward. The first
         # rescan is force_full (last-full == -inf), so a cloud root is still
@@ -939,7 +963,7 @@ class SourceManager:
         # force_full pass. ``skipped_dirs.add`` records the skip (asserted by tests)
         # and prunes the cloud root that was just recorded into ``next_state``.
         if cloud and not force_full:
-            skipped_dirs.add(path_str)
+            ctx.skipped_dirs.add(path_str)
             return
 
         if (
@@ -948,19 +972,15 @@ class SourceManager:
             # Cloud is handled by the dedicated branch above (a cloud subtree never
             # reaches this signature-based prune), so no cloud guard is needed here.
             and previous_entry is not None
-            and previous_entry[:2] == (is_directory, signature)
+            and (previous_entry.is_directory, previous_entry.signature)
+            == (is_directory, signature)
             and not pending_scan
-            and now - previous_entry[2] >= self._stability_window
+            and now - previous_entry.last_changed >= self._stability_window
             and stable_observations >= self._stable_rescans_required
             and not self._subtree_has_pending_scan(path_str)
         ):
-            skipped_dirs.add(path_str)
-            self._copy_cached_subtree_entries(
-                path_str,
-                next_state,
-                next_stable_observations,
-                next_pending_scan,
-            )
+            ctx.skipped_dirs.add(path_str)
+            self._copy_cached_subtree_entries(path_str, ctx.next_state)
             return
 
         # Depth backstop: if identity dedup ever fails to catch a directory loop
@@ -987,15 +1007,7 @@ class SourceManager:
                 for entry in entries:
                     self._scan_tree_state(
                         Path(entry.path),
-                        now,
-                        next_state,
-                        next_stable_observations,
-                        next_pending_scan,
-                        next_cloud,
-                        skipped_dirs,
-                        force_full,
-                        True,
-                        visited_identities,
+                        ctx,
                         dir_entry=entry,
                         cloud=cloud,
                         depth=depth + 1,
@@ -1020,8 +1032,8 @@ class SourceManager:
         # per-entry pathlib-parse cost as _copy_cached_subtree_entries, on the
         # same large carried-forward entry set. Keys are resolved path strings.
         prefix = root_path_str + os.sep
-        for cached_path, pending in self._entry_pending_scan.items():
-            if not pending or cached_path == root_path_str:
+        for cached_path, entry in self._entry_states.items():
+            if not entry.pending_scan or cached_path == root_path_str:
                 continue
             if cached_path.startswith(prefix):
                 return True
@@ -1030,9 +1042,7 @@ class SourceManager:
     def _copy_cached_subtree_entries(
         self,
         root_path_str: str,
-        next_state: Dict[str, Tuple[bool, Tuple[Any, ...], float]],
-        next_stable_observations: Dict[str, int],
-        next_pending_scan: Dict[str, bool],
+        next_state: Dict[str, EntryState],
     ) -> None:
         """Carry forward cached descendants when a stable subtree is skipped.
 
@@ -1049,19 +1059,23 @@ class SourceManager:
         claim phase already uses (``discover_sources_from_entries._under``).
         """
         prefix = root_path_str + os.sep
-        for cached_path, entry in self._entry_state.items():
+        for cached_path, entry in self._entry_states.items():
             if cached_path == root_path_str or cached_path in next_state:
                 continue
             if not cached_path.startswith(prefix):
                 continue
+            # Carried by reference, sharing the previous-generation instance.
+            # WARNING: EntryState is mutable -- `_should_scan_resolved` clears
+            # `pending_scan` in place -- so a mutation of a carried record would
+            # leak across generations and break the swap-then-rollback isolation
+            # `_rescan_monitored_dirs` relies on (the rolled-back "previous" cache
+            # would already carry the mutation). This is safe ONLY because a
+            # carried entry sits under a root just added to `skipped_dirs`, which
+            # the claim walk prunes (`discover_sources_from_entries._under`), so
+            # `_should_scan_resolved` never runs on it -- nothing mutates a carried
+            # record. If you ever mutate carried EntryStates, or decouple this
+            # carry prefix from the skip prefix, copy the record here instead.
             next_state[cached_path] = entry
-            next_stable_observations[cached_path] = self._entry_stable_observations.get(
-                cached_path, 0
-            )
-            next_pending_scan[cached_path] = self._entry_pending_scan.get(
-                cached_path,
-                False,
-            )
 
     def _should_force_full_rescan(self) -> bool:
         """Return True when a full tree walk should bypass subtree pruning."""
@@ -1123,20 +1137,18 @@ class SourceManager:
 
         return now
 
-    def _entry_for(
-        self, path_str: str
-    ) -> Optional[Tuple[bool, Tuple[Any, ...], float]]:
+    def _entry_for(self, path_str: str) -> Optional[EntryState]:
         """Cached signature entry for a path, from either partition.
 
-        Cloud entries live in ``_cloud_entry_state`` (walked only on force_full),
-        non-cloud in ``_entry_state``. Readers that may receive a cloud member path
+        Cloud entries live in ``_cloud_entry_states`` (walked only on force_full),
+        non-cloud in ``_entry_states``. Readers that may receive a cloud member path
         outside the force_full walk (signature diff, stability gate) use this so a
         cloud member is found in the partition instead of falling through to a live
         ``Path(member).stat()`` -- a cloud network round-trip.
         """
-        entry = self._entry_state.get(path_str)
+        entry = self._entry_states.get(path_str)
         if entry is None:
-            entry = self._cloud_entry_state.get(path_str)
+            entry = self._cloud_entry_states.get(path_str)
         return entry
 
     def _should_scan_resolved(self, resolved_str: str) -> bool:
@@ -1145,8 +1157,9 @@ class SourceManager:
         The snapshot-driven discovery (biopb/biopb#56 item 4) iterates ``next_state``
         keys, which ``_scan_tree_state`` already stored as resolved path strings, so
         a per-entry ``Path.resolve()`` would be pure waste. This carries the
-        load-bearing ``_entry_pending_scan`` clear-on-pass side effect (the #53
-        subtree-pending prune gate depends on it).
+        load-bearing ``pending_scan`` clear-on-pass side effect (the #53
+        subtree-pending prune gate depends on it) by mutating the cached
+        ``EntryState`` in place.
         """
         if os.path.basename(resolved_str).startswith("."):
             return False
@@ -1170,29 +1183,25 @@ class SourceManager:
         #
         # This bypass is also load-bearing for the cloud inode-backfill skip in
         # _scan_tree_state (biopb/biopb#190): under cloud the entry signature
-        # degrades to a constant (0, 0), so `stable_observations` never advances
+        # degrades to a constant (0, 0), leaving the stability counter meaningless
         # -- safe only because this early-return means that counter is never read
         # for a cloud path. Removing the bypass would make that skip incorrect.
         if self._is_under_cloud_root(resolved_str):
-            self._entry_pending_scan[resolved_str] = False
+            entry.pending_scan = False
             return True
 
-        age = time.time() - entry[2]
+        age = time.time() - entry.last_changed
         if age < self._stability_window:
             return False
 
-        stable_observations = self._entry_stable_observations.get(
-            resolved_str,
-            self._stable_rescans_required,
-        )
-        if stable_observations < self._stable_rescans_required:
+        if entry.stable_observations < self._stable_rescans_required:
             return False
 
-        if not entry[0] and self._probe_open_files:
+        if not entry.is_directory and self._probe_open_files:
             if not self._can_open_for_append(Path(resolved_str)):
                 return False
 
-        self._entry_pending_scan[resolved_str] = False
+        entry.pending_scan = False
         return True
 
     def _can_open_for_append(self, path: Path) -> bool:
@@ -1212,8 +1221,8 @@ class SourceManager:
         """Return unstable files/directories observed in the latest refresh."""
         now = time.time()
         unstable = []
-        for path_str, (_, _, last_changed) in self._entry_state.items():
-            if now - last_changed < self._stability_window:
+        for path_str, entry in self._entry_states.items():
+            if now - entry.last_changed < self._stability_window:
                 unstable.append(Path(path_str))
         return unstable
 
@@ -1326,7 +1335,7 @@ class SourceManager:
         for member_path in sorted(claim.member_paths):
             entry = self._entry_for(member_path)
             if entry is not None:
-                signatures[member_path] = entry[1]
+                signatures[member_path] = entry.signature
                 continue
 
             try:

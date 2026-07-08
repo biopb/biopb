@@ -736,7 +736,7 @@ class TestCloudRescanGating:
         self, tmp_path, force_nonresident, monkeypatch
     ):
         # After the startup force_full, cloud entries live in the cloud partition,
-        # NOT in _entry_state, and an incremental rescan touches none of them: the
+        # NOT in _entry_states, and an incremental rescan touches none of them: the
         # per-entry carry-forward must never run, and the partition is carried
         # forward by reference (unchanged), while the cloud source stays registered.
         root = tmp_path / "cloudroot"
@@ -748,11 +748,11 @@ class TestCloudRescanGating:
 
         mgr._handle_rescan()  # force_full
         sid = next(iter(server.registered))
-        assert mgr._cloud_entry_state  # cloud entries partitioned out
-        assert root_key in mgr._cloud_entry_state
-        # Nothing under the cloud root lingers in _entry_state.
+        assert mgr._cloud_entry_states  # cloud entries partitioned out
+        assert root_key in mgr._cloud_entry_states
+        # Nothing under the cloud root lingers in _entry_states.
         assert not any(
-            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_state
+            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_states
         )
         assert sid in mgr._cloud_source_ids
 
@@ -762,12 +762,12 @@ class TestCloudRescanGating:
 
         monkeypatch.setattr(mgr, "_copy_cached_subtree_entries", _boom)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
-        partition_before = dict(mgr._cloud_entry_state)
+        partition_before = dict(mgr._cloud_entry_states)
 
         mgr._handle_rescan()  # must not raise
 
         assert set(server.registered) == {sid}  # preserved
-        assert mgr._cloud_entry_state == partition_before  # carried, not rebuilt
+        assert mgr._cloud_entry_states == partition_before  # carried, not rebuilt
 
     def test_incremental_preserves_cloud_without_diff_or_churn(
         self, tmp_path, force_nonresident, monkeypatch
