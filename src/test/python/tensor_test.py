@@ -482,7 +482,9 @@ class TestTensorFlightClient:
 
     def test_get_upload_status_pb_uses_tensor_descriptor_array_id(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        # Upload lifecycle lives in the UploadSession collaborator (#278 item C),
+        # so the _pb conveniences resolve status through client._upload -- mock there.
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -498,12 +500,12 @@ class TestTensorFlightClient:
         finally:
             client.close()
 
-        client.get_upload_status.assert_called_once_with("cache_test")
+        client._upload.get_upload_status.assert_called_once_with("cache_test")
         assert status["state"] == "PENDING"
 
     def test_wait_for_upload_ready_pb_returns_when_ready(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             side_effect=[
                 {
                     "source_id": "cache_test",
@@ -532,11 +534,11 @@ class TestTensorFlightClient:
             client.close()
 
         assert status["state"] == "READY"
-        assert client.get_upload_status.call_count == 2
+        assert client._upload.get_upload_status.call_count == 2
 
     def test_wait_for_upload_ready_pb_times_out(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "PENDING",
@@ -573,7 +575,7 @@ class TestTensorFlightClient:
 
     def test_wait_for_upload_ready_pb_raises_on_failed_state(self):
         client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client.get_upload_status = Mock(
+        client._upload.get_upload_status = Mock(
             return_value={
                 "source_id": "cache_test",
                 "state": "FAILED",
