@@ -1134,17 +1134,28 @@ function Invoke-BiopbInstall {
                 Report-Detail "  ...still installing (${elapsed}s elapsed) -- normal for a first install"
             }
         }
+        # The timed WaitForExit above returns the instant uv signals exit, which can
+        # be before .NET has cached the process's exit code; the parameterless
+        # overload blocks until the process is fully reaped so $proc.ExitCode is
+        # reliably populated below (belt-and-suspenders with the .Handle touch above).
+        $proc.WaitForExit()
 
         # Replay captured output (after exit, so the streams are flushed/closed).
+        # -Encoding UTF8: uv writes UTF-8, but Windows PowerShell 5.1 Get-Content
+        # defaults to ANSI and would mangle any non-ASCII in the replayed summary /
+        # error lines (mojibake in the console + diagnostic transcript).
         foreach ($f in @($uvOutLog, $uvErrLog)) {
             if (Test-Path -LiteralPath $f) {
-                Get-Content -LiteralPath $f | ForEach-Object {
+                Get-Content -LiteralPath $f -Encoding UTF8 | ForEach-Object {
                     if ($_ -ne '') { Report-Detail "$_" }
                 }
             }
         }
         # Start-Process leaves $LASTEXITCODE untouched, so set it from the process
-        # object for the shared Assert-LastExit gate.
+        # object for the shared Assert-LastExit gate. Guard a null ExitCode -- it
+        # would make `$LASTEXITCODE -ne 0` true and false-fail a good install -- as an
+        # explicit, legible error rather than a phantom "failed (exit code )".
+        if ($null -eq $proc.ExitCode) { throw "biopb install: uv exit code unavailable" }
         $global:LASTEXITCODE = $proc.ExitCode
         Assert-LastExit "biopb install"
     } finally {
