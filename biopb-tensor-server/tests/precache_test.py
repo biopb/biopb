@@ -417,15 +417,19 @@ class TestRuntimePhaseGating:
         try:
             # Stub the heavy commit collaborators so we exercise only the gate.
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             fired = []
             sm.set_source_committed_hook(fired.append)
@@ -434,12 +438,12 @@ class TestRuntimePhaseGating:
             # During the initial scan: startup sources go to the backlog, not the
             # prompt enqueue -- the hook must NOT fire.
             sm._initial_scan_done = False
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == []
 
             # After the initial scan: live additions fire the hook.
             sm._initial_scan_done = True
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == ["s1"]
         finally:
             server.shutdown()
@@ -456,15 +460,19 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             fired = []
             sm.set_source_committed_hook(fired.append)
@@ -474,12 +482,12 @@ class TestRuntimePhaseGating:
             # Suppressed: initial scan done, but this is the boot-tick upstream
             # re-list -> backlog, not prompt enqueue.
             sm._suppress_live_precache = True
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == []
 
             # Not suppressed (a later live delta): the hook fires as usual.
             sm._suppress_live_precache = False
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == ["up1"]
         finally:
             server.shutdown()
@@ -490,15 +498,19 @@ class TestRuntimePhaseGating:
         server, sm = self._bare_source_manager()
         try:
             monkeypatch.setattr(
-                sm,
+                sm._reconciler,
                 "_register_source_claim",
                 lambda claim, catalog_seed=None, catalog_url=None: True,
             )
             monkeypatch.setattr(
-                sm._state, "add_claim", lambda claim, notify=False: True
+                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
-            monkeypatch.setattr(sm, "_build_claim_signatures", lambda claim: {})
-            monkeypatch.setattr(sm, "_clear_failed_source_attempt", lambda sid: None)
+            monkeypatch.setattr(
+                sm._reconciler, "_build_claim_signatures", lambda claim: {}
+            )
+            monkeypatch.setattr(
+                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
+            )
 
             def boom(_sid):
                 raise RuntimeError("hook failure")
@@ -507,7 +519,7 @@ class TestRuntimePhaseGating:
             sm._initial_scan_done = True
             claim = SimpleNamespace(source_id="s2", primary_path="/y")
             # Commit still succeeds despite the hook raising.
-            assert sm._commit_add_claim(claim) is True
+            assert sm._reconciler._commit_add_claim(claim) is True
         finally:
             server.shutdown()
 
@@ -737,13 +749,13 @@ class TestIterLocalSourceMtimes:
         try:
             real = tmp_path / "f.zarr"
             real.mkdir()
-            sm._state.claims["local"] = SimpleNamespace(
+            sm._reconciler._state.claims["local"] = SimpleNamespace(
                 source_id="local", primary_path=str(real), is_remote=False
             )
-            sm._state.claims["remote"] = SimpleNamespace(
+            sm._reconciler._state.claims["remote"] = SimpleNamespace(
                 source_id="remote", primary_path="s3://bucket/x", is_remote=True
             )
-            sm._state.claims["gone"] = SimpleNamespace(
+            sm._reconciler._state.claims["gone"] = SimpleNamespace(
                 source_id="gone",
                 primary_path=str(tmp_path / "missing"),
                 is_remote=False,
@@ -764,7 +776,7 @@ class TestIterLocalSourceMtimes:
         server, sm = self._bare_sm()
         holder = None
         try:
-            sm._state.claims["a"] = SimpleNamespace(
+            sm._reconciler._state.claims["a"] = SimpleNamespace(
                 source_id="a", primary_path="/x", is_remote=True
             )
             held = threading.Event()
@@ -772,7 +784,7 @@ class TestIterLocalSourceMtimes:
             done = threading.Event()
 
             def hold_lock():
-                with sm._lock:
+                with sm._reconciler._lock:
                     held.set()
                     release.wait(2.0)
 
