@@ -1,6 +1,7 @@
 """Thread-safety tests for cache module."""
 
 import errno
+import os
 import shutil
 import tempfile
 import threading
@@ -847,6 +848,88 @@ class TestArrowFileBackendRecovery:
         lock = ProcessLock(lock_path)
         assert lock.is_stale() is True
         assert lock.acquire() is True  # Should acquire after removing stale lock
+        lock.release()
+
+        shutil.rmtree(cache_dir)
+
+    def test_stale_lock_pid_reuse_identity(self):
+        """A lock whose PID was reused (alive, different create time) is stale.
+
+        The regression from biopb/biopb#138 item 8: a liveness-only check saw
+        our own alive PID and refused to reclaim; the identity check compares
+        the recorded create-time token and treats a mismatch as stale.
+        """
+        from biopb._proc import process_create_time
+
+        cache_dir = self._make_temp_cache_dir()
+        lock_path = cache_dir / "lock"
+
+        import json
+
+        # Alive PID (our own), but a create-time token that cannot match the
+        # live one -- as if a crashed owner's PID had been recycled onto us.
+        live_token = process_create_time(os.getpid())
+        if live_token is None:
+            pytest.skip("no create-time token on this platform (liveness-only)")
+        stale_data = {
+            "pid": os.getpid(),
+            "create_time": live_token + 1,
+            "acquired_at": time.time(),
+        }
+        with open(lock_path, "w") as f:
+            json.dump(stale_data, f)
+
+        lock = ProcessLock(lock_path)
+        assert lock.is_stale() is True
+        assert lock.acquire() is True  # Reclaims despite the PID being alive
+        lock.release()
+
+        shutil.rmtree(cache_dir)
+
+    def test_live_lock_matching_identity_is_held(self):
+        """A lock with our alive PID and matching create time is NOT stale."""
+        from biopb._proc import process_create_time
+
+        cache_dir = self._make_temp_cache_dir()
+        lock_path = cache_dir / "lock"
+
+        import json
+
+        live_token = process_create_time(os.getpid())
+        held_data = {
+            "pid": os.getpid(),
+            "create_time": live_token,
+            "acquired_at": time.time(),
+        }
+        with open(lock_path, "w") as f:
+            json.dump(held_data, f)
+
+        lock = ProcessLock(lock_path)
+        assert lock.is_stale() is False
+        assert lock.acquire() is False  # Owner still alive -> not reclaimable
+
+        shutil.rmtree(cache_dir)
+
+    def test_legacy_lock_no_token_falls_back_to_liveness(self):
+        """A tokenless (pre-identity) lock degrades to a liveness-only check."""
+        cache_dir = self._make_temp_cache_dir()
+        lock_path = cache_dir / "lock"
+
+        import json
+
+        # Legacy bare-PID file, alive PID -> treated as held (liveness fallback).
+        with open(lock_path, "w") as f:
+            json.dump({"pid": os.getpid(), "acquired_at": time.time()}, f)
+        lock = ProcessLock(lock_path)
+        assert lock.is_stale() is False
+        assert lock.acquire() is False
+
+        # Legacy bare-PID file, dead PID -> stale.
+        with open(lock_path, "w") as f:
+            json.dump({"pid": 99999, "acquired_at": time.time()}, f)
+        lock = ProcessLock(lock_path)
+        assert lock.is_stale() is True
+        assert lock.acquire() is True
         lock.release()
 
         shutil.rmtree(cache_dir)

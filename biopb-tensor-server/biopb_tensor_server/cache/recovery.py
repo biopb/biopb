@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from biopb._proc import is_process_running, process_create_time
+
 
 @dataclass
 class SegmentEntryInfo:
@@ -167,8 +169,19 @@ class WriteAheadLog:
 class ProcessLock:
     """File-based lock for crash detection.
 
-    Creates a lock file containing the process ID. On startup, if a lock
-    file exists with a PID that is no longer running, it indicates a crash.
+    Creates a lock file containing the owner's PID and a process create-time
+    token. On startup, a lock naming a process that is dead -- or whose PID was
+    *reused* by an unrelated process (alive, but a different create time) -- is
+    stale and reclaimable. This is an *identity* check, not just liveness: a
+    crashed cache owner whose PID gets recycled (worst on Windows, which
+    hard-kills at logout and reuses PIDs aggressively) would otherwise look
+    "alive" forever and wedge recovery. Same fix as the daemon PID file
+    (biopb/biopb#138 item 8), reusing the shared ``biopb._proc`` primitive --
+    which also avoids ``os.kill(pid, 0)``, a real Ctrl+C on Windows.
+
+    Legacy lock files with no ``create_time`` (or platforms with no cheap
+    create-time source, e.g. macOS -> token ``None``) degrade to liveness-only,
+    never a false "held".
     """
 
     def __init__(self, path: Path):
@@ -190,13 +203,12 @@ class ProcessLock:
             try:
                 with open(self._path) as f:
                     data = json.load(f)
-                existing_pid = data.get("pid")
 
-                if existing_pid and self._is_process_running(existing_pid):
+                if self._is_owner_alive(data):
                     # Lock held by another running process
                     return False
 
-                # Stale lock - process is dead, remove it
+                # Stale lock - process is dead (or PID reused) - remove it
                 self._path.unlink()
             except (OSError, json.JSONDecodeError):
                 # Corrupted lock file - remove it
@@ -207,6 +219,7 @@ class ProcessLock:
         self._acquired = True
         data = {
             "pid": self._pid,
+            "create_time": process_create_time(self._pid),
             "acquired_at": time.time(),
         }
         with open(self._path, "w") as f:
@@ -222,10 +235,10 @@ class ProcessLock:
         self._pid = None
 
     def is_stale(self) -> bool:
-        """Check if existing lock is from dead process.
+        """Check if existing lock is from a dead (or reused-PID) process.
 
-        Returns True if lock file exists but process is dead.
-        Returns False if no lock file or process is running.
+        Returns True if lock file exists but its owner is gone.
+        Returns False if no lock file or the owner is still running.
         """
         if not self._path.exists():
             return False
@@ -233,21 +246,31 @@ class ProcessLock:
         try:
             with open(self._path) as f:
                 data = json.load(f)
-            existing_pid = data.get("pid")
-            if existing_pid and not self._is_process_running(existing_pid):
-                return True
+            return not self._is_owner_alive(data)
         except (OSError, json.JSONDecodeError):
             return True  # Corrupted lock is stale
 
-        return False
+    def _is_owner_alive(self, data: dict) -> bool:
+        """Whether the lock's recorded owner is the same process, still running.
 
-    def _is_process_running(self, pid: int) -> bool:
-        """Check if a process with given PID is running."""
-        try:
-            os.kill(pid, 0)  # Signal 0 just checks if process exists
-            return True
-        except OSError:
+        Identity check: the PID must be alive *and* its live create-time token
+        must match the recorded one. A missing recorded token (legacy file) or
+        an unavailable live token degrades to liveness-only -- the pre-identity
+        behavior -- so an owner is never falsely declared gone.
+        """
+        pid = data.get("pid")
+        if not pid or not is_process_running(pid):
             return False
+
+        recorded = data.get("create_time")
+        if recorded is None:
+            return True  # Legacy/tokenless lock: liveness is all we have.
+
+        live = process_create_time(pid)
+        if live is None:
+            return True  # Can't compute a token here: fall back to liveness.
+
+        return live == recorded
 
     def is_acquired(self) -> bool:
         """Check if this instance holds the lock."""
