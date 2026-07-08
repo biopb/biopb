@@ -1092,25 +1092,63 @@ function Invoke-BiopbInstall {
         "--with-executables-from", "biopb-mcp"
     )
 
-    Report-Info "Installing biopb into one shared environment..."
+    Report-Info "Installing biopb into one shared environment (first run can take several minutes; on Windows, antivirus scans every file uv writes)..."
+    $uvOutLog = Join-Path $env:TEMP "biopb-uv-install.out.log"
+    $uvErrLog = Join-Path $env:TEMP "biopb-uv-install.err.log"
     try {
-        # Stream uv's own stdout+stderr through the reporter so the live install
-        # detail is BOTH visible (the GUI shows it in its scrolling log; the
-        # console prints it) and captured in the diagnostic transcript. A native
-        # child run UNPIPED writes straight to the console handle, which
-        # Start-Transcript does not intercept -- so the real error (e.g. the
-        # os-error-5 lock above) would otherwise be lost and only the generic
-        # "exit code 2" survive. The wizard now uses this streaming detail as its
-        # primary progress feedback (it no longer drives a determinate gauge, so
-        # the volume of uv/pip lines is no longer a problem). 2>&1 under EAP='Stop'
-        # can turn a benign uv stderr line into a terminating NativeCommandError,
-        # so soften EAP for the call and gate on the real exit code via Assert-LastExit.
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        uv @installArgs 2>&1 | ForEach-Object { Report-Detail "$_" }
-        $ErrorActionPreference = $prevEAP
+        # uv only animates its progress bar on a TTY, and it goes SILENT for
+        # minutes during the prepare/link phase (no per-line output there) -- which
+        # reads as a frozen console, worst on Windows where Defender real-time-scans
+        # every file uv unpacks/links (see biopb/biopb#384). --verbose does NOT help:
+        # it front-loads a burst during the ~seconds-long resolve, then is just as
+        # silent through the ~minute of prepare+install.
+        #
+        # So run uv detached with its output redirected to a log, emit our OWN
+        # heartbeat while it works, then replay the log through the reporter so uv's
+        # full detail (the "Installed N packages" summary, or the real error on
+        # failure) still lands in the console/GUI/diagnostic transcript. Start-Process
+        # is given a single pre-quoted argument line, not an -ArgumentList array:
+        # the requirement specs are PEP 508 direct refs containing spaces
+        # ("biopb[tensor] @ file:///..."), which an array would split under Windows
+        # PowerShell 5.1. Only spaces/quotes need quoting here (no embedded quotes).
+        $uvExe = (Get-Command uv -ErrorAction Stop).Source
+        $argLine = ($installArgs | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' '
+
+        $proc = Start-Process -FilePath $uvExe -ArgumentList $argLine -NoNewWindow -PassThru `
+            -RedirectStandardOutput $uvOutLog -RedirectStandardError $uvErrLog
+        # Touch .Handle so the Process object retains the native handle; without
+        # this, Start-Process -PassThru discards it on exit and $proc.ExitCode
+        # comes back $null -- which Assert-LastExit would misread as a failure.
+        $null = $proc.Handle
+        # Wait in 1s slices so we notice a fast (warm-cache) exit promptly, but
+        # only emit a heartbeat every ~10s so a slow install shows steady life
+        # without spamming. WaitForExit(ms) returns true the instant uv exits.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastTick = 0
+        while (-not $proc.WaitForExit(1000)) {
+            $elapsed = [int]$sw.Elapsed.TotalSeconds
+            if (($elapsed - $lastTick) -ge 10) {
+                $lastTick = $elapsed
+                Report-Detail "  ...still installing (${elapsed}s elapsed) -- normal for a first install"
+            }
+        }
+
+        # Replay captured output (after exit, so the streams are flushed/closed).
+        foreach ($f in @($uvOutLog, $uvErrLog)) {
+            if (Test-Path -LiteralPath $f) {
+                Get-Content -LiteralPath $f | ForEach-Object {
+                    if ($_ -ne '') { Report-Detail "$_" }
+                }
+            }
+        }
+        # Start-Process leaves $LASTEXITCODE untouched, so set it from the process
+        # object for the shared Assert-LastExit gate.
+        $global:LASTEXITCODE = $proc.ExitCode
         Assert-LastExit "biopb install"
     } finally {
+        Remove-Item -LiteralPath $uvOutLog, $uvErrLog -Force -ErrorAction SilentlyContinue
         if ($wheelsDir -and (Test-Path -LiteralPath $wheelsDir)) {
             Remove-Item -LiteralPath $wheelsDir -Recurse -Force -ErrorAction SilentlyContinue
         }
