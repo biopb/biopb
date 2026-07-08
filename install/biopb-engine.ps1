@@ -765,6 +765,16 @@ function Start-DataServer {
 # command, since it needs elevation; precompile needs none, so it runs always.)
 function Invoke-Precompile {
     try {
+        # Soften EAP for this whole function (function-scoped, auto-restored on
+        # return): the engine runs under EAP='Stop', where a native command's
+        # `2>&1` turns any benign stderr line into a terminating
+        # NativeCommandError (the same trap the uv-install call documents). Under
+        # 'Stop' the compileall below would abort on the first stderr line a
+        # vendored py2-only module prints -- leaving a PARTIAL cache on exactly
+        # the platform (Windows) precompile matters most. 'Continue' lets it run
+        # to completion; the try/catch remains the outer safety net.
+        $ErrorActionPreference = 'Continue'
+
         $toolDir = (uv tool dir 2>$null)
         if (-not $toolDir) { return }
         # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
