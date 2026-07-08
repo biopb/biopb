@@ -30,11 +30,18 @@ def _result_body(desc):
 
 
 def _bare_client():
-    """A client instance with no network: only the caches resolve() touches."""
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
+    # add_source / resolve / warm now live on CatalogClient (#278 item C); build
+    # the shared state + collaborators (no connection) and inject the fake flight
+    # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
-    client._sources = {}
-    client._descriptors = {}
-    client._call_options = None
+    state = _ClientState(
+        client=None, call_options=None, location="", token=None, cache_bytes=0
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
     return client
 
 
@@ -78,12 +85,12 @@ class TestResolve:
             source_id="cloud_x",
             tensors=[_resolved_tensor("cloud_x/f0"), _resolved_tensor("cloud_x/f1")],
         )
-        client._client = _FakeFlight([_FakeResult(full.SerializeToString())])
+        client._state.client = _FakeFlight([_FakeResult(full.SerializeToString())])
 
         out = client.resolve("cloud_x")
 
-        assert client._client.action.type == "resolve"
-        assert bytes(client._client.action.body) == b"cloud_x"
+        assert client._state.client.action.type == "resolve"
+        assert bytes(client._state.client.action.body) == b"cloud_x"
         assert out.source_id == "cloud_x"
         assert len(out.tensors) == 2  # complete field set, never truncated
         assert client._sources["cloud_x"] is out  # cache seeded for reuse
@@ -95,7 +102,7 @@ class TestResolve:
         full = DataSourceDescriptor(
             source_id="cloud_x", tensors=[_resolved_tensor("cloud_x")]
         )
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [
                 _FakeResult(_progress_body(0.0, "img.tif", 1024)),
                 _FakeResult(_progress_body(0.5, "img.tif", 1024)),
@@ -117,7 +124,7 @@ class TestResolve:
         full = DataSourceDescriptor(
             source_id="cloud_x", tensors=[_resolved_tensor("cloud_x")]
         )
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(b""), _FakeResult(b""), _FakeResult(full.SerializeToString())]
         )
 
@@ -132,7 +139,7 @@ class TestResolve:
         full = DataSourceDescriptor(
             source_id="cloud_x", tensors=[_resolved_tensor("cloud_x")]
         )
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(_progress_body(0.1)), _FakeResult(_result_body(full))]
         )
         with pytest.raises(ResolveCancelled):
@@ -143,7 +150,7 @@ class TestResolve:
         # A stream of only heartbeats (server closed without a descriptor) is an
         # error, not a silent empty descriptor.
         client = _bare_client()
-        client._client = _FakeFlight(
+        client._state.client = _FakeFlight(
             [_FakeResult(_progress_body(0.0)), _FakeResult(_progress_body(0.1))]
         )
         with pytest.raises(RuntimeError, match="no descriptor"):
@@ -177,7 +184,7 @@ class TestSourceMetadataUnresolvedGuard:
             "cloud_x": DataSourceDescriptor(source_id="cloud_x")  # no tensors
         }
         recalled = []
-        client._client = type(
+        client._state.client = type(
             "FakeFlight",
             (),
             {"get_flight_info": lambda *a, **k: recalled.append(a)},
@@ -200,7 +207,7 @@ class TestPhysicalScaleUnresolvedGuard:
         }
         recalled = []
         monkeypatch.setattr(
-            client,
+            client._catalog,
             "_fetch_tensor_descriptor",
             lambda *a, **k: recalled.append(a) or _resolved_tensor("cloud_x"),
         )
@@ -219,7 +226,9 @@ class TestPhysicalScaleUnresolvedGuard:
             physical_unit=["um", "um"],
         )
         client._sources = {"r": DataSourceDescriptor(source_id="r", tensors=[td])}
-        monkeypatch.setattr(client, "_fetch_tensor_descriptor", lambda *a, **k: td)
+        monkeypatch.setattr(
+            client._catalog, "_fetch_tensor_descriptor", lambda *a, **k: td
+        )
         scale, unit = client.get_physical_scale("r")
         assert scale == [0.5, 0.25]
         assert unit == ["um", "um"]

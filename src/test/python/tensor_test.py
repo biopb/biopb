@@ -687,9 +687,16 @@ class TestQuerySourcesFormat:
         ]
 
     def test_unknown_format_rejected_before_network(self):
-        # Validated at the top of query_sources, so a bad format fails fast
-        # without a server / connection.
+        # Validated at the top of query_sources (now on CatalogClient, #278 item
+        # C), so a bad format fails fast without a server / connection.
+        from biopb.tensor._session import CatalogClient, _ClientState
+
         client = TensorFlightClient.__new__(TensorFlightClient)
+        client._catalog = CatalogClient(
+            _ClientState(
+                client=None, call_options=None, location="", token=None, cache_bytes=0
+            )
+        )
         with pytest.raises(ValueError, match="unknown format"):
             client.query_sources("SELECT 1", format="polars")
 
@@ -733,13 +740,20 @@ class TestGetPhysicalScale:
 
     @staticmethod
     def _client():
-        # Build without __init__ (no connection); the method only touches the
-        # in-memory descriptor cache and (on a miss) _fetch_tensor_descriptor,
-        # which we stub.
+        # Build without __init__ (no connection): wire the shared state + the
+        # CatalogClient collaborator that now owns get_physical_scale (#278 item
+        # C). The method only touches the in-memory descriptor cache and (on a
+        # miss) the catalog's _fetch_tensor_descriptor, which we stub there.
+        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
+
         client = TensorFlightClient.__new__(TensorFlightClient)
-        client._descriptors = {}
-        client._sources = {}
-        client._fetch_tensor_descriptor = Mock()
+        state = _ClientState(
+            client=None, call_options=None, location="", token=None, cache_bytes=0
+        )
+        client._state = state
+        client._catalog = CatalogClient(state)
+        client._fetcher = ChunkFetcher(state, client._catalog)
+        client._catalog._fetch_tensor_descriptor = Mock()
         return client
 
     @staticmethod
@@ -765,7 +779,7 @@ class TestGetPhysicalScale:
         scale, unit = client.get_physical_scale("src/t1")
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["micrometer", "micrometer", "micrometer"]
-        client._fetch_tensor_descriptor.assert_not_called()
+        client._catalog._fetch_tensor_descriptor.assert_not_called()
 
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
@@ -782,12 +796,12 @@ class TestGetPhysicalScale:
         # (removed with the array_id-keyed accessor, #75).
         client = self._client()
         desc, _ = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
-        client._fetch_tensor_descriptor.return_value = desc
+        client._catalog._fetch_tensor_descriptor.return_value = desc
 
         scale, unit = client.get_physical_scale("src")  # bare source id -> default
         assert scale == [1.0, 0.5, 0.5]
         assert unit == ["", "micrometer", "micrometer"]
-        client._fetch_tensor_descriptor.assert_called_once_with("src", None)
+        client._catalog._fetch_tensor_descriptor.assert_called_once_with("src", None)
 
     def test_fetch_error_propagates(self):
         # A real fetch failure (server unreachable, source not found) must NOT be
@@ -795,7 +809,9 @@ class TestGetPhysicalScale:
         # physical scale recorded". Only a fetched descriptor with an empty
         # summary yields None (test_none_when_summary_empty).
         client = self._client()
-        client._fetch_tensor_descriptor.side_effect = ConnectionError("unreachable")
+        client._catalog._fetch_tensor_descriptor.side_effect = ConnectionError(
+            "unreachable"
+        )
 
         with pytest.raises(ConnectionError):
             client.get_physical_scale("src")
