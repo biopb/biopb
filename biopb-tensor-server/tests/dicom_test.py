@@ -11,7 +11,7 @@ from biopb_tensor_server.adapters.dicom import (
     DicomSeriesAdapter,
     _derive_orientation_from_iop,
 )
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads DICOM via pydicom (the [dicom]/[medical] extra);
 # skip the whole module when it is not installed rather than erroring.

@@ -633,7 +633,7 @@ class TestCompanionOmeIntegration:
         from pathlib import Path
 
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         companion_path, _tiff_files, _metadata_info = companion_ome_dataset
         ctx = ClaimContext(Path(companion_path))
@@ -891,7 +891,7 @@ class TestAicsImageIoAdapterClaim:
     def test_claim_generic_files_rejected(self):
         """Generic file types (txt, csv, cfg) should not be claimed."""
         from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Test various generic file types that bioformats supports
@@ -908,7 +908,7 @@ class TestAicsImageIoAdapterClaim:
     def test_microscopy_files_always_claimed(self):
         """Microscopy/scientific extensions are claimed regardless of the flag."""
         from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for ext in [".tif", ".tiff", ".mrc", ".ims", ".fits", ".nrrd"]:
@@ -926,7 +926,7 @@ class TestAicsImageIoAdapterClaim:
         """Generic raster/video must NOT be claimed during discovery by default
         (biopb/biopb#40) — they flood the catalog with screenshots/icons/movies."""
         from biopb_tensor_server.adapters.bioio import AicsImageIoAdapter
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for ext in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".mp4", ".mov"]:
@@ -947,7 +947,7 @@ class TestAicsImageIoAdapterClaim:
             AicsImageIoAdapter,
             set_claim_generic_images,
         )
-        from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+        from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         set_claim_generic_images(True)
         try:

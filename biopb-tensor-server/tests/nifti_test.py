@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.nifti import NiftiAdapter
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 # Every test here builds/reads NIfTI via nibabel (the [nifti]/[medical] extra);
 # skip the whole module when it is not installed rather than erroring.

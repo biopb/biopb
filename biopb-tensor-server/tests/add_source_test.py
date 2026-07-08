@@ -17,8 +17,8 @@ import numpy as np
 import pytest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import DiscoveryState
-from biopb_tensor_server.source_manager import (
+from biopb_tensor_server.core.discovery import DiscoveryState
+from biopb_tensor_server.sources.source_manager import (
     DND_URL_PREFIX,
     SourceManager,
     _drop_catalog_url,
@@ -162,8 +162,8 @@ class TestAddLocalSource:
         catches a drop that lands inside it. The containment guard keys on
         os.path.realpath, so the seeded claim must store the resolved path (case
         4 over a symlinked config path)."""
-        from biopb_tensor_server.config import SourceConfig
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         real = tmp_path / "real"
         real.mkdir()
@@ -197,12 +197,12 @@ class TestAddLocalSource:
         getting its own root. End-to-end: resolve_all_sources computes the
         catalog_url from the alias, create_source_manager threads it as the
         descriptor's display source_url override (never the source_id)."""
-        from biopb_tensor_server.config import (
+        from biopb_tensor_server.core.config import (
             ServerConfig,
             SourceConfig,
             resolve_all_sources,
         )
-        from biopb_tensor_server.source_manager import create_source_manager
+        from biopb_tensor_server.sources.source_manager import create_source_manager
 
         root = tmp_path / "acquisition"
         root.mkdir()

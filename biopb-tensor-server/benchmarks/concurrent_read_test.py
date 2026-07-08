@@ -64,8 +64,8 @@ def _run_server_process(
 ) -> None:
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     location = f"grpc://127.0.0.1:{port}"
     server = None

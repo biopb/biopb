@@ -18,7 +18,7 @@ from biopb_tensor_server.cache.memory_backend import (
     MemoryCacheBackend,
     MemoryCacheConfig,
 )
-from biopb_tensor_server.config import CacheConfig
+from biopb_tensor_server.core.config import CacheConfig
 
 
 class CacheManager:

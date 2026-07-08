@@ -12,7 +12,7 @@ plain ``(path, data, meta)`` values, so only numpy/zarr/ome_zarr are needed. The
 heavy imports are function-local so importing this module stays cheap.
 
 The OME metadata (multiscales axis typing) mirrors the biopb tensor server's
-``_build_minimal_ome_metadata`` (``biopb_tensor_server.server``) so the output
+``_build_minimal_ome_metadata`` (``biopb_tensor_server.serving.server``) so the output
 round-trips through the server's ``OmeZarrAdapter``, which derives ``dim_labels``
 from ``multiscales[0].axes[*].name``.
 
@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# Axis-typing convention -- mirrors biopb_tensor_server.server
+# Axis-typing convention -- mirrors biopb_tensor_server.serving.server
 # ._build_minimal_ome_metadata so written axes round-trip through OmeZarrAdapter.
 _SPACE = ("x", "y", "z")
 _CHANNEL = ("c", "channel")

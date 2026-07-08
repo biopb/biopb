@@ -88,7 +88,7 @@ from biopb._config_constraints import (
 
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI and biopb-mcp share one definition (all three depend on
-# `biopb`). Re-exported for back-compat (`biopb_tensor_server.config.find_config`
+# `biopb`). Re-exported for back-compat (`biopb_tensor_server.core.config.find_config`
 # and the name constants). See biopb._config_location for the JSON-canonical
 # rationale (biopb/biopb#34).
 from biopb._config_location import (
@@ -99,7 +99,7 @@ from biopb._config_location import (
 )
 
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     ClaimContext,
     DiscoveryState,
@@ -109,7 +109,7 @@ from biopb_tensor_server.discovery import (
     get_file_identity,
     is_remote_url,
 )
-from biopb_tensor_server.remote import (
+from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
 )
@@ -686,7 +686,7 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
 
     # build_config_schema lives in config_schema, which imports the dataclasses
     # here -- import lazily to avoid the cycle (see _known_config_keys).
-    from biopb_tensor_server.config_schema import build_config_schema
+    from biopb_tensor_server.core.config_schema import build_config_schema
 
     # Embed a relative $schema pointer (offline editor validation, no hosted URL).
     payload = dict(data)
@@ -842,7 +842,7 @@ _KNOWN_KEYS_CACHE: Optional[tuple] = None
 def _known_config_keys() -> tuple:
     global _KNOWN_KEYS_CACHE
     if _KNOWN_KEYS_CACHE is None:
-        from biopb_tensor_server.config_schema import known_config_keys
+        from biopb_tensor_server.core.config_schema import known_config_keys
 
         _KNOWN_KEYS_CACHE = known_config_keys()
     return _KNOWN_KEYS_CACHE
@@ -1174,7 +1174,7 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     # Lazy import: config_schema imports this module, so importing it at module
     # scope is a cycle (mirrors save_config's build_config_schema import).
-    from biopb_tensor_server.config_schema import ondisk_location
+    from biopb_tensor_server.core.config_schema import ondisk_location
 
     problems: List[Dict[str, Any]] = []
     for inst in (cfg, cfg.cache, cfg.pyramid, cfg.precache, cfg.metadata_db):

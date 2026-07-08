@@ -27,11 +27,22 @@ Client (Python or TypeScript)
 
 The FastAPI server handles both API requests and serves the static React webapp. It wraps the Python `TensorFlightClient` and re-exposes its operations as plain HTTP so that browsers can use it without a gRPC-Web proxy.
 
+### Package layout
+
+The `biopb_tensor_server` package is organized into layered subpackages:
+
+- **`core/`** — foundational primitives and contracts: `base` (adapter ABCs), `config` / `config_schema`, `discovery`, `chunk`, `downsample`, `errors`, `remote`, `activity`, `logging_config`, and the low-level `source_registry` / `metadata_db` stores. Depends only on itself plus `adapters` / `cache`.
+- **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI sidecar), `upload_manager`, `precache`, `renderer`. Builds on `core`.
+- **`sources/`** — source lifecycle: `source_manager` + `tree_scanner` + `watcher` (scan orchestration) and `reconciler` (the confirmed-catalog single writer). Builds on `core` and `serving`.
+- **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk cache.
+
+`cli`, `__main__`, `__init__` (the public-API re-exports), and `_version` stay at the package root.
+
 ---
 
 ## TensorFlightServer
 
-**Module:** `biopb_tensor_server.server`
+**Module:** `biopb_tensor_server.serving.server`
 **Class:** `TensorFlightServer(flight.FlightServerBase)`
 **Default location:** `grpc://0.0.0.0:8815`
 
@@ -189,7 +200,7 @@ An optional `ArrowFileBackend` persists decoded chunks to disk.
 
 ## FastAPI HTTP Server
 
-**Module:** `biopb_tensor_server.http_server`
+**Module:** `biopb_tensor_server.serving.http_server`
 **Factory:** `create_app(flight_location, token, dev_mode, cache_bytes, cors_origins, static_dir) → FastAPI`
 **Default port:** `8814`
 
@@ -348,7 +359,7 @@ direct one). On POSIX there is no such coupling — `stop` signals one PID.
 
 ### Discovery Protocol
 
-**Module:** `biopb_tensor_server.discovery`
+**Module:** `biopb_tensor_server.core.discovery`
 
 The discovery system uses a **claim-based protocol** where adapters "claim" filesystem paths they recognize. This enables:
 
@@ -445,7 +456,7 @@ class DiscoveryState:
 
 ### Directory Monitoring
 
-**Modules:** `biopb_tensor_server.watcher`, `biopb_tensor_server.source_manager`
+**Modules:** `biopb_tensor_server.sources.watcher`, `biopb_tensor_server.sources.source_manager`
 
 Periodic monitoring for configured directories. On each rescan interval, the catalog reconciles against a fresh stable snapshot of the monitored trees.
 

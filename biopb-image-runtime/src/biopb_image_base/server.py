@@ -323,8 +323,8 @@ def _start_embedded_tensor_cache(
         Tuple of (tensor_server, location_url)
     """
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import CacheConfig
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
     # Clean stale lock file (from previous run/crash)
     lock_path = cache_dir / "lock"

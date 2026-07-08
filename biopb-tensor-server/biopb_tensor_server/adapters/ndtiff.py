@@ -24,15 +24,15 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 
 if TYPE_CHECKING:
     from ndtiff import NDTiffDataset
 
-    from biopb_tensor_server.config import SourceConfig
-    from biopb_tensor_server.discovery import DiscoveryState
-    from biopb_tensor_server.remote import RemoteStore
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.remote import RemoteStore
 
 
 # =============================================================================
@@ -189,7 +189,7 @@ class NdTiffAdapter(SourceAdapter, TensorAdapter):
 
         if source.is_remote:
             # Remote storage: create RemoteStore and wrap with RemoteNdTiffFileIO
-            from biopb_tensor_server.remote import RemoteStore
+            from biopb_tensor_server.core.remote import RemoteStore
 
             store = RemoteStore.from_config(
                 url=source.url,

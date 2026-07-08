@@ -15,8 +15,8 @@ from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 import numpy as np
 import pytest
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.config import CacheConfig
-from biopb_tensor_server.server import TensorFlightServer
+from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.server import TensorFlightServer
 
 from benchmarks.utils import (
     generate_multiresolution_zarr,
@@ -527,7 +527,7 @@ def _register_source_with_server(
     Returns source_id.
     """
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.config import SourceConfig
+    from biopb_tensor_server.core.config import SourceConfig
 
     source_id = spec["id"]
     source_type = spec.get("type")
@@ -626,7 +626,7 @@ def data_source(
         source_type = spec.get("type")
 
         # For public S3 buckets, use anonymous access
-        from biopb_tensor_server.remote import CredentialProfile, CredentialsConfig
+        from biopb_tensor_server.core.remote import CredentialProfile, CredentialsConfig
 
         # Create anon credentials profile (empty key/secret triggers anon=True)
         anon_profile = CredentialProfile(
@@ -654,7 +654,7 @@ def data_source(
             pytest.skip(f"No adapter for source type: {source_type}")
 
         # Create SourceConfig for S3 with anon credentials profile
-        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.core.config import SourceConfig
 
         source_config = SourceConfig(
             url=url,

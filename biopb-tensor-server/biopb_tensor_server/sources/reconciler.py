@@ -43,8 +43,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-from biopb_tensor_server.config import SourceConfig
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.config import SourceConfig
+from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
     DiscoveryState,
     SourceClaim,
@@ -52,12 +52,14 @@ from biopb_tensor_server.discovery import (
     is_remote_url,
     resolve_local_path,
 )
-from biopb_tensor_server.tree_scanner import EntryState, build_entry_signature
+from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.config import SourceConfig as _SourceConfig  # noqa: F401
-    from biopb_tensor_server.metadata_db import MetadataDatabase
-    from biopb_tensor_server.server import TensorFlightServer
+    from biopb_tensor_server.core.config import (
+        SourceConfig as _SourceConfig,  # noqa: F401
+    )
+    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +475,7 @@ class Reconciler:
             fetch_upstream_catalog,
             list_upstream_source_ids,
         )
-        from biopb_tensor_server.config import _namespaced_source_id
+        from biopb_tensor_server.core.config import _namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias

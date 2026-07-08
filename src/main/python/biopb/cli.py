@@ -251,7 +251,7 @@ _LAST_WIN_SHUTDOWN_DIAG: Optional[str] = None
 def _win_shutdown_sentinel() -> Path:
     """Path of the shutdown sentinel file (Windows graceful stop).
 
-    Must match shutdown_sentinel_path() in biopb_tensor_server.http_server (kept
+    Must match shutdown_sentinel_path() in biopb_tensor_server.serving.http_server (kept
     as a literal here to avoid importing heavy server deps just to stop). A single
     fixed name - NOT keyed by PID: on Windows the daemon's os.getpid() can differ
     from the PID `start` recorded (Store-Python/uv launcher shims), so a pid in
@@ -269,7 +269,7 @@ def _win_request_shutdown(sentinel: Path) -> bool:
     so they have no console to receive a CTRL_BREAK, and Win32 named events are
     brittle across sessions/elevation. We instead drop a sentinel *file* the
     daemon polls for (tensor server: _install_windows_shutdown_listener in
-    biopb_tensor_server.http_server; MCP daemon: _install_shutdown_sentinel_watcher
+    biopb_tensor_server.serving.http_server; MCP daemon: _install_shutdown_sentinel_watcher
     in biopb_mcp.mcp.__main__); a file under the user's biopb dir is unambiguous
     regardless of how either process was launched.
     """
@@ -374,7 +374,7 @@ def _get_log_file() -> Path:
 
 # Severity ranks for the `--level` filter, matching the daemon's log format
 # `[asctime] LEVEL name: message` (DEFAULT_LOG_FORMAT in
-# biopb_tensor_server.logging_config).
+# biopb_tensor_server.core.logging_config).
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 
 
@@ -639,7 +639,9 @@ def start(
     grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
     if config.exists():
         try:
-            from biopb_tensor_server.config import load_config as _load_server_config
+            from biopb_tensor_server.core.config import (
+                load_config as _load_server_config,
+            )
 
             grpc_host = _load_server_config(config).host
         except Exception:
@@ -840,7 +842,9 @@ def _resolve_grpc_hostport(config: Path) -> Tuple[str, int]:
     host, port = "127.0.0.1", 8815
     if config and config.exists():
         try:
-            from biopb_tensor_server.config import load_config as _load_server_config
+            from biopb_tensor_server.core.config import (
+                load_config as _load_server_config,
+            )
 
             cfg = _load_server_config(config)
             host = cfg.host or host
@@ -1256,7 +1260,7 @@ def migrate_config(
 
     # The migration case: TOML only. Read the raw table and write canonical JSON.
     try:
-        from biopb_tensor_server.config import _read_config_file, save_config
+        from biopb_tensor_server.core.config import _read_config_file, save_config
     except Exception as exc:  # noqa: BLE001 - optional dependency
         console.print(
             "[red]Config migration is unavailable:[/red] "

@@ -16,8 +16,8 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.chunk import encode_chunk_id, get_bounds_from_chunk_id
-from biopb_tensor_server.config import CacheConfig
+from biopb_tensor_server.core.chunk import encode_chunk_id, get_bounds_from_chunk_id
+from biopb_tensor_server.core.config import CacheConfig
 
 
 class TestCachedSourceAdapter:
@@ -158,7 +158,7 @@ class TestCachedSourceAdapter:
         batch = adapter.resolve_chunk_data(chunk_id, CacheManager.get_instance())
 
         # Verify data matches - the chunk is the unified binary schema now.
-        from biopb_tensor_server.base import unpack_chunk_array
+        from biopb_tensor_server.core.base import unpack_chunk_array
 
         arr = unpack_chunk_array(batch)
         np.testing.assert_array_equal(arr, test_data)
@@ -259,7 +259,7 @@ class TestCachedSourceAdapter:
             assert pa.types.is_binary(batch.column("data").type)
 
             # Verify data can be reconstructed
-            from biopb_tensor_server.base import unpack_chunk_array
+            from biopb_tensor_server.core.base import unpack_chunk_array
 
             reconstructed = unpack_chunk_array(batch)
             assert reconstructed.shape == data.shape
@@ -299,7 +299,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_cache_backed(self):
         """Create cache-backed source."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",  # Use random port
@@ -329,7 +329,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_cache_server_generated_name(self):
         """Create cache-backed source with server-generated name."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -348,7 +348,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_not_writable_raises(self):
         """Non-writable server rejects source creation."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -371,7 +371,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_ome_zarr_requires_write_dir(self):
         """Zarr-backed source requires write_dir."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -391,7 +391,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_ome_zarr_with_write_dir(self):
         """Create zarr-backed source with write_dir."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
@@ -418,8 +418,8 @@ class TestServerDoPutHandler:
     def test_ome_zarr_upload_synced_to_catalog(self):
         """File-backed (durable) uploads are added to the catalog so they are
         discoverable via list_sources/query_sources (biopb/biopb#265)."""
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = MetadataDatabase()
@@ -445,8 +445,8 @@ class TestServerDoPutHandler:
     def test_cache_upload_not_synced_but_readable_by_id(self):
         """Ephemeral cache-backed uploads are NOT catalogued (no removal hook ->
         the row would dangle), but stay readable by their returned id."""
-        from biopb_tensor_server.metadata_db import MetadataDatabase
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         db = MetadataDatabase()
         server = TensorFlightServer(
@@ -470,7 +470,7 @@ class TestServerDoPutHandler:
 
     def test_create_source_invalid_prefix(self):
         """Invalid array_id prefix raises error."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -490,7 +490,7 @@ class TestServerDoPutHandler:
     def test_create_source_action_round_trip(self):
         """Live client create_source should return the server-assigned source_id."""
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -524,7 +524,7 @@ class TestChunkUpload:
 
     def test_upload_chunk_cache_backed(self):
         """Upload chunk to cache-backed source."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -571,7 +571,7 @@ class TestChunkUpload:
 
     def test_upload_chunk_cache_backed_preserves_logical_shape(self):
         """Cache-backed uploads must store shape metadata for reconstruction."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         CacheManager.reset()
         config = CacheConfig(backend="memory", memory_max_entries=10)
@@ -613,7 +613,7 @@ class TestChunkUpload:
         assert stored_batch.column("shape").to_pylist()[0] == [30, 40]
         assert stored_batch.column("dtype").to_pylist()[0] == np.dtype(np.uint8).str
 
-        from biopb_tensor_server.base import unpack_chunk_array
+        from biopb_tensor_server.core.base import unpack_chunk_array
 
         reconstructed = unpack_chunk_array(stored_batch)
         assert reconstructed.shape == data.shape
@@ -624,7 +624,7 @@ class TestChunkUpload:
 
     def test_upload_chunk_missing_source(self):
         """Upload to missing source raises error."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
             location="grpc://localhost:0",
@@ -651,7 +651,7 @@ class TestOmeZarrChunkAlignment:
         """Aligned chunk upload is accepted."""
         pytest.importorskip("zarr")
 
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             CacheManager.reset()
@@ -696,7 +696,7 @@ class TestOmeZarrChunkAlignment:
         """Unaligned chunk upload is rejected."""
         pytest.importorskip("zarr")
 
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
@@ -737,7 +737,7 @@ class TestBuildMinimalOmeMetadata:
 
     def test_minimal_metadata_structure(self):
         """Generated metadata has required fields."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(location="grpc://localhost:0")
 
@@ -762,7 +762,7 @@ class TestBuildMinimalOmeMetadata:
 
     def test_axis_types_detected(self):
         """Axis types are detected from labels."""
-        from biopb_tensor_server.server import TensorFlightServer
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(location="grpc://localhost:0")
 

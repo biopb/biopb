@@ -16,7 +16,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, SliceHint
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.downsample import ceil_div
+from biopb_tensor_server.core.downsample import ceil_div
 
 logger = logging.getLogger(__name__)
 

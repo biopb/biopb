@@ -40,7 +40,7 @@ load_config(path)
 
 ## What is implemented now (coexistence)
 
-1. **Dual-format reader.** `biopb_tensor_server.config.load_config` dispatches on
+1. **Dual-format reader.** `biopb_tensor_server.core.config.load_config` dispatches on
    file extension, with a content sniff for extension-less paths. Reading TOML
    logs a one-line deprecation warning naming `biopb.json` as canonical. Invalid
    files raise a `ValueError` naming the path.
@@ -52,7 +52,7 @@ load_config(path)
    It lives once in **`biopb._config_location`** (a stdlib-only module in the
    core `biopb` package — no heavy adapter/discovery imports, so it is cheap to
    import on every CLI invocation) and the three consumers all call it:
-   - `biopb_tensor_server.config` re-exports it (`find_config` + name constants)
+   - `biopb_tensor_server.core.config` re-exports it (`find_config` + name constants)
    - `biopb.cli` sets `DEFAULT_CONFIG = find_config()`
    - `biopb_mcp._connection` sets `DEFAULT_SERVER_CONFIG = find_config()`
 
@@ -108,7 +108,7 @@ are JSON-native; old TOML installs keep working until they next change folders.
 
 ## JSON Schema emitter (done)
 
-`biopb_tensor_server.config_schema.build_config_schema()` projects the config
+`biopb_tensor_server.core.config_schema.build_config_schema()` projects the config
 dataclasses + the `_CONSTRAINTS` table as a Draft 2020-12 JSON Schema for the
 **on-disk** config, so the key set and value bounds in the schema match exactly
 what the server reads and enforces at startup — one definition, no drift. The

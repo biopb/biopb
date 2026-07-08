@@ -10,7 +10,7 @@ import dataclasses
 
 import jsonschema
 import pytest
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
     CacheConfig,
     MetadataDbConfig,
@@ -21,13 +21,13 @@ from biopb_tensor_server.config import (
     _Enum,
     _Range,
 )
-from biopb_tensor_server.config_schema import (
+from biopb_tensor_server.core.config_schema import (
     build_config_schema,
     constrained_ondisk_keys,
     known_config_keys,
     ondisk_location,
 )
-from biopb_tensor_server.remote import CredentialProfile
+from biopb_tensor_server.core.remote import CredentialProfile
 from jsonschema import Draft202012Validator
 
 
@@ -269,7 +269,7 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
 
 def test_runtime_warning_uses_schema_keys():
     """config._warn_unknown_config_keys derives its sets from the schema."""
-    from biopb_tensor_server.config import _known_config_keys
+    from biopb_tensor_server.core.config import _known_config_keys
 
     sections, section_keys, source_keys, profile_keys = _known_config_keys()
     assert (sections, section_keys, source_keys, profile_keys) == known_config_keys()

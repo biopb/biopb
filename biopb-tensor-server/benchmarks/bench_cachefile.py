@@ -50,7 +50,7 @@ def _start_server(zpath):
     import zarr
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.config import CacheConfig
+    from biopb_tensor_server.core.config import CacheConfig
 
     cache_dir = Path(tempfile.mkdtemp()) / "cache"
     CacheManager.reset()

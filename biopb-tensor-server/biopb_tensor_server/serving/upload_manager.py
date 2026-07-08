@@ -36,10 +36,10 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload
 
 from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.chunk import encode_chunk_id
-from biopb_tensor_server.errors import WriteNotSupportedError
-from biopb_tensor_server.metadata_db import MetadataDatabase
-from biopb_tensor_server.source_registry import SourceRegistry
+from biopb_tensor_server.core.chunk import encode_chunk_id
+from biopb_tensor_server.core.errors import WriteNotSupportedError
+from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.core.source_registry import SourceRegistry
 
 logger = logging.getLogger(__name__)
 

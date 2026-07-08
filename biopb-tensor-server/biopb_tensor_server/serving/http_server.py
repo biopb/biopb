@@ -718,7 +718,7 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         # Read all data from the stream. do_get returns the unified binary chunk
         # schema (biopb/biopb#293); decode it, then ensure native byte order +
         # C-contiguous layout for the browser.
-        from biopb_tensor_server.base import unpack_chunk_array
+        from biopb_tensor_server.core.base import unpack_chunk_array
 
         table = reader.read_all()
         arr = _normalize_array(unpack_chunk_array(table.to_batches()[0]))
@@ -1205,8 +1205,8 @@ async def get_config(request: Request) -> JSONResponse:
         raise HTTPException(status_code=404, detail="This server has no config path")
     from pathlib import Path
 
-    from biopb_tensor_server.config import _read_config_file, redact_config_secrets
-    from biopb_tensor_server.config_schema import build_config_schema
+    from biopb_tensor_server.core.config import _read_config_file, redact_config_secrets
+    from biopb_tensor_server.core.config_schema import build_config_schema
 
     p = Path(ctx.config_path)
     raw: Dict[str, Any] = {}
@@ -1246,13 +1246,13 @@ async def put_config(request: Request) -> JSONResponse:
 
     from jsonschema import Draft202012Validator
 
-    from biopb_tensor_server.config import (
+    from biopb_tensor_server.core.config import (
         _read_config_file,
         restore_redacted_secrets,
         save_config,
         validate_config_dict,
     )
-    from biopb_tensor_server.config_schema import build_config_schema
+    from biopb_tensor_server.core.config_schema import build_config_schema
 
     # The form round-trips redacted secrets back as a sentinel; resolve those
     # from the on-disk config so a save never clobbers a real credential with

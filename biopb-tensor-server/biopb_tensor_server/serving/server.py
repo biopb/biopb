@@ -37,23 +37,23 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
 
-from biopb_tensor_server.activity import ActivityTracker
-from biopb_tensor_server.base import (
+from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
+from biopb_tensor_server.core.activity import ActivityTracker
+from biopb_tensor_server.core.base import (
     SourceAdapter,
     TensorAdapter,
     decode_chunk_id,
     strip_source_prefix,
 )
-from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.chunk import cache_key_for_chunk_id
-from biopb_tensor_server.config import PyramidConfig
-from biopb_tensor_server.errors import (
+from biopb_tensor_server.core.chunk import cache_key_for_chunk_id
+from biopb_tensor_server.core.config import PyramidConfig
+from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
 )
-from biopb_tensor_server.metadata_db import MetadataDatabase, NumpyEncoder
-from biopb_tensor_server.source_registry import SourceRegistry
-from biopb_tensor_server.upload_manager import UploadManager
+from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.core.source_registry import SourceRegistry
+from biopb_tensor_server.serving.upload_manager import UploadManager
 
 logger = logging.getLogger(__name__)
 

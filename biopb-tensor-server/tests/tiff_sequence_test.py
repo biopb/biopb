@@ -27,7 +27,7 @@ from biopb_tensor_server.adapters.tiff import (
     _group_tiff_sequence,
     _looks_like_tiff_sequence,
 )
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 
 def _write_tiff(path: Path, shape=(8, 8), *, seed: int = 0, compression=None):

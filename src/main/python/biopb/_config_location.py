@@ -8,7 +8,7 @@ instead of being mirrored.
 
 Deliberately stdlib-only (``pathlib`` + ``logging``) so importing it is cheap on
 every CLI invocation; it pulls in none of the heavy adapter/discovery machinery
-that ``biopb_tensor_server.config`` does.
+that ``biopb_tensor_server.core.config`` does.
 
 JSON is the *canonical* on-disk format going forward: the config is
 machine-generated (the installer / a future generator write it), and once nobody

@@ -1,6 +1,6 @@
 """JSON Schema for the tensor-server config file, generated from the dataclasses.
 
-The config dataclasses in :mod:`biopb_tensor_server.config` and their
+The config dataclasses in :mod:`biopb_tensor_server.core.config` and their
 ``_CONSTRAINTS`` validation table (the ``_Range`` / ``_Enum`` rules enforced in
 each ``__post_init__``) are the single source of truth for the config. This
 module re-projects them as a JSON Schema (Draft 2020-12) describing the
@@ -28,7 +28,7 @@ import dataclasses
 import typing
 from typing import Any, Dict, Optional, Tuple
 
-from biopb_tensor_server.config import (
+from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
     _SECTION_FOR,
     CacheConfig,
@@ -38,7 +38,7 @@ from biopb_tensor_server.config import (
     ServerConfig,
     SourceConfig,
 )
-from biopb_tensor_server.remote import CredentialProfile
+from biopb_tensor_server.core.remote import CredentialProfile
 
 SCHEMA_ID = "https://biopb.org/schemas/tensor-server-config.json"
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"

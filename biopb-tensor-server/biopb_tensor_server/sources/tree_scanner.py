@@ -19,7 +19,7 @@ from pathlib import Path
 from stat import S_ISDIR
 from typing import Any, Dict, Optional, Set, Tuple
 
-from biopb_tensor_server.discovery import get_file_identity, should_skip_walk_entry
+from biopb_tensor_server.core.discovery import get_file_identity, should_skip_walk_entry
 
 logger = logging.getLogger(__name__)
 

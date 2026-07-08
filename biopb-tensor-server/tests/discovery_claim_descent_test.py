@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.discovery import (
+from biopb_tensor_server.core.discovery import (
     discover_sources,
     walk_with_identity_tracking,
 )

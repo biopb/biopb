@@ -18,7 +18,7 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.discovery import ClaimContext, DiscoveryState
+from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
 
 def _ndtiff_available() -> bool:
@@ -321,7 +321,7 @@ class TestNdTiffCreateFromConfig:
     def test_create_from_local_config(self):
         """Test creating adapter from local SourceConfig."""
         from biopb_tensor_server.adapters.ndtiff import NdTiffAdapter
-        from biopb_tensor_server.config import SourceConfig
+        from biopb_tensor_server.core.config import SourceConfig
 
         with patch("ndtiff.NDTiffDataset") as mock_ndtiff:
             # Mock dataset
