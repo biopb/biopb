@@ -1,6 +1,10 @@
 # Loose-File Groups as Multi-Field Sources (+ a Field-Group Aggregate RPC)
 
-**Status:** Proposed (design). Nothing implemented yet.
+**Status:** Proposed (design). Nothing implemented yet. Two candidate mechanisms
+for the aggregate view are documented: a new [Field-Group Aggregate RPC](#the-field-group-aggregate-rpc-core-protocol-addition)
+and a lighter [virtual aggregate tensor](#alternative-implementation-the-aggregate-as-a-virtual-tensor-no-new-rpc)
+that reuses the existing `GetFlightInfo` path (recommended for the homogeneous
+loose-file case).
 **Component:** `biopb-tensor-server` (adapters, metadata DB, Flight protocol),
 `biopb-mcp` (tensor browser UX), `proto/biopb/tensor` (new request/response
 message).
@@ -193,6 +197,12 @@ extra catalog entry). A **request-time** aggregate is cleaner: the catalog stays
 pure inventory of N as-is fields; the stacked/normalized view is a transient
 projection computed only when asked; nothing extra is stored.
 
+> **A lighter alternative needs no new message at all** — model the aggregate as a
+> *virtual tensor* fetched through the existing `GetFlightInfo`, because the
+> default response shape (a) below is exactly what that verb already returns. It
+> covers the stacked-cube case (facet 2) but not lazy field listing (facet 1); see
+> [Alternative implementation](#alternative-implementation-the-aggregate-as-a-virtual-tensor-no-new-rpc).
+
 ### Request / response
 
 Request (a new CMD proto carried on `get_flight_info`, or a `do_action` type —
@@ -260,6 +270,152 @@ items) as a pure client-side fix.
 Purely additive: a client or server without the new RPC falls back to N×
 `GetFlightInfo`, so nothing breaks during rollout. New proto message → buf regen
 across Python/Java/TS.
+
+## Alternative implementation: the aggregate as a virtual tensor (no new RPC)
+
+The Field-Group Aggregate RPC above is the maximal design. A lighter alternative
+delivers its **default response shape (a)** — one synthesized `(i, Y, X)`
+`TensorDescriptor` **plus chunk endpoints**, with slice/scale hints applied
+uniformly — **without any new proto message**, because that response is *exactly*
+what `GetFlightInfo` already returns and the hints already live on
+`TensorReadOption`. Model the aggregate as a **virtual tensor** fetched through the
+existing read path.
+
+### A reserved field token, not an overloaded `source_id`
+
+Address the aggregate as its own `array_id = source_id/<reserved>` (e.g.
+`source_id/@all`), **not** by overloading `tensor_id == source_id`. The overload is
+already taken: `_field_within_source` (`server.py:389`) maps `tensor_id ==
+source_id` (and empty) to the source's **default/first tensor** (#44). Redefining
+it to "the stacked aggregate" both breaks that back-compat contract and is actively
+hazardous for the *heterogeneous* multi-field sources — an HCS plate or a CZI
+scene-set would try to fuse thousands of incompatible fields, precisely what this
+design says must **not** be stacked.
+
+The reserved token sidesteps all of it:
+
+- `tensor_id == source_id` keeps its #44 first-field meaning — no back-compat break.
+- The aggregate is **virtual**: it is *not* an entry in `tensors[]` / the DuckDB
+  `STRUCT[]` (so `ListFlights` and the catalog stay a pure inventory of N as-is
+  fields — the "nothing extra stored" property is preserved), but
+  `get_tensor_adapter("@all")` synthesizes an aggregate adapter on demand.
+- Every client reads it with code it already has — `client.get_tensor("dir/@all")`
+  — so there is **zero** new client method in Python/Java/TS. (A new RPC needs one
+  per language.)
+- The token must use a byte no field key can produce; filename-derived fields never
+  yield it (`_natural_key` output), and it is documented in the `array_id` spec
+  (below).
+
+### Chunk aliasing is free in the `NONE` tier
+
+Define the aggregate `chunk_id` as **field k's own `chunk_id`**. Then
+`GetFlightInfo` for `dir/@all` merely concatenates each field's endpoints, and
+**`DoGet` needs no aggregate code path at all**: the existing
+`_get_adapter_for_chunk(chunk_id)` routes each chunk straight to its per-field
+adapter, reusing the warm per-field cache and the POSIX-localhost mmap fast path
+(#9). The synthetic aggregate adapter exists only for the duration of endpoint
+enumeration in `GetFlightInfo`. This is the doc's "aggregate `chunk_id` aliases each
+field's chunk" property, obtained for free rather than engineered.
+
+The **normalized** tiers (`DTYPE` / `DTYPE_AND_PAD`) genuinely produce different
+bytes (promoted / padded), so those *do* need a real synthetic read path at `DoGet`
+with their own derived chunk ids. Ship the `NONE` endpoint-aliasing tier first;
+treat normalization as a phase-2 follow-on.
+
+### Scope: this covers facet 2, not facet 1
+
+The RPC secretly bundles two needs; the virtual-tensor form serves only one:
+
+| | What it is | One `GetFlightInfo`? |
+|---|---|---|
+| **Facet 2 — aggregate/stack** | one synthesized `(i, Y, X)` tensor + endpoints (homogeneous cube) | **Yes** — it *is* one tensor, one descriptor, one schema |
+| **Facet 1 — batch / lazy listing** | N *heterogeneous* per-field descriptors in one message; retire the fat `ListFlights` (roadblocks 2/3) | **No** — a `FlightInfo` carries one schema; N differently-shaped descriptors don't fit |
+
+So the virtual tensor **does not retire roadblock (2)** — that is the price of
+avoiding the new message. It is an acceptable cut: the loose-file-group problem is
+*homogeneous*, so facet 2 covers it completely, and lazy field-listing for fat
+*heterogeneous* sources (HCS / scenes, whose O(N) pain already ships) becomes
+separate, later work — and if that ever needs a wire change, that is the place to
+spend one.
+
+### Capability signalling: advertise, don't probe the error channel
+
+"Optimistically request `dir/@all`, catch the error, fall back to View-all" is
+**unsafe today** — the illegal-field path is inconsistent, and its most common
+branch is a silent false-positive:
+
+| Source kind | `get_tensor_adapter("@all")` | Client sees |
+|---|---|---|
+| **Single-tensor** (`ZarrAdapter` / base) | ignores the arg, `return self` | **No error** — returns the base tensor; `descriptor.array_id == "dir"`, not `dir/@all` |
+| **HCS OME-Zarr** | `raise ValueError("Unknown well: @all")` | generic internal error, message-only |
+| **OME-TIFF / bioio scenes** | `_scene_index_for_field` → `raise ValueError("Unknown scene")` | generic internal error, message-only |
+| Missing **source** | `_get_adapter_for_tensor` → `None` | clean `FlightServerError("Tensor not found")` (`server.py:1106`) |
+
+The only reliably catchable error (`FlightServerError("Tensor not found")`) is the
+path a *field* miss almost never takes; the single-tensor case doesn't error at
+all. So capability must be a **positive signal**, two ways:
+
+- **Option A — harden the not-found path, then ride it.** Add an aggregate
+  chokepoint in `get_flight_info` *before* `_field_within_source`: `field ==
+  RESERVED_TOKEN` → `source_adapter.get_aggregate_adapter()`, returning `None` when
+  unsupported → the existing `FlightServerError("Tensor not found")`. No proto
+  change, but it still distinguishes "no aggregate" from other failures by
+  message-matching, and it forces fixing the single-tensor silent-self and the
+  HCS/scene raw-`ValueError` leaks so a stray `@all` can't slip through — delicate
+  against the #44 rules (which intentionally let source_id / bare / empty resolve to
+  the default tensor; only a genuinely unknown *nonempty* field should 404, and
+  nothing enforces that today).
+- **Option B (recommended) — capability bit.** Add `supports_aggregate` (bool) to
+  `DataSourceDescriptor`, set by a group adapter that can stack, carried on the
+  `ListFlights` / `GetFlightInfo` the client already fetches. The browser enables
+  "View all stacked" only when set; the agent reads it via `query_sources`. The
+  client never sends a doomed `@all`, so the fragile error semantics never enter the
+  picture. Cost: one additive proto *field* (minor buf-regen) — far less than a new
+  message, and a clean positive signal instead of inferring capability from whether
+  an error came back.
+
+  Two richer variants were considered and rejected. **Listing the aggregate as an
+  `@all` entry in `tensors[]`** is self-describing (carries the `(N, Y, X)` shape)
+  but pollutes the member list: `tensors[]` means "the real, independently-
+  addressable members" everywhere it is consumed (DuckDB `STRUCT[]`, the agent's
+  `UNNEST(tensors)` / `len(tensors)`, the browser's per-field children, "add all as
+  separate layers"), so a folded-over projection sitting among them forces every
+  reader to know and *filter* the reserved token — a silent-if-forgotten
+  over-count, exactly the failure class of #378. **A separate self-describing
+  `aggregate` `TensorDescriptor` field** avoids that pollution but must compute the
+  aggregate descriptor at *list* time and hands readers another descriptor-shaped
+  thing to reason about. The **bool** carries the one bit that discovery needs
+  ("this source can stack"), pollutes nothing, and is ignorable by any consumer
+  that does not care; the aggregate's shape is one `GetFlightInfo` on `<src>/@all`
+  away — on the exact path the client was about to take anyway.
+
+### Identity-spec note
+
+The reserved token is a new clause in the `array_id` policy
+(`proto/biopb/tensor/descriptor.proto`, top-of-file block) — **not** a proto
+*message* change, but a policy addition: "`source_id/<reserved>` names a
+**transient aggregate projection**, not a stored field." It must be written there
+for the same reason the first-`/` source boundary rule is.
+
+### How the two approaches compare
+
+| | Field-Group Aggregate RPC | Virtual aggregate tensor |
+|---|---|---|
+| New proto **message** | yes (`FieldGroupInfoRequest` + response) | no |
+| New per-language client method | yes (Python / Java / TS) | no — reuses `get_tensor` |
+| Proto change | new message | one additive descriptor field (Option B) or none (Option A) |
+| Facet 2 (stacked cube) | yes | yes |
+| Facet 1 (lazy listing of N heterogeneous fields) | yes | **no** — stays future work |
+| Subset selection (`fields=[…]`) | yes | no — agent does `N reads + da.stack` |
+| Explicit `NormalizePolicy` on the wire | yes | encoded in token / adapter-decided |
+| Chunk aliasing (`NONE`) | must be engineered | falls out of per-field `chunk_id` |
+| Capability signalling | in the request/response | needs the `supports_aggregate` bit |
+
+**Recommendation:** if the immediate goal is the loose-file-group cube, prefer the
+**virtual aggregate tensor with the `supports_aggregate` bit** (facet 2, `NONE`
+tier first) — it is the smaller, lower-coupling change and needs no new message or
+client code. Adopt the full RPC only when facet 1 (lazy listing of fat
+*heterogeneous* sources) becomes the driving requirement.
 
 ## Cross-adapter impact: two orthogonal concerns
 
@@ -339,19 +495,40 @@ is opt-in for the homogeneous case.
 
 ## What changes, by component
 
-- **`biopb-tensor-server`**
-  - `adapters/tiff.py`, `adapters/dicom.py`: demote to multi-field group
-    adapters — enumerate + order + assign stable filename-derived `array_id`s +
-    emit N field `TensorDescriptor`s; drop single-tensor stacking and the
-    `_looks_like_tiff_sequence` gate; simplify the claim to a count/extension test.
-  - `server.py`: handle the Field-Group Aggregate request (endpoints for all
-    fields / a synthesized aggregate tensor); optional server-side normalization.
-  - `metadata_db.py`: optionally summarize fat sources in `list_source_descriptors`
-    (lazy field listing).
+The demotion of the loose-file adapters is common to both plans; the two differ
+only in **how the aggregate view is served** (RPC vs virtual tensor).
+
+**Common to both plans:**
+
+- **`biopb-tensor-server`** — `adapters/tiff.py`, `adapters/dicom.py`: demote to
+  multi-field group adapters — enumerate + order + assign stable filename-derived
+  `array_id`s + emit N field `TensorDescriptor`s; drop single-tensor stacking and
+  the `_looks_like_tiff_sequence` gate; simplify the claim to a count/extension
+  test.
+- **`biopb-mcp`** — "View all stacked" action; lazy browser child population;
+  guide/resource note documenting the group-source idiom for agents.
+
+**Plan 1 — Field-Group Aggregate RPC:**
+
+- `server.py`: handle the aggregate request (endpoints for all fields / a
+  synthesized aggregate tensor); optional server-side normalization.
+- `metadata_db.py`: optionally summarize fat sources in `list_source_descriptors`
+  (lazy field listing, facet 1).
 - **`proto/biopb/tensor`**: `FieldGroupInfoRequest` / response message.
-- **`biopb-mcp`**: "View all stacked" action; lazy browser child population;
-  client method wrapping the aggregate RPC; guide/resource note documenting the
-  group-source idiom for agents.
+- **`biopb-mcp`**: client method wrapping the aggregate RPC.
+
+**Plan 2 — virtual aggregate tensor (recommended for the homogeneous case):**
+
+- `server.py`: a reserved-token dispatch in `get_flight_info` *before*
+  `_field_within_source` → `source_adapter.get_aggregate_adapter()` synthesizing the
+  aggregate descriptor + endpoints (aliasing each field's `chunk_id` in the `NONE`
+  tier, so `DoGet` is untouched); `None` when unsupported.
+- **`proto/biopb/tensor`**: one additive `DataSourceDescriptor.supports_aggregate`
+  bool (Option B) — no new message; plus the reserved-token clause in the `array_id`
+  spec comment.
+- **`biopb-mcp`**: no new client method — "View all stacked" reads
+  `supports_aggregate` and calls the existing `client.get_tensor("<source>/@all")`.
+  Facet 1 (lazy listing) is **not** addressed by this plan.
 
 ## Open questions / non-goals
 
