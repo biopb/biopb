@@ -256,6 +256,19 @@ _STRIP_PER_PLANE = re.compile(
 )
 
 
+# Some Micro-Manager MMStacks emit a degenerate self-closing `<BinData BigEndian=
+# "true"/>` -- a BinData with no `Length` attribute and no inline content. It
+# carries no catalog data (it is a placeholder), but ome-types/pydantic rejects it
+# ("length Field required"), so `from_xml` raises and the whole fast path returns
+# None -> `get_metadata` yields `{}` for these files (biopb/biopb#199). Dropping
+# the empty placeholder lets `from_xml` succeed and produce the real structural
+# dict. Matched self-closing ONLY (the `/>` anchor): a genuine inline-pixels
+# BinData is always the open form `<BinData Length="N">...</BinData>`, never
+# self-closing, so it is left untouched. `[^>]` bounds the attribute scan to the
+# tag (an XML attribute value can't contain a raw `>`).
+_STRIP_SELF_CLOSING_BINDATA = re.compile(r"<(?:\w+:)?BinData\b[^>]*?/>")
+
+
 def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
     """Build the OME metadata dict cheaply by stripping per-plane elements first.
 
@@ -270,6 +283,7 @@ def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
         from ome_types import from_xml
 
         reduced = _STRIP_PER_PLANE.sub("", ome_xml)
+        reduced = _STRIP_SELF_CLOSING_BINDATA.sub("", reduced)
         ome = from_xml(reduced)
         if hasattr(ome, "model_dump"):
             return ome.model_dump(mode="json")
