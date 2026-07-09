@@ -11,7 +11,10 @@ description = "BioPB Tensor Arrow Flight server for multi-dimensional array stor
 readme = "README.md"
 license = "MIT"
 dependencies = [
-  "biopb",
+  # Floor: the cache ProcessLock imports biopb._proc (process identity primitive),
+  # first shipped in biopb 0.7.0. The uv workspace already pairs versions from the
+  # tree, so this floor is documentation for any non-workspace install path.
+  "biopb >= 0.7.0",
   "pyarrow >= 14.0.0",
   "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
   "dask[array] >= 2024.0.0",
