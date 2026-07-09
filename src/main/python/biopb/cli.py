@@ -1626,7 +1626,15 @@ def mcp_status(
         table_rows=[
             ("Port", str(port)),
             ("MCP", _mcp_url(port)),
-            ("Listening", "yes" if listening else "no (not bound yet?)"),
+            # `running` (process alive) but not listening is ambiguous: still
+            # starting, or the /mcp transport died under it (biopb/biopb#383).
+            # Don't assert "not bound yet" -- point at the recovery either way.
+            (
+                "Listening",
+                "yes"
+                if listening
+                else "no (starting up, or transport died -- try 'biopb mcp restart')",
+            ),
         ],
     )
 
