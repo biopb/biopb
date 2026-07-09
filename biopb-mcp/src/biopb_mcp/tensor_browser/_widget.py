@@ -1000,6 +1000,13 @@ class TensorBrowserWidget(QWidget):
         _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
+        # Column 0 stretches to the viewport and row text elides (ElideRight is
+        # the QTreeView default), so a horizontal scrollbar is never needed. Pin
+        # it off: left ScrollBarAsNeeded, its show/hide toggles as the widest
+        # row's text crosses the viewport width, and on non-overlay-scrollbar
+        # platforms (Windows) the bar steals viewport height -- shifting every
+        # row vertically on an otherwise-unchanged refresh (biopb/biopb#367).
+        self._tree_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)
@@ -1604,6 +1611,9 @@ class TensorBrowserWidget(QWidget):
 
         if node.node_type == "folder":
             item.setText(0, node.name)
+            # The horizontal scrollbar is pinned off (biopb/biopb#367), so a long
+            # or deeply-indented label that elides is only readable on hover.
+            item.setToolTip(0, node.name)
             for child in node.children:
                 self._add_tree_node(item, child)
         else:
@@ -1621,17 +1631,25 @@ class TensorBrowserWidget(QWidget):
 
             # Residency indicator: flag non-resident (remote/dehydrated) sources
             # with a leading cloud glyph and greyed text; resident sources stay
-            # plain. Both known states get an explanatory tooltip; an unknown
-            # state (old server) is left unmarked.
+            # plain. Both known states get an explanatory note; an unknown state
+            # (old server) is left unmarked.
             residency = _residency_state(src)
+            residency_note = None
             if residency == "remote":
                 display_name = f"{_RESIDENCY_GLYPH} {display_name}"
                 item.setForeground(0, QColor("#888"))
-                item.setToolTip(0, _REMOTE_TOOLTIP)
+                residency_note = _REMOTE_TOOLTIP
             elif residency == "resident":
-                item.setToolTip(0, _RESIDENT_TOOLTIP)
+                residency_note = _RESIDENT_TOOLTIP
 
             item.setText(0, display_name)
+            # The horizontal scrollbar is pinned off (biopb/biopb#367), so the
+            # full label -- which elides when it outgrows the panel -- is only
+            # readable on hover; carry the residency note on a second line.
+            item.setToolTip(
+                0,
+                f"{display_name}\n{residency_note}" if residency_note else display_name,
+            )
 
             # Add nested tensor items for multi-tensor sources
             if len(src.tensors) > 1:
