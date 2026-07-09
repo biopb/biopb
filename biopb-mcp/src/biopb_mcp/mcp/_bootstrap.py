@@ -373,15 +373,15 @@ def _bootstrap_impl():
     #    napari.Viewer(). enable_gui("qt") is cheap (~0.1 s) and needs none of
     #    those deps, so popping the splash here covers the *whole* slow stretch;
     #    showing it after the imports (as before) left several seconds of blank
-    #    screen the splash was meant to hide (issue #386). Best-effort:
-    #    _NullSplash when the splash is off or Qt is unavailable.
+    #    screen the splash was meant to hide (issue #386). Best-effort: show_splash
+    #    fails open to _NullSplash when Qt is unavailable, and the headless branch
+    #    (no Qt loop) keeps the _NullSplash default below.
     from ._splash import _NullSplash, show_splash
 
     splash = _NullSplash()  # replaced below when a real one can be shown
     if not headless:
         ip.enable_gui("qt")
-        if get_setting(config, "mcp.viewer.splash"):
-            splash = show_splash()
+        splash = show_splash()
 
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
