@@ -571,6 +571,9 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert item.text(0).startswith(_RESIDENCY_GLYPH)
         assert "Not resident" in item.toolTip(0)
+        # The full label rides in the tooltip too, so an elided long name is
+        # still readable on hover (biopb/biopb#367).
+        assert item.text(0) in item.toolTip(0)
         assert item.foreground(0).color().name() == "#888888"
 
     def test_resident_source_unmarked_with_tooltip(self, widget):
@@ -581,6 +584,7 @@ class TestResidencyIndicator:
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
         assert "Resident" in item.toolTip(0)
+        assert item.text(0) in item.toolTip(0)
 
     def test_unknown_residency_has_no_indicator(self, widget):
         from biopb_mcp.tensor_browser._widget import _RESIDENCY_GLYPH
@@ -589,7 +593,10 @@ class TestResidencyIndicator:
         w._add_tree_node(w._tree_widget, self._node(None))
         item = w._tree_widget.topLevelItem(0)
         assert _RESIDENCY_GLYPH not in item.text(0)
-        assert item.toolTip(0) == ""
+        # The row still carries a full-label tooltip (biopb/biopb#367), but with
+        # no residency note appended for an unknown state.
+        assert item.toolTip(0) == item.text(0)
+        assert "resident" not in item.toolTip(0).lower()
 
 
 class TestRemoveButton:
