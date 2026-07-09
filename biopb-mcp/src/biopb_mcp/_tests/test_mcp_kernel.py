@@ -1120,21 +1120,21 @@ class TestTokenReportPipe:
             host.shutdown()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object wiring (#403)")
 class TestWindowsJobObjectWiring:
     """KernelHost's kill-on-close Job Object wiring (biopb/biopb#403).
 
-    The Win32 calls live in _winjob (exercised for real on Windows CI by
-    TestWinJobReal); here we fake that module and force os.name == 'nt' so the
-    wiring itself is pinned on every platform: create the job once, assign each
-    launched kernel to it, tree-kill on teardown, and drop the handle only on
-    the terminal shutdown() path (a restart must reuse it).
+    Windows-only: the wired branches gate on os.name == 'nt', and faking that
+    globally is unsafe (pathlib picks WindowsPath, which cannot be instantiated
+    off Windows). So these run for real on the Windows CI runner and only fake
+    _winjob -- pinning the KernelHost orchestration (create the job once, assign
+    each launched kernel to it, tree-kill on teardown, and drop the handle only
+    on the terminal shutdown() path) without invoking the actual Win32 calls
+    (those are covered end-to-end by TestWinJobReal).
     """
 
     def _host(self, monkeypatch, fake):
-        # Construct as POSIX (benign), then force the nt-guarded branches on and
-        # swap in the fake _winjob so no real Win32 call is made.
         host = KernelHost(health_probe_code=None)
-        monkeypatch.setattr(_kernel.os, "name", "nt")
         monkeypatch.setattr(_kernel, "_winjob", fake)
         return host
 
