@@ -16,6 +16,7 @@ These tests lock the two things that make that safe:
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.ome_tiff import (
+    _STRIP_EMPTY_BINDATA,
     _STRIP_PER_PLANE,
     OmeTiffAdapter,
     _fast_ome_metadata,
@@ -491,6 +492,73 @@ class TestStripPerPlane:
         px = md["images"][0]["pixels"]
         assert px["tiff_data_blocks"] == []
         assert [c["name"] for c in px["channels"]] == ["DAPI"]
+
+
+class TestStripEmptyBinData:
+    """A degenerate empty `<BinData>` (no Length, no content) that some
+    Micro-Manager MMStacks emit -- in either the self-closing `<BinData/>` or the
+    open-but-empty `<BinData></BinData>` form -- must be stripped before ome-types
+    parsing, while a genuine inline-pixels `<BinData Length=..>..</BinData>` is
+    preserved (biopb/biopb#199).
+    """
+
+    def test_strips_self_closing_bindata(self):
+        xml = '<Pixels><BinData BigEndian="true"/><Channel ID="c0"/></Pixels>'
+        assert (
+            _STRIP_EMPTY_BINDATA.sub("", xml) == '<Pixels><Channel ID="c0"/></Pixels>'
+        )
+
+    def test_strips_open_empty_bindata(self):
+        # Open-but-empty form (no Length, whitespace-only body): also rejected by
+        # ome-types and carries nothing, so it is stripped too. The `\s*` body
+        # match stays linear -- it never scans to a distant `</BinData>`.
+        for body in ("", "\n    ", "  \t "):
+            xml = f'<Pixels><BinData BigEndian="true">{body}</BinData><Channel ID="c0"/></Pixels>'
+            assert (
+                _STRIP_EMPTY_BINDATA.sub("", xml)
+                == '<Pixels><Channel ID="c0"/></Pixels>'
+            ), repr(body)
+
+    def test_strips_namespaced_self_closing_bindata(self):
+        xml = '<Pixels><ns:BinData BigEndian="true"/><ns:Channel ID="c0"/></Pixels>'
+        assert (
+            _STRIP_EMPTY_BINDATA.sub("", xml)
+            == '<Pixels><ns:Channel ID="c0"/></Pixels>'
+        )
+
+    def test_preserves_inline_bindata_with_content(self):
+        # Open form carrying real pixels: has a non-whitespace body, so the
+        # empty-body (`>\s*</BinData>`) branch can't match -> never touched.
+        xml = (
+            '<Pixels><BinData Length="4" Compression="none">AAECAw==</BinData></Pixels>'
+        )
+        assert _STRIP_EMPTY_BINDATA.sub("", xml) == xml
+
+    def test_does_not_strip_lookalike_element(self):
+        # \b after the name must not let a longer element name match.
+        xml = '<Pixels><BinDataset Foo="1"/><Channel ID="c0"/></Pixels>'
+        assert _STRIP_EMPTY_BINDATA.sub("", xml) == xml
+
+    def test_fast_metadata_recovers_from_degenerate_bindata(self):
+        # End-to-end: the degenerate `<BinData/>` made ome-types raise ("length
+        # Field required") so the fast path returned None and get_metadata yielded
+        # {}. Stripping it lets from_xml succeed and produce the real structure.
+        ome = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Image ID="Image:0" Name="cell1"><Pixels ID="Pixels:0" '
+            'DimensionOrder="XYCZT" Type="uint16" SizeX="512" SizeY="512" '
+            'SizeC="1" SizeZ="1" SizeT="10">'
+            '<Channel ID="Channel:0:0" SamplesPerPixel="1"/>'
+            '<BinData xmlns="http://www.openmicroscopy.org/Schemas/BinaryFile/2016-06" '
+            'BigEndian="true"/>'
+            '<TiffData IFD="0" PlaneCount="10"/>'
+            "</Pixels></Image></OME>"
+        )
+        md = _fast_ome_metadata(ome)
+        assert md is not None
+        px = md["images"][0]["pixels"]
+        assert px["size_t"] == 10
+        assert [c["name"] for c in px["channels"]] == [None]  # channel has no Name
 
 
 class TestFastMetadata:
