@@ -14,6 +14,7 @@ from biopb_tensor_server.core.config import (
     CANONICAL_CONFIG_NAME,
     LEGACY_CONFIG_NAME,
     find_config,
+    generate_source_id,
     load_config,
     parse_config,
 )
@@ -32,7 +33,6 @@ max_bytes = 123456789
 [[sources]]
 type = "zarr"
 url = "/data/a.zarr"
-source_id = "a"
 dim_labels = ["z", "y", "x"]
 """
 
@@ -43,7 +43,6 @@ _JSON = {
         {
             "type": "zarr",
             "url": "/data/a.zarr",
-            "source_id": "a",
             "dim_labels": ["z", "y", "x"],
         }
     ],
@@ -58,7 +57,8 @@ def _assert_expected(cfg):
     assert len(cfg.sources) == 1
     src = cfg.sources[0]
     assert src.type == "zarr"
-    assert src.source_id == "a"
+    # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
+    assert src.source_id == generate_source_id("/data/a.zarr", "zarr")
     assert src.dim_labels == ["z", "y", "x"]
 
 
@@ -193,3 +193,29 @@ def test_metadata_db_absent_does_not_warn(caplog):
         cfg = parse_config({})
     assert cfg.metadata_db is not None
     assert not any("metadata_db.enabled" in r.message for r in caplog.records)
+
+
+# --- sources.source_id deprecation (biopb/biopb#308) -------------------------
+
+
+def test_explicit_source_id_is_ignored_and_warns(caplog):
+    """An explicit `source_id` no longer overrides the URL-derived id: honoring
+    it let two configs aim the same bytes at two catalog rows (biopb/biopb#308).
+    It is dropped with a warning, and the id falls back to the URL hash."""
+    with caplog.at_level(logging.WARNING):
+        cfg = parse_config(
+            {"sources": [{"type": "zarr", "url": "/data/a.zarr", "source_id": "a"}]}
+        )
+    (src,) = cfg.sources
+    assert src.source_id == generate_source_id("/data/a.zarr", "zarr")
+    assert src.source_id != "a"
+    msgs = [r.message for r in caplog.records if "sources.source_id" in r.message]
+    assert msgs and any("#308" in m for m in msgs)
+
+
+def test_source_id_absent_does_not_warn(caplog):
+    """A config that never sets `source_id` stays silent."""
+    with caplog.at_level(logging.WARNING):
+        cfg = parse_config({"sources": [{"type": "zarr", "url": "/data/a.zarr"}]})
+    assert cfg.sources[0].source_id == generate_source_id("/data/a.zarr", "zarr")
+    assert not any("sources.source_id" in r.message for r in caplog.records)

@@ -197,7 +197,6 @@ backend = "memory"
 [[sources]]
 type = "zarr"
 url = "/data/a.zarr"
-source_id = "a"
 dim_labels = ["z", "y", "x"]
 ```
 
@@ -211,7 +210,6 @@ JSON (canonical):
     {
       "type": "zarr",
       "url": "/data/a.zarr",
-      "source_id": "a",
       "dim_labels": ["z", "y", "x"]
     }
   ]

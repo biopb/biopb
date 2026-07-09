@@ -14,7 +14,7 @@ port = 8815
 [[sources]]
 type = "zarr"
 url = "/data/images.zarr"
-source_id = "my-image"
+alias = "my-image"  # friendly display name (source_id is derived from the URL)
 dim_labels = ["z", "y", "x"]
 
 [[sources]]
@@ -306,7 +306,12 @@ class SourceConfig:
         type: Storage type - "zarr", "hdf5", "ome-tiff", "ome-tiff-multifile", "ome-zarr", "ome-zarr-hcs",
               "aics", or "tensor-server" (experimental; an upstream biopb tensor server, fronted as a caching proxy).
               Optional - auto-detected if None (local files, or a grpc:// endpoint -> "tensor-server").
-        source_id: Unique identifier for the data source (auto-generated from URL if None)
+        source_id: Derived identity for the data source -- computed from the
+             resolved URL (or set internally by the tensor-server proxy). NOT a
+             user-facing config key: an explicit ``source_id`` in config is
+             deprecated and ignored (biopb/biopb#308), because a user-chosen id
+             lets the same bytes map to two catalog rows. Use ``alias`` for a
+             friendly display name.
         dim_labels: Dimension labels (optional, applies to all tensors in source)
         dataset: HDF5 dataset path (required for HDF5 type)
         monitor: Enable live filesystem monitoring for this source (local directories only)
@@ -1124,7 +1129,19 @@ def parse_config(data: Dict[str, Any]) -> ServerConfig:
 
         src_kwargs: Dict[str, Any] = {"url": url}
         _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
-        _carry(src_kwargs, "source_id", src_data)  # auto-generated when omitted
+        # `source_id` is derived from the resolved URL (a stable content
+        # identity), never user-assigned. Honoring an explicit id let two configs
+        # aim the same bytes at two ids -> duplicate catalog rows for one source
+        # (biopb/biopb#308). It is ignored with a warning; `alias` is the way to
+        # give a source a friendly display name (source_url is the user-facing
+        # text).
+        if "source_id" in src_data:
+            logger.warning(
+                "Config key `sources.source_id` is deprecated and ignored: a "
+                "source's id is derived from its resolved URL so the same data "
+                "always maps to one catalog entry (dropping explicit ids closes "
+                "biopb/biopb#308). Use `alias` to give the source a display name."
+            )
         _carry(src_kwargs, "dim_labels", src_data)
         _carry(src_kwargs, "dataset", src_data)
         _carry(src_kwargs, "monitor", src_data)

@@ -155,7 +155,6 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
                     {
                         "type": "zarr",
                         "url": zarr_path,
-                        "source_id": "z",
                         "dim_labels": ["y", "x"],
                     }
                 ],
