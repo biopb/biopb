@@ -1000,6 +1000,13 @@ class TensorBrowserWidget(QWidget):
         _header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree_widget.setExpandsOnDoubleClick(False)
         self._tree_widget.setIndentation(12)
+        # Column 0 stretches to the viewport and row text elides (ElideRight is
+        # the QTreeView default), so a horizontal scrollbar is never needed. Pin
+        # it off: left ScrollBarAsNeeded, its show/hide toggles as the widest
+        # row's text crosses the viewport width, and on non-overlay-scrollbar
+        # platforms (Windows) the bar steals viewport height -- shifting every
+        # row vertically on an otherwise-unchanged refresh (biopb/biopb#367).
+        self._tree_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree_widget.customContextMenuRequested.connect(self._show_context_menu)
         self._tree_widget.itemClicked.connect(self._on_tree_item_clicked)

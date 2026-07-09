@@ -210,6 +210,18 @@ def _connected_with(conn, sources, *, use_server_query=False):
     conn.auto_connect.side_effect = _side_effect
 
 
+class TestTreeLayoutStability:
+    """The tree pins its horizontal scrollbar off so a content-width change on
+    an otherwise-unchanged refresh can't toggle the bar and shift rows
+    vertically on non-overlay-scrollbar platforms (biopb/biopb#367)."""
+
+    def test_horizontal_scrollbar_pinned_off(self, widget):
+        from qtpy.QtCore import Qt
+
+        w, _, _ = widget
+        assert w._tree_widget.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+
+
 class TestConnect:
     def test_shows_connecting_then_builds_tree(self, widget):
         w, conn, workers = widget
