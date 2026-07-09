@@ -1,13 +1,16 @@
 """Unit tests for `biopb quick-start` -- the opt-in Windows Defender exclusion
 (issue #384).
 
+The exclusion covers every tree the interpreter reads at startup: the uv tool env
+(`sys.prefix`, heavy deps) AND its base Python (`sys.base_prefix`, stdlib .pyd +
+pythonXY.dll), deduped and runtime-resolved -- both trees, in one elevated session.
+
 OS calls (PowerShell, elevation) are mocked so the tests are deterministic on any
 platform; the platform gate is driven by patching `cli._is_windows` rather than
 the global `os.name` (which pathlib reads to choose WindowsPath/PosixPath, so
 mutating it would break every `Path(...)` in the process on POSIX).
 """
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
@@ -66,20 +69,51 @@ class TestQuickStartDispatch:
         assert qs.hidden == (not cli._is_windows())
 
 
+class TestDefenderTargets:
+    """`_defender_targets()` returns every startup-read tree, deduped, resolved."""
+
+    def test_two_trees_for_a_uv_tool_venv(self, monkeypatch, tmp_path):
+        # A uv tool venv: sys.prefix (deps) differs from sys.base_prefix (stdlib).
+        env = tmp_path / "toolenv"
+        base = tmp_path / "basepy"
+        env.mkdir()
+        base.mkdir()
+        monkeypatch.setattr(cli.sys, "prefix", str(env))
+        monkeypatch.setattr(cli.sys, "base_prefix", str(base))
+        got = cli._defender_targets()
+        assert set(got) == {str(env.resolve()), str(base.resolve())}
+        assert got == sorted(got)  # deterministic order (elevate/status agree)
+
+    def test_dedups_when_prefix_equals_base(self, monkeypatch, tmp_path):
+        # A plain (non-venv) install: the two coincide -> a single exclusion.
+        monkeypatch.setattr(cli.sys, "prefix", str(tmp_path))
+        monkeypatch.setattr(cli.sys, "base_prefix", str(tmp_path))
+        assert cli._defender_targets() == [str(tmp_path.resolve())]
+
+
 class TestDefenderExclusion:
-    _VENV = Path(r"C:\Users\lab\.local\share\uv\tools\biopb")
+    # Two distinct trees, as on a real uv tool install (tool env + base Python).
+    _TARGETS = [
+        r"C:\Users\lab\AppData\Local\uv\tools\biopb",
+        r"C:\Users\lab\AppData\Local\Programs\Python\Python310",
+    ]
 
     def test_add_snippet_is_wellformed(self):
         captured = {}
         with patch.object(
             cli, "_run_elevated_ps", side_effect=lambda s: captured.update(s=s) or 0
         ):
-            cli._defender_exclusion(self._VENV, add=True)
+            cli._defender_exclusion(self._TARGETS, add=True)
         snip = captured["s"]
         assert "Add-MpPreference -ExclusionPath $p" in snip
-        assert "$p = 'C:\\Users\\lab\\.local\\share\\uv\\tools\\biopb'" in snip
+        # BOTH trees land in one array -> one elevated session, one UAC prompt.
+        assert (
+            r"$paths = @('C:\Users\lab\AppData\Local\uv\tools\biopb', "
+            r"'C:\Users\lab\AppData\Local\Programs\Python\Python310')"
+        ) in snip
         # Literal PowerShell braces survive (no f-string brace-escape leakage).
-        assert "if ($present) { exit 0 } else { exit 3 }" in snip
+        assert "foreach ($p in $paths) {" in snip
+        assert "if (-not ($excl -contains $p)) {" in snip  # add -> must be present
         assert "{{" not in snip and "}}" not in snip
 
     def test_remove_snippet_inverts_the_check(self):
@@ -87,10 +121,10 @@ class TestDefenderExclusion:
         with patch.object(
             cli, "_run_elevated_ps", side_effect=lambda s: captured.update(s=s) or 0
         ):
-            cli._defender_exclusion(self._VENV, add=False)
+            cli._defender_exclusion(self._TARGETS, add=False)
         snip = captured["s"]
         assert "Remove-MpPreference -ExclusionPath $p" in snip
-        assert "if (-not $present) { exit 0 } else { exit 3 }" in snip
+        assert "if (($excl -contains $p)) {" in snip  # remove -> must be absent
 
     @pytest.mark.parametrize(
         "rc,exit_code,needle",
@@ -105,10 +139,10 @@ class TestDefenderExclusion:
     def test_result_code_mapping(self, rc, exit_code, needle, capsys):
         with patch.object(cli, "_run_elevated_ps", return_value=rc):
             if exit_code == 0:
-                cli._defender_exclusion(self._VENV, add=True)  # no raise
+                cli._defender_exclusion(self._TARGETS, add=True)  # no raise
             else:
                 with pytest.raises(cli.typer.Exit) as ei:
-                    cli._defender_exclusion(self._VENV, add=True)
+                    cli._defender_exclusion(self._TARGETS, add=True)
                 assert ei.value.exit_code == exit_code
         # Also assert the user-facing message, not just the exit code. Collapse
         # Rich's soft-wrapping so a needle isn't split across wrapped lines.
@@ -117,13 +151,13 @@ class TestDefenderExclusion:
 
     def test_single_quote_in_path_is_escaped(self):
         captured = {}
-        weird = Path(r"C:\Users\o'brien\biopb")
+        weird = [r"C:\Users\o'brien\biopb"]
         with patch.object(
             cli, "_run_elevated_ps", side_effect=lambda s: captured.update(s=s) or 0
         ):
             cli._defender_exclusion(weird, add=True)
         # ' -> '' so the PowerShell single-quoted string stays intact.
-        assert "$p = 'C:\\Users\\o''brien\\biopb'" in captured["s"]
+        assert r"@('C:\Users\o''brien\biopb')" in captured["s"]
 
 
 class TestRunElevatedPs:
@@ -153,24 +187,28 @@ class TestRunElevatedPs:
 
 
 class TestDefenderStatus:
-    _VENV = Path(r"C:\Users\lab\biopb")
+    _TARGETS = [r"C:\Users\lab\biopb", r"C:\Users\lab\py"]
 
     @pytest.mark.parametrize(
         "stdout,needle",
         [
             ("ON", "is enabled"),
             ("OFF", "not set"),
+            # PARTIAL: e.g. after upgrading from the single-path version, where
+            # only sys.prefix was excluded and sys.base_prefix wasn't.
+            ("PARTIAL", "partially set"),
             ("UNKNOWN", "Could not read"),
         ],
     )
     def test_status_messages(self, stdout, needle, capsys):
         with patch.object(cli.subprocess, "run") as run:
             run.return_value = MagicMock(stdout=stdout + "\n")
-            cli._defender_status(self._VENV)
-        out = capsys.readouterr().out
+            cli._defender_status(self._TARGETS)
+        # Collapse Rich's soft-wrapping so a needle isn't split across lines.
+        out = " ".join(capsys.readouterr().out.split())
         assert needle in out
 
     def test_status_swallows_subprocess_error(self, capsys):
         with patch.object(cli.subprocess, "run", side_effect=OSError("boom")):
-            cli._defender_status(self._VENV)  # no raise
+            cli._defender_status(self._TARGETS)  # no raise
         assert "Could not read" in capsys.readouterr().out

@@ -1664,9 +1664,11 @@ app.add_typer(mcp_app, name="mcp")
 # ---------------------------------------------------------------------------
 # Windows Defender real-time scanning of biopb's DLLs / .pyd / .pyc on every
 # launch is the single largest first-start tax on Windows (see #384). Excluding
-# the install dir from scanning removes it. This is the *privileged* half of
-# #384 -- it needs admin -- so it lives here as an opt-in command, separate from
-# the admin-free bytecode precompile the installer already does for everyone.
+# the install trees from scanning removes it -- both the uv tool env (deps) and
+# the base Python it runs on (stdlib .pyd + pythonXY.dll), which are separate
+# directories for a uv tool venv. This is the *privileged* half of #384 -- it
+# needs admin -- so it lives here as an opt-in command, separate from the
+# admin-free bytecode precompile the installer already does for everyone.
 
 
 def _is_windows() -> bool:
@@ -1680,14 +1682,32 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _defender_venv_path() -> Path:
-    """The biopb install dir to exclude -- this interpreter's venv (`sys.prefix`).
+def _defender_targets() -> List[str]:
+    """The install trees to exclude -- every tree this interpreter reads at startup.
 
-    `sys.prefix` is the shared uv tool venv holding biopb, the tensor server, and
-    biopb-mcp, so one folder exclusion covers every biopb process' DLL/.pyd/.pyc
-    loads. Resolved at runtime, never hardcoded.
+    A uv tool venv is a venv pointing at a *separate* base Python, so two distinct
+    trees get read + Defender-scanned on every launch (verified against a real
+    installer-based install, #384):
+
+    * ``sys.prefix``      -- the tool env's ``Lib\\site-packages`` (numpy / PyQt6 /
+      grpcio / scipy / ... -- the heavy deps; ``Qt6\\bin`` alone is ~100 MB of DLLs).
+      It's ~half ``.pyd`` and ~half ``.dll``, so we exclude the *directory*, not
+      ``*.pyd``.
+    * ``sys.base_prefix`` -- the base interpreter + stdlib ``.pyd`` (``_ssl``,
+      ``_socket``, ``_ctypes``, ...) + ``pythonXY.dll``, loaded on every start.
+
+    They differ for a uv tool venv and coincide for a plain (non-venv) install, so
+    we dedup. Both come from the *running interpreter* -- never hardcode the uv
+    path, because the base Python can live outside ``%LOCALAPPDATA%\\uv`` entirely
+    (the installer's ``--python`` may pick a pre-existing interpreter). Sorted so
+    the elevated snippet and the status read agree on order.
     """
-    return Path(sys.prefix)
+    return sorted({str(Path(p).resolve()) for p in (sys.prefix, sys.base_prefix)})
+
+
+def _ps_string_array(paths: List[str]) -> str:
+    """A PowerShell array literal of single-quote-safe path strings (`'a', 'b'`)."""
+    return ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
 
 
 def _run_elevated_ps(inner: str) -> int:
@@ -1728,39 +1748,47 @@ def _run_elevated_ps(inner: str) -> int:
             pass
 
 
-def _defender_exclusion(venv: Path, *, add: bool) -> None:
-    """Add/remove a Defender path exclusion for `venv`, elevating then VERIFYING.
+def _defender_exclusion(targets: List[str], *, add: bool) -> None:
+    """Add/remove Defender exclusions for every tree in `targets` in ONE elevated
+    session (a single UAC prompt), then VERIFY.
 
     Admin is necessary but not sufficient: Tamper Protection (consumer) or
     Intune/GPO (managed) can silently no-op the write even when elevated. So the
-    elevated snippet re-reads Get-MpPreference and reports the truth (exit 0 = it
-    took, 3 = blocked) rather than assuming success from a clean return.
+    elevated snippet re-reads Get-MpPreference and confirms *every* path reached
+    the intended state (exit 0 = all took, 3 = at least one blocked) rather than
+    assuming success from a clean return.
     """
     verb = "Add" if add else "Remove"
-    # After the change the path SHOULD be present (add) / absent (remove).
-    check = "$present" if add else "-not $present"
-    ps_path = str(venv).replace("'", "''")  # single-quote-safe in the snippet
-    # Placeholder substitution (not an f-string) so PowerShell's literal { }
-    # blocks don't collide with brace escaping.
+    # Verify each path reached its intended end-state; fail (exit 3) if any didn't.
+    fail = "-not ($excl -contains $p)" if add else "($excl -contains $p)"
+    ps_array = _ps_string_array(targets)
+    # Placeholder substitution (not an f-string) so PowerShell's literal { } blocks
+    # don't collide with brace escaping. Paths are substituted LAST so a path can
+    # never be re-interpreted as one of the other placeholders.
     inner = (
         "$ErrorActionPreference = 'Stop'\n"
-        "$p = '__PATH__'\n"
-        "try { __VERB__-MpPreference -ExclusionPath $p }\n"
-        'catch { Write-Host "FAILED: $($_.Exception.Message)"; exit 2 }\n'
-        "$present = (Get-MpPreference).ExclusionPath -contains $p\n"
-        "if (__CHECK__) { exit 0 } else { exit 3 }\n"
+        "$paths = @(__PATHS__)\n"
+        "foreach ($p in $paths) {\n"
+        "  try { __VERB__-MpPreference -ExclusionPath $p }\n"
+        '  catch { Write-Host "FAILED: $($_.Exception.Message)"; exit 2 }\n'
+        "}\n"
+        "$excl = (Get-MpPreference).ExclusionPath\n"
+        "foreach ($p in $paths) {\n"
+        '  if (__FAIL__) { Write-Host "MISSING: $p"; exit 3 }\n'
+        "}\n"
+        "exit 0\n"
     )
     inner = (
-        inner.replace("__PATH__", ps_path)
-        .replace("__VERB__", verb)
-        .replace("__CHECK__", check)
+        inner.replace("__VERB__", verb)
+        .replace("__FAIL__", fail)
+        .replace("__PATHS__", ps_array)
     )
 
     rc = _run_elevated_ps(inner)
-    path = str(venv)
+    joined = "\n".join(f"  {p}" for p in targets)
     if rc == 0:
         console.print(
-            f"[green]Defender exclusion {'added' if add else 'removed'}:[/green] {path}"
+            f"[green]Defender exclusion {'added' if add else 'removed'}:[/green]\n{joined}"
         )
         if add:
             console.print("  biopb should now start faster on this machine.")
@@ -1784,19 +1812,28 @@ def _defender_exclusion(venv: Path, *, add: bool) -> None:
     raise typer.Exit(1)
 
 
-def _defender_status(venv: Path) -> None:
-    """Print whether `venv` is currently a Defender exclusion (best-effort, no admin).
+def _defender_status(targets: List[str]) -> None:
+    """Print whether the biopb trees are currently Defender exclusions
+    (best-effort, no admin).
 
     Get-MpPreference is usually readable by a normal user; when it isn't we say
-    'unknown' rather than guess.
+    'unknown' rather than guess. With more than one tree the state can also be
+    PARTIAL (some excluded, some not -- e.g. after upgrading from the earlier
+    single-path version that excluded only sys.prefix).
     """
-    ps_path = str(venv).replace("'", "''")
+    ps_array = _ps_string_array(targets)
     inner = (
-        "$ErrorActionPreference='Stop'; "
-        "try { if ((Get-MpPreference).ExclusionPath -contains '__PATH__') "
-        "{ Write-Host 'ON' } else { Write-Host 'OFF' } } "
-        "catch { Write-Host 'UNKNOWN' }"
-    ).replace("__PATH__", ps_path)
+        "$ErrorActionPreference='Stop'\n"
+        "try {\n"
+        "  $excl = (Get-MpPreference).ExclusionPath\n"
+        "  $paths = @(__PATHS__)\n"
+        "  $on = 0\n"
+        "  foreach ($p in $paths) { if ($excl -contains $p) { $on++ } }\n"
+        "  if ($on -eq $paths.Count) { Write-Host 'ON' }\n"
+        "  elseif ($on -eq 0) { Write-Host 'OFF' }\n"
+        "  else { Write-Host 'PARTIAL' }\n"
+        "} catch { Write-Host 'UNKNOWN' }\n"
+    ).replace("__PATHS__", ps_array)
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", inner],
@@ -1806,15 +1843,24 @@ def _defender_status(venv: Path) -> None:
     except Exception:
         out = "UNKNOWN"
 
-    path = str(venv)
+    joined = "\n".join(f"  {p}" for p in targets)
     if out == "ON":
-        console.print(f"[green]Defender exclusion is enabled[/green] for {path}")
+        console.print("[green]Defender exclusion is enabled[/green] for:")
+        console.print(joined)
         console.print("  Remove it with: biopb quick-start --disable")
     elif out == "OFF":
-        console.print(f"Defender exclusion is [yellow]not set[/yellow] for {path}")
+        console.print("Defender exclusion is [yellow]not set[/yellow] for:")
+        console.print(joined)
         console.print(
             "  Enable it for a faster startup (needs admin): biopb quick-start --enable"
         )
+    elif out == "PARTIAL":
+        console.print(
+            "[yellow]Defender exclusion is only partially set[/yellow] "
+            "-- some biopb trees are excluded, some aren't:"
+        )
+        console.print(joined)
+        console.print("  Complete it (needs admin): biopb quick-start --enable")
     else:
         console.print(
             "[yellow]Could not read the Defender exclusion state[/yellow] "
@@ -1834,9 +1880,10 @@ def quick_start(
     """Speed up biopb startup on Windows via a Defender exclusion (issue #384).
 
     Windows Defender rescans biopb's DLLs / .pyd / .pyc on every launch, which
-    dominates the first-start wait. This adds (or removes, with --disable) a
-    Defender exclusion for the biopb install directory so those files aren't
-    rescanned. It needs admin -- one UAC prompt -- and is fully reversible.
+    dominates the first-start wait. This adds (or removes, with --disable) Defender
+    exclusions for the biopb install trees -- both the tool env (heavy deps) and
+    the base Python it runs on (stdlib .pyd + pythonXY.dll) -- so those files
+    aren't rescanned. It needs admin -- one UAC prompt -- and is fully reversible.
     Windows only.
     """
     if not _is_windows():
@@ -1846,11 +1893,11 @@ def quick_start(
         )
         raise typer.Exit(0)
 
-    venv = _defender_venv_path()
+    targets = _defender_targets()
     if enabled is None:
-        _defender_status(venv)
+        _defender_status(targets)
         return
-    _defender_exclusion(venv, add=enabled)
+    _defender_exclusion(targets, add=enabled)
 
 
 if __name__ == "__main__":
