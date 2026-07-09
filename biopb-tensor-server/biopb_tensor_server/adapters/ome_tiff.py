@@ -256,17 +256,27 @@ _STRIP_PER_PLANE = re.compile(
 )
 
 
-# Some Micro-Manager MMStacks emit a degenerate self-closing `<BinData BigEndian=
-# "true"/>` -- a BinData with no `Length` attribute and no inline content. It
-# carries no catalog data (it is a placeholder), but ome-types/pydantic rejects it
-# ("length Field required"), so `from_xml` raises and the whole fast path returns
-# None -> `get_metadata` yields `{}` for these files (biopb/biopb#199). Dropping
-# the empty placeholder lets `from_xml` succeed and produce the real structural
-# dict. Matched self-closing ONLY (the `/>` anchor): a genuine inline-pixels
-# BinData is always the open form `<BinData Length="N">...</BinData>`, never
-# self-closing, so it is left untouched. `[^>]` bounds the attribute scan to the
-# tag (an XML attribute value can't contain a raw `>`).
-_STRIP_SELF_CLOSING_BINDATA = re.compile(r"<(?:\w+:)?BinData\b[^>]*?/>")
+# Some Micro-Manager MMStacks emit a degenerate BinData placeholder -- a BinData
+# with no `Length` attribute and no pixel content -- in either the self-closing
+# form `<BinData BigEndian="true"/>` or the open-but-empty form
+# `<BinData BigEndian="true"></BinData>`. It carries no catalog data, but
+# ome-types/pydantic rejects it ("length Field required"), so `from_xml` raises
+# and the whole fast path returns None -> `get_metadata` yields `{}` for these
+# files (biopb/biopb#199). Dropping the empty placeholder lets `from_xml` succeed
+# and produce the real structural dict.
+#
+# Matched EMPTY forms only. A genuine inline-pixels BinData is always the open
+# form WITH content (`<BinData Length="N">...base64...</BinData>`), which neither
+# branch matches: the `/>` branch is self-closing-only, and the close branch
+# requires `>\s*</BinData>` (a whitespace-only body), so any real content fails
+# it. Crucially that branch uses `\s*`, NOT a `.*?</BinData>` scan-to-close -- it
+# stops at the first non-whitespace byte, so the match stays O(n) and cannot
+# reintroduce the #193 O(n^2) footgun (nor scan across a large inline-pixel blob).
+# `[^>]` bounds the attribute scan to the tag; `\b` stops `BinData` matching a
+# longer name like `BinDataset`.
+_STRIP_EMPTY_BINDATA = re.compile(
+    r"<(?:\w+:)?BinData\b[^>]*?(?:/>|>\s*</(?:\w+:)?BinData>)"
+)
 
 
 def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
@@ -283,7 +293,7 @@ def _fast_ome_metadata(ome_xml: str) -> Optional[dict]:
         from ome_types import from_xml
 
         reduced = _STRIP_PER_PLANE.sub("", ome_xml)
-        reduced = _STRIP_SELF_CLOSING_BINDATA.sub("", reduced)
+        reduced = _STRIP_EMPTY_BINDATA.sub("", reduced)
         ome = from_xml(reduced)
         if hasattr(ome, "model_dump"):
             return ome.model_dump(mode="json")

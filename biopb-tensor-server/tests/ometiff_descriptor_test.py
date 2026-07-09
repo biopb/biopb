@@ -16,8 +16,8 @@ These tests lock the two things that make that safe:
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.ome_tiff import (
+    _STRIP_EMPTY_BINDATA,
     _STRIP_PER_PLANE,
-    _STRIP_SELF_CLOSING_BINDATA,
     OmeTiffAdapter,
     _fast_ome_metadata,
     _ome_axes_shape,
@@ -494,38 +494,51 @@ class TestStripPerPlane:
         assert [c["name"] for c in px["channels"]] == ["DAPI"]
 
 
-class TestStripSelfClosingBinData:
-    """A degenerate self-closing `<BinData/>` (no Length, no content) that some
-    Micro-Manager MMStacks emit must be stripped before ome-types parsing, while a
-    genuine inline-pixels `<BinData Length=..>..</BinData>` is preserved
-    (biopb/biopb#199).
+class TestStripEmptyBinData:
+    """A degenerate empty `<BinData>` (no Length, no content) that some
+    Micro-Manager MMStacks emit -- in either the self-closing `<BinData/>` or the
+    open-but-empty `<BinData></BinData>` form -- must be stripped before ome-types
+    parsing, while a genuine inline-pixels `<BinData Length=..>..</BinData>` is
+    preserved (biopb/biopb#199).
     """
 
     def test_strips_self_closing_bindata(self):
         xml = '<Pixels><BinData BigEndian="true"/><Channel ID="c0"/></Pixels>'
         assert (
-            _STRIP_SELF_CLOSING_BINDATA.sub("", xml)
+            _STRIP_EMPTY_BINDATA.sub("", xml)
             == '<Pixels><Channel ID="c0"/></Pixels>'
         )
+
+    def test_strips_open_empty_bindata(self):
+        # Open-but-empty form (no Length, whitespace-only body): also rejected by
+        # ome-types and carries nothing, so it is stripped too. The `\s*` body
+        # match stays linear -- it never scans to a distant `</BinData>`.
+        for body in ("", "\n    ", "  \t "):
+            xml = f'<Pixels><BinData BigEndian="true">{body}</BinData><Channel ID="c0"/></Pixels>'
+            assert (
+                _STRIP_EMPTY_BINDATA.sub("", xml)
+                == '<Pixels><Channel ID="c0"/></Pixels>'
+            ), repr(body)
 
     def test_strips_namespaced_self_closing_bindata(self):
         xml = '<Pixels><ns:BinData BigEndian="true"/><ns:Channel ID="c0"/></Pixels>'
         assert (
-            _STRIP_SELF_CLOSING_BINDATA.sub("", xml)
+            _STRIP_EMPTY_BINDATA.sub("", xml)
             == '<Pixels><ns:Channel ID="c0"/></Pixels>'
         )
 
     def test_preserves_inline_bindata_with_content(self):
-        # Open form carrying real pixels: never self-closing, so never touched.
+        # Open form carrying real pixels: has a non-whitespace body, so the
+        # empty-body (`>\s*</BinData>`) branch can't match -> never touched.
         xml = (
             '<Pixels><BinData Length="4" Compression="none">AAECAw==</BinData></Pixels>'
         )
-        assert _STRIP_SELF_CLOSING_BINDATA.sub("", xml) == xml
+        assert _STRIP_EMPTY_BINDATA.sub("", xml) == xml
 
     def test_does_not_strip_lookalike_element(self):
         # \b after the name must not let a longer element name match.
         xml = '<Pixels><BinDataset Foo="1"/><Channel ID="c0"/></Pixels>'
-        assert _STRIP_SELF_CLOSING_BINDATA.sub("", xml) == xml
+        assert _STRIP_EMPTY_BINDATA.sub("", xml) == xml
 
     def test_fast_metadata_recovers_from_degenerate_bindata(self):
         # End-to-end: the degenerate `<BinData/>` made ome-types raise ("length
