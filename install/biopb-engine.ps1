@@ -781,7 +781,12 @@ function Invoke-Precompile {
         $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
         if (-not (Test-Path -LiteralPath $py)) { return }
         # Compile exactly the env's own site-packages (whatever was just installed).
-        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>$null)
+        # The dict key uses '' (escaped single quotes), NOT "purelib": Windows
+        # PowerShell 5.1 strips embedded double quotes when it builds a native
+        # command line, so "purelib" reaches python.exe as the bare name purelib
+        # -> NameError -> empty $site -> this function silently returns and NOTHING
+        # is precompiled (biopb/biopb#388). Single quotes survive that quoting.
+        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()[''purelib''])' 2>$null)
         if (-not $site -or -not (Test-Path -LiteralPath $site)) { return }
         Report-Info "Precompiling Python bytecode (removes the first-launch compile lag)..."
         # -j 0 = all cores; -q = quiet. compileall exits nonzero if any single
