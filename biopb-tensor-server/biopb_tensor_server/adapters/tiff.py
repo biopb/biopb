@@ -1026,8 +1026,23 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, SourceAdapter, TensorAdap
                 chan_idx = coords.get("ChannelIndex", 0)
                 slice_idx = coords.get("SliceIndex", 0)
 
-                # Look for file relative to directory (may be in subdirectory for v2)
+                # The Coords key path is written relative to the acquisition
+                # *parent*, so for a "separate image files" acquisition it carries
+                # a leading position-folder segment (e.g. "Default/img_...").
+                # Which directory this source was claimed at decides how that
+                # resolves: at the acquisition root (a DisplaySettings.json fired
+                # the v2 claim there) the leading segment is real, but with no
+                # DisplaySettings.json the root is invisible and the position
+                # folder's own metadata.txt claims it directly -- so self.directory
+                # *is* that folder and the segment doubles it (biopb/biopb#314).
+                # Try the path as-is, then retry after stripping a leading segment
+                # equal to this directory's own name, so both rootings land on the
+                # same file. (v1 keys carry no prefix and resolve as-is.)
                 file_path = self.directory / filepath_in_key
+                if not file_path.exists():
+                    parts = Path(filepath_in_key).parts
+                    if len(parts) > 1 and parts[0] == self.directory.name:
+                        file_path = self.directory.joinpath(*parts[1:])
                 if file_path.exists():
                     self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = (
                         file_path

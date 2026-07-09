@@ -1112,3 +1112,58 @@ class TestGetData:
             data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[h, w]))
             assert data.shape == (h, w)
             np.testing.assert_array_equal(data, red)
+
+    def test_micromanager_v2_separate_files_no_displaysettings(self):
+        """A v2 "separate image files" acquisition with no DisplaySettings.json
+        constructs when claimed at the position folder (biopb/biopb#314).
+
+        Layout: an acquisition root holding only a ``Default/`` position folder
+        (no ``DisplaySettings.json`` at the root), whose ``metadata.txt`` carries
+        ``Coords-Default/...`` keys prefixed with the folder's own name. With no
+        DisplaySettings.json the root is invisible, so discovery claims the
+        ``Default/`` folder directly and the adapter is rooted there -- the
+        leading ``Default/`` segment then doubles the path. ``__init__`` must
+        strip that redundant self-name segment and still resolve the file.
+        """
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "Default")
+            os.makedirs(data_dir)
+            fname = "img_channel000_position000_time000000000_z000.tif"
+            expected = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+            tifffile.imwrite(
+                os.path.join(data_dir, fname), expected, photometric="minisblack"
+            )
+            # Keys carry the position-folder prefix, written relative to the root.
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Positions": 1,
+                    "Frames": 1,
+                    "Slices": 1,
+                    "AxisOrder": ["time", "channel", "z", "position"],
+                },
+                f"Coords-Default/{fname}": {
+                    "PositionIndex": 0,
+                    "TimeIndex": 0,
+                    "ChannelIndex": 0,
+                    "SliceIndex": 0,
+                },
+                f"Metadata-Default/{fname}": {"Width": 48, "Height": 32},
+            }
+            with open(os.path.join(data_dir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            # Claimed at the position folder (v1 path fires on its metadata.txt).
+            adapter = MicroManagerLegacyAdapter(data_dir, "mm_v2")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.shape) == [32, 48]
+
+            data = adapter.get_data(ChunkBounds(start=[0, 0], stop=[32, 48]))
+            assert data.shape == (32, 48)
+            np.testing.assert_array_equal(data, expected)
