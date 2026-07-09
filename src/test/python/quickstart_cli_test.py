@@ -96,12 +96,13 @@ class TestDefenderExclusion:
         "rc,exit_code,needle",
         [
             (0, 0, "added"),
-            (2, 1, "Set-MpPreference call failed"),
+            # add=True below -> the cmdlet named in the message is Add-MpPreference.
+            (2, 1, "Add-MpPreference call failed"),
             (3, 1, "blocked by Tamper Protection"),
             (1, 1, "elevation was declined"),
         ],
     )
-    def test_result_code_mapping(self, rc, exit_code, needle):
+    def test_result_code_mapping(self, rc, exit_code, needle, capsys):
         with patch.object(cli, "_run_elevated_ps", return_value=rc):
             if exit_code == 0:
                 cli._defender_exclusion(self._VENV, add=True)  # no raise
@@ -109,6 +110,10 @@ class TestDefenderExclusion:
                 with pytest.raises(cli.typer.Exit) as ei:
                     cli._defender_exclusion(self._VENV, add=True)
                 assert ei.value.exit_code == exit_code
+        # Also assert the user-facing message, not just the exit code. Collapse
+        # Rich's soft-wrapping so a needle isn't split across wrapped lines.
+        out = " ".join(capsys.readouterr().out.split())
+        assert needle in out
 
     def test_single_quote_in_path_is_escaped(self):
         captured = {}

@@ -1701,8 +1701,13 @@ def _run_elevated_ps(inner: str) -> int:
     """
     import tempfile
 
+    # utf-8-sig, not plain utf-8: Windows PowerShell 5.1 reads a BOM-less script
+    # as the ANSI code page, so a non-ASCII install path (e.g. an accented
+    # username in sys.prefix) would be misread -- and since the same misread $p
+    # feeds both Add-MpPreference and the -contains verify, the script would
+    # exit 0 while excluding the wrong path. The BOM pins UTF-8 decoding.
     with tempfile.NamedTemporaryFile(
-        "w", suffix=".ps1", delete=False, encoding="utf-8"
+        "w", suffix=".ps1", delete=False, encoding="utf-8-sig"
     ) as f:
         f.write(inner)
         script = f.name
@@ -1763,7 +1768,7 @@ def _defender_exclusion(venv: Path, *, add: bool) -> None:
     if rc == 2:
         console.print(
             f"[red]Could not {verb.lower()} the Defender exclusion[/red] "
-            "(the Set-MpPreference call failed)."
+            f"(the {verb}-MpPreference call failed)."
         )
     elif rc == 3:
         console.print(
