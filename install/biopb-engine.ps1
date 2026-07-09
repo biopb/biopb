@@ -1136,7 +1136,7 @@ function Invoke-BiopbInstall {
             $elapsed = [int]$sw.Elapsed.TotalSeconds
             if (($elapsed - $lastTick) -ge 10) {
                 $lastTick = $elapsed
-                Report-Detail "  ...still installing (${elapsed}s elapsed) -- normal for a first install"
+                Report-Detail "  ...still installing (${elapsed}s elapsed)"
             }
         }
         # The timed WaitForExit above returns the instant uv signals exit, which can
