@@ -353,14 +353,9 @@ def bootstrap():
 
 
 def _bootstrap_impl():
-    import dask.array as da
-    import numpy as np
     from IPython import get_ipython
 
     from .._config import get_setting, load_config
-    from .._connection import TensorConnection
-    from . import _jobs
-    from ._process_ops import build_ops
 
     ip = get_ipython()
     config = load_config()
@@ -373,8 +368,32 @@ def _bootstrap_impl():
 
     # 1. Qt integration must be enabled before the viewer is created so napari
     #    shares the kernel's integrated Qt event loop (programmatic %gui qt).
+    #    Do it FIRST — before the heavy core imports below (dask.array, and on
+    #    some platforms napari, get pulled in there) and long before the ~10 s
+    #    napari.Viewer(). enable_gui("qt") is cheap (~0.1 s) and needs none of
+    #    those deps, so popping the splash here covers the *whole* slow stretch;
+    #    showing it after the imports (as before) left several seconds of blank
+    #    screen the splash was meant to hide (issue #386). Best-effort: show_splash
+    #    fails open to _NullSplash when Qt is unavailable, and the headless branch
+    #    (no Qt loop) keeps the _NullSplash default below.
+    from ._splash import _NullSplash, show_splash
+
+    splash = _NullSplash()  # replaced below when a real one can be shown
     if not headless:
         ip.enable_gui("qt")
+        splash = show_splash()
+
+    # Heavy core imports, now covered by the splash. dask.array is the slow one
+    # here; napari is pulled in transitively on some platforms, so this is the
+    # phase the "Loading napari…" cue is for (the later `import napari` is then a
+    # no-op — see step 4). numpy/da are bound for the execute_code namespace.
+    splash.message("Loading napari…")
+    import dask.array as da
+    import numpy as np
+
+    from .._connection import TensorConnection
+    from . import _jobs
+    from ._process_ops import build_ops
 
     # 2. Data-access service (dask-free), shared by the widget and the agent
     #    namespace. Created before dask so the viewer can come up without waiting
@@ -493,24 +512,39 @@ def _bootstrap_impl():
             "1" if get_setting(config, "mcp.viewer.async_slicing") else "0"
         )
 
-        import napari
+        try:
+            # napari was already pulled in by the core imports above (splash is
+            # showing "Loading napari…" for that phase), so this import just
+            # binds the name — the real cost is napari.Viewer() below.
+            import napari
 
-        from ..tensor_browser import TensorBrowserWidget
+            from ..tensor_browser import TensorBrowserWidget
 
-        viewer = napari.Viewer()
-        tbw = TensorBrowserWidget(
-            viewer, connection=conn, compute_scheduler=compute_scheduler
-        )
-        viewer.window.add_dock_widget(tbw, name="Tensor Browser")
-        # Tear the kernel down to idle when the user closes the window: signal
-        # the launcher's reader thread over the inherited window-close pipe.
-        _install_window_close_hook(viewer)
+            splash.message("Opening viewer…")  # the slow step
+            viewer = napari.Viewer()
+            tbw = TensorBrowserWidget(
+                viewer, connection=conn, compute_scheduler=compute_scheduler
+            )
+            viewer.window.add_dock_widget(tbw, name="Tensor Browser")
+            # Hand the splash off to the viewer window (closes once it's shown).
+            splash.finish(viewer)
+            # Tear the kernel down to idle when the user closes the window: signal
+            # the launcher's reader thread over the inherited window-close pipe.
+            _install_window_close_hook(viewer)
 
-        # Kernel-start update reminder (issue #87): once a window exists, check
-        # in the background whether a newer release-v* deployment is available
-        # and, if so, remind the user to run the upgrade script. GUI branch only;
-        # never blocks window paint.
-        _start_update_check(viewer, config)
+            # Kernel-start update reminder (issue #87): once a window exists, check
+            # in the background whether a newer release-v* deployment is available
+            # and, if so, remind the user to run the upgrade script. GUI branch only;
+            # never blocks window paint.
+            _start_update_check(viewer, config)
+
+        except Exception:
+            # Happy path: finish() hands the splash off to the viewer window (it
+            # closes once the window shows). If a step above fails first, close it
+            # so it can't linger before the kernel is torn down, then re-raise for
+            # bootstrap()'s BOOTSTRAP_ERROR handler.
+            splash.close()
+            raise
 
     # 5. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
