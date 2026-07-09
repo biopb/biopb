@@ -781,14 +781,35 @@ function Invoke-Precompile {
         $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
         if (-not (Test-Path -LiteralPath $py)) { return }
         # Compile exactly the env's own site-packages (whatever was just installed).
-        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>$null)
+        # The dict key uses '' (escaped single quotes), NOT "purelib": Windows
+        # PowerShell 5.1 strips embedded double quotes when it builds a native
+        # command line, so "purelib" reaches python.exe as the bare name purelib
+        # -> NameError -> empty $site -> this function silently returns and NOTHING
+        # is precompiled (biopb/biopb#388). Single quotes survive that quoting.
+        $site = (& $py -c 'import sysconfig; print(sysconfig.get_paths()[''purelib''])' 2>$null)
         if (-not $site -or -not (Test-Path -LiteralPath $site)) { return }
         Report-Info "Precompiling Python bytecode (removes the first-launch compile lag)..."
-        # -j 0 = all cores; -q = quiet. compileall exits nonzero if any single
-        # file fails to compile (a vendored py2-only module, say) -- harmless
-        # here, so the exit code is ignored.
-        & $py -m compileall -q -j 0 "$site" 2>&1 | Out-Null
-        Report-Ok "Bytecode precompiled (first viewer launch will be faster)"
+        # -j 0 = all cores. Deliberately NO -q: without it compileall prints a
+        # "Compiling '<file>'..." line per file (it does so even under -j 0), which
+        # we count to surface throttled progress instead of a silent 30s+ pause --
+        # long on Windows because Defender scans every .pyc as it is written (#384).
+        # We stream rather than discard to Out-Null, reporting one line per 1000
+        # files so the console/GUI log stays bounded. No -f: a fresh install
+        # compiles every file anyway, and a rerun (upgrade) then recompiles only
+        # the new files -- keeping this idempotent. Non-"Compiling" lines (Listing,
+        # or a vendored py2-only module's error on stderr, folded in by 2>&1) are
+        # ignored, and compileall's nonzero exit on such a failure stays ignored.
+        # (Under -j 0 the per-file lines come from worker processes; on POSIX they
+        # reach this pipe, and on Windows the spawned workers inherit stdout so they
+        # should too -- worst case the count updates in bursts, never wrongly.)
+        $compiled = 0
+        & $py -m compileall -j 0 "$site" 2>&1 | ForEach-Object {
+            if ($_ -like 'Compiling *') {
+                $compiled++
+                if ($compiled % 1000 -eq 0) { Report-Detail "  ...$compiled files" }
+            }
+        }
+        Report-Ok "Bytecode precompiled ($compiled files; first viewer launch will be faster)"
     } catch {
         # Non-fatal: the first run just recompiles, exactly as before this ran.
     }
@@ -1131,7 +1152,7 @@ function Invoke-BiopbInstall {
             $elapsed = [int]$sw.Elapsed.TotalSeconds
             if (($elapsed - $lastTick) -ge 10) {
                 $lastTick = $elapsed
-                Report-Detail "  ...still installing (${elapsed}s elapsed) -- normal for a first install"
+                Report-Detail "  ...still installing (${elapsed}s elapsed)"
             }
         }
         # The timed WaitForExit above returns the instant uv signals exit, which can
