@@ -505,8 +505,7 @@ class TestStripEmptyBinData:
     def test_strips_self_closing_bindata(self):
         xml = '<Pixels><BinData BigEndian="true"/><Channel ID="c0"/></Pixels>'
         assert (
-            _STRIP_EMPTY_BINDATA.sub("", xml)
-            == '<Pixels><Channel ID="c0"/></Pixels>'
+            _STRIP_EMPTY_BINDATA.sub("", xml) == '<Pixels><Channel ID="c0"/></Pixels>'
         )
 
     def test_strips_open_empty_bindata(self):
