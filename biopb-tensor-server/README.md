@@ -63,7 +63,7 @@ You can create custom config file to fine-tune server behavior, e.g.,specifying 
   "sources": [
     { "url": "/data" },
     {
-      "source_id": "my-zarr",
+      "alias": "my-zarr",
       "type": "zarr",
       "url": "/experiment.zarr",
       "dim_labels": ["z", "y", "x"]

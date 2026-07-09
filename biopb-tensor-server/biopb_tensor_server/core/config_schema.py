@@ -173,7 +173,15 @@ def _sources_schema() -> Dict[str, Any]:
                     "remote URLs (s3://, http(s)://, grpc://) are experimental."
                 ),
             },
-            "source_id": {"type": "string"},
+            "source_id": {
+                "type": "string",
+                "description": (
+                    "Deprecated and ignored: a source's id is derived from its "
+                    "resolved URL so the same data always maps to one catalog "
+                    "entry (biopb/biopb#308). Use `alias` for a display name."
+                ),
+                "deprecated": True,
+            },
             "dataset": {"type": "string", "description": "HDF5 dataset path."},
             "dim_labels": {"type": "array", "items": {"type": "string"}},
             "monitor": {

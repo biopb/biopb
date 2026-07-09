@@ -264,6 +264,10 @@ def test_legacy_aliases_present_and_marked_deprecated(schema):
     # the back-compat pyramid knob keeps its bound under [precache] too
     assert precache["downscale_factor"]["minimum"] == 2
     assert schema["properties"]["sources"]["items"]["properties"]["path"]["deprecated"]
+    # source_id is derived from the URL, not user-assigned (biopb/biopb#308).
+    assert schema["properties"]["sources"]["items"]["properties"]["source_id"][
+        "deprecated"
+    ]
     assert _section_props(schema, "metadata_db")["enabled"]["deprecated"] is True
 
 
