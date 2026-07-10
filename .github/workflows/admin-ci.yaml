@@ -1,0 +1,86 @@
+# CI for biopb-admin (the control plane). Lives in the monorepo at biopb-admin/.
+# It is a bundled component like biopb-tensor-server — shipped inside the
+# release-v* wheel bundle + installer, NOT published to PyPI — so this workflow
+# is test-only (no deploy job). Versioned off its own `admin-v*` tag prefix.
+name: Admin CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'biopb-admin/**'
+      - 'src/main/python/biopb/cli.py'          # the `admin` CLI verbs
+      - 'src/main/python/biopb/_config_admin.py' # shared admin endpoint
+      - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/admin-ci.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The admin is lean and pure-Python (stdlib + core biopb for the endpoint), so
+  # no headless GL / Qt / napari setup is needed — unlike mcp-ci. Sparse matrix:
+  # all versions on Linux, plus one on macOS/Windows (the Windows stop-sentinel
+  # path in the supervisor/_admin differs from POSIX signals — worth a cell).
+  test:
+    name: ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.10'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: macos-latest
+            python-version: '3.12'
+          - os: windows-latest
+            python-version: '3.12'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm needs tags for versioning
+
+      # Core biopb generates its protobuf stubs at build time via buf; biopb-admin
+      # depends on biopb, so building the workspace member needs buf available.
+      - name: Setup buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          github_token: ${{ github.token }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Resolve the workspace so biopb-admin resolves biopb from the in-tree
+      # member. uv is the workspace-aware installer (the monorepo convention).
+      - name: Install (workspace, testing group)
+        run: uv sync --package biopb-admin --group testing --python ${{ matrix.python-version }}
+
+      - name: Run biopb-admin tests
+        run: uv run --no-sync pytest -v --color=yes biopb-admin/src/biopb_admin/_tests
+
+      # The `biopb admin` CLI verbs live in the core biopb CLI; cover them from
+      # the core test suite too so a break in the wiring is caught here.
+      - name: Run core CLI admin tests
+        run: uv run --no-sync pytest -v --color=yes src/test/python/server_cli_test.py -k Admin

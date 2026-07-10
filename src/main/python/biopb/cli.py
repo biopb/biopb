@@ -120,14 +120,14 @@ ADMIN_PID_FILE = Path.home() / ".local" / "share" / "biopb" / "admin.pid"
 # from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
 # auto-updater's baseline. This is the *deployment* version and is distinct from
 # any single package's version: one release bundles the mutually-paired
-# biopb / biopb-tensor-server / biopb-mcp triple. Kept in sync with
+# biopb / biopb-tensor-server / biopb-mcp / biopb-admin set. Kept in sync with
 # CONFIG_DIR/release.version in install/install.sh.
 _RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
 
-# The three wheels the installer bundles in one release-v* deployment (see
+# The wheels the installer bundles in one release-v* deployment (see
 # install/install.sh). `biopb version` reports each separately so a version skew
 # within the installed set is visible; any may be absent, hence "not installed".
-_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp")
+_RELEASE_PACKAGES = ("biopb", "biopb-tensor-server", "biopb-mcp", "biopb-admin")
 
 
 def _read_release_version() -> str:

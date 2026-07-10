@@ -33,12 +33,13 @@ dependencies = [
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same
-# convention as biopb-mcp. Install from the workspace with uv:
+# convention as biopb-mcp. Minimal on purpose: the supervisor/control tests are
+# stdlib-only (TCP-liveness, urllib), so no tensor/pyarrow/Qt is pulled in.
+# Install from the workspace with uv:
 #   uv sync --package biopb-admin --group testing
 [dependency-groups]
 testing = [
     "pytest",
-    "biopb[tensor]",  # optional: exercises the Flight health probe path
 ]
 
 # The persistent supervisor is spawned as `python -m biopb_admin run` by the
