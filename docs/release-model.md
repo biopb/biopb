@@ -8,12 +8,18 @@ different audiences and cadences, and are driven by different tags.
 
 | | Audience | Mechanism | Tag(s) |
 |---|---|---|---|
-| **Library distribution** | developers / integrators (`pip install`, napari-hub) | **PyPI** | `v*` (biopb), `mcp-v*` (biopb-mcp) |
+| **Library distribution** | developers / integrators (`pip install`) | **PyPI** | `v*` (biopb) |
 | **Product deployment** | end users (`install.sh`), operators (Docker) | **GitHub release + Docker** | `release-v*` |
 
-PyPI is deliberately **excluded** from the `release-v*` deployment. `biopb` and
-`biopb-mcp` publish to PyPI on their own per-package tags, on their own cadence.
-(`biopb-tensor-server` and `biopb-image-base` are never on PyPI.)
+PyPI is deliberately **excluded** from the `release-v*` deployment. `biopb`
+publishes to PyPI on its own `v*` tag, on its own cadence.
+
+**biopb-mcp is no longer published to PyPI.** It only ever reached end users as
+part of the `release-v*` wheel triple the installer `file://`-installs (a plain
+`pip install biopb-mcp` could never pull the tensor server or the full-stack
+dependency groups anyway), so its PyPI upload carried no product weight and was
+retired. Its `mcp-v*` tag is kept purely as a **version marker** (below).
+(`biopb-tensor-server` and `biopb-image-base` were never on PyPI either.)
 
 ## A release is a coordinated set of tags on one commit
 
@@ -24,7 +30,7 @@ release commit:
 | Tag | Drives | Notes |
 |---|---|---|
 | `v<A>` | `python-ci` → PyPI: `biopb` | also the client's version marker |
-| `mcp-v<C>` | `mcp-ci` → PyPI: `biopb-mcp` | also mcp's version marker |
+| `mcp-v<C>` | (nothing on its own) | version marker only — mcp isn't on PyPI |
 | `server-v<B>` | (nothing on its own) | version marker only — tensor-server isn't on PyPI |
 | `release-v<R>` | `release.yaml` | the all-in-one deployment (below) |
 
@@ -50,8 +56,8 @@ before it lands on `main`. On a prerelease tag, `release.yaml`:
   `biopb-tensor-server:0.5.0rc1`) but **does not move `:latest`** — `:latest`
   only tracks a clean `X.Y.Z` release, so an RC never becomes the default pull.
 
-The per-package `v*`/`mcp-v*` PyPI tags follow PyPI's own prerelease rules: a
-`…rc1` version uploads as a prerelease, which `pip` ignores unless `--pre`.
+The `v*` PyPI tag (biopb) follows PyPI's own prerelease rules: a `…rc1` version
+uploads as a prerelease, which `pip` ignores unless `--pre`.
 
 ## What `release-v*` produces (`release.yaml`)
 
@@ -107,13 +113,15 @@ single source of truth.
 | Tag | Workflow | Publishes |
 |---|---|---|
 | `v*` | `python-ci` | PyPI: biopb |
-| `mcp-v*` | `mcp-ci` | PyPI: biopb-mcp |
+| `mcp-v*` | — | (version marker only) |
 | `server-v*` | — | (version marker only) |
 | `release-v*` | `release.yaml` | GitHub release + Docker (tensor-server, image-base) |
 
-`tensor-server-ci` and `image-runtime-ci` keep their PR test/build jobs but **do
-not publish** — publishing is consolidated in `release.yaml`. The old
-`mcp-release.yaml` and `tensor-server-ci`'s `publish` job are retired.
+`mcp-ci`, `tensor-server-ci`, and `image-runtime-ci` keep their PR test/build
+jobs but **do not publish** — the only PyPI publish left is `python-ci` (biopb),
+and product publishing is consolidated in `release.yaml`. The old
+`mcp-release.yaml`, `mcp-ci`'s `deploy` job, and `tensor-server-ci`'s `publish`
+job are all retired.
 
 ## Open items
 

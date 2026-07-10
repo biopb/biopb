@@ -1,18 +1,17 @@
-# CI/CD for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
-# biopb-mcp/; published to PyPI on its own `mcp-v*` tag prefix (kept distinct
-# from the client's `v*` and the server's `server-v*`).
-name: MCP CI/CD
+# CI for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
+# biopb-mcp/. This is a TEST-ONLY workflow: biopb-mcp is no longer published to
+# PyPI (the product ships as the release-v* wheel triple the installer
+# file://-installs — see docs/release-model.md). The `mcp-v*` tag is retained
+# purely as biopb-mcp's setuptools_scm version marker (it stamps the clean
+# 0.7.x version onto the wheel built in release.yaml); it no longer triggers any
+# publish, so it does not appear as a workflow trigger here.
+name: MCP CI
 
 on:
   push:
     branches:
       - main
       - dev
-    tags:
-      - 'mcp-v*'
-    # No paths filter on push: an mcp-v* tag must always trigger the deploy
-    # regardless of which files the tagged commit changed. (A paths filter under
-    # push applies to tag pushes too, which would silently skip releases.)
   pull_request:
     branches:
       - main
@@ -101,33 +100,3 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: ${{ matrix.os }}-py${{ matrix.python-version }}
-
-  # Publish biopb-mcp to PyPI on an mcp-v* tag. The wheel/sdist carry NO
-  # direct-reference deps (those live only in the dependency groups, which are
-  # not part of published metadata), so twine accepts them.
-  deploy:
-    needs: [test]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/mcp-v')
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0  # full history + tags so setuptools_scm derives the version
-
-      - name: Setup buf
-        uses: bufbuild/buf-action@v1
-        with:
-          setup_only: true
-          github_token: ${{ github.token }}
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Build biopb-mcp wheel + sdist
-        run: uv build --package biopb-mcp --out-dir dist
-
-      - name: Publish to PyPI
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv publish dist/*
-

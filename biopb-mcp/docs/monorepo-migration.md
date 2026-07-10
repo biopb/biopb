@@ -26,6 +26,10 @@ the tree and are automatically paired with the checkout.
    package** for now — its own PyPI release and napari-hub plugin — under a new
    **`mcp-v*`** git-tag prefix. This avoids colliding with the client's `v*` and
    the server's `server-v*` tags.
+   > **Superseded:** biopb-mcp's PyPI publishing (and the napari-hub listing it
+   > fed) has since been retired — it ships only inside the `release-v*` wheel
+   > triple. The `mcp-v*` tag is kept purely as its setuptools_scm version
+   > marker. See `docs/release-model.md`.
 3. **Interim dual-track, unified-release future.** The `mcp-v*` and `server-v*`
    release lines continue for now. The intended end state is a **single unified
    release** that builds and bundles the whole stack (client + tensor-server +
