@@ -115,6 +115,37 @@ def _remove_pidfile(pidfile):
         pass
 
 
+# Env var carrying the path of the file a shim-owned child publishes its
+# OS-assigned port to (de-daemonization Layer 1). Presence of this var is also
+# how _serve_http tells a shim-owned child (dynamic port, no PID file / sentinel)
+# from the standalone `biopb mcp start` daemon. Kept in sync with _shim.
+ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
+
+
+def _report_port(path, port):
+    """Publish the OS-assigned ``port`` to the shim's report file.
+
+    The stdio shim (docs/mcp-dedaemonization-migration.md, Layer 1) spawns this
+    child with ``--port 0`` and a unique ``BIOPB_PORT_REPORT_FILE``, then polls
+    that file for the real port to build its bridge URL. Written atomically
+    (temp + ``os.replace``) so the shim never reads a half-written value.
+
+    A cross-platform file rather than the inherited-pipe handshake used for the
+    kernel token (``BIOPB_TOKEN_REPORT_FD``): that pipe pattern is POSIX-only
+    here (``_kernel`` gates it on ``os.name == 'posix'`` — fd inheritance across
+    a Windows spawn is fragile), whereas a file is uniform. Best-effort: a write
+    failure only costs the shim its port (it times out; the client sees EOF),
+    never the server.
+    """
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(str(port))
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("Could not write port report file %s", path, exc_info=True)
+
+
 def _shutdown_sentinel_path():
     """Path of the stop-sentinel file `biopb mcp stop` writes on Windows.
 
@@ -458,11 +489,32 @@ def _serve_http(config, port):
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
+    # De-daemonization Layer 1 (docs/mcp-dedaemonization-migration.md): when the
+    # stdio shim spawned us it set BIOPB_PORT_REPORT_FILE and passed --port 0.
+    # We then own no shared lifecycle — the shim spawned us into its own process
+    # group / Job Object and reaps us directly — so we bind a dynamic port up
+    # front, report it back, and (unlike the standalone `biopb mcp start` daemon)
+    # write no PID file and install no stop sentinel: those are singular paths a
+    # second concurrent session would collide on, and `biopb mcp stop` is not our
+    # owner. The POSIX signal handlers below stay in both modes (a group-directed
+    # SIGTERM still reaps our kernel gracefully).
+    report_file = os.environ.get(ENV_PORT_REPORT_FILE)
+    shim_owned = bool(report_file)
+    listen_sock = None
+    if shim_owned:
+        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_sock.bind(("127.0.0.1", port))  # port is 0 -> OS assigns one
+        port = listen_sock.getsockname()[1]
+        _report_port(report_file, port)
+
     # Register the daemon's PID so `biopb mcp status` can detect it no matter
-    # how it was launched (CLI, stdio shim, or manual). Written just before the
-    # bind below; removed pid-safely on every exit path.
-    pidfile = _write_pidfile(port)
-    atexit.register(_remove_pidfile, pidfile)
+    # how it was launched (CLI or manual). Written just before the bind below;
+    # removed pid-safely on every exit path. Skipped for a shim-owned child.
+    pidfile = None
+    if not shim_owned:
+        pidfile = _write_pidfile(port)
+        atexit.register(_remove_pidfile, pidfile)
 
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
@@ -493,8 +545,10 @@ def _serve_http(config, port):
 
     # On Windows those handlers are unreachable from `biopb mcp stop` —
     # os.kill(SIGTERM) is TerminateProcess, uncatchable — so stop drops a
-    # sentinel file instead and a watcher thread runs the same _shutdown.
-    if os.name == "nt":
+    # sentinel file instead and a watcher thread runs the same _shutdown. A
+    # shim-owned child has no `biopb mcp stop` owner (the shim reaps it via its
+    # Job Object), so it installs no sentinel watcher.
+    if os.name == "nt" and not shim_owned:
         _install_shutdown_sentinel_watcher(_shutdown_sentinel_path(), _shutdown)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
@@ -505,6 +559,7 @@ def _serve_http(config, port):
         port,
         allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
         allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+        sock=listen_sock,
     )
 
     # If the server loop returns on its own, exit the same way (atexit

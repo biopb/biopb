@@ -814,12 +814,21 @@ def server_status() -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
+def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
     """Run the MCP server in the foreground (streamable-http).
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
     allowlist (see :func:`build_transport_security`).  They are applied before
     serving, when the streamable-http app reads ``transport_security``.
+
+    ``sock`` is an already-bound listening socket. When given we serve over it
+    with an explicit ``uvicorn.Server`` instead of letting FastMCP bind ``port``
+    itself: the de-daemonized shim-owned child (docs/mcp-dedaemonization-migration.md,
+    Layer 1) binds port 0 up front so it can report the OS-assigned port back to
+    its shim *before* serving, then hands the socket here. The Starlette app
+    FastMCP builds carries the ``session_manager.run()`` lifespan on its own
+    (``streamable_http_app``), so a plain uvicorn run drives it — identical to
+    the ``mcp.run`` path, only with the socket pre-bound.
     """
     mcp.settings.transport_security = build_transport_security(
         allowed_origins, allowed_hosts
@@ -827,7 +836,22 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=()):
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = port
     logger.info("MCP server listening on http://127.0.0.1:%d/mcp", port)
-    mcp.run(transport="streamable-http")
+    if sock is None:
+        mcp.run(transport="streamable-http")
+        return
+
+    import asyncio
+
+    import uvicorn
+
+    config = uvicorn.Config(
+        mcp.streamable_http_app(),
+        host="127.0.0.1",
+        port=port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve(sockets=[sock]))
 
 
 # run_stdio() is gone: this process serves http only (daemon migration,

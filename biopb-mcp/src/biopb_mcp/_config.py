@@ -435,7 +435,7 @@ def get_daemon_log_file(config: Optional[dict] = None) -> Path:
 
     The daemon logs to stderr (``logging.basicConfig`` in ``biopb_mcp.mcp``);
     whoever launches it redirects that stream into this file. A *single*
-    canonical location so every launcher (the stdio shim's ``ensure_daemon``,
+    canonical location so every launcher (the stdio shim's ``spawn_session``,
     the ``biopb mcp start`` CLI, a manual ``python -m biopb_mcp.mcp``) and every
     reader (``biopb mcp logs`` / ``status``) agree on one file regardless of who
     started the daemon -- otherwise the launchers disagree on the filename (a
