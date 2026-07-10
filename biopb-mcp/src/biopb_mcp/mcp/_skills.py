@@ -85,7 +85,9 @@ def _bundle_text(name: str) -> str | None:
             .joinpath(_BUNDLE_DIR, name)
             .read_text(encoding="utf-8")
         )
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
+    except (FileNotFoundError, ModuleNotFoundError, OSError, UnicodeError):
+        # UnicodeError: a corrupt / non-UTF8 bundle file (a ValueError subclass,
+        # not an OSError) must also fail open, not crash the read.
         return None
 
 
