@@ -331,7 +331,11 @@ appears.
 - **P3 — MCP dynamic resources.** Upgrade the template to dynamically-registered
   `skill://<id>` resources with `list_changed`.
 - **P4 — contribution loop.** Wire the "generate a skill?" close-out prompt to emit
-  a ready-to-PR `skills/<id>.md`.
+  a ready-to-PR `skills/<id>.md`. **The draft lands in the local `skills_dir` first**
+  (see [§7.5](#7-open-decisions)) so it is usable *this session*; promotion to the
+  curated catalog is the PR, whose payload is that same file byte-for-byte. Without
+  the local tier this loop does not close — a generated skill is invisible to
+  `find_skills` until merged upstream, so "added to your toolbox" would be false.
 
 ---
 
@@ -348,6 +352,104 @@ appears.
    fetch them — more moving parts; not recommended.
 4. **Tag vocabulary** — start with a small controlled list validated in `--check`,
    or allow free tags initially and tighten later.
+
+### 7.5 Local skills — resolved: a local *source*, not a parallel mechanism
+
+Should the runtime merge locally-stored (uncurated) skills alongside the curated
+catalog? The question is two questions with different answers, and conflating them
+is what makes it look like scope creep:
+
+- **A — lab customization** ("skills we'll never upstream"). *Already covered* by
+  `catalog_url` ([§3d](#3d-config-extend-the-mcpservices-block-in-_configpy)): a lab
+  points it at their own `catalog.json` and gets the full pipeline — validation,
+  versioning, `find_skills`, `skill://` — for their private set, with the same review
+  discipline. The only real gap is that `catalog_url` is singular. The honest fix is
+  to make catalog resolution take an **ordered list of sources** (e.g.
+  `[biopb.org, lab-site, local-dir]`), merged with a defined collision policy — *not*
+  a separate uncurated-file feature. This is a config shape change, not a new
+  subsystem.
+
+- **B — the individual draft on-ramp** (the real motivation). This is a **P4
+  concern**, not a standalone feature. The server already promises "generate a skill
+  and add it to your toolbox," but under curated-only a freshly generated skill is
+  useless until merged upstream — it can't appear in `find_skills` or be read as
+  `skill://<id>`. A local `skills_dir` is simply *where P4's draft lands so it is
+  usable this session*; promotion is the PR, whose payload is the identical file. The
+  lifecycle the design gestures at — **local draft → validated in use → promoted via
+  PR** — only exists if biopb-mcp owns this local tier.
+
+Why the host's own local-skill mechanism (Claude Code / opencode / Claude Desktop)
+does **not** cover B: it splits discovery (host skills never reach `find_skills`); it
+can't read biopb's `requires:` capability gating; and it is host-specific, whereas a
+biopb-owned local tier is one authoring format (identical to curated `.md`) that is
+portable across all three hosts and is exactly the PR payload.
+
+**Decision.** Yes, add it — scoped as *one more source in the resolution list*, not a
+parallel discovery path:
+
+1. Catalog resolution takes an **ordered source list**; one entry is a local
+   `skills_dir`. (Answers A independently of P4.)
+2. Local files are parsed by the **already-vendored** `skill_schema.py`
+   ([§5.4](#54-defensive-runtime-belt-and-suspenders)) — same tolerant reader, no new
+   parser. Entries flow into the existing in-memory merge ([§3c](#3c-fetch--cache--fallback-fail-open-like-_updatepy))
+   and are marked `source: local`.
+3. Collision policy is a knob; default **local-wins**, so a site can shadow a curated
+   skill.
+4. Ship it **with P4**, framed as "close the contribution loop," not as a P2 feature.
+
+It is scope creep only if built as a second discovery mechanism for its own sake —
+which the ordered-source-list framing explicitly avoids.
+
+---
+
+## 8. Development & testing
+
+The two repos are decoupled by the `catalog.json` contract, and **the inner dev
+loop needs no live site.** Each side tests hermetically; a production URL is an
+*integration* concern, not a development dependency.
+
+### 8.1 Fixtures-first (the inner loop)
+
+- **biopb-site side** (P1) is a static generator: test it by running
+  `build_skills_catalog.py` locally and `mkdocs build --strict`. The CI gate is
+  `--check` on the PR. No URL is involved at any point.
+- **biopb-mcp side** (P2/P3) is built not to depend on a live site (fail-open →
+  cache → bundled snapshot, [§3c](#3c-fetch--cache--fallback-fail-open-like-_updatepy)).
+  Point `catalog_url` at a local source — a `file://` fixture, a
+  `python -m http.server` on localhost, or the bundled snapshot — plus the local
+  `skills_dir` ([§7.5](#75-local-skills--resolved-a-local-source-not-a-parallel-mechanism)).
+  CI should assert the fallback and `catalog_version`-guard branches here, because
+  those need *deliberately-broken* catalogs, which belong in local fixtures, not on
+  a host.
+
+### 8.2 Prod-unlinked (the integration smoke)
+
+Once P1's `--check` gate is green, let `deploy.yml` publish
+`skills/catalog.json` + `skills/*.md` to biopb.org. This is harmless — static files
+under `/skills/`, with no shipped consumer pointing at them until `skills.enabled`
+flips — and it covers what localhost can't: real TLS, `Content-Type`, CORS (if the
+browser page fetches it), httpx-against-real-cert, and the actual rsync deploy path.
+Two guardrails:
+
+1. **Publish the data, don't advertise the page.** Hold the `docs/skills.md` nav
+   entry (`mkdocs.yml`) until the catalog is real, so humans don't find a
+   placeholder. The JSON/MD sit at their URLs unlinked.
+2. **Sequence the default flip after the publish.** Keep the shipped MCP build from
+   hitting prod by default (`skills.enabled=False`, or a non-live `catalog_url`)
+   until the prod catalog exists — otherwise every session start races a 404. It
+   fails open silently, but boot-time 404 noise is avoidable. Order: publish the
+   static catalog → then ship the consumer defaulting to it.
+
+### 8.3 No separate testing site
+
+A dedicated test host is real ongoing ops (DNS, TLS, another deploy target + rsync
+key) for a static-file payload. Its only edge over prod-unlinked is isolating
+broken/in-flight catalogs from prod — already covered twice over by the `--check`
+gate (a broken catalog never reaches prod) and the server's fail-open + version
+guard (a bad prod catalog degrades gracefully). The one case it would serve —
+publishing malformed catalogs to exercise the consumer's fallback — is faster and
+safer as local fixtures ([§8.1](#81-fixtures-first-the-inner-loop)). Not worth the
+standing cost.
 
 ---
 

@@ -298,6 +298,22 @@ DEFAULT_CONFIG = {
             # Each is queried via GetOpNames and exposed as callables in the
             # agent kernel's `ops` dict.
             "process_image_servers": [],
+            # Curated skills catalog (docs/skill-interface.md). The find_skills
+            # tool + skill://<id> resource fetch this catalog and lazily fetch
+            # skill bodies; both fail open to an on-disk cache, then a bundled
+            # snapshot, so they never block or crash when offline.
+            "skills": {
+                # Master switch for discovery/retrieval. When False, find_skills
+                # returns nothing and no catalog fetch is attempted.
+                "enabled": True,
+                # Published metadata catalog. Point at a self-hosted catalog to
+                # serve a lab's own curated set (an ordered multi-source model is
+                # a later addition, see skill-interface.md §7.5).
+                "catalog_url": "https://biopb.org/skills/catalog.json",
+                # Seconds a fetched catalog is reused before re-fetching. A stale
+                # on-disk cache is still used past this if the network is down.
+                "cache_ttl": 3600,
+            },
         },
         "observe": {
             # Minimal loopback web UI for watching execute_code job history and
@@ -533,6 +549,7 @@ _CONSTRAINTS = {
     "mcp.dask.num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
     "mcp.tensor.health_poll_min_interval": Range(min=0),  # 0 disables the watcher
     "mcp.tensor.health_poll_max_interval": Range(min=0),
+    "mcp.services.skills.cache_ttl": Range(min=0),
     # Compute-plane timeouts / limits shared by the demo widgets and `ops`.
     "timeout.health_check": Range(exclusive_min=0),
     "timeout.get_op_names": Range(exclusive_min=0),

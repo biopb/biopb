@@ -141,6 +141,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
+# Bundled skills snapshot (mcp/_skills_bundle/): last-resort offline fallback for
+# the curated catalog + bodies (see mcp/_skills.py).
+"biopb_mcp.mcp" = ["_skills_bundle/*.json", "_skills_bundle/*.md"]
 
 # Versioned off the shared monorepo git history. Like biopb-tensor-server, this
 # package lives in a subdir (root = "..") and is keyed to its OWN tag prefix so
