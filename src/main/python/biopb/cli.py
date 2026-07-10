@@ -21,6 +21,8 @@ from ._proc import (
 )
 
 console = Console()
+# Deprecation notices go to stderr so they never corrupt `--json` stdout output.
+err_console = Console(stderr=True)
 
 app = typer.Typer(
     name="biopb",
@@ -1301,6 +1303,14 @@ def migrate_config(
 # ---------------------------------------------------------------------------
 # biopb-mcp daemon management (`biopb mcp ...`)
 #
+# DEPRECATED (de-daemonization, biopb-mcp/docs/mcp-dedaemonization-migration.md):
+# the shared background MCP daemon these commands manage is being retired. Each
+# MCP client's stdio shim now spawns and owns its own session, and `biopb mcp
+# view` covers the foreground/agentless case, so start/stop/status/restart/logs
+# have little remaining purpose. They still work (each emits a deprecation
+# notice via _warn_mcp_daemon_deprecated) and will be removed in a future
+# release. `biopb mcp view` is NOT deprecated.
+#
 # Manages the biopb-mcp MCP server (HTTP/streamable-http transport) as a
 # background daemon, mirroring the tensor-server daemon commands. The biopb-mcp
 # package is an optional dependency: every subcommand first calls
@@ -1312,8 +1322,27 @@ def migrate_config(
 
 mcp_app = typer.Typer(
     name="mcp",
-    help="biopb-mcp MCP server daemon management (start/stop/restart/status/logs)",
+    help="biopb-mcp MCP server: `view` (foreground viewer) + deprecated daemon "
+    "management (start/stop/restart/status/logs).",
 )
+
+
+def _warn_mcp_daemon_deprecated() -> None:
+    """Print the daemon-pipeline deprecation notice (to stderr).
+
+    The persistent background MCP daemon is being retired by de-daemonization
+    (biopb-mcp/docs/mcp-dedaemonization-migration.md): every MCP client's stdio
+    shim now spawns and owns its own session, and ``biopb mcp view`` covers the
+    foreground/agentless case, so the shared background daemon has little
+    remaining purpose. ``start``/``stop``/``status``/``restart``/``logs`` still
+    work but will be removed in a future release.
+    """
+    err_console.print(
+        "[yellow]Deprecated:[/yellow] the biopb-mcp background daemon is being "
+        "retired. MCP clients now own their own session via the stdio shim; for a "
+        "foreground viewer use [bold]biopb mcp view[/bold]. These daemon commands "
+        "will be removed in a future release."
+    )
 
 
 def _require_biopb_mcp() -> None:
@@ -1458,8 +1487,9 @@ def mcp_start(
         help="HTTP transport port (default: biopb-mcp config, else 8765)",
     ),
 ):
-    """Start the biopb-mcp MCP server (HTTP transport) as a background daemon."""
+    """(Deprecated) Start the biopb-mcp MCP server (HTTP) as a background daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     _ensure_mcp_dirs()
 
     existing_pid, existing_token = _read_pid_record(MCP_PID_FILE)
@@ -1546,8 +1576,9 @@ def mcp_stop(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
     ),
 ):
-    """Stop the biopb-mcp server daemon."""
+    """(Deprecated) Stop the biopb-mcp server daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
 
     if not pid:
@@ -1583,8 +1614,9 @@ def mcp_restart(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
     ),
 ):
-    """Restart the biopb-mcp server daemon."""
+    """(Deprecated) Restart the biopb-mcp server daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
     if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
@@ -1605,8 +1637,9 @@ def mcp_status(
         False, "--json", help="Emit machine-readable JSON instead of a table"
     ),
 ):
-    """Check biopb-mcp server daemon status and HTTP liveness."""
+    """(Deprecated) Check biopb-mcp server daemon status and HTTP liveness."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
     running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
@@ -1659,8 +1692,9 @@ def mcp_logs(
     ),
     path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
-    """Show the biopb-mcp server daemon log."""
+    """(Deprecated) Show the biopb-mcp server daemon log."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     log_file = _resolve_mcp_log_for_read()
     if path:
         print(log_file)

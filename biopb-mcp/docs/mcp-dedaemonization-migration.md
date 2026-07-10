@@ -247,15 +247,27 @@ the alternative if the front and children may later cross a machine boundary.)
 
 ### The downgraded `biopb mcp` CLI (the standalone, no-agent path)
 
-Repurposed around the §4.4 serve-core, wrapped **with** the process-owner extras
-(PID file, sentinel/signal, optional detachment) that the agent path drops:
+**Superseded (decided during Layer 1).** The standalone no-agent path is now
+`biopb mcp view` — a **foreground, blocking, Ctrl-C** viewer that opens the napari
+window immediately (eager `host.ensure_started()`), binds a dynamic port, prints
+its `/mcp` URL for optional agent attach, and writes no PID file. It fills the
+role this section reserved for a repurposed `biopb mcp start`, so **the shared
+background daemon is retired rather than reshaped**:
 
-- `biopb mcp start` → spawn a standalone session, **auto-open the viewer/kernel**
-  (a human wants the window now, not on a first tool call), **register with the
-  admin**, and **print the server URL** (the admin-fronted observe link + the
-  `/mcp` URL for manually attaching an agent).
-- Keep `stop` / `status` / `logs` against that PID-tracked session; **drop**
-  `restart` and all shared-daemon semantics.
+- `biopb mcp view` — foreground agentless viewer (shipped in Layer 1). *Not*
+  deprecated; this is the standalone path going forward.
+- `biopb mcp start` / `stop` / `status` / `restart` / `logs` — **deprecated**
+  (each emits a runtime notice; `cli._warn_mcp_daemon_deprecated`). The stdio
+  shim owns its own per-client session, so a shared PID-tracked daemon has little
+  purpose. They still work; removal is a later step.
+- The two config keys the daemon path touched (`mcp.transport.port`,
+  `mcp.transport.kernel_log`) are **kept, not deprecated** — both still drive live
+  non-daemon paths (a direct `--transport http` / the observe mount; the
+  per-session-log "single shared file" override). Their comments note the reduced
+  role.
+
+The eventual admin-registration + admin-fronted observe link remain future work
+(Layers 2–3); `biopb mcp view` prints the direct `/mcp` URL in the meantime.
 
 ---
 

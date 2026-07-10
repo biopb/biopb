@@ -132,14 +132,20 @@ DEFAULT_CONFIG = {
     "mcp": {
         "transport": {
             # Front-end transport: "http" (loopback streamable-http on `port`;
-            # the real server) or "stdio" (deprecated; for a client that
-            # spawns biopb-mcp as a subprocess). stdio no longer serves MCP
-            # from this process: it bridges stdin/stdout to the http daemon on
-            # `port`, spawning it detached if nothing is listening (see
-            # docs/daemon-migration.md). The default stays "stdio" so
+            # the real server) or "stdio" (for a client that spawns biopb-mcp as
+            # a subprocess). stdio no longer serves MCP from this process: it
+            # spawns and OWNS a private http session child on a *dynamic* port and
+            # bridges stdin/stdout to it (de-daemonization,
+            # docs/mcp-dedaemonization-migration.md). The default stays "stdio" so
             # installer-seeded client configs keep working unchanged.
             # Overridable per-launch with `--transport`.
             "kind": "stdio",
+            # Fixed loopback port for the http server. NOTE: since
+            # de-daemonization the stdio shim no longer uses it (its owned child
+            # binds a dynamic port), and `biopb mcp view` is dynamic too — so this
+            # now applies only to a directly-launched `biopb-mcp --transport http`
+            # and the *deprecated* `biopb mcp start` daemon. The observe UI shares
+            # this port when one is fixed.
             "port": 8765,
             # Whether the kernel opens a visible napari viewer:
             #   "auto"    -> visible if a display is present
@@ -164,8 +170,8 @@ DEFAULT_CONFIG = {
             # interleave. Set a path here to send every session to that single
             # file instead (the pre-de-daemonization behavior). Unused when
             # launched directly with --transport http (output stays on the
-            # launching terminal/service manager) or by `biopb mcp start` (the
-            # CLI redirects to mcp-server.log itself).
+            # launching terminal/service manager) or by the deprecated
+            # `biopb mcp start` (the CLI redirects to mcp-server.log itself).
             "kernel_log": "",
             # How many per-session shim logs to keep under log/sessions/ (newest
             # by mtime); older ones are pruned on each new session. Ignored when

@@ -811,8 +811,15 @@ class TestMcpLogs:
     def test_tail_last_n_lines(self, log_file):
         log_file.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
         res = self._run("-n", "5")
-        out = res.output.strip().splitlines()
+        # Filter to the log content: the command also emits a daemon-deprecation
+        # notice (to stderr in real use; CliRunner may fold it into output).
+        out = [ln for ln in res.output.splitlines() if ln.startswith("line ")]
         assert out == ["line 15", "line 16", "line 17", "line 18", "line 19"]
+
+    def test_emits_deprecation_notice(self, log_file):
+        # The daemon commands are deprecated (de-daemonization); every one warns.
+        res = self._run("--path")
+        assert "Deprecated" in (res.output + (res.stderr or ""))
 
     def test_level_filter_mcp_format(self, log_file):
         log_file.write_text("INFO:n:i\nDEBUG:n:d\nWARNING:n:w\nERROR:n:e\n")
