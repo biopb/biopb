@@ -27,7 +27,7 @@ import os
 logger = logging.getLogger(__name__)
 
 # JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation
-_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOBOBJECTINFOCLASS_EXTENDED_LIMIT = 9
 # JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 # OpenProcess access rights AssignProcessToJobObject requires
@@ -93,6 +93,9 @@ if os.name == "nt":
         return k32
 
 
+_kernel32 = _kernel32() if os.name == "nt" else None
+
+
 def create_kill_on_close_job():
     """Create a kill-on-close Job Object; return an opaque handle or ``None``.
 
@@ -104,20 +107,19 @@ def create_kill_on_close_job():
     if os.name != "nt":
         return None
     try:
-        k32 = _kernel32()
-        handle = k32.CreateJobObjectW(None, None)
+        handle = _kernel32.CreateJobObjectW(None, None)
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not k32.SetInformationJobObject(
+        if not _kernel32.SetInformationJobObject(
             handle,
-            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            _JOBOBJECTINFOCLASS_EXTENDED_LIMIT,
             ctypes.byref(info),
             ctypes.sizeof(info),
         ):
             err = ctypes.get_last_error()
-            k32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
             raise ctypes.WinError(err)
         return handle
     except Exception:
@@ -136,16 +138,17 @@ def assign_process(job, pid):
     if os.name != "nt" or not job or not pid:
         return False
     try:
-        k32 = _kernel32()
-        proc = k32.OpenProcess(_PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, int(pid))
+        proc = _kernel32.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, int(pid)
+        )
         if not proc:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
-            if not k32.AssignProcessToJobObject(job, proc):
+            if not _kernel32.AssignProcessToJobObject(job, proc):
                 raise ctypes.WinError(ctypes.get_last_error())
             return True
         finally:
-            k32.CloseHandle(proc)
+            _kernel32.CloseHandle(proc)
     except Exception:
         logger.debug("AssignProcessToJobObject failed (pid=%s)", pid, exc_info=True)
         return False
@@ -160,7 +163,8 @@ def terminate_job(job, exit_code=1):
     if os.name != "nt" or not job:
         return
     try:
-        _kernel32().TerminateJobObject(job, exit_code)
+        if not _kernel32.TerminateJobObject(job, exit_code):
+            raise ctypes.WinError(ctypes.get_last_error())
     except Exception:
         logger.debug("TerminateJobObject failed", exc_info=True)
 
@@ -170,6 +174,7 @@ def close_job(job):
     if os.name != "nt" or not job:
         return
     try:
-        _kernel32().CloseHandle(job)
+        if not _kernel32.CloseHandle(job):
+            raise ctypes.WinError(ctypes.get_last_error())
     except Exception:
         logger.debug("CloseHandle(job) failed", exc_info=True)
