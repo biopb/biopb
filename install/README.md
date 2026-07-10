@@ -64,9 +64,9 @@ are produced.
 
 ## What gets installed
 
-- **biopb-mcp + biopb + biopb-tensor-server + biopb-admin** — the matched wheel
+- **biopb-mcp + biopb + biopb-tensor-server + biopb-control** — the matched wheel
   set from the one release, into a single `uv` tool environment so the components
-  can import and drive each other (`biopb admin start`, `biopb server start`, the
+  can import and drive each other (`biopb control start`, `biopb server start`, the
   napari viewer, etc.).
 - **napari** — from PyPI, into the same environment.
 - **Web interface** — `webapp.tar.gz` from the same biopb-mcp release, unpacked to

@@ -1080,10 +1080,10 @@ function Invoke-BiopbInstall {
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
     $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-    # biopb-admin (control plane). Its underscore filename (biopb_admin-…) is not
+    # biopb-control (control plane). Its underscore filename (biopb_control-…) is not
     # matched by the sdk pattern '^biopb-.*' above, so the two stay distinct.
-    $adminAsset  = $release.assets | Where-Object { $_.name -match '^biopb_admin-.*\.whl$' } | Select-Object -First 1
-    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset -or -not $adminAsset) {
+    $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1
+    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset -or -not $controlAsset) {
         throw "Release $($release.tag_name) is missing one of the biopb wheels."
     }
     Report-Info "Installing from release $($release.tag_name)"
@@ -1093,11 +1093,11 @@ function Invoke-BiopbInstall {
     $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
     $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
     $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
-    $adminWhl  = Join-Path $wheelsDir $adminAsset.name
+    $controlWhl  = Join-Path $wheelsDir $controlAsset.name
     Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
     Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
     Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
-    Invoke-WebRequest -Uri $adminAsset.browser_download_url -OutFile $adminWhl
+    Invoke-WebRequest -Uri $controlAsset.browser_download_url -OutFile $controlWhl
 
     # Verify the wheels against the release's SHA256SUMS before installing them
     # (issue #87 trust item). Hard-fail on a mismatch or a wheel missing from a
@@ -1119,7 +1119,7 @@ function Invoke-BiopbInstall {
             $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
             if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
         }
-        foreach ($w in @($mcpWhl, $sdkWhl, $tensorWhl, $adminWhl)) {
+        foreach ($w in @($mcpWhl, $sdkWhl, $tensorWhl, $controlWhl)) {
             $base = Split-Path -Leaf $w
             $expected = $sums[$base]
             if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
@@ -1135,7 +1135,7 @@ function Invoke-BiopbInstall {
     $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
     $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
-    $adminReq  = "biopb-admin @ $(([System.Uri]$adminWhl).AbsoluteUri)"
+    $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime. biopb is the primary tool; --with adds the
@@ -1153,13 +1153,13 @@ function Invoke-BiopbInstall {
         "--with", "napari[all]",
         "--with-executables-from", "biopb-mcp"
     )
-    # biopb-admin (control plane): `biopb admin …` runs through the core CLI (which
-    # spawns `python -m biopb_admin`), so it just needs to be importable here;
-    # --with-executables-from also links the standalone `biopb-admin` script.
-    Report-Info "including biopb-admin"
+    # biopb-control (control plane): `biopb control …` runs through the core CLI (which
+    # spawns `python -m biopb_control`), so it just needs to be importable here;
+    # --with-executables-from also links the standalone `biopb-control` script.
+    Report-Info "including biopb-control"
     $installArgs += @(
-        "--with", $adminReq,
-        "--with-executables-from", "biopb-admin"
+        "--with", $controlReq,
+        "--with-executables-from", "biopb-control"
     )
 
     Report-Info "Installing biopb into one shared environment (first run can take several minutes; on Windows, antivirus scans every file uv writes)..."

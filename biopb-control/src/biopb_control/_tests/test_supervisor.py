@@ -12,8 +12,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from biopb_admin._control import serve_control_api
-from biopb_admin._supervisor import DataPlaneSpec, DataPlaneSupervisor
+from biopb_control._control import serve_control_api
+from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
 
 
 def _free_port() -> int:
@@ -67,12 +67,12 @@ def test_ensure_spawns_and_reports_serving(spec, monkeypatch):
         assert snap["pid"] is not None
     finally:
         sup.stop()
-    # stop() reaps the child (the admin owns it exclusively), so the port frees.
+    # stop() reaps the child (the control owns it exclusively), so the port frees.
     assert sup._port_up() is False
 
 
 def test_ensure_refuses_when_port_held_by_another(spec, monkeypatch):
-    # The admin is the sole owner: a port already held by a process it did not
+    # The control is the sole owner: a port already held by a process it did not
     # start is a conflict it refuses, not a server to adopt.
     listener = _listener(spec.grpc_port)
     try:
@@ -224,7 +224,7 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     import urllib.request
 
     sup = DataPlaneSupervisor(spec)
-    # POST /data_plane/ensure spawns a real (binder) child the admin owns.
+    # POST /data_plane/ensure spawns a real (binder) child the control owns.
     monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
     api_port = _free_port()
     server, _thread = serve_control_api("127.0.0.1", api_port, sup, ensure_timeout=8.0)
@@ -232,7 +232,7 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     try:
         # Before ensure: nothing running.
         health = json.loads(urllib.request.urlopen(f"{base}/health", timeout=3).read())
-        assert health["admin"] == "ok"
+        assert health["control"] == "ok"
         assert health["data_plane"]["state"] == "stopped"
 
         # Ensure spawns and waits until the port is up.

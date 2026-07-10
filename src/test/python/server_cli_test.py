@@ -782,22 +782,22 @@ class TestMcpStatus:
         assert d["status"] == "stale" and d["running"] is False
 
 
-class TestAdminStatus:
-    """`biopb admin status` — pidfile + control-API /health, no biopb_admin needed."""
+class TestControlStatus:
+    """`biopb control status` — pidfile + control-API /health, no biopb_control needed."""
 
     def _json(self, monkeypatch, *, pid, running, health):
-        monkeypatch.setattr(cli, "_require_biopb_admin", lambda: None)
+        monkeypatch.setattr(cli, "_require_biopb_control", lambda: None)
         monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         monkeypatch.setattr(cli, "_is_process_running", lambda _p: running)
-        monkeypatch.setattr(cli, "_admin_endpoint", lambda: ("127.0.0.1", 8813))
-        monkeypatch.setattr(cli, "_query_admin_health", lambda *_a, **_k: health)
-        res = CliRunner().invoke(cli.app, ["admin", "status", "--json"])
+        monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
+        monkeypatch.setattr(cli, "_query_control_health", lambda *_a, **_k: health)
+        res = CliRunner().invoke(cli.app, ["control", "status", "--json"])
         assert res.exit_code == 0, res.output
         return json.loads(res.stdout.strip().splitlines()[-1])
 
     def test_running_with_data_plane(self, monkeypatch):
         health = {
-            "admin": "ok",
+            "control": "ok",
             "data_plane": {
                 "state": "serving",
                 "grpc_url": "grpc://127.0.0.1:8815",
@@ -808,7 +808,7 @@ class TestAdminStatus:
         assert d["running"] is True and d["pid"] == 7
         assert d["control_api"] is True
         assert d["data_plane"]["state"] == "serving"
-        assert d["admin_url"] == "http://127.0.0.1:8813"
+        assert d["control_url"] == "http://127.0.0.1:8813"
 
     def test_running_but_control_api_silent(self, monkeypatch):
         # Process alive, but /health does not answer (still booting, or wedged).
@@ -825,7 +825,7 @@ class TestAdminStatus:
         assert d["status"] == "stale" and d["running"] is False
 
     def test_help_lists_lifecycle_commands(self):
-        res = CliRunner().invoke(cli.app, ["admin", "--help"])
+        res = CliRunner().invoke(cli.app, ["control", "--help"])
         assert res.exit_code == 0, res.output
         for cmd in ("start", "stop", "status", "run"):
             assert cmd in res.output

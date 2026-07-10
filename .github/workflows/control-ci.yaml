@@ -1,8 +1,8 @@
-# CI for biopb-admin (the control plane). Lives in the monorepo at biopb-admin/.
+# CI for biopb-control (the control plane). Lives in the monorepo at biopb-control/.
 # It is a bundled component like biopb-tensor-server — shipped inside the
 # release-v* wheel bundle + installer, NOT published to PyPI — so this workflow
-# is test-only (no deploy job). Versioned off its own `admin-v*` tag prefix.
-name: Admin CI
+# is test-only (no deploy job). Versioned off its own `control-v*` tag prefix.
+name: Control CI
 
 on:
   push:
@@ -14,25 +14,25 @@ on:
       - main
       - dev
     paths:
-      - 'biopb-admin/**'
-      - 'src/main/python/biopb/cli.py'          # the `admin` CLI verbs
-      - 'src/main/python/biopb/_config_admin.py' # shared admin endpoint
+      - 'biopb-control/**'
+      - 'src/main/python/biopb/cli.py'          # the `control` CLI verbs
+      - 'src/main/python/biopb/_config_control.py' # shared control endpoint
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
       - 'pyproject.toml'
       - 'uv.lock'
-      - '.github/workflows/admin-ci.yaml'
+      - '.github/workflows/control-ci.yaml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # The admin is lean and pure-Python (stdlib + core biopb for the endpoint), so
+  # The control is lean and pure-Python (stdlib + core biopb for the endpoint), so
   # no headless GL / Qt / napari setup is needed — unlike mcp-ci. Sparse matrix:
   # all versions on Linux, plus one on macOS/Windows (the Windows stop-sentinel
-  # path in the supervisor/_admin differs from POSIX signals — worth a cell).
+  # path in the supervisor/_control differs from POSIX signals — worth a cell).
   test:
     name: ${{ matrix.os }} py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
@@ -59,7 +59,7 @@ jobs:
         with:
           fetch-depth: 0  # setuptools_scm needs tags for versioning
 
-      # Core biopb generates its protobuf stubs at build time via buf; biopb-admin
+      # Core biopb generates its protobuf stubs at build time via buf; biopb-control
       # depends on biopb, so building the workspace member needs buf available.
       - name: Setup buf
         uses: bufbuild/buf-action@v1
@@ -72,15 +72,15 @@ jobs:
         with:
           enable-cache: true
 
-      # Resolve the workspace so biopb-admin resolves biopb from the in-tree
+      # Resolve the workspace so biopb-control resolves biopb from the in-tree
       # member. uv is the workspace-aware installer (the monorepo convention).
       - name: Install (workspace, testing group)
-        run: uv sync --package biopb-admin --group testing --python ${{ matrix.python-version }}
+        run: uv sync --package biopb-control --group testing --python ${{ matrix.python-version }}
 
-      - name: Run biopb-admin tests
-        run: uv run --no-sync pytest -v --color=yes biopb-admin/src/biopb_admin/_tests
+      - name: Run biopb-control tests
+        run: uv run --no-sync pytest -v --color=yes biopb-control/src/biopb_control/_tests
 
-      # The `biopb admin` CLI verbs live in the core biopb CLI; cover them from
+      # The `biopb control` CLI verbs live in the core biopb CLI; cover them from
       # the core test suite too so a break in the wiring is caught here.
-      - name: Run core CLI admin tests
-        run: uv run --no-sync pytest -v --color=yes src/test/python/server_cli_test.py -k Admin
+      - name: Run core CLI control tests
+        run: uv run --no-sync pytest -v --color=yes src/test/python/server_cli_test.py -k Control

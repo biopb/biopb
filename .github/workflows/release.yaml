@@ -178,10 +178,10 @@ jobs:
           uv build --package biopb --wheel --out-dir wheels
           uv build --package biopb-tensor-server --wheel --out-dir wheels
           uv build --package biopb-mcp --out-dir release-wheels
-          # biopb-admin (control plane) ships in the bundle too, but is NOT in the
+          # biopb-control (control plane) ships in the bundle too, but is NOT in the
           # Docker context (it is a local supervisor, not a containerized plane),
           # so it builds straight to release-wheels/ and never into wheels/.
-          uv build --package biopb-admin --wheel --out-dir release-wheels
+          uv build --package biopb-control --wheel --out-dir release-wheels
           cp wheels/*.whl release-wheels/
 
       - name: Build webapp
@@ -426,7 +426,7 @@ jobs:
 
             ### Assets
             - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
-              `biopb_admin-*.whl` — the version-paired wheel set (installer
+              `biopb_control-*.whl` — the version-paired wheel set (installer
               `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
             - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install

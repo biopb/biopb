@@ -372,7 +372,7 @@ DEFAULT_CONFIG = {
         },
         # Give-up budget (seconds) applied TWICE by auto_connect's down-plane
         # fallback, so the worst-case wall wait is ~2x this value: first it bounds
-        # the admin-ensure call (asking the control plane to bring the data plane
+        # the control-ensure call (asking the control plane to bring the data plane
         # up, which returns once the port is listening), then it bounds the
         # subsequent boot wait (connect_when_booted), where connection-refused is
         # tolerated while the server binds and scans its data folder. Both phases

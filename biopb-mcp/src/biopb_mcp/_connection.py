@@ -29,8 +29,8 @@ from urllib.parse import urlparse
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
 
-from ._admin_client import ensure_data_plane
 from ._config import CONFIG, get_setting
+from ._control_client import ensure_data_plane
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 SERVER_QUERY_THRESHOLD = 1000
 
 
-# Hosts considered "local" — asking the admin to bring up the data plane only
+# Hosts considered "local" — asking the control to bring up the data plane only
 # makes sense for a server on this machine (a remote one is not ours to start).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -623,14 +623,14 @@ class TensorConnection:
         The single connect policy shared by **both** faces: try the resolved
         ``(url, token)``, wait the server through a ``STARTING`` data-folder
         scan, and — when the URL is local and unreachable — ask the biopb
-        **admin** (control plane) to bring the data plane up, then wait for it.
+        **control** (control plane) to bring the data plane up, then wait for it.
 
         ``_connection`` is a **pure client** since Layer 2 of the
         de-daemonization migration (docs/mcp-dedaemonization-migration.md §5): it
         never spawns a server itself, so the dependent no longer starts its
-        dependency (the §1.1 bootstrap loop). The admin is the durable root that
+        dependency (the §1.1 bootstrap loop). The control is the durable root that
         owns the data plane; here we only *ask* it to ensure the plane. If no
-        admin is running, we record an actionable "start the admin" status and
+        control is running, we record an actionable "start the control" status and
         return — best-effort, no exception out.
 
         Lives here, on the GUI-independent service, rather than in the MCP
@@ -672,24 +672,24 @@ class TensorConnection:
         if not is_local_url(url):
             return
 
-        # Ask the admin (control plane) to ensure the data plane, then wait it
-        # through boot. `ensure_data_plane` returns None when no admin answers.
+        # Ask the control (control plane) to ensure the data plane, then wait it
+        # through boot. `ensure_data_plane` returns None when no control answers.
         # NOTE: server_start_timeout is spent on BOTH phases below (ensure, then
         # connect_when_booted), so the worst-case wall wait is ~2x it — see the
         # `mcp.server_start_timeout` config note.
-        logger.info("auto_connect: %s down; asking the admin to ensure it", url)
+        logger.info("auto_connect: %s down; asking the control to ensure it", url)
         snapshot = ensure_data_plane(timeout=self.server_start_timeout())
         if snapshot is None:
             self.last_status = "error"
             self.last_message = (
-                "No data plane, and no biopb admin (control plane) to start one. "
-                "Run `biopb admin start`."
+                "No data plane, and no biopb control (control plane) to start one. "
+                "Run `biopb control start`."
             )
-            logger.info("auto_connect: data plane down and no admin reachable")
+            logger.info("auto_connect: data plane down and no control reachable")
             return
         try:
             self.connect_when_booted(url, token, timeout=self.server_start_timeout())
         except Exception:  # noqa: BLE001
             logger.exception(
-                "auto_connect: data plane did not become ready after admin ensure"
+                "auto_connect: data plane did not become ready after control ensure"
             )

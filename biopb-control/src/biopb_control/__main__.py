@@ -1,11 +1,11 @@
-"""``python -m biopb_admin`` — the runnable admin entry.
+"""``python -m biopb_control`` — the runnable control entry.
 
 The persistent supervisor is normally spawned by the core CLI's
-``biopb admin start`` (which owns the pidfile / detach / stop plumbing) as
-``python -m biopb_admin run ...``; this module is that target. It is plain
+``biopb control start`` (which owns the pidfile / detach / stop plumbing) as
+``python -m biopb_control run ...``; this module is that target. It is plain
 argparse (no typer dependency) and does no config resolution of its own -- the
 caller passes the already-resolved tensor-server endpoint + launch parameters,
-so the admin never imports ``biopb_tensor_server`` config (invariant I2).
+so the control never imports ``biopb_tensor_server`` config (invariant I2).
 """
 
 from __future__ import annotations
@@ -14,17 +14,17 @@ import argparse
 import sys
 from pathlib import Path
 
-from ._admin import run_admin
+from ._run import run_control
 from ._supervisor import DataPlaneSpec
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="biopb-admin", description=__doc__)
+    parser = argparse.ArgumentParser(prog="biopb-control", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="run the admin control plane (foreground)")
-    run.add_argument("--admin-host", default=None)
-    run.add_argument("--admin-port", type=int, default=None)
+    run = sub.add_parser("run", help="run the control plane (foreground)")
+    run.add_argument("--control-host", default=None)
+    run.add_argument("--control-port", type=int, default=None)
     run.add_argument("--config", required=True, help="tensor-server config path")
     run.add_argument("--grpc-host", default="127.0.0.1")
     run.add_argument("--grpc-port", type=int, default=8815)
@@ -55,9 +55,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "run":  # argparse requires a subcommand; defensive
         return 2
 
-    # Defaults for the admin endpoint come from the shared core-SDK module so a
-    # bare `python -m biopb_admin run` and the CLI agree on 8813.
-    from biopb._config_admin import admin_host, admin_port
+    # Defaults for the control endpoint come from the shared core-SDK module so a
+    # bare `python -m biopb_control run` and the CLI agree on 8813.
+    from biopb._config_control import control_host, control_port
 
     spec = DataPlaneSpec(
         config=Path(args.config),
@@ -71,10 +71,10 @@ def main(argv: list[str] | None = None) -> int:
         token=args.token,
         local_bypass=args.local_bypass,
     )
-    return run_admin(
+    return run_control(
         spec,
-        admin_host=args.admin_host or admin_host(),
-        admin_port=args.admin_port or admin_port(),
+        control_host=args.control_host or control_host(),
+        control_port=args.control_port or control_port(),
         data_plane=args.data_plane,
         ensure_timeout=args.ensure_timeout,
         win_sentinel=Path(args.win_sentinel) if args.win_sentinel else None,

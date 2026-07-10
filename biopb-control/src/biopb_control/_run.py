@@ -1,13 +1,13 @@
-"""``run_admin`` — the blocking admin process: supervise + serve control API.
+"""``run_control`` — the blocking control process: supervise + serve control API.
 
 Wires a :class:`DataPlaneSupervisor` to a supervision-loop thread and the stdlib
 control API, then blocks until asked to stop. Stop is delivered the same way the
-other biopb daemons receive it (so ``biopb admin stop`` can reach it): SIGTERM /
+other biopb daemons receive it (so ``biopb control stop`` can reach it): SIGTERM /
 SIGINT on POSIX, a stop-sentinel *file* on Windows (os.kill there is an
 uncatchable TerminateProcess, so a graceful stop must be file-driven).
 
 On stop it tears down the control API and, if it owns the data plane, shuts the
-plane down too. A plane it *adopted* is left running -- the admin did not start
+plane down too. A plane it *adopted* is left running -- the control did not start
 it and does not assume the right to stop it.
 """
 
@@ -44,7 +44,7 @@ def _watch_stop_sentinel(sentinel: Path, stop: threading.Event) -> None:
 
     Mirrors the tensor server / MCP daemon shutdown-sentinel watchers. Polled on
     a daemon thread; a pre-existing sentinel (stale) is consumed on first tick so
-    a leftover file from a prior run can't instantly stop a fresh admin.
+    a leftover file from a prior run can't instantly stop a fresh control.
     """
     try:
         if sentinel.exists():
@@ -63,20 +63,20 @@ def _watch_stop_sentinel(sentinel: Path, stop: threading.Event) -> None:
         stop.wait(0.5)
 
 
-def run_admin(
+def run_control(
     spec: DataPlaneSpec,
     *,
-    admin_host: str,
-    admin_port: int,
+    control_host: str,
+    control_port: int,
     data_plane: bool = True,
     ensure_timeout: float = 60.0,
     win_sentinel: Optional[Path] = None,
     log_level: str = "INFO",
 ) -> int:
-    """Run the admin control plane in the foreground until stopped.
+    """Run the control plane in the foreground until stopped.
 
     Returns a process exit code (0 on a clean stop). ``data_plane=False`` runs an
-    adopt-only admin: it supervises/restarts a tensor server that is already
+    adopt-only control: it supervises/restarts a tensor server that is already
     running but does not spawn one.
     """
     logging.basicConfig(
@@ -89,14 +89,14 @@ def run_admin(
 
     try:
         server, _api_thread = serve_control_api(
-            admin_host, admin_port, supervisor, ensure_timeout
+            control_host, control_port, supervisor, ensure_timeout
         )
     except OSError as exc:
         logger.error(
-            "Could not bind admin control API on %s:%d (%s). "
-            "Is another admin already running?",
-            admin_host,
-            admin_port,
+            "Could not bind control API on %s:%d (%s). "
+            "Is another control already running?",
+            control_host,
+            control_port,
             exc,
         )
         return 1
@@ -108,7 +108,7 @@ def run_admin(
     loop = threading.Thread(
         target=_supervision_loop,
         args=(supervisor, stop, _SUPERVISION_INTERVAL),
-        name="admin-supervision",
+        name="control-supervision",
         daemon=True,
     )
     loop.start()
@@ -126,11 +126,13 @@ def run_admin(
         threading.Thread(
             target=_watch_stop_sentinel,
             args=(win_sentinel, stop),
-            name="admin-stop-sentinel",
+            name="control-stop-sentinel",
             daemon=True,
         ).start()
 
-    logger.info("biopb admin ready (control API on %s:%d)", admin_host, admin_port)
+    logger.info(
+        "biopb control ready (control API on %s:%d)", control_host, control_port
+    )
     try:
         while not stop.wait(1.0):
             pass

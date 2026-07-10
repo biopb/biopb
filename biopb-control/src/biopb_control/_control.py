@@ -1,14 +1,14 @@
-"""The admin's loopback control API — stdlib HTTP, no web framework.
+"""The control's loopback control API — stdlib HTTP, no web framework.
 
 A tiny :class:`http.server.ThreadingHTTPServer` is all Layer-2 core needs: two
 JSON endpoints a client uses to learn whether the data plane is up and to ask
-the admin to bring it up. Kept on the stdlib so the lean admin pulls in no
+the control to bring it up. Kept on the stdlib so the lean control pulls in no
 starlette/uvicorn/httpx yet — those arrive with the Layer-3 single-origin front,
 which will replace this module with a real ASGI app on the same port.
 
 Endpoints:
 
-- ``GET  /health``            -> ``{"admin": "ok", "data_plane": {...}}``
+- ``GET  /health``            -> ``{"control": "ok", "data_plane": {...}}``
 - ``POST /data_plane/ensure`` -> ensure the plane is up (bounded wait), then the
                                  snapshot; this is what ``biopb-mcp`` calls in
                                  place of shelling out ``biopb server start``.
@@ -26,20 +26,20 @@ from ._supervisor import DataPlaneSupervisor
 logger = logging.getLogger(__name__)
 
 
-class _AdminHTTPServer(ThreadingHTTPServer):
+class _ControlHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer carrying the supervisor the handler dispatches to."""
 
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, addr, supervisor: DataPlaneSupervisor, ensure_timeout: float):
-        super().__init__(addr, _AdminHandler)
+        super().__init__(addr, _ControlHandler)
         self.supervisor = supervisor
         self.ensure_timeout = ensure_timeout
 
 
-class _AdminHandler(BaseHTTPRequestHandler):
-    server_version = "biopb-admin/control"
+class _ControlHandler(BaseHTTPRequestHandler):
+    server_version = "biopb-control/control"
 
     # Route access logs through the module logger (debug) instead of stderr.
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib hook name
@@ -60,10 +60,10 @@ class _AdminHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - stdlib hook name
         if self.path in ("/health", "/healthz"):
             self._write_json(
-                200, {"admin": "ok", "data_plane": self._supervisor.snapshot()}
+                200, {"control": "ok", "data_plane": self._supervisor.snapshot()}
             )
         elif self.path == "/":
-            self._write_json(200, {"admin": "ok", "service": "biopb control plane"})
+            self._write_json(200, {"control": "ok", "service": "biopb control plane"})
         else:
             self._write_json(404, {"error": "not found", "path": self.path})
 
@@ -90,17 +90,17 @@ def serve_control_api(
     port: int,
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
-) -> tuple[_AdminHTTPServer, threading.Thread]:
+) -> tuple[_ControlHTTPServer, threading.Thread]:
     """Start the control API on ``host:port`` in a background thread.
 
     Returns the server and its thread; the caller shuts it down with
     ``server.shutdown()`` on teardown. Binds eagerly so a port clash surfaces
-    to the caller (an admin already running) rather than in a detached thread.
+    to the caller (a control plane already running) rather than in a detached thread.
     """
-    server = _AdminHTTPServer((host, port), supervisor, ensure_timeout)
+    server = _ControlHTTPServer((host, port), supervisor, ensure_timeout)
     thread = threading.Thread(
-        target=server.serve_forever, name="admin-control-api", daemon=True
+        target=server.serve_forever, name="control-control-api", daemon=True
     )
     thread.start()
-    logger.info("Admin control API listening on http://%s:%d", host, port)
+    logger.info("Control API listening on http://%s:%d", host, port)
     return server, thread

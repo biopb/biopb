@@ -723,7 +723,7 @@ def test_health_delegates(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# local-URL detection + admin-ensure fallback
+# local-URL detection + control-ensure fallback
 # ---------------------------------------------------------------------------
 
 
@@ -761,7 +761,7 @@ class TestAutoConnect:
     """The shared connect policy used by both the kernel and the widget.
 
     Since Layer 2 of the de-daemonization migration, ``_connection`` is a pure
-    client: when the local data plane is down it asks the admin (control plane)
+    client: when the local data plane is down it asks the control plane
     to ensure it via ``ensure_data_plane``, and never spawns a server itself.
     Both callers drive this off their own worker thread; here we call it directly
     with ``connect`` and friends mocked.
@@ -780,7 +780,7 @@ class TestAutoConnect:
         conn.auto_connect()
 
         connect.assert_called_once_with("grpc://host:9", "tok")
-        # A clean connect short-circuits -- no boot wait, no admin call.
+        # A clean connect short-circuits -- no boot wait, no control call.
         booted.assert_not_called()
         ensure.assert_not_called()
 
@@ -800,7 +800,7 @@ class TestAutoConnect:
 
         conn.auto_connect()
 
-        # A STARTING server is waited through, not handed to the admin.
+        # A STARTING server is waited through, not handed to the control.
         booted.assert_called_once_with("grpc://host:9", None, timeout=42.0)
         ensure.assert_not_called()
 
@@ -822,10 +822,10 @@ class TestAutoConnect:
 
         # Best-effort: a boot timeout must not raise out of auto_connect.
         conn.auto_connect()
-        # Already up (just slow), so we do NOT fall through to the admin.
+        # Already up (just slow), so we do NOT fall through to the control.
         ensure.assert_not_called()
 
-    def test_unreachable_asks_admin_to_ensure(self, monkeypatch):
+    def test_unreachable_asks_control_to_ensure(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url, conn.token = "grpc://localhost:8815", None
         monkeypatch.setattr(
@@ -844,7 +844,7 @@ class TestAutoConnect:
         ensure.assert_called_once_with(timeout=30.0)
         booted.assert_called_once_with("grpc://localhost:8815", None, timeout=30.0)
 
-    def test_remote_unreachable_does_not_ask_admin(self, monkeypatch):
+    def test_remote_unreachable_does_not_ask_control(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url = "grpc://remote:9"
         monkeypatch.setattr(
@@ -856,10 +856,10 @@ class TestAutoConnect:
         monkeypatch.setattr(_connection, "ensure_data_plane", ensure)
 
         conn.auto_connect()  # must not raise
-        # A remote server is not ours (or the admin's) to start.
+        # A remote server is not ours (or the control's) to start.
         ensure.assert_not_called()
 
-    def test_no_admin_records_actionable_status(self, monkeypatch):
+    def test_no_control_records_actionable_status(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url = "grpc://localhost:8815"
         monkeypatch.setattr(
@@ -867,7 +867,7 @@ class TestAutoConnect:
             "connect",
             MagicMock(side_effect=RuntimeError("connection refused")),
         )
-        # No admin answers -> ensure returns None.
+        # No control answers -> ensure returns None.
         monkeypatch.setattr(_connection, "ensure_data_plane", lambda timeout: None)
         booted = MagicMock()
         monkeypatch.setattr(conn, "connect_when_booted", booted)
@@ -876,9 +876,9 @@ class TestAutoConnect:
 
         booted.assert_not_called()
         assert conn.last_status == "error"
-        assert "biopb admin start" in conn.last_message
+        assert "biopb control start" in conn.last_message
 
-    def test_admin_ensure_then_boot_failure_is_swallowed(self, monkeypatch):
+    def test_control_ensure_then_boot_failure_is_swallowed(self, monkeypatch):
         conn = TensorConnection(config={})
         conn.url = "grpc://localhost:8815"
         monkeypatch.setattr(

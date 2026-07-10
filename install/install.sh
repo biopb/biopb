@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# biopb stack installer (biopb-mcp + biopb + biopb-tensor-server + biopb-admin)
+# biopb stack installer (biopb-mcp + biopb + biopb-tensor-server + biopb-control)
 # Usage: curl -fsSL https://biopb.org/install.sh | bash
 #
 # Idempotent: rerun to upgrade to latest version
@@ -1069,7 +1069,7 @@ install_biopb() {
     # the tagged commit) and the resolver is never allowed to pull biopb /
     # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
     # set — no PyPI-vs-release version skew.
-    local biopb_req tensor_req mcp_req admin_req
+    local biopb_req tensor_req mcp_req control_req
     # napari is the one runtime dep resolved from PyPI. We pin it to the exact
     # version this release was built/tested against (carried in its versions.json
     # attribute, read below) so the deployed object graph matches the graph-walk
@@ -1086,14 +1086,14 @@ install_biopb() {
         fi
         exit 1
     fi
-    local mcp_url sdk_url tensor_url admin_url
+    local mcp_url sdk_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
     sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-    # biopb-admin (control plane) wheel. Its filename uses an underscore
-    # (biopb_admin-…), so the sdk regex `biopb-…` above never matches it.
-    admin_url=$(_release_asset_url 'biopb_admin-[^/]+\.whl')
-    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$admin_url" ]; then
+    # biopb-control (control plane) wheel. Its filename uses an underscore
+    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
+    control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
+    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
         _err "Release $RELEASE_TAG is missing one of the biopb wheels."
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
@@ -1127,22 +1127,22 @@ install_biopb() {
     local mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
     local sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
     local tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
-    local admin_whl="$WHEELS_DIR/$(_urldecode "$(basename "$admin_url")")"
+    local control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
-    curl -fsSL "$admin_url" -o "$admin_whl"
+    curl -fsSL "$control_url" -o "$control_whl"
     # Verify the downloaded wheels against the release's SHA256SUMS before they
     # are file://-installed (aborts on a mismatch; fails open on an older release
     # without the manifest). See the auto-updater trust item in issue #87.
-    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl" "$admin_whl"
+    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl" "$control_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
-    # `biopb[tensor]`, the admin's `biopb`) to the downloaded set rather than PyPI.
+    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set rather than PyPI.
     mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
     biopb_req="biopb[tensor] @ file://$sdk_whl"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
-    admin_req="biopb-admin @ file://$admin_whl"
+    control_req="biopb-control @ file://$control_whl"
 
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
@@ -1176,14 +1176,14 @@ install_biopb() {
         --with "$napari_req"
         --with-executables-from biopb-mcp
     )
-    # biopb-admin (control plane): supervises the data plane. `biopb admin …` is
-    # exposed through the core `biopb` CLI, which spawns `python -m biopb_admin`,
+    # biopb-control (control plane): supervises the data plane. `biopb control …` is
+    # exposed through the core `biopb` CLI, which spawns `python -m biopb_control`,
     # so it only needs to be importable in this shared env; --with-executables-from
-    # also links the standalone `biopb-admin` script for direct `biopb-admin run`.
-    _info "  including biopb-admin"
+    # also links the standalone `biopb-control` script for direct `biopb-control run`.
+    _info "  including biopb-control"
     install_args+=(
-        --with "$admin_req"
-        --with-executables-from biopb-admin
+        --with "$control_req"
+        --with-executables-from biopb-control
     )
 
     # cryptography >= 49 dropped its universal2/x86_64 macOS wheel and now ships

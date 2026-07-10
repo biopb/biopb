@@ -1,4 +1,4 @@
-# Control-plane architecture: a central admin endpoint
+# Control-plane architecture: a central control endpoint
 
 **Status:** design / planned. Supersedes and absorbs the earlier
 "de-daemonization migration" note — MCP de-daemonization is now **Layer 1** of a
@@ -42,38 +42,38 @@ knows "what is running" or that owns "what should be running."
 
 ## 2. Target architecture
 
-A lean, always-on **admin / control plane** becomes the durable root. It
+A lean, always-on **control plane** becomes the durable root. It
 supervises the durable planes, observes the ephemeral sessions, and is the single
 web origin.
 
 ```
-   biopb admin / control plane      (durable ROOT — lean: supervise + route + static UI)
+   biopb control plane      (durable ROOT — lean: supervise + route + static UI)
         │
         ├── supervises ──►  data plane      (tensor Flight server)           ┐ durable,
-        ├── supervises ──►  algorithm plane (algorithm servers + their config)┘ admin-owned
+        ├── supervises ──►  algorithm plane (algorithm servers + their config)┘ control-owned
         │
         └── observes   ◄──  MCP sessions    (ephemeral, SHIM-owned)  ── self-register on start
                               │  env inherited from the shim   (this is the #98 fix)
                               └─ USE the data / algorithm planes; never START them
 
-   dependency graph: a tree rooted at the admin. No cycles.
+   dependency graph: a tree rooted at the control. No cycles.
 ```
 
 ### The two invariants that make this correct
 
-**I1 — The admin supervises durable planes but only *observes* ephemeral
-sessions; it must never *spawn* a session.** If the admin spawned MCP sessions,
-each session would inherit the *admin's* frozen environment instead of the
+**I1 — The control supervises durable planes but only *observes* ephemeral
+sessions; it must never *spawn* a session.** If the control spawned MCP sessions,
+each session would inherit the *control's* frozen environment instead of the
 client's live one — re-breaking #98 (headless viewer). Sessions stay **shim-owned
-and env-inherited**; they merely **register** with the admin so it can route to
-their observe page and list them. *Admin owns the durable planes; shims own the
+and env-inherited**; they merely **register** with the control so it can route to
+their observe page and list them. *Control owns the durable planes; shims own the
 sessions; sessions register for observability.*
 
-**I2 — The admin stays lean and subprocess-based.** Its only jobs are
+**I2 — The control stays lean and subprocess-based.** Its only jobs are
 supervision, routing, and serving a static UI. It launches components as
 **subprocesses** (`python -m biopb_tensor_server …`, `python -m biopb_mcp.mcp …`),
 never by importing them — so no napari/Qt/dask/kernel and no cross-package
-imports enter the control plane. This is the discipline that keeps the admin from
+imports enter the control plane. This is the discipline that keeps the control from
 becoming the coupling monster the rejected process-merge would have been. It is
 not a new pattern: it is the existing `biopb` CLI subprocess supervision
 (`biopb server|mcp start/stop`, which already spawns both without importing
@@ -84,20 +84,20 @@ registry, health monitoring, and a web front.**
 
 | Component | Lifetime | Owned by | Role |
 |---|---|---|---|
-| **Admin / control plane** | durable (root) | the OS service / `biopb` launcher | supervise, route, single-origin web front, session registry, auth/TLS termination |
-| **Data plane** (tensor Flight) | durable | admin (supervised subprocess) | pixels, cache, remote-data proxy |
-| **Algorithm plane** | durable | admin (supervised subprocess/container) | compute ops; config lives with admin |
-| **MCP session** | ephemeral | the **shim** (not the admin) | kernel + dask + viewer; env-inherited; registers with admin |
+| **Control plane** | durable (root) | the OS service / `biopb` launcher | supervise, route, single-origin web front, session registry, auth/TLS termination |
+| **Data plane** (tensor Flight) | durable | control (supervised subprocess) | pixels, cache, remote-data proxy |
+| **Algorithm plane** | durable | control (supervised subprocess/container) | compute ops; config lives with control |
+| **MCP session** | ephemeral | the **shim** (not the control) | kernel + dask + viewer; env-inherited; registers with control |
 | **Shim** | per client connection | the MCP client | stdio bridge; spawns & reaps its session child |
 
 ---
 
-## 3. The admin endpoint
+## 3. The control endpoint
 
 **Is:** a small always-on process that (a) supervises the durable planes
 (start / liveness-monitor / restart-on-request or crash-with-backoff / status),
 (b) holds an in-memory **registry** of live MCP sessions that self-register, (c)
-serves the **single origin** — static admin UI + dataviewer webapp + reverse-proxy
+serves the **single origin** — static control UI + dataviewer webapp + reverse-proxy
 to each session's observe page — and terminates auth/TLS there.
 
 **Is not:** a compute host. No Qt, no napari, no dask cluster, no kernel, no
@@ -109,19 +109,19 @@ restart on request or on crash with backoff. Not an orchestrator; no scheduling,
 no scaling. (The tensor server's progressive-discovery `health` fields are the
 readiness signal it polls.)
 
-**Bootstrapping:** the admin is the root, started by the `biopb` launcher / an OS
+**Bootstrapping:** the control is the root, started by the `biopb` launcher / an OS
 service (systemd / launchd / Windows service). Everything else is downstream, so
 the graph has a single entry and no cycle.
 
-**Failure semantics:** the admin is a single point of failure for
+**Failure semantics:** the control is a single point of failure for
 *supervision and routing only* — already-spawned planes keep serving through an
-admin blip and **re-register** when it returns. Keeping the admin lean and
+control blip and **re-register** when it returns. Keeping the control lean and
 crash-only-restartable is what bounds that blast radius. (Contrast the process
 merge, where a fault took down data serving itself.)
 
 ---
 
-## 4. Layer 1 — MCP de-daemonization (shim-owned, ephemeral, admin-observed)
+## 4. Layer 1 — MCP de-daemonization (shim-owned, ephemeral, control-observed)
 
 The tactical layer. Fixes #98/#403 now and makes sessions clean clients.
 
@@ -133,9 +133,9 @@ The tactical layer. Fixes #98/#403 now and makes sessions clean clients.
 - The child **inherits the shim's live environment** → `DISPLAY` / `XAUTHORITY` /
   `WAYLAND_DISPLAY` are always the user's current session. This is the root fix
   for #98; the wire-threading/shim-stamping design becomes unnecessary.
-- The child **registers with the admin** on startup (session id + dynamic port +
-  pid) and **deregisters on reap**, so the admin can route `/observe` to it and
-  list it. Registration/observability is the *only* admin touchpoint — the admin
+- The child **registers with the control** on startup (session id + dynamic port +
+  pid) and **deregisters on reap**, so the control can route `/observe` to it and
+  list it. Registration/observability is the *only* control touchpoint — the control
   does not own the child's lifecycle (invariant I1).
 
 ### 4.2 The §2.6 shared-session thesis is preserved
@@ -148,7 +148,7 @@ intact. `biopb mcp` (below) is the separate no-agent convenience.
 
 - **Persistence across a client restart** — a session ends when its client quits.
   Acceptable because durable state lives in the data plane (cache, proxy), which
-  the admin keeps up; teardown only happens at app-quit anyway. (Public record:
+  the control keeps up; teardown only happens at app-quit anyway. (Public record:
   Claude Code, opencode, and Claude Desktop all keep the stdio server for the
   whole app session and tear down only on quit.)
 - **A single session shared across clients** — two agents get two viewers now,
@@ -170,7 +170,7 @@ intact. `biopb mcp` (below) is the separate no-agent convenience.
   `spawn_session`: drop the "already listening?" probe, the fixed port, and the
   detachment; spawn a tracked child with **inherited env** + the port pipe; read
   the port; bridge to `http://127.0.0.1:<port>/mcp`; then **register the session
-  with the admin**. On stdin-EOF / bridge close / shim exit, reap the child *and
+  with the control**. On stdin-EOF / bridge close / shim exit, reap the child *and
   its kernel grandchild* and **deregister**:
   - POSIX — child in the shim's process group / parent-death pipe → group kill.
   - Windows — the **shim** creates a Job Object (`_winjob.py`, #403) and assigns
@@ -182,11 +182,11 @@ intact. `biopb mcp` (below) is the separate no-agent convenience.
 
 ---
 
-## 5. Layer 2 — Admin owns the data plane; break the `_connection` loop
+## 5. Layer 2 — Control owns the data plane; break the `_connection` loop
 
 The structural fix. Highest value; unblocks single origin.
 
-> **Status: core landed.** The admin skeleton + data-plane supervision +
+> **Status: core landed.** The control skeleton + data-plane supervision +
 > `_connection` de-loop shipped as the Layer-2 *core* (phasing step 1). What
 > remains for full Layer 2 is trimming the tensor server's public web surface
 > (the third bullet), which pairs with the Layer-3 single-origin front.
@@ -195,49 +195,49 @@ The structural fix. Highest value; unblocks single origin.
   `can_autostart_server` / `launch_local_server` / `start_local_server` are
   **removed**; `auto_connect` no longer `Popen`s a server. `_connection` is now a
   **pure client**: connect, wait through a `STARTING` data-folder scan, and — when
-  the local plane is down — ask the admin to ensure it (`biopb_mcp/_admin_client.py`),
-  never shelling out. With no admin reachable it records an actionable
-  "run `biopb admin start`" status.
-- **A lean admin supervises the data plane.** *(done)* New **`biopb-admin`**
-  workspace package (own `admin-v*` tag), managed by `biopb admin
+  the local plane is down — ask the control to ensure it (`biopb_mcp/_control_client.py`),
+  never shelling out. With no control reachable it records an actionable
+  "run `biopb control start`" status.
+- **A lean control supervises the data plane.** *(done)* New **`biopb-control`**
+  workspace package (own `control-v*` tag), managed by `biopb control
   start/stop/status/run` in the core CLI (which owns the pidfile/detach/stop
   plumbing, reused from the server/mcp daemons). `DataPlaneSupervisor` spawns the
   tensor server (the same `python -m biopb_tensor_server.cli launch` argv `biopb
   server start` uses), polls TCP liveness, and restarts on crash with capped
-  backoff. **The admin is the *sole owner* of the data plane** — it always spawns
+  backoff. **The control is the *sole owner* of the data plane** — it always spawns
   and manages its own child and never adopts a server it did not start (decision:
   the earlier dual spawn/adopt mode was dropped as needless complexity, see §9).
-  A gRPC port already in use is a *conflict* it refuses (`admin start` errors,
+  A gRPC port already in use is a *conflict* it refuses (`control start` errors,
   mirroring `biopb server start`'s port guard), not something to attach to. This
   single-owner rule is what keeps `self._proc` the whole state and makes `biopb
-  admin stop` a **complete data-plane teardown** (no "adopted, left running"
+  control stop` a **complete data-plane teardown** (no "adopted, left running"
   case). Per invariant **I2** it imports neither `biopb_tensor_server` nor
-  `biopb_mcp`; the only shared fact — the admin's loopback endpoint — lives in the
-  core SDK (`biopb/_config_admin.py`). `biopb admin start` brings the plane up by
-  default (`--no-data-plane` starts the admin without it, on-demand).
+  `biopb_mcp`; the only shared fact — the control's loopback endpoint — lives in the
+  core SDK (`biopb/_config_control.py`). `biopb control start` brings the plane up by
+  default (`--no-data-plane` starts the control without it, on-demand).
 - **Control API.** *(done)* A stdlib `ThreadingHTTPServer` on `127.0.0.1:8813`
   exposes `GET /health` and `POST /data_plane/ensure` — the endpoint `_connection`
   calls in place of the old shell-out. This is the seed of the Layer-3 origin; it
   stays stdlib until the front replaces it with an ASGI app on the same port.
-- **The tensor server trends to Flight + a minimal internal HTTP** the admin
+- **The tensor server trends to Flight + a minimal internal HTTP** the control
   proxies; it loses its role as a public web surface. *(pending — with Layer 3.)*
   This makes the data plane simpler and removes the last reason MCP needs to know
   how to launch it.
 
-Result: the cycle in §1.1 becomes a tree rooted at the admin.
+Result: the cycle in §1.1 becomes a tree rooted at the control.
 
 ---
 
-## 6. Layer 3 — Single-origin web front (a facet of the admin)
+## 6. Layer 3 — Single-origin web front (a facet of the control)
 
-The admin *is* the durable web origin, so single origin falls out — it is no
+The control *is* the durable web origin, so single origin falls out — it is no
 longer a reverse-proxy bolted onto the ephemeral sidecar.
 
 **Routing:**
 
 | Path | Target | Hop |
 |---|---|---|
-| `/`, admin UI, dataviewer | admin's own static app | in-process |
+| `/`, control UI, dataviewer | control's own static app | in-process |
 | `/api/slice`, data API | tensor server's internal HTTP | loopback proxy |
 | `/observe`, observe API | the registered session's dynamic port | loopback proxy |
 | `/session/<id>/*` | that session's port (multi-session) | loopback proxy |
@@ -248,13 +248,13 @@ session"; `/session/<id>/` is the multi-session refinement.
 
 **Session discovery:** a **filesystem registry** (recommended for localhost) —
 each session writes `~/.local/share/biopb/sessions/<id>.json` (port + pid) on
-startup, removes it on reap; the admin reads/watches that dir. Matches the
+startup, removes it on reap; the control reads/watches that dir. Matches the
 existing sentinel/PID-file idioms; no new endpoint. (HTTP self-registration is
 the alternative if the front and children may later cross a machine boundary.)
 
 **Why it is worth more than one bookmark:**
 - **Security win.** The observe UI currently fronts an `execute_code` RCE behind
-  loopback + Host/Origin only. Behind the admin origin, the tensor server's Bearer
+  loopback + Host/Origin only. Behind the control origin, the tensor server's Bearer
   token gates it *uniformly*, and the loopback hop to the child is trusted. This
   is the surface you put TLS + authn in front of for the §1 "trusted intranet"
   hardening — **one origin to front, not N dynamic ports.**
@@ -292,22 +292,22 @@ background daemon is retired rather than reshaped**:
   per-session-log "single shared file" override). Their comments note the reduced
   role.
 
-The eventual admin-registration + admin-fronted observe link remain future work
+The eventual control-registration + control-fronted observe link remain future work
 (Layers 2–3); `biopb mcp view` prints the direct `/mcp` URL in the meantime.
 
 ---
 
-## 7. Layer 4 — Algorithm plane under admin (config extraction) *(later)*
+## 7. Layer 4 — Algorithm plane under control (config extraction) *(later)*
 
 The largest and most separable piece — sequence it last so it cannot stall the
 core.
 
-- Move algorithm-server configuration **out of MCP** into the admin's config.
-- The admin supervises algorithm-server lifecycles (subprocess / container) like
-  the data plane, and sessions discover them through the admin rather than
+- Move algorithm-server configuration **out of MCP** into the control's config.
+- The control supervises algorithm-server lifecycles (subprocess / container) like
+  the data plane, and sessions discover them through the control rather than
   carrying their own config.
 - Ops (`ProcessImage` / `ObjectDetection`) remain wired into the kernel namespace
-  as today; only *which servers exist and how they start* moves to the admin.
+  as today; only *which servers exist and how they start* moves to the control.
 
 ---
 
@@ -316,27 +316,27 @@ core.
 Each phase is independently shippable; the old shim keeps working until Layer 1
 flips it. Suggested order (value-first):
 
-1. **Admin skeleton + data-plane supervision (Layer 2 core).** ✅ *Shipped.* Lean
-   `biopb-admin` package supervises the tensor server (spawn/adopt/restart);
-   `_connection` gutted to a pure client that asks the admin to ensure the plane.
-   Breaks the bootstrap loop. (Session self-registration + the admin-fronted
+1. **Control skeleton + data-plane supervision (Layer 2 core).** ✅ *Shipped.* Lean
+   `biopb-control` package supervises the tensor server (spawn/adopt/restart);
+   `_connection` gutted to a pure client that asks the control to ensure the plane.
+   Breaks the bootstrap loop. (Session self-registration + the control-fronted
    observe route are deferred to Layer 3.)
 2. **De-daemonize sessions + registry (Layer 1).** ✅ *Shipped* (before the Layer-2
    core, reordering the value-first list to fix #98/#403 first). Serve-core
    refactor, shim ownership, dynamic-port handoff. Closes #98 (env inheritance)
    and lands #403/#402 in the shim-owned model. Session self-registration with the
-   admin is the remaining registry piece, folded into Layer 3.
-3. **Single-origin front (Layer 3).** Admin routes `/observe`, absorbs the
-   dataviewer + admin UI, terminates auth/TLS. Downgrade `biopb mcp` to the
+   control is the remaining registry piece, folded into Layer 3.
+3. **Single-origin front (Layer 3).** Control routes `/observe`, absorbs the
+   dataviewer + control UI, terminates auth/TLS. Downgrade `biopb mcp` to the
    standalone wrapper.
-4. **Algorithm plane under admin (Layer 4).** Config extraction + supervision.
+4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---
 
 ## 9. Risks / open questions
 
-- **Admin as SPOF (supervision/routing only).** Keep it lean and crash-only;
-  already-spawned planes must survive an admin blip and re-register.
+- **Control as SPOF (supervision/routing only).** Keep it lean and crash-only;
+  already-spawned planes must survive a control blip and re-register.
 - **Resource multiplication.** N concurrent sessions = N dask `LocalCluster`s +
   N kernels + N viewers (was one shared). Consider a soft cap or a shared-cluster
   opt-in if it bites.
@@ -347,25 +347,25 @@ flips it. Suggested order (value-first):
 - **Startup latency moves to per-session** (no daemon to amortize the http-stack
   import). The heavy kernel/dask/napari start stays lazy (first `start_kernel`),
   so the shim-spawn cost is the import only. Acceptable for session-scoped clients.
-- **Admin's packaging home.** Subprocess-based (I2) keeps it decoupled, so it can
+- **Control's packaging home.** Subprocess-based (I2) keeps it decoupled, so it can
   live wherever the `biopb` launcher lives (core `biopb`) without depending on the
   unpublished tensor server or on `biopb-mcp`. Decide: extend the existing
-  `biopb` CLI process, or a dedicated `biopb admin` entrypoint.
-- **What keeps the admin alive** (systemd / launchd / Windows service vs. a
+  `biopb` CLI process, or a dedicated `biopb control` entrypoint.
+- **What keeps the control alive** (systemd / launchd / Windows service vs. a
   detached process the installer manages) — the one place a persistent daemon is
   still wanted, now isolated to the lean control plane.
 - **Config unification.** Data-plane, algorithm-plane, and MCP config could
-  collapse into one admin-owned surface, or stay per-plane with the admin
+  collapse into one control-owned surface, or stay per-plane with the control
   referencing them. Decide during Layer 4.
 - **Transition / back-compat.** `biopb server` / `biopb mcp` semantics during the
-  migration. *Resolved (Layer 2 core): the admin does NOT adopt an already-running
+  migration. *Resolved (Layer 2 core): the control does NOT adopt an already-running
   tensor server.* Supervising both spawned and adopted servers made the state
   fragile (a crashed child's handle could no longer be trusted to tell "ours" from
-  "someone else's") and left teardown incomplete (`admin stop` couldn't stop an
-  adopted plane). The admin is now the **sole owner**: it always spawns its own
+  "someone else's") and left teardown incomplete (`control stop` couldn't stop an
+  adopted plane). The control is now the **sole owner**: it always spawns its own
   plane and treats a port already in use as a conflict to refuse. During migration
   the old standalone `biopb server start` daemon still exists, but you run *either*
-  it *or* the admin, not both against one port — the admin will not attach to a
+  it *or* the control, not both against one port — the control will not attach to a
   server it did not start.
 
 ---
