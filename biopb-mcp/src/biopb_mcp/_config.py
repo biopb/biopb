@@ -157,13 +157,20 @@ DEFAULT_CONFIG = {
             # viewer-dependent tools return a clear message; the `viewer`
             # namespace object self-describes on access.
             "display_mode": "auto",
-            # Where the stdio bridge sends the spawned daemon's stdout/stderr
-            # (inherited by its child kernel, so this still carries the native
-            # Qt/GL/dask/gRPC output the key always named). Empty ->
-            # ~/.local/share/biopb-mcp/log/mcp-server.log. Unused when the daemon
-            # is launched directly with --transport http (output stays on the
-            # launching terminal/service manager).
+            # Force the stdio bridge's session child to log to ONE fixed file
+            # instead of the default per-session file. Empty (default) -> each
+            # shim session gets its own ~/.local/share/biopb-mcp/log/sessions/
+            # <id>.log (pruned to session_log_keep), so concurrent sessions don't
+            # interleave. Set a path here to send every session to that single
+            # file instead (the pre-de-daemonization behavior). Unused when
+            # launched directly with --transport http (output stays on the
+            # launching terminal/service manager) or by `biopb mcp start` (the
+            # CLI redirects to mcp-server.log itself).
             "kernel_log": "",
+            # How many per-session shim logs to keep under log/sessions/ (newest
+            # by mtime); older ones are pruned on each new session. Ignored when
+            # kernel_log forces a single shared file.
+            "session_log_keep": 5,
             # Extra Host/Origin header values appended to the loopback allowlist
             # that guards the server against DNS-rebinding / cross-origin browser
             # requests. Set these only when fronting the server with a reverse
@@ -430,6 +437,20 @@ def get_log_dir() -> Path:
     return log_dir
 
 
+def get_session_log_dir() -> Path:
+    """Directory for per-session stdio-shim logs (<log dir>/sessions).
+
+    Each shim-owned session (de-daemonization Layer 1) writes its own logfile
+    here rather than the shared ``mcp-server.log``, so concurrent sessions never
+    interleave; retention (``mcp.transport.session_log_keep``) prunes it to the
+    newest N. The standalone ``biopb mcp start`` daemon keeps using
+    ``mcp-server.log`` — a separate domain.
+    """
+    d = get_log_dir() / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def get_daemon_log_file(config: Optional[dict] = None) -> Path:
     """Path of the http daemon's combined stdout/stderr log.
 
@@ -521,6 +542,7 @@ _CONSTRAINTS = {
     "mcp.transport.kind": Enum({"http", "stdio"}),
     "mcp.transport.port": Range(min=1, max=65535),
     "mcp.transport.display_mode": Enum({"auto", "visible", "headless"}),
+    "mcp.transport.session_log_keep": Range(min=1),  # keep at least the current
     "mcp.kernel.startup_timeout": Range(exclusive_min=0),
     "mcp.kernel.execute_timeout": Range(exclusive_min=0),
     "mcp.kernel.busy_lock_timeout": Range(exclusive_min=0),

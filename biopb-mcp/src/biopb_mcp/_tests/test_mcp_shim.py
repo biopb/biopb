@@ -114,31 +114,62 @@ class TestReadPortFile:
         assert _shim._read_port_file(str(p)) is None
 
 
-class TestOpenDaemonLog:
-    def test_uses_configured_path(self, tmp_path):
-        path = tmp_path / "d.log"
-        f = _shim._open_daemon_log(_cfg(kernel_log=str(path)))
+class TestOpenSessionLog:
+    def test_writes_to_path_creating_parent(self, tmp_path):
+        path = tmp_path / "sub" / "sess.log"  # parent does not exist yet
+        f = _shim._open_session_log(str(path))
         try:
             f.write(b"hello\n")
         finally:
             f.close()
         assert path.read_bytes() == b"hello\n"
 
-    def test_empty_path_defaults_under_log_dir(self, tmp_path, monkeypatch):
+    def test_falls_back_to_stderr_when_unopenable(self, tmp_path):
+        # Parent path is a FILE, so mkdir(parents=True) fails regardless of
+        # privilege (works even when tests run as root).
+        blocker = tmp_path / "afile"
+        blocker.write_text("x")
+        f = _shim._open_session_log(str(blocker / "sub" / "x.log"))
+        assert f is getattr(sys.stderr, "buffer", sys.stderr)
+
+
+class TestSessionLogPath:
+    def test_default_is_per_session_under_sessions_dir(self, tmp_path, monkeypatch):
         import biopb_mcp._config as cfg
 
         monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
-        f = _shim._open_daemon_log(_cfg(kernel_log=""))
-        try:
-            assert (tmp_path / "mcp-server.log").exists()
-        finally:
-            f.close()
+        p = _shim._session_log_path(_cfg(), "20260101-000000-42")
+        assert p == str(tmp_path / "sessions" / "20260101-000000-42.log")
 
-    def test_falls_back_to_stderr_on_open_error(self):
-        f = _shim._open_daemon_log(
-            _cfg(kernel_log="/nonexistent_dir/deep/path/kernel.log")
-        )
-        assert f is getattr(sys.stderr, "buffer", sys.stderr)
+    def test_kernel_log_override_forces_single_file(self, tmp_path):
+        override = tmp_path / "one.log"
+        p = _shim._session_log_path(_cfg(kernel_log=str(override)), "sid")
+        assert p == str(override)
+
+
+class TestPruneSessionLogs:
+    def test_keeps_newest_n_by_mtime(self, tmp_path, monkeypatch):
+        import biopb_mcp._config as cfg
+
+        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        for i in range(7):
+            p = sessions / f"s{i}.log"
+            p.write_text("x")
+            os.utime(p, (1000 + i, 1000 + i))  # ascending mtime: s6 newest
+        _shim._prune_session_logs(3)
+        assert sorted(q.name for q in sessions.glob("*.log")) == [
+            "s4.log",
+            "s5.log",
+            "s6.log",
+        ]
+
+    def test_missing_dir_is_noop(self, tmp_path, monkeypatch):
+        import biopb_mcp._config as cfg
+
+        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path / "nope")
+        _shim._prune_session_logs(5)  # must not raise
 
 
 class TestSpawnSession:
@@ -191,6 +222,8 @@ class TestSpawnSession:
         assert url == "http://127.0.0.1:54321/mcp"
         assert captured["env"]["DISPLAY"] == ":test-99"
         assert captured["env"]["BIOPB_PORT_REPORT_FILE"]  # port channel wired
+        # session log path handed to the child (here the kernel_log override).
+        assert captured["env"]["BIOPB_MCP_SESSION_LOG"] == str(tmp_path / "d.log")
         assert captured["cmd"][-2:] == ["--port", "0"]  # dynamic port
 
     def test_raises_when_child_dies_before_reporting(self, tmp_path, monkeypatch):
@@ -414,13 +447,13 @@ class TestEndToEnd:
             assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
 
             # The owned child logs its PID (uvicorn's "Started server process
-            # [pid]") and its dynamic listen URL (_server.run) to the daemon log
-            # under the isolated home.
-            log = (
-                (tmp_path / ".local/share/biopb-mcp/log/mcp-server.log")
-                .read_bytes()
-                .decode(errors="replace")
-            )
+            # [pid]") and its dynamic listen URL (_server.run) to its own
+            # per-session logfile under log/sessions/ (NOT the shared
+            # mcp-server.log — that separation is the session-log feature).
+            sessions_dir = tmp_path / ".local/share/biopb-mcp/log/sessions"
+            session_logs = list(sessions_dir.glob("*.log"))
+            assert len(session_logs) == 1, session_logs
+            log = session_logs[0].read_bytes().decode(errors="replace")
             child_pid = int(
                 _extract(r"Started server process \[(\d+)\]", log, "child pid")
             )

@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 import anyio
 from mcp import types
@@ -76,6 +77,12 @@ REAP_TIMEOUT = 10.0
 # this featherweight module from importing the heavy launcher).
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
+# Env var telling the child the path of its own session logfile, so it can report
+# it (server_status) and the agent's execute_code can read it from os.environ.
+# The child inherits it, and so does the kernel it spawns. Kept in sync with
+# __main__.ENV_SESSION_LOG.
+ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+
 
 def _port_listening(port, timeout=0.5):
     """Whether something accepts TCP connections on 127.0.0.1:<port>."""
@@ -102,28 +109,59 @@ def _session_command():
     return [*cmd, "--transport", "http", "--port", "0"]
 
 
-def _open_daemon_log(config):
-    """Open the file the session child's stdout/stderr is sent to.
+def _new_session_id():
+    """A sortable, unique id for this shim session: ``<timestamp>-<shim-pid>``."""
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
 
-    The canonical daemon log (``mcp.transport.kernel_log``, empty ->
-    <log dir>/mcp-server.log) shared with the ``biopb mcp`` CLI so `mcp logs` /
-    `status` read whatever this writes: the child's fds are inherited by its
-    kernel, so this file carries the same native Qt/GL/dask/gRPC output the key
-    always named — plus the child's own logs. Binary, append, unbuffered, for
-    the same reason the kernel redirection always was: native writers emit
-    arbitrary bytes. On failure, falls back to the shim's stderr buffer so the
-    child still starts (its output then interleaves with the shim's logging —
-    harmless, stderr is not a protocol channel).
+
+def _session_log_path(config, session_id):
+    """Where this session's child logs. Per-session by default; a single shared
+    file when ``mcp.transport.kernel_log`` is set (opt back into the old behavior).
     """
-    from .._config import get_daemon_log_file
+    from .._config import get_session_log_dir, get_setting
 
-    path = str(get_daemon_log_file(config))
+    override = get_setting(config, "mcp.transport.kernel_log")
+    if override:
+        return str(override)
+    return str(get_session_log_dir() / f"{session_id}.log")
+
+
+def _prune_session_logs(keep):
+    """Keep only the newest ``keep`` per-session logs; best-effort.
+
+    Run after the current session's log is created (it is newest, so it always
+    survives). A prune failure never affects the session.
+    """
+    from .._config import get_session_log_dir
+
     try:
+        logs = sorted(
+            get_session_log_dir().glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for old in logs[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _open_session_log(path):
+    """Open ``path`` for the session child's stdout/stderr (binary, append,
+    unbuffered — native Qt/GL/dask/gRPC writers emit arbitrary bytes, and the
+    child's fds are inherited by its kernel). On failure, falls back to the shim's
+    stderr buffer so the child still starts (its output then interleaves with the
+    shim's logging — harmless, stderr is not a protocol channel).
+    """
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         return open(path, "ab", buffering=0)
     except OSError:
         logger.warning(
-            "Could not open daemon log %s; routing child output to stderr",
-            path,
+            "Could not open session log %s; routing child output to stderr", path
         )
         return getattr(sys.stderr, "buffer", sys.stderr)
 
@@ -205,15 +243,30 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
 
     Raises TimeoutError / RuntimeError if the child never becomes reachable.
     """
-    log = _open_daemon_log(config)
+    from .._config import get_setting
+
+    # Per-session logfile (not the shared mcp-server.log): concurrent sessions no
+    # longer interleave. Prune older ones to the configured cap after opening the
+    # new one (it is newest, so it survives).
+    session_id = _new_session_id()
+    log_path = _session_log_path(config, session_id)
+    log = _open_session_log(log_path)
+    logged_to_file = log is not getattr(sys.stderr, "buffer", sys.stderr)
+    if logged_to_file and not get_setting(config, "mcp.transport.kernel_log"):
+        _prune_session_logs(get_setting(config, "mcp.transport.session_log_keep", 5))
+
     cmd = _session_command()
     fd, port_file = tempfile.mkstemp(prefix="biopb-mcp-port-", suffix=".txt")
     os.close(fd)  # the child writes it by path, not fd
 
     # Inherit THIS shim's live environment (the #98 fix). Explicit copy so the
-    # intent is legible; we only add the port-report channel.
+    # intent is legible; we add the port-report channel and — so the child can
+    # report its own logfile (server_status) and the agent's execute_code can
+    # read it from os.environ — the session log path.
     env = os.environ.copy()
     env[ENV_PORT_REPORT_FILE] = port_file
+    if logged_to_file:
+        env[ENV_SESSION_LOG] = log_path
 
     popen_kwargs = {}
     if os.name == "nt":

@@ -121,6 +121,11 @@ def _remove_pidfile(pidfile):
 # from the standalone `biopb mcp start` daemon. Kept in sync with _shim.
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
+# Env var the stdio shim sets to the child's own session logfile path, so the
+# child can report it (server_status) and the agent's execute_code can read it
+# from os.environ. Kept in sync with _shim.ENV_SESSION_LOG.
+ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+
 
 def _report_port(path, port):
     """Publish the OS-assigned ``port`` to the shim's report file.
@@ -493,6 +498,22 @@ def _serve_http(config, port, view=False):
     # Surfaces headless state to the agent (initialize `instructions`) and the
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
+
+    # Tell server_status where this process's log lives, so an agent can find it.
+    #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
+    #     shim); also visible to execute_code via os.environ.
+    #   * file-redirected launch (`biopb mcp start`) -> the canonical daemon log.
+    #   * a terminal (foreground `--transport http` / `biopb mcp view`) -> None,
+    #     reported as stdout.
+    from .._config import get_daemon_log_file
+
+    if os.environ.get(ENV_SESSION_LOG):
+        session_log = os.environ[ENV_SESSION_LOG]
+    elif not sys.stdout.isatty():
+        session_log = str(get_daemon_log_file(config))
+    else:
+        session_log = None
+    _server.set_session_log_path(session_log)
 
     # On-demand start: the kernel is NOT launched here. The server stays cheap
     # and idle (no viewer window pops, no Qt abort on a display-less daemon)
