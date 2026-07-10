@@ -21,6 +21,8 @@ from ._proc import (
 )
 
 console = Console()
+# Deprecation notices go to stderr so they never corrupt `--json` stdout output.
+err_console = Console(stderr=True)
 
 app = typer.Typer(
     name="biopb",
@@ -87,15 +89,19 @@ DEFAULT_CONFIG = find_config()
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it
 # gets its own PID/log under biopb-mcp's XDG data dir (matching
-# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The daemon
+# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). These
+# commands manage the *standalone* `biopb mcp start` daemon: it writes its own
+# PID file (biopb_mcp._config.get_pid_file()) so `status`/`stop` find it, and
 # logs to ONE canonical file (biopb_mcp._config.get_daemon_log_file() ->
-# mcp-server.log) shared with the stdio shim, so `mcp logs` / `status` show the
-# right log no matter who launched the daemon (the CLI's `mcp start`, or the
-# shim spawning it on demand for an AI client). The running daemon writes this
-# same PID file itself (biopb_mcp._config.get_pid_file()) regardless of who
-# launched it — including the stdio shim, which spawns it detached without going
-# through `mcp start` — so `status` detects it uniformly. Keep this path in sync
-# with get_pid_file().
+# mcp-server.log). Keep both literals in sync with get_pid_file()/get_log_dir().
+#
+# Since de-daemonization (biopb-mcp/docs/mcp-dedaemonization-migration.md,
+# Layer 1) the stdio shim no longer spawns a shared daemon through here: it
+# spawns and OWNS an ephemeral session child that writes NO PID file (the shim
+# reaps it directly), so `biopb mcp status` tracks only the standalone daemon.
+# That child still writes the same canonical daemon log (fd inherited from the
+# shim), so `mcp logs` shows whichever session last ran. Repurposing `biopb mcp`
+# around the shared serve-core is deferred to Layer 3.
 MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
@@ -1297,6 +1303,14 @@ def migrate_config(
 # ---------------------------------------------------------------------------
 # biopb-mcp daemon management (`biopb mcp ...`)
 #
+# DEPRECATED (de-daemonization, biopb-mcp/docs/mcp-dedaemonization-migration.md):
+# the shared background MCP daemon these commands manage is being retired. Each
+# MCP client's stdio shim now spawns and owns its own session, and `biopb mcp
+# view` covers the foreground/agentless case, so start/stop/status/restart/logs
+# have little remaining purpose. They still work (each emits a deprecation
+# notice via _warn_mcp_daemon_deprecated) and will be removed in a future
+# release. `biopb mcp view` is NOT deprecated.
+#
 # Manages the biopb-mcp MCP server (HTTP/streamable-http transport) as a
 # background daemon, mirroring the tensor-server daemon commands. The biopb-mcp
 # package is an optional dependency: every subcommand first calls
@@ -1308,8 +1322,27 @@ def migrate_config(
 
 mcp_app = typer.Typer(
     name="mcp",
-    help="biopb-mcp MCP server daemon management (start/stop/restart/status/logs)",
+    help="biopb-mcp MCP server: `view` (foreground viewer) + deprecated daemon "
+    "management (start/stop/restart/status/logs).",
 )
+
+
+def _warn_mcp_daemon_deprecated() -> None:
+    """Print the daemon-pipeline deprecation notice (to stderr).
+
+    The persistent background MCP daemon is being retired by de-daemonization
+    (biopb-mcp/docs/mcp-dedaemonization-migration.md): every MCP client's stdio
+    shim now spawns and owns its own session, and ``biopb mcp view`` covers the
+    foreground/agentless case, so the shared background daemon has little
+    remaining purpose. ``start``/``stop``/``status``/``restart``/``logs`` still
+    work but will be removed in a future release.
+    """
+    err_console.print(
+        "[yellow]Deprecated:[/yellow] the biopb-mcp background daemon is being "
+        "retired. MCP clients now own their own session via the stdio shim; for a "
+        "foreground viewer use [bold]biopb mcp view[/bold]. These daemon commands "
+        "will be removed in a future release."
+    )
 
 
 def _require_biopb_mcp() -> None:
@@ -1454,8 +1487,9 @@ def mcp_start(
         help="HTTP transport port (default: biopb-mcp config, else 8765)",
     ),
 ):
-    """Start the biopb-mcp MCP server (HTTP transport) as a background daemon."""
+    """(Deprecated) Start the biopb-mcp MCP server (HTTP) as a background daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     _ensure_mcp_dirs()
 
     existing_pid, existing_token = _read_pid_record(MCP_PID_FILE)
@@ -1542,8 +1576,9 @@ def mcp_stop(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
     ),
 ):
-    """Stop the biopb-mcp server daemon."""
+    """(Deprecated) Stop the biopb-mcp server daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
 
     if not pid:
@@ -1579,8 +1614,9 @@ def mcp_restart(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
     ),
 ):
-    """Restart the biopb-mcp server daemon."""
+    """(Deprecated) Restart the biopb-mcp server daemon."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
     if _is_our_daemon(pid, token):
         console.print(f"[green]Stopping biopb-mcp server (PID {pid})...[/green]")
@@ -1601,8 +1637,9 @@ def mcp_status(
         False, "--json", help="Emit machine-readable JSON instead of a table"
     ),
 ):
-    """Check biopb-mcp server daemon status and HTTP liveness."""
+    """(Deprecated) Check biopb-mcp server daemon status and HTTP liveness."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     pid, token = _read_pid_record(MCP_PID_FILE)
     running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
@@ -1655,13 +1692,68 @@ def mcp_logs(
     ),
     path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
-    """Show the biopb-mcp server daemon log."""
+    """(Deprecated) Show the biopb-mcp server daemon log."""
     _require_biopb_mcp()
+    _warn_mcp_daemon_deprecated()
     log_file = _resolve_mcp_log_for_read()
     if path:
         print(log_file)
         raise typer.Exit(0)
     _tail_and_follow(log_file, follow, lines, _validate_level(level), _mcp_line_level)
+
+
+@mcp_app.command("view")
+def mcp_view(
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="MCP port for an optional agent to attach (default: dynamic, "
+        "OS-assigned — printed on startup).",
+    ),
+):
+    """Open the napari viewer in the foreground (agentless).
+
+    Runs a biopb-mcp session in *this* terminal: the napari window opens
+    immediately and the process blocks until Ctrl-C. Unlike `biopb mcp start`
+    (a detached background daemon managed by stop/status), this is a foreground,
+    user-owned viewer that writes no PID file. It still serves /mcp on the chosen
+    (default dynamic) port, so an AI agent may optionally attach to the same live
+    session.
+
+    Implemented by running `biopb-mcp --view` as a foreground child that shares
+    this terminal's stdio and process group, so Ctrl-C reaches it directly (its
+    own SIGINT handler reaps the kernel/viewer). This CLI stays free of the heavy
+    napari/Qt import — it only launches and waits.
+    """
+    _require_biopb_mcp()
+    resolved_port = 0 if port is None else port
+    cmd = [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp",
+        "--view",
+        "--port",
+        str(resolved_port),
+    ]
+    console.print("[green]Opening biopb-mcp viewer (Ctrl-C to stop)...[/green]")
+    # Foreground: NO _detach_kwargs — inherit this terminal's stdio and stay in
+    # its process group so Ctrl-C (SIGINT / CTRL_C_EVENT) reaches the launcher.
+    try:
+        process = subprocess.Popen(cmd, env=os.environ.copy())
+    except OSError as exc:
+        console.print(f"[red]Could not launch the viewer:[/red] {exc}")
+        raise typer.Exit(1)
+    try:
+        raise typer.Exit(process.wait())
+    except KeyboardInterrupt:
+        # Ctrl-C already reached the child via the shared group; give it a moment
+        # to tear the kernel/viewer down, then force-reap if it overruns.
+        try:
+            process.wait(timeout=20)
+        except Exception:
+            process.kill()
+        raise typer.Exit(0)
 
 
 app.add_typer(mcp_app, name="mcp")

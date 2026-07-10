@@ -115,6 +115,42 @@ def _remove_pidfile(pidfile):
         pass
 
 
+# Env var carrying the path of the file a shim-owned child publishes its
+# OS-assigned port to (de-daemonization Layer 1). Presence of this var is also
+# how _serve_http tells a shim-owned child (dynamic port, no PID file / sentinel)
+# from the standalone `biopb mcp start` daemon. Kept in sync with _shim.
+ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
+
+# Env var the stdio shim sets to the child's own session logfile path, so the
+# child can report it (server_status) and the agent's execute_code can read it
+# from os.environ. Kept in sync with _shim.ENV_SESSION_LOG.
+ENV_SESSION_LOG = "BIOPB_MCP_SESSION_LOG"
+
+
+def _report_port(path, port):
+    """Publish the OS-assigned ``port`` to the shim's report file.
+
+    The stdio shim (docs/mcp-dedaemonization-migration.md, Layer 1) spawns this
+    child with ``--port 0`` and a unique ``BIOPB_PORT_REPORT_FILE``, then polls
+    that file for the real port to build its bridge URL. Written atomically
+    (temp + ``os.replace``) so the shim never reads a half-written value.
+
+    A cross-platform file rather than the inherited-pipe handshake used for the
+    kernel token (``BIOPB_TOKEN_REPORT_FD``): that pipe pattern is POSIX-only
+    here (``_kernel`` gates it on ``os.name == 'posix'`` — fd inheritance across
+    a Windows spawn is fragile), whereas a file is uniform. Best-effort: a write
+    failure only costs the shim its port (it times out; the client sees EOF),
+    never the server.
+    """
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            f.write(str(port))
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("Could not write port report file %s", path, exc_info=True)
+
+
 def _shutdown_sentinel_path():
     """Path of the stop-sentinel file `biopb mcp stop` writes on Windows.
 
@@ -200,6 +236,16 @@ def _parse_args(argv, default_transport, default_port):
         type=int,
         default=default_port,
         help="Port for the http transport (ignored for stdio).",
+    )
+    parser.add_argument(
+        "--view",
+        action="store_true",
+        help="Agentless viewer: open the napari viewer directly in the "
+        "foreground and block until Ctrl-C. Forces a visible display and an "
+        "eager kernel start (the window opens now, not on a start_kernel call); "
+        "still serves /mcp on a dynamic port for optional agent attach. Writes "
+        "no PID file — it is a user-owned foreground session, not the managed "
+        "`biopb mcp start` daemon. Fronted by `biopb mcp view`.",
     )
     return parser.parse_args(argv)
 
@@ -298,6 +344,12 @@ def main(argv=None):
         default_port=default_port,
     )
 
+    if opts.view:
+        # Agentless foreground viewer (fronted by `biopb mcp view`): serve http
+        # with a visible, eagerly-started viewer, regardless of the configured
+        # transport. Blocks until Ctrl-C.
+        return _serve_http(config, opts.port, view=True)
+
     if opts.transport == "stdio":
         # Bridge mode: keep this process featherweight — the heavy stack
         # (FastMCP/uvicorn/kernel plumbing) is only imported by the daemon it
@@ -315,8 +367,15 @@ def main(argv=None):
     return _serve_http(config, opts.port)
 
 
-def _serve_http(config, port):
-    """Run the real MCP server (streamable-http) in the foreground."""
+def _serve_http(config, port, view=False):
+    """Run the real MCP server (streamable-http) in the foreground.
+
+    ``view`` selects the agentless-viewer mode (`biopb mcp view`): force a
+    visible display, bind a dynamic port and print its URL, and start the
+    kernel/viewer eagerly so the window opens immediately instead of on the
+    first ``start_kernel`` tool call. Like a shim-owned child (and unlike the
+    managed ``biopb mcp start`` daemon) it writes no PID file / stop sentinel.
+    """
     from .._config import get_setting
     from . import _server
     from ._cluster import DaskClusterHost
@@ -342,7 +401,10 @@ def _serve_http(config, port):
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
     # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
     # the user demands "visible" we degrade to a compute-only headless kernel.
-    display_mode = get_setting(config, "mcp.transport.display_mode")
+    # `--view` demands visible by definition (the human wants the window).
+    display_mode = (
+        "visible" if view else get_setting(config, "mcp.transport.display_mode")
+    )
     has_display = _has_display()
     if display_mode == "visible" and not has_display:
         kernel_log_path = (
@@ -437,6 +499,22 @@ def _serve_http(config, port):
     # viewer-dependent tools (take_screenshot / server_status).
     _server.set_headless(headless)
 
+    # Tell server_status where this process's log lives, so an agent can find it.
+    #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
+    #     shim); also visible to execute_code via os.environ.
+    #   * file-redirected launch (`biopb mcp start`) -> the canonical daemon log.
+    #   * a terminal (foreground `--transport http` / `biopb mcp view`) -> None,
+    #     reported as stdout.
+    from .._config import get_daemon_log_file
+
+    if os.environ.get(ENV_SESSION_LOG):
+        session_log = os.environ[ENV_SESSION_LOG]
+    elif not sys.stdout.isatty():
+        session_log = str(get_daemon_log_file(config))
+    else:
+        session_log = None
+    _server.set_session_log_path(session_log)
+
     # On-demand start: the kernel is NOT launched here. The server stays cheap
     # and idle (no viewer window pops, no Qt abort on a display-less daemon)
     # until an agent calls the `start_kernel` tool, which drives
@@ -458,11 +536,43 @@ def _serve_http(config, port):
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
+    # Two foreground modes bind a *dynamic* port and are NOT the managed
+    # `biopb mcp start` daemon, so they skip the PID file and stop sentinel
+    # (singular paths a concurrent session would collide on, and neither is owned
+    # by `biopb mcp stop`):
+    #   * the de-daemonized shim-owned child (Layer 1) — the shim set
+    #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
+    #     process group / Job Object) and we report the OS-assigned port back;
+    #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it
+    #     prints its URL instead.
+    # The POSIX signal handlers below stay in every mode (a group-directed
+    # SIGTERM / Ctrl-C still reaps our kernel gracefully).
+    report_file = os.environ.get(ENV_PORT_REPORT_FILE)
+    shim_owned = bool(report_file)
+    dynamic_port = shim_owned or view
+    listen_sock = None
+    if dynamic_port:
+        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_sock.bind(("127.0.0.1", port))  # port 0 -> OS assigns one
+        port = listen_sock.getsockname()[1]
+        if shim_owned:
+            _report_port(report_file, port)
+        else:  # view
+            print(
+                f"biopb-mcp viewer serving on http://127.0.0.1:{port}/mcp "
+                "(Ctrl-C to stop; an agent may attach at this URL).",
+                flush=True,
+            )
+
     # Register the daemon's PID so `biopb mcp status` can detect it no matter
-    # how it was launched (CLI, stdio shim, or manual). Written just before the
-    # bind below; removed pid-safely on every exit path.
-    pidfile = _write_pidfile(port)
-    atexit.register(_remove_pidfile, pidfile)
+    # how it was launched (CLI or manual). Written just before the bind below;
+    # removed pid-safely on every exit path. Only the managed standalone daemon
+    # writes it — a shim-owned child and the foreground viewer do not.
+    pidfile = None
+    if not dynamic_port:
+        pidfile = _write_pidfile(port)
+        atexit.register(_remove_pidfile, pidfile)
 
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
@@ -493,18 +603,33 @@ def _serve_http(config, port):
 
     # On Windows those handlers are unreachable from `biopb mcp stop` —
     # os.kill(SIGTERM) is TerminateProcess, uncatchable — so stop drops a
-    # sentinel file instead and a watcher thread runs the same _shutdown.
-    if os.name == "nt":
+    # sentinel file instead and a watcher thread runs the same _shutdown. Only
+    # the managed standalone daemon has a `biopb mcp stop` owner; a shim-owned
+    # child (reaped by its shim) and the foreground viewer (Ctrl-C) do not, so
+    # they install no sentinel watcher.
+    if os.name == "nt" and not dynamic_port:
         _install_shutdown_sentinel_watcher(_shutdown_sentinel_path(), _shutdown)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built.
     _setup_observe(config)
 
+    if view:
+        # Agentless viewer: bring the window up now (the human wants it
+        # immediately) rather than waiting for a start_kernel tool call. Same
+        # synchronous bring-up the start_kernel tool drives.
+        logger.info("Opening the napari viewer (Ctrl-C to stop)...")
+        try:
+            host.ensure_started()
+        except Exception:
+            logger.exception("Failed to open the viewer; exiting")
+            return 1  # atexit reaps the kernel/cluster and cleans the spill dir
+
     _server.run(
         port,
         allowed_origins=get_setting(config, "mcp.transport.allowed_origins"),
         allowed_hosts=get_setting(config, "mcp.transport.allowed_hosts"),
+        sock=listen_sock,
     )
 
     # If the server loop returns on its own, exit the same way (atexit
