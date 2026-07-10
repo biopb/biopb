@@ -25,7 +25,9 @@ whenever reachable.
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import urllib.request
@@ -67,6 +69,35 @@ def _cache_dir() -> Path:
     d = Path.home() / ".cache" / "biopb-mcp" / "skills"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write *data* to *path* atomically: a uniquely-named temp file in the same
+    directory, then ``os.replace``.
+
+    The skills cache is shared by every concurrent biopb-mcp session — since
+    de-daemonization each MCP client owns its own *process*, so a plain
+    ``write_bytes`` would let one session read a half-written file another is
+    mid-write (and two writers interleave). ``os.replace`` is atomic on POSIX and
+    Windows for same-filesystem paths, so a reader always sees either the old
+    complete file or the new one, with no cross-process lock: bodies are
+    content-addressed (racing writers write identical bytes) and the catalog is a
+    cache (last-writer-wins is fine). ``mkstemp`` gives each writer its own temp,
+    so writers never clobber each other's partial file either. Raises ``OSError``
+    on failure (caller logs and degrades); the temp is cleaned up first.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _http_get(url: str, timeout: float) -> bytes:
@@ -200,7 +231,7 @@ def _resolve_catalog(url: str) -> list[dict]:
             raw = _http_get(url, _FETCH_TIMEOUT)
             skills = _accept_catalog(raw)
             try:
-                cache_file.write_bytes(raw)
+                _atomic_write(cache_file, raw)
             except OSError:
                 logger.debug("skills: could not write catalog cache", exc_info=True)
             return skills
@@ -276,13 +307,19 @@ def get_skill_body(skill_id: str) -> str:
     sha = entry.get("sha256") or ""
     body_dir = _cache_dir() / "bodies"
 
-    # 1. sha-keyed cache (the sha is both integrity check and cache key, §1).
+    # 1. sha-keyed cache. Re-verify the sha on read (the sha is both integrity
+    #    check and cache key, §1): a truncated/corrupt file — e.g. a crash
+    #    mid-write, or another concurrent session — is treated as a miss and
+    #    refetched, never returned as content. Atomic writes below make this rare,
+    #    but the check costs a hash of a small file and closes the hole entirely.
     if sha:
         cached = body_dir / f"{sha}.md"
         try:
-            return _strip_frontmatter(cached.read_text(encoding="utf-8"))
+            raw = cached.read_bytes()
         except OSError:
-            pass
+            raw = None
+        if raw is not None and hashlib.sha256(raw).hexdigest() == sha:
+            return _strip_frontmatter(raw.decode("utf-8"))
 
     # 2. network, verified against the catalog sha.
     url = entry.get("url") or ""
@@ -299,8 +336,9 @@ def get_skill_body(skill_id: str) -> str:
                 )
             elif sha:
                 try:
-                    body_dir.mkdir(parents=True, exist_ok=True)
-                    (body_dir / f"{sha}.md").write_text(text, encoding="utf-8")
+                    # Store the exact fetched bytes so the sha-verified read above
+                    # matches; atomic so a concurrent reader never sees a partial.
+                    _atomic_write(body_dir / f"{sha}.md", raw)
                 except OSError:
                     logger.debug("skills: could not cache body", exc_info=True)
             return _strip_frontmatter(text)

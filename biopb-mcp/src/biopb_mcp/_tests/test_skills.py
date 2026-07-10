@@ -198,3 +198,54 @@ def test_get_body_network_verifies_and_caches(mock_home, skills_cfg, monkeypatch
     assert cached.exists()
     _offline(monkeypatch)
     assert _skills.get_skill_body("net") == "# Net\n\nbody text"
+
+
+# --------------------------------------------------------------------------- #
+# Concurrent-cache safety: atomic writes + sha-verified reads
+# --------------------------------------------------------------------------- #
+def test_atomic_write_replaces_and_leaves_no_temp(mock_home):
+    target = _skills._cache_dir() / "catalog.json"
+    _skills._atomic_write(target, b'{"catalog_version": 1, "skills": []}')
+    assert target.read_bytes() == b'{"catalog_version": 1, "skills": []}'
+    # Overwrite (last-writer-wins), still atomic, no stray temp left behind.
+    _skills._atomic_write(target, b"second")
+    assert target.read_bytes() == b"second"
+    leftovers = [
+        p.name
+        for p in target.parent.iterdir()
+        if p.name.startswith(".tmp-") or p.suffix == ".part"
+    ]
+    assert leftovers == []
+
+
+def test_corrupt_cached_body_is_not_trusted_and_refetched(
+    mock_home, skills_cfg, monkeypatch
+):
+    # A truncated/corrupt cached body (e.g. a crash mid-write, or a concurrent
+    # session) must be treated as a miss (sha re-verified on read), not returned.
+    body_url = "https://example.test/skills/net.md"
+    raw_body = b"---\nid: net\n---\n\n# Net\n\nbody text"
+    sha = hashlib.sha256(raw_body).hexdigest()
+    catalog = _catalog_bytes(
+        [{"id": "net", "description": "d", "url": body_url, "sha256": sha}]
+    )
+    skills_cfg["catalog_url"] = CATALOG_URL
+
+    bodies = _skills._cache_dir() / "bodies"
+    bodies.mkdir(parents=True, exist_ok=True)
+    (bodies / f"{sha}.md").write_bytes(b"CORRUPT PARTIAL")  # wrong bytes for this sha
+
+    fetches = {"body": 0}
+
+    def get(url, timeout):
+        if url == CATALOG_URL:
+            return catalog
+        fetches["body"] += 1
+        return raw_body
+
+    monkeypatch.setattr(_skills, "_http_get", get)
+    out = _skills.get_skill_body("net")
+    assert out == "# Net\n\nbody text"  # correct content, not the corrupt bytes
+    assert fetches["body"] == 1  # the corrupt cache was rejected, so it refetched
+    # ...and the cache was repaired with the correct bytes.
+    assert (bodies / f"{sha}.md").read_bytes() == raw_body
