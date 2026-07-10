@@ -73,6 +73,7 @@ class _State:
     next_attempt_at: float = 0.0  # monotonic; earliest time to (re)spawn
     up_since: Optional[float] = None  # monotonic; when we last observed it up
     last_error: Optional[str] = None
+    last_exit_code: Optional[int] = None  # exit code of the most recent crash
 
 
 class DataPlaneSupervisor:
@@ -176,22 +177,57 @@ class DataPlaneSupervisor:
         self._state.owned = True
         self._state.up_since = None
 
+    def _child_alive(self) -> bool:
+        """Whether we hold a spawned child that is still running.
+
+        poll() reaps a just-exited child (no zombie) and caches its returncode,
+        so a non-None poll means gone.
+        """
+        return self._proc is not None and self._proc.poll() is None
+
+    def _reap_dead_child(self) -> Optional[int]:
+        """Drop the handle to our spawned child if it has exited; return its exit
+        code (else ``None``).
+
+        Clearing ``self._proc`` to ``None`` the moment the child dies is what
+        keeps it an honest signal: every ``self._proc is None`` test then means
+        "no live child of ours", so the adopt-vs-restart decisions that key on it
+        can't be fooled by a crashed child's ``Popen`` left lying around (the
+        fragility this guards against). poll() has already reaped the OS zombie.
+        """
+        if self._proc is None or self._proc.poll() is None:
+            return None
+        rc = self._proc.returncode
+        self._proc = None
+        return rc
+
+    def _note_healthy(self) -> None:
+        """Record that the plane is up; after a sustained healthy run, clear the
+        failure count so an earlier crash burst stops inflating the backoff."""
+        st = self._state
+        now = time.monotonic()
+        if st.up_since is None:
+            st.up_since = now
+        elif now - st.up_since >= _HEALTHY_RESET_SECONDS:
+            st.failures = 0
+
     def ensure(self) -> None:
         """Idempotently make the data plane running. Spawn it, or adopt one that
         is already listening. Safe to call repeatedly / concurrently."""
         with self._lock:
-            self._state.want = True
-            self._state.last_error = None
-            if self._proc is not None and self._proc.poll() is None:
+            st = self._state
+            st.want = True
+            st.last_error = None
+            self._reap_dead_child()  # normalize a stale handle before deciding
+            if self._proc is not None:
                 return  # our child is alive (starting or serving)
             if self._port_up():
                 # Something is already serving on the port we'd bind. Adopt it
                 # rather than double-bind; we monitor but do not own its death.
-                if self._proc is None:
-                    self._state.owned = False
+                st.owned = False
                 return
             self._spawn_locked()
-            self._state.next_attempt_at = time.monotonic() + self._backoff()
+            st.next_attempt_at = time.monotonic() + self._backoff()
 
     def _backoff(self) -> float:
         idx = min(self._state.failures, len(_BACKOFF_SCHEDULE) - 1)
@@ -209,38 +245,39 @@ class DataPlaneSupervisor:
             if not st.want:
                 return
 
-            up = self._port_up()
-            if up:
-                if st.up_since is None:
-                    st.up_since = time.monotonic()
-                elif time.monotonic() - st.up_since >= _HEALTHY_RESET_SECONDS:
-                    st.failures = 0  # recovered; forget the backoff burst
-                # Our child alive OR an adopted server up: nothing to do.
-                if self._proc is None:
-                    st.owned = False
-                return
-
-            # Port is down.
-            st.up_since = None
-            if not st.owned:
-                # We adopted a server that has since vanished. Take ownership and
-                # bring one up ourselves (the admin is the plane's supervisor now).
-                logger.warning("Adopted data plane is gone; taking over")
-                st.owned = True
-
-            child_alive = self._proc is not None and self._proc.poll() is None
-            if child_alive:
-                return  # spawned, still binding its port -- give it time
-
-            now = time.monotonic()
-            if now < st.next_attempt_at:
-                return
-            if self._proc is not None:
-                rc = self._proc.returncode
+            # Reap a crashed child up front so self._proc never lingers as a dead
+            # handle, and count the crash exactly once -- at the tick we observe
+            # it, independent of whether the backoff lets us respawn this tick.
+            rc = self._reap_dead_child()
+            if rc is not None:
                 st.restarts += 1
                 st.failures += 1
                 st.last_error = f"data plane exited (code {rc}); restarting"
                 logger.warning(st.last_error)
+
+            if self._proc is not None:
+                # A live child of ours (still binding its port, or serving).
+                if self._port_up():
+                    self._note_healthy()
+                return
+
+            if self._port_up():
+                # The port is served, but not by a child of ours: an adopted or
+                # external server. Monitor it; never restart or kill what we did
+                # not spawn.
+                st.owned = False
+                self._note_healthy()
+                return
+
+            # Port down and no live child of ours: (re)start when backoff allows.
+            st.up_since = None
+            now = time.monotonic()
+            if now < st.next_attempt_at:
+                return
+            if not st.owned:
+                # A previously-adopted server vanished; the admin is its
+                # supervisor now (a fresh spawn always sets owned via ensure).
+                logger.info("data plane is down and unowned; taking it over")
             self._spawn_locked()
             st.next_attempt_at = now + self._backoff()
 
@@ -323,7 +360,7 @@ class DataPlaneSupervisor:
         with self._lock:
             st = self._state
             up = self._port_up()
-            child_alive = self._proc is not None and self._proc.poll() is None
+            child_alive = self._child_alive()
             # State reflects reality first: a listening port is "serving" whether
             # we spawned, adopted, or have not yet been asked to manage it. Only
             # when nothing is listening does intent matter -- "down" if we want it

@@ -151,6 +151,44 @@ def test_tick_noop_when_not_wanted(spec, monkeypatch):
     spawn.assert_not_called()
 
 
+def test_tick_reaps_dead_handle_even_while_backing_off(spec, monkeypatch):
+    # The moment a crash is observed, the dead Popen handle must be cleared to
+    # None -- even if the backoff window forbids respawning this tick -- so
+    # `self._proc is None` stays an honest "no live child of ours" signal.
+    sup = DataPlaneSupervisor(spec)
+    _downed(sup, monkeypatch)
+    sup._state.next_attempt_at = time.monotonic() + 100  # can't respawn yet
+    sup.tick()
+    assert sup._proc is None  # dead handle reaped, not left dangling
+    assert sup._state.restarts == 1  # crash still counted exactly once
+
+
+def test_crashed_owned_child_yields_to_external_server(spec, monkeypatch):
+    # An owned child dies AND something else is now serving the port. The
+    # supervisor must not keep treating the stale dead handle as "our running
+    # child": it reaps it and flips to adopt (owned=False), never restarting or
+    # claiming a server it did not spawn.
+    sup = DataPlaneSupervisor(spec)
+    spawn = _downed(sup, monkeypatch)
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: True)  # external up
+    sup.tick()
+    spawn.assert_not_called()
+    assert sup._proc is None
+    assert sup._state.owned is False
+    snap = sup.snapshot()
+    assert snap["state"] == "serving" and snap["owned"] is False
+
+
+def test_ensure_after_crash_is_not_fooled_by_dead_handle(spec, monkeypatch):
+    # ensure() decides adopt-vs-spawn from `self._proc`; a crashed child left in
+    # it must not be mistaken for a live one. With the port down it spawns fresh.
+    sup = DataPlaneSupervisor(spec)
+    spawn = _downed(sup, monkeypatch)  # dead handle, port down, spawn mocked
+    sup.ensure()
+    spawn.assert_called_once()  # reaped the dead handle, then spawned
+    assert sup._proc is None  # (spawn is mocked, so no new handle set)
+
+
 def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
     sup = DataPlaneSupervisor(spec)
     sup._state.failures = 3
