@@ -675,17 +675,17 @@ function Show-LogTail {
 function Start-ControlPlane {
     param([string]$BiopbHome, [string]$ConfigFile, [bool]$NoStart)
 
-    $adminLog  = Join-Path $BiopbHome ".local\share\biopb\logs\admin.log"
+    $controlLog  = Join-Path $BiopbHome ".local\share\biopb\logs\control.log"
     $serverLog = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
 
     if ($NoStart) {
         Report-Info "Skipping control-plane start"
-        Report-Detail "start it later with: biopb admin start"
+        Report-Detail "start it later with: biopb control start"
         return
     }
     if (-not (Get-Command biopb -ErrorAction SilentlyContinue)) {
         Report-Warn "biopb not found on PATH; skipping control-plane start"
-        Report-Detail "start it later with: biopb admin start"
+        Report-Detail "start it later with: biopb control start"
         return
     }
 
@@ -698,14 +698,14 @@ function Start-ControlPlane {
     # Retire a prior control plane (+ the data plane it owns) and any legacy
     # standalone data server, so the new admin can bind a fresh plane it owns --
     # it refuses an in-use gRPC port. Best-effort; no-ops on a clean machine.
-    try { & biopb admin stop  *> $null } catch { }
+    try { & biopb control stop  *> $null } catch { }
     try { & biopb server stop *> $null } catch { }
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the admin refuse, and the CLI prints the real cause.
     $startOut = @()
-    try { $startOut = @(& biopb admin start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
+    try { $startOut = @(& biopb control start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Report-Warn "Control plane failed to start"
@@ -713,9 +713,9 @@ function Start-ControlPlane {
             $t = "$line".Trim()
             if ($t) { Report-Detail $t }
         }
-        Show-LogTail -LogFile $adminLog
-        Report-Detail "full log: $adminLog"
-        Report-Detail "after fixing the cause, run: biopb admin start"
+        Show-LogTail -LogFile $controlLog
+        Report-Detail "full log: $controlLog"
+        Report-Detail "after fixing the cause, run: biopb control start"
         return
     }
 
@@ -728,7 +728,7 @@ function Start-ControlPlane {
     $serving = $false; $conflict = $false
     for ($i = 0; $i -lt 60; $i++) {
         $out = ""
-        try { $out = (& biopb admin status --json 2>$null | Out-String) } catch { $out = "" }
+        try { $out = (& biopb control status --json 2>$null | Out-String) } catch { $out = "" }
         try {
             $state = ($out | ConvertFrom-Json).data_plane.state
             if ($state -eq "serving")  { $serving = $true;  break }
@@ -742,13 +742,13 @@ function Start-ControlPlane {
         Report-Ok "Control plane started - data plane serving; catalog + pre-cache building in the background"
     } elseif ($conflict) {
         Report-Warn "Data-plane gRPC port is held by another process; the admin will not adopt it"
-        Report-Detail "stop that server, then: biopb admin start"
+        Report-Detail "stop that server, then: biopb control start"
     } else {
         Report-Warn "Data plane did not reach serving within 60s"
         Report-Detail "it likely failed to start or is wedged:"
         Show-LogTail -LogFile $serverLog
         Report-Detail "full log: $serverLog"
-        Report-Detail "recheck with: biopb admin status"
+        Report-Detail "recheck with: biopb control status"
     }
 }
 
@@ -1020,7 +1020,7 @@ function Invoke-BiopbInstall {
     # (try/catch swallows the benign "nothing running" stderr) and a no-op on a
     # clean machine. Done before the downloads so the OS releases the handles.
     if (Get-Command biopb -ErrorAction SilentlyContinue) {
-        try { & biopb admin stop  *> $null } catch { }
+        try { & biopb control stop  *> $null } catch { }
         try { & biopb server stop *> $null } catch { }
         try { & biopb mcp stop    *> $null } catch { }
         Report-Detail "stopped any running biopb daemons (admin + data + mcp) so their files can be replaced"
@@ -1539,7 +1539,7 @@ function Invoke-BiopbUninstall {
         # dir on Windows. The admin goes first -- it owns the data plane, so
         # stopping it is a complete teardown of that pair and stops it respawning.
         if (Get-Command biopb -ErrorAction SilentlyContinue) {
-            try { & biopb admin stop  *> $null } catch { }
+            try { & biopb control stop  *> $null } catch { }
             try { & biopb server stop *> $null } catch { }
             try { & biopb mcp stop    *> $null } catch { }
         }

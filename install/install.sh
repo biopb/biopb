@@ -712,38 +712,38 @@ _tail_log() {
     done
 }
 
-# Start the control plane (biopb admin), which spawns and supervises the data
+# Start the control plane (biopb control), which spawns and supervises the data
 # plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
 # Starting now lets the pre-cache warm overviews before the user opens anything.
 # The admin owns the data plane exclusively, so we first retire any prior admin
 # AND any legacy standalone data server (`biopb server start`) so the freshly
 # installed admin can spawn and own a new plane -- it refuses an in-use gRPC port.
 _start_control_plane() {
-    local admin_log="$HOME/.local/share/biopb/logs/admin.log"
+    local control_log="$HOME/.local/share/biopb/logs/control.log"
     local server_log="$HOME/.local/share/biopb/logs/tensor-server.log"
 
     if [ "${BIOPB_NO_SERVER_START:-0}" = "1" ]; then
         _info "Skipping control-plane start (BIOPB_NO_SERVER_START=1)"
-        _info "  start it later with: ${CYAN}biopb admin start${RESET}"
+        _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
     if ! command -v biopb >/dev/null 2>&1; then
         _warn "biopb not found on PATH; skipping control-plane start"
-        _info "  start it later with: ${CYAN}biopb admin start${RESET}"
+        _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
 
     # Retire a prior control plane (+ the data plane it owns) and any legacy
     # standalone data server, so the new admin can bind a fresh plane it owns.
     # Best-effort; both are no-ops on a clean machine.
-    biopb admin stop >/dev/null 2>&1 || true
+    biopb control stop >/dev/null 2>&1 || true
     biopb server stop >/dev/null 2>&1 || true
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the admin refuse, and the CLI prints the real cause.
     local start_out
-    if ! start_out=$(biopb admin start 2>&1); then
+    if ! start_out=$(biopb control start 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
@@ -752,9 +752,9 @@ _start_control_plane() {
         printf '%s\n' "$start_out" | while IFS= read -r line; do
             if [ -n "$line" ]; then _info "  $line"; fi
         done
-        _tail_log "$admin_log"
-        _info "  full log: ${CYAN}$admin_log${RESET}"
-        _info "  after fixing the cause, run: ${CYAN}biopb admin start${RESET}"
+        _tail_log "$control_log"
+        _info "  full log: ${CYAN}$control_log${RESET}"
+        _info "  after fixing the cause, run: ${CYAN}biopb control start${RESET}"
         return 0
     fi
 
@@ -767,14 +767,14 @@ _start_control_plane() {
     # Flight health query, so no source_count here -- it climbs in the background).
     local out i=0
     while [ "$i" -lt 60 ]; do
-        out=$(biopb admin status --json 2>/dev/null || echo "")
+        out=$(biopb control status --json 2>/dev/null || echo "")
         if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"serving"'; then
             _ok "Control plane started — data plane serving; catalog + pre-cache building in the background"
             return 0
         fi
         if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"conflict"'; then
             _warn "Data-plane gRPC port is held by another process; the admin will not adopt it"
-            _info "  stop that server, then: ${CYAN}biopb admin start${RESET}"
+            _info "  stop that server, then: ${CYAN}biopb control start${RESET}"
             return 0
         fi
         i=$((i + 1))
@@ -784,7 +784,7 @@ _start_control_plane() {
     _info "  it likely failed to start or is wedged:"
     _tail_log "$server_log"
     _info "  full log: ${CYAN}$server_log${RESET}"
-    _info "  recheck with: ${CYAN}biopb admin status${RESET}"
+    _info "  recheck with: ${CYAN}biopb control status${RESET}"
 }
 
 # Stop a running biopb-mcp daemon (best-effort) so the just-installed code takes
@@ -1127,7 +1127,7 @@ install_biopb() {
 
     # Install everything into ONE uv tool environment so the components can import
     # and drive each other at runtime:
-    #   - the control plane (`biopb admin`) supervises the data plane by running
+    #   - the control plane (`biopb control`) supervises the data plane by running
     #     `sys.executable -m biopb_tensor_server.cli`, so the server must be
     #     importable from biopb's interpreter (this also restores
     #     `from biopb_tensor_server.config import load_config`);
@@ -1554,11 +1554,11 @@ uninstall_biopb() {
     # 1. Stop the daemons first. On some platforms a live process keeps its files
     #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
     #    engine hits exactly this — os error 5), so stopping precedes removal.
-    #    The control plane goes first: it owns the data plane, so `admin stop` is a
+    #    The control plane goes first: it owns the data plane, so `control stop` is a
     #    complete teardown of that pair and stops it respawning what follows.
     _step "[1/3] Stopping biopb services..."
     if command -v biopb &>/dev/null; then
-        biopb admin stop &>/dev/null || true
+        biopb control stop &>/dev/null || true
         biopb server stop &>/dev/null || true
         biopb mcp stop &>/dev/null || true
         _ok "Control plane, data server and MCP server stopped (if they were running)"
