@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
 
-from . import _resources
+from . import _resources, _skills
 from ._kernel import KernelHost
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ _BASE_INSTRUCTIONS = (
     "The napari kernel does NOT auto-start. Call `start_kernel` once at the "
     "start of the session (and again to recover after a failure or after the "
     "user closes the viewer window); it blocks until the kernel is ready.\n"
+    "\n"
+    "At the start of a task, call `find_skills` to check for a curated workflow "
+    "before improvising; read the matching `skill://<id>` resource for the "
+    "steps.\n"
     "\n"
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client` or `viewer`; avoid the filesystem unless the user "
@@ -434,9 +438,36 @@ def get_ops_guide() -> str:
     return _resources.OPS
 
 
+@mcp.resource("skill://{skill_id}")
+def get_skill(skill_id: str) -> str:
+    """Full workflow body for a curated skill; discover ids with `find_skills`.
+
+    The catalog (metadata) is served separately via the `find_skills` tool; this
+    resource lazily fetches one skill's markdown body, verifies it against the
+    catalog checksum, and caches it. Fail-open: returns a short explanatory
+    string rather than erroring when a skill is unknown or unreachable.
+    """
+    return _skills.get_skill_body(skill_id)
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def find_skills(query: str = "") -> list:
+    """Discover curated biopb workflows ("skills"). Call at the start of a task.
+
+    Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
+    labels"). `query` filters by title/description/tags; empty returns all.
+    Each result includes a `uri` (`skill://<id>`) — read that resource for the
+    full step-by-step workflow. Prefer an existing skill over improvising.
+
+    Fail-open: returns an empty list (never errors) when the catalog is
+    unreachable and nothing is cached or bundled.
+    """
+    return _skills.find_skills(query)
 
 
 @mcp.tool()
