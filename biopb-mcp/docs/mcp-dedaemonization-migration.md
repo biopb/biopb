@@ -186,17 +186,37 @@ intact. `biopb mcp` (below) is the separate no-agent convenience.
 
 The structural fix. Highest value; unblocks single origin.
 
-- **Move the auto-start responsibility up.** `_connection`'s
-  `can_autostart_server` / `start_local_server` / `auto_connect`
-  (`_connection.py:594–689`) stop spawning a server. `_connection` becomes a
-  **pure client**: connect, wait through a `STARTING` data-folder scan, surface
-  status — never `Popen` a data plane.
-- **The admin ensures the data plane is up** before any session runs (it supervised
-  it into existence at boot). If a client needs the plane and it is somehow down,
-  `_connection` asks the admin to ensure it, rather than shelling out itself.
+> **Status: core landed.** The admin skeleton + data-plane supervision +
+> `_connection` de-loop shipped as the Layer-2 *core* (phasing step 1). What
+> remains for full Layer 2 is trimming the tensor server's public web surface
+> (the third bullet), which pairs with the Layer-3 single-origin front.
+
+- **Move the auto-start responsibility up.** *(done)* `_connection`'s
+  `can_autostart_server` / `launch_local_server` / `start_local_server` are
+  **removed**; `auto_connect` no longer `Popen`s a server. `_connection` is now a
+  **pure client**: connect, wait through a `STARTING` data-folder scan, and — when
+  the local plane is down — ask the admin to ensure it (`biopb_mcp/_admin_client.py`),
+  never shelling out. With no admin reachable it records an actionable
+  "run `biopb admin start`" status.
+- **A lean admin supervises the data plane.** *(done)* New **`biopb-admin`**
+  workspace package (own `admin-v*` tag), managed by `biopb admin
+  start/stop/status/run` in the core CLI (which owns the pidfile/detach/stop
+  plumbing, reused from the server/mcp daemons). `DataPlaneSupervisor` spawns the
+  tensor server (the same `python -m biopb_tensor_server.cli launch` argv `biopb
+  server start` uses), polls TCP liveness, restarts on crash with capped backoff,
+  and **adopts** an already-running server instead of double-binding (§9
+  transition). Per invariant **I2** it imports neither `biopb_tensor_server` nor
+  `biopb_mcp`; the only shared fact — the admin's loopback endpoint — lives in the
+  core SDK (`biopb/_config_admin.py`). `biopb admin start` brings the plane up by
+  default (`--no-data-plane` for adopt/on-demand).
+- **Control API.** *(done)* A stdlib `ThreadingHTTPServer` on `127.0.0.1:8813`
+  exposes `GET /health` and `POST /data_plane/ensure` — the endpoint `_connection`
+  calls in place of the old shell-out. This is the seed of the Layer-3 origin; it
+  stays stdlib until the front replaces it with an ASGI app on the same port.
 - **The tensor server trends to Flight + a minimal internal HTTP** the admin
-  proxies; it loses its role as a public web surface. This makes the data plane
-  simpler and removes the last reason MCP needs to know how to launch it.
+  proxies; it loses its role as a public web surface. *(pending — with Layer 3.)*
+  This makes the data plane simpler and removes the last reason MCP needs to know
+  how to launch it.
 
 Result: the cycle in §1.1 becomes a tree rooted at the admin.
 
@@ -290,12 +310,16 @@ core.
 Each phase is independently shippable; the old shim keeps working until Layer 1
 flips it. Suggested order (value-first):
 
-1. **Admin skeleton + data-plane supervision (Layer 2 core).** Stand up the lean
-   admin; it supervises the tensor server; gut `_connection`'s auto-start. Breaks
-   the bootstrap loop. Unblocks everything else.
-2. **De-daemonize sessions + registry (Layer 1).** Serve-core refactor, shim
-   ownership, dynamic-port handoff, session self-registration. Closes #98 (env
-   inheritance) and lands #403/#402 in the shim-owned model.
+1. **Admin skeleton + data-plane supervision (Layer 2 core).** ✅ *Shipped.* Lean
+   `biopb-admin` package supervises the tensor server (spawn/adopt/restart);
+   `_connection` gutted to a pure client that asks the admin to ensure the plane.
+   Breaks the bootstrap loop. (Session self-registration + the admin-fronted
+   observe route are deferred to Layer 3.)
+2. **De-daemonize sessions + registry (Layer 1).** ✅ *Shipped* (before the Layer-2
+   core, reordering the value-first list to fix #98/#403 first). Serve-core
+   refactor, shim ownership, dynamic-port handoff. Closes #98 (env inheritance)
+   and lands #403/#402 in the shim-owned model. Session self-registration with the
+   admin is the remaining registry piece, folded into Layer 3.
 3. **Single-origin front (Layer 3).** Admin routes `/observe`, absorbs the
    dataviewer + admin UI, terminates auth/TLS. Downgrade `biopb mcp` to the
    standalone wrapper.

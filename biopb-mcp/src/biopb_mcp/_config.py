@@ -370,11 +370,13 @@ DEFAULT_CONFIG = {
             # Short on purpose — the check must never delay viewer start.
             "timeout": 5.0,
         },
-        # Give-up budget (seconds) for start_local_server's just-launched boot
-        # wait, where connection-refused is tolerated while the server binds and
-        # scans its data folder. The normal auto-connect path has no timeout: it
-        # fails fast on a down server and polls a STARTING (scanning) server
-        # indefinitely with progress feedback (issue #12).
+        # Give-up budget (seconds) for the just-launched boot wait after
+        # auto_connect asks the admin to ensure the data plane, where
+        # connection-refused is tolerated while the server binds and scans its
+        # data folder. It also bounds the admin-ensure call itself. The normal
+        # auto-connect path has no timeout: it fails fast on a down server and
+        # polls a STARTING (scanning) server indefinitely with progress
+        # feedback (issue #12).
         "server_start_timeout": 60.0,
     },
 }

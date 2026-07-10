@@ -106,6 +106,15 @@ MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
 
+# biopb-admin (control plane) management. The admin is a separate, lean package
+# (`biopb-admin`) started as `python -m biopb_admin run` by `biopb admin start`;
+# the lifecycle plumbing (pidfile / detach / stop-sentinel) lives here, reused
+# from the tensor-server / mcp daemons, so the package itself stays a pure
+# supervisor. It supervises the tensor server, which keeps writing the canonical
+# tensor-server.log (LOG_DIR), so `biopb server logs` still shows the data plane;
+# the admin's own supervision/control-API log is admin.log.
+ADMIN_PID_FILE = Path.home() / ".local" / "share" / "biopb" / "admin.pid"
+
 
 # The installer records the release-v* deployment version it pulled the wheels
 # from in this marker file -- a clean PEP 440 string (e.g. "0.6.7"), the
@@ -1757,6 +1766,419 @@ def mcp_view(
 
 
 app.add_typer(mcp_app, name="mcp")
+
+
+# ---------------------------------------------------------------------------
+# biopb admin: the control plane (supervises the durable planes)
+# ---------------------------------------------------------------------------
+# `biopb admin` manages the lean control-plane process (the `biopb-admin`
+# package). Layer 2 of the de-daemonization migration
+# (biopb-mcp/docs/mcp-dedaemonization-migration.md): the admin becomes the
+# durable root that supervises the tensor server, so `_connection` no longer
+# shells out `biopb server start` -- it asks the admin to ensure the data plane.
+admin_app = typer.Typer(
+    name="admin",
+    help="Biopb control plane: supervise the data plane (start/stop/status/run)",
+)
+
+
+def _require_biopb_admin() -> None:
+    """Exit(1) with an install hint if the biopb-admin package is absent.
+
+    Checks the import *spec* (not a real import), matching _require_biopb_mcp, so
+    gating a command never imports the package.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("biopb_admin") is None:
+        console.print(
+            "[red]The 'admin' commands require the biopb-admin package, which "
+            "is not installed.[/red]\n"
+            r"[yellow]Install it with: pip install biopb-admin[/yellow]"
+        )
+        raise typer.Exit(1)
+
+
+def _admin_endpoint() -> Tuple[str, int]:
+    """The admin control-API (host, port) from the shared core-SDK location."""
+    from ._config_admin import admin_host, admin_port
+
+    return admin_host(), admin_port()
+
+
+def _admin_log_file() -> Path:
+    """The admin's own supervision / control-API log (distinct from the data
+    plane's tensor-server.log, which the supervised server keeps writing)."""
+    return LOG_DIR / "admin.log"
+
+
+def _write_admin_pid(pid: int) -> None:
+    _ensure_dirs()
+    _write_pid_file(ADMIN_PID_FILE, pid, _process_create_time(pid))
+
+
+def _remove_admin_pid() -> None:
+    _remove_pid_file(ADMIN_PID_FILE)
+
+
+def _admin_shutdown_sentinel() -> Path:
+    """The admin's Windows stop-sentinel path (watched by biopb_admin._admin).
+    A single fixed name under the biopb data dir, like the other daemons'."""
+    return ADMIN_PID_FILE.parent / "admin.stop"
+
+
+def _resolve_dataplane_token(
+    config: Path, web_host: str, token: Optional[str]
+) -> Tuple[Optional[str], bool]:
+    """Resolve the tensor server's token / local-only-bypass, as `server start`
+    does, so the admin-supervised server applies the identical policy.
+
+    Returns ``(token, local_bypass)``: a token to enforce (from --token,
+    BIOPB_TENSOR_TOKEN, or freshly generated + printed for a non-local bind), or
+    ``local_bypass=True`` when the all-localhost no-token case skips enforcement.
+    """
+    _LOCALHOST_ADDRS = {"127.0.0.1", "localhost", "::1"}
+    if not token:
+        token = os.environ.get("BIOPB_TENSOR_TOKEN")
+
+    grpc_host = "0.0.0.0"  # safe default: assume public if config unreadable
+    if config.exists():
+        try:
+            from biopb_tensor_server.core.config import (
+                load_config as _load_server_config,
+            )
+
+            grpc_host = _load_server_config(config).host
+        except Exception:
+            pass
+
+    local_only = (
+        not token and web_host in _LOCALHOST_ADDRS and grpc_host in _LOCALHOST_ADDRS
+    )
+    if not token and not local_only:
+        import secrets as _secrets
+
+        token = _secrets.token_urlsafe(32)
+        console.print(f"[bold green]Generated access token:[/bold green] {token}")
+    return token, local_only
+
+
+def _query_admin_health(host: str, port: int, timeout: float = 2.0) -> Optional[dict]:
+    """GET the admin control API's /health, or None if unreachable."""
+    import json as _json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/health", timeout=timeout
+        ) as resp:
+            return _json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _admin_run_argv(
+    *,
+    config: Path,
+    static_dir: Optional[Path],
+    web_host: str,
+    web_port: int,
+    log_level: str,
+    data_plane: bool,
+    token: Optional[str],
+    local_bypass: bool,
+) -> List[str]:
+    """Build the `python -m biopb_admin run ...` argv `admin start` spawns.
+
+    The core CLI resolves everything (grpc endpoint, token policy, endpoint,
+    log paths) and passes it explicitly, so biopb_admin imports no server config
+    (invariant I2). The supervised tensor server logs to tensor-server.log; the
+    admin's own output is redirected by the caller to admin.log.
+    """
+    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    admin_host, admin_port = _admin_endpoint()
+    argv = [
+        sys.executable,
+        "-m",
+        "biopb_admin",
+        "run",
+        "--config",
+        str(config),
+        "--grpc-host",
+        grpc_host,
+        "--grpc-port",
+        str(grpc_port),
+        "--web-host",
+        web_host,
+        "--web-port",
+        str(web_port),
+        "--log-level",
+        str(log_level),
+        "--server-log",
+        str(_get_log_file()),
+        "--admin-host",
+        admin_host,
+        "--admin-port",
+        str(admin_port),
+        "--win-sentinel",
+        str(_admin_shutdown_sentinel()),
+    ]
+    if static_dir and static_dir.exists():
+        argv += ["--static-dir", str(static_dir)]
+    if not data_plane:
+        argv.append("--no-data-plane")
+    if token:
+        argv += ["--token", token]
+    elif local_bypass:
+        argv.append("--local-bypass")
+    return argv
+
+
+@admin_app.command("start")
+def admin_start(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+    ),
+    static_dir: Optional[Path] = typer.Option(
+        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+    ),
+    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
+    web_host: str = typer.Option(
+        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
+    ),
+    log_level: str = typer.Option("INFO", "--log-level", "-l", help="Admin log level"),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+    ),
+    data_plane: bool = typer.Option(
+        True,
+        "--data-plane/--no-data-plane",
+        help="Bring the data plane up on start (default). With --no-data-plane "
+        "the admin starts without it; a client brings it up on demand via the "
+        "control API. An already-running server is adopted either way.",
+    ),
+):
+    """Start the biopb control plane as a background daemon.
+
+    The admin supervises the tensor (data) plane -- and by default brings it up
+    on start, so `biopb admin start` is the single command that stands up a local
+    deployment. It restarts the plane on crash, adopts a server that is already
+    running instead of double-binding, and answers clients that ask it to ensure
+    the plane is up.
+    """
+    _require_biopb_admin()
+    _ensure_dirs()
+
+    existing_pid, existing_token = _read_pid_record(ADMIN_PID_FILE)
+    if _is_our_daemon(existing_pid, existing_token):
+        console.print(
+            f"[yellow]biopb admin already running (PID {existing_pid})[/yellow]"
+        )
+        raise typer.Exit(0)
+    if existing_pid:
+        console.print(
+            f"[yellow]Removing stale PID file (process {existing_pid} not running)[/yellow]"
+        )
+        _remove_admin_pid()
+
+    admin_host, admin_port = _admin_endpoint()
+    if _port_listening(admin_host, admin_port):
+        console.print(
+            f"[red]Admin control port {admin_host}:{admin_port} is already in use.[/red]"
+        )
+        console.print(
+            "It is held by a process biopb is not tracking (an orphaned admin, or "
+            "another login session), so [bold]biopb admin stop[/bold] cannot reach "
+            "it. Identify and stop the owner, then retry."
+        )
+        raise typer.Exit(1)
+
+    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
+    argv = _admin_run_argv(
+        config=config,
+        static_dir=static_dir,
+        web_host=web_host,
+        web_port=web_port,
+        log_level=log_level,
+        data_plane=data_plane,
+        token=resolved_token,
+        local_bypass=local_bypass,
+    )
+
+    log_file = _admin_log_file()
+    _rotate_log(log_file)
+    console.print("[green]Starting biopb control plane...[/green]")
+    console.print(f"  Config: {config}")
+    env = os.environ.copy()
+    if resolved_token:
+        env["BIOPB_TENSOR_TOKEN"] = resolved_token
+    with open(log_file, "a") as log:
+        log.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        process = subprocess.Popen(
+            argv, stdout=log, stderr=log, env=env, **_detach_kwargs()
+        )
+
+    _write_admin_pid(process.pid)
+
+    if not _await_listening(process.pid, admin_host, admin_port, 15.0):
+        if _is_process_running(process.pid):
+            console.print(
+                f"[red]Admin started but its control API is not listening on "
+                f"{admin_host}:{admin_port} after 15s.[/red]"
+            )
+            console.print(f"Check the log: {log_file}")
+        else:
+            console.print("[red]Failed to start biopb control plane[/red]")
+            _remove_admin_pid()
+            console.print(f"Check the log: {log_file}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]biopb control plane started (PID {process.pid})[/green]")
+    console.print(f"  Admin: http://{admin_host}:{admin_port}")
+    if data_plane:
+        console.print("  Data plane: starting (see 'biopb admin status')")
+    else:
+        console.print("  Data plane: not started (--no-data-plane; on-demand)")
+    console.print(f"  Logs: {log_file}")
+
+
+@admin_app.command("stop")
+def admin_stop(
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
+    ),
+):
+    """Stop the biopb control plane.
+
+    The admin stops the data plane it *owns* (spawned) on the way down; a plane
+    it merely adopted keeps running.
+    """
+    _require_biopb_admin()
+    pid, token = _read_pid_record(ADMIN_PID_FILE)
+    if not pid:
+        console.print("[yellow]No biopb control plane running[/yellow]")
+        raise typer.Exit(0)
+    if not _is_our_daemon(pid, token):
+        console.print(
+            f"[yellow]Process {pid} not running, cleaning up PID file[/yellow]"
+        )
+        _remove_admin_pid()
+        raise typer.Exit(0)
+
+    console.print(f"[green]Stopping biopb control plane (PID {pid})...[/green]")
+    if _stop_daemon(
+        pid,
+        timeout,
+        token,
+        sentinel=_admin_shutdown_sentinel(),
+        remove_pid=_remove_admin_pid,
+    ):
+        console.print("[green]biopb control plane stopped[/green]")
+    else:
+        console.print(f"[yellow]Did not stop within {timeout}s; force killed[/yellow]")
+    raise typer.Exit(0)
+
+
+@admin_app.command("status")
+def admin_status(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show the control plane's status and the data plane it supervises."""
+    _require_biopb_admin()
+    pid, token = _read_pid_record(ADMIN_PID_FILE)
+    running = _is_our_daemon(pid, token)
+    stale = bool(pid and not running)
+
+    admin_host, admin_port = _admin_endpoint()
+    health = _query_admin_health(admin_host, admin_port) if running else None
+    data_plane = (health or {}).get("data_plane") or {}
+    dp_state = data_plane.get("state", "unknown")
+
+    _emit_daemon_status(
+        title="biopb Control Plane Status",
+        pid=pid,
+        running=running,
+        stale=stale,
+        pid_file=ADMIN_PID_FILE,
+        log_file=_admin_log_file(),
+        json_output=json_output,
+        json_fields={
+            "admin_url": f"http://{admin_host}:{admin_port}" if running else None,
+            "control_api": bool(health) if running else False,
+            "data_plane": (data_plane or None) if running else None,
+        },
+        table_rows=[
+            ("Admin", f"http://{admin_host}:{admin_port}"),
+            ("Control API", "responding" if health else "not responding"),
+            ("Data plane", dp_state),
+            ("Data plane URL", data_plane.get("grpc_url", "-")),
+            ("Restarts", str(data_plane.get("restarts", 0))),
+        ],
+    )
+
+
+@admin_app.command("run")
+def admin_run(
+    config: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (JSON or TOML)"
+    ),
+    static_dir: Optional[Path] = typer.Option(
+        DEFAULT_WEBAPP, "--static-dir", help="Tensor-server static webapp directory"
+    ),
+    web_port: int = typer.Option(8814, "--web-port", help="Tensor-server HTTP port"),
+    web_host: str = typer.Option(
+        "127.0.0.1", "--web-host", help="Tensor-server HTTP bind address"
+    ),
+    log_level: str = typer.Option("INFO", "--log-level", "-l", help="Admin log level"),
+    token: Optional[str] = typer.Option(
+        None, "--token", help="Tensor-server access token (auto for non-local binds)"
+    ),
+    data_plane: bool = typer.Option(
+        True,
+        "--data-plane/--no-data-plane",
+        help="Bring the data plane up (default), or start without it (on-demand).",
+    ),
+):
+    """Run the control plane in the foreground (Ctrl-C to stop).
+
+    The foreground counterpart of `biopb admin start`: no PID file, blocks this
+    terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
+    (let the service manager own the process) or for debugging supervision.
+    """
+    _require_biopb_admin()
+    _ensure_dirs()
+    from biopb_admin import run_admin
+    from biopb_admin._supervisor import DataPlaneSpec
+
+    grpc_host, grpc_port = _resolve_grpc_hostport(config)
+    admin_host, admin_port = _admin_endpoint()
+    resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
+    spec = DataPlaneSpec(
+        config=config,
+        grpc_host=grpc_host,
+        grpc_port=grpc_port,
+        web_host=web_host,
+        web_port=web_port,
+        static_dir=static_dir if (static_dir and static_dir.exists()) else None,
+        log_level=log_level,
+        server_log=_get_log_file(),
+        token=resolved_token,
+        local_bypass=local_bypass,
+    )
+    code = run_admin(
+        spec,
+        admin_host=admin_host,
+        admin_port=admin_port,
+        data_plane=data_plane,
+        win_sentinel=_admin_shutdown_sentinel(),
+        log_level=log_level,
+    )
+    raise typer.Exit(code)
+
+
+app.add_typer(admin_app, name="admin")
 
 
 # ---------------------------------------------------------------------------
