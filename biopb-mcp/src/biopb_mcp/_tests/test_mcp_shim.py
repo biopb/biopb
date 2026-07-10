@@ -300,30 +300,82 @@ class TestReplayInitOptions:
         assert opts.capabilities is init.capabilities
 
 
+# --------------------------------------------------------------------------- #
+# End-to-end: platform-aware helpers
+#
+# The shim and its owned child use real OS process management, which differs by
+# platform. biopb_mcp resolves every dir under ``Path.home()`` (``os.path.
+# expanduser('~')``), which reads ``HOME`` on POSIX and ``USERPROFILE`` (then
+# ``HOMEDRIVE``+``HOMEPATH``) on Windows — so isolation sets the right var. And
+# liveness must not perturb the child: ``os.kill(pid, 0)`` is a probe on POSIX
+# but on Windows *any* signal other than CTRL_* is an unconditional
+# TerminateProcess, so Windows checks liveness with ``psutil`` instead. These
+# helpers let one e2e cover all three OSes rather than skipping Windows (where
+# the reap is the very thing #403 was about).
+# --------------------------------------------------------------------------- #
+def _home_env(tmp_path):
+    """Env that redirects ``Path.home()`` to ``tmp_path`` (isolates config/log/pid)."""
+    env = os.environ.copy()
+    home = str(tmp_path)
+    if os.name == "nt":
+        env["USERPROFILE"] = home
+        drive, tail = os.path.splitdrive(home)
+        env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
+    else:
+        env["HOME"] = home
+    return env
+
+
+def _pid_alive(pid):
+    """Whether ``pid`` names a live process — WITHOUT killing or perturbing it."""
+    if os.name == "nt":
+        import psutil  # a biopb-mcp[mcp] dep; only needed on the Windows leg
+
+        return psutil.pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours
+
+
 def _await_dead(pid, timeout):
     """Poll until ``pid`` is gone (reaping is asynchronous to the shim's exit)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _pid_alive(pid):
             return
-        except PermissionError:
-            return  # exists but not ours: treat as gone/unknown, not a failure
         time.sleep(0.1)
     raise AssertionError(f"owned child {pid} still alive after {timeout:.0f}s")
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX process management in the test"
-)
+def _force_kill(pid):
+    """Best-effort teardown of a still-running child (SIGKILL / TerminateProcess)."""
+    try:
+        if os.name == "nt":
+            import psutil
+
+            psutil.Process(pid).kill()
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def _extract(pattern, text, what):
+    m = re.search(pattern, text)
+    assert m, f"could not find {what} in daemon log:\n{text[-2000:]}"
+    return m.group(1)
+
+
 class TestEndToEnd:
-    """The real thing: the shim spawns its OWN session child, bridges a full
-    stdio session, and reaps that child when the client disconnects."""
+    """The real thing (all OSes): the shim spawns its OWN session child, bridges
+    a full stdio session, and reaps that child when the client disconnects."""
 
     def test_session_is_private_and_reaped_on_disconnect(self, tmp_path):
-        env = os.environ.copy()
-        env["HOME"] = str(tmp_path)  # isolate config + log dirs
+        env = _home_env(tmp_path)  # isolate config + log dirs, per platform
 
         shim = subprocess.Popen(
             [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
@@ -361,28 +413,29 @@ class TestEndToEnd:
             tools = json.loads(shim.stdout.readline())["result"]["tools"]
             assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
 
-            # The owned child logs its PID to the daemon log under the isolated
-            # HOME (uvicorn's "Started server process [pid]").
+            # The owned child logs its PID (uvicorn's "Started server process
+            # [pid]") and its dynamic listen URL (_server.run) to the daemon log
+            # under the isolated home.
             log = (
                 (tmp_path / ".local/share/biopb-mcp/log/mcp-server.log")
                 .read_bytes()
                 .decode(errors="replace")
             )
             child_pid = int(
-                re.search(r"Started server process \[(\d+)\]", log).group(1)
+                _extract(r"Started server process \[(\d+)\]", log, "child pid")
             )
-            os.kill(child_pid, 0)  # alive now
+            port = int(_extract(r"http://127\.0\.0\.1:(\d+)/mcp", log, "listen port"))
+            assert _pid_alive(child_pid)  # up now
+            assert _shim._port_listening(port) is True
 
             # Client hangs up: the shim must exit AND reap its private child
             # (the shared daemon used to survive — that is exactly what changed).
             shim.stdin.close()
-            assert shim.wait(timeout=20) == 0
-            _await_dead(child_pid, timeout=15)
+            assert shim.wait(timeout=40) == 0
+            _await_dead(child_pid, timeout=20)
+            assert _shim._port_listening(port) is False  # server truly gone
         finally:
             if shim.poll() is None:
                 shim.kill()
             if child_pid is not None:
-                try:
-                    os.kill(child_pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                _force_kill(child_pid)
