@@ -153,7 +153,10 @@ class TestSpawnSession:
             assert m, url
             assert _shim._port_listening(int(m.group(1))) is True
             assert proc.poll() is None  # still running while we bridge
-            assert job is None  # POSIX: reaped via the process group, not a job
+            if os.name == "nt":
+                assert job is not None  # Windows: a kill-on-close Job Object
+            else:
+                assert job is None  # POSIX: reaped via the process group, not a job
         finally:
             _shim._reap_session(proc, job)
         assert proc.poll() is not None  # reaped on the way out

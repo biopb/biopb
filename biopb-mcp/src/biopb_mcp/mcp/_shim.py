@@ -285,7 +285,16 @@ def _reap_session(proc, job):
         return
 
     if os.name == "nt":
+        # terminate_job force-reaps the whole tree when the child was assigned;
+        # proc.kill() (TerminateProcess) is the backstop for when the Job Object
+        # is unavailable (winjob is best-effort — a ctypes/OS hiccup returns
+        # None) or the assign failed, so the child is still reaped directly, and
+        # its own kill-on-close kernel job then reaps the kernel.
         _winjob.terminate_job(job)
+        try:
+            proc.kill()
+        except OSError:
+            pass
         try:
             proc.wait(timeout=REAP_TIMEOUT)
         except subprocess.TimeoutExpired:
