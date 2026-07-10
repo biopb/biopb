@@ -71,7 +71,9 @@ _add_optional_typer("image", "biopb.image.cli", "ProcessImage client operations"
 # Tensor server daemon management
 server_app = typer.Typer(
     name="server",
-    help="Biopb server daemon management (start/stop/restart/status)",
+    help="Biopb tensor-server diagnostics. The standalone-daemon commands "
+    "(start/stop/restart/status/logs) are deprecated -- the control plane "
+    "(`biopb admin`) now owns the data plane; cache-stats/migrate-config remain.",
 )
 app.add_typer(server_app, name="server")
 
@@ -572,6 +574,28 @@ def _detach_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _warn_server_daemon_deprecated() -> None:
+    """Print the standalone-tensor-server deprecation notice (to stderr).
+
+    Since Layer 2 of the de-daemonization migration
+    (biopb-mcp/docs/mcp-dedaemonization-migration.md), the data plane is owned
+    and supervised by the control plane: ``biopb admin start`` brings it up and
+    owns its lifecycle (restart-on-crash, complete teardown on stop), so the
+    standalone ``biopb server`` daemon is superseded. ``start``/``stop``/
+    ``restart``/``status``/``logs`` still work but will be removed in a future
+    release. Goes to stderr so it never corrupts ``status --json`` stdout.
+    (``cache-stats`` and ``migrate-config`` are diagnostics/utilities, not daemon
+    management, and are not deprecated.)
+    """
+    err_console.print(
+        "[yellow]Deprecated:[/yellow] the standalone biopb tensor-server daemon "
+        "is superseded by the control plane. Use [bold]biopb admin start[/bold] "
+        "(it owns and supervises the data plane) and [bold]biopb admin "
+        "status[/bold]. These commands still work but will be removed in a future "
+        "release."
+    )
+
+
 @server_app.command("start")
 def start(
     config: Path = typer.Option(
@@ -607,7 +631,8 @@ def start(
         help="Access token (auto-generated if not provided)",
     ),
 ):
-    """Start TensorFlight server as a background daemon."""
+    """(Deprecated) Start TensorFlight server as a background daemon."""
+    _warn_server_daemon_deprecated()
     _ensure_dirs()
 
     # Check if already running (identity-checked, so a reused stale PID does not
@@ -758,7 +783,8 @@ def stop(
         help="Seconds to wait for graceful shutdown",
     ),
 ):
-    """Stop TensorFlight server daemon."""
+    """(Deprecated) Stop TensorFlight server daemon."""
+    _warn_server_daemon_deprecated()
     pid, token = _read_pid_record(PID_FILE)
 
     if not pid:
@@ -824,7 +850,8 @@ def restart(
         help="Seconds to wait for graceful shutdown",
     ),
 ):
-    """Restart TensorFlight server daemon."""
+    """(Deprecated) Restart TensorFlight server daemon."""
+    _warn_server_daemon_deprecated()
     # Stop first. Use id_token (the PID-record identity token) so we don't clobber
     # the `token` access-token parameter, which must be passed through to start().
     pid, id_token = _read_pid_record(PID_FILE)
@@ -1022,7 +1049,8 @@ def status(
         help="Seconds to poll for the server to reach SERVING (0 = check once)",
     ),
 ):
-    """Check TensorFlight server daemon status and live health."""
+    """(Deprecated) Check TensorFlight server daemon status and live health."""
+    _warn_server_daemon_deprecated()
     pid, id_token = _read_pid_record(PID_FILE)
     running = _is_our_daemon(pid, id_token)
     stale = bool(pid and not running)
@@ -1107,7 +1135,8 @@ def logs(
     ),
     path: bool = typer.Option(False, "--path", help="Print the log file path and exit"),
 ):
-    """Show the TensorFlight server daemon log."""
+    """(Deprecated) Show the TensorFlight server daemon log."""
+    _warn_server_daemon_deprecated()
     log_file = _get_log_file()
     if path:
         print(log_file)

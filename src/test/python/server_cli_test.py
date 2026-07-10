@@ -344,7 +344,9 @@ class TestLogs:
         log_file.write_text("\n".join(f"line {i}" for i in range(20)) + "\n")
         res = self._run("-n", "5")
         assert res.exit_code == 0
-        out = res.output.strip().splitlines()
+        # Filter out the daemon-deprecation notice (stderr, mixed into CliRunner
+        # output); only the tailed log lines start with "line ".
+        out = [ln for ln in res.output.splitlines() if ln.startswith("line ")]
         assert out == ["line 15", "line 16", "line 17", "line 18", "line 19"]
 
     def test_level_filter_drops_below_threshold(self, log_file):
