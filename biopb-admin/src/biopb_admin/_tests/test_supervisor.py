@@ -54,7 +54,7 @@ def spec(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# spawn / adopt
+# spawn (sole ownership) / conflict
 # --------------------------------------------------------------------------- #
 def test_ensure_spawns_and_reports_serving(spec, monkeypatch):
     sup = DataPlaneSupervisor(spec)
@@ -64,43 +64,52 @@ def test_ensure_spawns_and_reports_serving(spec, monkeypatch):
         assert sup.wait_until_up(10.0) is True
         snap = sup.snapshot()
         assert snap["state"] == "serving"
-        assert snap["owned"] is True
         assert snap["pid"] is not None
     finally:
         sup.stop()
-    # stop() reaps the owned child, so the port is free again.
+    # stop() reaps the child (the admin owns it exclusively), so the port frees.
     assert sup._port_up() is False
 
 
-def test_ensure_adopts_already_running_server(spec, monkeypatch):
+def test_ensure_refuses_when_port_held_by_another(spec, monkeypatch):
+    # The admin is the sole owner: a port already held by a process it did not
+    # start is a conflict it refuses, not a server to adopt.
     listener = _listener(spec.grpc_port)
     try:
         sup = DataPlaneSupervisor(spec)
         spawn = MagicMock()
         monkeypatch.setattr(sup, "_spawn_locked", spawn)
         sup.ensure()
-        spawn.assert_not_called()  # adopted, not double-bound
+        spawn.assert_not_called()  # refused, not adopted, not double-bound
         snap = sup.snapshot()
-        assert snap["state"] == "serving"
-        assert snap["owned"] is False
+        assert snap["state"] == "conflict"
         assert snap["pid"] is None
+        assert "did not start" in (snap["last_error"] or "")
     finally:
         listener.close()
 
 
-def test_stop_leaves_adopted_plane_running(spec, monkeypatch):
-    listener = _listener(spec.grpc_port)
-    try:
-        sup = DataPlaneSupervisor(spec)
-        monkeypatch.setattr(sup, "_spawn_locked", MagicMock())
-        sup.ensure()
-        terminate = MagicMock()
-        monkeypatch.setattr(sup, "_terminate", terminate)
-        sup.stop()
-        terminate.assert_not_called()  # we did not spawn it; leave it be
-        assert sup._port_up() is True
-    finally:
-        listener.close()
+def test_stop_terminates_the_owned_plane(spec, monkeypatch):
+    # There is no 'adopted, leave it running' case: stop always tears the plane
+    # down. Here _spawn_locked is faked to install a live child; stop must reap it.
+    sup = DataPlaneSupervisor(spec)
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: False)
+
+    class _LiveProc:
+        pid = 4321
+
+        def poll(self):
+            return None  # alive
+
+    monkeypatch.setattr(
+        sup, "_spawn_locked", lambda: setattr(sup, "_proc", _LiveProc())
+    )
+    sup.ensure()
+    assert sup._proc is not None
+    terminate = MagicMock()
+    monkeypatch.setattr(sup, "_terminate", terminate)
+    sup.stop()
+    terminate.assert_called_once()  # the plane we own is always stopped
 
 
 # --------------------------------------------------------------------------- #
@@ -119,7 +128,6 @@ def _downed(sup, monkeypatch):
     monkeypatch.setattr(sup, "_spawn_locked", spawn)
     sup._proc = _DeadProc()
     sup._state.want = True
-    sup._state.owned = True
     return spawn
 
 
@@ -163,24 +171,23 @@ def test_tick_reaps_dead_handle_even_while_backing_off(spec, monkeypatch):
     assert sup._state.restarts == 1  # crash still counted exactly once
 
 
-def test_crashed_owned_child_yields_to_external_server(spec, monkeypatch):
-    # An owned child dies AND something else is now serving the port. The
-    # supervisor must not keep treating the stale dead handle as "our running
-    # child": it reaps it and flips to adopt (owned=False), never restarting or
-    # claiming a server it did not spawn.
+def test_crashed_child_with_port_still_held_reports_conflict(spec, monkeypatch):
+    # An owned child dies AND something else now holds the port. The supervisor
+    # reaps the stale dead handle and, as the sole owner, does NOT restart or
+    # claim the unowned server -- it reports a conflict.
     sup = DataPlaneSupervisor(spec)
     spawn = _downed(sup, monkeypatch)
-    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: True)  # external up
+    monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: True)  # something up
     sup.tick()
     spawn.assert_not_called()
     assert sup._proc is None
-    assert sup._state.owned is False
     snap = sup.snapshot()
-    assert snap["state"] == "serving" and snap["owned"] is False
+    assert snap["state"] == "conflict"
+    assert "did not start" in (snap["last_error"] or "")
 
 
 def test_ensure_after_crash_is_not_fooled_by_dead_handle(spec, monkeypatch):
-    # ensure() decides adopt-vs-spawn from `self._proc`; a crashed child left in
+    # ensure() decides spawn-vs-refuse from `self._proc`; a crashed child left in
     # it must not be mistaken for a live one. With the port down it spawns fresh.
     sup = DataPlaneSupervisor(spec)
     spawn = _downed(sup, monkeypatch)  # dead handle, port down, spawn mocked
@@ -193,10 +200,17 @@ def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
     sup = DataPlaneSupervisor(spec)
     sup._state.failures = 3
     assert sup._backoff() == 4.0  # _BACKOFF_SCHEDULE[3]
-    # A run of healthy ticks past the reset window clears the failure count.
+    # A live child up past the reset window clears the failure count.
     monkeypatch.setattr(sup, "_port_up", lambda timeout=0.5: True)
     sup._state.want = True
-    sup._proc = None
+
+    class _LiveProc:
+        pid = 4321
+
+        def poll(self):
+            return None  # alive
+
+    sup._proc = _LiveProc()
     sup._state.up_since = time.monotonic() - 120  # long healthy
     sup.tick()
     assert sup._state.failures == 0
@@ -209,22 +223,25 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
     import json
     import urllib.request
 
-    listener = _listener(spec.grpc_port)  # so ensure adopts, no real spawn
     sup = DataPlaneSupervisor(spec)
+    # POST /data_plane/ensure spawns a real (binder) child the admin owns.
+    monkeypatch.setattr(sup, "_build_argv", lambda: _binder_argv(spec.grpc_port))
     api_port = _free_port()
-    server, _thread = serve_control_api("127.0.0.1", api_port, sup, ensure_timeout=5.0)
+    server, _thread = serve_control_api("127.0.0.1", api_port, sup, ensure_timeout=8.0)
     base = f"http://127.0.0.1:{api_port}"
     try:
+        # Before ensure: nothing running.
         health = json.loads(urllib.request.urlopen(f"{base}/health", timeout=3).read())
         assert health["admin"] == "ok"
-        assert health["data_plane"]["state"] == "serving"
+        assert health["data_plane"]["state"] == "stopped"
 
+        # Ensure spawns and waits until the port is up.
         req = urllib.request.Request(
             f"{base}/data_plane/ensure", data=b"", method="POST"
         )
-        ensured = json.loads(urllib.request.urlopen(req, timeout=6).read())
+        ensured = json.loads(urllib.request.urlopen(req, timeout=10).read())
         assert ensured["data_plane"]["state"] == "serving"
-        assert ensured["data_plane"]["owned"] is False
+        assert ensured["data_plane"]["pid"] is not None
 
         # Unknown path -> 404 JSON, not a hang.
         try:
@@ -234,4 +251,4 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
             assert exc.code == 404
     finally:
         server.shutdown()
-        listener.close()
+        sup.stop()  # reap the binder child

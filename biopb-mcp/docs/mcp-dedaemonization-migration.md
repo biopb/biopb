@@ -203,12 +203,18 @@ The structural fix. Highest value; unblocks single origin.
   start/stop/status/run` in the core CLI (which owns the pidfile/detach/stop
   plumbing, reused from the server/mcp daemons). `DataPlaneSupervisor` spawns the
   tensor server (the same `python -m biopb_tensor_server.cli launch` argv `biopb
-  server start` uses), polls TCP liveness, restarts on crash with capped backoff,
-  and **adopts** an already-running server instead of double-binding (§9
-  transition). Per invariant **I2** it imports neither `biopb_tensor_server` nor
+  server start` uses), polls TCP liveness, and restarts on crash with capped
+  backoff. **The admin is the *sole owner* of the data plane** — it always spawns
+  and manages its own child and never adopts a server it did not start (decision:
+  the earlier dual spawn/adopt mode was dropped as needless complexity, see §9).
+  A gRPC port already in use is a *conflict* it refuses (`admin start` errors,
+  mirroring `biopb server start`'s port guard), not something to attach to. This
+  single-owner rule is what keeps `self._proc` the whole state and makes `biopb
+  admin stop` a **complete data-plane teardown** (no "adopted, left running"
+  case). Per invariant **I2** it imports neither `biopb_tensor_server` nor
   `biopb_mcp`; the only shared fact — the admin's loopback endpoint — lives in the
   core SDK (`biopb/_config_admin.py`). `biopb admin start` brings the plane up by
-  default (`--no-data-plane` for adopt/on-demand).
+  default (`--no-data-plane` starts the admin without it, on-demand).
 - **Control API.** *(done)* A stdlib `ThreadingHTTPServer` on `127.0.0.1:8813`
   exposes `GET /health` and `POST /data_plane/ensure` — the endpoint `_connection`
   calls in place of the old shell-out. This is the seed of the Layer-3 origin; it
@@ -352,8 +358,15 @@ flips it. Suggested order (value-first):
   collapse into one admin-owned surface, or stay per-plane with the admin
   referencing them. Decide during Layer 4.
 - **Transition / back-compat.** `biopb server` / `biopb mcp` semantics during the
-  migration — the admin should be able to adopt an already-running tensor server,
-  not only ones it spawned.
+  migration. *Resolved (Layer 2 core): the admin does NOT adopt an already-running
+  tensor server.* Supervising both spawned and adopted servers made the state
+  fragile (a crashed child's handle could no longer be trusted to tell "ours" from
+  "someone else's") and left teardown incomplete (`admin stop` couldn't stop an
+  adopted plane). The admin is now the **sole owner**: it always spawns its own
+  plane and treats a port already in use as a conflict to refuse. During migration
+  the old standalone `biopb server start` daemon still exists, but you run *either*
+  it *or* the admin, not both against one port — the admin will not attach to a
+  server it did not start.
 
 ---
 

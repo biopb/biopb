@@ -1955,16 +1955,18 @@ def admin_start(
         "--data-plane/--no-data-plane",
         help="Bring the data plane up on start (default). With --no-data-plane "
         "the admin starts without it; a client brings it up on demand via the "
-        "control API. An already-running server is adopted either way.",
+        "control API.",
     ),
 ):
     """Start the biopb control plane as a background daemon.
 
     The admin supervises the tensor (data) plane -- and by default brings it up
     on start, so `biopb admin start` is the single command that stands up a local
-    deployment. It restarts the plane on crash, adopts a server that is already
-    running instead of double-binding, and answers clients that ask it to ensure
-    the plane is up.
+    deployment. It is the *sole owner* of the plane: it always spawns and manages
+    its own tensor server, restarts it on crash, and answers clients that ask it
+    to ensure the plane is up. It does not adopt a server it did not start -- if
+    the gRPC port is already in use, `admin start` refuses (stop the stray server
+    first), so `biopb admin stop` is always a complete data-plane teardown.
     """
     _require_biopb_admin()
     _ensure_dirs()
@@ -1992,6 +1994,25 @@ def admin_start(
             "it. Identify and stop the owner, then retry."
         )
         raise typer.Exit(1)
+
+    # The admin owns the data plane exclusively, so refuse to start into a gRPC
+    # port a stray server already holds -- otherwise the supervised child would
+    # crash-loop on EADDRINUSE. Mirrors `biopb server start`'s port guard. Skipped
+    # for --no-data-plane (the plane comes up on demand, guarded there too).
+    if data_plane:
+        grpc_host, grpc_port = _resolve_grpc_hostport(config)
+        if _port_listening(grpc_host, grpc_port):
+            console.print(
+                f"[red]Data-plane gRPC port {grpc_host}:{grpc_port} is already "
+                "in use.[/red]"
+            )
+            console.print(
+                "The admin owns the data plane exclusively and will not adopt a "
+                "server it did not start. Stop the process holding that port "
+                f"(`lsof -i :{grpc_port}` / `netstat -ano | findstr {grpc_port}`), "
+                "then retry -- or start with [bold]--no-data-plane[/bold]."
+            )
+            raise typer.Exit(1)
 
     resolved_token, local_bypass = _resolve_dataplane_token(config, web_host, token)
     argv = _admin_run_argv(
@@ -2048,10 +2069,13 @@ def admin_stop(
         10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
     ),
 ):
-    """Stop the biopb control plane.
+    """Stop the biopb control plane and the data plane it owns.
 
-    The admin stops the data plane it *owns* (spawned) on the way down; a plane
-    it merely adopted keeps running.
+    The admin owns the data plane exclusively, so stopping it is a complete
+    teardown: the supervised tensor server is shut down too. This is the single
+    command an installer/upgrade uses to free the admin-managed processes before
+    replacing files. (Legacy standalone daemons started with `biopb server start`
+    / `biopb mcp start` are stopped by their own `stop` commands.)
     """
     _require_biopb_admin()
     pid, token = _read_pid_record(ADMIN_PID_FILE)

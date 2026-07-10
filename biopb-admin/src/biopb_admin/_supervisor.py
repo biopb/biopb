@@ -3,11 +3,15 @@
 :class:`DataPlaneSupervisor` owns the tensor-server process the way the existing
 ``biopb server start`` command does (same ``python -m biopb_tensor_server.cli
 launch`` argv, same detach/log idiom), but *persistently*: it starts the plane,
-polls its liveness, and restarts it on crash with capped backoff. It **adopts**
-an already-running server instead of double-binding (the transition case in the
-migration doc), and it never imports ``biopb_tensor_server`` — liveness is a
-cheap stdlib TCP connect to the gRPC port, so no pyarrow/grpc is pulled into the
-lean admin (invariant I2).
+polls its liveness, and restarts it on crash with capped backoff. The admin is
+the **sole owner** of the data plane — it always spawns and manages its own
+child and never adopts a server it did not start; a gRPC port already held by
+another process is a *conflict* it refuses (surface, don't manage), not
+something to attach to. This single-owner rule is what makes the state simple
+(``self._proc`` alone tracks the child) and makes ``biopb admin stop`` a complete
+teardown. It never imports ``biopb_tensor_server`` — liveness is a cheap stdlib
+TCP connect to the gRPC port, so no pyarrow/grpc is pulled into the lean admin
+(invariant I2).
 
 Readiness beyond "port bound" (the progressive-discovery ``SERVING`` scan) is
 left to the *client*: ``biopb-mcp``'s ``_connection`` connects and waits the
@@ -67,7 +71,6 @@ class DataPlaneSpec:
 @dataclass
 class _State:
     want: bool = False  # should the plane be running (set by ensure/stop)
-    owned: bool = False  # did we spawn it (vs adopt an already-running one)
     failures: int = 0  # consecutive failed/crashed attempts (drives backoff)
     restarts: int = 0  # total restarts since admin start (for status)
     next_attempt_at: float = 0.0  # monotonic; earliest time to (re)spawn
@@ -174,7 +177,6 @@ class DataPlaneSupervisor:
             env=self._child_env(),
             close_fds=True,
         )
-        self._state.owned = True
         self._state.up_since = None
 
     def _child_alive(self) -> bool:
@@ -211,21 +213,36 @@ class DataPlaneSupervisor:
         elif now - st.up_since >= _HEALTHY_RESET_SECONDS:
             st.failures = 0
 
+    def _conflict_message(self) -> str:
+        return (
+            f"data-plane port {self._spec.grpc_host}:{self._spec.grpc_port} is "
+            "held by a process the admin did not start; refusing to manage it. "
+            "Stop that server, then the admin will bring up one it owns."
+        )
+
     def ensure(self) -> None:
-        """Idempotently make the data plane running. Spawn it, or adopt one that
-        is already listening. Safe to call repeatedly / concurrently."""
+        """Idempotently bring the data plane up under admin ownership.
+
+        The admin is the *sole* owner of the data plane: it always spawns and
+        manages its own tensor-server child, and never adopts or coexists with a
+        server it did not start. If the gRPC port is already held by another
+        process, that is a conflict the admin refuses (recorded in ``last_error``
+        / the ``conflict`` status) rather than silently attaching to -- stop the
+        stray server and the admin will own a freshly-spawned one. Safe to call
+        repeatedly / concurrently.
+        """
         with self._lock:
             st = self._state
             st.want = True
-            st.last_error = None
             self._reap_dead_child()  # normalize a stale handle before deciding
             if self._proc is not None:
+                st.last_error = None
                 return  # our child is alive (starting or serving)
             if self._port_up():
-                # Something is already serving on the port we'd bind. Adopt it
-                # rather than double-bind; we monitor but do not own its death.
-                st.owned = False
+                st.last_error = self._conflict_message()
+                logger.error(st.last_error)
                 return
+            st.last_error = None
             self._spawn_locked()
             st.next_attempt_at = time.monotonic() + self._backoff()
 
@@ -234,11 +251,12 @@ class DataPlaneSupervisor:
         return _BACKOFF_SCHEDULE[idx]
 
     def tick(self) -> None:
-        """One supervision step: restart a crashed owned child with backoff.
+        """One supervision step: restart a crashed child with backoff.
 
-        Called on a fixed cadence by the supervision loop. Adopted (unowned)
-        planes are only monitored, never restarted -- we did not spawn them and
-        another manager may.
+        Called on a fixed cadence by the supervision loop. The admin owns the
+        plane exclusively, so there is no adopted/unowned case to juggle: a live
+        child is left alone, a crashed one is reaped and restarted, and a port
+        held by a process we did not spawn is a conflict we surface, never manage.
         """
         with self._lock:
             st = self._state
@@ -262,11 +280,14 @@ class DataPlaneSupervisor:
                 return
 
             if self._port_up():
-                # The port is served, but not by a child of ours: an adopted or
-                # external server. Monitor it; never restart or kill what we did
-                # not spawn.
-                st.owned = False
-                self._note_healthy()
+                # The port is held, but not by a child of ours (a stray server,
+                # or our child died and something else grabbed it). As the sole
+                # owner we do not manage it -- surface the conflict (log once on
+                # entry) and wait for it to clear.
+                if st.last_error != self._conflict_message():
+                    logger.error(self._conflict_message())
+                st.last_error = self._conflict_message()
+                st.up_since = None
                 return
 
             # Port down and no live child of ours: (re)start when backoff allows.
@@ -274,10 +295,6 @@ class DataPlaneSupervisor:
             now = time.monotonic()
             if now < st.next_attempt_at:
                 return
-            if not st.owned:
-                # A previously-adopted server vanished; the admin is its
-                # supervisor now (a fresh spawn always sets owned via ensure).
-                logger.info("data plane is down and unowned; taking it over")
             self._spawn_locked()
             st.next_attempt_at = now + self._backoff()
 
@@ -298,12 +315,17 @@ class DataPlaneSupervisor:
             time.sleep(0.25)
 
     def stop(self) -> None:
-        """Stop supervising and, if we own the plane, shut it down."""
+        """Stop supervising and shut the data plane down.
+
+        The admin owns the plane exclusively, so stopping the admin always stops
+        the plane -- there is no 'adopted, leave it running' case. This is what
+        makes ``biopb admin stop`` a complete data-plane teardown.
+        """
         with self._lock:
             self._state.want = False
-            proc, owned = self._proc, self._state.owned
+            proc = self._proc
             self._proc = None
-        if proc is not None and owned:
+        if proc is not None:
             self._terminate(proc)
         self._close_log()
 
@@ -361,14 +383,15 @@ class DataPlaneSupervisor:
             st = self._state
             up = self._port_up()
             child_alive = self._child_alive()
-            # State reflects reality first: a listening port is "serving" whether
-            # we spawned, adopted, or have not yet been asked to manage it. Only
-            # when nothing is listening does intent matter -- "down" if we want it
-            # up (and are backing off / restarting), else "stopped".
-            if up:
-                state = "serving"
-            elif child_alive:
-                state = "starting"
+            # The admin owns the plane exclusively, so the port being up means one
+            # of two things: our child serves it ("serving"), or a process we did
+            # not start holds it ("conflict"). With nothing listening, intent
+            # decides: "starting" while our child binds, "down" if we want it up
+            # (backing off / restarting), else "stopped".
+            if child_alive:
+                state = "serving" if up else "starting"
+            elif up:
+                state = "conflict"
             elif st.want:
                 state = "down"
             else:
@@ -378,7 +401,6 @@ class DataPlaneSupervisor:
                 "grpc_url": f"grpc://{self._spec.grpc_host}:{self._spec.grpc_port}",
                 "web_url": f"http://{self._spec.web_host}:{self._spec.web_port}/",
                 "pid": self._proc.pid if child_alive else None,
-                "owned": st.owned,
                 "restarts": st.restarts,
                 "last_error": st.last_error,
             }
