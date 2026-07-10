@@ -1041,16 +1041,19 @@ function Invoke-BiopbInstall {
     # On Windows a running biopb process keeps its executables under the uv tool
     # dir open, so `uv tool install --force` cannot delete that dir to reinstall
     # and aborts with "Access is denied" (os error 5) -> uv exit code 2. Stop any
-    # previously installed biopb daemons -- the data server AND the biopb-mcp
-    # server (which also owns a detached napari kernel) -- so the upgrade can
-    # replace the locked binaries. Best-effort (try/catch swallows the benign
-    # "nothing running" stderr that would otherwise raise a terminating
-    # NativeCommandError) and a no-op on a clean machine. Done before the downloads
-    # so the OS has time to release the handles.
+    # previously installed biopb daemons -- the control plane (which owns and
+    # holds open a supervised tensor-server child), the standalone data server,
+    # AND the biopb-mcp server (which owns a detached napari kernel) -- so the
+    # upgrade can replace the locked binaries. The admin goes FIRST: it owns the
+    # data plane, so stopping it tears that child down and stops it respawning
+    # anything the next two commands / the force-kill would race. Best-effort
+    # (try/catch swallows the benign "nothing running" stderr) and a no-op on a
+    # clean machine. Done before the downloads so the OS releases the handles.
     if (Get-Command biopb -ErrorAction SilentlyContinue) {
+        try { & biopb admin stop  *> $null } catch { }
         try { & biopb server stop *> $null } catch { }
         try { & biopb mcp stop    *> $null } catch { }
-        Report-Detail "stopped any running biopb daemons (data + mcp) so their files can be replaced"
+        Report-Detail "stopped any running biopb daemons (admin + data + mcp) so their files can be replaced"
     }
     # Belt-and-suspenders: the graceful stops above miss servers launched ad-hoc
     # from a shell, detached napari kernels, and agent-spawned stdio biopb-mcp --
@@ -1560,10 +1563,13 @@ function Invoke-BiopbUninstall {
     }
     try {
         Report-Step 1 "Stopping data server..."
-        # Stop the data server AND the biopb-mcp server (+ its napari kernel):
-        # both lock executables under the uv tool dir, so a still-running daemon
-        # would make `uv tool uninstall` fail to remove the dir on Windows.
+        # Stop the control plane, the data server, AND the biopb-mcp server (+ its
+        # napari kernel): each locks executables under the uv tool dir, so a
+        # still-running daemon would make `uv tool uninstall` fail to remove the
+        # dir on Windows. The admin goes first -- it owns the data plane, so
+        # stopping it is a complete teardown of that pair and stops it respawning.
         if (Get-Command biopb -ErrorAction SilentlyContinue) {
+            try { & biopb admin stop  *> $null } catch { }
             try { & biopb server stop *> $null } catch { }
             try { & biopb mcp stop    *> $null } catch { }
         }

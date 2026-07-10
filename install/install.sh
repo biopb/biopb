@@ -1572,11 +1572,14 @@ uninstall_biopb() {
     # 1. Stop the daemons first. On some platforms a live process keeps its files
     #    open and `uv tool uninstall` then can't remove the tool dir (the Windows
     #    engine hits exactly this — os error 5), so stopping precedes removal.
+    #    The control plane goes first: it owns the data plane, so `admin stop` is a
+    #    complete teardown of that pair and stops it respawning what follows.
     _step "[1/3] Stopping biopb services..."
     if command -v biopb &>/dev/null; then
+        biopb admin stop &>/dev/null || true
         biopb server stop &>/dev/null || true
         biopb mcp stop &>/dev/null || true
-        _ok "Data server and MCP server stopped (if they were running)"
+        _ok "Control plane, data server and MCP server stopped (if they were running)"
     else
         _info "biopb command not on PATH; nothing to stop"
     fi
