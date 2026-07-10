@@ -756,6 +756,20 @@ class TestMcpStatus:
         d = self._json(monkeypatch, pid=42, running=True, listening=False)
         assert d["running"] is True and d["listening"] is False
 
+    def test_table_hint_when_running_not_listening(self, monkeypatch):
+        # Running (process alive) but not listening is ambiguous: still starting
+        # up, or the /mcp transport died under it (biopb/biopb#383). The table
+        # hint must not assert "not bound yet" and should point at recovery.
+        monkeypatch.setattr(cli, "_require_biopb_mcp", lambda: None)
+        monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (42, None))
+        monkeypatch.setattr(cli, "_is_process_running", lambda _p: True)
+        monkeypatch.setattr(cli, "_mcp_default_port", lambda: 8765)
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        res = CliRunner().invoke(cli.app, ["mcp", "status"])
+        assert res.exit_code == 0, res.output
+        assert "not bound yet" not in res.output
+        assert "restart" in res.output
+
     def test_stopped(self, monkeypatch):
         d = self._json(monkeypatch, pid=None, running=False, listening=False)
         assert d["running"] is False and d["status"] == "stopped"

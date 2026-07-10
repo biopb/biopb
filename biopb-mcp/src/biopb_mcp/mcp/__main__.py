@@ -322,6 +322,23 @@ def _serve_http(config, port):
     from ._cluster import DaskClusterHost
     from ._kernel import KernelHost
 
+    # Windows: serve on the Selector event loop, not the default Proactor one
+    # (biopb/biopb#383). The Proactor accept loop treats *any* OSError from
+    # AcceptEx as fatal -- it closes the listening socket and never re-arms
+    # accept -- leaving the server "alive but not serving."
+    # The Selector loop's also silences zmq's "Proactor does not implement
+    # add_reader" warning, since jupyter_client's kernel channels want exactly
+    # this loop. Safe to set because both child kernel and Dask's `LocalCluster`
+    # uses synchronous `subprocess.Popen`, so the Selector loop's lack of
+    # asyncio-subprocess support is fine. Caveat: the Windows Selector loop is
+    # select()-based (FD_SETSIZE 512); this single-agent localhost transport
+    # handles only the listener plus a handful of /mcp + observe connections,
+    # far under that ceiling.
+    if os.name == "nt":
+        import asyncio
+
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     # Decide whether the kernel opens a visible viewer. With no display, a Qt
     # viewer hard-aborts the kernel (SIGABRT, not a catchable error), so unless
     # the user demands "visible" we degrade to a compute-only headless kernel.
