@@ -672,114 +672,84 @@ function Show-LogTail {
 
 # Start (or restart) the background data server, then report its health.
 # Best-effort: never aborts the install.
-function Start-DataServer {
+function Start-ControlPlane {
     param([string]$BiopbHome, [string]$ConfigFile, [bool]$NoStart)
 
-    $logFile = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
+    $adminLog  = Join-Path $BiopbHome ".local\share\biopb\logs\admin.log"
+    $serverLog = Join-Path $BiopbHome ".local\share\biopb\logs\tensor-server.log"
 
     if ($NoStart) {
-        Report-Info "Skipping server start"
-        Report-Detail "start it later with: biopb server start"
+        Report-Info "Skipping control-plane start"
+        Report-Detail "start it later with: biopb admin start"
         return
     }
     if (-not (Get-Command biopb -ErrorAction SilentlyContinue)) {
-        Report-Warn "biopb not found on PATH; skipping server start"
-        Report-Detail "start it later with: biopb server start"
+        Report-Warn "biopb not found on PATH; skipping control-plane start"
+        Report-Detail "start it later with: biopb admin start"
         return
     }
 
-    # Both native calls below merge stderr via 2>&1; under the script's
-    # EAP='Stop', PS 5.1 turns a stderr line into a terminating
-    # NativeCommandError, so soften EAP around them and gate on real exit codes.
+    # Native calls below merge stderr via 2>&1; under the script's EAP='Stop',
+    # PS 5.1 turns a stderr line into a terminating NativeCommandError, so soften
+    # EAP around them and gate on real exit codes.
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
 
-    # 'restart' loads the just-installed code if a server is already running,
-    # and is a plain start otherwise. Don't swallow a failure (biopb/biopb#324):
-    # on a start that can never succeed -- e.g. gRPC port 8815 held by a process
-    # biopb is not tracking -- the CLI prints the real cause, and the status poll
-    # below would bury it under a generic "may not have started".
-    $restartOut = @()
-    try { $restartOut = @(& biopb server restart 2>&1 | ForEach-Object { "$_" }) } catch { $restartOut += "$_" }
+    # Retire a prior control plane (+ the data plane it owns) and any legacy
+    # standalone data server, so the new admin can bind a fresh plane it owns --
+    # it refuses an in-use gRPC port. Best-effort; no-ops on a clean machine.
+    try { & biopb admin stop  *> $null } catch { }
+    try { & biopb server stop *> $null } catch { }
+
+    # Start the control plane; it brings up the data plane by default. Don't
+    # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
+    # process makes the admin refuse, and the CLI prints the real cause.
+    $startOut = @()
+    try { $startOut = @(& biopb admin start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
-        Report-Warn "Data server failed to (re)start"
-        foreach ($line in $restartOut) {
+        Report-Warn "Control plane failed to start"
+        foreach ($line in $startOut) {
             $t = "$line".Trim()
             if ($t) { Report-Detail $t }
         }
-        Show-LogTail -LogFile $logFile
-        Report-Detail "full log: $logFile"
-        Report-Detail "after fixing the cause, run: biopb server start"
+        Show-LogTail -LogFile $adminLog
+        Report-Detail "full log: $adminLog"
+        Report-Detail "after fixing the cause, run: biopb admin start"
         return
     }
 
-    # Ask the daemon for its health, polling until SERVING (or 60s). Merge stderr
-    # (live progress) into the stream and surface it as it arrives; the JSON
-    # verdict (line starting with '{') on stdout is captured for parsing.
-    $result = @{ json = $null }
-    try {
-        & biopb server status --json --wait 60 2>&1 | ForEach-Object {
-            $s = "$_"
-            if ($s.TrimStart().StartsWith("{")) { $result.json = $s.Trim() }
-            elseif ($s.Trim()) { Report-Info $s.Trim() }
-        }
-    } catch { }
+    # `admin start` returns once its control API is listening but before the data
+    # plane finishes booting, so poll the admin until the plane reports serving.
+    # Progressive discovery (biopb/biopb#212) reaches SERVING as soon as the
+    # server binds and scans in the background, so not-serving after 60s points to
+    # a real startup failure. `admin status --json` carries only the plane's state
+    # (the lean admin does no Flight query, so no source_count -- it climbs later).
+    $serving = $false; $conflict = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        $out = ""
+        try { $out = (& biopb admin status --json 2>$null | Out-String) } catch { $out = "" }
+        try {
+            $state = ($out | ConvertFrom-Json).data_plane.state
+            if ($state -eq "serving")  { $serving = $true;  break }
+            if ($state -eq "conflict") { $conflict = $true; break }
+        } catch { }
+        Start-Sleep -Seconds 1
+    }
     $ErrorActionPreference = $prevEAP
-    $out = $result.json
-    if (-not $out) { $out = "" }
 
-    # Tolerate an older biopb that predates --json/--wait.
-    if (-not $out) {
-        $plain = ""
-        try { $plain = (& biopb server status 2>$null | Out-String) } catch { $plain = "" }
-        if ($plain -match "Running") {
-            Report-Ok "Data server started"
-        } else {
-            Report-Warn "Data server may not have started"
-            Show-LogTail -LogFile $logFile
-            Report-Detail "full log: $logFile"
-        }
-        return
+    if ($serving) {
+        Report-Ok "Control plane started - data plane serving; catalog + pre-cache building in the background"
+    } elseif ($conflict) {
+        Report-Warn "Data-plane gRPC port is held by another process; the admin will not adopt it"
+        Report-Detail "stop that server, then: biopb admin start"
+    } else {
+        Report-Warn "Data plane did not reach serving within 60s"
+        Report-Detail "it likely failed to start or is wedged:"
+        Show-LogTail -LogFile $serverLog
+        Report-Detail "full log: $serverLog"
+        Report-Detail "recheck with: biopb admin status"
     }
-
-    $health = $null; $count = $null
-    try {
-        $obj = $out | ConvertFrom-Json
-        $health = $obj.health
-        $count = $obj.source_count
-    } catch { }
-
-    if ($health -ne "SERVING") {
-        # Progressive discovery (biopb/biopb#212) decoupled SERVING from the data
-        # folder scan: the server reaches SERVING as soon as it binds and scans in
-        # the background, so a big folder no longer holds it out of SERVING. Not
-        # SERVING after 60s therefore points to a real startup failure (crash,
-        # port already in use, or a wedged bind), not a slow scan.
-        Report-Warn "Data server did not reach SERVING within 60s"
-        Report-Detail "it likely failed to start or is wedged (a slow folder scan no"
-        Report-Detail "longer blocks SERVING, so this is not just still scanning):"
-        Show-LogTail -LogFile $logFile
-        Report-Detail "full log: $logFile"
-        Report-Detail "recheck once with: biopb server status --wait 30"
-        return
-    }
-
-    if ((-not $count) -or ($count -eq 0)) {
-        # SERVING no longer implies a complete catalog: the folder scan runs in
-        # the background and registers sources as it walks. status --wait returns
-        # at the first SERVING, which is normally *before* the scan has indexed
-        # anything -- so 0 sources here usually just means "scan not finished
-        # yet," not "empty folder." The count climbs on its own shortly after.
-        Report-Info "Data server is up; catalog is still building in the background"
-        Report-Detail "no sources indexed yet - normal right after a (re)start"
-        Report-Detail "recheck in a moment: biopb server status"
-        Report-Detail "if it stays at 0, confirm the data folder holds supported images:"
-        Report-Cmd "$ConfigFile"
-        return
-    }
-
-    Report-Ok "Data server ready - $count data source(s) so far; still scanning + pre-caching in the background"
 }
 
 # Precompile the tool env's Python bytecode (.py -> .pyc) so the first
@@ -899,7 +869,7 @@ function Invoke-BiopbInstall {
             "Installing biopb packages...",
             "Installing web interface...",
             "Config...",
-            "Starting data server...",
+            "Starting control plane...",
             "Configuring MCP client..."
         )
         for ($i = 0; $i -lt $stepMsgs.Count; $i++) {
@@ -1489,9 +1459,9 @@ function Invoke-BiopbInstall {
         }
     }
 
-    # ===== 6. Start the data server =====
-    Report-Step 6 "Starting data server..."
-    Start-DataServer -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
+    # ===== 6. Start the control plane (which owns the data plane) =====
+    Report-Step 6 "Starting control plane..."
+    Start-ControlPlane -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
 
     # ===== 7. Wire biopb-mcp into the user's agent system =====
     Report-Step 7 "Configuring MCP client..."
