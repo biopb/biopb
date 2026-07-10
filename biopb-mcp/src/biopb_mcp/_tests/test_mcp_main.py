@@ -56,6 +56,14 @@ class TestParseArgs:
                 default_port=8765,
             )
 
+    def test_view_defaults_false(self):
+        opts = _parse_args([], default_transport="http", default_port=8765)
+        assert opts.view is False
+
+    def test_view_flag_sets_true(self):
+        opts = _parse_args(["--view"], default_transport="http", default_port=8765)
+        assert opts.view is True
+
 
 def _cfg(**transport):
     """Build a full config carrying only the given mcp.transport overrides."""
@@ -114,6 +122,27 @@ class TestMainDispatch:
         # The shim failing must surface as a nonzero exit (client sees EOF),
         # never a traceback-crash or a hung launcher.
         assert main(["--transport", "stdio"]) == 1
+
+    def test_view_routes_to_serve_http_view_mode(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            launcher,
+            "_serve_http",
+            lambda config, port, view=False: calls.append((port, view)) or 0,
+        )
+        assert main(["--view", "--port", "0"]) == 0
+        assert calls == [(0, True)]
+
+    def test_view_takes_precedence_over_stdio_default(self, monkeypatch):
+        # empty config -> default transport stdio, but --view wins (viewer path).
+        calls = []
+        monkeypatch.setattr(
+            launcher,
+            "_serve_http",
+            lambda config, port, view=False: calls.append(view) or 0,
+        )
+        assert main(["--view"]) == 0
+        assert calls == [True]
 
 
 class TestHasDisplay:

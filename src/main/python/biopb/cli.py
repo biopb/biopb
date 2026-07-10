@@ -1668,6 +1668,60 @@ def mcp_logs(
     _tail_and_follow(log_file, follow, lines, _validate_level(level), _mcp_line_level)
 
 
+@mcp_app.command("view")
+def mcp_view(
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="MCP port for an optional agent to attach (default: dynamic, "
+        "OS-assigned — printed on startup).",
+    ),
+):
+    """Open the napari viewer in the foreground (agentless).
+
+    Runs a biopb-mcp session in *this* terminal: the napari window opens
+    immediately and the process blocks until Ctrl-C. Unlike `biopb mcp start`
+    (a detached background daemon managed by stop/status), this is a foreground,
+    user-owned viewer that writes no PID file. It still serves /mcp on the chosen
+    (default dynamic) port, so an AI agent may optionally attach to the same live
+    session.
+
+    Implemented by running `biopb-mcp --view` as a foreground child that shares
+    this terminal's stdio and process group, so Ctrl-C reaches it directly (its
+    own SIGINT handler reaps the kernel/viewer). This CLI stays free of the heavy
+    napari/Qt import — it only launches and waits.
+    """
+    _require_biopb_mcp()
+    resolved_port = 0 if port is None else port
+    cmd = [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp",
+        "--view",
+        "--port",
+        str(resolved_port),
+    ]
+    console.print("[green]Opening biopb-mcp viewer (Ctrl-C to stop)...[/green]")
+    # Foreground: NO _detach_kwargs — inherit this terminal's stdio and stay in
+    # its process group so Ctrl-C (SIGINT / CTRL_C_EVENT) reaches the launcher.
+    try:
+        process = subprocess.Popen(cmd, env=os.environ.copy())
+    except OSError as exc:
+        console.print(f"[red]Could not launch the viewer:[/red] {exc}")
+        raise typer.Exit(1)
+    try:
+        raise typer.Exit(process.wait())
+    except KeyboardInterrupt:
+        # Ctrl-C already reached the child via the shared group; give it a moment
+        # to tear the kernel/viewer down, then force-reap if it overruns.
+        try:
+            process.wait(timeout=20)
+        except Exception:
+            process.kill()
+        raise typer.Exit(0)
+
+
 app.add_typer(mcp_app, name="mcp")
 
 
