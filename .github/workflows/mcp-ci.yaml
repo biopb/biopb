@@ -3,8 +3,14 @@
 # PyPI (the product ships as the release-v* wheel triple the installer
 # file://-installs — see docs/release-model.md). The `mcp-v*` tag is retained
 # purely as biopb-mcp's setuptools_scm version marker (it stamps the clean
-# 0.7.x version onto the wheel built in release.yaml); it no longer triggers any
+# X.Y.Z version onto the wheel built in release.yaml); it no longer triggers any
 # publish, so it does not appear as a workflow trigger here.
+#
+# push and pull_request carry the SAME paths filter so branch-push and PR runs
+# are scoped identically (test-only, MCP-relevant changes). A paths filter under
+# push is now safe: it once had to be omitted because a filter there would also
+# gate the (now-removed) mcp-v* tag push and could silently skip a release —
+# with no tag trigger, that risk is gone.
 name: MCP CI
 
 on:
@@ -12,6 +18,16 @@ on:
     branches:
       - main
       - dev
+    paths:
+      - 'biopb-mcp/**'
+      - 'proto/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'src/main/python/**'
+      - 'biopb-tensor-server/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/mcp-ci.yaml'
   pull_request:
     branches:
       - main

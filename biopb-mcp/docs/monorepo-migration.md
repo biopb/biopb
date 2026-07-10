@@ -75,14 +75,16 @@ so the legacy `pip install -e` flow into the shared root `.venv` still works;
 ### CI (`.github/workflows/`)
 The imported `biopb-mcp/.github/*` were inert (GitHub only runs root workflows).
 Replaced with:
-- **`mcp-ci.yaml`** — uv-based test matrix (path-filtered to `biopb-mcp/**` +
-  shared proto/server) and PyPI publish on `mcp-v*`.
+- **`mcp-ci.yaml`** — uv-based test matrix, path-filtered to `biopb-mcp/**` +
+  shared proto/server. Test-only.
 
-PyPI publishing for biopb-mcp stays on its own `mcp-v*` tag. Product deployment
-(the GitHub release + Docker that the installer/operators consume) is **not** in
-mcp-ci — it is the unified `release.yaml` on `release-v*` tags. The cross-platform
-PyInstaller "frozen app" bundles are disabled (everything installs via uv); the
-spec/hooks (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
+biopb-mcp is **no longer published to PyPI** (see the "Superseded" note on
+decision #2 above and `docs/release-model.md`); mcp-ci runs tests only, and the
+`mcp-v*` tag is now just biopb-mcp's setuptools_scm version marker. Product
+deployment (the GitHub release + Docker that the installer/operators consume) is
+the unified `release.yaml` on `release-v*` tags. The cross-platform PyInstaller
+"frozen app" bundles are disabled (everything installs via uv); the spec/hooks
+(`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
 
 ### Installer (`install/install.sh`, `install.ps1`)
 Originally staged under `biopb-mcp/install/`; promoted to the repo-root `install/`
