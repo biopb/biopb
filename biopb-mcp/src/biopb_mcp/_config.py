@@ -370,13 +370,15 @@ DEFAULT_CONFIG = {
             # Short on purpose — the check must never delay viewer start.
             "timeout": 5.0,
         },
-        # Give-up budget (seconds) for the just-launched boot wait after
-        # auto_connect asks the admin to ensure the data plane, where
-        # connection-refused is tolerated while the server binds and scans its
-        # data folder. It also bounds the admin-ensure call itself. The normal
-        # auto-connect path has no timeout: it fails fast on a down server and
-        # polls a STARTING (scanning) server indefinitely with progress
-        # feedback (issue #12).
+        # Give-up budget (seconds) applied TWICE by auto_connect's down-plane
+        # fallback, so the worst-case wall wait is ~2x this value: first it bounds
+        # the admin-ensure call (asking the control plane to bring the data plane
+        # up, which returns once the port is listening), then it bounds the
+        # subsequent boot wait (connect_when_booted), where connection-refused is
+        # tolerated while the server binds and scans its data folder. Both phases
+        # are sequential and each capped here. The normal auto-connect path (plane
+        # already up) has no timeout: it fails fast on a down server and polls a
+        # STARTING (scanning) server indefinitely with progress feedback (#12).
         "server_start_timeout": 60.0,
     },
 }

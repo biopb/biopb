@@ -674,6 +674,9 @@ class TensorConnection:
 
         # Ask the admin (control plane) to ensure the data plane, then wait it
         # through boot. `ensure_data_plane` returns None when no admin answers.
+        # NOTE: server_start_timeout is spent on BOTH phases below (ensure, then
+        # connect_when_booted), so the worst-case wall wait is ~2x it — see the
+        # `mcp.server_start_timeout` config note.
         logger.info("auto_connect: %s down; asking the admin to ensure it", url)
         snapshot = ensure_data_plane(timeout=self.server_start_timeout())
         if snapshot is None:
