@@ -18,7 +18,7 @@ import threading
 import time
 from typing import List, Optional
 
-from . import _deathwatch
+from . import _deathwatch, _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,14 @@ class KernelHost:
         # pgid captured at launch so the group-kill never re-derives it from a
         # possibly-dead / pid-recycled kernel pid.
         self._pgid = None
+        # Windows counterpart to the pgid + parent-death pair below: a Job Object
+        # (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) the daemon holds and the kernel is
+        # assigned to at launch. os.killpg does not exist on Windows, so both
+        # POSIX reapers are inert there; the job ties the kernel's whole process
+        # tree to the daemon's handle, so even a force-killed or crashed daemon
+        # reaps the kernel -- GIL state and all (biopb/biopb#403). None off
+        # Windows, or if job creation is unavailable (degrades to the old path).
+        self._winjob = None
         # Launcher-held write end of the parent-death pipe; its closure (on
         # launcher death) makes the kernel self-terminate (failure mode 1).
         self._parent_death_pipe = parent_death_pipe and os.name == "posix"
@@ -402,6 +410,7 @@ class KernelHost:
                         except OSError:
                             pass
             self._pgid = self._capture_pgid()
+            self._assign_kernel_to_job()
             self._kc = self._km.client()
             self._kc.start_channels()
             self._kc.wait_for_ready(timeout=self._startup_timeout)
@@ -410,6 +419,20 @@ class KernelHost:
         except Exception:
             self._shutdown_current()
             raise
+
+    def _assign_kernel_to_job(self):
+        """Windows: put the freshly-launched kernel in the daemon's kill-on-close
+        Job Object, so it (and everything it spawns) dies with the daemon even on
+        an uncatchable force-kill (biopb/biopb#403). No-op on POSIX (the pgid +
+        parent-death pipe cover it) and best-effort -- a failure just leaves the
+        pre-#403 behavior. The job is created once and reused across restarts."""
+        if os.name != "nt":
+            return
+        if self._winjob is None:
+            self._winjob = _winjob.create_kill_on_close_job()
+        pid = self._kernel_pid()
+        if self._winjob is not None and pid is not None:
+            _winjob.assign_process(self._winjob, pid)
 
     def _capture_pgid(self):
         """The kernel's process-group id, read once at launch time."""
@@ -704,6 +727,12 @@ class KernelHost:
                 except Exception:
                     logger.debug("graceful close on shutdown failed", exc_info=True)
             self._shutdown_current()
+            # Terminal path only (restart() drives _shutdown_current directly and
+            # must keep the job): drop the job handle so it doesn't leak and its
+            # closure fires kill-on-close as a final backstop (biopb/biopb#403).
+            if self._winjob is not None:
+                _winjob.close_job(self._winjob)
+                self._winjob = None
 
     def _shutdown_current(self):
         # The kernel is going away: tools must wait for the next successful
@@ -724,6 +753,14 @@ class KernelHost:
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 logger.debug("killpg failed", exc_info=True)
+
+        # Windows has no killpg; TerminateJobObject is the from-outside tree-kill
+        # equivalent -- it reaps the kernel and everything it spawned, and works
+        # even if km.shutdown_kernel below is wedged or raises (biopb/biopb#403).
+        # The handle is kept open (closed only in shutdown()) so a restart reuses
+        # it and it stays the kill-on-close backstop for daemon death.
+        if os.name == "nt" and self._winjob is not None:
+            _winjob.terminate_job(self._winjob)
 
         try:
             if self._km is not None:

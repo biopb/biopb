@@ -9,12 +9,14 @@ import os
 import signal
 import sys
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
+from biopb_mcp.mcp import _kernel  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
@@ -1116,3 +1118,109 @@ class TestTokenReportPipe:
             assert "round-trip-tok" in res["stdout"]
         finally:
             host.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object wiring (#403)")
+class TestWindowsJobObjectWiring:
+    """KernelHost's kill-on-close Job Object wiring (biopb/biopb#403).
+
+    Windows-only: the wired branches gate on os.name == 'nt', and faking that
+    globally is unsafe (pathlib picks WindowsPath, which cannot be instantiated
+    off Windows). So these run for real on the Windows CI runner and only fake
+    _winjob -- pinning the KernelHost orchestration (create the job once, assign
+    each launched kernel to it, tree-kill on teardown, and drop the handle only
+    on the terminal shutdown() path) without invoking the actual Win32 calls
+    (those are covered end-to-end by TestWinJobReal).
+    """
+
+    def _host(self, monkeypatch, fake):
+        host = KernelHost(health_probe_code=None)
+        monkeypatch.setattr(_kernel, "_winjob", fake)
+        return host
+
+    def test_launch_creates_job_once_and_assigns_each_kernel(self, monkeypatch):
+        fake = MagicMock()
+        fake.create_kill_on_close_job.return_value = "JOB"
+        host = self._host(monkeypatch, fake)
+        monkeypatch.setattr(host, "_kernel_pid", lambda: 4321)
+
+        host._assign_kernel_to_job()
+        host._assign_kernel_to_job()  # a restart reuses the job, not recreates it
+
+        fake.create_kill_on_close_job.assert_called_once()
+        assert host._winjob == "JOB"
+        assert fake.assign_process.call_count == 2
+        fake.assign_process.assert_called_with("JOB", 4321)
+
+    def test_shutdown_current_tree_kills_and_keeps_handle(self, monkeypatch):
+        fake = MagicMock()
+        host = self._host(monkeypatch, fake)
+        host._winjob = "JOB"
+
+        host._shutdown_current()  # the restart / respawn path
+
+        fake.terminate_job.assert_called_once_with("JOB")
+        fake.close_job.assert_not_called()  # kept so the next kernel reuses it
+        assert host._winjob == "JOB"
+
+    def test_shutdown_closes_handle(self, monkeypatch):
+        fake = MagicMock()
+        host = self._host(monkeypatch, fake)
+        host._winjob = "JOB"
+
+        host.shutdown()  # the terminal daemon-exit path
+
+        fake.terminate_job.assert_called_once_with("JOB")  # via _shutdown_current
+        fake.close_job.assert_called_once_with("JOB")
+        assert host._winjob is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Win32 Job Object (Windows CI)")
+class TestWinJobReal:
+    """Exercise the real _winjob ctypes path on Windows CI: a member process
+    must die when the job is terminated or its last handle closes (#403)."""
+
+    def _sleeper(self):
+        import subprocess
+
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+
+    def test_close_job_kills_member(self):
+        from biopb_mcp.mcp import _winjob
+
+        job = _winjob.create_kill_on_close_job()
+        assert job is not None
+        proc = self._sleeper()
+        try:
+            assert _winjob.assign_process(job, proc.pid) is True
+            # Closing the last handle fires KILL_ON_JOB_CLOSE -- the daemon-death
+            # guarantee, needing no in-process teardown code.
+            _winjob.close_job(job)
+            job = None
+            proc.wait(timeout=10)  # raises if the OS did not reap it
+        finally:
+            if job is not None:
+                _winjob.close_job(job)
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_terminate_job_kills_member_and_keeps_job_usable(self):
+        from biopb_mcp.mcp import _winjob
+
+        job = _winjob.create_kill_on_close_job()
+        assert job is not None
+        proc = self._sleeper()
+        try:
+            assert _winjob.assign_process(job, proc.pid) is True
+            _winjob.terminate_job(job)
+            proc.wait(timeout=10)  # tree-killed from outside
+            # Still usable after terminate: a restart reassigns a fresh kernel.
+            proc2 = self._sleeper()
+            try:
+                assert _winjob.assign_process(job, proc2.pid) is True
+            finally:
+                proc2.kill()
+        finally:
+            _winjob.close_job(job)
+            if proc.poll() is None:
+                proc.kill()
