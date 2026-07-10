@@ -1,10 +1,7 @@
 # biopb-mcp
 
-[![License MIT](https://img.shields.io/pypi/l/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://github.com/biopb/biopb/raw/main/biopb-mcp/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://pypi.org/project/biopb-mcp)
-[![Python Version](https://img.shields.io/pypi/pyversions/biopb-mcp.svg?color=green&cacheSeconds=3600)](https://python.org)
-[![MCP CI/CD](https://github.com/biopb/biopb/actions/workflows/mcp-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions/workflows/mcp-ci.yaml)
-[![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/biopb-mcp&cacheSeconds=3600)](https://napari-hub.org/plugins/biopb-mcp)
+[![License MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/biopb/biopb/raw/main/biopb-mcp/LICENSE)
+[![MCP CI](https://github.com/biopb/biopb/actions/workflows/mcp-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions/workflows/mcp-ci.yaml)
 
 
 **biopb-mcp** is the MCP component of the **[BioPB](https://github.com/biopb/biopb)** project
@@ -20,19 +17,15 @@ curl -fsSL https://biopb.org/install.sh | bash
 
 These methods only install the mcp component without the rest of **[BioPB](https://github.com/biopb/biopb)**  system.
 
-### From PyPI
+> **biopb-mcp is no longer published to PyPI.** It ships as part of the
+> `release-v*` wheel triple that the recommended installer above
+> `file://`-installs; a standalone `pip install biopb-mcp` could never pull the
+> tensor server or the full-stack dependency groups it needs anyway. To install
+> just the mcp component from source, use the development method below.
 
-```
-pip install biopb-mcp        # or: uv pip install biopb-mcp
-```
+### Development / from source
 
-> Standalone PyInstaller app bundles (the per-platform `.zip`/`.tar.gz`
-> downloads) are temporarily disabled — installation is uv/pip-based for now.
-> Use the recommended one-liner above, or the methods here.
-
-### Development Version
-
-To install latest development version:
+To install the latest source version:
 
     pip install "git+https://github.com/biopb/biopb.git#subdirectory=biopb-mcp"
 

@@ -5,8 +5,8 @@
 #   - Docker images for biopb-tensor-server and biopb-image-base, each tagged
 #     with ITS OWN package version (+ :latest), published idempotently (skipped
 #     if that version is already in the registry).
-# PyPI is intentionally NOT part of this — biopb/biopb-mcp publish to PyPI on
-# their own v*/mcp-v* tags.
+# PyPI is intentionally NOT part of this — biopb publishes to PyPI on its own v*
+# tag (biopb-mcp is no longer on PyPI; it ships only as the wheel triple here).
 name: Release (deployment)
 
 on:

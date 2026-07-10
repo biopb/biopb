@@ -26,6 +26,10 @@ the tree and are automatically paired with the checkout.
    package** for now — its own PyPI release and napari-hub plugin — under a new
    **`mcp-v*`** git-tag prefix. This avoids colliding with the client's `v*` and
    the server's `server-v*` tags.
+   > **Superseded:** biopb-mcp's PyPI publishing (and the napari-hub listing it
+   > fed) has since been retired — it ships only inside the `release-v*` wheel
+   > triple. The `mcp-v*` tag is kept purely as its setuptools_scm version
+   > marker. See `docs/release-model.md`.
 3. **Interim dual-track, unified-release future.** The `mcp-v*` and `server-v*`
    release lines continue for now. The intended end state is a **single unified
    release** that builds and bundles the whole stack (client + tensor-server +
@@ -71,14 +75,16 @@ so the legacy `pip install -e` flow into the shared root `.venv` still works;
 ### CI (`.github/workflows/`)
 The imported `biopb-mcp/.github/*` were inert (GitHub only runs root workflows).
 Replaced with:
-- **`mcp-ci.yaml`** — uv-based test matrix (path-filtered to `biopb-mcp/**` +
-  shared proto/server) and PyPI publish on `mcp-v*`.
+- **`mcp-ci.yaml`** — uv-based test matrix, path-filtered to `biopb-mcp/**` +
+  shared proto/server. Test-only.
 
-PyPI publishing for biopb-mcp stays on its own `mcp-v*` tag. Product deployment
-(the GitHub release + Docker that the installer/operators consume) is **not** in
-mcp-ci — it is the unified `release.yaml` on `release-v*` tags. The cross-platform
-PyInstaller "frozen app" bundles are disabled (everything installs via uv); the
-spec/hooks (`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
+biopb-mcp is **no longer published to PyPI** (see the "Superseded" note on
+decision #2 above and `docs/release-model.md`); mcp-ci runs tests only, and the
+`mcp-v*` tag is now just biopb-mcp's setuptools_scm version marker. Product
+deployment (the GitHub release + Docker that the installer/operators consume) is
+the unified `release.yaml` on `release-v*` tags. The cross-platform PyInstaller
+"frozen app" bundles are disabled (everything installs via uv); the spec/hooks
+(`biopb-mcp/biopb-mcp.spec`, `biopb-mcp/hooks/`) remain in the tree.
 
 ### Installer (`install/install.sh`, `install.ps1`)
 Originally staged under `biopb-mcp/install/`; promoted to the repo-root `install/`
