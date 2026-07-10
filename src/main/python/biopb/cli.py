@@ -87,15 +87,19 @@ DEFAULT_CONFIG = find_config()
 # biopb-mcp daemon management. The MCP server is a separate, optional process
 # (the `biopb-mcp` package) managed independently of the tensor server, so it
 # gets its own PID/log under biopb-mcp's XDG data dir (matching
-# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). The daemon
+# biopb_mcp._config.get_log_dir() -> ~/.local/share/biopb-mcp/log). These
+# commands manage the *standalone* `biopb mcp start` daemon: it writes its own
+# PID file (biopb_mcp._config.get_pid_file()) so `status`/`stop` find it, and
 # logs to ONE canonical file (biopb_mcp._config.get_daemon_log_file() ->
-# mcp-server.log) shared with the stdio shim, so `mcp logs` / `status` show the
-# right log no matter who launched the daemon (the CLI's `mcp start`, or the
-# shim spawning it on demand for an AI client). The running daemon writes this
-# same PID file itself (biopb_mcp._config.get_pid_file()) regardless of who
-# launched it — including the stdio shim, which spawns it detached without going
-# through `mcp start` — so `status` detects it uniformly. Keep this path in sync
-# with get_pid_file().
+# mcp-server.log). Keep both literals in sync with get_pid_file()/get_log_dir().
+#
+# Since de-daemonization (biopb-mcp/docs/mcp-dedaemonization-migration.md,
+# Layer 1) the stdio shim no longer spawns a shared daemon through here: it
+# spawns and OWNS an ephemeral session child that writes NO PID file (the shim
+# reaps it directly), so `biopb mcp status` tracks only the standalone daemon.
+# That child still writes the same canonical daemon log (fd inherited from the
+# shim), so `mcp logs` shows whichever session last ran. Repurposing `biopb mcp`
+# around the shared serve-core is deferred to Layer 3.
 MCP_PID_FILE = Path.home() / ".local" / "share" / "biopb-mcp" / "mcp-server.pid"
 MCP_LOG_DIR = Path.home() / ".local" / "share" / "biopb-mcp" / "log"
 MCP_DEFAULT_PORT = 8765  # biopb_mcp default mcp.transport.port (loopback /mcp)
