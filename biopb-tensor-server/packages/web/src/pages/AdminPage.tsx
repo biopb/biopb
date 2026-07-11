@@ -312,7 +312,12 @@ export function AdminPage() {
   return (
     <div className="app-shell admin-shell">
       <header className="app-topbar">
-        <img className="topbar-logo" src="/biopb-logo.png" alt="" aria-hidden="true" />
+        <img
+          className="topbar-logo"
+          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          alt=""
+          aria-hidden="true"
+        />
         <h1>BioPB · Admin</h1>
         <span className={`status-pill ${pill.cls}`}>{pill.text}</span>
         <div className="topbar-spacer" />

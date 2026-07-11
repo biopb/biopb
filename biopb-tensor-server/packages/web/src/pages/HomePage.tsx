@@ -15,7 +15,12 @@ export function HomePage() {
   return (
     <div className="app-shell">
       <header className="app-topbar">
-        <img className="topbar-logo" src="/biopb-logo.png" alt="" aria-hidden="true" />
+        <img
+          className="topbar-logo"
+          src={`${import.meta.env.BASE_URL}biopb-logo.png`}
+          alt=""
+          aria-hidden="true"
+        />
         <h1>BioPB Tensor Viewer</h1>
         <span className={`status-pill ${connectionState}`}>
           {connectionState === "connected"

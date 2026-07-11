@@ -193,7 +193,8 @@ def _truncate_tail(text):
 
 
 async def _observe_page(request):
-    return HTMLResponse(_OBSERVE_HTML.replace("__POLL_MS__", str(_poll_interval_ms)))
+    html = _OBSERVE_HTML.replace("__POLL_MS__", str(_poll_interval_ms))
+    return HTMLResponse(html.replace("__FAVICON__", _FAVICON))
 
 
 async def _api_jobs(request):
@@ -344,11 +345,17 @@ def describe(mcp_port=None):
 # Frontend (single static page; vanilla JS polling, no build step)
 # ---------------------------------------------------------------------------
 
+# The biopb mark (the tensor server's favicon-32.png) embedded as a data URI so
+# the observe tab has an icon without the session child serving a static asset.
+# Kept on one line so no accidental whitespace enters the base64 payload.
+_FAVICON = "data:image/png;base64,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"  # noqa: E501
+
 _OBSERVE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>biopb-mcp · observe</title>
+<link rel="icon" type="image/png" href="__FAVICON__">
 <style>
   body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #111; color: #ddd; }
   header { padding: 10px 16px; background: #1b1b1b; border-bottom: 1px solid #333;
