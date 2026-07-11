@@ -32,11 +32,16 @@ curl -fsSL https://biopb.org/install.sh | bash
 ```bash
 docker run -d --rm \
     --name biopb-tensor \
-    -p 8814:8814 -p 8815:8815 \
+    -p 8813:8813 -p 8815:8815 \
     -v ${YOUR_DATA_LOCATION}:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
     jiyuuchc/biopb-tensor-server:latest
 ```
+
+The container runs the **control plane** as its single web origin: open
+`http://localhost:8813` for the data viewer (`:8813` → `/data_plane/viewer`). The
+Arrow Flight gRPC endpoint stays on `:8815` for SDK clients. The HTTP sidecar
+(`:8814`) is now internal to the container and is not published.
 
 See [deploy.md](deploy.md) for a complete list of deployment options, including methods for HPC deployment with singularity.
 
@@ -46,7 +51,7 @@ See [deploy.md](deploy.md) for a complete list of deployment options, including 
 - Transport is **unencrypted** by default! Only deploy on trusted intranet!
 - If BIOPB_TENSOR_TOKEN is not given, the server generates a random token that can be viewed with `docker logs biopb-tensor`
 - Dev mode (`--dev` flag or `BIOPB_WEB_DEV_BYPASS=1`) disables token enforcement!
-- Bind to localhost-only `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
+- Bind to localhost-only `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` if not on trusted net, and access via ssh tunnel
 
 ## Configuration
 
@@ -78,7 +83,7 @@ discovery; a specific source like `my-zarr` lets you override its metadata.
 To use your custom configuration:
 
 ```bash
-docker run -d -p 8814:8814 -p 8815:8815 \
+docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/biopb.json:/custom.json \
     -v ~/data:/data \
     -v ~/experiment.zarr:/experiment.zarr \
@@ -141,7 +146,7 @@ The React web viewer is served directly by the FastAPI server. Build it before r
 pnpm --filter @biopb/web build
 ```
 
-The webapp files are copied into the Docker image and served at the HTTP port (8814). On first load you will be prompted for the access token printed by the `launch` command.
+The webapp files are copied into the Docker image and served by the **control plane** at the web origin (`:8813`, under `/data_plane/viewer`). On first load you will be prompted for the access token (printed in the container logs, or set via `BIOPB_TENSOR_TOKEN`).
 
 For development with hot reload, run the dev server separately:
 ```bash

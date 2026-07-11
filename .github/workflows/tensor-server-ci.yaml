@@ -168,6 +168,11 @@ jobs:
       - name: Build biopb_tensor_server wheel
         run: pip wheel ./biopb-tensor-server --no-deps -w wheels/
 
+      - name: Build biopb_control wheel
+        # The image runs the control as its web origin, so the Dockerfile installs
+        # this wheel too (its ASGI deps resolve from PyPI at image-build time).
+        run: pip wheel ./biopb-control --no-deps -w wheels/
+
       - name: Set up Docker Buildx
         if: github.event_name != 'pull_request'
         uses: docker/setup-buildx-action@v3

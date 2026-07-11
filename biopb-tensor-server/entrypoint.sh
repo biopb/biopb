@@ -20,10 +20,14 @@ set -e
 # Default 8810 → HTTP=8814, gRPC=8815
 BIOPB_BASE_PORT="${BIOPB_BASE_PORT:-8810}"
 
+CONTROL_PORT=$((BIOPB_BASE_PORT + 3))
 HTTP_PORT=$((BIOPB_BASE_PORT + 4))
 GRPC_PORT=$((BIOPB_BASE_PORT + 5))
 
-echo "Ports: HTTP=$HTTP_PORT gRPC=$GRPC_PORT"
+# CONTROL_PORT is the single public web origin (the control plane). HTTP_PORT is
+# the tensor sidecar, now PRIVATE (loopback) behind the control. GRPC_PORT (Flight)
+# stays public for SDK clients. See mcp-dedaemonization-migration.md §6.1.
+echo "Ports: CONTROL(web)=$CONTROL_PORT  HTTP(sidecar, private)=$HTTP_PORT  gRPC=$GRPC_PORT"
 
 # Create unique temp directory prefix to avoid multi-user collisions on shared /tmp
 # Use USER env var if available, else use PID as unique identifier
@@ -99,21 +103,44 @@ else
     WEB_HOST="localhost"
 fi
 
-# Build command args
-COMMAND="${1:-launch}"
-shift 2>/dev/null || true
-
-ARGS=(
-    --config "$CONFIG_FILE"
-    --web-host "$BIND_ADDR"
-    --web-port "$HTTP_PORT"
-    --web-url "http://${WEB_HOST}:${HTTP_PORT}"
-    --cors "*"
-)
-
-# Add static-dir only if webapp directory exists
-if [ -d "/app/webapp" ]; then
-    ARGS+=(--static-dir /app/webapp)
+# Resolve the tensor-server access token. The control forwards the browser's
+# Bearer token to the (private) sidecar, which re-validates; the Flight gRPC port
+# re-validates it too. A public bind with no token would be open, so generate one
+# (mirroring `biopb server start`); a loopback-only bind may skip enforcement.
+TOKEN_ARGS=()
+if [ -n "$BIOPB_TENSOR_TOKEN" ]; then
+    TOKEN_ARGS=(--token "$BIOPB_TENSOR_TOKEN")
+elif [ "$BIND_ADDR" = "127.0.0.1" ]; then
+    TOKEN_ARGS=(--local-bypass)
+else
+    GEN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export BIOPB_TENSOR_TOKEN="$GEN_TOKEN"
+    echo "Generated access token: $GEN_TOKEN"
+    TOKEN_ARGS=(--token "$GEN_TOKEN")
 fi
 
-exec biopb-tensor-server "$COMMAND" "${ARGS[@]}" "$@"
+# Run the control plane in the foreground (container PID 1). It is the single
+# public web origin on $CONTROL_PORT: it supervises the tensor server as a PRIVATE
+# loopback subprocess (sidecar on 127.0.0.1:$HTTP_PORT, never exposed) and
+# reverse-proxies it under /data_plane (dataviewer at /data_plane/viewer). The
+# Flight gRPC port stays directly exposed for SDK clients.
+#   --control-host $BIND_ADDR : bind the public origin (0.0.0.0 -> reachable via -p)
+#   --grpc-host 127.0.0.1     : the liveness-probe CONNECT address; the server BINDs
+#                               server.host from the config (0.0.0.0 above), so
+#                               Flight itself stays public
+#   --web-host 127.0.0.1      : bind the sidecar privately (only the control reaches it)
+CONTROL_ARGS=(
+    --config "$CONFIG_FILE"
+    --control-host "$BIND_ADDR"
+    --control-port "$CONTROL_PORT"
+    --grpc-host 127.0.0.1
+    --grpc-port "$GRPC_PORT"
+    --web-host 127.0.0.1
+    --web-port "$HTTP_PORT"
+)
+if [ -d "/app/webapp" ]; then
+    CONTROL_ARGS+=(--static-dir /app/webapp)
+fi
+
+echo "Web origin (control): http://${WEB_HOST}:${CONTROL_PORT}   Flight gRPC: ${WEB_HOST}:${GRPC_PORT}"
+exec python -m biopb_control run "${CONTROL_ARGS[@]}" "${TOKEN_ARGS[@]}"

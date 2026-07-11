@@ -67,7 +67,7 @@ docker build --memory=4g --memory-swap=8g -t biopb-tensor-server:latest -f biopb
 ```bash
 docker run -d \
     --name biopb-tensor \
-    -p 8814:8814 \
+    -p 8813:8813 \
     -p 8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=your_secure_token \
@@ -123,7 +123,7 @@ docker run -d -p 9004:9004 -p 9005:9005 -v ~/data:/data \
     biopb-tensor-server:latest
 
 # With custom config file
-docker run -d -p 8814:8814 -p 8815:8815 \
+docker run -d -p 8813:8813 -p 8815:8815 \
     -v ~/my-config.json:/custom.json \
     -v ~/data:/data \
     -e CONFIG_FILE=/custom.json \
@@ -132,7 +132,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 
 # Localhost-only access. A token is still required.
 docker run -d \
-    -p 127.0.0.1:8814:8814 \
+    -p 127.0.0.1:8813:8813 \
     -p 127.0.0.1:8815:8815 \
     -v ~/data:/data \
     -e BIOPB_TENSOR_TOKEN=mytoken \
@@ -216,11 +216,12 @@ singularity run \
 These checks report service readiness, not completion of monitored dataset discovery. A healthy container can still have zero visible monitored sources briefly after startup while stability gating defers initial registration.
 
 ```bash
-# Liveness (HTTP)
-curl http://localhost:8814/livez
+# Control-plane liveness (the container's web origin)
+curl http://localhost:8813/health
 
-# Readiness (HTTP)
-curl http://localhost:8814/readyz
+# Tensor-server liveness/readiness, proxied under the /data_plane namespace
+curl http://localhost:8813/data_plane/livez
+curl http://localhost:8813/data_plane/readyz
 
 # Flight server health action (gRPC)
 # Use Flight's do_action("health") for gRPC health status
@@ -228,7 +229,7 @@ curl http://localhost:8814/readyz
 
 ## Access the Webapp
 
-1. Open `http://localhost:8814/` in browser
+1. Open `http://localhost:8813/` in browser (redirects to `/data_plane/viewer`)
 2. Enter the token (shown once in container logs, or set via `BIOPB_TENSOR_TOKEN`)
 3. Browse microscopy datasets
 
@@ -247,7 +248,7 @@ Container (external ports 8814, 8815)
     └── do_get                 → fetch tensor data
 ```
 
-FastAPI serves both the webapp and API endpoints on port 8814. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
+The **control plane** is the container's single web origin (port 8813): it serves the webapp + API under `/data_plane` by reverse-proxying the FastAPI sidecar, which now binds privately to `127.0.0.1:8814` inside the container. TensorFlightServer exposes gRPC directly on port 8815 (no proxy needed).
 
 ### Network Binding Control
 
@@ -257,7 +258,7 @@ all interfaces (`0.0.0.0`) inside the container. Docker's port forwarding
 token-authenticated. The HTTP sidecar connects to the Flight server over loopback whenever it binds to a wildcard address — which is what this entrypoint always generates — so the bind change never affects the sidecar.
 
 **For localhost-only access:**
-- **Docker**: Use `-p 127.0.0.1:8814:8814 -p 127.0.0.1:8815:8815` to restrict to host's localhost
+- **Docker**: Use `-p 127.0.0.1:8813:8813 -p 127.0.0.1:8815:8815` to restrict to host's localhost
 - **Singularity/HPC**: Use `BIOPB_BIND_LOCALHOST=true` to bind both HTTP and gRPC to localhost (useful on shared nodes)
 
 Note: `BIOPB_BIND_LOCALHOST=true` is **ignored in Docker** with a warning, since it would break external access (services bound to 127.0.0.1 inside a container cannot be reached from outside).
