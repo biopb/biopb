@@ -4,9 +4,10 @@ Concerns beyond the health/ensure control API (covered in ``test_supervisor``):
 (1) the control's own routes win, (2) the ``/data_plane`` namespace faithfully
 reverse-proxies to the tensor web sidecar -- method, path, query, headers,
 request/response bodies, and the ``/ws/render`` WebSocket -- with the mount
-prefix stripped, and (3) ``/`` redirects to the dataviewer. A trivial stdlib
-HTTP server and a ``websockets`` echo server stand in for the tensor sidecar so
-no real tensor server is needed.
+prefix stripped, and (3) ``/`` serves the control's own dashboard, which is
+backed by the in-process ``/api/status`` + ``/api/sessions`` control API. A
+trivial stdlib HTTP server and a ``websockets`` echo server stand in for the
+tensor sidecar so no real tensor server is needed.
 """
 
 import json
@@ -118,11 +119,6 @@ def _get(url, headers=None):
         return resp.status, resp.headers, resp.read()
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_a, **_k):
-        return None  # surface the 3xx as an HTTPError instead of following it
-
-
 def test_control_health_is_not_proxied(control):
     # /health is the control's own endpoint and must win over the proxy mounts.
     status, _headers, body = _get(f"{control}/health")
@@ -134,13 +130,59 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_root_redirects_to_dataviewer(control):
-    # `/` sends the origin root to the dataviewer (until the dashboard lands).
-    opener = urllib.request.build_opener(_NoRedirect)
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        opener.open(f"{control}/", timeout=5)
-    assert exc.value.code in (302, 307)
-    assert exc.value.headers["Location"] == "/data_plane/viewer/"
+def test_root_serves_the_control_dashboard(control):
+    # `/` is the control's own buildless dashboard, not a redirect or the proxy.
+    status, headers, body = _get(f"{control}/")
+    assert status == 200
+    assert "text/html" in (headers.get("Content-Type") or "")
+    html = body.decode()
+    assert "biopb · control" in html  # its title/header
+    # It polls the in-process control API, not the data-plane proxy.
+    assert "/api/status" in html
+    assert "/api/sessions" in html
+    assert "path" not in html  # not the echo upstream's response
+
+
+def test_api_status_reports_control_and_data_plane(control):
+    status, _headers, body = _get(f"{control}/api/status")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["control"] == "ok"
+    assert "state" in payload["data_plane"]  # the supervisor snapshot
+    assert payload["sessions"] == 0  # none registered in this test
+
+
+def test_api_sessions_lists_live_sessions(control, upstream):
+    # Empty to start, then a registered session shows up with its observe link.
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    assert json.loads(body)["sessions"] == []
+
+    _register_session("20260101-000000-42", upstream)
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    sessions = json.loads(body)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "20260101-000000-42"
+    assert sessions[0]["observe_url"] == "/session/20260101-000000-42/observe"
+
+
+def test_api_sessions_omits_dead_records(control, upstream):
+    # A session whose pid is gone is pruned by list_sessions() on read.
+    dead = subprocess_dead_pid()
+    u = urlparse(upstream)
+    _config_sessions.register("ghost", host=u.hostname, port=u.port, pid=dead)
+    _status, _headers, body = _get(f"{control}/api/sessions")
+    assert json.loads(body)["sessions"] == []
+    assert _config_sessions.read_session("ghost") is None  # pruned
+
+
+def test_data_plane_stop_is_a_control_verb(control):
+    # POST /api/data_plane/stop returns the snapshot; with no data plane wired in
+    # this test it just reports a stopped plane rather than proxying anywhere.
+    req = urllib.request.Request(f"{control}/api/data_plane/stop", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        payload = json.loads(resp.read())
+    assert resp.status == 200
+    assert payload["data_plane"]["state"] == "stopped"
 
 
 def test_data_api_is_proxied_with_prefix_stripped_query_and_auth(control):
