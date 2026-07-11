@@ -1027,7 +1027,7 @@ function Invoke-BiopbInstall {
     # previously installed biopb daemons -- the control plane (which owns and
     # holds open a supervised tensor-server child), the standalone data server,
     # AND the biopb-mcp server (which owns a detached napari kernel) -- so the
-    # upgrade can replace the locked binaries. The admin goes FIRST: it owns the
+    # upgrade can replace the locked binaries. The control plane goes FIRST: it owns the
     # data plane, so stopping it tears that child down and stops it respawning
     # anything the next two commands / the force-kill would race. Best-effort
     # (try/catch swallows the benign "nothing running" stderr) and a no-op on a
@@ -1036,7 +1036,7 @@ function Invoke-BiopbInstall {
         try { & biopb control stop  *> $null } catch { }
         try { & biopb server stop *> $null } catch { }
         try { & biopb mcp stop    *> $null } catch { }
-        Report-Detail "stopped any running biopb daemons (admin + data + mcp) so their files can be replaced"
+        Report-Detail "stopped any running biopb daemons (control + data + mcp) so their files can be replaced"
     }
     # Belt-and-suspenders: the graceful stops above miss servers launched ad-hoc
     # from a shell, detached napari kernels, and agent-spawned stdio biopb-mcp --
@@ -1545,11 +1545,11 @@ function Invoke-BiopbUninstall {
         } catch { $script:LogFilePath = $null }
     }
     try {
-        Report-Step 1 "Stopping data server..."
+        Report-Step 1 "Stopping biopb services..."
         # Stop the control plane, the data server, AND the biopb-mcp server (+ its
         # napari kernel): each locks executables under the uv tool dir, so a
         # still-running daemon would make `uv tool uninstall` fail to remove the
-        # dir on Windows. The admin goes first -- it owns the data plane, so
+        # dir on Windows. The control plane goes first -- it owns the data plane, so
         # stopping it is a complete teardown of that pair and stops it respawning.
         if (Get-Command biopb -ErrorAction SilentlyContinue) {
             try { & biopb control stop  *> $null } catch { }
@@ -1560,7 +1560,7 @@ function Invoke-BiopbUninstall {
         # `uv tool uninstall` below fails to delete it with os error 5 (same as
         # the install path -- see Stop-BiopbToolProcesses).
         Stop-BiopbToolProcesses | Out-Null
-        Report-Ok "Data server and MCP server stopped (if they were running)"
+        Report-Ok "biopb services stopped (if they were running)"
 
         Report-Step 2 "Removing biopb packages..."
         if (Get-Command uv -ErrorAction SilentlyContinue) {

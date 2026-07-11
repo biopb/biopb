@@ -1575,7 +1575,7 @@ uninstall_biopb() {
         biopb control stop &>/dev/null || true
         biopb server stop &>/dev/null || true
         biopb mcp stop &>/dev/null || true
-        _ok "Control plane, data server and MCP server stopped (if they were running)"
+        _ok "biopb services stopped (if they were running)"
     else
         _info "biopb command not on PATH; nothing to stop"
     fi
