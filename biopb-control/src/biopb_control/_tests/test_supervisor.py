@@ -45,10 +45,15 @@ def _listener(port: int) -> socket.socket:
 
 @pytest.fixture
 def spec(tmp_path):
+    # web_port points at a free (closed) port so the control's reverse proxy to
+    # the tensor web sidecar fails deterministically (connection refused -> 502)
+    # in tests that exercise a path the control does not own itself.
     return DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),
+        web_host="127.0.0.1",
+        web_port=_free_port(),
         server_log=tmp_path / "server.log",
     )
 
@@ -279,12 +284,14 @@ def test_control_api_health_and_ensure(spec, monkeypatch):
         assert ensured["data_plane"]["state"] == "serving"
         assert ensured["data_plane"]["pid"] is not None
 
-        # Unknown path -> 404 JSON, not a hang.
+        # A path the control does not own is now reverse-proxied to the tensor
+        # web sidecar. None is running (the fixture's web_port is closed), so the
+        # proxy returns a clean 502 -- not a control 404, not a hang.
         try:
             urllib.request.urlopen(f"{base}/nope", timeout=3)
-            raise AssertionError("expected 404")
+            raise AssertionError("expected an HTTP error from the proxy")
         except urllib.error.HTTPError as exc:
-            assert exc.code == 404
+            assert exc.code == 502
     finally:
         server.shutdown()
         sup.stop()  # reap the binder child

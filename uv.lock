@@ -27,6 +27,7 @@ resolution-markers = [
 [manifest]
 members = [
     "biopb",
+    "biopb-control",
     "biopb-image-base",
     "biopb-mcp",
     "biopb-tensor-server",
@@ -602,6 +603,34 @@ requires-dist = [
     { name = "zarr", marker = "extra == 'tensor'", specifier = ">=2.0.0,<3" },
 ]
 provides-extras = ["test", "tensor", "doc"]
+
+[[package]]
+name = "biopb-control"
+source = { editable = "biopb-control" }
+dependencies = [
+    { name = "biopb" },
+    { name = "httpx" },
+    { name = "starlette" },
+    { name = "uvicorn" },
+    { name = "websockets" },
+]
+
+[package.dev-dependencies]
+testing = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "biopb", editable = "." },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "starlette", specifier = ">=0.37" },
+    { name = "uvicorn", specifier = ">=0.30" },
+    { name = "websockets", specifier = ">=12" },
+]
+
+[package.metadata.requires-dev]
+testing = [{ name = "pytest" }]
 
 [[package]]
 name = "biopb-image-base"

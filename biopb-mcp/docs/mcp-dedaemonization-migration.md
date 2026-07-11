@@ -219,10 +219,13 @@ The structural fix. Highest value; unblocks single origin.
   exposes `GET /health` and `POST /data_plane/ensure` — the endpoint `_connection`
   calls in place of the old shell-out. This is the seed of the Layer-3 origin; it
   stays stdlib until the front replaces it with an ASGI app on the same port.
-- **The tensor server trends to Flight + a minimal internal HTTP** the control
-  proxies; it loses its role as a public web surface. *(pending — with Layer 3.)*
-  This makes the data plane simpler and removes the last reason MCP needs to know
-  how to launch it.
+- **The tensor server's HTTP sidecar is now fronted by the control**, no longer
+  meant as its own public origin: the Layer-3 front reverse-proxies the
+  dataviewer + `/api/*` + `/ws/render` through 8813, forwarding the Bearer token
+  *(done — Layer-3 origin step)*. Trimming the sidecar further to a minimal,
+  control-only internal HTTP (dropping its public web role entirely) is a later
+  refinement; the proxying that makes the data plane a private upstream is in
+  place.
 
 Result: the cycle in §1.1 becomes a tree rooted at the control.
 
@@ -232,6 +235,16 @@ Result: the cycle in §1.1 becomes a tree rooted at the control.
 
 The control *is* the durable web origin, so single origin falls out — it is no
 longer a reverse-proxy bolted onto the ephemeral sidecar.
+
+> **Status: origin + data-plane proxy landed.** The control API is now a
+> Starlette/uvicorn app on `127.0.0.1:8813` (replacing the stdlib
+> `ThreadingHTTPServer`) that answers its own `/health` + `/data_plane/ensure`
+> and reverse-proxies everything else to the supervised tensor server's HTTP
+> sidecar — dataviewer static app, `/api/*`, health probes, and the `/ws/render`
+> WebSocket — with the Bearer token forwarded through (`biopb_control/_control.py`).
+> One origin now fronts the dataviewer. **Remaining:** session `/observe` routing
+> — the filesystem session registry + per-session reverse proxy (needs the
+> observe frontend's base-path fix, §3-gotcha-1).
 
 **Routing:**
 
@@ -328,7 +341,9 @@ flips it. Suggested order (value-first):
    control is the remaining registry piece, folded into Layer 3.
 3. **Single-origin front (Layer 3).** Control routes `/observe`, absorbs the
    dataviewer + control UI, terminates auth/TLS. Downgrade `biopb mcp` to the
-   standalone wrapper.
+   standalone wrapper. *(Partial: the ASGI origin + the tensor-sidecar reverse
+   proxy — dataviewer, `/api/*`, `/ws/render` — shipped; `/observe` + the session
+   registry are the remaining sub-step.)*
 4. **Algorithm plane under control (Layer 4).** Config extraction + supervision.
 
 ---
